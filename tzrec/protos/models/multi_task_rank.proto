@@ -19,6 +19,17 @@ message MMoE {
     repeated TaskTower task_towers = 4;
 }
 
+message TMMoE {
+    // mmoe expert module definition
+    required MLP expert_mlp = 1;
+    // mmoe gate module definition
+    optional MLP gate_mlp = 2;
+    // number of mmoe experts
+    required uint32 num_expert = 3 [default=3];
+    // task tower
+    repeated TaskTower task_towers = 4;
+}
+
 message DBMTL {
     // shared bottom mlp layer
     optional MLP bottom_mlp = 1;
