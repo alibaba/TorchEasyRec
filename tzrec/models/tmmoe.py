@@ -14,12 +14,14 @@ from typing import Dict, List
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.multi_task_rank import MultiTaskRank
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mmoe import MMoE as MMoEModule
+from tzrec.modules.sequence import SimpleAttention
 from tzrec.modules.task_tower import TaskTower
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
@@ -45,8 +47,18 @@ class TMMoE(MultiTaskRank):
         )
 
         mmoe_feature_in = self.embedding_group.group_total_dim("dnn")
+        self._use_skill = self.embedding_group.has_group("skill")
+        self._use_lastnapplyjob = self.embedding_group.has_group("lastnapplyjob")
         self._use_label = self.embedding_group.has_group("label")
         self._use_pair = self.embedding_group.has_group("pair")
+        if self._use_skill:
+            mmoe_feature_in += self.embedding_group.group_total_dim("skill.sequence")
+            self.skill_attn = SimpleAttention()
+        if self._use_lastnapplyjob:
+            mmoe_feature_in += self.embedding_group.group_total_dim(
+                "lastnapplyjob.sequence"
+            )
+
         self._pair_features_dims = []
         if self._use_pair:
             self._pair_features_dims = self.embedding_group.group_dims("pair")
@@ -89,7 +101,28 @@ class TMMoE(MultiTaskRank):
             predictions (dict): a dict of predicted result.
         """
         grouped_features = self.embedding_group(batch)
-        task_input_list = self.mmoe(grouped_features["dnn"])
+        mmoe_features = [grouped_features["dnn"]]
+        if self._use_skill:
+            mmoe_features.append(
+                self.skill_attn(
+                    grouped_features["skill.query"],
+                    grouped_features["skill.sequence"],
+                    grouped_features["skill.sequence_length"],
+                )
+            )
+        if self._use_lastnapplyjob:
+            sequence_length = grouped_features["lastnapplyjob.sequence_length"]
+            sequence_length = torch.max(
+                sequence_length, torch.ones_like(sequence_length)
+            )
+            mmoe_features.append(
+                F.normalize(
+                    torch.sum(grouped_features["lastnapplyjob.sequence"], dim=1)
+                    / sequence_length.unsqueeze(1)
+                )
+            )
+
+        task_input_list = self.mmoe(torch.cat(mmoe_features, dim=1))
         label_features = None
         sim_value = None
         if self._use_label:

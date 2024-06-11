@@ -14,7 +14,7 @@ import unittest
 
 import torch
 from parameterized import parameterized
-from torchrec import KeyedJaggedTensor, KeyedTensor
+from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
@@ -43,6 +43,37 @@ class TMMoETest(unittest.TestCase):
             feature_pb2.FeatureConfig(
                 raw_feature=feature_pb2.RawFeature(feature_name="int_a")
             ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="skill_emb", value_dim=3
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="skill_seq",
+                    sequence_length=50,
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            raw_feature=feature_pb2.RawFeature(
+                                feature_name="skill_emb", value_dim=3
+                            )
+                        )
+                    ],
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="lastn_seq",
+                    sequence_length=20,
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            raw_feature=feature_pb2.RawFeature(
+                                feature_name="skill_emb", value_dim=3
+                            )
+                        )
+                    ],
+                )
+            ),
         ]
         features = create_features(feature_cfgs)
         feature_groups = [
@@ -60,6 +91,16 @@ class TMMoETest(unittest.TestCase):
                 group_name="pair",
                 feature_names=["cat_a", "cat_b"],
                 group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="skill",
+                feature_names=["skill_emb", "skill_seq__skill_emb"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="lastnapplyjob",
+                feature_names=["lastn_seq__skill_emb"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
             ),
         ]
         model_config = model_pb2.ModelConfig(
@@ -102,12 +143,27 @@ class TMMoETest(unittest.TestCase):
             lengths=torch.tensor([1, 2, 1, 3]),
         )
         dense_feature = KeyedTensor.from_tensor_list(
-            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+            keys=["int_a", "skill_emb"],
+            tensors=[
+                torch.tensor([[0.2], [0.3]]),
+                torch.tensor([[0.2, 0.2, 0.2], [0.3, 0.3, 0.3]]),
+            ],
         )
+        sequence_dense_features = {
+            "skill_seq__skill_emb": JaggedTensor(
+                values=torch.tensor([[0.2, 0.2, 0.2]] * 5),
+                lengths=torch.tensor([1, 4]),
+            ),
+            "lastn_seq__skill_emb": JaggedTensor(
+                values=torch.tensor([[0.2, 0.2, 0.2]] * 5),
+                lengths=torch.tensor([1, 4]),
+            ),
+        }
 
         batch = Batch(
             dense_features={BASE_DATA_GROUP: dense_feature},
             sparse_features={BASE_DATA_GROUP: sparse_feature},
+            sequence_dense_features=sequence_dense_features,
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
