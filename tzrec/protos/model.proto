@@ -50,6 +50,8 @@ message ModelConfig {
         TDM tdm = 400;
 
         TMMoE tmmoe = 1201;
+        FusionDSSM fusion_dssm = 2201;
+        FusionDSSMV2 fusion_dssm_v2 = 2202;
     }
 
     optional uint32 num_class = 2 [default = 1];
