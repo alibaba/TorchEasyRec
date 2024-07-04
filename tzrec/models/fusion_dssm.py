@@ -84,7 +84,8 @@ class DSSMTower(MatchTower):
             )
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
-        self.output = nn.Linear(self.mlp.output_dim(), output_dim)
+        if output_dim > 0:
+            self.output = nn.Linear(self.mlp.output_dim(), output_dim)
 
         feature_names = list(feature_group.feature_names)
         self._perm_feats_index = []
@@ -122,8 +123,9 @@ class DSSMTower(MatchTower):
             )
         if self._use_senet:
             feature = self.senet(feature)
-        mlp_output = self.mlp(feature)
-        output = self.output(mlp_output)
+        output = self.mlp(feature)
+        if self._output_dim > 0:
+            output = self.output(output)
         if self._similarity == match_model_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
         return output

@@ -50,7 +50,7 @@ message FusionDSSM {
     repeated Tower user_tower = 1;
     required Tower item_tower = 2;
     // user and item tower output dimension
-    required int32 output_dim = 3;
+    optional int32 output_dim = 3;
     optional Similarity similarity = 4 [default=INNER_PRODUCT];
     optional float temperature = 5 [default=0.1];
     optional bool use_senet = 6 [default=false];
@@ -64,7 +64,7 @@ message FusionDSSMV2 {
     repeated Tower user_tower = 1;
     required Tower item_tower = 2;
     // user and item tower output dimension
-    required int32 output_dim = 3;
+    optional int32 output_dim = 3;
     optional Similarity similarity = 4 [default=INNER_PRODUCT];
     optional float temperature = 5 [default=0.1];
     optional bool use_senet = 6 [default=false];
