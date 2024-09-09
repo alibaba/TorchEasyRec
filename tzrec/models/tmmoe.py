@@ -52,8 +52,12 @@ class TMMoE(MultiTaskRank):
         self._use_label = self.embedding_group.has_group("label")
         self._use_pair = self.embedding_group.has_group("pair")
         if self._use_skill:
-            mmoe_feature_in += self.embedding_group.group_total_dim("skill.sequence")
-            self.skill_attn = SimpleAttention()
+            self.skill_attn = SimpleAttention(
+                sequence_dim=self.embedding_group.group_total_dim("skill.sequence"),
+                query_dim=self.embedding_group.group_total_dim("skill.query"),
+                input="skill",
+            )
+            mmoe_feature_in += self.skill_attn.output_dim()
         if self._use_lastnapplyjob:
             mmoe_feature_in += self.embedding_group.group_total_dim(
                 "lastnapplyjob.sequence"
@@ -103,13 +107,7 @@ class TMMoE(MultiTaskRank):
         grouped_features = self.embedding_group(batch)
         mmoe_features = [grouped_features["dnn"]]
         if self._use_skill:
-            mmoe_features.append(
-                self.skill_attn(
-                    grouped_features["skill.query"],
-                    grouped_features["skill.sequence"],
-                    grouped_features["skill.sequence_length"],
-                )
-            )
+            mmoe_features.append(self.skill_attn(grouped_features))
         if self._use_lastnapplyjob:
             sequence_length = grouped_features["lastnapplyjob.sequence_length"]
             sequence_length = torch.max(

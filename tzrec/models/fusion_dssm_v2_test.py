@@ -10,7 +10,6 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
-# Copyright (c) Alibaba, Inc. and its affiliates.
 import unittest
 
 import torch
