@@ -1,0 +1,29 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "tzrec/protos/train.proto";
+import "tzrec/protos/eval.proto";
+import "tzrec/protos/export.proto";
+import "tzrec/protos/data.proto";
+import "tzrec/protos/feature.proto";
+import "tzrec/protos/model.proto";
+
+message EasyRecConfig {
+    required string train_input_path = 1;
+
+    required string eval_input_path = 2;
+
+    required string model_dir = 3;
+
+    optional TrainConfig train_config = 4;
+
+    optional EvalConfig eval_config = 5;
+
+    optional ExportConfig export_config = 6;
+
+    optional DataConfig data_config = 7;
+
+    repeated FeatureConfig feature_configs = 8;
+
+    optional ModelConfig model_config = 9;
+}

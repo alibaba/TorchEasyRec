@@ -1,0 +1,9 @@
+syntax = "proto2";
+package tzrec.protos;
+
+message EvalConfig {
+    // number of steps to evaluate.
+    optional uint32 num_steps = 1;
+    // the frequency progress be logged during eval
+    optional uint32 log_step_count_steps = 2 [default = 10];
+}

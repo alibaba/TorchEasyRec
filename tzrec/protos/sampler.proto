@@ -1,0 +1,133 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Weighted Random Sampling ItemID not in Batch
+message NegativeSampler {
+    // sample data path
+    // schema => id:int64 | weight:float | attrs:string
+    required string input_path = 1;
+    // number of negative sample
+    required uint32 num_sample = 2;
+    // field names of attrs in train data or eval data
+    repeated string attr_fields = 3;
+    // field name of item_id in train data or eval data
+    required string item_id_field = 4;
+    // attribute delimiter of attrs string
+    optional string attr_delimiter = 5 [default=":"];
+    // number of negative samples for evaluator
+    optional uint32 num_eval_sample = 6 [default=0];
+    // field delimiter of input data
+    optional string field_delimiter = 7;
+}
+
+
+// Weighted Random Sampling ItemID not with Edge
+message NegativeSamplerV2 {
+    // user data path
+    // schema => userid:int64 | weight:float
+    required string user_input_path = 1;
+    // item data path
+    // schema => itemid:int64 | weight:float | attrs:string
+    required string item_input_path = 2;
+    // positive edge path
+    // schema => userid:int64 | itemid:int64 | weight:float
+    required string pos_edge_input_path = 3;
+    // number of negative sample
+    required uint32 num_sample = 4;
+    // field names of attrs in train data or eval data
+    repeated string attr_fields = 5;
+    // field name of item_id in train data or eval data
+    required string item_id_field = 6;
+    // field name of user_id in train data or eval data
+    required string user_id_field = 7;
+    // attribute delimiter of attrs string
+    optional string attr_delimiter = 8 [default=":"];
+    // number of negative samples for evaluator
+    optional uint32 num_eval_sample = 9 [default=0];
+    // field delimiter of input data
+    optional string field_delimiter = 10;
+}
+
+// Weighted Random Sampling ItemID not in Batch and Sampling Hard Edge
+message HardNegativeSampler {
+    // user data path
+    // schema => userid:int64 | weight:float
+    required string user_input_path = 1;
+    // item data path
+    // schema => itemid:int64 | weight:float | attrs:string
+    required string item_input_path = 2;
+    // hard negative edge path
+    // schema => userid:int64 | itemid:int64 | weight:float
+    required string hard_neg_edge_input_path = 3;
+    // number of negative sample
+    required uint32 num_sample = 4;
+    // max number of hard negative sample
+    required uint32 num_hard_sample = 5;
+    // field names of attrs in train data or eval data
+    repeated string attr_fields = 6;
+    // field name of item_id in train data or eval data
+    required string item_id_field = 7;
+    // field name of user_id in train data or eval data
+    required string user_id_field = 8;
+    // attribute delimiter of attrs string
+    optional string attr_delimiter = 9 [default=":"];
+    // number of negative samples for evaluator
+    optional uint32 num_eval_sample = 10 [default=0];
+    // only works on local
+    optional string field_delimiter = 11;
+}
+
+// Weighted Random Sampling ItemID not with Edge and Sampling Hard Edge
+message HardNegativeSamplerV2 {
+    // user data path
+    // schema => userid:int64 | weight:float
+    required string user_input_path = 1;
+    // item data path
+    // schema => itemid:int64 | weight:float | attrs:string
+    required string item_input_path = 2;
+    // positive edge path
+    // schema => userid:int64 | itemid:int64 | weight:float
+    required string pos_edge_input_path = 3;
+    // hard negative edge path
+    // schema => userid:int64 | itemid:int64 | weight:float
+    required string hard_neg_edge_input_path = 4;
+    // number of negative sample
+    required uint32 num_sample = 5;
+    // max number of hard negative sample
+    required uint32 num_hard_sample = 6;
+    // field names of attrs in train data or eval data
+    repeated string attr_fields = 7;
+    // field name of item_id in train data or eval data
+    required string item_id_field = 8;
+    // field name of user_id in train data or eval data
+    required string user_id_field = 9;
+    // attribute delimiter of attrs string
+    optional string attr_delimiter = 10 [default=":"];
+    // number of negative samples for evaluator
+    optional uint32 num_eval_sample = 11 [default=0];
+    // field delimiter of input data
+    optional string field_delimiter = 12;
+}
+
+message TDMSampler {
+    // schema => itemid:int64 | weight:float | attrs:string
+    required string item_input_path = 1;
+    // scheme => src_id:int64 | dst_id:int64 | weight:float
+    // edge for train.
+    required string edge_input_path = 2;
+    // scheme => src_id:int64 | dst_id:int64 | weight:float
+    // edge for retrieval beam search.
+    required string predict_edge_input_path = 3;
+    // field names of attrs in train data or eval data
+    repeated string attr_fields = 4;
+    // field name of item_id in train data or eval data
+    required string item_id_field = 5;
+    // the number of negative samples per layer
+    repeated uint32 layer_num_sample = 6;
+    // attribute delimiter of attrs string
+    optional string attr_delimiter = 7 [default=":"];
+    // number of negative samples for evaluator
+    optional uint32 num_eval_sample = 8 [default=0];
+    // field delimiter of input data
+    optional string field_delimiter = 9;
+}

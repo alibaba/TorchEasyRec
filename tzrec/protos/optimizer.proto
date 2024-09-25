@@ -1,0 +1,153 @@
+syntax = "proto2";
+package tzrec.protos;
+
+message SparseOptimizer {
+    oneof optimizer {
+        FusedSGDOptimizer sgd_optimizer = 1;
+        FusedAdagradOptimizer adagrad_optimizer = 2;
+        FusedAdamOptimizer adam_optimizer = 3;
+        FusedLarsSGDOptimizer lars_sgd_optimizer = 4;
+        FusedLAMBOptimizer lamb_optimizer = 5;
+        FusedPartialRowWiseLAMBOptimizer partial_rowwise_lamb_optimizer = 6;
+        FusedPartialRowWiseAdamOptimizer partial_rowwise_adam_optimizer = 7;
+        FusedRowWiseAdagradOptimizer rowwise_adagrad_optimizer = 8;
+    }
+    oneof learning_rate {
+        ConstantLR constant_learning_rate = 101;
+        ExponentialDecayLR exponential_decay_learning_rate = 102;
+        ManualStepLR manual_step_learning_rate = 103;
+    }
+}
+
+message DenseOptimizer {
+    oneof optimizer {
+        SGDOptimizer sgd_optimizer = 1;
+        AdagradOptimizer adagrad_optimizer = 2;
+        AdamOptimizer adam_optimizer = 3;
+    }
+    oneof learning_rate {
+        ConstantLR constant_learning_rate = 101;
+        ExponentialDecayLR exponential_decay_learning_rate = 102;
+        ManualStepLR manual_step_learning_rate = 103;
+    }
+}
+
+enum WeightDecayMode {
+    NONE = 0;
+    L2 = 1;
+    DECOUPLE = 2;
+}
+
+message FusedSGDOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional bool gradient_clipping = 2 [default = false];
+    optional float max_gradient = 3 [default = 1.0];
+}
+
+message FusedAdagradOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional bool gradient_clipping = 2 [default = false];
+    optional float max_gradient = 3 [default = 1.0];
+}
+
+message FusedAdamOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float beta1 = 2 [default = 0.9];
+    optional float beta2 = 3 [default = 0.999];
+    optional float weight_decay = 4 [default = 0.0];
+    optional bool gradient_clipping = 5 [default = false];
+    optional float max_gradient = 6 [default = 1.0];
+}
+
+message FusedLarsSGDOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float momentum = 2 [default = 0.9];
+    optional float weight_decay = 3 [default = 0.0];
+    optional bool gradient_clipping = 4 [default = false];
+    optional float max_gradient = 5 [default = 1.0];
+}
+
+message FusedLAMBOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float beta1 = 2 [default = 0.9];
+    optional float beta2 = 3 [default = 0.999];
+    optional float weight_decay = 4 [default = 0.0];
+    optional bool gradient_clipping = 5 [default = false];
+    optional float max_gradient = 6 [default = 1.0];
+}
+
+message FusedPartialRowWiseLAMBOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float beta1 = 2 [default = 0.9];
+    optional float beta2 = 3 [default = 0.999];
+    optional float weight_decay = 4 [default = 0.0];
+    optional bool gradient_clipping = 5 [default = false];
+    optional float max_gradient = 6 [default = 1.0];
+}
+
+message FusedPartialRowWiseAdamOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float beta1 = 2 [default = 0.9];
+    optional float beta2 = 3 [default = 0.999];
+    optional float weight_decay = 4 [default = 0.0];
+    optional bool gradient_clipping = 5 [default = false];
+    optional float max_gradient = 6 [default = 1.0];
+}
+
+message FusedRowWiseAdagradOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float weight_decay = 2 [default = 0.0];
+    optional WeightDecayMode weight_decay_mode = 3 [default = NONE];
+    optional bool gradient_clipping = 4 [default = false];
+    optional float max_gradient = 5 [default = 1.0];
+}
+
+message SGDOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float momentum = 2 [default = 0.9];
+    optional float weight_decay = 3 [default = 0.0];
+}
+
+message AdagradOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float weight_decay = 2 [default = 0.0];
+}
+
+message AdamOptimizer {
+    required float lr = 1 [default = 0.002];
+    optional float beta1 = 2 [default = 0.9];
+    optional float beta2 = 3 [default = 0.999];
+    optional float weight_decay = 4 [default = 0.0];
+}
+
+message ConstantLR {
+}
+
+message ExponentialDecayLR {
+    // decay steps or epochs
+    optional uint32 decay_size = 1;
+    // decay rate
+    optional float decay_factor = 2 [default = 0.95];
+    // if true, decay the learning rate at discrete intervals
+    optional bool staircase = 3 [default = true];
+    // warmup start learning rate
+    optional float warmup_learning_rate = 4 [default = 0.0];
+    // warmup steps or epochs
+    optional uint32 warmup_size = 5 [default = 0];
+    // minimum learning rate
+    optional float min_learning_rate = 6 [default = 0.0];
+    // schedule by epoch or by step.
+    optional bool by_epoch = 7 [default = false];
+}
+
+message ManualStepLR {
+    // a list of global steps or epochs at which to switch learning
+    repeated uint32 schedule_sizes = 1;
+    // a list of learning rates corresponding to intervals
+    repeated float learning_rates = 2;
+    // Whether to linearly interpolate learning rates for steps in
+    // [0, schedule_steps[0]].
+    optional bool warmup = 3 [default = false];
+    // schedule by epoch or by step.
+    optional bool by_epoch = 4 [default = false];
+}

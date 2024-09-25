@@ -1,0 +1,25 @@
+syntax = "proto2";
+package tzrec.protos;
+
+message LossConfig {
+    oneof loss {
+        BinaryCrossEntropy binary_cross_entropy = 1;
+        SoftmaxCrossEntropy softmax_cross_entropy = 2;
+        L2Loss l2_loss = 3;
+        JRCLoss jrc_loss = 4;
+    }
+}
+
+message BinaryCrossEntropy {
+}
+
+message SoftmaxCrossEntropy {
+}
+
+message L2Loss {
+}
+
+message JRCLoss {
+    required string session_name = 1;
+    optional float alpha = 2 [default = 0.5];
+}

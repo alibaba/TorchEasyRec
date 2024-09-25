@@ -1,0 +1,479 @@
+syntax = "proto2";
+package tzrec.protos;
+
+
+message IdFeature {
+    // feature name, e.g. item_id
+    required string feature_name = 1;
+    // feature input, e.g. item:item_id
+    required string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    required uint32 embedding_dim = 4;
+    // number of hash size
+    optional uint64 hash_bucket_size = 5;
+    // number of id enumerators
+    optional uint64 num_buckets = 6;
+    // id vocabulary list
+    repeated string vocab_list = 7;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 8;
+    // id value dimensions, default = 0, when use in seq, default = 1
+    // if value_dim = 0, it supports id with multi-value
+    optional uint32 value_dim = 9;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value, default value before bucktize
+    optional string default_value = 11 [default = ""];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // fg multi-value with whether has weight
+    optional bool weighted = 13 [default = false];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 14;
+    // mask value in training progress
+    optional bool use_mask =  15;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+
+    // TODO: constrains
+}
+
+message RawFeature {
+    // feature name, e.g. click_count
+    required string feature_name = 1;
+    // feature input, e.g. item:click_count
+    required string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    optional uint32 embedding_dim = 4;
+    // boundaries for bucktize numeric feature
+    repeated float boundaries = 5;
+    // raw feature of multiple dimensions
+    optional uint32 value_dim = 6 [default = 1];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 7;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 13;
+    // mask value in training progress
+    optional bool use_mask =  14;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+
+    // TODO: constrains
+}
+
+message ComboFeature {
+    // feature name, e.g. os_and_cate
+    required string feature_name = 1;
+    // feature input, e.g. [user:os, item:cate]
+    repeated string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    optional uint32 embedding_dim = 4;
+    // number of hash size
+    optional uint64 hash_bucket_size = 5;
+    // id vocabulary list
+    repeated string vocab_list = 7;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 8;
+    // id value dimensions, if value_dim = 0, it supports id with multi-value
+    optional uint32 value_dim = 9 [default = 0];
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = ""];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 13;
+    // mask value in training progress
+    optional bool use_mask =  14;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+
+    // TODO: constrains
+}
+
+message LookupFeature {
+    // feature name, e.g. kv_os_click_count
+    required string feature_name = 1;
+    // map input, e.g. item:kv_os_click_count
+    required string map = 2;
+    // key input, e.g. user:os
+    required string key = 3;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 4;
+    // embedding dimension
+    optional uint32 embedding_dim = 5;
+    // boundaries for bucktize numeric lookup value
+    repeated float boundaries = 6;
+    // number of hash size for sparse lookup value
+    optional uint64 hash_bucket_size = 7;
+    // number of id enumerators for sparse lookup value
+    optional uint64 num_buckets = 8;
+    // id vocabulary list for sparse lookup value
+    repeated string vocab_list = 9;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 10;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 11 [default = "sum"];
+    // lookup value combiner type, available is {sum | mean | min | max | count}
+    optional string combiner = 12 [default = "sum"];
+    // fg default value
+    optional string default_value = 13 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 14 [default = "\x1d"];
+    // lookup map value is sparse or numeric,
+    // when need_discrete is true, combiner will be empty string
+    optional bool need_discrete = 15 [default = false];
+    // lookup value need key as prefix or not.
+    optional bool need_key = 16 [default = false];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 17;
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 18;
+    // lookup value dimensions
+    optional uint32 value_dim = 19;
+    // numeric lookup value separator
+    optional string value_separator = 20 [default = ","];
+
+    // mask value in training progress
+    optional bool use_mask =  25;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+
+    // TODO: optional string kv_separator = 13 [default = ":"];
+    // TODO: constrains
+}
+
+message MatchFeature {
+    // feature name, e.g. match_cate_brand_click_count
+    required string feature_name = 1;
+    // nested map input, e.g. user:match_cate_brand_click_count
+    required string nested_map = 2;
+    // first layer (primary) key input, e.g. item:cate or ALL
+    required string pkey = 3;
+    // second layer (secondary) key input, e.g. item:brand or ALL
+    required string skey = 4;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 5;
+    // embedding dimension
+    optional uint32 embedding_dim = 6;
+    // boundaries for bucktize numeric match value
+    repeated float boundaries = 7;
+    // number of hash size for sparse match value
+    optional uint64 hash_bucket_size = 8;
+    // number of id enumerators for sparse match value
+    optional uint64 num_buckets = 9;
+    // id vocabulary list for sparse match value
+    repeated string vocab_list = 10;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 11;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 12 [default = "sum"];
+    // match value combiner type, available is {sum | mean | min | max | count}
+    // optional string combiner = 12 [default = "sum"];
+    // fg default value
+    optional string default_value = 13 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 14 [default = "\x1d"];
+    // match map value is sparse or numeric,
+    // when need_discrete is true, combiner will be empty string
+    optional bool need_discrete = 15 [default = false];
+    // match value need pkey value as prefix or not.
+    optional bool show_pkey = 16 [default = false];
+    // match value need skey  valueas prefix or not.
+    optional bool show_skey = 17 [default = false];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 18;
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 19;
+    // match value dimensions
+    optional uint32 value_dim = 20;
+    // mask value in training progress
+    optional bool use_mask =  25;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+}
+
+message ExprFeature {
+    // feature name, e.g. kv_os_click_count
+    required string feature_name = 1;
+    // expression, e.g. sigmoid(pv/(1+click))
+    required string expression = 2;
+    // variables in expression, e,g. ["item:pv", "item:click"]
+    repeated string variables = 3;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 4;
+    // embedding dimension
+    optional uint32 embedding_dim = 5;
+    // boundaries for bucktize numeric expr value
+    repeated float boundaries = 6;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = "0"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 12;
+    // mask value in training progress
+    optional bool use_mask =  13;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+}
+
+message OverlapFeature {
+    // feature name, e.g. overlap_ratio
+    required string feature_name = 1;
+    // query input name, e.g. user:query
+    required string query = 2;
+    // title input name, e,g. item:title
+    required string title = 3;
+    // overlap calculate method, available is {query_common_ratio | title_common_ratio | is_contain | is_equal}
+    required string method = 4;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 5;
+    // embedding dimension
+    optional uint32 embedding_dim = 6;
+    // boundaries for bucktize numeric expr value
+    repeated float boundaries = 7;
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 8;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    // optional string default_value = 11 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 13;
+    // mask value in training progress
+    optional bool use_mask =  14;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+}
+
+
+enum TextNormalizeOption {
+    // lower case to upper case
+    TEXT_LOWER2UPPER = 0;
+    // upper case to lower case
+    TEXT_UPPER2LOWER = 1;
+    // sbc case to dbc case
+    TEXT_SBC2DBC = 2;
+    // traditional chinese to simple chinese
+    TEXT_CHT2CHS = 3;
+    // filter speicial chars
+    TEXT_FILTER = 4;
+    // chinese split to chars with blanks
+    TEXT_SPLITCHRS = 5;
+    // remove space
+    TEXT_REMOVE_SPACE = 6;
+}
+
+message TextNormalizer {
+    // if text_length greater than max_length, will not do normalize
+    optional uint32 max_length = 1;
+    // stop char file path, default will use built-in stop char
+    optional string stop_char_file = 2;
+    // text normalize options, default is TEXT_LOWER2UPPER & TEXT_SBC2DBC & TEXT_CHT2CHS & TEXT_FILTER
+    repeated TextNormalizeOption norm_options = 3;
+}
+
+message TokenizeFeature {
+    // feature name, e.g. title_token
+    required string feature_name = 1;
+    // feature input, e.g. item:title
+    required string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    required uint32 embedding_dim = 4;
+    // text normalizer
+    optional TextNormalizer text_normalizer = 6;
+    // tokenizer vocabulary file path
+    required string vocab_file = 7;
+    // vocab file relative directory
+    optional string asset_dir = 8;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value, default value before bucktize
+    optional string default_value = 11 [default = ""];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 14;
+    // mask value in training progress
+    optional bool use_mask =  15;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+
+    // TODO: constrains
+}
+
+message SequenceIdFeature {
+    // feature name, e.g. item_cat_seq
+    required string feature_name = 1;
+    // feature input, e.g. item:item_cat_seq
+    required string expression = 2;
+    // max sequence length, only take effect in fg
+    required uint32 sequence_length = 3;
+    // sequence delimiter
+    required string sequence_delim = 4 [default = ";"];
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 5;
+    // embedding dimension
+    required uint32 embedding_dim = 6;
+    // number of hash size
+    optional uint64 hash_bucket_size = 7;
+    // number of id enumerators
+    optional uint64 num_buckets = 8;
+    // id vocabulary list
+    repeated string vocab_list = 9;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 10;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 11 [default = "sum"];
+    // fg default value, default value before bucktize
+    optional string default_value = 12 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 13 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 14;
+    // id value dimensions, now only support value_dim = 1
+    optional uint32 value_dim = 15 [default = 1];
+    // mask value in training progress
+    optional bool use_mask =  20;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // TODO: constrains
+}
+
+message SequenceRawFeature {
+    // feature name, e.g. click_count
+    required string feature_name = 1;
+    // feature input, e.g. item:click_count
+    required string expression = 2;
+    // max sequence length, only take effect in fg
+    required uint32 sequence_length = 3;
+    // sequence delimiter
+    required string sequence_delim = 4 [default = ";"];
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 5;
+    // embedding dimension
+    optional uint32 embedding_dim = 6;
+    // boundaries for bucktize numeric feature
+    repeated float boundaries = 7;
+    // raw feature of multiple dimensions
+    optional uint32 value_dim = 8 [default = 1];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 9;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 13;
+    // mask value in training progress
+    optional bool use_mask =  14;
+
+    // default value when fg_encoded = true,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // TODO: constrains
+}
+
+message SequenceFeature {
+    // sequence name
+    required string sequence_name = 1;
+    // max sequence length, only take effect in fg
+    required uint32 sequence_length = 2;
+    // sequence delimiter
+    required string sequence_delim = 3 [default = ";"];
+    // sequence primary key name for serving,
+    // default will be user:{sequence_name}
+    optional string sequence_pk = 4;
+    // sub feature config
+    repeated SeqFeatureConfig features = 5;
+}
+
+message FeatureConfig {
+    oneof feature {
+        IdFeature id_feature = 1;
+        RawFeature raw_feature = 2;
+        ComboFeature combo_feature = 3;
+        LookupFeature lookup_feature = 4;
+        MatchFeature match_feature = 5;
+        SequenceFeature sequence_feature = 6;
+        ExprFeature expr_feature = 7;
+        OverlapFeature overlap_feature = 8;
+        TokenizeFeature tokenize_feature = 9;
+        SequenceIdFeature sequence_id_feature = 10;
+        SequenceRawFeature sequence_raw_feature = 11;
+    }
+}
+
+
+message SeqFeatureConfig {
+    oneof feature {
+        IdFeature id_feature = 1;
+        RawFeature raw_feature = 2;
+    }
+}

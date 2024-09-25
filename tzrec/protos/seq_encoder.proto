@@ -1,0 +1,27 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "tzrec/protos/module.proto";
+
+message DINEncoder {
+    // seq encoder name
+    optional string name = 1;
+    // sequence feature name
+    required string input = 2;
+    // mlp config for target attention score
+    required MLP attn_mlp = 3;
+}
+
+message SimpleAttention {
+    // seq encoder name
+    optional string name = 1;
+    // sequence feature name
+    required string input = 2;
+}
+
+message SeqEncoderConfig {
+    oneof seq_module {
+        DINEncoder din_encoder=1;
+        SimpleAttention simple_attention=2;
+    }
+}

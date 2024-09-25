@@ -1,0 +1,114 @@
+{
+  "tzrec/benchmark/configs/taobao_ccp/dbmtl.config": {
+    "label": {
+      "auc_ctr": 0.614,
+      "auc_cvr": 0.645
+    },
+    "threshold": 0.005,
+    "run_cnt": 3
+  },
+  "tzrec/benchmark/configs/taobao_ccp/mmoe.config": {
+    "label": {
+      "auc_ctr": 0.614,
+      "auc_cvr": 0.642
+    },
+    "threshold": 0.005,
+    "run_cnt": 3
+  },
+  "tzrec/benchmark/configs/taobao_ccp/ple.config": {
+    "label": {
+      "auc_ctr": 0.618,
+      "auc_cvr": 0.647
+    },
+    "threshold": 0.005,
+    "run_cnt": 3
+  },
+  "tzrec/benchmark/configs/taobao/dbmtl.config": {
+    "label": {
+      "auc_ctr": 0.634,
+      "auc_cvr": 0.705,
+      "grouped_auc_ctr": 0.568,
+      "grouped_auc_cvr": 0.630
+    },
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.005,
+      "grouped_auc_ctr": 0.002,
+      "grouped_auc_cvr": 0.005
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/dbmtl_has_sequence.config": {
+    "label": {
+      "auc_ctr": 0.635,
+      "auc_cvr": 0.709
+    },
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.005
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/dbmtl_jrc.config": {
+    "label": {
+      "grouped_auc_ctr": 0.567,
+      "grouped_auc_cvr": 0.719
+    },
+    "threshold": {
+      "grouped_auc_ctr": 0.002,
+      "grouped_auc_cvr": 0.005
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/mmoe.config": {
+    "label": {
+      "auc_ctr": 0.634,
+      "auc_cvr": 0.705
+    },
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.020
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/mmoe_has_sequence.config": {
+    "label": {
+      "auc_ctr": 0.636,
+      "auc_cvr": 0.705
+    },
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.020
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/ple.config": {
+    "label": {
+      "auc_ctr": 0.634,
+      "auc_cvr": 0.740
+    },
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.040
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/ple_has_sequence.config": {
+    "label": {
+      "auc_ctr": 0.636,
+      "auc_cvr": 0.740
+    },
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.040
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/criteo/deepfm.config": {
+    "label": {
+      "auc": 0.784
+    },
+    "threshold": 0.005,
+    "run_cnt": 1
+  }
+}

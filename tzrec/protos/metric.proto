@@ -1,0 +1,43 @@
+syntax = "proto2";
+package tzrec.protos;
+
+message AUC {
+    optional uint32 thresholds = 1 [default = 200];
+}
+
+message MulticlassAUC {
+    optional uint32 thresholds = 1 [default = 200];
+    // macro: calculate score for each class and average them
+    // weighted: calculates score for each class and computes weighted average using their support
+    optional string average = 2 [default = 'macro'];
+}
+
+message RecallAtK {
+    optional uint32 top_k = 1 [default = 5];
+}
+
+message MeanAbsoluteError {
+}
+
+message MeanSquaredError {
+}
+
+message Accuracy {
+}
+
+message GroupedAUC {
+    required string grouping_key = 1;
+}
+
+
+message MetricConfig {
+    oneof metric {
+        AUC auc = 1;
+        MulticlassAUC multiclass_auc = 2;
+        RecallAtK recall_at_k = 3;
+        MeanAbsoluteError mean_absolute_error = 4;
+        MeanSquaredError mean_squared_error = 5;
+        Accuracy accuracy = 6;
+        GroupedAUC grouped_auc = 7;
+    }
+}

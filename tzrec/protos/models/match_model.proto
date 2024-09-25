@@ -1,0 +1,22 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "tzrec/protos/tower.proto";
+
+enum Similarity {
+  COSINE = 0;
+  INNER_PRODUCT = 1;
+}
+
+message DSSM {
+    required Tower user_tower = 1;
+    required Tower item_tower = 2;
+    // user and item tower output dimension
+    required int32 output_dim = 3;
+    // similarity method
+    optional Similarity similarity = 4 [default=INNER_PRODUCT];
+    // similarity scaling factor
+    optional float temperature = 5 [default = 1.0];
+    // use in batch items as negative items.
+    optional bool in_batch_negative = 6 [default = false];
+}

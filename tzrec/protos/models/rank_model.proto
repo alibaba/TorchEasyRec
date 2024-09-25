@@ -1,0 +1,27 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "tzrec/protos/module.proto";
+import "tzrec/protos/tower.proto";
+
+message DeepFM {
+    required MLP deep = 1;
+    optional MLP final = 2;
+    optional uint32 wide_embedding_dim = 3 [default = 4];
+}
+
+message MultiTower {
+    repeated Tower towers = 1;
+    required MLP final = 2;
+}
+
+message MultiTowerDIN {
+    repeated Tower towers = 1;
+    repeated DINTower din_towers = 2;
+    required MLP final = 3;
+}
+
+message TDM {
+    required MultiWindowDIN multiwindow_din =1;
+    required MLP final = 2;
+}

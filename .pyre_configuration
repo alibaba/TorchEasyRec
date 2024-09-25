@@ -1,0 +1,17 @@
+{
+  "ignore_all_errors": [
+    "tzrec/protos/*_pb2.pyi",
+    "tzrec/*/*_test.py",
+    "tzrec/tests/*.py",
+    "tzrec/utils/load_class.py"
+  ],
+  "site_package_search_strategy": "all",
+  "source_directories": [
+    {
+      "import_root": ".",
+      "source": "tzrec"
+    }
+  ],
+  "strict": true,
+  "version": "0.9.21"
+}

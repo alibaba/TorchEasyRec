@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Pre commit
+.pyre/
+.ruff_cache/
+
+# Ide
+.idea/
+
+# Proto
+protoc*
+*_pb2.py
+*_pb2.pyi
+
+# Generated Docs
+docs/source/intro.md
+docs/source/proto.html

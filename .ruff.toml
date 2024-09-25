@@ -1,0 +1,8 @@
+lint.select = ["B", "D", "E", "F", "W", "B9", "I"]
+lint.ignore = ["D100", "D104", "D105", "D107"]
+
+[lint.per-file-ignores]
+"*_test.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+
+[lint.pydocstyle]
+convention = "google"

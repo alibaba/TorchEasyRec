@@ -1,0 +1,26 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "tzrec/protos/optimizer.proto";
+
+message TrainConfig {
+    // embedding part optimizer
+    required SparseOptimizer sparse_optimizer = 1;
+    // dense part optimizer
+    required DenseOptimizer dense_optimizer = 2;
+    // number of steps to train models
+    optional uint32 num_steps = 3;
+    // number of epochs to train models
+    optional uint32 num_epochs = 4;
+    // step interval for saving checkpoint
+    optional uint32 save_checkpoints_steps = 5 [default = 1000];
+    // checkpoint to restore parameters from
+    optional string fine_tune_checkpoint = 6;
+    // checkpoint to restore parameters mapping, each line is {param name in current model}\\t{param name in old ckpt}
+    optional string fine_tune_ckpt_param_map = 7;
+    // the frequency the loss and lr will be logged during training
+    optional uint32 log_step_count_steps = 8 [default = 100];
+    // profiling or not
+    optional bool is_profiling = 9 [default = false];
+    // TBD: qcomm config
+}
