@@ -1,0 +1,23 @@
+name: PyTyping CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+jobs:
+  ci-test:
+    runs-on: tzrec-codestyle-runner
+    container:
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.5
+    steps:
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: RunPyTypingCI
+        id: run_pytyping_ci
+        run: |
+          pip install -r requirements.txt
+          bash scripts/gen_proto.sh
+          python scripts/pyre_check.py

@@ -1,0 +1,21 @@
+name: Unit Test CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+jobs:
+  ci-test:
+    runs-on: tzrec-runner
+    container:
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.5
+      options: --gpus all --ipc host
+    steps:
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: RunUnitTestCI
+        id: run_unittest_ci
+        run: bash scripts/ci_test.sh
