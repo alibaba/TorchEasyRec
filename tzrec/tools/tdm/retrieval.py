@@ -198,7 +198,7 @@ def tdm_retrieval(
     sampler_config = pipeline_config.data_config.tdm_sampler
     item_id_field = sampler_config.item_id_field
     max_level = len(sampler_config.layer_num_sample)
-    first_recall_layer = int(math.log(2 * recall_num, n_cluster)) + 1
+    first_recall_layer = int(math.ceil(math.log(2 * recall_num, n_cluster)))
 
     dataset = infer_dataloader.dataset
     # pyre-ignore [16]
