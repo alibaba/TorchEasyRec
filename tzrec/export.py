@@ -46,4 +46,5 @@ if __name__ == "__main__":
         args.pipeline_config_path,
         export_dir=args.export_dir,
         checkpoint_path=args.checkpoint_path,
+        asset_files=args.asset_files,
     )
