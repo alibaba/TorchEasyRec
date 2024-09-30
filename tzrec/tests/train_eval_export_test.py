@@ -558,7 +558,6 @@ class TrainEvalExportTest(unittest.TestCase):
                 item_id="item_id",
                 embedding_field="item_emb",
             )
-        self.success = True
         if self.success:
             with open(os.path.join(self.test_dir, "init_tree/node_table.txt")) as f:
                 for line_number, line in enumerate(f):
