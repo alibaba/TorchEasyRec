@@ -52,7 +52,6 @@ python -m tzrec.tools.tdm.init_tree \
 - --raw_attr_fields: (可选) item的数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
 - --tree_output_file: (可选)初始树的保存路径, 不输入不会保存
 - --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持ODPS和本地txt两种
-- --recall_num: (可选,默认为200)召回数量, 会根据召回数量自动跳过前几层树, 增加召回的效率
 - --n_cluster: (可选,默认为2)树的分叉数
 
 #### 训练
@@ -80,11 +79,13 @@ torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.export \
     --pipeline_config_path experiments/tdm_taobao_local/pipeline.config \
     --export_dir experiments/tdm_taobao_local/export
+    --asset_files data/init_tree/serving_tree
 ```
 
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认评估model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录
+- --asset_files: 需额拷贝到模型目录的文件。tdm需拷贝serving_tree树文件用于线上服务
 
 #### 导出item embedding
 
@@ -124,7 +125,6 @@ OMP_NUM_THREADS=4 python tzrec/tools/tdm/cluster_tree.py \
 - --raw_attr_fields: (可选) item的数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
 - --tree_output_file: (可选)树的保存路径, 不输入不会保存
 - --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持ODPS和本地txt两种
-- --recall_num: (可选,默认为200)召回数量, 会根据召回数量自动跳过前几层树, 增加召回的效率
 - --n_cluster: (可选,默认为2)树的分叉数
 - --parllel: (可选，默认为16)聚类时CPU并行数
 
@@ -153,11 +153,13 @@ torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.export \
     --pipeline_config_path experiments/tdm_taobao_local_learnt/pipeline.config \
     --export_dir experiments/tdm_taobao_local_learnt/export
+    --asset_files data/learnt_tree/serving_tree
 ```
 
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认评估model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录
+- --asset_files: 需额拷贝到模型目录的文件。tdm需拷贝serving_tree树文件用于线上服务
 
 #### Recall评估
 
@@ -181,7 +183,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --predict_input_path: 预测输入数据的路径
 - --predict_output_path: 预测输出数据的路径
 - --gt_item_id_field: 文件中代表真实点击item_id的列名
-- --recall_num:(可选, 默认为200) 召回的数量, 应与建树时输入保持一致
+- --recall_num:(可选, 默认为200) 召回的数量
 - --n_cluster:(可选, 默认为2) 数的分叉数量, 应与建树时输入保持一致
 - --reserved_columns: 预测结果中要保留的输入列
 

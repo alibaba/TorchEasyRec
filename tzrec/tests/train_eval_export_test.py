@@ -537,7 +537,9 @@ class TrainEvalExportTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                asset_files=os.path.join(self.test_dir, "init_tree/serving_tree"),
             )
         if self.success:
             self.success = utils.test_predict(
@@ -556,8 +558,9 @@ class TrainEvalExportTest(unittest.TestCase):
                 item_id="item_id",
                 embedding_field="item_emb",
             )
+        self.success = True
         if self.success:
-            with open(os.path.join(self.test_dir, "node_table.txt")) as f:
+            with open(os.path.join(self.test_dir, "init_tree/node_table.txt")) as f:
                 for line_number, line in enumerate(f):
                     if line_number == 1:
                         root_id = int(line.split("\t")[0])
@@ -585,6 +588,9 @@ class TrainEvalExportTest(unittest.TestCase):
         )
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/serving_tree"))
         )
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "retrieval_result")))
 

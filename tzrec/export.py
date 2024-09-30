@@ -34,6 +34,12 @@ if __name__ == "__main__":
         default=None,
         help="directory where model should be exported to.",
     )
+    parser.add_argument(
+        "--asset_files",
+        type=str,
+        default=None,
+        help="more files will be copy to export_dir.",
+    )
     args, extra_args = parser.parse_known_args()
 
     export(

@@ -167,25 +167,19 @@ class TreeSearch(object):
                     for i in range(self.max_level):
                         f.write(f"{travel[0]}\t{travel[i+1]}\t{1.0}\n")
 
-    def save_predict_edge(self, first_recall_layer: int) -> None:
+    def save_predict_edge(self) -> None:
         """Save edge info for prediction."""
         if self.output_file.startswith("odps://"):
             writer = create_writer(self.output_file + "predict_edge_table")
             src_ids = []
             dst_ids = []
             weight = []
-            for i in range(first_recall_layer - 1, self.max_level):
-                if i == first_recall_layer - 1:
-                    for node in self.level_code[i + 1]:
-                        src_ids.append(self.root.item_id)
-                        dst_ids.append(node.item_id)
+            for i in range(self.max_level):
+                for node in self.level_code[i]:
+                    for child in node.children:
+                        src_ids.append(node.item_id)
+                        dst_ids.append(child.item_id)
                         weight.append(1.0)
-                else:
-                    for node in self.level_code[i]:
-                        for child in node.children:
-                            src_ids.append(node.item_id)
-                            dst_ids.append(child.item_id)
-                            weight.append(1.0)
             edge_table_dict = OrderedDict()
             edge_table_dict["src_id"] = pa.array(src_ids)
             edge_table_dict["dst_id"] = pa.array(dst_ids)
@@ -196,11 +190,15 @@ class TreeSearch(object):
                 os.path.join(self.output_file, "predict_edge_table.txt"), "w"
             ) as f:
                 f.write("src_id:int64\tdst_id:int64\tweight:float\n")
-                for i in range(first_recall_layer - 1, self.max_level):
-                    if i == first_recall_layer - 1:
-                        for node in self.level_code[i + 1]:
-                            f.write(f"{self.root.item_id}\t{node.item_id}\t{1.0}\n")
-                    else:
-                        for node in self.level_code[i]:
-                            for child in node.children:
-                                f.write(f"{node.item_id}\t{child.item_id}\t{1.0}\n")
+                for i in range(self.max_level):
+                    for node in self.level_code[i]:
+                        for child in node.children:
+                            f.write(f"{node.item_id}\t{child.item_id}\t{1.0}\n")
+
+    def save_serving_tree(self) -> None:
+        """Save tree info for serving."""
+        with open(os.path.join(self.output_file, "serving_tree"), "w") as f:
+            f.write(f"{self.max_level + 1} {self.child_num}\n")
+            for _, nodes in enumerate(self.level_code):
+                for node in nodes:
+                    f.write(f"{node.tree_code} {node.item_id}\n")

@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import argparse
-import math
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import TreeSearch
@@ -67,12 +66,6 @@ if __name__ == "__main__":
         help="The number of CPU cores for parallel processing.",
     )
     parser.add_argument(
-        "--recall_num",
-        type=int,
-        default=200,
-        help="Recall number per item when retrieval.",
-    )
-    parser.add_argument(
         "--n_cluster",
         type=int,
         default=2,
@@ -102,6 +95,6 @@ if __name__ == "__main__":
         child_num=args.n_cluster,
     )
     tree_search.save()
-    first_recall_layer = int(math.ceil(math.log(2 * args.recall_num, args.n_cluster)))
-    tree_search.save_predict_edge(first_recall_layer)
+    tree_search.save_predict_edge()
+    tree_search.save_serving_tree()
     logger.info("Save nodes and edges table done.")

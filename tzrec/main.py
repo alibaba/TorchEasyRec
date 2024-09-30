@@ -13,6 +13,7 @@ import copy
 import itertools
 import json
 import os
+import shutil
 from collections import OrderedDict
 from queue import Queue
 from threading import Thread
@@ -747,7 +748,10 @@ def _script_model(
 
 
 def export(
-    pipeline_config_path: str, export_dir: str, checkpoint_path: Optional[str] = None
+    pipeline_config_path: str,
+    export_dir: str,
+    checkpoint_path: Optional[str] = None,
+    asset_files: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -756,6 +760,7 @@ def export(
         export_dir (str): base directory where the model should be exported.
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path.
+        asset_files (str, optional): more files will be copy to export_dir.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
@@ -765,6 +770,10 @@ def export(
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
+
+    assets = []
+    if asset_files:
+        assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -832,13 +841,16 @@ def export(
         for name, module in cpu_model.named_children():
             if isinstance(module, MatchTower):
                 tower = ScriptWrapper(TowerWrapper(module, name))
+                tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 _script_model(
                     ori_pipeline_config,
                     tower,
                     cpu_state_dict,
                     dataloader,
-                    os.path.join(export_dir, name.replace("_tower", "")),
+                    tower_export_dir,
                 )
+                for asset in assets:
+                    shutil.copy(asset, tower_export_dir)
     elif isinstance(cpu_model, TDM):
         for name, module in cpu_model.named_children():
             if isinstance(module, EmbeddingGroup):
@@ -857,7 +869,8 @@ def export(
             dataloader,
             export_dir,
         )
-
+        for asset in assets:
+            shutil.copy(asset, export_dir)
     else:
         _script_model(
             ori_pipeline_config,
@@ -866,6 +879,8 @@ def export(
             dataloader,
             export_dir,
         )
+        for asset in assets:
+            shutil.copy(asset, export_dir)
 
 
 def predict(

@@ -791,16 +791,19 @@ def load_config_for_test(
                 f"--cate_id_field {cate_id} "
                 f"--attr_fields {','.join(attr_fields)} "
                 f"--raw_attr_fields {','.join(raw_attr_fields)} "
-                f"--node_edge_output_file {test_dir} "
-                f"--recall_num 1"
+                f"--node_edge_output_file {test_dir}/init_tree "
             )
             p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_init_tree.txt"))
             p.wait(600)
 
-            sampler_config.item_input_path = os.path.join(test_dir, "node_table.txt")
-            sampler_config.edge_input_path = os.path.join(test_dir, "edge_table.txt")
+            sampler_config.item_input_path = os.path.join(
+                test_dir, "init_tree/node_table.txt"
+            )
+            sampler_config.edge_input_path = os.path.join(
+                test_dir, "init_tree/edge_table.txt"
+            )
             sampler_config.predict_edge_input_path = os.path.join(
-                test_dir, "predict_edge_table.txt"
+                test_dir, "init_tree/predict_edge_table.txt"
             )
 
         else:
@@ -874,7 +877,9 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
     return True
 
 
-def test_export(pipeline_config_path: str, test_dir: str) -> bool:
+def test_export(
+    pipeline_config_path: str, test_dir: str, asset_files: str = ""
+) -> bool:
     """Run export integration test."""
     port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_export")
@@ -884,8 +889,10 @@ def test_export(pipeline_config_path: str, test_dir: str) -> bool:
         f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
-        f"--export_dir {test_dir}/export"
+        f"--export_dir {test_dir}/export "
     )
+    if asset_files:
+        cmd_str += f"--asset_files {asset_files}"
 
     p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_export.txt"))
     p.wait(600)
@@ -1206,7 +1213,6 @@ def test_tdm_cluster_train_eval(
         f"--raw_attr_fields {','.join(raw_attr_fields)} "
         f"--node_edge_output_file {os.path.join(test_dir, 'learnt_tree')} "
         f"--parallel 1 "
-        f"--recall_num 1 "
     )
     p = misc_util.run_cmd(
         cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt")
