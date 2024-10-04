@@ -195,9 +195,11 @@ class TreeSearch(object):
                         for child in node.children:
                             f.write(f"{node.item_id}\t{child.item_id}\t{1.0}\n")
 
-    def save_serving_tree(self) -> None:
+    def save_serving_tree(self, tree_output_dir: str) -> None:
         """Save tree info for serving."""
-        with open(os.path.join(self.output_file, "serving_tree"), "w") as f:
+        if not os.path.exists(tree_output_dir):
+            os.makedirs(tree_output_dir)
+        with open(os.path.join(tree_output_dir, "serving_tree"), "w") as f:
             f.write(f"{self.max_level + 1} {self.child_num}\n")
             for _, nodes in enumerate(self.level_code):
                 for node in nodes:

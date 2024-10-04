@@ -37,7 +37,7 @@ class TreeGenerator:
         cate_id_field: str,
         attr_fields: Optional[str] = None,
         raw_attr_fields: Optional[str] = None,
-        tree_output_file: Optional[str] = None,
+        tree_output_dir: Optional[str] = None,
         n_cluster: int = 2,
     ) -> None:
         self.item_input_path = item_input_path
@@ -49,7 +49,7 @@ class TreeGenerator:
             self.attr_fields = [x.strip() for x in attr_fields.split(",")]
         if raw_attr_fields:
             self.raw_attr_fields = [x.strip() for x in raw_attr_fields.split(",")]
-        self.tree_output_file = tree_output_file
+        self.tree_output_dir = tree_output_dir
         self.n_cluster = n_cluster
 
     def generate(self, save_tree: bool = False) -> TDMTreeClass:
@@ -141,6 +141,6 @@ class TreeGenerator:
         )
         data = np.array([[] for i in range(len(ids))])
 
-        builder = TreeBuilder(self.tree_output_file, self.n_cluster)
+        builder = TreeBuilder(self.tree_output_dir, self.n_cluster)
         root = builder.build(ids, codes, attrs, raw_attrs, data, save_tree)
         return root

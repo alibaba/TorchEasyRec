@@ -52,7 +52,7 @@ class TreeSearchtest(unittest.TestCase):
         search = TreeSearch(output_file=self.test_dir, root=root, child_num=2)
         search.save()
         search.save_predict_edge()
-        search.save_serving_tree()
+        search.save_serving_tree(self.test_dir)
 
         node_table = []
         edge_table = []

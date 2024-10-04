@@ -792,6 +792,7 @@ def load_config_for_test(
                 f"--attr_fields {','.join(attr_fields)} "
                 f"--raw_attr_fields {','.join(raw_attr_fields)} "
                 f"--node_edge_output_file {test_dir}/init_tree "
+                f"--tree_output_dir {test_dir}/init_tree "
             )
             p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_init_tree.txt"))
             p.wait(600)
@@ -1212,6 +1213,7 @@ def test_tdm_cluster_train_eval(
         f"--attr_fields {','.join(attr_fields)} "
         f"--raw_attr_fields {','.join(raw_attr_fields)} "
         f"--node_edge_output_file {os.path.join(test_dir, 'learnt_tree')} "
+        f"--tree_output_dir {os.path.join(test_dir, 'learnt_tree')} "
         f"--parallel 1 "
     )
     p = misc_util.run_cmd(

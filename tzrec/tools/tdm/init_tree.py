@@ -48,10 +48,10 @@ if __name__ == "__main__":
         help="The column names representing the raw features of item in the file.",
     )
     parser.add_argument(
-        "--tree_output_file",
+        "--tree_output_dir",
         type=str,
         default=None,
-        help="The tree output file.",
+        help="The tree output directory.",
     )
     parser.add_argument(
         "--node_edge_output_file",
@@ -73,14 +73,10 @@ if __name__ == "__main__":
         cate_id_field=args.cate_id_field,
         attr_fields=args.attr_fields,
         raw_attr_fields=args.raw_attr_fields,
-        tree_output_file=args.tree_output_file,
+        tree_output_dir=args.tree_output_dir,
         n_cluster=args.n_cluster,
     )
-    if args.tree_output_file:
-        save_tree = True
-    else:
-        save_tree = False
-    root = generator.generate(save_tree)
+    root = generator.generate()
     logger.info("Tree init done. Start save nodes and edges table.")
     tree_search = TreeSearch(
         output_file=args.node_edge_output_file,
@@ -89,5 +85,6 @@ if __name__ == "__main__":
     )
     tree_search.save()
     tree_search.save_predict_edge()
-    tree_search.save_serving_tree()
+    if args.tree_output_dir:
+        tree_search.save_serving_tree(args.tree_output_dir)
     logger.info("Save nodes and edges table done.")
