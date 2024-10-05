@@ -39,7 +39,7 @@ class TreeClusterTest(unittest.TestCase):
             embedding_field="item_emb",
             attr_fields="cate_id,str_a",
             raw_attr_fields="raw_1",
-            output_file=None,
+            output_dir=None,
             parallel=1,
             n_cluster=2,
         )

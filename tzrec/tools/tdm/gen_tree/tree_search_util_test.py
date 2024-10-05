@@ -36,13 +36,13 @@ class TreeSearchtest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir)
 
-    def test_cluster(self) -> None:
+    def test_tree_search(self) -> None:
         cluster = TreeCluster(
             item_input_path=self.tmp_file.name,
             item_id_field="item_id",
             attr_fields="int_a,str_c",
             raw_attr_fields="float_b",
-            output_file=None,
+            output_dir=None,
             embedding_field="item_emb",
             parallel=1,
             n_cluster=2,
