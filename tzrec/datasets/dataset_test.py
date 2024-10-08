@@ -499,7 +499,7 @@ class DatasetTest(unittest.TestCase):
                 fg_encoded=True,
                 label_fields=["label"],
                 negative_sampler=sampler_pb2.TDMSampler(
-                    input_input_path=node.name,
+                    item_input_path=node.name,
                     edge_input_path=edge.name,
                     predict_edge_input_path=predict_edge.name,
                     attr_fields=["tree_level", "int_a", "float_b", "str_c"],

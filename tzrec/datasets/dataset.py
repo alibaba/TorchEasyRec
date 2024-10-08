@@ -128,7 +128,7 @@ def _expand_tdm_sample(
         )
         remain_layer.sort()
     else:
-        remain_layer = list(range(tree_level - 1))
+        remain_layer = np.array(range(tree_level - 1))
 
     num_remain_layer_neg = (
         sum([layer_num_sample[i] for i in remain_layer]) + layer_num_sample[-1]
