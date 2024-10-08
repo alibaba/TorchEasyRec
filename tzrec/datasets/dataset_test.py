@@ -515,6 +515,7 @@ class DatasetTest(unittest.TestCase):
             input_path="",
             input_fields=input_fields,
         )
+        
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
             dataset=dataset,
