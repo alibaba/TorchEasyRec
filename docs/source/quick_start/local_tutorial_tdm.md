@@ -43,6 +43,7 @@ python -m tzrec.tools.tdm.init_tree \
 --cate_id_field cate_id \
 --attr_fields cate_id,campaign_id,customer,brand,price \
 --node_edge_output_file data/init_tree
+--tree_output_dir data/init_tree
 ```
 
 - --item_input_path: 建树用的item特征文件
@@ -50,9 +51,10 @@ python -m tzrec.tools.tdm.init_tree \
 - --cate_id_field: 代表item的类别的列名
 - --attr_fields: (可选) 除了item_id外的item非数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
 - --raw_attr_fields: (可选) item的数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
-- --tree_output_file: (可选)初始树的保存路径, 不输入不会保存
-- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持ODPS和本地txt两种
-- --recall_num: (可选,默认为200)召回数量, 会根据召回数量自动跳过前几层树, 增加召回的效率
+- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持`ODPS表`和`本地txt`两种
+  - ODPS表：设置形如`odps://{project}/tables/{tb_prefix}`，将会产出用于TDM训练负采样的GL Node表`odps://{project}/tables/{tb_prefix}_node_table`、GL Edge表`odps://{project}/tables/{tb_prefix}_edge_table`、用于离线检索的GL Edge表`odps://{project}/tables/{tb_prefix}_predict_edge_table`
+  - 本地txt：设置的为目录， 将在目录下产出用于TDM训练负采样的GL Node表`node_table.txt`,GL Edge表`edge_table.txt`、用于离线检索的GL Edge表`predict_edge_table.txt`
+- --tree_output_dir: (可选) 树的保存目录, 将会在目录下存储`serving_tree`文件用于线上服务
 - --n_cluster: (可选,默认为2)树的分叉数
 
 #### 训练
@@ -80,11 +82,13 @@ torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.export \
     --pipeline_config_path experiments/tdm_taobao_local/pipeline.config \
     --export_dir experiments/tdm_taobao_local/export
+    --asset_files data/init_tree/serving_tree
 ```
 
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认评估model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录
+- --asset_files: 需额拷贝到模型目录的文件。tdm需拷贝serving_tree树文件用于线上服务
 
 #### 导出item embedding
 
@@ -114,6 +118,7 @@ OMP_NUM_THREADS=4 python tzrec/tools/tdm/cluster_tree.py \
     --embedding_field item_emb \
     --attr_fields cate_id,campaign_id,customer,brand,price \
     --node_edge_output_file data/learnt_tree \
+    --tree_output_dir data/learnt_tree \
     --parallel 16
 ```
 
@@ -122,9 +127,8 @@ OMP_NUM_THREADS=4 python tzrec/tools/tdm/cluster_tree.py \
 - --embedding_field: 代表item embedding的列名
 - --attr_fields: (可选) 除了item_id外的item非数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
 - --raw_attr_fields: (可选) item的数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
-- --tree_output_file: (可选)树的保存路径, 不输入不会保存
-- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持ODPS和本地txt两种
-- --recall_num: (可选,默认为200)召回数量, 会根据召回数量自动跳过前几层树, 增加召回的效率
+- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持`ODPS表`和`本地txt`两种，同初始树
+- --tree_output_dir: (可选) 树的保存目录, 将会在目录下存储`serving_tree`文件用于线上服务
 - --n_cluster: (可选,默认为2)树的分叉数
 - --parllel: (可选，默认为16)聚类时CPU并行数
 
@@ -153,11 +157,13 @@ torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.export \
     --pipeline_config_path experiments/tdm_taobao_local_learnt/pipeline.config \
     --export_dir experiments/tdm_taobao_local_learnt/export
+    --asset_files data/learnt_tree/serving_tree
 ```
 
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认评估model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录
+- --asset_files: 需额拷贝到模型目录的文件。tdm需拷贝serving_tree树文件用于线上服务
 
 #### Recall评估
 
@@ -181,7 +187,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --predict_input_path: 预测输入数据的路径
 - --predict_output_path: 预测输出数据的路径
 - --gt_item_id_field: 文件中代表真实点击item_id的列名
-- --recall_num:(可选, 默认为200) 召回的数量, 应与建树时输入保持一致
+- --recall_num:(可选, 默认为200) 召回的数量
 - --n_cluster:(可选, 默认为2) 数的分叉数量, 应与建树时输入保持一致
 - --reserved_columns: 预测结果中要保留的输入列
 

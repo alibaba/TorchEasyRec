@@ -12,6 +12,7 @@
 
 import argparse
 import os
+import sys
 import unittest
 
 
@@ -48,4 +49,7 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner()
     test_suite = _gather_test_cases(args)
     if not args.list_tests:
-        runner.run(test_suite)
+        result = runner.run(test_suite)
+        failed, errored = len(result.failures), len(result.errors)
+        if failed > 0 or errored > 0:
+            sys.exit(1)

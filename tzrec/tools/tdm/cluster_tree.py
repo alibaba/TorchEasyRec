@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import argparse
-import math
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import TreeSearch
@@ -49,7 +48,7 @@ if __name__ == "__main__":
         help="The column names representing the raw features of item in the file.",
     )
     parser.add_argument(
-        "--tree_output_file",
+        "--tree_output_dir",
         type=str,
         default=None,
         help="The tree output file.",
@@ -67,12 +66,6 @@ if __name__ == "__main__":
         help="The number of CPU cores for parallel processing.",
     )
     parser.add_argument(
-        "--recall_num",
-        type=int,
-        default=200,
-        help="Recall number per item when retrieval.",
-    )
-    parser.add_argument(
         "--n_cluster",
         type=int,
         default=2,
@@ -85,16 +78,12 @@ if __name__ == "__main__":
         item_id_field=args.item_id_field,
         attr_fields=args.attr_fields,
         raw_attr_fields=args.raw_attr_fields,
-        output_file=args.tree_output_file,
+        output_dir=args.tree_output_dir,
         embedding_field=args.embedding_field,
         parallel=args.parallel,
         n_cluster=args.n_cluster,
     )
-    if args.tree_output_file:
-        save_tree = True
-    else:
-        save_tree = False
-    root = cluster.train(save_tree)
+    root = cluster.train()
     logger.info("Tree cluster done. Start save nodes and edges table.")
     tree_search = TreeSearch(
         output_file=args.node_edge_output_file,
@@ -102,6 +91,7 @@ if __name__ == "__main__":
         child_num=args.n_cluster,
     )
     tree_search.save()
-    first_recall_layer = int(math.ceil(math.log(2 * args.recall_num, args.n_cluster)))
-    tree_search.save_predict_edge(first_recall_layer)
+    tree_search.save_predict_edge()
+    if args.tree_output_dir:
+        tree_search.save_serving_tree(args.tree_output_dir)
     logger.info("Save nodes and edges table done.")

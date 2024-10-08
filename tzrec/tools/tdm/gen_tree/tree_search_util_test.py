@@ -36,13 +36,13 @@ class TreeSearchtest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir)
 
-    def test_cluster(self) -> None:
+    def test_tree_search(self) -> None:
         cluster = TreeCluster(
             item_input_path=self.tmp_file.name,
             item_id_field="item_id",
             attr_fields="int_a,str_c",
             raw_attr_fields="float_b",
-            output_file=None,
+            output_dir=None,
             embedding_field="item_emb",
             parallel=1,
             n_cluster=2,
@@ -51,11 +51,13 @@ class TreeSearchtest(unittest.TestCase):
         root = cluster.train(save_tree=False)
         search = TreeSearch(output_file=self.test_dir, root=root, child_num=2)
         search.save()
-        search.save_predict_edge(3)
+        search.save_predict_edge()
+        search.save_serving_tree(self.test_dir)
 
         node_table = []
         edge_table = []
         predict_edge_table = []
+        serving_tree = []
         with open(os.path.join(self.test_dir, "node_table.txt")) as f:
             for line in f:
                 node_table.append(line)
@@ -63,14 +65,17 @@ class TreeSearchtest(unittest.TestCase):
         with open(os.path.join(self.test_dir, "edge_table.txt")) as f:
             for line in f:
                 edge_table.append(line)
-
         with open(os.path.join(self.test_dir, "predict_edge_table.txt")) as f:
             for line in f:
                 predict_edge_table.append(line)
+        with open(os.path.join(self.test_dir, "serving_tree")) as f:
+            for line in f:
+                serving_tree.append(line)
 
         self.assertEqual(len(node_table), 14)
         self.assertEqual(len(edge_table), 19)
-        self.assertEqual(len(predict_edge_table), 7)
+        self.assertEqual(len(predict_edge_table), 13)
+        self.assertEqual(len(serving_tree), 14)
 
 
 if __name__ == "__main__":

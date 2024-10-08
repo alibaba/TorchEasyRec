@@ -31,12 +31,12 @@ class TreeCluster:
     """Cluster based on emb vec.
 
     Args:
-        item_input_path(str): The file path where the item information is stored.
-        item_id_field(str): The column name representing item_id in the file.
-        attr_fields(List[str]): The column names representing the features in the file.
-        output_file(str): The output file.
-        parallel(int): The number of CPU cores for parallel processing.
-        n_cluster(int): The branching factor of the nodes in the tree.
+        item_input_path (str): The file path where the item information is stored.
+        item_id_field (str): The column name representing item_id in the file.
+        attr_fields (List[str]): The column names representing the features in the file.
+        output_dir (str): The output file.
+        parallel (int): The number of CPU cores for parallel processing.
+        n_cluster (int): The branching factor of the nodes in the tree.
     """
 
     def __init__(
@@ -45,7 +45,7 @@ class TreeCluster:
         item_id_field: str,
         attr_fields: Optional[str] = None,
         raw_attr_fields: Optional[str] = None,
-        output_file: Optional[str] = None,
+        output_dir: Optional[str] = None,
         embedding_field: str = "item_emb",
         parallel: int = 16,
         n_cluster: int = 2,
@@ -60,7 +60,7 @@ class TreeCluster:
         self.queue = None
         self.timeout = 5
         self.codes = None
-        self.output_file = output_file
+        self.output_dir = output_dir
         self.n_clusters = n_cluster
 
         self.item_id_field = item_id_field
@@ -140,7 +140,7 @@ class TreeCluster:
             p.join()
 
         assert queue.empty()
-        builder = tree_builder.TreeBuilder(self.output_file, self.n_clusters)
+        builder = tree_builder.TreeBuilder(self.output_dir, self.n_clusters)
         root = builder.build(
             self.ids, self.codes, self.attrs, self.raw_attrs, self.data, save_tree
         )

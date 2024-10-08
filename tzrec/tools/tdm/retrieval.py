@@ -198,7 +198,7 @@ def tdm_retrieval(
     sampler_config = pipeline_config.data_config.tdm_sampler
     item_id_field = sampler_config.item_id_field
     max_level = len(sampler_config.layer_num_sample)
-    first_recall_layer = int(math.ceil(math.log(2 * recall_num, n_cluster)))
+    first_recall_layer = int(math.ceil(math.log(2 * n_cluster * recall_num, n_cluster)))
 
     dataset = infer_dataloader.dataset
     # pyre-ignore [16]
@@ -210,6 +210,7 @@ def tdm_retrieval(
     pos_sampler.init_cluster(num_client_per_rank=1)
     pos_sampler.launch_server()
     pos_sampler.init()
+    pos_sampler.init_sampler(n_cluster)
     i_step = 0
 
     num_class = pipeline_config.model_config.num_class
@@ -226,10 +227,14 @@ def tdm_retrieval(
             cur_batch_size = len(node_ids)
 
             expand_num = n_cluster**first_recall_layer
-            pos_sampler.init_sampler(expand_num)
-
-            for layer in range(first_recall_layer, max_level):
+            for layer in range(1, max_level):
                 sampled_result_dict = pos_sampler.get(node_ids)
+
+                # skip layers before first_recall_layer
+                if layer < first_recall_layer:
+                    node_ids = sampled_result_dict[item_id_field]
+                    continue
+
                 updated_inputs = update_data(
                     reserve_batch_record, sampled_result_dict, expand_num
                 )
@@ -267,16 +272,13 @@ def tdm_retrieval(
                     _, topk_indices_in_group = torch.topk(probs, k, dim=1)
                     topk_indices = (
                         topk_indices_in_group
-                        + torch.arange(cur_batch_size)
-                        .unsqueeze(1)
-                        .to(topk_indices_in_group.device)
+                        + torch.arange(cur_batch_size, device=device).unsqueeze(1)
                         * expand_num
                     )
                     topk_indices = topk_indices.reshape(-1).cpu().numpy()
                     node_ids = updated_inputs[item_id_field].take(topk_indices)
 
                 if layer == first_recall_layer:
-                    pos_sampler.init_sampler(n_cluster)
                     expand_num = n_cluster * k
 
             output_dict = OrderedDict()

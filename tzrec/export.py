@@ -34,10 +34,17 @@ if __name__ == "__main__":
         default=None,
         help="directory where model should be exported to.",
     )
+    parser.add_argument(
+        "--asset_files",
+        type=str,
+        default=None,
+        help="more files will be copied to export_dir.",
+    )
     args, extra_args = parser.parse_known_args()
 
     export(
         args.pipeline_config_path,
         export_dir=args.export_dir,
         checkpoint_path=args.checkpoint_path,
+        asset_files=args.asset_files,
     )
