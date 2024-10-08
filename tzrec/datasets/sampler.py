@@ -695,6 +695,7 @@ class TDMSampler(BaseSampler):
         self._item_id_field = config.item_id_field
         self._max_level = len(config.layer_num_sample)
         self._layer_num_sample = config.layer_num_sample
+        assert self._layer_num_sample[0] == 0, "sample num of tree root must be 0"
         self._last_layer_num_sample = config.layer_num_sample[-1]
         self._pos_sampler = None
         self._neg_sampler_list = []

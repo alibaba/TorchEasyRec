@@ -108,7 +108,7 @@ def _expand_tdm_sample(
 
     remain_ratio = sampler_config.remain_ratio
     if remain_ratio < 1.0:
-        probability_type = sampler_config.probabilty_type
+        probability_type = sampler_config.probability_type
         if probability_type == "UNIFORM":
             p = np.array([1 / (tree_level - 1)] * (tree_level - 1))
         elif probability_type == "ARITHMETIC":

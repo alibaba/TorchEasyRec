@@ -432,10 +432,10 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(node)
         node.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(63):
-            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:我们{i}\n")
+            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:{i*2}\n")
         node.flush()
 
-        def _ancesstor(code):
+        def _ancestor(code):
             ancs = []
             while code > 0:
                 code = int((code - 1) / 2)
@@ -446,7 +446,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(edge)
         edge.write("src_id:int64\tdst_id:int\tweight:float\n")
         for i in range(31, 63):
-            for anc in _ancesstor(i):
+            for anc in _ancestor(i):
                 edge.write(f"{i}\t{anc}\t{1.0}\n")
         edge.flush()
 
@@ -488,9 +488,7 @@ class DatasetTest(unittest.TestCase):
                 raw_feature=feature_pb2.RawFeature(feature_name="float_d")
             ),
         ]
-        features = create_features(
-            feature_cfgs, neg_fields=["int_a", "float_b", "str_c"]
-        )
+        features = create_features(feature_cfgs)
 
         dataset = _TestDataset(
             data_config=data_pb2.DataConfig(
@@ -498,13 +496,13 @@ class DatasetTest(unittest.TestCase):
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
                 fg_encoded=True,
                 label_fields=["label"],
-                negative_sampler=sampler_pb2.TDMSampler(
+                tdm_sampler=sampler_pb2.TDMSampler(
                     item_input_path=node.name,
                     edge_input_path=edge.name,
                     predict_edge_input_path=predict_edge.name,
                     attr_fields=["tree_level", "int_a", "float_b", "str_c"],
                     item_id_field="int_a",
-                    layer_num_sample=[1, 1, 1, 1, 1, 5],
+                    layer_num_sample=[0, 1, 1, 1, 1, 5],
                     field_delimiter=",",
                     remain_ratio=0.4,
                     probability_type="UNIFORM",
