@@ -81,7 +81,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.export \
     --pipeline_config_path experiments/tdm_taobao_local/pipeline.config \
-    --export_dir experiments/tdm_taobao_local/export
+    --export_dir experiments/tdm_taobao_local/export \
     --asset_files data/init_tree/serving_tree
 ```
 
@@ -156,7 +156,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.export \
     --pipeline_config_path experiments/tdm_taobao_local_learnt/pipeline.config \
-    --export_dir experiments/tdm_taobao_local_learnt/export
+    --export_dir experiments/tdm_taobao_local_learnt/export \
     --asset_files data/learnt_tree/serving_tree
 ```
 
