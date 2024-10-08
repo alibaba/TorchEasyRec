@@ -760,7 +760,7 @@ def export(
         export_dir (str): base directory where the model should be exported.
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path.
-        asset_files (str, optional): more files will be copy to export_dir.
+        asset_files (str, optional): more files will be copied to export_dir.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)

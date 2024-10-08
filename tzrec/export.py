@@ -38,7 +38,7 @@ if __name__ == "__main__":
         "--asset_files",
         type=str,
         default=None,
-        help="more files will be copy to export_dir.",
+        help="more files will be copied to export_dir.",
     )
     args, extra_args = parser.parse_known_args()
 
