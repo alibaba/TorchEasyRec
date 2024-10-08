@@ -10,13 +10,13 @@
 # limitations under the License.
 
 
+import math
 import tempfile
 import unittest
 from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import pyarrow as pa
-import math
 from graphlearn.python.nn.pytorch.data import utils
 from parameterized import parameterized
 from torch.utils.data import DataLoader
@@ -426,7 +426,7 @@ class DatasetTest(unittest.TestCase):
             )
         else:
             self.assertEqual(list(batch.reserves.get().column_names), ["label"])
-    
+
     def test_dataset_with_tdm_sampler_and_remain_ratio(self):
         node = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(node)
@@ -489,8 +489,7 @@ class DatasetTest(unittest.TestCase):
             ),
         ]
         features = create_features(
-            feature_cfgs,
-            neg_fields=["int_a", "float_b", "str_c"]
+            feature_cfgs, neg_fields=["int_a", "float_b", "str_c"]
         )
 
         dataset = _TestDataset(
@@ -505,17 +504,17 @@ class DatasetTest(unittest.TestCase):
                     predict_edge_input_path=predict_edge.name,
                     attr_fields=["tree_level", "int_a", "float_b", "str_c"],
                     item_id_field="int_a",
-                    layer_num_sample=[1,1,1,1,1,5],
+                    layer_num_sample=[1, 1, 1, 1, 1, 5],
                     field_delimiter=",",
                     remain_ratio=0.4,
-                    probability_type="UNIFORM"
+                    probability_type="UNIFORM",
                 ),
             ),
             features=features,
             input_path="",
             input_fields=input_fields,
         )
-        
+
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
             dataset=dataset,
@@ -524,21 +523,18 @@ class DatasetTest(unittest.TestCase):
             pin_memory=True,
             collate_fn=lambda x: x,
         )
+
         iterator = iter(dataloader)
         batch = next(iterator)
         self.assertEqual(
             batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b", "float_d"]
         )
-        self.assertEqual(
-            batch.dense_features[BASE_DATA_GROUP].values().size(), (40, 2)
-        )
+        self.assertEqual(batch.dense_features[BASE_DATA_GROUP].values().size(), (40, 2))
         self.assertEqual(
             batch.sparse_features[BASE_DATA_GROUP].keys(),
             ["int_a", "str_c", "int_d"],
         )
-        self.assertEqual(
-            batch.sparse_features[BASE_DATA_GROUP].values().size(), (120,)
-        )
+        self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].values().size(), (120,))
         self.assertEqual(
             batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (120,)
         )

@@ -110,32 +110,33 @@ def _expand_tdm_sample(
     if remain_ratio < 1.0:
         probability_type = sampler_config.probabilty_type
         if probability_type == "UNIFORM":
-            p = np.array([1/(tree_level-1)]*(tree_level-1))
+            p = np.array([1 / (tree_level - 1)] * (tree_level - 1))
         elif probability_type == "ARITHMETIC":
             p = np.arange(1, tree_level) / sum(np.arange(1, tree_level))
         elif probability_type == "RECIPROCAL":
-            p = 1/np.arange(tree_level-1, 0, -1)
-            p = p/sum(p)
+            p = 1 / np.arange(tree_level - 1, 0, -1)
+            p = p / sum(p)
         else:
             raise ValueError(
-                    f"probability_type: [{probability_type}]"
-                    "is not supported now."
-                )  
-        remain_layer = np.random.choice(
-            range(tree_level-1), int(remain_ratio*(tree_level-1)), replace=False, p=p
+                f"probability_type: [{probability_type}]" "is not supported now."
             )
+        remain_layer = np.random.choice(
+            range(tree_level - 1),
+            int(remain_ratio * (tree_level - 1)),
+            replace=False,
+            p=p,
+        )
         remain_layer.sort()
     else:
-        remain_layer = list(range(tree_level-1))
-    
-    num_remain_layer_neg = sum(
-        [layer_num_sample[i] for i in remain_layer]
-        ) + layer_num_sample[-1]
+        remain_layer = list(range(tree_level - 1))
 
+    num_remain_layer_neg = (
+        sum([layer_num_sample[i] for i in remain_layer]) + layer_num_sample[-1]
+    )
     for item_fea_name in item_fea_names:
         batch_size = len(input_data[item_fea_name])
         pos_index = (
-            (remain_layer[None, :] + (tree_level-1) * np.arange(batch_size)[:, None])
+            (remain_layer[None, :] + (tree_level - 1) * np.arange(batch_size)[:, None])
             .flatten()
             .astype(np.int64)
         )
@@ -143,8 +144,8 @@ def _expand_tdm_sample(
             (
                 np.concatenate(
                     [
-                        range(sum(layer_num_sample[:i]), sum(layer_num_sample[:i+1]))
-                        for i in np.append(remain_layer, tree_level-1)
+                        range(sum(layer_num_sample[:i]), sum(layer_num_sample[: i + 1]))
+                        for i in np.append(remain_layer, tree_level - 1)
                     ]
                 )[None, :]
                 + num_all_layer_neg * np.arange(batch_size)[:, None]

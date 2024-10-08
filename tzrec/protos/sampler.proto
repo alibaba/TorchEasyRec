@@ -130,10 +130,10 @@ message TDMSampler {
     optional uint32 num_eval_sample = 8 [default=0];
     // field delimiter of input data
     optional string field_delimiter = 9;
-    // The training process only trains a randomly selected 
+    // The training process only trains a randomly selected
     // proportion of nodes in the middle layers of the tree
     optional float remain_ratio = 10 [default=1.0];
-    // The type of probability for selecting and retaining 
-    // each layer in the middle layers of the tree.
+    // The type of probability for selecting and retaining
+    // each layer in the middle layers of the tree
     optional string probabilty_type = 11 [default="UNIFORM"];
 }

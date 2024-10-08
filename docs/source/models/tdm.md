@@ -115,9 +115,9 @@ model_config {
   - attr_delimiter: 目前是以","写表的, 因此需设置为","
   - remain_ratio: (可选, 默认为1.0)训练时每个batch内在树中随机选取一定比例的非叶节点层的节点训练, 可以一定程度防止过拟合
   - probability_type: (可选, 默认为"UNIFORM")随机选取树中非叶节点层时, 每层被选中的概率, 目前可选择"UNIFORM", "ARITHMETIC", "RECIPROCAL"
-   - "UNIFORM": 每层被选中的概率相同
-   - "ARTITHMETIC": 每层被选中概率等差递增
-   - "RECIPROCAL": 每层被选中的概率呈反比例函数递增, 即p正比于1/(TREE_LEVEL - CUR_LEVEL)
+  - "UNIFORM": 每层被选中的概率相同
+  - "ARTITHMETIC": 每层被选中概率等差递增
+  - "RECIPROCAL": 每层被选中的概率呈反比例函数递增, 即p正比于1/(TREE_LEVEL - CUR_LEVEL)
 
 ### 示例Config
 
