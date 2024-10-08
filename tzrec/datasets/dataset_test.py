@@ -437,8 +437,10 @@ class DatasetTest(unittest.TestCase):
 
         def _ancestor(code):
             ancs = []
-            while code > 0:
+            while True:
                 code = int((code - 1) / 2)
+                if code <= 0:
+                    break
                 ancs.append(code)
             return ancs
 
