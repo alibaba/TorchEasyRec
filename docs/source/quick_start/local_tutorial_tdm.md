@@ -51,9 +51,9 @@ python -m tzrec.tools.tdm.init_tree \
 - --cate_id_field: 代表item的类别的列名
 - --attr_fields: (可选) 除了item_id外的item非数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
 - --raw_attr_fields: (可选) item的数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
-- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持`ODPS GL表`和`本地txt GL`两种
-  - ODPS GL表：设置形如`odps://{project}/tables/{tb_prefix}`，将会产出用于TDM训练负采样的GL Node表`odps://{project}/tables/{tb_prefix}_node_table`、GL Edge表`odps://{project}/tables/{tb_prefix}_edge_table`、用于离线检索的GL Edge表`odps://{project}/tables/{tb_prefix}_predict_edge_table`
-  - 本地txt GL表：设置的为目录， 将在目录下产出用于TDM训练负采样的GL Node表`node_table.txt`,GL Edge表`edge_table.txt`、用于离线检索的GL Edge表`predict_edge_table.txt`
+- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持`ODPS表`和`本地txt`两种
+  - ODPS表：设置形如`odps://{project}/tables/{tb_prefix}`，将会产出用于TDM训练负采样的GL Node表`odps://{project}/tables/{tb_prefix}_node_table`、GL Edge表`odps://{project}/tables/{tb_prefix}_edge_table`、用于离线检索的GL Edge表`odps://{project}/tables/{tb_prefix}_predict_edge_table`
+  - 本地txt：设置的为目录， 将在目录下产出用于TDM训练负采样的GL Node表`node_table.txt`,GL Edge表`edge_table.txt`、用于离线检索的GL Edge表`predict_edge_table.txt`
 - --tree_output_dir: (可选) 树的保存目录, 将会在目录下存储`serving_tree`文件用于线上服务
 - --n_cluster: (可选,默认为2)树的分叉数
 
@@ -127,7 +127,7 @@ OMP_NUM_THREADS=4 python tzrec/tools/tdm/cluster_tree.py \
 - --embedding_field: 代表item embedding的列名
 - --attr_fields: (可选) 除了item_id外的item非数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
 - --raw_attr_fields: (可选) item的数值型特征列名, 用逗号分开. 注意和配置文件中tdm_sampler顺序一致
-- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持`ODPS GL表`和`本地txt GL`两种，同初始树
+- --node_edge_output_file: 根据树生成的node和edge表的保存路径, 支持`ODPS表`和`本地txt`两种，同初始树
 - --tree_output_dir: (可选) 树的保存目录, 将会在目录下存储`serving_tree`文件用于线上服务
 - --n_cluster: (可选,默认为2)树的分叉数
 - --parllel: (可选，默认为16)聚类时CPU并行数
