@@ -99,26 +99,73 @@ def _expand_tdm_sample(
     sampler_config = getattr(data_config, sampler_type)
     tree_level = len(sampler_config.layer_num_sample)
     num_all_layer_neg = sum(sampler_config.layer_num_sample)
+    layer_num_sample = sampler_config.layer_num_sample
 
     item_fea_names = pos_sampled.keys()
     all_fea_names = input_data.keys()
     label_fields = set(data_config.label_fields)
     user_fea_names = all_fea_names - item_fea_names - label_fields
 
+    remain_ratio = sampler_config.remain_ratio
+    if remain_ratio < 1.0:
+        probability_type = sampler_config.probabilty_type
+        if probability_type == "UNIFORM":
+            p = np.array([1 / (tree_level - 1)] * (tree_level - 1))
+        elif probability_type == "ARITHMETIC":
+            p = np.arange(1, tree_level) / sum(np.arange(1, tree_level))
+        elif probability_type == "RECIPROCAL":
+            p = 1 / np.arange(tree_level - 1, 0, -1)
+            p = p / sum(p)
+        else:
+            raise ValueError(
+                f"probability_type: [{probability_type}]" "is not supported now."
+            )
+        remain_layer = np.random.choice(
+            range(tree_level - 1),
+            int(remain_ratio * (tree_level - 1)),
+            replace=False,
+            p=p,
+        )
+        remain_layer.sort()
+    else:
+        remain_layer = list(range(tree_level - 1))
+
+    num_remain_layer_neg = (
+        sum([layer_num_sample[i] for i in remain_layer]) + layer_num_sample[-1]
+    )
     for item_fea_name in item_fea_names:
+        batch_size = len(input_data[item_fea_name])
+        pos_index = (
+            (remain_layer[None, :] + (tree_level - 1) * np.arange(batch_size)[:, None])
+            .flatten()
+            .astype(np.int64)
+        )
+        neg_index = (
+            (
+                np.concatenate(
+                    [
+                        range(sum(layer_num_sample[:i]), sum(layer_num_sample[: i + 1]))
+                        for i in np.append(remain_layer, tree_level - 1)
+                    ]
+                )[None, :]
+                + num_all_layer_neg * np.arange(batch_size)[:, None]
+            )
+            .flatten()
+            .astype(np.int64)
+        )
         input_data[item_fea_name] = pa.concat_arrays(
             [
                 input_data[item_fea_name],
-                pos_sampled[item_fea_name],
-                neg_sampled[item_fea_name],
+                pos_sampled[item_fea_name].take(pos_index),
+                neg_sampled[item_fea_name].take(neg_index),
             ]
         )
 
     # In the sampling results, the sampled outcomes for each item are contiguous.
     for user_fea_name in user_fea_names:
         user_fea = input_data[user_fea_name]
-        pos_index = np.repeat(np.arange(len(user_fea)), tree_level - 1)
-        neg_index = np.repeat(np.arange(len(user_fea)), num_all_layer_neg)
+        pos_index = np.repeat(np.arange(len(user_fea)), len(remain_layer))
+        neg_index = np.repeat(np.arange(len(user_fea)), num_remain_layer_neg)
         pos_expand_user_fea = user_fea.take(pos_index)
         neg_expand_user_fea = user_fea.take(neg_index)
         input_data[user_fea_name] = pa.concat_arrays(
@@ -134,11 +181,11 @@ def _expand_tdm_sample(
             [
                 input_data[label_field].cast(pa.int64()),
                 pa.array(
-                    [1] * (len(input_data[label_field]) * (tree_level - 1)),
+                    [1] * (len(input_data[label_field]) * len(remain_layer)),
                     type=pa.int64(),
                 ),
                 pa.array(
-                    [0] * (len(input_data[label_field]) * num_all_layer_neg),
+                    [0] * (len(input_data[label_field]) * num_remain_layer_neg),
                     type=pa.int64(),
                 ),
             ]

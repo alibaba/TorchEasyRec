@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import math
 import tempfile
 import unittest
 from typing import Any, Dict, Iterator, List, Optional
@@ -425,6 +426,119 @@ class DatasetTest(unittest.TestCase):
             )
         else:
             self.assertEqual(list(batch.reserves.get().column_names), ["label"])
+
+    def test_dataset_with_tdm_sampler_and_remain_ratio(self):
+        node = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(node)
+        node.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(63):
+            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:我们{i}\n")
+        node.flush()
+
+        def _ancesstor(code):
+            ancs = []
+            while code > 0:
+                code = int((code - 1) / 2)
+                ancs.append(code)
+            return ancs
+
+        edge = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(edge)
+        edge.write("src_id:int64\tdst_id:int\tweight:float\n")
+        for i in range(31, 63):
+            for anc in _ancesstor(i):
+                edge.write(f"{i}\t{anc}\t{1.0}\n")
+        edge.flush()
+
+        def _childern(code):
+            return [2 * code + 1, 2 * code + 2]
+
+        predict_edge = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(predict_edge)
+        predict_edge.write("src_id:int64\tdst_id:int\tweight:float\n")
+        for i in range(7, 15):
+            predict_edge.write(f"0\t{i}\t{1}\n")
+        for i in range(7, 31):
+            for child in _childern(i):
+                predict_edge.write(f"{i}\t{child}\t{1}\n")
+        predict_edge.flush()
+
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="str_c", type=pa.string()),
+            pa.field(name="int_d", type=pa.int64()),
+            pa.field(name="float_d", type=pa.float64()),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_d")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_d")
+            ),
+        ]
+        features = create_features(
+            feature_cfgs, neg_fields=["int_a", "float_b", "str_c"]
+        )
+
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_encoded=True,
+                label_fields=["label"],
+                negative_sampler=sampler_pb2.TDMSampler(
+                    input_input_path=node.name,
+                    edge_input_path=edge.name,
+                    predict_edge_input_path=predict_edge.name,
+                    attr_fields=["tree_level", "int_a", "float_b", "str_c"],
+                    item_id_field="int_a",
+                    layer_num_sample=[1, 1, 1, 1, 1, 5],
+                    field_delimiter=",",
+                    remain_ratio=0.4,
+                    probability_type="UNIFORM",
+                ),
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+        )
+
+        dataset.launch_sampler_cluster(2)
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+
+        iterator = iter(dataloader)
+        batch = next(iterator)
+        self.assertEqual(
+            batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b", "float_d"]
+        )
+        self.assertEqual(batch.dense_features[BASE_DATA_GROUP].values().size(), (40, 2))
+        self.assertEqual(
+            batch.sparse_features[BASE_DATA_GROUP].keys(),
+            ["int_a", "str_c", "int_d"],
+        )
+        self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].values().size(), (120,))
+        self.assertEqual(
+            batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (120,)
+        )
+        self.assertEqual(batch.labels["label"].size(), (40,))
 
 
 if __name__ == "__main__":
