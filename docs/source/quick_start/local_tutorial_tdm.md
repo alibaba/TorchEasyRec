@@ -42,7 +42,7 @@ python -m tzrec.tools.tdm.init_tree \
 --item_id_field adgroup_id \
 --cate_id_field cate_id \
 --attr_fields cate_id,campaign_id,customer,brand,price \
---node_edge_output_file data/init_tree
+--node_edge_output_file data/init_tree \
 --tree_output_dir data/init_tree
 ```
 
