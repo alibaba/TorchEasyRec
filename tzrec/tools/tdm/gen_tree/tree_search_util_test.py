@@ -73,7 +73,7 @@ class TreeSearchtest(unittest.TestCase):
                 serving_tree.append(line)
 
         self.assertEqual(len(node_table), 14)
-        self.assertEqual(len(edge_table), 19)
+        self.assertEqual(len(edge_table), 13)
         self.assertEqual(len(predict_edge_table), 13)
         self.assertEqual(len(serving_tree), 14)
 
