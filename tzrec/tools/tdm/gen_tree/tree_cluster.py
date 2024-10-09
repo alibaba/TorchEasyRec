@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 import time
 from multiprocessing.connection import Connection
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -49,6 +49,7 @@ class TreeCluster:
         embedding_field: str = "item_emb",
         parallel: int = 16,
         n_cluster: int = 2,
+        **kwargs: Any,
     ) -> None:
         self.item_input_path = item_input_path
         self.mini_batch = 1024
@@ -73,15 +74,19 @@ class TreeCluster:
 
         self.embedding_field = embedding_field
 
+        self.dataset_kwargs = {}
+        if "odps_data_quota_name" in kwargs:
+            self.dataset_kwargs["quota_name"] = kwargs["odps_data_quota_name"]
+
     def _read(self) -> None:
         t1 = time.time()
         ids = list()
         data = list()
         attrs = list()
         raw_attrs = list()
-        reader = create_reader(self.item_input_path, 256)
+        reader = create_reader(self.item_input_path, 256, **self.dataset_kwargs)
         for data_dict in reader.to_batches():
-            ids += data_dict[self.item_id_field].to_pylist()
+            ids += data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
             data += data_dict[self.embedding_field].to_pylist()
             tmp_attr = []
             if self.attr_fields is not None:
