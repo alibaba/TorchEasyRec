@@ -104,6 +104,9 @@ class TreeSearch(object):
                 self.max_level = level - 1
                 self.level_code.append([])
             self.level_code[self.max_level].append(node)
+        logger.info(
+            f"Tree Level: {self.max_level + 1}, Tree Cluster: {self.child_num}."
+        )
 
         tree_walker = Walker()
         logger.info("Begin Travel Tree.")
