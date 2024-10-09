@@ -723,7 +723,7 @@ class TDMSampler(BaseSampler):
         super().init()
         self._pos_sampler = self._g.neighbor_sampler(
             meta_path=["ancestor"],
-            expand_factor=self._max_level - 1,
+            expand_factor=self._max_level - 2,
             strategy="random_without_replacement",
         )
 
@@ -779,7 +779,7 @@ class TDMSampler(BaseSampler):
         if self._remain_ratio < 1.0:
             remain_layer = np.random.choice(
                 range(1, self._max_level - 1),
-                int(self._remain_ratio * (self._max_level - 1)),
+                int(round(self._remain_ratio * (self._max_level - 2))),
                 replace=False,
                 p=self._remain_p,
             )
@@ -789,7 +789,10 @@ class TDMSampler(BaseSampler):
 
         if self._remain_ratio < 1.0:
             pos_fea_index = np.concatenate(
-                [remain_layer + j * (self._max_level - 2) for j in range(batch_size)]
+                [
+                    remain_layer - 1 + j * (self._max_level - 2)
+                    for j in range(batch_size)
+                ]
             )
             pos_fea_result = [
                 pos_fea_result[i].take(pos_fea_index) for i in range(num_fea)
@@ -798,7 +801,9 @@ class TDMSampler(BaseSampler):
         # negative sample layer by layer.
         neg_fea_layer = []
         for i in np.append(remain_layer, self._max_level - 1):
-            neg_nodes = self._neg_sampler_list[i - 1].get(pos_ids[:, i], pos_ids[:, i])
+            neg_nodes = self._neg_sampler_list[i - 1].get(
+                pos_ids[:, i - 1], pos_ids[:, i - 1]
+            )
             features = self._parse_nodes(neg_nodes)[1:]
             neg_fea_layer.append(features)
 
