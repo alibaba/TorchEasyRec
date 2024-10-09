@@ -434,6 +434,7 @@ class BaseWriter(metaclass=_writer_meta_cls):
 
     def __del__(self) -> None:
         if self._lazy_inited:
+            # pyre-ignore [16]
             logger.warning(f"You should close {self.__class__.__name__} explicitly.")
 
 

@@ -116,9 +116,9 @@ class TreeSearch(object):
     def save(self) -> None:
         """Save tree info."""
         if self.output_file.startswith("odps://"):
-            node_writer = create_writer(
-                self.output_file + "node_table", **self.dataset_kwargs
-            )
+            str_list = self.output_file.split("/")
+            str_list[5] = str_list[5] + "_node_table"
+            node_writer = create_writer("/".join(str_list), **self.dataset_kwargs)
             ids = []
             weight = []
             features = []
@@ -139,9 +139,9 @@ class TreeSearch(object):
             node_writer.write(node_table_dict)
             node_writer.close()
 
-            edge_writer = create_writer(
-                self.output_file + "edge_table", **self.dataset_kwargs
-            )
+            str_list = self.output_file.split("/")
+            str_list[5] = str_list[5] + "_edge_table"
+            edge_writer = create_writer("/".join(str_list), **self.dataset_kwargs)
             src_ids = []
             dst_ids = []
             weight = []
@@ -183,9 +183,9 @@ class TreeSearch(object):
     def save_predict_edge(self) -> None:
         """Save edge info for prediction."""
         if self.output_file.startswith("odps://"):
-            writer = create_writer(
-                self.output_file + "predict_edge_table", **self.dataset_kwargs
-            )
+            str_list = self.output_file.split("/")
+            str_list[5] = str_list[5] + "_predict_edge_table"
+            writer = create_writer("/".join(str_list), **self.dataset_kwargs)
             src_ids = []
             dst_ids = []
             weight = []
