@@ -136,7 +136,8 @@ class TreeSearch(object):
             dst_ids = []
             weight = []
             for travel in self.travel_list:
-                for i in range(self.max_level):
+                # do not include edge from leaf to root
+                for i in range(self.max_level - 1):
                     src_ids.append(travel[0])
                     dst_ids.append(travel[i + 1])
                     weight.append(1.0)
@@ -164,7 +165,8 @@ class TreeSearch(object):
             with open(os.path.join(self.output_file, "edge_table.txt"), "w") as f:
                 f.write("src_id:int64\tdst_id:int64\tweight:float\n")
                 for travel in self.travel_list:
-                    for i in range(self.max_level):
+                    # do not include edge from leaf to root
+                    for i in range(self.max_level - 1):
                         f.write(f"{travel[0]}\t{travel[i+1]}\t{1.0}\n")
 
     def save_predict_edge(self) -> None:

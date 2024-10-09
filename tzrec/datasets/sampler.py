@@ -695,21 +695,40 @@ class TDMSampler(BaseSampler):
         self._item_id_field = config.item_id_field
         self._max_level = len(config.layer_num_sample)
         self._layer_num_sample = config.layer_num_sample
+        assert self._layer_num_sample[0] == 0, "sample num of tree root must be 0"
         self._last_layer_num_sample = config.layer_num_sample[-1]
         self._pos_sampler = None
         self._neg_sampler_list = []
+
+        self._remain_ratio = config.remain_ratio
+        if self._remain_ratio < 1.0:
+            if config.probability_type == "UNIFORM":
+                p = np.array([1 / (self._max_level - 2)] * (self._max_level - 2))
+            elif config.probability_type == "ARITHMETIC":
+                p = np.arange(1, self._max_level - 1) / sum(
+                    np.arange(1, self._max_level - 1)
+                )
+            elif config.probability_type == "RECIPROCAL":
+                p = 1 / np.arange(self._max_level - 2, 0, -1)
+                p = p / sum(p)
+            else:
+                raise ValueError(
+                    f"probability_type: [{config.probability_type}]"
+                    "is not supported now."
+                )
+            self._remain_p = p
 
     def init(self) -> None:
         """Init sampler client and samplers."""
         super().init()
         self._pos_sampler = self._g.neighbor_sampler(
             meta_path=["ancestor"],
-            expand_factor=self._max_level - 1,
+            expand_factor=self._max_level - 2,
             strategy="random_without_replacement",
         )
 
         # TODO: only use one conditional smapler
-        for i in range(self._max_level):
+        for i in range(1, self._max_level):
             self._neg_sampler_list.append(
                 self._g.negative_sampler(
                     "item",
@@ -745,6 +764,8 @@ class TDMSampler(BaseSampler):
             .to_numpy()
             .reshape(-1, 1)
         )
+        batch_size = len(ids)
+        num_fea = len(self._attr_names[1:])
 
         # positive node.
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
@@ -752,42 +773,69 @@ class TDMSampler(BaseSampler):
         # the ids of non-leaf nodes is arranged in ascending order.
         pos_non_leaf_ids = np.sort(pos_nodes.ids, axis=1)
         pos_ids = np.concatenate((pos_non_leaf_ids, ids), axis=1)
-
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
-        pos_result_dict = dict(zip(self._attr_names[1:], pos_fea_result))
+
+        # randomly select layers to keep
+        if self._remain_ratio < 1.0:
+            remain_layer = np.random.choice(
+                range(1, self._max_level - 1),
+                int(round(self._remain_ratio * (self._max_level - 2))),
+                replace=False,
+                p=self._remain_p,
+            )
+        else:
+            remain_layer = np.array(range(1, self._max_level - 1))
+        remain_layer.sort()
+
+        if self._remain_ratio < 1.0:
+            pos_fea_index = np.concatenate(
+                [
+                    remain_layer - 1 + j * (self._max_level - 2)
+                    for j in range(batch_size)
+                ]
+            )
+            pos_fea_result = [
+                pos_fea_result[i].take(pos_fea_index) for i in range(num_fea)
+            ]
 
         # negative sample layer by layer.
         neg_fea_layer = []
-        for i in range(1, self._max_level):
-            neg_nodes = self._neg_sampler_list[i].get(pos_ids[:, i], pos_ids[:, i])
+        for i in np.append(remain_layer, self._max_level - 1):
+            neg_nodes = self._neg_sampler_list[i - 1].get(
+                pos_ids[:, i - 1], pos_ids[:, i - 1]
+            )
             features = self._parse_nodes(neg_nodes)[1:]
             neg_fea_layer.append(features)
 
         # concatenate the features of each layer and
         # ensure that the negative sample features of the same user are adjacent.
         neg_fea_result = []
-        num_fea = len(neg_fea_layer[0])
-        batch_size = len(ids)
-        cum_layer_num = np.cumsum([0] + self._layer_num_sample[:-1])
-        same_user_index = np.concatenate(
+        cum_layer_num = np.cumsum(
+            [0]
+            + [
+                self._layer_num_sample[i] if i in remain_layer else 0
+                for i in range(self._max_level - 1)
+            ]
+        )
+        neg_fea_index = np.concatenate(
             [
                 np.concatenate(
                     [
                         np.arange(self._layer_num_sample[i])
                         + j * self._layer_num_sample[i]
                         + batch_size * cum_layer_num[i]
-                        for i in range(self._max_level)
+                        for i in np.append(remain_layer, self._max_level - 1)
                     ]
                 )
                 for j in range(batch_size)
             ]
         )
         neg_fea_result = [
-            pa.concat_arrays([array[i] for array in neg_fea_layer]).take(
-                same_user_index
-            )
+            pa.concat_arrays([array[i] for array in neg_fea_layer]).take(neg_fea_index)
             for i in range(num_fea)
         ]
+
+        pos_result_dict = dict(zip(self._attr_names[1:], pos_fea_result))
         neg_result_dict = dict(zip(self._attr_names[1:], neg_fea_result))
 
         return pos_result_dict, neg_result_dict

@@ -135,5 +135,5 @@ message TDMSampler {
     optional float remain_ratio = 10 [default=1.0];
     // The type of probability for selecting and retaining
     // each layer in the middle layers of the tree
-    optional string probabilty_type = 11 [default="UNIFORM"];
+    optional string probability_type = 11 [default="UNIFORM"];
 }

@@ -88,10 +88,12 @@ class SamplerTest(unittest.TestCase):
         return f
 
     def _create_edge_gl_data_for_tdm(self):
-        def _ancesstor(code):
+        def _ancestor(code):
             ancs = []
-            while code > 0:
+            while True:
                 code = int((code - 1) / 2)
+                if code <= 0:
+                    break
                 ancs.append(code)
             return ancs
 
@@ -99,7 +101,7 @@ class SamplerTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("src_id:int64\tdst_id:int\tweight:float\n")
         for i in range(31, 63):
-            for anc in _ancesstor(i):
+            for anc in _ancestor(i):
                 f.write(f"{i}\t{anc}\t{1.0}\n")
         f.flush()
         return f
@@ -227,7 +229,6 @@ class SamplerTest(unittest.TestCase):
                 procs.append(p)
             for i, p in enumerate(procs):
                 p.join()
-                print(f"{local_rank}, {group_rank} done.")
                 if p.exitcode != 0:
                     raise RuntimeError(f"client-{i} of worker-{rank} failed.")
 
@@ -456,9 +457,9 @@ class SamplerTest(unittest.TestCase):
         p.join()
         if p.exitcode != 0:
             raise RuntimeError("worker failed.")
-        self.assertEqual(len(pos_res["int_a"]), 4 * 5)
-        self.assertEqual(len(pos_res["float_b"]), 4 * 5)
-        self.assertEqual(len(pos_res["str_c"]), 4 * 5)
+        self.assertEqual(len(pos_res["int_a"]), 4 * 4)
+        self.assertEqual(len(pos_res["float_b"]), 4 * 4)
+        self.assertEqual(len(pos_res["str_c"]), 4 * 4)
         self.assertEqual(len(neg_res["int_a"]), 4 * 15)
         self.assertEqual(len(neg_res["float_b"]), 4 * 15)
         self.assertEqual(len(neg_res["str_c"]), 4 * 15)
