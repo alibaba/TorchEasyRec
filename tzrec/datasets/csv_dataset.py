@@ -156,3 +156,4 @@ class CsvWriter(BaseWriter):
         """Close and commit data."""
         if self._writer is not None:
             self._writer.close()
+        super().close()

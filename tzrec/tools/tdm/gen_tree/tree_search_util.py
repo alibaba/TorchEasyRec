@@ -137,6 +137,7 @@ class TreeSearch(object):
             node_table_dict["weight"] = pa.array(weight)
             node_table_dict["features"] = pa.array(features)
             node_writer.write(node_table_dict)
+            node_writer.close()
 
             edge_writer = create_writer(
                 self.output_file + "edge_table", **self.dataset_kwargs
@@ -155,6 +156,7 @@ class TreeSearch(object):
             edge_table_dict["dst_id"] = pa.array(dst_ids)
             edge_table_dict["weight"] = pa.array(weight)
             edge_writer.write(edge_table_dict)
+            edge_writer.close()
 
         else:
             if not os.path.exists(self.output_file):
@@ -198,6 +200,7 @@ class TreeSearch(object):
             edge_table_dict["dst_id"] = pa.array(dst_ids)
             edge_table_dict["weight"] = pa.array(weight)
             writer.write(edge_table_dict)
+            writer.close()
         else:
             with open(
                 os.path.join(self.output_file, "predict_edge_table.txt"), "w"
