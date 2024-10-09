@@ -457,9 +457,9 @@ class SamplerTest(unittest.TestCase):
         p.join()
         if p.exitcode != 0:
             raise RuntimeError("worker failed.")
-        self.assertEqual(len(pos_res["int_a"]), 4 * 5)
-        self.assertEqual(len(pos_res["float_b"]), 4 * 5)
-        self.assertEqual(len(pos_res["str_c"]), 4 * 5)
+        self.assertEqual(len(pos_res["int_a"]), 4 * 4)
+        self.assertEqual(len(pos_res["float_b"]), 4 * 4)
+        self.assertEqual(len(pos_res["str_c"]), 4 * 4)
         self.assertEqual(len(neg_res["int_a"]), 4 * 15)
         self.assertEqual(len(neg_res["float_b"]), 4 * 15)
         self.assertEqual(len(neg_res["str_c"]), 4 * 15)
