@@ -77,9 +77,9 @@ class DSSMTower(MatchTower):
             embedding (dict): tower output embedding.
         """
         grouped_features = self.build_input(batch)
-        mlp_output = self.mlp(grouped_features[self._group_name])
+        output = self.mlp(grouped_features[self._group_name])
         if self._output_dim > 0:
-            output = self.output(mlp_output)
+            output = self.output(output)
         if self._similarity == match_model_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
         return output
