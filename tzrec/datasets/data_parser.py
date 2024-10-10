@@ -235,16 +235,22 @@ class DataParser:
                     output_data[f"{feat_name}.values"] = torch.tensor(
                         feat_data.values, dtype=torch.int64
                     )
-                    output_data[f"{feat_name}.lengths"] = torch.tensor(
-                        feat_data.lengths, dtype=torch.int32
-                    )
+                    feat_lengths = np.asarray(feat_data.lengths, dtype=np.int32)
+                    if self._force_base_data_group:
+                        feat_lengths = np.pad(
+                            feat_lengths, (0, max_batch_size - len(feat_lengths))
+                        )
+                    output_data[f"{feat_name}.lengths"] = _to_tensor(feat_lengths)
                 else:
                     output_data[f"{feat_name}.values"] = _to_tensor(
                         feat_data.dense_values
                     )
-                    output_data[f"{feat_name}.lengths"] = torch.tensor(
-                        feat_data.lengths, dtype=torch.int32
-                    )
+                    feat_lengths = np.asarray(feat_data.lengths, dtype=np.int32)
+                    if self._force_base_data_group:
+                        feat_lengths = np.pad(
+                            feat_lengths, (0, max_batch_size - len(feat_lengths))
+                        )
+                    output_data[f"{feat_name}.lengths"] = _to_tensor(feat_lengths)
             else:
                 if feature.is_sparse:
                     output_data[f"{feat_name}.values"] = torch.tensor(
