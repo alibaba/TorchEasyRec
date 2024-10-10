@@ -547,3 +547,4 @@ class OdpsWriter(BaseWriter):
                     raise RuntimeError(
                         f"Fail to commit write session: {self._sess_req.session_id}"
                     )
+        super().close()

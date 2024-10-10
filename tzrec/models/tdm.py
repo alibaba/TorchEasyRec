@@ -43,6 +43,7 @@ class TDM(RankModel):
         )
 
         non_seq_fea_dim = 0
+        self.seq_group_name = ""
         self.non_seq_group_name = []
         query_emb_dim = 0
         for feature_group in model_config.feature_groups:

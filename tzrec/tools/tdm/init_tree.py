@@ -65,6 +65,12 @@ if __name__ == "__main__":
         default=2,
         help="The branching factor of the nodes in the tree.",
     )
+    parser.add_argument(
+        "--odps_data_quota_name",
+        type=str,
+        default="pay-as-you-go",
+        help="maxcompute storage api/tunnel data quota name.",
+    )
     args, extra_args = parser.parse_known_args()
 
     generator = TreeGenerator(
@@ -75,6 +81,7 @@ if __name__ == "__main__":
         raw_attr_fields=args.raw_attr_fields,
         tree_output_dir=args.tree_output_dir,
         n_cluster=args.n_cluster,
+        odps_data_quota_name=args.odps_data_quota_name,
     )
     root = generator.generate()
     logger.info("Tree init done. Start save nodes and edges table.")
@@ -82,6 +89,7 @@ if __name__ == "__main__":
         output_file=args.node_edge_output_file,
         root=root,
         child_num=args.n_cluster,
+        odps_data_quota_name=args.odps_data_quota_name,
     )
     tree_search.save()
     tree_search.save_predict_edge()

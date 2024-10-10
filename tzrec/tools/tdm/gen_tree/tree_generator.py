@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -39,6 +39,7 @@ class TreeGenerator:
         raw_attr_fields: Optional[str] = None,
         tree_output_dir: Optional[str] = None,
         n_cluster: int = 2,
+        **kwargs: Any,
     ) -> None:
         self.item_input_path = item_input_path
         self.item_id_field = item_id_field
@@ -52,6 +53,10 @@ class TreeGenerator:
         self.tree_output_dir = tree_output_dir
         self.n_cluster = n_cluster
 
+        self.dataset_kwargs = {}
+        if "odps_data_quota_name" in kwargs:
+            self.dataset_kwargs["quota_name"] = kwargs["odps_data_quota_name"]
+
     def generate(self, save_tree: bool = False) -> TDMTreeClass:
         """Generate tree."""
         item_fea = self._read()
@@ -60,9 +65,11 @@ class TreeGenerator:
 
     def _read(self) -> Dict[str, List[Union[int, float, str]]]:
         item_fea = {"ids": [], "cates": [], "attrs": [], "raw_attrs": []}
-        reader = create_reader(self.item_input_path, 4096)
+        reader = create_reader(self.item_input_path, 4096, **self.dataset_kwargs)
         for data_dict in reader.to_batches():
-            item_fea["ids"] += data_dict[self.item_id_field].to_pylist()
+            item_fea["ids"] += (
+                data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
+            )
             item_fea["cates"] += (
                 data_dict[self.cate_id_field]
                 .cast(pa.string())

@@ -12,7 +12,7 @@
 import os
 import pickle
 from collections import OrderedDict
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 from anytree.importer.dictimporter import DictImporter
@@ -62,6 +62,7 @@ class TreeSearch(object):
         tree_path: Optional[str] = None,
         root: Optional[TDMTreeClass] = None,
         child_num: int = 2,
+        **kwargs: Any,
     ) -> None:
         self.child_num = child_num
         if root is not None:
@@ -81,6 +82,10 @@ class TreeSearch(object):
 
         self.output_file = output_file
 
+        self.dataset_kwargs = {}
+        if "odps_data_quota_name" in kwargs:
+            self.dataset_kwargs["quota_name"] = kwargs["odps_data_quota_name"]
+
         self._get_nodes()
 
     def _load(self, path: str) -> None:
@@ -99,6 +104,9 @@ class TreeSearch(object):
                 self.max_level = level - 1
                 self.level_code.append([])
             self.level_code[self.max_level].append(node)
+        logger.info(
+            f"Tree Level: {self.max_level + 1}, Tree Cluster: {self.child_num}."
+        )
 
         tree_walker = Walker()
         logger.info("Begin Travel Tree.")
@@ -111,7 +119,9 @@ class TreeSearch(object):
     def save(self) -> None:
         """Save tree info."""
         if self.output_file.startswith("odps://"):
-            node_writer = create_writer(self.output_file + "node_table")
+            str_list = self.output_file.split("/")
+            str_list[4] = str_list[4] + "_node_table"
+            node_writer = create_writer("/".join(str_list), **self.dataset_kwargs)
             ids = []
             weight = []
             features = []
@@ -130,8 +140,11 @@ class TreeSearch(object):
             node_table_dict["weight"] = pa.array(weight)
             node_table_dict["features"] = pa.array(features)
             node_writer.write(node_table_dict)
+            node_writer.close()
 
-            edge_writer = create_writer(self.output_file + "edge_table")
+            str_list = self.output_file.split("/")
+            str_list[4] = str_list[4] + "_edge_table"
+            edge_writer = create_writer("/".join(str_list), **self.dataset_kwargs)
             src_ids = []
             dst_ids = []
             weight = []
@@ -146,6 +159,7 @@ class TreeSearch(object):
             edge_table_dict["dst_id"] = pa.array(dst_ids)
             edge_table_dict["weight"] = pa.array(weight)
             edge_writer.write(edge_table_dict)
+            edge_writer.close()
 
         else:
             if not os.path.exists(self.output_file):
@@ -172,7 +186,9 @@ class TreeSearch(object):
     def save_predict_edge(self) -> None:
         """Save edge info for prediction."""
         if self.output_file.startswith("odps://"):
-            writer = create_writer(self.output_file + "predict_edge_table")
+            str_list = self.output_file.split("/")
+            str_list[4] = str_list[4] + "_predict_edge_table"
+            writer = create_writer("/".join(str_list), **self.dataset_kwargs)
             src_ids = []
             dst_ids = []
             weight = []
@@ -187,6 +203,7 @@ class TreeSearch(object):
             edge_table_dict["dst_id"] = pa.array(dst_ids)
             edge_table_dict["weight"] = pa.array(weight)
             writer.write(edge_table_dict)
+            writer.close()
         else:
             with open(
                 os.path.join(self.output_file, "predict_edge_table.txt"), "w"

@@ -29,6 +29,7 @@ from tzrec.datasets.utils import (
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.logging_util import logger
 
 _DATASET_CLASS_MAP = {}
 _READER_CLASS_MAP = {}
@@ -429,7 +430,12 @@ class BaseWriter(metaclass=_writer_meta_cls):
 
     def close(self) -> None:
         """Close and commit data."""
-        pass
+        self._lazy_inited = False
+
+    def __del__(self) -> None:
+        if self._lazy_inited:
+            # pyre-ignore [16]
+            logger.warning(f"You should close {self.__class__.__name__} explicitly.")
 
 
 def create_reader(
