@@ -19,9 +19,19 @@ message SimpleAttention {
     required string input = 2;
 }
 
+message PoolingEncoder {
+    // seq encoder name
+    optional string name = 1;
+    // sequence feature name
+    required string input = 2;
+    // pooling type, sum or mean
+    optional string pooling_type = 3 [default = 'mean'];
+}
+
 message SeqEncoderConfig {
     oneof seq_module {
-        DINEncoder din_encoder=1;
-        SimpleAttention simple_attention=2;
+        DINEncoder din_encoder = 1;
+        SimpleAttention simple_attention = 2;
+        PoolingEncoder pooling_encoder = 3;
     }
 }

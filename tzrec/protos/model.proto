@@ -39,14 +39,15 @@ message ModelConfig {
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
 
-        TDM tdm = 400;
-
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
         DBMTL dbmtl = 202;
         PLE ple = 203;
 
         DSSM dssm = 301;
+        DSSMV2 dssm_v2 = 302;
+
+        TDM tdm = 400;
     }
 
     optional uint32 num_class = 2 [default = 1];

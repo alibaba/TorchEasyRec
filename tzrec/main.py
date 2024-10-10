@@ -60,7 +60,13 @@ from tzrec.features.feature import (
     create_features,
     create_fg_json,
 )
-from tzrec.models.match_model import MatchModel, MatchTower, TowerWrapper
+from tzrec.models.match_model import (
+    MatchModel,
+    MatchTower,
+    MatchTowerWoEG,
+    TowerWoEGWrapper,
+    TowerWrapper,
+)
 from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
@@ -839,8 +845,11 @@ def export(
 
     if isinstance(cpu_model, MatchModel):
         for name, module in cpu_model.named_children():
-            if isinstance(module, MatchTower):
-                tower = ScriptWrapper(TowerWrapper(module, name))
+            if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
+                wrapper = (
+                    TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
+                )
+                tower = ScriptWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 _script_model(
                     ori_pipeline_config,
