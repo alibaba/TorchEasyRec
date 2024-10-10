@@ -538,7 +538,7 @@ def train_and_evaluate(
 
     planner = create_planner(
         device=device,
-        batch_size=data_config.batch_size,
+        batch_size=train_dataloader.dataset.sampled_batch_size,
     )
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD
@@ -656,7 +656,7 @@ def evaluate(
 
     planner = create_planner(
         device=device,
-        batch_size=data_config.batch_size,
+        batch_size=eval_dataloader.dataset.sampled_batch_size,
     )
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD
