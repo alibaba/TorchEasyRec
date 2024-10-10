@@ -144,6 +144,50 @@ class SimpleAttention(SequenceEncoder):
         return torch.matmul(scores.unsqueeze(1), sequence).squeeze(1)
 
 
+class PoolingEncoder(SequenceEncoder):
+    """Mean/Sum pooling sequence encoder.
+
+    Args:
+        sequence_dim (int): sequence tensor channel dimension.
+        query_dim (int): query tensor channel dimension.
+        input(str): input feature group name
+        attn_mlp (dict): target attention MLP module parameters.
+    """
+
+    def __init__(
+        self,
+        sequence_dim: int,
+        input: str,
+        pooling_type: str = "mean",
+        **kwargs: Optional[Dict[str, Any]],
+    ) -> None:
+        super().__init__(input)
+        self._sequence_dim = sequence_dim
+        self._pooling_type = pooling_type
+        assert self._pooling_type in [
+            "sum",
+            "mean",
+        ], "only sum|mean pooling type supported now."
+        self._sequence_name = f"{input}.sequence"
+        self._sequence_length_name = f"{input}.sequence_length"
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._sequence_dim
+
+    def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward the module."""
+        sequence = sequence_embedded[self._sequence_name]
+        feature = torch.sum(sequence, dim=1)
+        if self._pooling_type == "mean":
+            sequence_length = sequence_embedded[self._sequence_length_name]
+            sequence_length = torch.max(
+                sequence_length, torch.ones_like(sequence_length)
+            )
+            feature = feature / sequence_length.unsqueeze(1)
+        return feature
+
+
 class MultiWindowDINEncoder(nn.Module):
     """DIN module for TDM.
 

@@ -170,11 +170,21 @@ class DataParser:
 
             if isinstance(feat_data, SequenceSparseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
+                if self._force_base_data_group:
+                    feat_data.seq_lengths = np.pad(
+                        feat_data.seq_lengths,
+                        (0, max_batch_size - len(feat_data.seq_lengths)),
+                    )
                 output_data[f"{feature.name}.lengths"] = _to_tensor(
                     feat_data.seq_lengths
                 )
             elif isinstance(feat_data, SequenceDenseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
+                if self._force_base_data_group:
+                    feat_data.seq_lengths = np.pad(
+                        feat_data.seq_lengths,
+                        (0, max_batch_size - len(feat_data.seq_lengths)),
+                    )
                 output_data[f"{feature.name}.lengths"] = _to_tensor(
                     feat_data.seq_lengths
                 )

@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
@@ -19,25 +19,15 @@ from torch._tensor import Tensor
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.match_model import MatchModel, MatchTower
+from tzrec.models.match_model import MatchModel, MatchTowerWoEG
+from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos import model_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
-@torch.fx.wrap
-def _update_dict_tensor(
-    tensor_dict: Dict[str, torch.Tensor],
-    new_tensor_dict: Optional[Dict[str, Optional[torch.Tensor]]],
-) -> None:
-    if new_tensor_dict:
-        for k, v in new_tensor_dict.items():
-            if v is not None:
-                tensor_dict[k] = v
-
-
-class DSSMTower(MatchTower):
+class DSSMTower(MatchTowerWoEG):
     """DSSM user/item tower.
 
     Args:
@@ -46,6 +36,7 @@ class DSSMTower(MatchTower):
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
         feature_group (FeatureGroupConfig): feature group config.
+        feature_group_dims (list): feature dimension for each feature.
         features (list): list of features.
     """
 
@@ -55,29 +46,25 @@ class DSSMTower(MatchTower):
         output_dim: int,
         similarity: match_model_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
+        feature_group_dims: List[int],
         features: List[BaseFeature],
-        model_config: model_pb2.ModelConfig,
     ) -> None:
-        super().__init__(
-            tower_config, output_dim, similarity, feature_group, features, model_config
-        )
-        self.init_input()
-        tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
+        super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        tower_feature_in = sum(feature_group_dims)
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
         if self._output_dim > 0:
             self.output = nn.Linear(self.mlp.output_dim(), output_dim)
 
-    def forward(self, batch: Batch) -> torch.Tensor:
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
         """Forward the tower.
 
         Args:
-            batch (Batch): input batch data.
+            feature (torch.Tensor): input batch data.
 
         Return:
             embedding (dict): tower output embedding.
         """
-        grouped_features = self.build_input(batch)
-        mlp_output = self.mlp(grouped_features[self._group_name])
+        mlp_output = self.mlp(feature)
         if self._output_dim > 0:
             output = self.output(mlp_output)
         if self._similarity == match_model_pb2.Similarity.COSINE:
@@ -85,7 +72,7 @@ class DSSMTower(MatchTower):
         return output
 
 
-class DSSM(MatchModel):
+class DSSMV2(MatchModel):
     """DSSM model.
 
     Args:
@@ -102,6 +89,10 @@ class DSSM(MatchModel):
     ) -> None:
         super().__init__(model_config, features, labels)
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
+
+        self.embedding_group = EmbeddingGroup(
+            features, list(model_config.feature_groups)
+        )
 
         user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
@@ -120,8 +111,8 @@ class DSSM(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             user_group,
+            self.embedding_group.group_dims(self._model_config.user_tower.input),
             list(user_features.values()),
-            model_config,
         )
 
         self.item_tower = DSSMTower(
@@ -129,8 +120,8 @@ class DSSM(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             item_group,
+            self.embedding_group.group_dims(self._model_config.item_tower.input),
             item_features,
-            model_config,
         )
 
     def predict(self, batch: Batch) -> Dict[str, Tensor]:
@@ -142,14 +133,13 @@ class DSSM(MatchModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        user_tower_emb = self.user_tower(batch)
-        item_tower_emb = self.item_tower(batch)
-        _update_dict_tensor(
-            self._loss_collection, self.user_tower.group_variational_dropout_loss
-        )
-        _update_dict_tensor(
-            self._loss_collection, self.item_tower.group_variational_dropout_loss
-        )
+        grouped_features = self.embedding_group(batch)
+
+        batch_size = batch.labels[self._labels[0]].size(0)
+        user_feat = grouped_features[self._model_config.user_tower.input][:batch_size]
+        item_feat = grouped_features[self._model_config.item_tower.input]
+        user_tower_emb = self.user_tower(user_feat)
+        item_tower_emb = self.item_tower(item_feat)
 
         ui_sim = (
             self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature

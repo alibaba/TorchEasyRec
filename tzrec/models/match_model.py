@@ -119,6 +119,35 @@ class MatchTower(nn.Module):
         return feature_dict
 
 
+class MatchTowerWoEG(nn.Module):
+    """Base match tower without embedding group for share embedding.
+
+    Args:
+        tower_config (Tower): user/item tower config.
+        output_dim (int): user/item output embedding dimension.
+        similarity (Similarity): when use COSINE similarity,
+            will norm the output embedding.
+        feature_group (FeatureGroupConfig): feature group config.
+        features (list): list of features.
+    """
+
+    def __init__(
+        self,
+        tower_config: tower_pb2.Tower,
+        output_dim: int,
+        similarity: match_model_pb2.Similarity,
+        feature_group: model_pb2.FeatureGroupConfig,
+        features: List[BaseFeature],
+    ) -> None:
+        super().__init__()
+        self._tower_config = tower_config
+        self._group_name = tower_config.input
+        self._output_dim = output_dim
+        self._similarity = similarity
+        self._feature_group = feature_group
+        self._features = features
+
+
 class MatchModel(BaseModel):
     """Base model for match.
 
@@ -288,3 +317,31 @@ class TowerWrapper(nn.Module):
             embedding (dict): tower output embedding.
         """
         return {f"{self._tower_name}_emb": getattr(self, self._tower_name)(batch)}
+
+
+class TowerWoEGWrapper(nn.Module):
+    """Tower without embedding group inference wrapper for jit.script."""
+
+    def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
+        super().__init__()
+        self.embedding_group = EmbeddingGroup(module._features, [module._feature_group])
+        setattr(self, tower_name, module)
+        self._features = module._features
+        self._tower_name = tower_name
+        self._group_name = module._group_name
+
+    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Forward the tower.
+
+        Args:
+            batch (Batch): input batch data.
+
+        Return:
+            embedding (dict): tower output embedding.
+        """
+        grouped_features = self.embedding_group(batch)
+        return {
+            f"{self._tower_name}_emb": getattr(self, self._tower_name)(
+                grouped_features[self._group_name]
+            )
+        }
