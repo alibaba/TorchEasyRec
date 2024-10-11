@@ -17,6 +17,7 @@ from parameterized import parameterized
 from tzrec.modules.sequence import (
     DINEncoder,
     MultiWindowDINEncoder,
+    PoolingEncoder,
     SimpleAttention,
     create_seq_encoder,
 )
@@ -95,6 +96,42 @@ class SimpleAttentionTest(unittest.TestCase):
         }
         result = attn(embedded)
         self.assertEqual(result.size(), (4, 16))
+
+
+class PoolingEncoderTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_mean_pooling(self, graph_type) -> None:
+        attn = PoolingEncoder(16, input="click_seq", pooling_type="mean")
+        self.assertEqual(attn.output_dim(), 16)
+        attn = create_test_module(attn, graph_type)
+        sequence_length = torch.tensor([2, 3, 4, 5])
+        sequence_mask = torch.arange(10).unsqueeze(0) < sequence_length.unsqueeze(1)
+        embedded = {
+            "click_seq.sequence": torch.ones([4, 10, 16]) * sequence_mask.unsqueeze(2),
+            "click_seq.sequence_length": sequence_length,
+        }
+        result = attn(embedded)
+        torch.testing.assert_close(result, torch.ones(4, 16))
+
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_sum_pooling(self, graph_type) -> None:
+        attn = PoolingEncoder(16, input="click_seq", pooling_type="sum")
+        self.assertEqual(attn.output_dim(), 16)
+        attn = create_test_module(attn, graph_type)
+        sequence_length = torch.tensor([2, 3, 4, 5])
+        sequence_mask = torch.arange(10).unsqueeze(0) < sequence_length.unsqueeze(1)
+        embedded = {
+            "click_seq.sequence": torch.ones([4, 10, 16]) * sequence_mask.unsqueeze(2),
+            "click_seq.sequence_length": sequence_length,
+        }
+        result = attn(embedded)
+        torch.testing.assert_close(
+            result, torch.ones(4, 16) * sequence_length.unsqueeze(1)
+        )
 
 
 class MultiWindowDINEncoderTest(unittest.TestCase):
