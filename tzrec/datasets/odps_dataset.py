@@ -151,16 +151,46 @@ def _calc_slice_position(
     slice_count: int,
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
-) -> Tuple[int, int]:
-    """Calc table read position according to the slice information."""
-    size = int(row_count / slice_count)
-    split_point = row_count % slice_count
+    pre_total_remain: int = 0,
+) -> Tuple[int, int, int]:
+    """Calc table read position according to the slice information.
+
+    Args:
+        row_count (int): table total row count.
+        slice_id (int): worker id.
+        slice_count (int): total worker number.
+        batch_size (int): batch_size.
+        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
+            equal one to prevent train_eval hung.
+        pre_total_remain (int): remaining total count in pre-table is
+            insufficient to meet the batch_size requirement for each worker.
+
+    Return:
+        start (int): start row position in table.
+        end (int): start row position in table.
+        total_remain (int): remaining total count in curr-table is
+            insufficient to meet the batch_size requirement for each worker.
+    """
+    pre_remain_size = int(pre_total_remain / slice_count)
+    pre_remain_split_point = pre_total_remain % slice_count
+
+    size = int((row_count + pre_total_remain) / slice_count)
+    split_point = (row_count + pre_total_remain) % slice_count
     if slice_id < split_point:
         start = slice_id * (size + 1)
         end = start + (size + 1)
     else:
         start = split_point * (size + 1) + (slice_id - split_point) * size
         end = start + size
+
+    real_start = (
+        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
+    )
+    real_end = (
+        end
+        - pre_remain_size * (slice_id + 1)
+        - min(pre_remain_split_point, slice_id + 1)
+    )
     # when (end - start) % bz = 1 on some workers and
     # (end - start) % bz = 0 on other workers, train_eval will hang
     if (
@@ -169,8 +199,9 @@ def _calc_slice_position(
         and (end - start) % batch_size == 1
         and size % batch_size == 0
     ):
-        end = end - 1
-    return start, end
+        real_end = real_end - 1
+        split_point = 0
+    return real_start, real_end, (size % batch_size) * slice_count + split_point
 
 
 def _read_rows_arrow_with_retry(
@@ -200,20 +231,23 @@ def _reader_iter(
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
 ) -> Iterator[pa.RecordBatch]:
-    for sess_req in sess_reqs:
+    num_sess = len(sess_reqs)
+    remain_row_count = 0
+    for i, sess_req in enumerate(sess_reqs):
         while True:
             scan_resp = client.get_read_session(sess_req)
             if scan_resp.session_status == SessionStatus.INIT:
                 time.sleep(1)
                 continue
             break
-        start, end = _calc_slice_position(
+        start, end, remain_row_count = _calc_slice_position(
             # pyre-ignore [6]
             scan_resp.record_count,
             worker_id,
             num_workers,
             batch_size,
-            drop_redundant_bs_eq_one,
+            drop_redundant_bs_eq_one if i == num_sess - 1 else False,
+            remain_row_count,
         )
 
         offset = 0

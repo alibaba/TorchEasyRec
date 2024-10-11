@@ -21,7 +21,7 @@ from parameterized import parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter
+from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _calc_slice_position
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import test_util
@@ -49,6 +49,26 @@ class OdpsDatasetTest(unittest.TestCase):
     def tearDown(self):
         if self.o is not None:
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
+
+    def test_calc_slice_position(self):
+        num_tables = 81
+        num_workers = 8
+        batch_size = 10
+        remain_row_counts = [0] * num_workers
+        worker_row_counts = [0] * num_workers
+        for i in range(num_tables):
+            for j in range(num_workers):
+                start, end, remain_row_counts[j] = _calc_slice_position(
+                    row_count=81,
+                    slice_id=j,
+                    slice_count=num_workers,
+                    batch_size=batch_size,
+                    drop_redundant_bs_eq_one=True if i == num_tables - 1 else False,
+                    pre_total_remain=remain_row_counts[j],
+                )
+                worker_row_counts[j] += end - start
+        self.assertTrue(np.all(np.ceil(np.array(worker_row_counts) / batch_size) == 82))
+        self.assertEqual(sum(worker_row_counts), num_tables * 81 - 1)
 
     @parameterized.expand([[False], [True]])
     @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")

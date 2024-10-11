@@ -19,7 +19,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.tdm import TDM
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
-from tzrec.protos.models import rank_model_pb2
+from tzrec.protos.models import match_model_pb2
 from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
 
 
@@ -85,7 +85,7 @@ class TDMTest(unittest.TestCase):
         ]
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            tdm=rank_model_pb2.TDM(
+            tdm=match_model_pb2.TDM(
                 multiwindow_din=tower_pb2.MultiWindowDIN(
                     windows_len=[1, 2, 5], attn_mlp=module_pb2.MLP(hidden_units=[8, 4])
                 ),

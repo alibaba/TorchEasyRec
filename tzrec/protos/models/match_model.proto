@@ -1,6 +1,7 @@
 syntax = "proto2";
 package tzrec.protos;
 
+import "tzrec/protos/module.proto";
 import "tzrec/protos/tower.proto";
 
 enum Similarity {
@@ -32,4 +33,9 @@ message DSSMV2 {
     optional float temperature = 5 [default = 1.0];
     // use in batch items as negative items.
     optional bool in_batch_negative = 6 [default = false];
+}
+
+message TDM {
+    required MultiWindowDIN multiwindow_din =1;
+    required MLP final = 2;
 }
