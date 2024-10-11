@@ -302,6 +302,11 @@ class BaseSampler(metaclass=_meta_cls):
         # pyre-ignore [16]
         return features, nodes.indices
 
+    @property
+    def estimated_sample_num(self) -> int:
+        """Max number of sampled num examples."""
+        raise NotImplementedError
+
 
 class NegativeSampler(BaseSampler):
     """Negative Sampler.
@@ -362,6 +367,11 @@ class NegativeSampler(BaseSampler):
         features = self._parse_nodes(nodes)
         result_dict = dict(zip(self._attr_names, features))
         return result_dict
+
+    @property
+    def estimated_sample_num(self) -> int:
+        """Estimated number of sampled num examples."""
+        return self._num_sample
 
 
 class NegativeSamplerV2(BaseSampler):
@@ -452,6 +462,11 @@ class NegativeSamplerV2(BaseSampler):
         features = self._parse_nodes(nodes)
         result_dict = dict(zip(self._attr_names, features))
         return result_dict
+
+    @property
+    def estimated_sample_num(self) -> int:
+        """Estimated number of sampled num examples."""
+        return self._num_sample
 
 
 class HardNegativeSampler(BaseSampler):
@@ -547,6 +562,11 @@ class HardNegativeSampler(BaseSampler):
         result_dict = dict(zip(self._attr_names, results))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
         return result_dict
+
+    @property
+    def estimated_sample_num(self) -> int:
+        """Estimated number of sampled num examples."""
+        return self._num_sample + min(self._num_hard_sample, 8) * self._batch_size
 
 
 class HardNegativeSamplerV2(BaseSampler):
@@ -648,6 +668,11 @@ class HardNegativeSamplerV2(BaseSampler):
         result_dict = dict(zip(self._attr_names, results))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
         return result_dict
+
+    @property
+    def estimated_sample_num(self) -> int:
+        """Estimated number of sampled num examples."""
+        return self._num_sample + min(self._num_hard_sample, 8) * self._batch_size
 
 
 class TDMSampler(BaseSampler):
@@ -840,6 +865,13 @@ class TDMSampler(BaseSampler):
 
         return pos_result_dict, neg_result_dict
 
+    @property
+    def estimated_sample_num(self) -> int:
+        """Estimated number of sampled num examples."""
+        return (
+            sum(self._layer_num_sample) + len(self._layer_num_sample) - 2
+        ) * self._batch_size
+
 
 class TDMPredictSampler(BaseSampler):
     """TDM predict sampler.
@@ -913,3 +945,8 @@ class TDMPredictSampler(BaseSampler):
         pos_result_dict = dict(zip(self._attr_names[1:], pos_fea_result))
 
         return pos_result_dict
+
+    @property
+    def estimated_sample_num(self) -> int:
+        """Estimated number of sampled num examples."""
+        return min((2 ** (self._max_level - 1)), 800) * self._batch_size

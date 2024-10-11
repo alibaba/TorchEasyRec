@@ -158,6 +158,7 @@ class SamplerTest(unittest.TestCase):
                 ],
                 batch_size=4,
             )
+            assert sampler.estimated_sample_num == 8
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()
@@ -285,6 +286,7 @@ class SamplerTest(unittest.TestCase):
                 ],
                 batch_size=4,
             )
+            assert sampler.estimated_sample_num == 8
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()
@@ -332,6 +334,7 @@ class SamplerTest(unittest.TestCase):
                 ],
                 batch_size=4,
             )
+            assert sampler.estimated_sample_num == 40
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()
@@ -381,6 +384,7 @@ class SamplerTest(unittest.TestCase):
                 ],
                 batch_size=4,
             )
+            assert sampler.estimated_sample_num == 40
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()
@@ -426,6 +430,7 @@ class SamplerTest(unittest.TestCase):
                 ],
                 batch_size=4,
             )
+            assert sampler.estimated_sample_num == 76
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()
@@ -487,6 +492,7 @@ class SamplerTest(unittest.TestCase):
                 ],
                 batch_size=4,
             )
+            assert sampler.estimated_sample_num == 128
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()

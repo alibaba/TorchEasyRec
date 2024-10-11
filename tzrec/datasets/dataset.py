@@ -346,6 +346,14 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             batch = self._data_parser.to_batch(output_data)
         return batch
 
+    @property
+    def sampled_batch_size(self) -> int:
+        """Batch size with sampler."""
+        if self._sampler:
+            return self._batch_size + self._sampler.estimated_sample_num
+        else:
+            return self._batch_size
+
 
 class BaseReader(metaclass=_reader_meta_cls):
     """Reader base class.
