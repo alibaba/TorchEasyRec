@@ -538,6 +538,7 @@ def train_and_evaluate(
 
     planner = create_planner(
         device=device,
+        # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
     )
     plan = planner.collective_plan(
@@ -656,6 +657,7 @@ def evaluate(
 
     planner = create_planner(
         device=device,
+        # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
     )
     plan = planner.collective_plan(

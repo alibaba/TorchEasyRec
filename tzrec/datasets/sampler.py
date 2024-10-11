@@ -369,7 +369,7 @@ class NegativeSampler(BaseSampler):
         return result_dict
 
     @property
-    def estimated_sample_num(self):
+    def estimated_sample_num(self) -> int:
         """Estimated number of sampled num examples."""
         return self._num_sample
 
@@ -868,7 +868,9 @@ class TDMSampler(BaseSampler):
     @property
     def estimated_sample_num(self) -> int:
         """Estimated number of sampled num examples."""
-        return sum(self._layer_num_sample) + len(self._layer_num_sample) - 2
+        return (
+            sum(self._layer_num_sample) + len(self._layer_num_sample) - 2
+        ) * self._batch_size
 
 
 class TDMPredictSampler(BaseSampler):
@@ -947,4 +949,4 @@ class TDMPredictSampler(BaseSampler):
     @property
     def estimated_sample_num(self) -> int:
         """Estimated number of sampled num examples."""
-        return min((2**self._max_level), 800) * self._batch_size
+        return min((2 ** (self._max_level - 1)), 800) * self._batch_size
