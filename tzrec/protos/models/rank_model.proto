@@ -20,8 +20,3 @@ message MultiTowerDIN {
     repeated DINTower din_towers = 2;
     required MLP final = 3;
 }
-
-message TDM {
-    required MultiWindowDIN multiwindow_din =1;
-    required MLP final = 2;
-}
