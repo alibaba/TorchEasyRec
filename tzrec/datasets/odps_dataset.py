@@ -152,7 +152,7 @@ def _calc_slice_position(
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
     pre_total_remain: int = 0,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
     """Calc table read position according to the slice information.
 
     Args:
