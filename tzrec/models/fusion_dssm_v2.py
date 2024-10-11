@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) Alibaba, Inc. and its affiliates.
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import torch
@@ -159,8 +159,13 @@ class FusionDSSMV2(FusionMatchModel):
 
         name_to_feature = {x.name: x for x in features}
         user_features = [
-            [name_to_feature[x] for x in g.feature_names] for g in user_groups
+            OrderedDict([(x, name_to_feature[x]) for x in g.feature_names])
+            for g in user_groups
         ]
+        for i, g in enumerate(user_groups):
+            for sequence_group in g.sequence_groups:
+                for x in sequence_group.feature_names:
+                    user_features[i][x] = name_to_feature[x]
         item_features = [name_to_feature[x] for x in item_group.feature_names]
 
         self._user_tower_perm_feat = {

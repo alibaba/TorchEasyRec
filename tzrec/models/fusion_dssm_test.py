@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) Alibaba, Inc. and its affiliates.
 import unittest
 
 import torch

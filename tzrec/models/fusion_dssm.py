@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) Alibaba, Inc. and its affiliates.
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import torch
@@ -21,7 +21,6 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.fusion_match_model import FusionMatchModel
 from tzrec.models.match_model import MatchTower
-from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.interaction import InputSENet
 from tzrec.modules.mlp import MLP
 from tzrec.protos import model_pb2, tower_pb2
@@ -62,6 +61,7 @@ class DSSMTower(MatchTower):
         use_senet (bool): use input senet or not.
         feature_group (FeatureGroupConfig): feature group config.
         features (list): list of features.
+        model_config (ModelConfig): an instance of ModelConfig.
     """
 
     def __init__(
@@ -72,12 +72,15 @@ class DSSMTower(MatchTower):
         use_senet: bool,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
+        model_config: model_pb2.ModelConfig,
         perm_features: Optional[List[str]] = None,
         perm_nflods: int = 0,
     ) -> None:
-        super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        super().__init__(
+            tower_config, output_dim, similarity, feature_group, features, model_config
+        )
         self._use_senet = use_senet
-        self.embedding_group = EmbeddingGroup(features, [feature_group])
+        self.init_input()
         if self._use_senet:
             self.senet = InputSENet(
                 length_per_key=self.embedding_group.group_dims(self._group_name)
@@ -110,7 +113,7 @@ class DSSMTower(MatchTower):
         Return:
             embedding (dict): tower output embedding.
         """
-        grouped_features = self.embedding_group(batch)
+        grouped_features = self.build_input(batch)
         feature = grouped_features[self._group_name]
         if tower_index is not None:
             feature = feature[tower_index]
@@ -157,8 +160,13 @@ class FusionDSSM(FusionMatchModel):
 
         name_to_feature = {x.name: x for x in features}
         user_features = [
-            [name_to_feature[x] for x in g.feature_names] for g in user_groups
+            OrderedDict([(x, name_to_feature[x]) for x in g.feature_names])
+            for g in user_groups
         ]
+        for i, g in enumerate(user_groups):
+            for sequence_group in g.sequence_groups:
+                for x in sequence_group.feature_names:
+                    user_features[i][x] = name_to_feature[x]
         item_features = [name_to_feature[x] for x in item_group.feature_names]
 
         self._user_tower_perm_feat = {
@@ -182,7 +190,8 @@ class FusionDSSM(FusionMatchModel):
                     self._model_config.similarity,
                     self._model_config.use_senet,
                     user_groups[i],
-                    user_features[i],
+                    list(user_features[i].values()),
+                    model_config,
                     perm_features,
                     perm_nflods,
                 ),
@@ -194,6 +203,7 @@ class FusionDSSM(FusionMatchModel):
             self._model_config.use_senet,
             item_group,
             item_features,
+            model_config,
         )
 
     def predict(self, batch: Batch) -> Dict[str, Tensor]:

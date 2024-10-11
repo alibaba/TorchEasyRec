@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) Alibaba, Inc. and its affiliates.
 from typing import Dict, List
 
 import torch
@@ -19,7 +18,6 @@ from torch.nn import functional as F
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.multi_task_rank import MultiTaskRank
-from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mmoe import MMoE as MMoEModule
 from tzrec.modules.sequence import SimpleAttention
 from tzrec.modules.task_tower import TaskTower
@@ -42,9 +40,7 @@ class TMMoE(MultiTaskRank):
         super().__init__(model_config, features, labels)
         self._task_tower_cfgs = self._model_config.task_towers
 
-        self.embedding_group = EmbeddingGroup(
-            features, list(model_config.feature_groups)
-        )
+        self.init_input()
 
         mmoe_feature_in = self.embedding_group.group_total_dim("dnn")
         self._use_skill = self.embedding_group.has_group("skill")
@@ -104,7 +100,7 @@ class TMMoE(MultiTaskRank):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        grouped_features = self.embedding_group(batch)
+        grouped_features = self.build_input(batch)
         mmoe_features = [grouped_features["dnn"]]
         if self._use_skill:
             mmoe_features.append(self.skill_attn(grouped_features))
