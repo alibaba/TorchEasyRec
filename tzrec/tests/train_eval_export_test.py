@@ -584,7 +584,7 @@ class TrainEvalExportTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_tdm_retrieval(
                 scripted_model_path=os.path.join(self.test_dir, "export"),
-                eval_data_path=os.path.join(self.test_dir, "eval_data/*.parquet"),
+                eval_data_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 retrieval_output_path=os.path.join(self.test_dir, "retrieval_result"),
                 reserved_columns="user_id,item_id",
                 test_dir=self.test_dir,
