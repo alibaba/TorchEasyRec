@@ -125,16 +125,26 @@ class TreeSearch(object):
             ids = []
             weight = []
             features = []
+            first_node = True
             for level, nodes in enumerate(self.level_code):
                 for node in nodes:
-                    ids.append(node.item_id)
-                    weight.append(1.0)
                     fea = [level, node.item_id]
                     if node.attrs:
                         fea.append(node.attrs)
                     if node.raw_attrs:
                         fea.append(node.raw_attrs)
+
+                    # add a node with id -1 for graph-learn to get root node
+                    if first_node:
+                        ids.append(-1)
+                        weight.append(1.0)
+                        features.append(",".join(["-1"] + list(map(str, fea[1:]))))
+                        first_node = False
+
+                    ids.append(node.item_id)
+                    weight.append(1.0)
                     features.append(",".join(map(str, fea)))
+
             node_table_dict = OrderedDict()
             node_table_dict["id"] = pa.array(ids)
             node_table_dict["weight"] = pa.array(weight)
@@ -166,15 +176,19 @@ class TreeSearch(object):
                 os.makedirs(self.output_file)
             with open(os.path.join(self.output_file, "node_table.txt"), "w") as f:
                 f.write("id:int64\tweight:float\tfeature:string\n")
+                first_node = True
                 for level, nodes in enumerate(self.level_code):
                     for node in nodes:
-                        f.write(f"{node.item_id}\t{1.0}\t")
                         fea = [level, node.item_id]
                         if node.attrs:
                             fea.append(node.attrs)
                         if node.raw_attrs:
                             fea.append(node.raw_attrs)
-                        f.write(",".join(map(str, fea)) + "\n")
+                        # add a node with id -1 for graph-learn to get root node
+                        if first_node:
+                            f.write(f"-1\t1.0\t-1,{','.join(map(str, fea[1:]))}\n")
+                            first_node = False
+                        f.write(f"{node.item_id}\t1.0\t{','.join(map(str, fea))}\n")
 
             with open(os.path.join(self.output_file, "edge_table.txt"), "w") as f:
                 f.write("src_id:int64\tdst_id:int64\tweight:float\n")
@@ -189,9 +203,10 @@ class TreeSearch(object):
             str_list = self.output_file.split("/")
             str_list[4] = str_list[4] + "_predict_edge_table"
             writer = create_writer("/".join(str_list), **self.dataset_kwargs)
-            src_ids = []
-            dst_ids = []
-            weight = []
+            # add a edge from -1 to root for graph-learn to get root node
+            src_ids = [-1]
+            dst_ids = [self.root.item_id]
+            weight = [1.0]
             for i in range(self.max_level):
                 for node in self.level_code[i]:
                     for child in node.children:
@@ -209,6 +224,8 @@ class TreeSearch(object):
                 os.path.join(self.output_file, "predict_edge_table.txt"), "w"
             ) as f:
                 f.write("src_id:int64\tdst_id:int64\tweight:float\n")
+                # add a edge from  with id -1 to root for graph-learn to get root node
+                f.write(f"-1\t{self.root.item_id}\t1.0\n")
                 for i in range(self.max_level):
                     for node in self.level_code[i]:
                         for child in node.children:

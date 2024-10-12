@@ -23,43 +23,12 @@ from torch.distributed import ReduceOp
 
 from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
-from tzrec.datasets.dataset import create_reader, create_writer
+from tzrec.datasets.dataset import create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
 from tzrec.main import _create_features, _get_dataloader, init_process_group
 from tzrec.protos.data_pb2 import DatasetType
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import ProgressLogger, logger
-
-
-def gen_data_for_tdm_retrieval(
-    data_input_path: str,
-    data_output_path: str,
-    item_id_field: str,
-    gt_item_id_field: str,
-    root_id: int,
-    writer_type: Optional[str] = None,
-    save_to_output_path: bool = True,
-) -> Dict[str, pa.Array]:
-    """Transform eval data for tdm retrieval."""
-    reader = create_reader(data_input_path, 256)
-    eval_data_dict = {}
-    for data_dict in reader.to_batches():
-        for k, v in data_dict.items():
-            if k not in eval_data_dict:
-                eval_data_dict[k] = v
-            else:
-                eval_data_dict[k] = pa.concat_arrays([eval_data_dict[k], v])
-
-    eval_data_dict[gt_item_id_field] = eval_data_dict[item_id_field]
-    eval_data_dict[item_id_field] = pa.array(
-        [root_id] * len(eval_data_dict[gt_item_id_field])
-    )
-
-    if save_to_output_path:
-        writer = create_writer(data_output_path, writer_type)
-        writer.write(eval_data_dict)
-
-    return eval_data_dict
 
 
 def update_data(
@@ -98,7 +67,6 @@ def tdm_retrieval(
     predict_output_path: str,
     scripted_model_path: str,
     recall_num: int,
-    gt_item_id_field: str,
     n_cluster: int = 2,
     reserved_columns: Optional[str] = None,
     batch_size: Optional[int] = None,
@@ -115,7 +83,6 @@ def tdm_retrieval(
         scripted_model_path (str): path to scripted model.
         recall_num (int): recall item num per user.
         n_cluster (int): tree cluster num.
-        gt_item_id_field (str): ground true item id field.
         reserved_columns (str, optional): columns to reserved in output.
         batch_size (int, optional): predict batch_size.
         is_profiling (bool): profiling predict process or not.
@@ -210,7 +177,6 @@ def tdm_retrieval(
     pos_sampler.init_cluster(num_client_per_rank=1)
     pos_sampler.launch_server()
     pos_sampler.init()
-    pos_sampler.init_sampler(n_cluster)
     i_step = 0
 
     num_class = pipeline_config.model_config.num_class
@@ -220,13 +186,16 @@ def tdm_retrieval(
     total = 0
     while True:
         try:
-            # TBD (hongsheng.jhs): prefetch data on memcpy stream
             batch = next(infer_iterator)
             reserve_batch_record = batch.reserves.get()
-            node_ids = reserve_batch_record[item_id_field]
-            cur_batch_size = len(node_ids)
+            gt_node_ids = reserve_batch_record[item_id_field]
+            cur_batch_size = len(gt_node_ids)
+            # get root node
+            pos_sampler.init_sampler(1)
+            node_ids = pos_sampler.get(pa.array([-1] * cur_batch_size))[item_id_field]
 
             expand_num = n_cluster**first_recall_layer
+            pos_sampler.init_sampler(n_cluster)
             for layer in range(1, max_level):
                 sampled_result_dict = pos_sampler.get(node_ids)
 
@@ -289,9 +258,10 @@ def tdm_retrieval(
             writer.write(output_dict)
 
             # calculate precision and recall
-            gt_node_ids = reserve_batch_record[gt_item_id_field].to_numpy()
-            retrieval_result = np.any(np.equal(gt_node_ids[:, None], node_ids), axis=1)
-            total += len(gt_node_ids)
+            retrieval_result = np.any(
+                np.equal(gt_node_ids.to_numpy()[:, None], node_ids), axis=1
+            )
+            total += cur_batch_size
             recall += np.sum(retrieval_result)
 
             if is_rank_zero:
@@ -334,12 +304,6 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="inference data output path",
-    )
-    parser.add_argument(
-        "--gt_item_id_field",
-        type=str,
-        default=None,
-        help="grond true item id field",
     )
     parser.add_argument(
         "--reserved_columns",
@@ -388,7 +352,6 @@ if __name__ == "__main__":
         predict_output_path=args.predict_output_path,
         scripted_model_path=args.scripted_model_path,
         recall_num=args.recall_num,
-        gt_item_id_field=args.gt_item_id_field,
         n_cluster=args.n_cluster,
         reserved_columns=args.reserved_columns,
         batch_size=args.batch_size,

@@ -11,8 +11,6 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 - 训练样本数据: [taobao_data_recall_train_transformed](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train_transformed.tar.gz)
 - 评估样本数据: [taobao_data_recall_eval_transformed](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval_transformed.tar.gz)
 - 物品池特征数据: [taobao_ad_feature_transformed_fill](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature_transformed_fill.tar.gz)
-- 对评估数据集处理用于召回时beam search的数据: [taobao_data_recall_eval_for_tdm_retrieval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval_for_tdm_retrieval.tar.gz)
-  - TDM召回时， 需要从根节点逐层beam search。 因此召回时所有ite特征应设为root节点的特征。
 
 #### 配置文件
 
@@ -24,12 +22,10 @@ mkdir -p data
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train_transformed.tar.gz
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval_transformed.tar.gz
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature_transformed_fill.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval_for_tdm_retrieval.tar.gz
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/tdm_taobao_local.config
 tar xf taobao_data_recall_train_transformed.tar.gz -C data
 tar xf taobao_data_recall_eval_transformed.tar.gz -C data
 tar xf taobao_ad_feature_transformed_fill.tar.gz -C data
-tar xf taobao_data_recall_eval_for_tdm_retrieval.tar.gz -C data
 ```
 
 ### 启动命令
@@ -174,19 +170,17 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.tools.tdm.retrieval \
     --scripted_model_path experiments/tdm_taobao_local/export/ \
-    --predict_input_path data/taobao_data_recall_eval_for_tdm_retrieval/\*.parquet \
+    --predict_input_path data/taobao_data_recall_eval_transformed/\*.parquet \
     --predict_output_path data/init_tree/taobao_data_eval_recall \
-    --gt_item_id_field gt_adgroup_id \
     --recall_num 200 \
     --n_cluster 2 \
     --reserved_columns user_id,gt_adgroup_id \
-    --batch_size 64
+    --batch_size 32
 ```
 
 - --scripted_model_path: 要预测的模型
 - --predict_input_path: 预测输入数据的路径
 - --predict_output_path: 预测输出数据的路径
-- --gt_item_id_field: 文件中代表真实点击item_id的列名
 - --recall_num:(可选, 默认为200) 召回的数量
 - --n_cluster:(可选, 默认为2) 数的分叉数量, 应与建树时输入保持一致
 - --reserved_columns: 预测结果中要保留的输入列
