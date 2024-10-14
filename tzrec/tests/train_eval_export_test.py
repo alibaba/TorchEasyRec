@@ -582,19 +582,11 @@ class TrainEvalExportTest(unittest.TestCase):
                 embedding_field="item_emb",
             )
         if self.success:
-            with open(os.path.join(self.test_dir, "init_tree/node_table.txt")) as f:
-                for line_number, line in enumerate(f):
-                    if line_number == 1:
-                        root_id = int(line.split("\t")[0])
-                        break
             self.success = utils.test_tdm_retrieval(
                 scripted_model_path=os.path.join(self.test_dir, "export"),
-                eval_data_path=os.path.join(self.test_dir, "eval_data/*.parquet"),
+                eval_data_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 retrieval_output_path=os.path.join(self.test_dir, "retrieval_result"),
-                item_id="item_id",
-                gt_item_id="gt_item_id",
-                root_id=root_id,
-                reserved_columns="user_id,gt_item_id",
+                reserved_columns="user_id,item_id",
                 test_dir=self.test_dir,
             )
 

@@ -34,7 +34,6 @@ from tzrec.features.sequence_feature import SequenceIdFeature, SequenceRawFeatur
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.tools.tdm.retrieval import gen_data_for_tdm_retrieval
 from tzrec.utils import config_util, misc_util
 
 
@@ -1107,49 +1106,10 @@ def test_tdm_retrieval(
     scripted_model_path: str,
     eval_data_path: str,
     retrieval_output_path: str,
-    item_id: str,
-    gt_item_id: str,
-    root_id: int,
     reserved_columns: str,
     test_dir: str,
 ) -> bool:
     """Run tdm retrieval test."""
-    eval_data_for_tdm_retrieval_path = os.path.join(
-        test_dir, "eval_data_for_tdm_retrieval"
-    )
-    eval_data_for_tdm_retrieval = gen_data_for_tdm_retrieval(
-        eval_data_path,
-        eval_data_for_tdm_retrieval_path,
-        item_id,
-        gt_item_id,
-        root_id,
-        writer_type="ParquetWriter",
-        save_to_output_path=False,
-    )
-
-    t = pa.Table.from_arrays(
-        list(eval_data_for_tdm_retrieval.values()),
-        names=list(eval_data_for_tdm_retrieval.keys()),
-    )
-    pipeline_config = config_util.load_pipeline_config(
-        os.path.join(scripted_model_path, "pipeline.config")
-    )
-    data_config = pipeline_config.data_config
-
-    num_parts = data_config.num_workers * 2
-    num_rows = data_config.batch_size * num_parts * 4
-    max_rows_per_file = num_rows // num_parts
-    ds.write_dataset(
-        t,
-        eval_data_for_tdm_retrieval_path,
-        format="parquet",
-        max_rows_per_file=max_rows_per_file,
-        max_rows_per_group=min(max_rows_per_file, 1024 * 1024),
-    )
-
-    eval_data_for_tdm_retrieval_path = os.path.join(
-        eval_data_for_tdm_retrieval_path, r"\*.parquet"
-    )
     port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
@@ -1158,10 +1118,9 @@ def test_tdm_retrieval(
         f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
-        f"--predict_input_path {eval_data_for_tdm_retrieval_path} "
+        f"--predict_input_path {eval_data_path} "
         f"--predict_output_path {retrieval_output_path} "
         f"--reserved_columns {reserved_columns} "
-        f"--gt_item_id_field {gt_item_id} "
         f"--recall_num 2 "
         f"--n_cluster 2 "
     )
