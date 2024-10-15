@@ -452,19 +452,14 @@ if __name__ == "__main__":
         help="dataset type, default will use dataset type in config.",
     )
     parser.add_argument(
-        "--recall_num",
-        type=int,
-        default=200,
+        "--recall_num", type=int, default=200, help="recall item num per user."
     )
-    parser.add_argument(
-        "--n_cluster",
-        type=int,
-        default=2,
-    )
+    parser.add_argument("--n_cluster", type=int, default=2, help="tree cluster num.")
     parser.add_argument(
         "--num_worker_per_level",
         type=int,
         default=1,
+        help="num data generate worker per tree level.",
     )
     args, extra_args = parser.parse_known_args()
 
