@@ -229,15 +229,16 @@ class BaseSampler(metaclass=_meta_cls):
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
             launch_server(self._g, self._cluster, int(os.environ.get("GROUP_RANK", 0)))
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
         gl.set_tracker_mode(0)
         assert self._cluster, "should init cluster first."
-        worker_info = get_worker_info()
-        if worker_info is None:
-            client_id = 0
-        else:
-            client_id = worker_info.id
+        if client_id < 0:
+            worker_info = get_worker_info()
+            if worker_info is None:
+                client_id = 0
+            else:
+                client_id = worker_info.id
         client_id += self._client_id_bias
         task_index = (
             self._num_client_per_rank * int(os.environ.get("RANK", 0)) + client_id

@@ -10,10 +10,14 @@
 # limitations under the License.
 
 import argparse
+import copy
 import math
 import os
+import time
 from collections import OrderedDict
-from typing import Dict, Optional
+from multiprocessing import Process, Queue
+from threading import Thread
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -25,6 +29,7 @@ from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.dataset import create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
+from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.main import _create_features, _get_dataloader, init_process_group
 from tzrec.protos.data_pb2 import DatasetType
 from tzrec.utils import config_util
@@ -32,14 +37,13 @@ from tzrec.utils.logging_util import ProgressLogger, logger
 
 
 def update_data(
-    input_data: pa.RecordBatch, sampled_data: Dict[str, pa.Array], num: int
+    input_data: pa.RecordBatch, sampled_data: Dict[str, pa.Array]
 ) -> Dict[str, pa.Array]:
     """Update input data based on sampled data.
 
     Args:
         input_data (pa.RecordBatch): raw input data.
         sampled_data (dict): sampled data.
-        num (int): each user's expansion count.
 
     Returns:
         updated data.
@@ -52,14 +56,59 @@ def update_data(
     for item_fea in item_fea_fields:
         updated_data[item_fea] = sampled_data[item_fea]
 
+    item_field_0 = list(item_fea_fields)[0]
+    expand_num = len(sampled_data[item_field_0]) // len(input_data[item_field_0])
     for user_fea in user_fea_fields:
         _user_fea_array = input_data[user_fea]
-        index = np.repeat(np.arange(len(_user_fea_array)), num)
+        index = np.repeat(np.arange(len(_user_fea_array)), expand_num)
 
         expand_user_fea = _user_fea_array.take(index)
         updated_data[user_fea] = expand_user_fea
 
     return updated_data
+
+
+def _tdm_predict_data_worker(
+    sampler: TDMPredictSampler,
+    data_parser: DataParser,
+    first_recall_layer: int,
+    n_cluster: int,
+    in_queue: Queue,
+    out_queue: Queue,
+    worker_id: int,
+) -> None:
+    item_id_field = sampler._item_id_field
+    sampler.init(worker_id)
+    sampler.init_sampler(n_cluster)
+
+    while True:
+        record_batch_t, node_ids = in_queue.get()
+
+        if record_batch_t is None:
+            out_queue.put((None, None, None))
+            time.sleep(10)
+            break
+
+        record_batch = record_batch_t.get()
+        if worker_id == 0:
+            sampler.init_sampler(1)
+
+            gt_node_ids = record_batch[item_id_field]
+            cur_batch_size = len(gt_node_ids)
+            node_ids = sampler.get(pa.array([-1] * cur_batch_size))[item_id_field]
+
+            # skip layers before first_recall_layer
+            sampler.init_sampler(n_cluster)
+            for _ in range(1, first_recall_layer):
+                sampled_result_dict = sampler.get(node_ids)
+                node_ids = sampled_result_dict[item_id_field]
+
+        sampled_result_dict = sampler.get(node_ids)
+        updated_inputs = update_data(record_batch, sampled_result_dict)
+        output_data = data_parser.parse(updated_inputs)
+        batch = data_parser.to_batch(output_data, force_no_tile=True)
+
+        out_queue.put((batch, record_batch_t, updated_inputs[item_id_field]))
 
 
 def tdm_retrieval(
@@ -115,8 +164,10 @@ def tdm_retrieval(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
+    infer_data_config = copy.copy(data_config)
+    infer_data_config.num_workers = 1
     infer_dataloader = _get_dataloader(
-        data_config,
+        infer_data_config,
         features,
         predict_input_path,
         reserved_columns=["ALL_COLUMNS"],
@@ -171,86 +222,81 @@ def tdm_retrieval(
     # pyre-ignore [16]
     fields = dataset.input_fields
     # pyre-ignore [29]
-    pos_sampler = TDMPredictSampler(
+    predict_sampler = TDMPredictSampler(
         sampler_config, fields, batch_size, is_training=False
     )
-    pos_sampler.init_cluster(num_client_per_rank=1)
-    pos_sampler.launch_server()
-    pos_sampler.init()
-    i_step = 0
+    predict_sampler.init_cluster(num_client_per_rank=max_level - first_recall_layer)
+    predict_sampler.launch_server()
 
     num_class = pipeline_config.model_config.num_class
     pos_prob_name = "probs1" if num_class == 2 else "probs"
 
-    recall = 0
-    total = 0
-    while True:
-        try:
-            batch = next(infer_iterator)
-            reserve_batch_record = batch.reserves.get()
-            gt_node_ids = reserve_batch_record[item_id_field]
+    def _forward(
+        batch: Batch,
+        record_batch_t: RecordBatchTensor,
+        node_ids: pa.Array,
+        layer_id: int,
+    ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
+        with torch.no_grad():
+            parsed_inputs = batch.to_dict(sparse_dtype=sparse_dtype)
+            # when predicting with a model exported using INPUT_TILE,
+            #  we set the batch size tensor to 1 to disable tiling.
+            parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
+            predictions = model(parsed_inputs, device)
+
+            gt_node_ids = record_batch_t.get()[item_id_field]
             cur_batch_size = len(gt_node_ids)
-            # get root node
-            pos_sampler.init_sampler(1)
-            node_ids = pos_sampler.get(pa.array([-1] * cur_batch_size))[item_id_field]
-
-            expand_num = n_cluster**first_recall_layer
-            pos_sampler.init_sampler(n_cluster)
-            for layer in range(1, max_level):
-                sampled_result_dict = pos_sampler.get(node_ids)
-
-                # skip layers before first_recall_layer
-                if layer < first_recall_layer:
-                    node_ids = sampled_result_dict[item_id_field]
-                    continue
-
-                updated_inputs = update_data(
-                    reserve_batch_record, sampled_result_dict, expand_num
+            probs = predictions[pos_prob_name].reshape(cur_batch_size, -1)
+            if layer_id < max_level - 1:
+                k = 2 * recall_num
+                _, topk_indices_in_group = torch.topk(probs, k, dim=1)
+                topk_indices = (
+                    topk_indices_in_group
+                    + torch.arange(cur_batch_size, device=device).unsqueeze(1)
+                    * n_cluster
+                    * k
                 )
-                parsed_inputs = parser.parse(updated_inputs)
-                for key, value in parsed_inputs.items():
-                    if value.dtype in [torch.int32, torch.int64]:
-                        parsed_inputs[key] = value.to(sparse_dtype)
-                predictions = model(parsed_inputs, device)
-
-                probs = predictions[pos_prob_name].reshape(cur_batch_size, -1)
-
-                if layer == max_level - 1:
-                    k = recall_num
-                    candidate_ids = (
-                        updated_inputs[item_id_field]
-                        .to_numpy()
-                        .reshape(cur_batch_size, -1)
+                topk_indices = topk_indices.reshape(-1).cpu().numpy()
+                node_ids = node_ids.take(topk_indices)
+            else:
+                k = recall_num
+                candidate_ids = node_ids.to_numpy(zero_copy_only=False).reshape(
+                    cur_batch_size, -1
+                )
+                sort_prob_index = torch.argsort(-probs, dim=1).cpu().numpy()
+                sort_cand_ids = np.take_along_axis(
+                    candidate_ids, sort_prob_index, axis=1
+                )
+                node_ids = []
+                for i in range(cur_batch_size):
+                    _, unique_indices = np.unique(sort_cand_ids[i], return_index=True)
+                    node_ids.append(
+                        np.take(sort_cand_ids[i], np.sort(unique_indices)[:k]).tolist()
                     )
-                    sort_prob_index = torch.argsort(-probs, dim=1).cpu().numpy()
-                    sort_cand_ids = np.take_along_axis(
-                        candidate_ids, sort_prob_index, axis=1
-                    )
-                    node_ids = []
-                    for i in range(cur_batch_size):
-                        _, unique_indices = np.unique(
-                            sort_cand_ids[i], return_index=True
-                        )
-                        node_ids.append(
-                            np.take(
-                                sort_cand_ids[i], np.sort(unique_indices)[:k]
-                            ).tolist()
-                        )
-                else:
-                    k = 2 * recall_num
-                    _, topk_indices_in_group = torch.topk(probs, k, dim=1)
-                    topk_indices = (
-                        topk_indices_in_group
-                        + torch.arange(cur_batch_size, device=device).unsqueeze(1)
-                        * expand_num
-                    )
-                    topk_indices = topk_indices.reshape(-1).cpu().numpy()
-                    node_ids = updated_inputs[item_id_field].take(topk_indices)
+            return record_batch_t, node_ids
 
-                if layer == first_recall_layer:
-                    expand_num = n_cluster * k
+    def _forward_loop(data_queue: Queue, pred_queue: Queue, layer_id: int) -> None:
+        while True:
+            batch, record_batch_t, node_ids = data_queue.get()
+            if batch is None:
+                pred_queue.put((None, None))
+                break
+            assert batch is not None
+            pred = _forward(batch, record_batch_t, node_ids, layer_id)
+            pred_queue.put(pred)
+
+    def _write_loop(pred_queue: Queue, metric_queue: Queue) -> None:
+        total = 0
+        recall = 0
+        while True:
+            record_batch_t, node_ids = pred_queue.get()
+            if record_batch_t is None:
+                break
 
             output_dict = OrderedDict()
+            reserve_batch_record = record_batch_t.get()
+            gt_node_ids = reserve_batch_record[item_id_field]
+            cur_batch_size = len(gt_node_ids)
             if reserved_cols is not None:
                 for c in reserved_cols:
                     output_dict[c] = reserve_batch_record[c]
@@ -259,12 +305,54 @@ def tdm_retrieval(
 
             # calculate precision and recall
             retrieval_result = np.any(
-                np.equal(gt_node_ids.to_numpy()[:, None], node_ids), axis=1
+                np.equal(gt_node_ids.to_numpy(zero_copy_only=False)[:, None], node_ids),
+                axis=1,
             )
             total += cur_batch_size
             recall += np.sum(retrieval_result)
+        metric_queue.put((total, recall))
 
-            if is_rank_zero:
+    in_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer + 1)]
+    out_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer)]
+    metric_queue = Queue(maxsize=1)
+
+    data_p_list = []
+    for i in range(max_level - first_recall_layer):
+        p = Process(
+            target=_tdm_predict_data_worker,
+            args=(
+                predict_sampler,
+                parser,
+                first_recall_layer,
+                n_cluster,
+                in_queues[i],
+                out_queues[i],
+                i,
+            ),
+        )
+        p.start()
+        data_p_list.append(p)
+
+    forward_t_list = []
+    for i in range(max_level - first_recall_layer):
+        t = Thread(
+            target=_forward_loop,
+            args=(out_queues[i], in_queues[i + 1], i + first_recall_layer),
+        )
+        t.start()
+        forward_t_list.append(t)
+
+    write_t = Thread(
+        target=_write_loop, args=(in_queues[len(in_queues) - 1], metric_queue)
+    )
+    write_t.start()
+
+    i_step = 0
+    while True:
+        try:
+            batch = next(infer_iterator)
+            in_queues[0].put((batch.reserves, None))
+            if is_local_rank_zero:
                 plogger.log(i_step)
             if is_profiling:
                 prof.step()
@@ -272,6 +360,16 @@ def tdm_retrieval(
         except StopIteration:
             break
 
+    in_queues[0].put((None, None))
+    for p in data_p_list:
+        p.join()
+    for t in forward_t_list:
+        t.join()
+    write_t.join()
+    writer.close()
+
+    total, recall = metric_queue.get()
+    logger.info(f"Rank {os.environ.get('RANK', 0)}. Recall:{recall}, Total: {total}.")
     total_t = torch.tensor(total, device=device)
     recall_t = torch.tensor(recall, device=device)
     dist.all_reduce(total_t, op=ReduceOp.SUM)
