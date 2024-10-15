@@ -345,9 +345,9 @@ class NegativeSampler(BaseSampler):
         self._item_id_field = config.item_id_field
         self._sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._sampler = self._g.negative_sampler(
             "item", expand_factor, strategy="node_weight"
@@ -425,9 +425,9 @@ class NegativeSamplerV2(BaseSampler):
         self._user_id_field = config.user_id_field
         self._sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._sampler = self._g.negative_sampler(
             "edge", expand_factor, strategy="random", conditional=True
@@ -523,9 +523,9 @@ class HardNegativeSampler(BaseSampler):
         self._neg_sampler = None
         self._hard_neg_sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._neg_sampler = self._g.negative_sampler(
             "item", expand_factor, strategy="node_weight"
@@ -628,9 +628,9 @@ class HardNegativeSamplerV2(BaseSampler):
         self._neg_sampler = None
         self._hard_neg_sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._neg_sampler = self._g.negative_sampler(
             "edge", expand_factor, strategy="random", conditional=True
@@ -744,9 +744,9 @@ class TDMSampler(BaseSampler):
                 )
             self._remain_p = p
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         self._pos_sampler = self._g.neighbor_sampler(
             meta_path=["ancestor"],
             expand_factor=self._max_level - 2,

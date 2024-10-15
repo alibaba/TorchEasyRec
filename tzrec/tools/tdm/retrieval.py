@@ -27,7 +27,7 @@ from torch.distributed import ReduceOp
 
 from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
-from tzrec.datasets.dataset import create_writer
+from tzrec.datasets.dataset import BaseWriter, create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.main import _create_features, _get_dataloader, init_process_group
@@ -75,6 +75,7 @@ def _tdm_predict_data_worker(
     n_cluster: int,
     in_queue: Queue,
     out_queue: Queue,
+    is_first_layer: bool,
     worker_id: int,
 ) -> None:
     item_id_field = sampler._item_id_field
@@ -90,7 +91,7 @@ def _tdm_predict_data_worker(
             break
 
         record_batch = record_batch_t.get()
-        if worker_id == 0:
+        if is_first_layer:
             sampler.init_sampler(1)
 
             gt_node_ids = record_batch[item_id_field]
@@ -123,6 +124,7 @@ def tdm_retrieval(
     debug_level: int = 0,
     dataset_type: Optional[str] = None,
     writer_type: Optional[str] = None,
+    num_worker_per_level: int = 1,
 ) -> None:
     """Evaluate EasyRec TDM model.
 
@@ -139,8 +141,9 @@ def tdm_retrieval(
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
+        num_worker_per_level (int): num data generate worker per tree level.
     """
-    reserved_cols = None
+    reserved_cols: Optional[list[str]] = None
     if reserved_columns is not None:
         reserved_cols = [x.strip() for x in reserved_columns.split(",")]
 
@@ -152,8 +155,9 @@ def tdm_retrieval(
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
 
-    device, _ = init_process_group()
-    sparse_dtype = torch.int32 if device.type == "cuda" else torch.int64
+    device_and_backend = init_process_group()
+    device: torch.device = device_and_backend[0]
+    sparse_dtype: torch.dtype = torch.int32 if device.type == "cuda" else torch.int64
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
@@ -180,7 +184,7 @@ def tdm_retrieval(
         writer_type = DatasetType.Name(data_config.dataset_type).replace(
             "Dataset", "Writer"
         )
-    writer = create_writer(
+    writer: BaseWriter = create_writer(
         predict_output_path,
         writer_type,
         quota_name=data_config.odps_data_quota_name,
@@ -214,8 +218,8 @@ def tdm_retrieval(
     parser = DataParser(features)
 
     sampler_config = pipeline_config.data_config.tdm_sampler
-    item_id_field = sampler_config.item_id_field
-    max_level = len(sampler_config.layer_num_sample)
+    item_id_field: str = sampler_config.item_id_field
+    max_level: int = len(sampler_config.layer_num_sample)
     first_recall_layer = int(math.ceil(math.log(2 * n_cluster * recall_num, n_cluster)))
 
     dataset = infer_dataloader.dataset
@@ -225,18 +229,20 @@ def tdm_retrieval(
     predict_sampler = TDMPredictSampler(
         sampler_config, fields, batch_size, is_training=False
     )
-    predict_sampler.init_cluster(num_client_per_rank=max_level - first_recall_layer)
+    predict_sampler.init_cluster(
+        num_client_per_rank=(max_level - first_recall_layer) * num_worker_per_level
+    )
     predict_sampler.launch_server()
 
     num_class = pipeline_config.model_config.num_class
-    pos_prob_name = "probs1" if num_class == 2 else "probs"
+    pos_prob_name: str = "probs1" if num_class == 2 else "probs"
 
     def _forward(
         batch: Batch,
         record_batch_t: RecordBatchTensor,
         node_ids: pa.Array,
         layer_id: int,
-    ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
+    ) -> Tuple[RecordBatchTensor, pa.Array]:
         with torch.no_grad():
             parsed_inputs = batch.to_dict(sparse_dtype=sparse_dtype)
             # when predicting with a model exported using INPUT_TILE,
@@ -247,18 +253,7 @@ def tdm_retrieval(
             gt_node_ids = record_batch_t.get()[item_id_field]
             cur_batch_size = len(gt_node_ids)
             probs = predictions[pos_prob_name].reshape(cur_batch_size, -1)
-            if layer_id < max_level - 1:
-                k = 2 * recall_num
-                _, topk_indices_in_group = torch.topk(probs, k, dim=1)
-                topk_indices = (
-                    topk_indices_in_group
-                    + torch.arange(cur_batch_size, device=device).unsqueeze(1)
-                    * n_cluster
-                    * k
-                )
-                topk_indices = topk_indices.reshape(-1).cpu().numpy()
-                node_ids = node_ids.take(topk_indices)
-            else:
+            if layer_id == max_level - 1:
                 k = recall_num
                 candidate_ids = node_ids.to_numpy(zero_copy_only=False).reshape(
                     cur_batch_size, -1
@@ -273,14 +268,30 @@ def tdm_retrieval(
                     node_ids.append(
                         np.take(sort_cand_ids[i], np.sort(unique_indices)[:k]).tolist()
                     )
+                node_ids = pa.array(node_ids)
+            else:
+                k = 2 * recall_num
+                _, topk_indices_in_group = torch.topk(probs, k, dim=1)
+                topk_indices = topk_indices_in_group + torch.arange(
+                    cur_batch_size, device=device
+                ).unsqueeze(1) * probs.size(1)
+                topk_indices = topk_indices.reshape(-1).cpu().numpy()
+                node_ids = node_ids.take(topk_indices)
+
             return record_batch_t, node_ids
 
     def _forward_loop(data_queue: Queue, pred_queue: Queue, layer_id: int) -> None:
+        stop_cnt = 0
         while True:
             batch, record_batch_t, node_ids = data_queue.get()
             if batch is None:
-                pred_queue.put((None, None))
-                break
+                stop_cnt += 1
+                if stop_cnt == num_worker_per_level:
+                    for _ in range(num_worker_per_level):
+                        pred_queue.put((None, None))
+                    break
+                else:
+                    continue
             assert batch is not None
             pred = _forward(batch, record_batch_t, node_ids, layer_id)
             pred_queue.put(pred)
@@ -300,12 +311,15 @@ def tdm_retrieval(
             if reserved_cols is not None:
                 for c in reserved_cols:
                     output_dict[c] = reserve_batch_record[c]
-            output_dict["recall_ids"] = pa.array(node_ids)
+            output_dict["recall_ids"] = node_ids
             writer.write(output_dict)
 
             # calculate precision and recall
             retrieval_result = np.any(
-                np.equal(gt_node_ids.to_numpy(zero_copy_only=False)[:, None], node_ids),
+                np.equal(
+                    gt_node_ids.to_numpy(zero_copy_only=False)[:, None],
+                    node_ids.to_numpy(),
+                ),
                 axis=1,
             )
             total += cur_batch_size
@@ -318,20 +332,22 @@ def tdm_retrieval(
 
     data_p_list = []
     for i in range(max_level - first_recall_layer):
-        p = Process(
-            target=_tdm_predict_data_worker,
-            args=(
-                predict_sampler,
-                parser,
-                first_recall_layer,
-                n_cluster,
-                in_queues[i],
-                out_queues[i],
-                i,
-            ),
-        )
-        p.start()
-        data_p_list.append(p)
+        for j in range(num_worker_per_level):
+            p = Process(
+                target=_tdm_predict_data_worker,
+                args=(
+                    predict_sampler,
+                    parser,
+                    first_recall_layer,
+                    n_cluster,
+                    in_queues[i],
+                    out_queues[i],
+                    i == 0,
+                    i * num_worker_per_level + j,
+                ),
+            )
+            p.start()
+            data_p_list.append(p)
 
     forward_t_list = []
     for i in range(max_level - first_recall_layer):
@@ -360,7 +376,8 @@ def tdm_retrieval(
         except StopIteration:
             break
 
-    in_queues[0].put((None, None))
+    for _ in range(num_worker_per_level):
+        in_queues[0].put((None, None))
     for p in data_p_list:
         p.join()
     for t in forward_t_list:
@@ -369,7 +386,6 @@ def tdm_retrieval(
     writer.close()
 
     total, recall = metric_queue.get()
-    logger.info(f"Rank {os.environ.get('RANK', 0)}. Recall:{recall}, Total: {total}.")
     total_t = torch.tensor(total, device=device)
     recall_t = torch.tensor(recall, device=device)
     dist.all_reduce(total_t, op=ReduceOp.SUM)
@@ -443,6 +459,11 @@ if __name__ == "__main__":
         type=int,
         default=2,
     )
+    parser.add_argument(
+        "--num_worker_per_level",
+        type=int,
+        default=1,
+    )
     args, extra_args = parser.parse_known_args()
 
     tdm_retrieval(
@@ -456,4 +477,5 @@ if __name__ == "__main__":
         is_profiling=args.is_profiling,
         debug_level=args.debug_level,
         dataset_type=args.dataset_type,
+        num_worker_per_level=args.num_worker_per_level,
     )

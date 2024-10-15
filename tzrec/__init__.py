@@ -11,6 +11,9 @@
 
 import os as _os
 
+if "OMP_NUM_THREADS" not in _os.environ:
+    _os.environ["OMP_NUM_THREADS"] = "1"
+
 try:
     # import graphlearn before set GLOG_logtostderr, prevent graphlearn's glog to stderr
     import graphlearn as _gl  # NOQA

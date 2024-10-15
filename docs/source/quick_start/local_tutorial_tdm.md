@@ -108,7 +108,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 #### 根据item embedding重新聚类建树
 
 ```bash
-OMP_NUM_THREADS=4 python tzrec/tools/tdm/cluster_tree.py \
+python tzrec/tools/tdm/cluster_tree.py \
     --item_input_path experiments/tdm_taobao_local/item_emb/\*.parquet \
     --item_id_field adgroup_id \
     --embedding_field item_emb \
@@ -174,7 +174,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     --predict_output_path data/init_tree/taobao_data_eval_recall \
     --recall_num 200 \
     --n_cluster 2 \
-    --reserved_columns user_id,gt_adgroup_id \
+    --reserved_columns user_id,adgroup_id \
     --batch_size 32
 ```
 
