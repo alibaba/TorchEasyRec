@@ -96,15 +96,17 @@ def _tdm_predict_data_worker(
 
             gt_node_ids = record_batch[item_id_field]
             cur_batch_size = len(gt_node_ids)
-            node_ids = sampler.get(pa.array([-1] * cur_batch_size))[item_id_field]
+            node_ids = sampler.get({item_id_field: pa.array([-1] * cur_batch_size)})[
+                item_id_field
+            ]
 
             # skip layers before first_recall_layer
             sampler.init_sampler(n_cluster)
             for _ in range(1, first_recall_layer):
-                sampled_result_dict = sampler.get(node_ids)
+                sampled_result_dict = sampler.get({item_id_field: node_ids})
                 node_ids = sampled_result_dict[item_id_field]
 
-        sampled_result_dict = sampler.get(node_ids)
+        sampled_result_dict = sampler.get({item_id_field: node_ids})
         updated_inputs = update_data(record_batch, sampled_result_dict)
         output_data = data_parser.parse(updated_inputs)
         batch = data_parser.to_batch(output_data, force_no_tile=True)
@@ -266,7 +268,7 @@ def tdm_retrieval(
                 for i in range(cur_batch_size):
                     _, unique_indices = np.unique(sort_cand_ids[i], return_index=True)
                     node_ids.append(
-                        np.take(sort_cand_ids[i], np.sort(unique_indices)[:k]).tolist()
+                        np.take(sort_cand_ids[i], np.sort(unique_indices)[:k])
                     )
                 node_ids = pa.array(node_ids)
             else:
@@ -318,7 +320,7 @@ def tdm_retrieval(
             retrieval_result = np.any(
                 np.equal(
                     gt_node_ids.to_numpy(zero_copy_only=False)[:, None],
-                    node_ids.to_numpy(),
+                    np.array(node_ids.to_pylist()),
                 ),
                 axis=1,
             )

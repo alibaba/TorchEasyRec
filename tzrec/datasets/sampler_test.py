@@ -499,7 +499,7 @@ class SamplerTest(unittest.TestCase):
             sampler.init_sampler(2)
             res.update(
                 sampler.get(
-                    pa.array([21, 22, 23, 24]),
+                    {"item_id": pa.array([21, 22, 23, 24])},
                 )
             )
 

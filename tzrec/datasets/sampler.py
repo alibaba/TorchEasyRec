@@ -930,16 +930,22 @@ class TDMPredictSampler(BaseSampler):
             strategy="random_without_replacement",
         )
 
-    def get(self, input_ids: pa.Array) -> Dict[str, pa.Array]:
+    def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
 
         Args:
-            input_ids (pa.Array): input item_id.
+            input_data (dict): input data with item_id.
 
         Returns:
             Positive and negative sampled feature dict.
         """
-        ids = input_ids.cast(pa.int64()).fill_null(0).to_numpy().reshape(-1, 1)
+        ids = (
+            input_data[self._item_id_field]
+            .cast(pa.int64())
+            .fill_null(0)
+            .to_numpy()
+            .reshape(-1, 1)
+        )
 
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
