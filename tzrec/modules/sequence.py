@@ -235,8 +235,11 @@ class MultiWindowDINEncoder(SequenceEncoder):
         query = sequence_embedded[self._query_name]
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
-
         max_seq_length = sequence.size(1)
+        sequence_mask = _arange(
+            max_seq_length, device=sequence_length.device
+        ).unsqueeze(0) < sequence_length.unsqueeze(1)
+
         if self._query_dim < self._sequence_dim:
             query = F.pad(query, (0, self._sequence_dim - self._query_dim))
         queries = query.unsqueeze(1).expand(-1, max_seq_length, -1)  # [B, T, C]
@@ -246,7 +249,7 @@ class MultiWindowDINEncoder(SequenceEncoder):
         attn_output = self.linear(attn_output)
         attn_output = self.active(attn_output)  # [B, T, 1]
 
-        att_sequences = attn_output * sequence
+        att_sequences = attn_output * sequence_mask.unsqueeze(2) * sequence
 
         pad = (0, 0, 0, self._sum_windows_len - max_seq_length)
         pad_att_sequences = F.pad(att_sequences, pad).transpose(0, 1)
