@@ -583,7 +583,7 @@ class TrainEvalExportTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_tdm_retrieval(
-                scripted_model_path=os.path.join(self.test_dir, "export"),
+                scripted_model_path=os.path.join(self.test_dir, "export/model"),
                 eval_data_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 retrieval_output_path=os.path.join(self.test_dir, "retrieval_result"),
                 reserved_columns="user_id,item_id",
@@ -601,10 +601,12 @@ class TrainEvalExportTest(unittest.TestCase):
             )
         )
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+            os.path.exists(
+                os.path.join(self.test_dir, "export/model/scripted_model.pt")
+            )
         )
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/serving_tree"))
+            os.path.exists(os.path.join(self.test_dir, "export/model/serving_tree"))
         )
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "retrieval_result")))
 

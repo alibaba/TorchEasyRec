@@ -86,6 +86,7 @@ LR策略可以支持按epoch更新或者按step更新
       ```
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录下记录trace文件
+- use_tensorboard: 是否使用tensorboard，默认为true
 
 ## 训练性能优化
 

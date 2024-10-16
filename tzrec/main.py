@@ -350,7 +350,7 @@ def _train_and_evaluate(
     eval_summary_writer = None
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
-    if is_rank_zero:
+    if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
 
@@ -873,15 +873,16 @@ def export(
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
+                break
         _script_model(
             ori_pipeline_config,
             ScriptWrapper(cpu_model),
             cpu_state_dict,
             dataloader,
-            export_dir,
+            os.path.join(export_dir, "model"),
         )
         for asset in assets:
-            shutil.copy(asset, export_dir)
+            shutil.copy(asset, os.path.join(export_dir, "model"))
     else:
         _script_model(
             ori_pipeline_config,

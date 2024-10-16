@@ -18,6 +18,8 @@ DEEP: 深度特征组。其中feature_names只能包含非序列特征（IdFeatu
 
 - SimpleAttention: 类似于DINEncoder,其中的**score**是`query`和`sequence`矩阵相乘，得到序列特征中对用的权重，然后对权重和向量乘积求和得到池化向量。由于要做矩阵相乘，要求`query`和`sequence`的特征输数量和顺序一定相同。
 
+- PoolingEncoder: 对变长的`sequence`的Emebdding做池化，`pooling_type`支持mean和sum两种，常用于向量召回模型的user侧特征组
+
 #### WIDE
 
 WIDE: 广度特征组，主要用于WideAndDeep/DeepFM模型。其中feature_names只能包含非序列特征IdFeature/RawFeature/ComboFeature等，embedding_dim固定为4，不根据feature_group中的embedding_dim的配置变化而变化，开发者可以根据group_name从EmbeddingGroup的输出字典中获取到相应的特征组Embedding。不可以包含sequence_groups。
