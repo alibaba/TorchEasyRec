@@ -11,6 +11,7 @@
 
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -52,7 +53,7 @@ class DINEncoder(SequenceEncoder):
     Args:
         sequence_dim (int): sequence tensor channel dimension.
         query_dim (int): query tensor channel dimension.
-        input(str): input feature group name
+        input(str): input feature group name.
         attn_mlp (dict): target attention MLP module parameters.
     """
 
@@ -149,9 +150,8 @@ class PoolingEncoder(SequenceEncoder):
 
     Args:
         sequence_dim (int): sequence tensor channel dimension.
-        query_dim (int): query tensor channel dimension.
-        input(str): input feature group name
-        attn_mlp (dict): target attention MLP module parameters.
+        input (str): input feature group name.
+        pooling_type (str): pooling type, sum or mean.
     """
 
     def __init__(
@@ -188,38 +188,57 @@ class PoolingEncoder(SequenceEncoder):
         return feature
 
 
-class MultiWindowDINEncoder(nn.Module):
-    """DIN module for TDM.
+class MultiWindowDINEncoder(SequenceEncoder):
+    """Multi Window DIN module.
 
     Args:
-        query_emb_dim (int): sequence and query tensor channel dimension.
+        sequence_dim (int): sequence tensor channel dimension.
+        query_dim (int): query tensor channel dimension.
+        input(str): input feature group name.
         windows_len (list): time windows len.
         attn_mlp (dict): target attention MLP module parameters.
     """
 
     def __init__(
-        self, query_emb_dim: int, windows_len: List[int], attn_mlp: Dict[str, Any]
+        self,
+        sequence_dim: int,
+        query_dim: int,
+        input: str,
+        windows_len: List[int],
+        attn_mlp: Dict[str, Any],
+        **kwargs: Optional[Dict[str, Any]],
     ) -> None:
-        super().__init__()
-        self.query_emb_dim = query_emb_dim
+        super().__init__(input)
+        self._query_dim = query_dim
+        self._sequence_dim = sequence_dim
+        self._windows_len = windows_len
+        if self._query_dim > self._sequence_dim:
+            raise ValueError("query_dim > sequence_dim not supported yet.")
         self.register_buffer("windows_len", torch.tensor(windows_len))
-        self.sum_windows_len = sum(windows_len)
-        self.mlp = MLP(in_features=query_emb_dim * 3, **attn_mlp)
+        self.register_buffer(
+            "cumsum_windows_len", torch.tensor(np.cumsum([0] + list(windows_len)[:-1]))
+        )
+        self._sum_windows_len = sum(windows_len)
+        self.mlp = MLP(in_features=sequence_dim * 3, **attn_mlp)
         self.linear = nn.Linear(self.mlp.hidden_units[-1], 1)
         self.active = nn.PReLU()
+        self._query_name = f"{input}.query"
+        self._sequence_name = f"{input}.sequence"
+        self._sequence_length_name = f"{input}.sequence_length"
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
-        return self.query_emb_dim * (len(self.windows_len) + 1)
+        return self._sequence_dim * (len(self._windows_len) + 1)
 
-    def forward(self, query: torch.Tensor, sequence: torch.Tensor) -> torch.Tensor:
-        """Forward the module.
+    def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward the module."""
+        query = sequence_embedded[self._query_name]
+        sequence = sequence_embedded[self._sequence_name]
+        sequence_length = sequence_embedded[self._sequence_length_name]
 
-        Args:
-            query (Tensor): query tensor with shape [B, C]
-            sequence (Tensor): sequence tensor with shape [B, T, C]
-        """
         max_seq_length = sequence.size(1)
+        if self._query_dim < self._sequence_dim:
+            query = F.pad(query, (0, self._sequence_dim - self._query_dim))
         queries = query.unsqueeze(1).expand(-1, max_seq_length, -1)  # [B, T, C]
 
         attn_input = torch.cat([sequence, queries * sequence, queries], dim=-1)
@@ -229,11 +248,19 @@ class MultiWindowDINEncoder(nn.Module):
 
         att_sequences = attn_output * sequence
 
-        pad = (0, 0, 0, self.sum_windows_len - max_seq_length)
+        pad = (0, 0, 0, self._sum_windows_len - max_seq_length)
         pad_att_sequences = F.pad(att_sequences, pad).transpose(0, 1)
         result = torch.segment_reduce(
-            pad_att_sequences, reduce="mean", lengths=self.windows_len, axis=0
+            pad_att_sequences, reduce="sum", lengths=self.windows_len, axis=0
         ).transpose(0, 1)  # [B, L, C]
+
+        segment_length = torch.min(
+            sequence_length.unsqueeze(1) - self.cumsum_windows_len.unsqueeze(0),
+            self.windows_len,
+        )
+        result = result / torch.max(
+            segment_length, torch.ones_like(segment_length)
+        ).unsqueeze(2)
 
         return torch.cat([result, query.unsqueeze(1)], dim=1).reshape(
             result.shape[0], -1
