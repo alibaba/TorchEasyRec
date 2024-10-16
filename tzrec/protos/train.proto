@@ -22,5 +22,7 @@ message TrainConfig {
     optional uint32 log_step_count_steps = 8 [default = 100];
     // profiling or not
     optional bool is_profiling = 9 [default = false];
+    // use tensorboard or not.
+    optional bool use_tensorboard = 10 [default = true];
     // TBD: qcomm config
 }

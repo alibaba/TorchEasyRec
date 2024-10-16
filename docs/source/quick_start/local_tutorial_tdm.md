@@ -70,7 +70,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 #### 导出模型和embedding模块
 
-导出命令会自动导出模型模块和embedding模块, embedding模块会存在embedding子目录下
+导出命令会自动导出模型和embedding模块, 模型模块会存在model子目录下，embedding模块会存在embedding子目录下
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
@@ -169,7 +169,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.tools.tdm.retrieval \
-    --scripted_model_path experiments/tdm_taobao_local/export/ \
+    --scripted_model_path experiments/tdm_taobao_local/export/model/ \
     --predict_input_path data/taobao_data_recall_eval_transformed/\*.parquet \
     --predict_output_path data/init_tree/taobao_data_eval_recall \
     --recall_num 200 \
