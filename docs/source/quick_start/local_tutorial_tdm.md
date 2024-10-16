@@ -34,12 +34,12 @@ tar xf taobao_ad_feature_transformed_fill.tar.gz -C data
 
 ```bash
 python -m tzrec.tools.tdm.init_tree \
---item_input_path data/taobao_ad_feature_transformed_fill/\*.parquet \
---item_id_field adgroup_id \
---cate_id_field cate_id \
---attr_fields cate_id,campaign_id,customer,brand,price \
---node_edge_output_file data/init_tree \
---tree_output_dir data/init_tree
+    --item_input_path data/taobao_ad_feature_transformed_fill/\*.parquet \
+    --item_id_field adgroup_id \
+    --cate_id_field cate_id \
+    --attr_fields cate_id,campaign_id,customer,brand,price \
+    --node_edge_output_file data/init_tree \
+    --tree_output_dir data/init_tree
 ```
 
 - --item_input_path: 建树用的item特征文件
@@ -108,7 +108,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 #### 根据item embedding重新聚类建树
 
 ```bash
-python tzrec/tools/tdm/cluster_tree.py \
+python -m tzrec.tools.tdm.cluster_tree \
     --item_input_path experiments/tdm_taobao_local/item_emb/\*.parquet \
     --item_id_field adgroup_id \
     --embedding_field item_emb \
