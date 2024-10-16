@@ -1165,7 +1165,7 @@ def test_tdm_cluster_train_eval(
     log_dir = os.path.join(test_dir, "log_tdm_cluster")
     cluster_cmd_str = (
         "PYTHONPATH=. "
-        "OMP_NUM_THREADS=1 python tzrec/tools/tdm/cluster_tree.py "
+        "python tzrec/tools/tdm/cluster_tree.py "
         f"--item_input_path {item_input_path} "
         f"--item_id_field {item_id} "
         f"--embedding_field {embedding_field} "

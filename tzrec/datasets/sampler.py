@@ -229,15 +229,16 @@ class BaseSampler(metaclass=_meta_cls):
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
             launch_server(self._g, self._cluster, int(os.environ.get("GROUP_RANK", 0)))
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
         gl.set_tracker_mode(0)
         assert self._cluster, "should init cluster first."
-        worker_info = get_worker_info()
-        if worker_info is None:
-            client_id = 0
-        else:
-            client_id = worker_info.id
+        if client_id < 0:
+            worker_info = get_worker_info()
+            if worker_info is None:
+                client_id = 0
+            else:
+                client_id = worker_info.id
         client_id += self._client_id_bias
         task_index = (
             self._num_client_per_rank * int(os.environ.get("RANK", 0)) + client_id
@@ -344,9 +345,9 @@ class NegativeSampler(BaseSampler):
         self._item_id_field = config.item_id_field
         self._sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._sampler = self._g.negative_sampler(
             "item", expand_factor, strategy="node_weight"
@@ -424,9 +425,9 @@ class NegativeSamplerV2(BaseSampler):
         self._user_id_field = config.user_id_field
         self._sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._sampler = self._g.negative_sampler(
             "edge", expand_factor, strategy="random", conditional=True
@@ -522,9 +523,9 @@ class HardNegativeSampler(BaseSampler):
         self._neg_sampler = None
         self._hard_neg_sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._neg_sampler = self._g.negative_sampler(
             "item", expand_factor, strategy="node_weight"
@@ -627,9 +628,9 @@ class HardNegativeSamplerV2(BaseSampler):
         self._neg_sampler = None
         self._hard_neg_sampler = None
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         expand_factor = int(math.ceil(self._num_sample / self._batch_size))
         self._neg_sampler = self._g.negative_sampler(
             "edge", expand_factor, strategy="random", conditional=True
@@ -743,9 +744,9 @@ class TDMSampler(BaseSampler):
                 )
             self._remain_p = p
 
-    def init(self) -> None:
+    def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
-        super().init()
+        super().init(client_id)
         self._pos_sampler = self._g.neighbor_sampler(
             meta_path=["ancestor"],
             expand_factor=self._max_level - 2,
@@ -929,16 +930,22 @@ class TDMPredictSampler(BaseSampler):
             strategy="random_without_replacement",
         )
 
-    def get(self, input_ids: pa.Array) -> Dict[str, pa.Array]:
+    def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
 
         Args:
-            input_ids (pa.Array): input item_id.
+            input_data (dict): input data with item_id.
 
         Returns:
             Positive and negative sampled feature dict.
         """
-        ids = input_ids.cast(pa.int64()).fill_null(0).to_numpy().reshape(-1, 1)
+        ids = (
+            input_data[self._item_id_field]
+            .cast(pa.int64())
+            .fill_null(0)
+            .to_numpy()
+            .reshape(-1, 1)
+        )
 
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
