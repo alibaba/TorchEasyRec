@@ -935,14 +935,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 )
                 if i == 0:
                     sequence_length = jt.lengths()
+                    group_sequence_length = _int_item(torch.max(sequence_length))
                     if need_tile:
-                        group_sequence_length = _int_item(sequence_length)
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
                             batch_size
                         )
-
                     else:
-                        group_sequence_length = _int_item(torch.max(sequence_length))
                         results[f"{group_name}.sequence_length"] = sequence_length
                 jt = jt.to_padded_dense(group_sequence_length)
 
