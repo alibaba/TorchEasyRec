@@ -86,7 +86,7 @@ class TDMTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             tdm=match_model_pb2.TDM(
-                multiwindow_din=tower_pb2.MultiWindowDIN(
+                multiwindow_din=tower_pb2.MultiWindowDINTower(
                     windows_len=[1, 2, 5], attn_mlp=module_pb2.MLP(hidden_units=[8, 4])
                 ),
                 final=module_pb2.MLP(hidden_units=[2]),
