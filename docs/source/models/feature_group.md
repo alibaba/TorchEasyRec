@@ -20,6 +20,8 @@ DEEP: 深度特征组。其中feature_names只能包含非序列特征（IdFeatu
 
 - PoolingEncoder: 对变长的`sequence`的Emebdding做池化，`pooling_type`支持mean和sum两种，常用于向量召回模型的user侧特征组
 
+- MultiWindowDINEncoder: 相比DINEncoder新增一个`windows_len`参数来设置分段的序列行为窗口长度，会对序列分段做TargetAttention，从而强化用户的长短期兴趣。
+
 #### WIDE
 
 WIDE: 广度特征组，主要用于WideAndDeep/DeepFM模型。其中feature_names只能包含非序列特征IdFeature/RawFeature/ComboFeature等，embedding_dim固定为4，不根据feature_group中的embedding_dim的配置变化而变化，开发者可以根据group_name从EmbeddingGroup的输出字典中获取到相应的特征组Embedding。不可以包含sequence_groups。
