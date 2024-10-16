@@ -311,8 +311,9 @@ class TrainEvalExportTest(unittest.TestCase):
         input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
         pred_output = os.path.join(self.test_dir, "predict_result")
         tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
+        tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
 
-        # quant and no-input-tile
+        # export quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
@@ -327,20 +328,22 @@ class TrainEvalExportTest(unittest.TestCase):
                 test_dir=self.test_dir,
             )
 
-        # no-quant and no-input-tile
+        # export no-quant and no-input-tile
         if self.success:
             os.environ["QUANT_EMB"] = "0"
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), no_quant_dir
             )
 
-        # quant and input-tile
+        # export quant and input-tile
         if self.success:
             os.environ["QUANT_EMB"] = "1"
             os.environ["INPUT_TILE"] = "2"
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), input_tile_dir
             )
+
+        # predict quant and input-tile
         if self.success:
             # we should not set INPUT_TILE env when predict
             os.environ.pop("QUANT_EMB", None)
@@ -360,13 +363,37 @@ class TrainEvalExportTest(unittest.TestCase):
             df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
             self.assertTrue(df.equals(df_t))
 
-        # quant and input-tile emb
+        # export quant and input-tile emb
         if self.success:
             os.environ["QUANT_EMB"] = "1"
             os.environ["INPUT_TILE"] = "3"
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), input_tile_dir_emb
             )
+
+        # predict quant and input-tile emb
+        if self.success:
+            # we should not set INPUT_TILE env when predict
+            os.environ.pop("QUANT_EMB", None)
+            os.environ.pop("INPUT_TILE", None)
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=tile_pred_output_emb,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_dir_emb,
+            )
+            # compare INPUT_TILE and no INPUT_TILE result consistency
+            df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
+            df_t = (
+                ds.dataset(tile_pred_output_emb, format="parquet")
+                .to_table()
+                .to_pandas()
+            )
+            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
+            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            self.assertTrue(df.equals(df_t))
 
         self.assertTrue(self.success)
 
