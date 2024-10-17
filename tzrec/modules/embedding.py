@@ -927,22 +927,23 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 #   sequence_sparse_features
                 #       when input_tile_emb need to tile(batch_size,1):
                 #   sequence_dense_features always need to tile
-                need_tile = is_user and (
-                    (need_input_tile and not is_sparse) or need_input_tile_emb
-                )
+                need_tile = False
+                if is_user:
+                    if is_sparse:
+                        need_tile = need_input_tile_emb
+                    else:
+                        need_tile = need_input_tile
                 jt = (
                     sparse_jt_dict[name] if is_sparse else sequence_dense_features[name]
                 )
                 if i == 0:
                     sequence_length = jt.lengths()
+                    group_sequence_length = _int_item(torch.max(sequence_length))
                     if need_tile:
-                        group_sequence_length = _int_item(sequence_length)
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
                             batch_size
                         )
-
                     else:
-                        group_sequence_length = _int_item(torch.max(sequence_length))
                         results[f"{group_name}.sequence_length"] = sequence_length
                 jt = jt.to_padded_dense(group_sequence_length)
 
