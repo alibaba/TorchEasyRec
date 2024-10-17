@@ -140,7 +140,9 @@ class MultiWindowDINEncoderTest(unittest.TestCase):
     )
     def test_multiwindow_din_encoder(self, graph_type) -> None:
         multiwindow_din = MultiWindowDINEncoder(
-            query_emb_dim=12,
+            sequence_dim=12,
+            query_dim=12,
+            input="click_seq",
             windows_len=[1, 1, 2, 2, 5, 10],
             attn_mlp=dict(
                 hidden_units=[8, 4, 2],
@@ -150,9 +152,12 @@ class MultiWindowDINEncoderTest(unittest.TestCase):
             ),
         )
         multiwindow_din = create_test_module(multiwindow_din, graph_type)
-        query = torch.randn(4, 12)
-        sequence = torch.randn(4, 21, 12)
-        result = multiwindow_din(query, sequence)
+        embedded = {
+            "click_seq.query": torch.randn(4, 12),
+            "click_seq.sequence": torch.randn(4, 21, 12),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = multiwindow_din(embedded)
         self.assertEqual(result.size(), (4, 7 * 12))
 
     @parameterized.expand(
@@ -160,7 +165,9 @@ class MultiWindowDINEncoderTest(unittest.TestCase):
     )
     def test_multiwindow_din_encoder_padding(self, graph_type) -> None:
         multiwindow_din = MultiWindowDINEncoder(
-            query_emb_dim=12,
+            sequence_dim=16,
+            query_dim=12,
+            input="click_seq",
             windows_len=[1, 1, 2, 2, 5, 10],
             attn_mlp=dict(
                 hidden_units=[8, 4, 2],
@@ -170,10 +177,13 @@ class MultiWindowDINEncoderTest(unittest.TestCase):
             ),
         )
         multiwindow_din = create_test_module(multiwindow_din, graph_type)
-        query = torch.randn(4, 12)
-        sequence = torch.randn(4, 16, 12)
-        result = multiwindow_din(query, sequence)
-        self.assertEqual(result.size(), (4, 7 * 12))
+        embedded = {
+            "click_seq.query": torch.randn(4, 12),
+            "click_seq.sequence": torch.randn(4, 21, 16),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = multiwindow_din(embedded)
+        self.assertEqual(result.size(), (4, 7 * 16))
 
 
 class CreateSequenceTest(unittest.TestCase):

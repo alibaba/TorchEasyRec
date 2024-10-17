@@ -58,7 +58,9 @@ message BayesTaskTower {
     optional MLP relation_mlp = 9;
 };
 
-message MultiWindowDIN {
+message MultiWindowDINTower {
+    // time windows len
     repeated uint32 windows_len = 1;
-    required MLP attn_mlp =2;
+    // mlp config for target attention score
+    required MLP attn_mlp = 2;
 }

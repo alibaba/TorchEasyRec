@@ -36,6 +36,6 @@ message DSSMV2 {
 }
 
 message TDM {
-    required MultiWindowDIN multiwindow_din =1;
+    required MultiWindowDINTower multiwindow_din =1;
     required MLP final = 2;
 }

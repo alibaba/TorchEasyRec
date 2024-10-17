@@ -45,12 +45,8 @@ class TDM(RankModel):
         non_seq_fea_dim = 0
         self.seq_group_name = ""
         self.non_seq_group_name = []
-        query_emb_dim = 0
         for feature_group in model_config.feature_groups:
             if feature_group.group_type == model_pb2.SEQUENCE:
-                query_emb_dim = self.embedding_group.group_total_dim(
-                    f"{feature_group.group_name}.query"
-                )
                 self.seq_group_name = feature_group.group_name
             else:
                 non_seq_fea_dim += self.embedding_group.group_total_dim(
@@ -58,10 +54,11 @@ class TDM(RankModel):
                 )
                 self.non_seq_group_name.append(feature_group.group_name)
 
-        windows_len = self._model_config.multiwindow_din.windows_len
         self.multiwindow_din = MultiWindowDINEncoder(
-            query_emb_dim,
-            windows_len,
+            self.embedding_group.group_total_dim(f"{self.seq_group_name}.sequence"),
+            self.embedding_group.group_total_dim(f"{self.seq_group_name}.query"),
+            self.seq_group_name,
+            list(self._model_config.multiwindow_din.windows_len),
             config_to_kwargs(self._model_config.multiwindow_din.attn_mlp),
         )
 
@@ -84,10 +81,7 @@ class TDM(RankModel):
         """
         grouped_feature = self.embedding_group(batch)
 
-        query = grouped_feature[f"{self.seq_group_name}.query"]
-        sequence = grouped_feature[f"{self.seq_group_name}.sequence"]
-
-        multiwindow_output = self.multiwindow_din(query, sequence)
+        multiwindow_output = self.multiwindow_din(grouped_feature)
         mlp_input = multiwindow_output
 
         for group_name in self.non_seq_group_name:
