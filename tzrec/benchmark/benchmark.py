@@ -88,11 +88,9 @@ def _benchmark_train_eval(
     log_path: str,
 ) -> bool:
     """Run train_eval for benchmark."""
-    port = misc_util.get_free_port()
     cmd_str = (
-        f"PYTHONPATH=. torchrun --master_addr=localhost "
-        f"--master_port={port} --nnodes=1 "
-        "--nproc-per-node=2 --node_rank=0 "
+        "PYTHONPATH=. torchrun --standalone "
+        "--nnodes=1 --nproc-per-node=2 "
         f"--log_dir {log_path} -r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {run_config_path}"
     )

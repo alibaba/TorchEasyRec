@@ -841,12 +841,10 @@ def test_train_eval(
 
     test_config_path = os.path.join(test_dir, "pipeline.config")
     config_util.save_message(pipeline_config, test_config_path)
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
@@ -860,12 +858,10 @@ def test_train_eval(
 
 def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
     """Run evaluate integration test."""
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
@@ -881,12 +877,10 @@ def test_export(
     pipeline_config_path: str, test_dir: str, asset_files: str = ""
 ) -> bool:
     """Run export integration test."""
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_export")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {test_dir}/export "
@@ -903,12 +897,10 @@ def test_export(
 
 def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
     """Run export integration test."""
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_feature_selection")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=1 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=1 --log_dir {log_dir} "
         "-m tzrec.tools.feature_selection "
         f"--pipeline_config_path {pipeline_config_path} "
         "--topk 5 "
@@ -932,12 +924,10 @@ def test_predict(
     test_dir: str,
 ) -> bool:
     """Run predict integration test."""
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_predict")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/predict.py "
         f"--scripted_model_path {scripted_model_path} "
         f"--predict_input_path {predict_input_path} "
@@ -986,12 +976,10 @@ def test_hitrate(
     test_dir: str,
 ) -> bool:
     """Run hitrate integration test."""
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
-        "OMP_NUM_THREADS=16 PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "OMP_NUM_THREADS=16 PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "
         f"--item_embedding_input {item_embedding_input} "
@@ -1110,12 +1098,10 @@ def test_tdm_retrieval(
     test_dir: str,
 ) -> bool:
     """Run tdm retrieval test."""
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
         f"--predict_input_path {eval_data_path} "
@@ -1196,12 +1182,10 @@ def test_tdm_cluster_train_eval(
     test_config_path = os.path.join(test_dir, "learnt_tree/pipeline.config")
     config_util.save_message(pipeline_config, test_config_path)
 
-    port = misc_util.get_free_port()
     log_dir = os.path.join(test_dir, "log_learnt_train_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun "
-        f"--master_addr=localhost --master_port={port} --nnodes=1 "
-        f"--nproc-per-node=2 --node_rank=0 --log_dir {log_dir} "
+        "PYTHONPATH=. torchrun --standalone "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path}"
     )
