@@ -14,6 +14,7 @@ import json
 from typing import Any, Dict, List, Tuple
 
 from tzrec.datasets.dataset import create_reader
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
 
@@ -36,7 +37,7 @@ class AddFeatureInfoToConfig(object):
         config_table_path: str,
         reader_type: str,
         odps_data_quota_name: str,
-    ):
+    ) -> None:
         self.template_model_config_path = template_model_config_path
         self.model_config_path = model_config_path
         self.config_table_path = config_table_path
@@ -67,7 +68,9 @@ class AddFeatureInfoToConfig(object):
 
         return feature_info_map, drop_feature_names
 
-    def _drop_feature_config(self, pipeline_config, drop_feature_names) -> None:
+    def _drop_feature_config(
+        self, pipeline_config: EasyRecConfig, drop_feature_names: List[str]
+    ) -> None:
         """Drop invalid feature config."""
         feature_configs = pipeline_config.feature_configs
         filter_feature_configs = []
@@ -100,7 +103,9 @@ class AddFeatureInfoToConfig(object):
             pipeline_config.ClearField("feature_configs")
             pipeline_config.feature_configs.extend(feature_configs)
 
-    def _update_feature_config(self, pipeline_config, feature_info_map) -> List[str]:
+    def _update_feature_config(
+        self, pipeline_config: EasyRecConfig, feature_info_map: Dict[str, Any]
+    ) -> List[str]:
         """Add feature info to feature config."""
         feature_configs = pipeline_config.feature_configs
         general_feature = []
@@ -161,7 +166,10 @@ class AddFeatureInfoToConfig(object):
         return general_feature
 
     def _update_feature_group(
-        self, pipeline_config, drop_feature_names, general_feature
+        self,
+        pipeline_config: EasyRecConfig,
+        drop_feature_names: List[str],
+        general_feature: List[str],
     ) -> None:
         """Drop feature name for feature group."""
         for feature_group in pipeline_config.model_config.feature_groups:
