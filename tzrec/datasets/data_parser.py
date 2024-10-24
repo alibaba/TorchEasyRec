@@ -122,7 +122,7 @@ class DataParser:
         if not self._fg_handler:
             fg_json = create_fg_json(self._features)
             # pyre-ignore [16]
-            self._fg_handler = pyfg.FgHandler(fg_json, self._fg_threads)
+            self._fg_handler = pyfg.FgArrowHandler(fg_json, self._fg_threads)
 
     def parse(self, input_data: Dict[str, pa.Array]) -> Dict[str, torch.Tensor]:
         """Parse input data dict and build batch.
@@ -216,15 +216,7 @@ class DataParser:
             else 0
         )
 
-        fg_input = {}
-        for k, x in input_data.items():
-            if pa.types.is_list(x.type):
-                x = x.fill_null([])
-            elif pa.types.is_map(x.type):
-                x = x.fill_null({})
-            fg_input[k] = x.tolist()
-
-        fg_output, status = self._fg_handler.process(fg_input)
+        fg_output, status = self._fg_handler.process_arrow(input_data)
         assert status.ok(), status.message()
 
         for feature in self._features:
