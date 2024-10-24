@@ -14,9 +14,13 @@ import argparse
 import json
 import os
 
+from odps import ODPS
+
+from tzrec.datasets.odps_dataset import _create_odps_account
 from tzrec.features.feature import create_fg_json
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.utils import config_util
+from tzrec.utils.logging_util import logger
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -37,6 +41,18 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Reserved column names, e.g. label,request_id.",
+    )
+    parser.add_argument(
+        "--odps_project_name",
+        type=str,
+        default=None,
+        help="odps project name.",
+    )
+    parser.add_argument(
+        "--fg_resource_name",
+        type=str,
+        default=None,
+        help="fg json resource name.",
     )
     parser.add_argument(
         "--debug",
@@ -69,5 +85,22 @@ if __name__ == "__main__":
             reserves.append(column.strip())
         fg_json["reserves"] = reserves
 
-    with open(os.path.join(args.fg_output_dir, "fg.json"), "w") as f:
+    fg_path = os.path.join(args.fg_output_dir, "fg.json")
+    with open(fg_path, "w") as f:
         json.dump(fg_json, f, indent=4)
+
+    project = args.odps_project_name
+    fg_json_name = args.fg_resource_name
+    if project is not None and fg_json_name is not None:
+        account, odps_endpoint = _create_odps_account()
+        o = ODPS(
+            account=account,
+            project=project,
+            endpoint=odps_endpoint,
+        )
+        if o.exist_resource(fg_json_name):
+            o.delete_resource(fg_json_name)
+            logger.info(
+                f"{fg_json_name} has already existed, will update this resource !"
+            )
+        resource = o.create_resource(fg_json_name, "file", file_obj=open(fg_path, "r"))
