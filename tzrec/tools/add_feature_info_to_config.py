@@ -11,6 +11,7 @@
 
 import argparse
 import json
+from typing import Any, Dict, List, Tuple
 
 from tzrec.datasets.dataset import create_reader
 from tzrec.utils import config_util
@@ -30,11 +31,11 @@ class AddFeatureInfoToConfig(object):
 
     def __init__(
         self,
-        template_model_config_path,
-        model_config_path,
-        config_table_path,
-        reader_type,
-        odps_data_quota_name,
+        template_model_config_path: str,
+        model_config_path: str,
+        config_table_path: str,
+        reader_type: str,
+        odps_data_quota_name: str,
     ):
         self.template_model_config_path = template_model_config_path
         self.model_config_path = model_config_path
@@ -42,7 +43,7 @@ class AddFeatureInfoToConfig(object):
         self.reader_type = reader_type
         self.odps_data_quota_name = odps_data_quota_name
 
-    def _load_feature_info(self):
+    def _load_feature_info(self) -> Tuple[Dict[str, Any], List[str]]:
         """Load feature info for update config."""
         feature_info_map = {}
         drop_feature_names = []
@@ -66,7 +67,7 @@ class AddFeatureInfoToConfig(object):
 
         return feature_info_map, drop_feature_names
 
-    def _drop_feature_config(self, pipeline_config, drop_feature_names):
+    def _drop_feature_config(self, pipeline_config, drop_feature_names) -> None:
         """Drop invalid feature config."""
         feature_configs = pipeline_config.feature_configs
         filter_feature_configs = []
@@ -99,7 +100,7 @@ class AddFeatureInfoToConfig(object):
             pipeline_config.ClearField("feature_configs")
             pipeline_config.feature_configs.extend(feature_configs)
 
-    def _update_feature_config(self, pipeline_config, feature_info_map):
+    def _update_feature_config(self, pipeline_config, feature_info_map) -> List[str]:
         """Add feature info to feature config."""
         feature_configs = pipeline_config.feature_configs
         general_feature = []
@@ -161,7 +162,7 @@ class AddFeatureInfoToConfig(object):
 
     def _update_feature_group(
         self, pipeline_config, drop_feature_names, general_feature
-    ):
+    ) -> None:
         """Drop feature name for feature group."""
         for feature_group in pipeline_config.model_config.feature_groups:
             feature_names = feature_group.feature_names
@@ -196,7 +197,7 @@ class AddFeatureInfoToConfig(object):
                     feature_group.sequence_encoders.remove(seq_encoded)
                     logger.info("drop sequence encoder: %s" % seq_module.input)
 
-    def build(self):
+    def build(self) -> None:
         """Build method."""
         feature_info_map, drop_feature_names = self._load_feature_info()
         pipeline_config = config_util.load_pipeline_config(
