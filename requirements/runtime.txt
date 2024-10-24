@@ -8,7 +8,7 @@ graphlearn @ https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/graphlearn-1.
 grpcio-tools<1.63.0
 pandas
 pyfg @ https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg-0.3.2-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
-pyfg @ https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg-0.3.0-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
+pyfg @ https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg-0.3.2-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 scikit-learn
 tensorboard
 torch==2.4.0
