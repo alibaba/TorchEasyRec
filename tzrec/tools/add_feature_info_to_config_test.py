@@ -197,10 +197,10 @@ feature_configs {
     feature_name: "item_cnt"
     expression: "item:item_cnt"
     embedding_dim: 8
-    boundaries: -1024
-    boundaries: 4
-    boundaries: 461
-    boundaries: 1057
+    boundaries: -1023.9
+    boundaries: 4.01
+    boundaries: 461.01
+    boundaries: 1057.01
   }
 }
 feature_configs {
