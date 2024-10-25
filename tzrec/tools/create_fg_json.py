@@ -52,7 +52,13 @@ if __name__ == "__main__":
         "--fg_resource_name",
         type=str,
         default=None,
-        help="fg json resource name.",
+        help="fg json resource name. if specified, will upload fg.json to odps.",
+    )
+    parser.add_argument(
+        "--force_update_resource ",
+        type=bool,
+        default=True,
+        help="if true will update fg.json.",
     )
     parser.add_argument(
         "--debug",
@@ -90,17 +96,25 @@ if __name__ == "__main__":
         json.dump(fg_json, f, indent=4)
 
     project = args.odps_project_name
-    fg_json_name = args.fg_resource_name
-    if project is not None and fg_json_name is not None:
+    fg_resource_name = args.fg_resource_name
+    if project is not None and fg_resource_name is not None:
         account, odps_endpoint = _create_odps_account()
         o = ODPS(
             account=account,
             project=project,
             endpoint=odps_endpoint,
         )
-        if o.exist_resource(fg_json_name):
-            o.delete_resource(fg_json_name)
-            logger.info(
-                f"{fg_json_name} has already existed, will update this resource !"
+        if o.exist_resource(fg_resource_name):
+            if args.force_update_resource:
+                o.delete_resource(fg_resource_name)
+                logger.info(
+                    f"{fg_resource_name} has already existed, "
+                    f"will update this resource !"
+                )
+                resource = o.create_resource(
+                    fg_resource_name, "file", file_obj=open(fg_path, "r")
+                )
+        else:
+            resource = o.create_resource(
+                fg_resource_name, "file", file_obj=open(fg_path, "r")
             )
-        resource = o.create_resource(fg_json_name, "file", file_obj=open(fg_path, "r"))

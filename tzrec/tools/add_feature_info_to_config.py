@@ -189,7 +189,7 @@ class AddFeatureInfoToConfig(object):
                 for feature_name in sequence_group.feature_names:
                     if feature_name not in drop_feature_names:
                         reserved_features.append(feature_name)
-                        if feature_name not in general_feature:
+                        if feature_name in general_feature:
                             seq_feature_num += 1
                     else:
                         logger.info("sequence group drop feature: %s" % feature_name)
