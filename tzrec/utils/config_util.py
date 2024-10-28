@@ -127,7 +127,7 @@ def edit_config(pipeline_config: Message, edit_config_json: Dict[str, Any]) -> M
 
     # pyre-ignore [2, 3]
     def _type_convert(proto, val, parent=None):
-        if type(val) != type(proto):
+        if type(val) is not type(proto):
             try:
                 if isinstance(proto, bool):
                     assert val in ["True", "true", "False", "false"]
