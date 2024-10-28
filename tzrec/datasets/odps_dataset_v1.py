@@ -131,7 +131,7 @@ class OdpsReaderV1(BaseReader):
         self._ordered_cols = []
         for field in reader.get_schema():
             # pyre-ignore [58]
-            if not selected_cols and field["colname"] in selected_cols:
+            if not selected_cols or field["colname"] in selected_cols:
                 self.schema.append(field)
                 self._ordered_cols.append(field["colname"])
         reader.close()
