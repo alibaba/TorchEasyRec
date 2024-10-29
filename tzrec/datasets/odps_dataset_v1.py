@@ -125,20 +125,14 @@ class OdpsReaderV1(BaseReader):
     ) -> None:
         super().__init__(input_path, batch_size, selected_cols, drop_remainder)
         self.schema = []
-        self._ordered_cols = None
         reader = common_io.table.TableReader(
             self._input_path.split(",")[0],
-            selected_cols=",".join(self._selected_cols or []),
         )
-        if self._selected_cols:
-            self._ordered_cols = []
-            for field in reader.get_schema():
-                # pyre-ignore [58]
-                if field["colname"] in self._selected_cols:
-                    self.schema.append(field)
-                    self._ordered_cols.append(field["colname"])
-        else:
-            self.schema = reader.get_schema()
+        self._ordered_cols = []
+        for field in reader.get_schema():
+            if not selected_cols or field["colname"] in selected_cols:
+                self.schema.append(field)
+                self._ordered_cols.append(field["colname"])
         reader.close()
 
     def _iter_one_table(
@@ -148,7 +142,7 @@ class OdpsReaderV1(BaseReader):
             input_path,
             slice_id=worker_id,
             slice_count=num_workers,
-            selected_cols=",".join(self._selected_cols or []),
+            selected_cols=",".join(self._ordered_cols or []),
         )
         while True:
             try:
