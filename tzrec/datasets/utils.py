@@ -133,7 +133,7 @@ class Batch(Pipelineable):
             batch_size=self.batch_size,
         )
 
-    def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
+    def record_stream(self, stream: torch.Stream) -> None:
         """Record which streams have used the tensor."""
         for v in self.dense_features.values():
             v.record_stream(stream)

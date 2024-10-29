@@ -582,7 +582,7 @@ def build_mock_input_with_fg(
     inputs = defaultdict(dict)
     single_id_fields = {user_id, item_id}
     for feature in features:
-        if type(feature) == IdFeature:
+        if type(feature) is IdFeature:
             is_multi = (
                 random.random() < 0.5 and feature.inputs[0] not in single_id_fields
             )
@@ -594,14 +594,14 @@ def build_mock_input_with_fg(
                 vocab_list=feature.config.vocab_list,
                 multival_sep=chr(29),
             )
-        elif type(feature) == RawFeature:
+        elif type(feature) is RawFeature:
             side, name = feature.side_inputs[0]
             inputs[side][name] = RawMockInput(
                 name,
                 value_dim=feature.config.value_dim,
                 multival_sep=chr(29),
             )
-        elif type(feature) == ComboFeature:
+        elif type(feature) is ComboFeature:
             for side, input_name in feature.side_inputs:
                 if input_name in inputs[side]:
                     continue
@@ -609,7 +609,7 @@ def build_mock_input_with_fg(
                 inputs[side][input_name] = IdMockInput(
                     input_name, is_multi=is_multi, multival_sep=chr(29)
                 )
-        elif type(feature) == LookupFeature:
+        elif type(feature) is LookupFeature:
             for i, (side, input_name) in enumerate(feature.side_inputs):
                 if input_name in inputs[side]:
                     continue
@@ -627,7 +627,7 @@ def build_mock_input_with_fg(
                     inputs[side][input_name] = IdMockInput(
                         input_name, is_multi=is_multi, multival_sep=chr(29)
                     )
-        elif type(feature) == MatchFeature:
+        elif type(feature) is MatchFeature:
             for i, (side, input_name) in enumerate(feature.side_inputs):
                 if input_name in inputs[side]:
                     continue
@@ -637,14 +637,14 @@ def build_mock_input_with_fg(
                     inputs[side][input_name] = IdMockInput(
                         input_name, multival_sep=chr(29)
                     )
-        elif type(feature) == ExprFeature:
+        elif type(feature) is ExprFeature:
             for side, input_name in feature.side_inputs:
                 if input_name in inputs[side]:
                     continue
                 inputs[side][input_name] = RawMockInput(
                     input_name, multival_sep=chr(29)
                 )
-        elif type(feature) == TokenizeFeature:
+        elif type(feature) is TokenizeFeature:
             side, name = feature.side_inputs[0]
             inputs[side][name] = IdMockInput(
                 name,

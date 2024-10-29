@@ -15,10 +15,10 @@ pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-pip install fbgemm-gpu==0.8.0 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.5.0 --index-url https://download.pytorch.org/whl/cu121
+pip install fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cu121
 pip install torchmetrics==1.0.3
-pip install torchrec==0.8.0 --index-url https://download.pytorch.org/whl/cu121
+pip install torchrec==1.0.0 --index-url https://download.pytorch.org/whl/cu121
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
 ```
 
@@ -28,6 +28,15 @@ pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyu
 docker run -td --gpus all --shm-size 10gb  --network host mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}
 docker exec -it <CONTAINER_ID> bash
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+```
+
+注：
+
+```
+GPU版本（CUDA 12.1) 镜像地址：
+  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu121
+CPU版本 镜像地址:
+  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cpu
 ```
 
 ## 前置准备

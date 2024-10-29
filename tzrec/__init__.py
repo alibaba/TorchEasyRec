@@ -11,6 +11,8 @@
 
 import os as _os
 
+import torch as _torch  # NOQA
+
 if "OMP_NUM_THREADS" not in _os.environ:
     _os.environ["OMP_NUM_THREADS"] = "1"
 
