@@ -28,7 +28,7 @@ model_config {
 ```
 model_config {
     losses {
-        SoftmaxCrossEntropy {
+        softmax_cross_entropy {
         }
     }
 }

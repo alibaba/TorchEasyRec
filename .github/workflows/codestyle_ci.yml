@@ -19,4 +19,5 @@ jobs:
         id: run_codestyle_ci
         run: |
           pip install -r requirements.txt
+          git config --global --add safe.directory $(pwd)
           pre-commit run -a
