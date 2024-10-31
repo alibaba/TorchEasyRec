@@ -54,7 +54,7 @@ class AddFeatureInfoToConfig(object):
             1,
             selected_cols=sels,
             reader_type=self.reader_type,
-            odps_data_quota_name=self.odps_data_quota_name,
+            quota_name=self.odps_data_quota_name,
         )
         for data in reader.to_batches():
             feature_names = data["feature"].tolist()

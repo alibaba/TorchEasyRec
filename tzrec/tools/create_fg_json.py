@@ -55,7 +55,7 @@ if __name__ == "__main__":
         help="fg json resource name. if specified, will upload fg.json to odps.",
     )
     parser.add_argument(
-        "--force_update_resource ",
+        "--force_update_resource",
         type=bool,
         default=True,
         help="if true will update fg.json.",
