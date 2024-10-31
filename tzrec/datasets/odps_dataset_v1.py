@@ -126,7 +126,7 @@ class OdpsReaderV1(BaseReader):
         super().__init__(input_path, batch_size, selected_cols, drop_remainder)
         self.schema = []
         reader = common_io.table.TableReader(
-            self._input_path.split(",")[0],
+            self._input_path.split(",")[0], selected_cols=",".join(selected_cols)
         )
         self._ordered_cols = []
         for field in reader.get_schema():

@@ -414,6 +414,18 @@ class DataParserTest(unittest.TestCase):
         feature_cfgs = self._create_test_fg_feature_cfgs(tag_b_weighted=weigted_id)
         features = create_features(feature_cfgs, fg_mode=fg_mode)
         data_parser = DataParser(features=features, labels=["label"])
+        self.assertEqual(
+            sorted(list(data_parser.feature_input_names)),
+            [
+                "cat_a",
+                "click_seq__cat_a",
+                "click_seq__int_a",
+                "int_a",
+                "int_b",
+                "map_a",
+                "tag_b",
+            ],
+        )
 
         data = data_parser.parse(
             input_data={

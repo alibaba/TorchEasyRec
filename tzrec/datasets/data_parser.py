@@ -95,7 +95,7 @@ class DataParser:
                 | self._fg_handler.item_inputs()
                 | self._fg_handler.context_inputs()
                 | set(self._fg_handler.sequence_input_to_name().keys())
-            )
+            ) - set(self._fg_handler.sequence_feature_inputs().keys())
         else:
             for feature in features:
                 self.feature_input_names |= set(feature.inputs)
