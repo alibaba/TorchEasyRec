@@ -75,7 +75,7 @@ class AddFeatureInfoToConfig(object):
         feature_configs = pipeline_config.feature_configs
         filter_feature_configs = []
         if drop_feature_names:
-            for fea_cfg in feature_configs:
+            for fea_cfg in feature_configs[:]:
                 oneof_feat_config = getattr(fea_cfg, fea_cfg.WhichOneof("feature"))
                 feat_cls_name = oneof_feat_config.__class__.__name__
                 if feat_cls_name == "SequenceFeature":
