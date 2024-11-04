@@ -10,7 +10,11 @@ cd docker
 
 for DEVICE in cu121 cpu
 do
-    docker build --network host -t ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} .
+    case ${DEVICE} in
+        "cu121") BASE_IMAGE=nvidia/cuda:12.1.1-devel-ubuntu22.04 ;;
+        * )      BASE_IMAGE=ubuntu:22.04 ;;
+    esac
+    docker build --network host -t ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} --build-arg BASE_IMAGE=${BASE_IMAGE} .
     docker push ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE}
 done
 
