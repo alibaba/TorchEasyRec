@@ -46,7 +46,7 @@ pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nig
 cd /mnt/data
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_local.config
+wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc.config
 tar xf taobao_data_train.tar.gz
 tar xf taobao_data_eval.tar.gz
 cd -
@@ -56,7 +56,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.train_eval \
     --pipeline_config_path /mnt/data/multi_tower_din_taobao_dlc.config \
-    --train_input_path /mnt/data/data/taobao_data_train/\*.parquet \
+    --train_input_path /mnt/data/taobao_data_train/\*.parquet \
     --eval_input_path /mnt/data/taobao_data_eval/\*.parquet \
     --model_dir /mnt/data/multi_tower_din_taobao_dlc
 ```
@@ -117,7 +117,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 
 ### 直读MaxCompute数据
 
-设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表
+设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表。配置文件的data_config.dataset_type需设置为OdpsDataset。
 
 ```bash
 ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
