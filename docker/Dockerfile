@@ -1,4 +1,5 @@
-FROM ubuntu:22.04
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
 
 RUN sed -i "s@http://archive.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list && \
     sed -i "s@http://security.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list && \
@@ -26,6 +27,8 @@ ENV PATH /opt/conda/bin:$PATH
 ARG DEVICE
 RUN case ${DEVICE} in \
         "cu121") pip install torch==2.5.0 fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cu121 && \
+                 pip uninstall -y nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
+                 sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python3.11/site-packages/torch-2.5.0+cu121.dist-info/METADATA && \
                  pip install torchmetrics==1.0.3 torch_tensorrt==2.5.0 && \
                  pip install torchrec==1.0.0 --index-url https://download.pytorch.org/whl/cu121 ;; \
         * )      pip install torch==2.5.0 fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cpu && \
