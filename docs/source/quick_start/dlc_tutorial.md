@@ -31,7 +31,7 @@ pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nig
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 填入镜像地址`mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}`
+**节点镜像** 选择官方镜像`torcheasyrec:0.6.0-pytorch2.5.0-gpu-py311-cu121-ubuntu22.04`
 
 **数据集配置** 选择刚新建的NAS数据集
 
