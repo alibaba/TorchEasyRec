@@ -11,7 +11,7 @@ DBMTL构建了多个目标之间的贝叶斯网络，显式建模了多个目标
 
 ## 配置说明
 
-### DBTML
+### DBMTL
 
 ```
 model_config {
@@ -150,4 +150,4 @@ DBMTL模型每个塔的指标为：指标名+ "\_" + tower_name
 
 ## 参考论文
 
-[DBMTL](https://dl.acm.org/doi/pdf/10.1145/3219819.3220007)
+[DBMTL](https://arxiv.org/pdf/1902.09154)
