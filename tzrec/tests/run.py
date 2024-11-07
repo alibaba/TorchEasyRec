@@ -111,7 +111,7 @@ class TZRecTestRunner(TextTestRunner):
                                 ["python", "-m", subp_test_module, subp_test_name],
                                 capture_output=True,
                                 text=True,
-                                timeout=1200,
+                                timeout=600,
                             )
                             if subp_result.returncode != 0:
                                 result.failures.append(
