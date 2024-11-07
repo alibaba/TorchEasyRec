@@ -101,7 +101,7 @@ class DynamicProgrammingProposer(Proposer):
         The problem of the Embedding Sharding Plan can be framed as follows: Given
     :math:`M` tables and their corresponding :math:`N` Sharding Options, we need to
     select one sharding option for each table such that the total performance is
-    minimized, while keeping the overall mem constraint :math:`K` in check. This can
+    minimized, while keeping the overall memory constraint :math:`K` in check. This can
     be abstracted into the following mathematical formulation:
 
     Given a matrix :math:`A` of dimensions :math:`(M, N)` and another matrix :math:`B`
@@ -125,14 +125,14 @@ class DynamicProgrammingProposer(Proposer):
     .. math::
         dp[i][f(k)] = \min_{j=0}^{N-1} \left( dp[i-1][f(k - A[i][j])] + B[i][j] \right)
 
-    Since :math:`K` is the sum allocated across all mem, simply satisfying that the
-    total mem in the plan equals :math:`K` does not guarantee that the allocation will
-    fit on all cards. Therefore, it is essential to maintain all the states of the last
-    layer of :math:`dp`. This allows us to propose different plans under varying total
-    mem constraints.
+    Since :math:`K` is the sum allocated across all memory, simply satisfying that the
+    total memory in the plan equals :math:`K` does not guarantee that the allocation
+    will fit on all cards. Therefore, it is essential to maintain all the states of the
+    last layer of :math:`dp`. This allows us to propose different plans under varying
+    total memory constraints.
 
     Args:
-        mem_bins_per_device (int): hdm bins for dynamic programming precision.
+        mem_bins_per_device (int): memory bins for dynamic programming precision.
     """
 
     def __init__(self, mem_bins_per_device: int = 100) -> None:
