@@ -43,10 +43,13 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
+from tzrec.acc.trt_utils import export_model_trt
 from tzrec.acc.utils import (
     export_acc_config,
     is_input_tile_emb,
     is_quant,
+    is_trt,
+    is_trt_predict,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import Mode
@@ -736,12 +739,17 @@ def _script_model(
         result = model(data)
         result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
         logger.info(f"Model Outputs: {result_info}")
-        gm = symbolic_trace(model)
-        with open(os.path.join(save_dir, "gm.code"), "w") as f:
-            f.write(gm.code)
 
-        scripted_model = torch.jit.script(gm)
-        scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+        if is_trt():
+            data_cuda = batch.to_dict(sparse_dtype=torch.int32)
+            export_model_trt(model, data_cuda, save_dir)
+        else:
+            gm = symbolic_trace(model)
+            with open(os.path.join(save_dir, "gm.code"), "w") as f:
+                f.write(gm.code)
+
+            scripted_model = torch.jit.script(gm)
+            scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
         features = model._features
         feature_configs = create_feature_configs(features, asset_dir=save_dir)
@@ -1020,7 +1028,11 @@ def predict(
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            predictions = model(parsed_inputs, device)
+            is_trt = is_trt_predict(scripted_model_path)
+            if is_trt:
+                predictions = model(parsed_inputs)
+            else:
+                predictions = model(parsed_inputs, device)
             predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
 

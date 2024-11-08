@@ -48,6 +48,8 @@ message ModelConfig {
         DSSMV2 dssm_v2 = 302;
 
         TDM tdm = 400;
+
+        MultiTowerDINTRT multi_tower_din_trt =500;
     }
 
     optional uint32 num_class = 2 [default = 1];

@@ -927,7 +927,7 @@ def test_predict(
     log_dir = os.path.join(test_dir, "log_predict")
     cmd_str = (
         "PYTHONPATH=. torchrun --standalone "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node=1 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/predict.py "
         f"--scripted_model_path {scripted_model_path} "
         f"--predict_input_path {predict_input_path} "

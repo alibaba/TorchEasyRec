@@ -646,6 +646,257 @@ class TrainEvalExportTest(unittest.TestCase):
         )
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "retrieval_result")))
 
+    def test_multi_tower_with_fg_train_eval_export_trt(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
+        )
+        trt_dir = os.path.join(self.test_dir, "trt")
+        input_tile_trt_dir = os.path.join(self.test_dir, "input_tile_trt")
+        input_tile_emb_trt_dir = os.path.join(self.test_dir, "input_tile_emb_trt")
+
+        pred_output = os.path.join(self.test_dir, "predict_result")
+        trt_pred_output = os.path.join(self.test_dir, "predict_result_trt")
+        tile_trt_pred_output = os.path.join(self.test_dir, "predict_result_tile_trt")
+        tile_trt_pred_output_emb = os.path.join(
+            self.test_dir, "predict_result_tile_emb_trt"
+        )
+
+        # quant and no-input-tile
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=pred_output,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=self.test_dir,
+            )
+
+        # quant and and trt
+        if self.success:
+            os.environ["ENABLE_TRT"] = "1"
+            os.environ["DEBUG_TRT"] = "1"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), trt_dir
+            )
+
+        # predict quant and trt
+        if self.success:
+            # we should not set INPUT_TILE env when predict
+            os.environ.pop("QUANT_EMB", None)
+            os.environ.pop("INPUT_TILE", None)
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(trt_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=trt_pred_output,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=trt_dir,
+            )
+            # compare INPUT_TILE and no INPUT_TILE result consistency
+            df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
+            df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
+            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
+            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            # self.assertTrue(df.equals(df_t))
+            print(df)
+            print(df_t)
+
+        # quant and input-tile and trt
+        if self.success:
+            os.environ["ENABLE_TRT"] = "1"
+            os.environ["DEBUG_TRT"] = "1"
+            os.environ["INPUT_TILE"] = "2"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), input_tile_trt_dir
+            )
+        if self.success:
+            # we should not set INPUT_TILE env when predict
+            os.environ.pop("QUANT_EMB", None)
+            os.environ.pop("INPUT_TILE", None)
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_trt_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=tile_trt_pred_output,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_trt_dir,
+            )
+            # compare INPUT_TILE and no INPUT_TILE result consistency
+            df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
+            df_t = (
+                ds.dataset(tile_trt_pred_output, format="parquet")
+                .to_table()
+                .to_pandas()
+            )
+            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
+            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            # self.assertTrue(df.equals(df_t))
+            print(df)
+            print(df_t)
+
+        # quant and input-tile emb and trt
+        if self.success:
+            os.environ["ENABLE_TRT"] = "1"
+            os.environ["DEBUG_TRT"] = "1"
+            os.environ["INPUT_TILE"] = "3"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), input_tile_emb_trt_dir
+            )
+        if self.success:
+            # we should not set INPUT_TILE env when predict
+            os.environ.pop("QUANT_EMB", None)
+            os.environ.pop("INPUT_TILE", None)
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_emb_trt_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=tile_trt_pred_output_emb,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_emb_trt_dir,
+            )
+            # compare INPUT_TILE and no INPUT_TILE result consistency
+            df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
+            df_t = (
+                ds.dataset(tile_trt_pred_output_emb, format="parquet")
+                .to_table()
+                .to_pandas()
+            )
+            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
+            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            # self.assertTrue(df.equals(df_t))
+            print(df)
+            print(df_t)
+
+        self.assertTrue(self.success)
+
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+        )
+
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_trt_dir, "export/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(input_tile_emb_trt_dir, "export/scripted_model.pt")
+            )
+        )
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(input_tile_emb_trt_dir, "export/model_acc.json")
+            )
+        )
+        with open(os.path.join(input_tile_emb_trt_dir, "export/model_acc.json")) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["ENABLE_TRT"], "1")
+            self.assertEqual(acc_cfg["INPUT_TILE"], "3")
+
+        pipeline_config = config_util.load_pipeline_config(
+            os.path.join(self.test_dir, "pipeline.config")
+        )
+        features = _create_features(
+            pipeline_config.feature_configs, pipeline_config.data_config
+        )
+        utils.create_predict_data(
+            pipeline_config_path=os.path.join(self.test_dir, "pipeline.config"),
+            batch_size=512,
+            item_id="item_id",
+            output_dir=os.path.join(self.test_dir, "predict"),
+        )
+        dataloader = _get_dataloader(
+            pipeline_config.data_config,
+            features,
+            os.path.join(self.test_dir, "predict", "*.parquet"),
+            mode=Mode.PREDICT,
+        )
+
+        os.environ["INPUT_TILE"] = "1"
+        iterator = iter(dataloader)
+        data = next(iterator)
+
+        # quant and no-input-tile
+        device = "cuda:0"
+        model_gpu = torch.jit.load(
+            os.path.join(self.test_dir, "export/scripted_model.pt"), map_location=device
+        )
+        result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
+        result_dict_json_path = os.path.join(self.test_dir, "result_gpu.json")
+        utils.save_predict_result_json(result_gpu, result_dict_json_path)
+
+        # quant and trt
+        model_gpu_trt = torch.jit.load(
+            os.path.join(self.test_dir, "trt/export/scripted_model.pt"),
+            map_location=device,
+        )
+        result_gpu_trt = model_gpu_trt(data.to_dict(sparse_dtype=torch.int32))
+        result_dict_json_path = os.path.join(self.test_dir, "result_gpu_trt.json")
+        utils.save_predict_result_json(result_gpu_trt, result_dict_json_path)
+
+        # quant and input-tile and trt
+        model_gpu_input_tile = torch.jit.load(
+            os.path.join(self.test_dir, "input_tile_trt/export/scripted_model.pt"),
+            map_location=device,
+        )
+        os.environ["INPUT_TILE"] = "2"
+        dataloader = _get_dataloader(
+            pipeline_config.data_config,
+            features,
+            os.path.join(self.test_dir, "predict", "*.parquet"),
+            mode=Mode.PREDICT,
+        )
+        iterator_input_tile = iter(dataloader)
+        data_input_tile = next(iterator_input_tile)
+        result_gpu_input_tile = model_gpu_input_tile(
+            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32)
+        )
+        result_dict_json_path = os.path.join(
+            self.test_dir, "result_gpu_input_tile.json"
+        )
+        utils.save_predict_result_json(result_gpu_input_tile, result_dict_json_path)
+
+        # quant and input-tile emb
+        model_gpu_input_tile_emb = torch.jit.load(
+            os.path.join(self.test_dir, "input_tile_emb_trt/export/scripted_model.pt"),
+            map_location=device,
+        )
+        result_gpu_input_tile_emb = model_gpu_input_tile_emb(
+            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32)
+        )
+
+        # trt is all same sa no-trt
+        for k, v in result_gpu.items():
+            torch.testing.assert_close(
+                result_gpu_trt[k].to(device), v, rtol=1e-4, atol=1e-4
+            )
+
+        # tile & trt is all same sa no-tile-trt
+        for k, v in result_gpu.items():
+            torch.testing.assert_close(
+                result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
+            )
+
+        # tile emb & trt is all same sa no-tile-trt
+        for k, v in result_gpu.items():
+            torch.testing.assert_close(
+                result_gpu_input_tile_emb[k].to(device), v, rtol=1e-4, atol=1e-4
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

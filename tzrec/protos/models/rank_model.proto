@@ -20,3 +20,9 @@ message MultiTowerDIN {
     repeated DINTower din_towers = 2;
     required MLP final = 3;
 }
+
+message MultiTowerDINTRT {
+    repeated Tower towers = 1;
+    repeated DINTower din_towers = 2;
+    required MLP final = 3;
+}
