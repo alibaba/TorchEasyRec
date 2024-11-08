@@ -45,3 +45,9 @@ ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
 ADD requirements.txt /root/requirements.txt
 ADD requirements /root/requirements
 RUN cd /root && pip install -r requirements.txt && rm requirements.txt
+
+RUN mkdir -p /home/pai/bin && \
+    wget -O /home/pai/bin/prepare_dlc_environment.sh https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pai/prepare_dlc_environment.sh && \
+    chmod +x /home/pai/bin/prepare_dlc_environment.sh && \
+    apt-get update && apt-get install -y --no-install-recommends openssh-server && rm -rf /var/lib/apt/lists/*
+ENV PATH $PATH:/home/pai/bin
