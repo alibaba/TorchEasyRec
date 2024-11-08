@@ -64,8 +64,8 @@ Any contributions you make are greatly appreciated!
 
 - DingDing Group2: 37930014162, click \[this url\]click [this url](https://page.dingtalk.com/wow/z/dingtalk/simple/ddhomedownload?action=joingroup&code=v1,k1,1ppFWEXXNPyxUClHh77gCmpfB+JcPhbFv6FXC6wTGns=&_dt_no_comment=1&origin=11#/) or scan QrCode to join!
 
-  <img src="docs/images/qrcode/dinggroup1.png" alt="dingroup1" width="300">
-    <img src="docs/images/qrcode/dinggroup2.png" alt="dingroup2" width="300">
+  <img src="docs/images/qrcode/dinggroup1.png" alt="dingroup1" width="400">
+    <img src="docs/images/qrcode/dinggroup2.png" alt="dingroup2" width="400">
 
 - Email Group: easy_rec@service.aliyun.com.
 
