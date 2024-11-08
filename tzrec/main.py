@@ -27,7 +27,6 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
-    get_default_sharders,
 )
 
 # NOQA
@@ -80,7 +79,7 @@ from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.logging_util import ProgressLogger, logger
-from tzrec.utils.plan_util import create_planner
+from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -547,13 +546,18 @@ def train_and_evaluate(
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
     )
+
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD
     )
     if is_rank_zero:
         logger.info(str(plan))
 
-    model = DistributedModelParallel(module=model, device=device, plan=plan)
+    model = DistributedModelParallel(
+        module=model,
+        device=device,
+        plan=plan,
+    )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
         pipeline_config.train_config.dense_optimizer

@@ -153,35 +153,37 @@ class TrainEvalExportTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
-
-        pipeline_config = config_util.load_pipeline_config(
-            os.path.join(self.test_dir, "pipeline.config")
-        )
-        features = _create_features(
-            pipeline_config.feature_configs, pipeline_config.data_config
-        )
-        dataloader = _get_dataloader(
-            pipeline_config.data_config,
-            features,
-            pipeline_config.train_input_path,
-            mode=Mode.PREDICT,
-        )
-        iterator = iter(dataloader)
-        data = next(iterator)
-        device = "cpu"
-        model_cpu = torch.jit.load(
-            os.path.join(self.test_dir, "export/scripted_model.pt"), map_location=device
-        )
-        result_cpu = model_cpu(data.to_dict(sparse_dtype=torch.int64))
-        device = "cuda:0"
-        model_gpu = torch.jit.load(
-            os.path.join(self.test_dir, "export/scripted_model.pt"), map_location=device
-        )
-        result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
-        for k, v in result_gpu.items():
-            torch.testing.assert_close(
-                result_cpu[k].to(device), v, rtol=5e-3, atol=1e-5
+        if torch.cuda.is_available():
+            pipeline_config = config_util.load_pipeline_config(
+                os.path.join(self.test_dir, "pipeline.config")
             )
+            features = _create_features(
+                pipeline_config.feature_configs, pipeline_config.data_config
+            )
+            dataloader = _get_dataloader(
+                pipeline_config.data_config,
+                features,
+                pipeline_config.train_input_path,
+                mode=Mode.PREDICT,
+            )
+            iterator = iter(dataloader)
+            data = next(iterator)
+            device = "cpu"
+            model_cpu = torch.jit.load(
+                os.path.join(self.test_dir, "export/scripted_model.pt"),
+                map_location=device,
+            )
+            result_cpu = model_cpu(data.to_dict(sparse_dtype=torch.int64))
+            device = "cuda:0"
+            model_gpu = torch.jit.load(
+                os.path.join(self.test_dir, "export/scripted_model.pt"),
+                map_location=device,
+            )
+            result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
+            for k, v in result_gpu.items():
+                torch.testing.assert_close(
+                    result_cpu[k].to(device), v, rtol=5e-3, atol=1e-5
+                )
 
     def test_dssm_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
@@ -417,102 +419,109 @@ class TrainEvalExportTest(unittest.TestCase):
             self.assertEqual(acc_cfg["QUANT_EMB"], "1")
             self.assertEqual(acc_cfg["INPUT_TILE"], "3")
 
-        pipeline_config = config_util.load_pipeline_config(
-            os.path.join(self.test_dir, "pipeline.config")
-        )
-        features = _create_features(
-            pipeline_config.feature_configs, pipeline_config.data_config
-        )
-        utils.create_predict_data(
-            pipeline_config_path=os.path.join(self.test_dir, "pipeline.config"),
-            batch_size=512,
-            item_id="item_id",
-            output_dir=os.path.join(self.test_dir, "predict"),
-        )
-        dataloader = _get_dataloader(
-            pipeline_config.data_config,
-            features,
-            os.path.join(self.test_dir, "predict", "*.parquet"),
-            mode=Mode.PREDICT,
-        )
-
-        os.environ["INPUT_TILE"] = "1"
-        iterator = iter(dataloader)
-        data = next(iterator)
-        device = "cpu"
-
-        # quant and no-input-tile
-        model_cpu = torch.jit.load(
-            os.path.join(self.test_dir, "export/scripted_model.pt"), map_location=device
-        )
-        result_cpu = model_cpu(data.to_dict(sparse_dtype=torch.int64))
-        device = "cuda:0"
-        model_gpu = torch.jit.load(
-            os.path.join(self.test_dir, "export/scripted_model.pt"), map_location=device
-        )
-        result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
-        result_dict_json_path = os.path.join(self.test_dir, "result_gpu.json")
-        utils.save_predict_result_json(result_gpu, result_dict_json_path)
-        for k, v in result_gpu.items():
-            torch.testing.assert_close(
-                result_cpu[k].to(device), v, rtol=5e-3, atol=1e-5
+        if torch.cuda.is_available():
+            pipeline_config = config_util.load_pipeline_config(
+                os.path.join(self.test_dir, "pipeline.config")
+            )
+            features = _create_features(
+                pipeline_config.feature_configs, pipeline_config.data_config
+            )
+            utils.create_predict_data(
+                pipeline_config_path=os.path.join(self.test_dir, "pipeline.config"),
+                batch_size=512,
+                item_id="item_id",
+                output_dir=os.path.join(self.test_dir, "predict"),
+            )
+            dataloader = _get_dataloader(
+                pipeline_config.data_config,
+                features,
+                os.path.join(self.test_dir, "predict", "*.parquet"),
+                mode=Mode.PREDICT,
             )
 
-        # no-quant and no-input-tile
-        model_gpu_no_quant = torch.jit.load(
-            os.path.join(self.test_dir, "no_quant/export/scripted_model.pt"),
-            map_location=device,
-        )
-        result_gpu_no_quant = model_gpu_no_quant(
-            data.to_dict(sparse_dtype=torch.int32), device
-        )
-        result_dict_json_path = os.path.join(self.test_dir, "result_gpu_no_quant.json")
-        utils.save_predict_result_json(result_gpu_no_quant, result_dict_json_path)
+            os.environ["INPUT_TILE"] = "1"
+            iterator = iter(dataloader)
+            data = next(iterator)
+            device = "cpu"
 
-        # quant and input-tile
-        model_gpu_input_tile = torch.jit.load(
-            os.path.join(self.test_dir, "input_tile/export/scripted_model.pt"),
-            map_location=device,
-        )
-        os.environ["INPUT_TILE"] = "2"
-        dataloader = _get_dataloader(
-            pipeline_config.data_config,
-            features,
-            os.path.join(self.test_dir, "predict", "*.parquet"),
-            mode=Mode.PREDICT,
-        )
-        iterator_input_tile = iter(dataloader)
-        data_input_tile = next(iterator_input_tile)
-        result_gpu_input_tile = model_gpu_input_tile(
-            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32), device
-        )
-        result_dict_json_path = os.path.join(
-            self.test_dir, "result_gpu_input_tile.json"
-        )
-        utils.save_predict_result_json(result_gpu_input_tile, result_dict_json_path)
-
-        # quant and input-tile emb
-        model_gpu_input_tile_emb = torch.jit.load(
-            os.path.join(self.test_dir, "input_tile_emb/export/scripted_model.pt"),
-            map_location=device,
-        )
-        result_gpu_input_tile_emb = model_gpu_input_tile_emb(
-            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32), device
-        )
-
-        # tile is all same sa no-tile
-        for k, v in result_gpu.items():
-            torch.testing.assert_close(result_gpu_input_tile[k].to(device), v)
-
-        # tile emb is all same sa no-tile
-        for k, v in result_gpu.items():
-            torch.testing.assert_close(result_gpu_input_tile_emb[k].to(device), v)
-
-        # tile is all same, the atol is because the quant
-        for k, v in result_gpu_no_quant.items():
-            torch.testing.assert_close(
-                result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
+            # quant and no-input-tile
+            model_cpu = torch.jit.load(
+                os.path.join(self.test_dir, "export/scripted_model.pt"),
+                map_location=device,
             )
+            result_cpu = model_cpu(data.to_dict(sparse_dtype=torch.int64))
+            device = "cuda:0"
+            model_gpu = torch.jit.load(
+                os.path.join(self.test_dir, "export/scripted_model.pt"),
+                map_location=device,
+            )
+            result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
+            result_dict_json_path = os.path.join(self.test_dir, "result_gpu.json")
+            utils.save_predict_result_json(result_gpu, result_dict_json_path)
+            for k, v in result_gpu.items():
+                torch.testing.assert_close(
+                    result_cpu[k].to(device), v, rtol=5e-3, atol=1e-5
+                )
+
+            # no-quant and no-input-tile
+            model_gpu_no_quant = torch.jit.load(
+                os.path.join(self.test_dir, "no_quant/export/scripted_model.pt"),
+                map_location=device,
+            )
+            result_gpu_no_quant = model_gpu_no_quant(
+                data.to_dict(sparse_dtype=torch.int32), device
+            )
+            result_dict_json_path = os.path.join(
+                self.test_dir, "result_gpu_no_quant.json"
+            )
+            utils.save_predict_result_json(result_gpu_no_quant, result_dict_json_path)
+
+            # quant and input-tile
+            model_gpu_input_tile = torch.jit.load(
+                os.path.join(self.test_dir, "input_tile/export/scripted_model.pt"),
+                map_location=device,
+            )
+            os.environ["INPUT_TILE"] = "2"
+            dataloader = _get_dataloader(
+                pipeline_config.data_config,
+                features,
+                os.path.join(self.test_dir, "predict", "*.parquet"),
+                mode=Mode.PREDICT,
+            )
+            iterator_input_tile = iter(dataloader)
+            data_input_tile = next(iterator_input_tile)
+            result_gpu_input_tile = model_gpu_input_tile(
+                data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32),
+                device,
+            )
+            result_dict_json_path = os.path.join(
+                self.test_dir, "result_gpu_input_tile.json"
+            )
+            utils.save_predict_result_json(result_gpu_input_tile, result_dict_json_path)
+
+            # quant and input-tile emb
+            model_gpu_input_tile_emb = torch.jit.load(
+                os.path.join(self.test_dir, "input_tile_emb/export/scripted_model.pt"),
+                map_location=device,
+            )
+            result_gpu_input_tile_emb = model_gpu_input_tile_emb(
+                data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32),
+                device,
+            )
+
+            # tile is all same sa no-tile
+            for k, v in result_gpu.items():
+                torch.testing.assert_close(result_gpu_input_tile[k].to(device), v)
+
+            # tile emb is all same sa no-tile
+            for k, v in result_gpu.items():
+                torch.testing.assert_close(result_gpu_input_tile_emb[k].to(device), v)
+
+            # tile is all same, the atol is because the quant
+            for k, v in result_gpu_no_quant.items():
+                torch.testing.assert_close(
+                    result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
+                )
 
     def test_dbmtl_has_sequence_train_eval_export(self):
         self.success = utils.test_train_eval(
