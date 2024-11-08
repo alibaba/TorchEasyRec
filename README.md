@@ -61,7 +61,7 @@ Any contributions you make are greatly appreciated!
 ### Join Us
 
 - DingDing Group: 32260796. (TorchEasyRec usage general discussion.)
-- DingDing Group2: 37930014162, click [this url](https://qr.dingtalk.com/action/joingroup?code=v1,k1,oHNqtNObbu+xUClHh77gCuKdGGH8AYoQ8AjKU23zTg4=&_dt_no_comment=1&origin=11) or scan QrCode to join![new_group.jpg](docs/images/qrcode/new_group.jpg)
+- DingDing Group2: 37930014162, click [this url](https://qr.dingtalk.com/action/joingroup?code=v1,k1,oHNqtNObbu+xUClHh77gCuKdGGH8AYoQ8AjKU23zTg4=&_dt_no_comment=1&origin=11) or scan QrCode to join![new_group.png](docs/images/qrcode/new_group.png)
 - Email Group: easy_rec@service.aliyun.com.
 
 ### Enterprise Service
