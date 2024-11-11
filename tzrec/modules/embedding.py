@@ -119,6 +119,7 @@ class EmbeddingGroup(nn.Module):
         self._impl_key_to_seq_groups = defaultdict(list)
         self._group_name_to_impl_key = dict()
         self._group_name_to_seq_encoder_configs = defaultdict(list)
+        self._grouped_features_keys = list()
 
         for feature_group in feature_groups:
             group_name = feature_group.group_name
@@ -142,6 +143,9 @@ class EmbeddingGroup(nn.Module):
             self._group_name_to_impl_key[group_name] = impl_key
             if feature_group.group_type == model_pb2.SEQUENCE:
                 self._impl_key_to_seq_groups[impl_key].append(feature_group)
+                self._grouped_features_keys.append(group_name + ".query")
+                self._grouped_features_keys.append(group_name + ".sequence")
+                self._grouped_features_keys.append(group_name + ".sequence_length")
             else:
                 self._impl_key_to_feat_groups[impl_key].append(feature_group)
                 if len(feature_group.sequence_groups) > 0:
@@ -152,6 +156,7 @@ class EmbeddingGroup(nn.Module):
                     self._group_name_to_seq_encoder_configs[group_name] = list(
                         feature_group.sequence_encoders
                     )
+                self._grouped_features_keys.append(group_name)
 
         for k, v in self._impl_key_to_feat_groups.items():
             self.emb_impls[k] = EmbeddingGroupImpl(
@@ -195,6 +200,12 @@ class EmbeddingGroup(nn.Module):
                             seq_encoder.output_dim()
                         )
                 self._group_feature_dims[group_name] = feature_dim
+
+        self._grouped_features_keys.sort()
+
+    def grouped_features_keys(self) -> List[str]:
+        """grouped_features_keys."""
+        return self._grouped_features_keys
 
     def _respect_and_supplement_feature_group(
         self, feature_group: FeatureGroupConfig
@@ -440,6 +451,17 @@ class EmbeddingGroup(nn.Module):
                 new_feature.append(seq_encoder(result))
             seq_feature_dict[group_name] = torch.cat(new_feature, dim=-1)
         return _update_dict_tensor(result, seq_feature_dict)
+
+    def predict(
+        self,
+        batch: Batch,
+    ) -> List[torch.Tensor]:
+        """Predict embedding module and return a list of grouped embedding features."""
+        grouped_features = self.forward(batch)
+        values_list = []
+        for key in self._grouped_features_keys:
+            values_list.append(grouped_features[key])
+        return values_list
 
 
 def add_embedding_bag_config(

@@ -43,10 +43,13 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
+from tzrec.acc.trt_utils import export_model_trt
 from tzrec.acc.utils import (
     export_acc_config,
     is_input_tile_emb,
     is_quant,
+    is_trt,
+    is_trt_predict,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import Mode
@@ -713,12 +716,16 @@ def _script_model(
     save_dir: str,
 ) -> None:
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    is_trt_convert = is_trt()
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-
-        model = model.to_empty(device="cpu")
-        logger.info("gather states to cpu model...")
+        if is_trt_convert:
+            model = model.to_empty(device="cuda:0")
+            logger.info("gather states to cuda model...")
+        else:
+            model = model.to_empty(device="cpu")
+            logger.info("gather states to cpu model...")
 
     state_dict_gather(state_dict, model.state_dict())
 
@@ -726,22 +733,32 @@ def _script_model(
 
     if is_rank_zero:
         batch = next(iter(dataloader))
-        data = batch.to_dict(sparse_dtype=torch.int64)
 
         if is_quant():
             logger.info("quantize embeddings...")
             quantize_embeddings(model, dtype=torch.qint8, inplace=True)
 
         model.eval()
-        result = model(data)
-        result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-        logger.info(f"Model Outputs: {result_info}")
-        gm = symbolic_trace(model)
-        with open(os.path.join(save_dir, "gm.code"), "w") as f:
-            f.write(gm.code)
 
-        scripted_model = torch.jit.script(gm)
-        scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+        if is_trt_convert:
+            data_cuda = batch.to_dict(sparse_dtype=torch.int32)
+            result = model(data_cuda, "cuda:0")
+            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+            logger.info(f"Model Outputs: {result_info}")
+
+            export_model_trt(model, data_cuda, save_dir)
+        else:
+            data = batch.to_dict(sparse_dtype=torch.int64)
+            result = model(data)
+            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+            logger.info(f"Model Outputs: {result_info}")
+
+            gm = symbolic_trace(model)
+            with open(os.path.join(save_dir, "gm.code"), "w") as f:
+                f.write(gm.code)
+
+            scripted_model = torch.jit.script(gm)
+            scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
         features = model._features
         feature_configs = create_feature_configs(features, asset_dir=save_dir)
@@ -832,13 +849,23 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    checkpoint_pg = dist.new_group(backend="gloo")
-    if is_rank_zero:
-        logger.info("copy sharded state_dict to cpu...")
-    cpu_state_dict = state_dict_to_device(
-        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-    )
-    cpu_model = _create_model(
+    is_trt_convert = is_trt()
+    if is_trt_convert:
+        checkpoint_pg = dist.new_group(backend="nccl")
+        if is_rank_zero:
+            logger.info("copy sharded state_dict to cuda...")
+        device_state_dict = state_dict_to_device(
+            model.state_dict(), pg=checkpoint_pg, device=torch.device(device)
+        )
+    else:
+        checkpoint_pg = dist.new_group(backend="gloo")
+        if is_rank_zero:
+            logger.info("copy sharded state_dict to cpu...")
+        device_state_dict = state_dict_to_device(
+            model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
+        )
+
+    device_model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
@@ -849,8 +876,8 @@ def export(
         data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
     )
 
-    if isinstance(cpu_model, MatchModel):
-        for name, module in cpu_model.named_children():
+    if isinstance(device_model, MatchModel):
+        for name, module in device_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -860,28 +887,28 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    cpu_state_dict,
+                    device_state_dict,
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(cpu_model, TDM):
-        for name, module in cpu_model.named_children():
+    elif isinstance(device_model, TDM):
+        for name, module in device_model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = ScriptWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    cpu_state_dict,
+                    device_state_dict,
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(cpu_model),
-            cpu_state_dict,
+            ScriptWrapper(device_model),
+            device_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -890,8 +917,8 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(cpu_model),
-            cpu_state_dict,
+            ScriptWrapper(device_model),
+            device_state_dict,
             dataloader,
             export_dir,
         )
@@ -1020,7 +1047,11 @@ def predict(
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            predictions = model(parsed_inputs, device)
+            is_trt = is_trt_predict(scripted_model_path)
+            if is_trt:
+                predictions = model(parsed_inputs)
+            else:
+                predictions = model(parsed_inputs, device)
             predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
 
