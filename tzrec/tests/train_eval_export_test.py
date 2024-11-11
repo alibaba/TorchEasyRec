@@ -646,6 +646,7 @@ class TrainEvalExportTest(unittest.TestCase):
         )
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "retrieval_result")))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",

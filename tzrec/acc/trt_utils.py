@@ -13,7 +13,12 @@ import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
-import torch_tensorrt
+
+# cpu image has no torch_tensorrt
+try:
+    import torch_tensorrt
+except Exception:
+    pass
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 from torchrec.fx import symbolic_trace
@@ -90,6 +95,7 @@ class ScriptWrapperList(ScriptWrapper):
     """Model inference wrapper for jit.script.
 
     ScriptWrapperList for trace the ScriptWrapperTRT(emb_trace_gpu, dense_layer_trt)
+    and return a list of Tensor instead of a dict of Tensor
     """
 
     def __init__(self, module: nn.Module) -> None:
@@ -153,22 +159,14 @@ def export_model_trt(
         data (Dict[str, torch.Tensor]): the test data
         save_dir (str): model save dir
     """
-    # save emb
     # ScriptWrapperList for trace the ScriptWrapperTRT(emb_trace_gpu, dense_layer_trt)
-    emb = ScriptWrapperList(model.model.embedding_group)
-    # make ebc not script
-    emb_trace = symbolic_trace(emb)
-    emb_scripted_model = torch.jit.script(emb_trace)
-    emb_scripted_model.save(os.path.join(save_dir, "scripted_model_emb.pt"))
-
-    emb_trace_gpu = torch.jit.load(
-        os.path.join(save_dir, "scripted_model_emb.pt"), map_location="cuda:0"
-    )
+    emb_trace_gpu = ScriptWrapperList(model.model.embedding_group)
     emb_res = emb_trace_gpu(data, "cuda:0")
-    logger.info("script emb success")
+    emb_trace_gpu = symbolic_trace(emb_trace_gpu)
+    emb_trace_gpu = torch.jit.script(emb_trace_gpu)
 
+    # dynamic shapes
     batch = torch.export.Dim("batch", min=1, max=10000)
-
     dynamic_shapes_list = []
     values_list_cuda = []
     for i, value in enumerate(emb_res):
@@ -180,7 +178,7 @@ def export_model_trt(
         dynamic_shapes_list.append(dict_dy)
 
     # convert dense
-    dense = model.model.dense.to("cuda:0")
+    dense = model.model.dense
     logger.info("dense res: %s", dense(values_list_cuda))
     dense_layer = symbolic_trace(dense)
     dynamic_shapes = {"args": dynamic_shapes_list}
@@ -200,12 +198,6 @@ def export_model_trt(
     # pyre-ignore [16]
     scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
-    model_gpu2 = torch.jit.load(
-        os.path.join(save_dir, "scripted_model.pt"), map_location="cuda:0"
-    )
-    res = model_gpu2(data)
-    logger.info("final res: %s", res)
-
     if is_debug_trt():
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -223,12 +215,17 @@ def export_model_trt(
                 dict_res = dense_layer_trt(values_list_cuda)
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
+        model_gpu_combined = torch.jit.load(
+            os.path.join(save_dir, "scripted_model.pt"), map_location="cuda:0"
+        )
+        res = model_gpu_combined(data)
+        logger.info("final res: %s", res)
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
         ) as prof:
             with record_function("model_inference_combined_trt"):
-                dict_res = model_gpu2(data)
+                dict_res = model_gpu_combined(data)
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
     logger.info("trt convert success")

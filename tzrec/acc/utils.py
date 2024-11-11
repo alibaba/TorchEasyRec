@@ -49,8 +49,6 @@ def is_trt_predict(model_path: str) -> bool:
     with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
         data = json.load(file)
     is_trt = data.get("ENABLE_TRT")
-    # if "ENABLE_TRT" in data:
-    #     is_trt = data["ENABLE_TRT"]
     if is_trt and is_trt[0] == "1":
         return True
     return False

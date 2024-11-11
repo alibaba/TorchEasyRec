@@ -456,7 +456,7 @@ class EmbeddingGroup(nn.Module):
         self,
         batch: Batch,
     ) -> List[torch.Tensor]:
-        """Predict the model."""
+        """Predict embedding module and return a list of grouped embedding features."""
         grouped_features = self.forward(batch)
         values_list = []
         for key in self._grouped_features_keys:
