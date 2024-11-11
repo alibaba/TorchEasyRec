@@ -46,7 +46,7 @@ def trt_convert(
         torch.fx.GraphModule: Compiled FX Module, when run it will execute via TensorRT
     """
     logger.info("trt convert start...")
-    torch_tensorrt.runtime.set_multi_device_safe_mode(True)
+    # torch_tensorrt.runtime.set_multi_device_safe_mode(True)
     enabled_precisions = {torch.float32}
 
     # Workspace size for TensorRT

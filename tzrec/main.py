@@ -722,6 +722,7 @@ def _script_model(
             os.makedirs(save_dir)
         if is_trt_convert:
             model = model.to_empty(device="cuda:0")
+            logger.info("gather states to cuda model...")
         else:
             model = model.to_empty(device="cpu")
             logger.info("gather states to cpu model...")

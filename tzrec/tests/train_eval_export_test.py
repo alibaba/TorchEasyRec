@@ -38,6 +38,7 @@ class TrainEvalExportTest(unittest.TestCase):
                 shutil.rmtree(self.test_dir)
         os.environ.pop("QUANT_EMB", None)
         os.environ.pop("INPUT_TILE", None)
+        os.environ.pop("ENABLE_TRT", None)
 
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
         self.success = utils.test_train_eval(
