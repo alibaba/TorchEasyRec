@@ -20,7 +20,7 @@ from anytree.iterators.abstractiter import AbstractIter
 from anytree.walker import Walker
 
 from tzrec.datasets.dataset import create_writer
-from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeClass
+from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode
 from tzrec.utils.logging_util import logger
 
 
@@ -29,11 +29,11 @@ class LevelOrderIter(AbstractIter):
 
     @staticmethod
     def _iter(
-        children: List[TDMTreeClass],
-        filter_: Callable[[TDMTreeClass], bool],
-        stop: Callable[[TDMTreeClass], bool],
+        children: List[TDMTreeNode],
+        filter_: Callable[[TDMTreeNode], bool],
+        stop: Callable[[TDMTreeNode], bool],
         maxlevel: int,
-    ) -> Iterator[Tuple[TDMTreeClass, int]]:
+    ) -> Iterator[Tuple[TDMTreeNode, int]]:
         level = 1
         while children:
             next_children = []
@@ -60,11 +60,14 @@ class TreeSearch(object):
         self,
         output_file: str,
         tree_path: Optional[str] = None,
-        root: Optional[TDMTreeClass] = None,
+        root: Optional[TDMTreeNode] = None,
         child_num: int = 2,
+        attr_delimiter: str = ",",
         **kwargs: Any,
     ) -> None:
         self.child_num = child_num
+        self.attr_delimiter = attr_delimiter
+
         if root is not None:
             self.root = root
         elif tree_path is not None:
@@ -130,9 +133,20 @@ class TreeSearch(object):
                 for node in nodes:
                     fea = [level, node.item_id]
                     if node.attrs:
-                        fea.append(node.attrs)
+                        fea.append(
+                            self.attr_delimiter.join(
+                                map(lambda x: str(x) if x.is_valid else "", node.attrs)
+                            )
+                        )
                     if node.raw_attrs:
-                        fea.append(node.raw_attrs)
+                        fea.append(
+                            self.attr_delimiter.join(
+                                map(
+                                    lambda x: str(x) if x.is_valid else 0,
+                                    node.raw_attrs,
+                                )
+                            )
+                        )
 
                     # add a node with id -1 for graph-learn to get root node
                     if first_node:
@@ -181,9 +195,23 @@ class TreeSearch(object):
                     for node in nodes:
                         fea = [level, node.item_id]
                         if node.attrs:
-                            fea.append(node.attrs)
+                            fea.append(
+                                self.attr_delimiter.join(
+                                    map(
+                                        lambda x: str(x) if x.is_valid else "",
+                                        node.attrs,
+                                    )
+                                )
+                            )
                         if node.raw_attrs:
-                            fea.append(node.raw_attrs)
+                            fea.append(
+                                self.attr_delimiter.join(
+                                    map(
+                                        lambda x: str(x) if x.is_valid else 0,
+                                        node.raw_attrs,
+                                    )
+                                )
+                            )
                         # add a node with id -1 for graph-learn to get root node
                         if first_node:
                             f.write(f"-1\t1.0\t-1,{','.join(map(str, fea[1:]))}\n")

@@ -9,13 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import pickle
-from collections import Counter
-from typing import List, Optional
+from typing import Any, List, Optional
 
-import numpy as np
-import numpy.typing as npt
+import pyarrow as pa
+import pyarrow.compute as pc
 from anytree import NodeMixin
 from anytree.exporter.dictexporter import DictExporter
 
@@ -28,34 +28,38 @@ class BaseClass(object):
     pass
 
 
-class TDMTreeClass(BaseClass, NodeMixin):
-    """TDM tree."""
+class TDMTreeNode(BaseClass, NodeMixin):
+    """TDM tree node."""
 
     def __init__(
         self,
-        tree_code: int,
-        emb_vec: List[float],
+        tree_code: int = -1,
         item_id: Optional[int] = None,
-        attrs: Optional[str] = None,
-        raw_attrs: Optional[str] = None,
-        parent: Optional["TDMTreeClass"] = None,
-        children: Optional[List["TDMTreeClass"]] = None,
+        cate: Optional[str] = None,
+        attrs: Optional[List[Any]] = None,
+        raw_attrs: Optional[List[Any]] = None,
+        parent: Optional["TDMTreeNode"] = None,
+        children: Optional[List["TDMTreeNode"]] = None,
     ) -> None:
-        super(TDMTreeClass, self).__init__()
+        super(TDMTreeNode, self).__init__()
         self.tree_code = tree_code
-        self.emb_vec = emb_vec
         self.item_id = item_id
-        self.attrs = attrs
-        self.raw_attrs = raw_attrs
+        self.cate = cate
+        self.attrs = attrs or []
+        self.raw_attrs = raw_attrs or []
+
+        self.attrs_list = []
+        self.raw_attrs_list = []
+
         self.parent = parent
         if children:
             self.children = children
 
-    def set_parent(self, parent: "TDMTreeClass") -> None:
+    def set_parent(self, parent: "TDMTreeNode") -> None:
         """Set parent."""
         self.parent = parent
 
-    def set_children(self, children: "TDMTreeClass") -> None:
+    def set_children(self, children: "TDMTreeNode") -> None:
         """Set children."""
         self.children = children
 
@@ -74,134 +78,79 @@ class TreeBuilder:
 
     def build(
         self,
-        ids: npt.NDArray,
-        codes: npt.NDArray,
-        attrs: npt.NDArray,
-        raw_attrs: npt.NDArray,
-        data: npt.NDArray,
+        leaf_nodes: List[TDMTreeNode],
         save_tree: bool = False,
-    ) -> TDMTreeClass:
+    ) -> TDMTreeNode:
         """Build tree."""
-        max_item_id = max(ids) + 1
-        # sort by code
-        argindex = np.argsort(codes)
-        codes = codes[argindex]
-        ids = ids[argindex]
-        attrs = attrs[argindex]
-        raw_attrs = raw_attrs[argindex]
-        data = data[argindex]
-
         # pull all leaf nodes to the last level
-        min_code = 0
-        max_code = codes[-1]
-        while max_code > 0:
-            min_code = min_code * self.n_cluster + 1
-            max_code = int((max_code - 1) / self.n_cluster)
-
+        min_code = (
+            self.n_cluster ** math.ceil(math.log(len(leaf_nodes), self.n_cluster)) - 1
+        )
         max_code = 0
-        for i in range(len(codes)):
-            while codes[i] < min_code:
-                codes[i] = codes[i] * self.n_cluster + 1
-            max_code = max(codes[i], max_code)
+        max_item_id = 0
+        for i in range(len(leaf_nodes)):
+            while leaf_nodes[i].tree_code < min_code:
+                leaf_nodes[i].tree_code = leaf_nodes[i].tree_code * self.n_cluster + 1
+            max_code = max(leaf_nodes[i].tree_code, max_code)
+            max_item_id = max(leaf_nodes[i].item_id, max_item_id)
 
-        class Item:
-            def __init__(self, item_id=None, attrs=None, raw_attrs=None, emb=None):
-                self.item_id = item_id
-                self.attrs = attrs
-                self.raw_attrs = raw_attrs
-                self.emb = emb
-
-        code_list: List[Optional[Item]] = [None for _ in range(max_code + 1)]
-        node_dict = {}
+        tree_nodes: List[Optional[TDMTreeNode]] = [None for _ in range(max_code + 1)]
         logger.info("start gen code_list")
 
-        for _id, code, attr, raw_attr, datum in zip(ids, codes, attrs, raw_attrs, data):
-            code_list[code] = Item(_id, attr, raw_attr, datum)
-            ancestors = self._ancestors(code)
+        for leaf_node in leaf_nodes:
+            tree_nodes[leaf_node.tree_code] = leaf_node
+            ancestors = self._ancestors(leaf_node.tree_code)
             for ancestor in ancestors:
-                code_list[ancestor] = Item(attrs=[], raw_attrs=[], emb=[])
+                tree_nodes[ancestor] = TDMTreeNode(tree_code=ancestor)
 
-        # If there are embedding vectors, the embedding vector of the parent node
-        # is the average of the embedding vectors of all its child nodes,
-        # and the ID feature is determined by the mode.
         for code in range(max_code, -1, -1):
-            code_item = code_list[code]
-            if code_item is None:
+            node = tree_nodes[code]
+            if node is None:
                 continue
-            assert code_item is not None
-            if not isinstance(code_item.item_id, np.integer):
-                if data[0].size != 0:
-                    code_item.emb = np.mean(code_item.emb, axis=0)
-                mode_attr = self._column_modes(code_item.attrs)
-                code_item.attrs = ",".join(mode_attr)
+            assert node is not None
+            if node.item_id is None:
+                node.attrs = self._column_modes(node.attrs_list)
+                node.raw_attrs = self._column_means(node.raw_attrs_list)
+                node.item_id = max_item_id + code
 
-                if len(code_item.raw_attrs[0]) > 0:
-                    mean_raw_attr = np.nanmean(code_item.raw_attrs, axis=0)
-                    mean_raw_attr = mean_raw_attr.astype(str)
-                    mean_raw_attr[mean_raw_attr == "nan"] = ""
-                    code_item.raw_attrs = ",".join(mean_raw_attr)
-                else:
-                    code_item.raw_attrs = ""
             if code > 0:
                 ancestors = self._ancestors(code)
                 for ancestor in ancestors:
-                    ancestor_code_item = code_list[ancestor]
-                    assert ancestor_code_item is not None
-                    if data[0].size != 0:
-                        ancestor_code_item.emb.append(code_item.emb)
-                    ancestor_code_item.attrs.append(code_item.attrs.split(","))
-                    if code_item.raw_attrs:
-                        raw_fea = np.array(code_item.raw_attrs.split(","))
-                        raw_fea[raw_fea == ""] = np.nan
-                        ancestor_code_item.raw_attrs.append(raw_fea.astype(float))
+                    ancestor_node = tree_nodes[ancestor]
+                    assert ancestor_node is not None
+                    if code < min_code:
+                        ancestor_node.attrs_list.extend(node.attrs_list)
+                        ancestor_node.raw_attrs_list.extend(node.raw_attrs_list)
                     else:
-                        ancestor_code_item.raw_attrs.append("")
-
-        logger.info("start gen node_dict")
-        for code in range(0, max_code + 1):
-            code_item = code_list[code]
-            if code_item is None:
-                continue
-            assert code_item is not None
-            if isinstance(code_item.item_id, np.integer):
-                node_dict[code] = TDMTreeClass(
-                    code,
-                    emb_vec=[],
-                    item_id=int(code_item.item_id),
-                    attrs=code_item.attrs,
-                    raw_attrs=code_item.raw_attrs,
-                )
-            else:
-                node_dict[code] = TDMTreeClass(
-                    code,
-                    emb_vec=[],
-                    item_id=code + max_item_id,
-                    attrs=code_item.attrs,
-                    raw_attrs=code_item.raw_attrs,
-                )
-            if code > 0:
-                ancestor = int((code - 1) / self.n_cluster)
-                node_dict[code].set_parent(node_dict[ancestor])
+                        ancestor_node.attrs_list.append(node.attrs)
+                        ancestor_node.raw_attrs_list.append(node.raw_attrs)
+            node.attrs_list = []
+            node.raw_attrs_list = []
 
         if save_tree:
-            self.save_tree(node_dict[0])
-        return node_dict[0]
+            self.save_tree(tree_nodes[0])
+        return tree_nodes[0]
 
-    def _column_modes(self, matrix: List[List[str]]) -> List[str]:
+    def _column_modes(self, matrix: List[List[pa.Scalar]]) -> List[pa.Scalar]:
         transposed_matrix = list(zip(*matrix))
         modes = []
-
         for column in transposed_matrix:
-            filtered_column = [x for x in column if x]
-            if filtered_column:
-                most_common = Counter(filtered_column).most_common(1)[0][0]
-                modes.append(most_common)
+            mode = pc.mode(column)
+            if len(mode) > 0:
+                modes.append(mode[0])
             else:
-                modes.append("")
-
+                # null value with column dtype
+                modes.append(column[0])
         return modes
 
-    def save_tree(self, root: TDMTreeClass) -> None:
+    def _column_means(self, matrix: List[List[pa.Scalar]]) -> List[pa.Scalar]:
+        transposed_matrix = list(zip(*matrix))
+        means = []
+        for column in transposed_matrix:
+            means.append(pc.mean(column).cast(column[0].type))
+        return means
+
+    def save_tree(self, root: TDMTreeNode) -> None:
         """Save tree."""
         assert self.output_dir is not None, "if save tree, must set output_dir."
         path = os.path.join(self.output_dir, "tree.pkl")

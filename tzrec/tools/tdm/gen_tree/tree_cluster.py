@@ -23,7 +23,7 @@ from sklearn.cluster import KMeans
 
 from tzrec.datasets.dataset import create_reader
 from tzrec.tools.tdm.gen_tree import tree_builder
-from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeClass
+from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode
 from tzrec.utils.logging_util import logger
 
 
@@ -53,10 +53,10 @@ class TreeCluster:
     ) -> None:
         self.item_input_path = item_input_path
         self.mini_batch = 1024
-        self.ids = None
+
         self.data = None
-        self.attrs = None
-        self.raw_attrs = None
+        self.leaf_nodes = None
+
         self.parallel = parallel
         self.queue = None
         self.timeout = 5
@@ -80,51 +80,61 @@ class TreeCluster:
 
     def _read(self) -> None:
         t1 = time.time()
-        ids = list()
         data = list()
-        attrs = list()
-        raw_attrs = list()
-        reader = create_reader(self.item_input_path, 256, **self.dataset_kwargs)
-        for data_dict in reader.to_batches():
-            ids += data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
-            data += data_dict[self.embedding_field].to_pylist()
-            tmp_attr = []
-            if self.attr_fields is not None:
-                # pyre-ignore [16]
-                for attr in self.attr_fields:
-                    tmp_attr.append(
-                        data_dict[attr].cast(pa.string()).fill_null("").to_pylist()
-                    )
-                attrs += [",".join(map(str, i)) for i in zip(*tmp_attr)]
 
-            tmp_raw_attr = []
+        self.leaf_nodes = []
+
+        selected_cols = (
+            {self.item_id_field, self.embedding_field}
+            | set(self.attr_fields)
+            | set(self.raw_attr_fields)
+        )
+        reader = create_reader(
+            self.item_input_path,
+            4096,
+            selected_cols=list(selected_cols),
+            **self.dataset_kwargs,
+        )
+
+        for data_dict in reader.to_batches():
+            data += data_dict[self.embedding_field].to_pylist()
+
+            batch_tree_nodes = []
+            ids = data_dict[self.item_id_field].cast(pa.int64())
+            for one_id in ids:
+                batch_tree_nodes.append(TDMTreeNode(item_id=one_id))
+
+            if self.attr_fields is not None:
+                for attr in self.attr_fields:
+                    attr_data = data_dict[attr]
+                    for i in range(len(batch_tree_nodes)):
+                        batch_tree_nodes[i].attrs.append(attr_data[i])
+
             if self.raw_attr_fields is not None:
                 for attr in self.raw_attr_fields:
-                    tmp_raw_attr.append(
-                        data_dict[attr].cast(pa.string()).fill_null("").to_pylist()
-                    )
-                raw_attrs += [",".join(map(str, i)) for i in zip(*tmp_raw_attr)]
+                    attr_data = data_dict[attr]
+                    for i in range(len(batch_tree_nodes)):
+                        batch_tree_nodes[i].raw_attrs.append(attr_data[i])
 
-        self.ids = np.array(ids)
+            self.leaf_nodes.extend(batch_tree_nodes)
+
         if isinstance(data[0], str):
             data = [eval(i) for i in data]
         self.data = np.array(data)
-        self.attrs = np.array(attrs) if attrs else np.array([""] * len(ids))
-        self.raw_attrs = np.array(raw_attrs) if raw_attrs else np.array([""] * len(ids))
         t2 = time.time()
 
         logger.info(
             "Read data done, {} records read, elapsed: {}".format(len(ids), t2 - t1)
         )
 
-    def train(self, save_tree: bool = False) -> TDMTreeClass:
+    def train(self, save_tree: bool = False) -> TDMTreeNode:
         """Cluster data."""
         self._read()
         # The (code, index) stored in the queue represent the node number
         # in the current class’s tree and the index of the item belonging
         # to this class, respectively.
         queue = mp.Queue()
-        queue.put((0, np.arange(len(self.ids))))
+        queue.put((0, np.arange(len(self.leaf_nodes))))
         processes = []
         pipes = []
         for _ in range(self.parallel):
@@ -134,28 +144,26 @@ class TreeCluster:
             pipes.append(parent_conn)
             p.start()
 
-        self.codes = np.zeros((len(self.ids),), dtype=np.int64)
+        self.codes = np.zeros((len(self.leaf_nodes),), dtype=np.int64)
         for pipe in pipes:
             codes = pipe.recv()
             for i in range(len(codes)):
                 if codes[i] > 0:
-                    self.codes[i] = codes[i]
+                    self.leaf_nodes[i].tree_code = codes[i]
 
         for p in processes:
             p.join()
 
         assert queue.empty()
         builder = tree_builder.TreeBuilder(self.output_dir, self.n_clusters)
-        root = builder.build(
-            self.ids, self.codes, self.attrs, self.raw_attrs, self.data, save_tree
-        )
+        root = builder.build(self.leaf_nodes, save_tree)
         return root
 
     def _train(self, pipe: Connection, queue: mp.Queue) -> None:
         last_size = -1
         catch_time = 0
         processed = False
-        code = np.zeros((len(self.ids),), dtype=np.int64)
+        code = np.zeros((len(self.leaf_nodes),), dtype=np.int64)
         parent_code = None
         index = None
         while True:
