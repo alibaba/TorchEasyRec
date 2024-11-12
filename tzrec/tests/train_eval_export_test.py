@@ -16,7 +16,12 @@ import tempfile
 import unittest
 
 import torch
-import torch_tensorrt
+
+# cpu image has no torch_tensorrt
+try:
+    import torch_tensorrt
+except Exception:
+    pass
 from pyarrow import dataset as ds
 
 from tzrec.acc.utils import is_close
