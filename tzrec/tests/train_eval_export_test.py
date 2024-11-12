@@ -16,8 +16,10 @@ import tempfile
 import unittest
 
 import torch
+import torch_tensorrt
 from pyarrow import dataset as ds
 
+from tzrec.acc.utils import is_close
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
@@ -715,9 +717,9 @@ class TrainEvalExportTest(unittest.TestCase):
             df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
             df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
             df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
-            # self.assertTrue(df.equals(df_t))
             print(df)
             print(df_t)
+            self.assertTrue(is_close(df, df_t, 1e-6))
 
         # quant and input-tile and trt
         if self.success:
@@ -748,9 +750,9 @@ class TrainEvalExportTest(unittest.TestCase):
             )
             df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
             df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
-            # self.assertTrue(df.equals(df_t))
             print(df)
             print(df_t)
+            self.assertTrue(is_close(df, df_t, 1e-6))
 
         # quant and input-tile emb and trt
         if self.success:
@@ -781,9 +783,9 @@ class TrainEvalExportTest(unittest.TestCase):
             )
             df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
             df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
-            # self.assertTrue(df.equals(df_t))
             print(df)
             print(df_t)
+            self.assertTrue(is_close(df, df_t, 1e-6))
 
         self.assertTrue(self.success)
 
@@ -842,6 +844,7 @@ class TrainEvalExportTest(unittest.TestCase):
         utils.save_predict_result_json(result_gpu, result_dict_json_path)
 
         # quant and trt
+        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
         model_gpu_trt = torch.jit.load(
             os.path.join(self.test_dir, "trt/export/scripted_model.pt"),
             map_location=device,
@@ -884,19 +887,19 @@ class TrainEvalExportTest(unittest.TestCase):
         # trt is all same sa no-trt
         for k, v in result_gpu.items():
             torch.testing.assert_close(
-                result_gpu_trt[k].to(device), v, rtol=1e-4, atol=1e-4
+                result_gpu_trt[k].to(device), v, rtol=1e-6, atol=1e-6
             )
 
         # tile & trt is all same sa no-tile-trt
         for k, v in result_gpu.items():
             torch.testing.assert_close(
-                result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
+                result_gpu_input_tile[k].to(device), v, rtol=1e-6, atol=1e-6
             )
 
         # tile emb & trt is all same sa no-tile-trt
         for k, v in result_gpu.items():
             torch.testing.assert_close(
-                result_gpu_input_tile_emb[k].to(device), v, rtol=1e-4, atol=1e-4
+                result_gpu_input_tile_emb[k].to(device), v, rtol=1e-6, atol=1e-6
             )
 
 

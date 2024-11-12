@@ -8,7 +8,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+# cpu image has no torch_tensorrt
+try:
+    import torch_tensorrt
+except Exception:
+    pass
 import copy
 import itertools
 import json
@@ -1012,6 +1016,11 @@ def predict(
     # disable jit compile， as it compile too slow now.
     if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
         os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+
+    is_trt_convert: bool = is_trt_predict(scripted_model_path)
+    if is_trt_convert:
+        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
+
     model: torch.jit.ScriptModule = torch.jit.load(
         os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
     )
@@ -1047,8 +1056,7 @@ def predict(
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            is_trt = is_trt_predict(scripted_model_path)
-            if is_trt:
+            if is_trt_convert:
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
@@ -1061,16 +1069,17 @@ def predict(
         output_cols: List[str],
     ) -> None:
         output_dict = OrderedDict()
-        for c in output_cols:
-            v = predictions[c]
-            v = v.tolist() if v.ndim > 1 else v.numpy()
-            output_dict[c] = pa.array(v)
         reserve_batch_record = reserves.get()
         if reserve_batch_record is not None:
             for k, v in zip(
                 reserve_batch_record.column_names, reserve_batch_record.columns
             ):
                 output_dict[k] = v
+        for c in output_cols:
+            v = predictions[c]
+            v = v.tolist() if v.ndim > 1 else v.numpy()
+            logger.info("key: %s %s", c, v)
+            output_dict[c] = pa.array(v)
         writer.write(output_dict)
 
     def _write_loop(output_cols: List[str]) -> None:
