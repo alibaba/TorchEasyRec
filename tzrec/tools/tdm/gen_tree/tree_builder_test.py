@@ -25,7 +25,7 @@ class TreeBuilderTest(unittest.TestCase):
             leaf_nodes.append(
                 TDMTreeNode(
                     item_id=i,
-                    cate=i,
+                    cate=str(i),
                     attrs=[pa.scalar(i)],
                     raw_attrs=[pa.scalar(0.1 * i)],
                 )

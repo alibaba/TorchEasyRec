@@ -93,7 +93,9 @@ class TreeBuilder:
             while leaf_nodes[i].tree_code < min_code:
                 leaf_nodes[i].tree_code = leaf_nodes[i].tree_code * self.n_cluster + 1
             max_code = max(leaf_nodes[i].tree_code, max_code)
-            max_item_id = max(leaf_nodes[i].item_id, max_item_id)
+            leaf_item_id = leaf_nodes[i].item_id
+            assert leaf_item_id is not None
+            max_item_id = max(leaf_item_id, max_item_id)
 
         tree_nodes: List[Optional[TDMTreeNode]] = [None for _ in range(max_code + 1)]
         logger.info("start gen code_list")
@@ -104,8 +106,10 @@ class TreeBuilder:
             for ancestor in ancestors:
                 if tree_nodes[ancestor] is None:
                     tree_nodes[ancestor] = TDMTreeNode(tree_code=ancestor)
-                tree_nodes[ancestor].attrs_list.append(leaf_node.attrs)
-                tree_nodes[ancestor].raw_attrs_list.append(leaf_node.raw_attrs)
+                ancestor_node = tree_nodes[ancestor]
+                assert ancestor_node is not None
+                ancestor_node.attrs_list.append(leaf_node.attrs)
+                ancestor_node.raw_attrs_list.append(leaf_node.raw_attrs)
 
         for code in range(max_code + 1):
             node = tree_nodes[code]
@@ -119,7 +123,9 @@ class TreeBuilder:
 
             if code > 0:
                 ancestor = int((code - 1) / self.n_cluster)
-                node.set_parent(tree_nodes[ancestor])
+                ancestor_node = tree_nodes[ancestor]
+                assert ancestor_node is not None
+                node.set_parent(ancestor_node)
 
             node.attrs_list = []
             node.raw_attrs_list = []
