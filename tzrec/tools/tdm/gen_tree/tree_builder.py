@@ -150,7 +150,7 @@ class TreeBuilder:
             else:
                 mode = pc.mode(list(column))
                 if len(mode) > 0:
-                    modes.append(mode[0])
+                    modes.append(mode[0][0])
                 else:
                     # null value with column dtype
                     modes.append(column[0])
