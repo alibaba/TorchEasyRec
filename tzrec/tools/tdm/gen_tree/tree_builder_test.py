@@ -10,72 +10,52 @@
 # limitations under the License.
 
 import unittest
-from typing import List, Tuple
+from typing import List
 
-import numpy as np
-import numpy.typing as npt
+import pyarrow as pa
 
-from tzrec.tools.tdm.gen_tree.tree_builder import TreeBuilder
+from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode, TreeBuilder
 from tzrec.tools.tdm.gen_tree.tree_search_util import LevelOrderIter
 
 
 class TreeBuilderTest(unittest.TestCase):
-    def gen_ids_codes(
-        self,
-    ) -> Tuple[
-        npt.NDArray,
-        npt.NDArray,
-        npt.NDArray,
-        npt.NDArray,
-        npt.NDArray,
-    ]:
-        class Item:
-            def __init__(self, item_id, cat_id, attrs=None, raw_attrs=None):
-                self.item_id = item_id
-                self.cat_id = cat_id
-                self.attrs = attrs
-                self.raw_attrs = raw_attrs
-                self.code = 0
-
-            def __lt__(self, other):
-                return self.cat_id < other.cat_id or (
-                    self.cat_id == other.cat_id and self.item_id < other.item_id
-                )
-
-        items = []
+    def gen_ids_codes(self) -> List[TDMTreeNode]:
+        leaf_nodes = []
         for i in range(10):
-            items.append(Item(item_id=i, cat_id=i, attrs=f"{i}", raw_attrs=f"{0.1*i}"))
-        items.sort()
+            leaf_nodes.append(
+                TDMTreeNode(
+                    item_id=i,
+                    cate=i,
+                    attrs=[pa.scalar(i)],
+                    raw_attrs=[pa.scalar(0.1 * i)],
+                )
+            )
+        leaf_nodes.sort(key=lambda x: (x.cate, x.item_id))
 
-        def gen_code(start: int, end: int, code: int, items: List[Item]) -> None:
+        def gen_code(
+            start: int, end: int, code: int, leaf_nodes: List[TDMTreeNode]
+        ) -> None:
             if end <= start:
                 return
             if end == start + 1:
-                items[start].code = code
+                leaf_nodes[start].tree_code = code
                 return
             for i in range(2):
                 left = int(start + i * (end - start) / 2)
                 right = int(start + (i + 1) * (end - start) / 2)
-                gen_code(left, right, 2 * code + 2 - i, items)
+                gen_code(left, right, 2 * code + 2 - i, leaf_nodes)
 
-        gen_code(0, len(items), 0, items)
-        ids = np.array([item.item_id for item in items])
-        codes = np.array([item.code for item in items])
-        attrs = np.array([item.attrs if item.attrs else "" for item in items])
-        raw_attrs = np.array(
-            [item.raw_attrs if item.raw_attrs else "" for item in items]
-        )
-        data = np.array([[] for i in range(len(ids))])
+        gen_code(0, len(leaf_nodes), 0, leaf_nodes)
 
-        return ids, codes, attrs, raw_attrs, data
+        return leaf_nodes
 
     def test_treebuilder(self) -> None:
-        ids, codes, attrs, raw_attrs, data = self.gen_ids_codes()
+        leaf_nodes = self.gen_ids_codes()
         builder = TreeBuilder()
-        root = builder.build(ids, codes, attrs, raw_attrs, data, False)
+        root = builder.build(leaf_nodes, False)
         true_ids = list(range(10, 25)) + list(range(9, -1, -1))
         true_levels = [1] + [2] * 2 + [3] * 4 + [4] * 8 + [5] * 10
-        true_leaf_feas = [f"{i},{0.1*i}" for i in true_ids[-10:]]
+        true_leaf_feas = [[pa.scalar(i), pa.scalar(0.1 * i)] for i in true_ids[-10:]]
         ids = []
         levels = []
         leaf_feas = []
@@ -83,7 +63,7 @@ class TreeBuilderTest(unittest.TestCase):
             levels.append(level)
             ids.append(node.item_id)
             if level == 5:
-                leaf_feas.append(node.attrs + "," + node.raw_attrs)
+                leaf_feas.append(node.attrs + node.raw_attrs)
         self.assertEqual(true_ids, ids)
         self.assertEqual(true_levels, levels)
         self.assertEqual(true_leaf_feas, leaf_feas)

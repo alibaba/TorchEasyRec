@@ -65,8 +65,8 @@ class TreeCluster:
         self.n_clusters = n_cluster
 
         self.item_id_field = item_id_field
-        self.attr_fields: Optional[List[str]] = None
-        self.raw_attr_fields: Optional[List[str]] = None
+        self.attr_fields = []
+        self.raw_attr_fields = []
         if attr_fields:
             self.attr_fields = [x.strip() for x in attr_fields.split(",")]
         if raw_attr_fields:
@@ -97,24 +97,22 @@ class TreeCluster:
         )
 
         for data_dict in reader.to_batches():
+            ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
             data += data_dict[self.embedding_field].to_pylist()
 
             batch_tree_nodes = []
-            ids = data_dict[self.item_id_field].cast(pa.int64())
             for one_id in ids:
                 batch_tree_nodes.append(TDMTreeNode(item_id=one_id))
 
-            if self.attr_fields is not None:
-                for attr in self.attr_fields:
-                    attr_data = data_dict[attr]
-                    for i in range(len(batch_tree_nodes)):
-                        batch_tree_nodes[i].attrs.append(attr_data[i])
+            for attr in self.attr_fields:
+                attr_data = data_dict[attr]
+                for i in range(len(batch_tree_nodes)):
+                    batch_tree_nodes[i].attrs.append(attr_data[i])
 
-            if self.raw_attr_fields is not None:
-                for attr in self.raw_attr_fields:
-                    attr_data = data_dict[attr]
-                    for i in range(len(batch_tree_nodes)):
-                        batch_tree_nodes[i].raw_attrs.append(attr_data[i])
+            for attr in self.raw_attr_fields:
+                attr_data = data_dict[attr]
+                for i in range(len(batch_tree_nodes)):
+                    batch_tree_nodes[i].raw_attrs.append(attr_data[i])
 
             self.leaf_nodes.extend(batch_tree_nodes)
 
@@ -124,7 +122,9 @@ class TreeCluster:
         t2 = time.time()
 
         logger.info(
-            "Read data done, {} records read, elapsed: {}".format(len(ids), t2 - t1)
+            "Read data done, {} records read, elapsed: {}".format(
+                len(self.leaf_nodes), t2 - t1
+            )
         )
 
     def train(self, save_tree: bool = False) -> TDMTreeNode:

@@ -12,7 +12,8 @@
 import math
 import os
 import pickle
-from typing import Any, List, Optional
+from collections import Counter
+from typing import List, Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -36,8 +37,8 @@ class TDMTreeNode(BaseClass, NodeMixin):
         tree_code: int = -1,
         item_id: Optional[int] = None,
         cate: Optional[str] = None,
-        attrs: Optional[List[Any]] = None,
-        raw_attrs: Optional[List[Any]] = None,
+        attrs: Optional[List[pa.Scalar]] = None,
+        raw_attrs: Optional[List[pa.Scalar]] = None,
         parent: Optional["TDMTreeNode"] = None,
         children: Optional[List["TDMTreeNode"]] = None,
     ) -> None:
@@ -59,7 +60,7 @@ class TDMTreeNode(BaseClass, NodeMixin):
         """Set parent."""
         self.parent = parent
 
-    def set_children(self, children: "TDMTreeNode") -> None:
+    def set_children(self, children: List["TDMTreeNode"]) -> None:
         """Set children."""
         self.children = children
 
@@ -101,9 +102,12 @@ class TreeBuilder:
             tree_nodes[leaf_node.tree_code] = leaf_node
             ancestors = self._ancestors(leaf_node.tree_code)
             for ancestor in ancestors:
-                tree_nodes[ancestor] = TDMTreeNode(tree_code=ancestor)
+                if tree_nodes[ancestor] is None:
+                    tree_nodes[ancestor] = TDMTreeNode(tree_code=ancestor)
+                tree_nodes[ancestor].attrs_list.append(leaf_node.attrs)
+                tree_nodes[ancestor].raw_attrs_list.append(leaf_node.raw_attrs)
 
-        for code in range(max_code, -1, -1):
+        for code in range(max_code + 1):
             node = tree_nodes[code]
             if node is None:
                 continue
@@ -111,43 +115,46 @@ class TreeBuilder:
             if node.item_id is None:
                 node.attrs = self._column_modes(node.attrs_list)
                 node.raw_attrs = self._column_means(node.raw_attrs_list)
-                node.item_id = max_item_id + code
+                node.item_id = max_item_id + code + 1
 
             if code > 0:
-                ancestors = self._ancestors(code)
-                for ancestor in ancestors:
-                    ancestor_node = tree_nodes[ancestor]
-                    assert ancestor_node is not None
-                    if code < min_code:
-                        ancestor_node.attrs_list.extend(node.attrs_list)
-                        ancestor_node.raw_attrs_list.extend(node.raw_attrs_list)
-                    else:
-                        ancestor_node.attrs_list.append(node.attrs)
-                        ancestor_node.raw_attrs_list.append(node.raw_attrs)
+                ancestor = int((code - 1) / self.n_cluster)
+                node.set_parent(tree_nodes[ancestor])
+
             node.attrs_list = []
             node.raw_attrs_list = []
 
+        root_node = tree_nodes[0]
+        assert root_node is not None
         if save_tree:
-            self.save_tree(tree_nodes[0])
-        return tree_nodes[0]
+            self.save_tree(root_node)
+        return root_node
 
     def _column_modes(self, matrix: List[List[pa.Scalar]]) -> List[pa.Scalar]:
         transposed_matrix = list(zip(*matrix))
         modes = []
         for column in transposed_matrix:
-            mode = pc.mode(column)
-            if len(mode) > 0:
-                modes.append(mode[0])
+            if pa.types.is_string(column[0].type):
+                filtered_column = [x for x in column if x]
+                if filtered_column:
+                    most_common = Counter(filtered_column).most_common(1)[0][0]
+                    modes.append(most_common)
+                else:
+                    modes.append(pa.scalar(""))
             else:
-                # null value with column dtype
-                modes.append(column[0])
+                mode = pc.mode(list(column))
+                if len(mode) > 0:
+                    modes.append(mode[0])
+                else:
+                    # null value with column dtype
+                    modes.append(column[0])
         return modes
 
     def _column_means(self, matrix: List[List[pa.Scalar]]) -> List[pa.Scalar]:
         transposed_matrix = list(zip(*matrix))
         means = []
         for column in transposed_matrix:
-            means.append(pc.mean(column).cast(column[0].type))
+            means.append(pc.mean(list(column)).cast(column[0].type))
         return means
 
     def save_tree(self, root: TDMTreeNode) -> None:

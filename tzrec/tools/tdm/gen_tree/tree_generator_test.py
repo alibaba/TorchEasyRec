@@ -14,6 +14,8 @@ import os
 import tempfile
 import unittest
 
+import pyarrow as pa
+
 from tzrec.tools.tdm.gen_tree.tree_generator import TreeGenerator
 from tzrec.tools.tdm.gen_tree.tree_search_util import LevelOrderIter
 
@@ -43,7 +45,10 @@ class Clustertest(unittest.TestCase):
         root = generator.generate(save_tree=False)
         true_ids = list(range(10, 25)) + list(range(9, -1, -1))
         true_levels = [1] + [2] * 2 + [3] * 4 + [4] * 8 + [5] * 10
-        true_leaf_feas = [f"{i},我们{i},{0.1*i if i!=0 else 0}" for i in true_ids[-10:]]
+        true_leaf_feas = [
+            [pa.scalar(i), pa.scalar(f"我们{i}"), pa.scalar(0.1 * i)]
+            for i in true_ids[-10:]
+        ]
         ids = []
         levels = []
         leaf_feas = []
@@ -51,7 +56,7 @@ class Clustertest(unittest.TestCase):
             levels.append(level)
             ids.append(node.item_id)
             if level == 5:
-                leaf_feas.append(node.attrs + "," + node.raw_attrs)
+                leaf_feas.append(node.attrs + node.raw_attrs)
         self.assertEqual(true_ids, ids)
         self.assertEqual(true_levels, levels)
         self.assertEqual(true_leaf_feas, leaf_feas)

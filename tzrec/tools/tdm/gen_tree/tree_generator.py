@@ -43,8 +43,8 @@ class TreeGenerator:
         self.item_input_path = item_input_path
         self.item_id_field = item_id_field
         self.cate_id_field = cate_id_field
-        self.attr_fields: Optional[List[str]] = None
-        self.raw_attr_fields: Optional[List[str]] = None
+        self.attr_fields = []
+        self.raw_attr_fields = []
         if attr_fields:
             self.attr_fields = [x.strip() for x in attr_fields.split(",")]
         if raw_attr_fields:
@@ -78,24 +78,27 @@ class TreeGenerator:
         )
 
         for data_dict in reader.to_batches():
-            ids = data_dict[self.item_id_field].cast(pa.int64())
-            cates = data_dict[self.cate_id_field].cast(pa.string()).fill_null("")
+            ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
+            cates = (
+                data_dict[self.cate_id_field]
+                .cast(pa.string())
+                .fill_null("")
+                .to_pylist()
+            )
 
             batch_tree_nodes = []
             for one_id, one_cate in zip(ids, cates):
                 batch_tree_nodes.append(TDMTreeNode(item_id=one_id, cate=one_cate))
 
-            if self.attr_fields is not None:
-                for attr in self.attr_fields:
-                    attr_data = data_dict[attr]
-                    for i in range(len(batch_tree_nodes)):
-                        batch_tree_nodes[i].attrs.append(attr_data[i])
+            for attr in self.attr_fields:
+                attr_data = data_dict[attr]
+                for i in range(len(batch_tree_nodes)):
+                    batch_tree_nodes[i].attrs.append(attr_data[i])
 
-            if self.raw_attr_fields is not None:
-                for attr in self.raw_attr_fields:
-                    attr_data = data_dict[attr]
-                    for i in range(len(batch_tree_nodes)):
-                        batch_tree_nodes[i].raw_attrs.append(attr_data[i])
+            for attr in self.raw_attr_fields:
+                attr_data = data_dict[attr]
+                for i in range(len(batch_tree_nodes)):
+                    batch_tree_nodes[i].raw_attrs.append(attr_data[i])
 
             leaf_nodes.extend(batch_tree_nodes)
 
