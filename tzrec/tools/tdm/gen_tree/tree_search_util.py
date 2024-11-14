@@ -275,11 +275,13 @@ class TreeSearch(object):
             output_path, writer_type=writer_type, **self.dataset_kwargs
         )
 
-        attr_fields = [x.strip() for x in attr_fields.split(",")] if attr_fields else []
-        raw_attr_fields = (
+        attr_field_names = (
+            [x.strip() for x in attr_fields.split(",")] if attr_fields else []
+        )
+        raw_attr_field_names = (
             [x.strip() for x in raw_attr_fields.split(",")] if raw_attr_fields else []
         )
-        attr_names = ["item_id"] + attr_fields + raw_attr_fields
+        attr_names = ["item_id"] + attr_field_names + raw_attr_field_names
         attr_values = [[] for _ in range(len(attr_names))]
         for _, nodes in enumerate(self.level_code):
             for node in nodes:
