@@ -261,7 +261,9 @@ class TreeSearch(object):
                         for child in node.children:
                             f.write(f"{node.item_id}\t{child.item_id}\t{1.0}\n")
 
-    def save_node_feature(self, attr_fields: str, raw_attr_fields: str) -> None:
+    def save_node_feature(
+        self, attr_fields: Optional[str] = None, raw_attr_fields: Optional[str] = None
+    ) -> None:
         """Save feature of tree node for serving."""
         if self.output_file.startswith("odps://"):
             output_path = _add_suffix_to_odps_table(self.output_file, "_node_feature")
@@ -273,7 +275,11 @@ class TreeSearch(object):
             output_path, writer_type=writer_type, **self.dataset_kwargs
         )
 
-        attr_names = ["item_id"] + attr_fields.split(",") + raw_attr_fields.split(",")
+        attr_fields = [x.strip() for x in attr_fields.split(",")] if attr_fields else []
+        raw_attr_fields = (
+            [x.strip() for x in raw_attr_fields.split(",")] if raw_attr_fields else []
+        )
+        attr_names = ["item_id"] + attr_fields + raw_attr_fields
         attr_values = [[] for _ in range(len(attr_names))]
         for _, nodes in enumerate(self.level_code):
             for node in nodes:

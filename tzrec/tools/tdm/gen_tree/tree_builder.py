@@ -160,7 +160,10 @@ class TreeBuilder:
         transposed_matrix = list(zip(*matrix))
         means = []
         for column in transposed_matrix:
-            means.append(pc.mean(list(column)).cast(column[0].type))
+            mean = pc.mean(list(column))
+            if pa.types.is_integer(column[0].type):
+                mean = pc.round(mean)
+            means.append(mean.cast(column[0].type, safe=False))
         return means
 
     def save_tree(self, root: TDMTreeNode) -> None:

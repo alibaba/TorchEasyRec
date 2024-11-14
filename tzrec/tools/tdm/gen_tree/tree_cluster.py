@@ -192,7 +192,7 @@ class TreeCluster:
             catch_time = 0
             last_size = len(index)
             if last_size <= self.mini_batch:
-                self._minbatch(parent_code, index, code)
+                self._mini_batch(parent_code, index, code)
             else:
                 start = time.time()
                 sub_index = self._cluster(index)
@@ -217,7 +217,7 @@ class TreeCluster:
         logger.info("Process {} process {} items".format(os.getpid(), process_count))
         pipe.send(code)
 
-    def _minbatch(
+    def _mini_batch(
         self, parent_code: int, index: npt.NDArray, code: npt.NDArray
     ) -> None:
         dq = collections.deque()
@@ -242,7 +242,7 @@ class TreeCluster:
                             self.n_clusters * parent_code + i + j + 1
                         )
         logger.info(
-            "Minbatch, batch size: {}, elapsed: {}".format(
+            "Minibatch, batch size: {}, elapsed: {}".format(
                 batch_size, time.time() - tstart
             )
         )
