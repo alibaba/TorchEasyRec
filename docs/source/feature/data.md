@@ -149,6 +149,9 @@ data_config {
           --fg_output_dir fg_output
           --reserves ${COLS_YOU_WANT_RESERVE}
       ```
+      - --pipeline_config_path: 模型配置文件。
+      - --fg_output_dir: fg json的输出文件夹。
+      - --reserves: 需要透传到输出表的列，列名用逗号分隔。一般需要保留Label列，也可以保留request_id，user_id，item_id列，注意：如果模型的feature_config中有user_id，item_id作为特征，feature_name需避免与样本中的user_id，item_id列名冲突。
     - 在[Dataworks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
       ```shell
       /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg035-0.3.5-cp37-cp37m-linux_x86_64.whl
