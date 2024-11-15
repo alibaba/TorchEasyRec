@@ -48,10 +48,16 @@ if __name__ == "__main__":
         help="The column names representing the raw features of item in the file.",
     )
     parser.add_argument(
+        "--attr_delimiter",
+        type=str,
+        default=",",
+        help="The attribute delimiter in tdm node and edge table.",
+    )
+    parser.add_argument(
         "--tree_output_dir",
         type=str,
         default=None,
-        help="The tree output file.",
+        help="The tree output directory.",
     )
     parser.add_argument(
         "--node_edge_output_file",
@@ -98,8 +104,9 @@ if __name__ == "__main__":
         child_num=args.n_cluster,
         odps_data_quota_name=args.odps_data_quota_name,
     )
-    tree_search.save()
+    tree_search.save(attr_delimiter=args.attr_delimiter)
     tree_search.save_predict_edge()
+    tree_search.save_node_feature(args.attr_fields, args.raw_attr_fields)
     if args.tree_output_dir:
         tree_search.save_serving_tree(args.tree_output_dir)
     logger.info("Save nodes and edges table done.")

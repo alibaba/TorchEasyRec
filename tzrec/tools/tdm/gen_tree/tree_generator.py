@@ -9,13 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, List, Optional
 
-import numpy as np
 import pyarrow as pa
 
 from tzrec.datasets.dataset import create_reader
-from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeClass, TreeBuilder
+from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode, TreeBuilder
 
 
 class TreeGenerator:
@@ -44,8 +43,8 @@ class TreeGenerator:
         self.item_input_path = item_input_path
         self.item_id_field = item_id_field
         self.cate_id_field = cate_id_field
-        self.attr_fields: Optional[List[str]] = None
-        self.raw_attr_fields: Optional[List[str]] = None
+        self.attr_fields = []
+        self.raw_attr_fields = []
         if attr_fields:
             self.attr_fields = [x.strip() for x in attr_fields.split(",")]
         if raw_attr_fields:
@@ -57,97 +56,74 @@ class TreeGenerator:
         if "odps_data_quota_name" in kwargs:
             self.dataset_kwargs["quota_name"] = kwargs["odps_data_quota_name"]
 
-    def generate(self, save_tree: bool = False) -> TDMTreeClass:
+    def generate(self, save_tree: bool = False) -> TDMTreeNode:
         """Generate tree."""
         item_fea = self._read()
         root = self._init_tree(item_fea, save_tree)
         return root
 
-    def _read(self) -> Dict[str, List[Union[int, float, str]]]:
-        item_fea = {"ids": [], "cates": [], "attrs": [], "raw_attrs": []}
-        reader = create_reader(self.item_input_path, 4096, **self.dataset_kwargs)
+    def _read(self) -> List[TDMTreeNode]:
+        leaf_nodes = []
+
+        selected_cols = (
+            {self.item_id_field, self.cate_id_field}
+            | set(self.attr_fields)
+            | set(self.raw_attr_fields)
+        )
+        reader = create_reader(
+            self.item_input_path,
+            4096,
+            selected_cols=list(selected_cols),
+            **self.dataset_kwargs,
+        )
+
         for data_dict in reader.to_batches():
-            item_fea["ids"] += (
-                data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
-            )
-            item_fea["cates"] += (
+            ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
+            cates = (
                 data_dict[self.cate_id_field]
                 .cast(pa.string())
                 .fill_null("")
                 .to_pylist()
             )
-            tmp_attr = []
-            if self.attr_fields is not None:
-                # pyre-ignore [16]
-                for attr in self.attr_fields:
-                    tmp_attr.append(
-                        data_dict[attr].cast(pa.string()).fill_null("").to_pylist()
-                    )
-                item_fea["attrs"] += [",".join(map(str, i)) for i in zip(*tmp_attr)]
-            else:
-                item_fea["attrs"] += [""] * len(
-                    data_dict[self.item_id_field].to_pylist()
-                )
 
-            tmp_raw_attr = []
-            if self.raw_attr_fields is not None:
-                for attr in self.raw_attr_fields:
-                    tmp_raw_attr.append(
-                        data_dict[attr].cast(pa.string()).fill_null("").to_pylist()
-                    )
-                item_fea["raw_attrs"] += [
-                    ",".join(map(str, i)) for i in zip(*tmp_raw_attr)
-                ]
-            else:
-                item_fea["raw_attrs"] += [""] * len(
-                    data_dict[self.item_id_field].to_pylist()
-                )
+            batch_tree_nodes = []
+            for one_id, one_cate in zip(ids, cates):
+                batch_tree_nodes.append(TDMTreeNode(item_id=one_id, cate=one_cate))
 
-        return item_fea
+            for attr in self.attr_fields:
+                attr_data = data_dict[attr]
+                for i in range(len(batch_tree_nodes)):
+                    batch_tree_nodes[i].attrs.append(attr_data[i])
 
-    def _init_tree(
-        self, item_fea: Dict[str, List[Union[int, float, str]]], save_tree: bool
-    ) -> TDMTreeClass:
-        class Item:
-            def __init__(self, item_id, cat_id, attrs=None, raw_attrs=None):
-                self.item_id = item_id
-                self.cat_id = cat_id
-                self.attrs = attrs
-                self.raw_attrs = raw_attrs
-                self.code = 0
+            for attr in self.raw_attr_fields:
+                attr_data = data_dict[attr]
+                for i in range(len(batch_tree_nodes)):
+                    batch_tree_nodes[i].raw_attrs.append(attr_data[i])
 
-            def __lt__(self, other):
-                return self.cat_id < other.cat_id or (
-                    self.cat_id == other.cat_id and self.item_id < other.item_id
-                )
+            leaf_nodes.extend(batch_tree_nodes)
 
-        items = []
-        for item_id, cat_id, attrs, raw_attrs in zip(
-            item_fea["ids"], item_fea["cates"], item_fea["attrs"], item_fea["raw_attrs"]
-        ):
-            items.append(Item(item_id, cat_id, attrs, raw_attrs))
-        items.sort()
+        return leaf_nodes
 
-        def gen_code(start: int, end: int, code: int, items: List[Item]) -> None:
+    def _init_tree(self, leaf_nodes: List[TDMTreeNode], save_tree: bool) -> TDMTreeNode:
+        leaf_nodes.sort(key=lambda x: (x.cate, x.item_id))
+
+        def gen_code(
+            start: int, end: int, code: int, leaf_nodes: List[TDMTreeNode]
+        ) -> None:
             if end <= start:
                 return
             if end == start + 1:
-                items[start].code = code
+                leaf_nodes[start].tree_code = code
                 return
             for i in range(self.n_cluster):
                 left = int(start + i * (end - start) / self.n_cluster)
                 right = int(start + (i + 1) * (end - start) / self.n_cluster)
-                gen_code(left, right, self.n_cluster * code + self.n_cluster - i, items)
+                gen_code(
+                    left, right, self.n_cluster * code + self.n_cluster - i, leaf_nodes
+                )
 
-        gen_code(0, len(items), 0, items)
-        ids = np.array([item.item_id for item in items])
-        codes = np.array([item.code for item in items])
-        attrs = np.array([item.attrs if item.attrs else "" for item in items])
-        raw_attrs = np.array(
-            [item.raw_attrs if item.raw_attrs else "" for item in items]
-        )
-        data = np.array([[] for i in range(len(ids))])
+        gen_code(0, len(leaf_nodes), 0, leaf_nodes)
 
         builder = TreeBuilder(self.tree_output_dir, self.n_cluster)
-        root = builder.build(ids, codes, attrs, raw_attrs, data, save_tree)
+        root = builder.build(leaf_nodes, save_tree)
         return root
