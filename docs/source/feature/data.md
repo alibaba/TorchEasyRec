@@ -142,7 +142,7 @@ data_config {
   - 则认为输入数据为编码后的数据，数据列名与**特征名**(`feature_name`)同名，Dataset会自动分析所有特征的特征名来读取数据
     - 以上文LookupFeature为例，**特征名**为`lookup_feat`，Dataset会从输入表中直接读取编码后的`lookup_feat`列直接进行模型推理
   - 该模式训练速度最佳，但需提前对数据提前进行FG编码，目前仅提供MaxCompute方式，步骤如下：
-    - 生成fg json配置，上传至Dataworks的资源中，如果有vocab_file等其他文件，也需要上传至资源中
+    - 在DLC/DSW/Local环境中生成fg json配置，上传至Dataworks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
       ```shell
       python -m tzrec.tools.create_fg_json \
           --pipeline_config_path ${PIPELINE_CONFIG_PATH} \
@@ -151,11 +151,11 @@ data_config {
       ```
     - 在[Dataworks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
       ```shell
-      /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg030-0.3.0-cp37-cp37m-linux_x86_64.whl
+      /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg035-0.3.5-cp37-cp37m-linux_x86_64.whl
       ```
     - 在Dataworks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
       ```
-      from pyfg030 import offline_pyfg
+      from pyfg035 import offline_pyfg
       offline_pyfg.run(
         o,
         input_table="YOU_PROJECT.TABLE_NAME",
