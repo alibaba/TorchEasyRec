@@ -180,6 +180,53 @@ class ExprFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
+    @parameterized.expand(
+        [
+            [
+                [[0.2, 0.3], [0.1, 0.2], [0.3, 0.4], []],
+                [[0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [0.2, 0.2]],
+                "0.1",
+                [2, 1, 2, 1],
+                [1, 1, 1, 1],
+            ],
+            [
+                ["0.2\x1d0.3", "", "0.3\x1d0.4"],
+                ["0.2\x1d0.2", "0.2\x1d0.2", "0.2\x1d0.2"],
+                "",
+                [1, 2],
+                [1, 0, 1],
+            ],
+        ]
+    )
+    def test_expr_feature_dot(
+        self,
+        input_feat_a,
+        input_feat_b,
+        default_value,
+        expected_values,
+        expected_lengths,
+    ):
+        expr_feat_cfg = feature_pb2.FeatureConfig(
+            expr_feature=feature_pb2.ExprFeature(
+                feature_name="expr_feat",
+                embedding_dim=16,
+                boundaries=[0.05, 0.10, 0.15],
+                expression="dot(a,b)",
+                variables=["user:a", "item:b"],
+                default_value=default_value,
+            )
+        )
+        expr_feat = expr_feature_lib.ExprFeature(expr_feat_cfg, fg_mode=FgMode.NORMAL)
+        self.assertEqual(expr_feat.output_dim, 16)
+        self.assertEqual(expr_feat.is_sparse, True)
+        self.assertEqual(expr_feat.inputs, ["a", "b"])
+
+        input_data = {"a": pa.array(input_feat_a), "b": pa.array(input_feat_b)}
+        parsed_feat = expr_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "expr_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
 
 if __name__ == "__main__":
     unittest.main()
