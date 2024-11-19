@@ -1078,7 +1078,6 @@ def predict(
         for c in output_cols:
             v = predictions[c]
             v = v.tolist() if v.ndim > 1 else v.numpy()
-            logger.info("key: %s %s", c, v)
             output_dict[c] = pa.array(v)
         writer.write(output_dict)
 
