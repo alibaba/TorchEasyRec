@@ -381,6 +381,7 @@ class FeatureTest(unittest.TestCase):
                         "expression": "item:token_g",
                         "output_delim": "\x03",
                         "output_type": "word_id",
+                        "tokenizer_type": "bpe",
                         "vocab_file": token_file,
                         "default_value": "",
                     },

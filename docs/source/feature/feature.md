@@ -398,6 +398,8 @@ feature_configs: {
 
 - **vocab_file**: 分词字典，完全兼容 https://github.com/mlc-ai/tokenizers-cpp 库的分词文件
 
+- **tokenizer_type**: 分词类型，支持bpe、sentencepiece，默认为bpe
+
 - **text_normalizer**: 可选，是否对文本进行归一化
 
   - **stop_char_file**: 停用词表路径，默认为系统内置，详见[stop_char](https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/stop_char)
