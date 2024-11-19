@@ -345,6 +345,8 @@ message TokenizeFeature {
     optional string pooling = 10 [default = "sum"];
     // fg default value, default value before bucktize
     optional string default_value = 11 [default = ""];
+    // tokenizer_type type, available is {bpe | sentencepiece}
+    optional string tokenizer_type = 12 [default = "bpe"];
     // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
     optional string init_fn = 14;
     // mask value in training progress
