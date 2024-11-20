@@ -47,7 +47,7 @@ def _get_easyrec(local_cache_dir):
             f"easy_rec-{EASYREC_VERSION}-py2.py3-none-any.whl"
         )
     r = requests.get(whl_path)
-    logger.info(f"down easyrec whl from {whl_path}")
+    logger.info(f"down easyrec from {whl_path}")
     if "tar.gz" in whl_path:
         try:
             with tarfile.open(fileobj=io.BytesIO(r.content)) as tar:

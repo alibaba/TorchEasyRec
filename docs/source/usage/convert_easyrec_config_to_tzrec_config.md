@@ -20,7 +20,7 @@ PYTHONPATH=. python tzrec/tools/convert_easyrec_config_to_tzrec_config.py \
 如果使用自定义的EasyRec安装包，应使用如下转换命令
 
 ```bash
-EASYREC_URL http://xxx.whl
+EASYREC_URL=http://xxx.whl
 PYTHONPATH=. python tzrec/tools/convert_easyrec_config_to_tzrec_config.py \
   --easyrec_config_path ./easyrec.config \
   --fg_json_path ./fg.json \
