@@ -3,7 +3,8 @@
     "tzrec/protos/*_pb2.pyi",
     "tzrec/*/*_test.py",
     "tzrec/tests/*.py",
-    "tzrec/utils/load_class.py"
+    "tzrec/utils/load_class.py",
+    "tzrec/tools/convert_easyrec_config_to_tzrec_config.py"
   ],
   "site_package_search_strategy": "all",
   "source_directories": [
