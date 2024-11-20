@@ -16,6 +16,12 @@ import tempfile
 import unittest
 
 import torch
+
+# cpu image has no torch_tensorrt
+try:
+    import torch_tensorrt
+except Exception:
+    pass
 from pyarrow import dataset as ds
 
 from tzrec.constant import Mode
@@ -674,6 +680,7 @@ class TrainEvalExportTest(unittest.TestCase):
             self.test_dir, "predict_result_tile_emb_trt"
         )
 
+        predict_columns = ["user_id", "item_id", "clk", "probs"]
         # quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
@@ -710,14 +717,13 @@ class TrainEvalExportTest(unittest.TestCase):
                 output_columns="probs",
                 test_dir=trt_dir,
             )
-            # compare INPUT_TILE and no INPUT_TILE result consistency
+            # compare TRT and origin result consistency
             df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
             df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
-            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
-            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
-            # self.assertTrue(df.equals(df_t))
-            print(df)
-            print(df_t)
+            df = df.sort_values(by=predict_columns).reset_index(drop=True)
+            df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
+            # differences = df.compare(df_t)
+            # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
         # quant and input-tile and trt
         if self.success:
@@ -739,18 +745,17 @@ class TrainEvalExportTest(unittest.TestCase):
                 output_columns="probs",
                 test_dir=input_tile_trt_dir,
             )
-            # compare INPUT_TILE and no INPUT_TILE result consistency
+            # compare INPUT_TILE+TRT and origin result consistency
             df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
             df_t = (
                 ds.dataset(tile_trt_pred_output, format="parquet")
                 .to_table()
                 .to_pandas()
             )
-            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
-            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
-            # self.assertTrue(df.equals(df_t))
-            print(df)
-            print(df_t)
+            df = df.sort_values(by=predict_columns).reset_index(drop=True)
+            df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
+            # differences = df.compare(df_t)
+            # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
         # quant and input-tile emb and trt
         if self.success:
@@ -772,18 +777,17 @@ class TrainEvalExportTest(unittest.TestCase):
                 output_columns="probs",
                 test_dir=input_tile_emb_trt_dir,
             )
-            # compare INPUT_TILE and no INPUT_TILE result consistency
+            # compare INPUT_TILE_EMB+TRT and origin result consistency
             df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
             df_t = (
                 ds.dataset(tile_trt_pred_output_emb, format="parquet")
                 .to_table()
                 .to_pandas()
             )
-            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
-            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
-            # self.assertTrue(df.equals(df_t))
-            print(df)
-            print(df_t)
+            df = df.sort_values(by=predict_columns).reset_index(drop=True)
+            df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
+            # differences = df.compare(df_t)
+            # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
         self.assertTrue(self.success)
 
@@ -842,6 +846,7 @@ class TrainEvalExportTest(unittest.TestCase):
         utils.save_predict_result_json(result_gpu, result_dict_json_path)
 
         # quant and trt
+        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
         model_gpu_trt = torch.jit.load(
             os.path.join(self.test_dir, "trt/export/scripted_model.pt"),
             map_location=device,
@@ -884,19 +889,19 @@ class TrainEvalExportTest(unittest.TestCase):
         # trt is all same sa no-trt
         for k, v in result_gpu.items():
             torch.testing.assert_close(
-                result_gpu_trt[k].to(device), v, rtol=1e-4, atol=1e-4
+                result_gpu_trt[k].to(device), v, rtol=1e-6, atol=1e-6
             )
 
         # tile & trt is all same sa no-tile-trt
         for k, v in result_gpu.items():
             torch.testing.assert_close(
-                result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
+                result_gpu_input_tile[k].to(device), v, rtol=1e-6, atol=1e-6
             )
 
         # tile emb & trt is all same sa no-tile-trt
         for k, v in result_gpu.items():
             torch.testing.assert_close(
-                result_gpu_input_tile_emb[k].to(device), v, rtol=1e-4, atol=1e-4
+                result_gpu_input_tile_emb[k].to(device), v, rtol=1e-6, atol=1e-6
             )
 
 

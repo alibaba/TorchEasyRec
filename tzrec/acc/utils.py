@@ -12,7 +12,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict, List
+from typing import Dict
 
 import torch
 
@@ -150,28 +150,3 @@ def export_acc_config() -> Dict[str, str]:
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     return acc_config
-
-
-def dicts_are_equal(
-    dict1: Dict[str, torch.Tensor], dict2: Dict[str, torch.Tensor]
-) -> bool:
-    """Compare dict[str,torch.Tensor]."""
-    if dict1.keys() != dict2.keys():
-        return False
-
-    for key in dict1:
-        if not torch.equal(dict1[key], dict2[key]):
-            return False
-
-    return True
-
-
-def lists_are_equal(list1: List[torch.Tensor], list2: List[torch.Tensor]) -> bool:
-    """Compare List[torch.Tensor]."""
-    if len(list1) != len(list2):
-        return False
-
-    for i in range(len(list1)):
-        if not torch.equal(list1[i], list2[i]):
-            return False
-    return True

@@ -10,8 +10,10 @@
 # limitations under the License.
 
 from enum import Enum
-from typing import Union
+from typing import Dict, List, Union
 
+import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.fx import GraphModule
@@ -80,3 +82,38 @@ def parameterized_name_func(func, num, p) -> str:
     base_name = func.__name__
     name_suffix = "_%s" % (num,)
     return base_name + name_suffix
+
+
+def dicts_are_equal(
+    dict1: Dict[str, torch.Tensor], dict2: Dict[str, torch.Tensor]
+) -> bool:
+    """Compare dict[str,torch.Tensor]."""
+    if dict1.keys() != dict2.keys():
+        return False
+
+    for key in dict1:
+        if not torch.equal(dict1[key], dict2[key]):
+            return False
+
+    return True
+
+
+def lists_are_equal(list1: List[torch.Tensor], list2: List[torch.Tensor]) -> bool:
+    """Compare List[torch.Tensor]."""
+    if len(list1) != len(list2):
+        return False
+
+    for i in range(len(list1)):
+        if not torch.equal(list1[i], list2[i]):
+            return False
+    return True
+
+
+def dfs_are_close(df1: pd.DataFrame, df2: pd.DataFrame, abs_tol: float) -> bool:
+    """Compare DataFrame."""
+    if df1.shape != df2.shape:
+        return False
+    abs_diff = np.abs(df1.values - df2.values)
+    result = np.all(abs_diff <= abs_tol)
+    # pyre-ignore [7]
+    return result

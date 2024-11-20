@@ -8,7 +8,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+# cpu image has no torch_tensorrt
+try:
+    import torch_tensorrt
+except Exception:
+    pass
 import copy
 import itertools
 import json
@@ -43,7 +47,7 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
-from tzrec.acc.trt_utils import export_model_trt
+from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
     is_input_tile_emb,
@@ -805,6 +809,13 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
+    is_trt_convert = is_trt()
+    if is_trt_convert:
+        # export batch_size too large may OOM in trt convert phase
+        max_batch_size = get_trt_max_batch_size()
+        data_config.batch_size = min(data_config.batch_size, max_batch_size)
+        logger.info("using new batch_size: %s in trt export", data_config.batch_size)
+
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
@@ -849,7 +860,6 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    is_trt_convert = is_trt()
     if is_trt_convert:
         checkpoint_pg = dist.new_group(backend="nccl")
         if is_rank_zero:
@@ -970,6 +980,19 @@ def predict(
     )
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
+
+    is_trt_convert: bool = is_trt_predict(scripted_model_path)
+    if is_trt_convert:
+        # predict batch_size too large may out of range
+        max_batch_size = get_trt_max_batch_size()
+        pipeline_config.data_config.batch_size = min(
+            pipeline_config.data_config.batch_size, max_batch_size
+        )
+        logger.info(
+            "using new batch_size: %s in trt predict",
+            pipeline_config.data_config.batch_size,
+        )
+
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
     if edit_config_json:
@@ -1012,6 +1035,10 @@ def predict(
     # disable jit compile， as it compile too slow now.
     if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
         os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+
+    if is_trt_convert:
+        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
+
     model: torch.jit.ScriptModule = torch.jit.load(
         os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
     )
@@ -1047,8 +1074,7 @@ def predict(
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            is_trt = is_trt_predict(scripted_model_path)
-            if is_trt:
+            if is_trt_convert:
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
