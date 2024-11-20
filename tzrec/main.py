@@ -1087,16 +1087,16 @@ def predict(
         output_cols: List[str],
     ) -> None:
         output_dict = OrderedDict()
+        for c in output_cols:
+            v = predictions[c]
+            v = v.tolist() if v.ndim > 1 else v.numpy()
+            output_dict[c] = pa.array(v)
         reserve_batch_record = reserves.get()
         if reserve_batch_record is not None:
             for k, v in zip(
                 reserve_batch_record.column_names, reserve_batch_record.columns
             ):
                 output_dict[k] = v
-        for c in output_cols:
-            v = predictions[c]
-            v = v.tolist() if v.ndim > 1 else v.numpy()
-            output_dict[c] = pa.array(v)
         writer.write(output_dict)
 
     def _write_loop(output_cols: List[str]) -> None:

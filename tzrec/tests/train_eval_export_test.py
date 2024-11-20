@@ -680,6 +680,7 @@ class TrainEvalExportTest(unittest.TestCase):
             self.test_dir, "predict_result_tile_emb_trt"
         )
 
+        predict_columns = ["user_id", "item_id", "clk", "probs"]
         # quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
@@ -716,11 +717,11 @@ class TrainEvalExportTest(unittest.TestCase):
                 output_columns="probs",
                 test_dir=trt_dir,
             )
-            # compare INPUT_TILE and no INPUT_TILE result consistency
+            # compare TRT and origin result consistency
             df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
             df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
-            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
-            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            df = df.sort_values(by=predict_columns).reset_index(drop=True)
+            df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
             # differences = df.compare(df_t)
             # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
@@ -744,15 +745,15 @@ class TrainEvalExportTest(unittest.TestCase):
                 output_columns="probs",
                 test_dir=input_tile_trt_dir,
             )
-            # compare INPUT_TILE and no INPUT_TILE result consistency
+            # compare INPUT_TILE+TRT and origin result consistency
             df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
             df_t = (
                 ds.dataset(tile_trt_pred_output, format="parquet")
                 .to_table()
                 .to_pandas()
             )
-            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
-            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            df = df.sort_values(by=predict_columns).reset_index(drop=True)
+            df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
             # differences = df.compare(df_t)
             # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
@@ -776,15 +777,15 @@ class TrainEvalExportTest(unittest.TestCase):
                 output_columns="probs",
                 test_dir=input_tile_emb_trt_dir,
             )
-            # compare INPUT_TILE and no INPUT_TILE result consistency
+            # compare INPUT_TILE_EMB+TRT and origin result consistency
             df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
             df_t = (
                 ds.dataset(tile_trt_pred_output_emb, format="parquet")
                 .to_table()
                 .to_pandas()
             )
-            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
-            df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+            df = df.sort_values(by=predict_columns).reset_index(drop=True)
+            df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
             # differences = df.compare(df_t)
             # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
