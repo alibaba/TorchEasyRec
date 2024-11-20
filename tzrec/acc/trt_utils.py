@@ -149,6 +149,24 @@ class ScriptWrapperTRT(nn.Module):
         return y
 
 
+def get_trt_max_batch_size() -> int:
+    """Get trt max batch size.
+
+    Returns:
+        int: max_batch_size
+    """
+    return int(os.environ.get("TRT_MAX_BATCH_SIZE", 2048))
+
+
+def get_trt_max_seq_len() -> int:
+    """Get trt max seq len.
+
+    Returns:
+        int: max_seq_len
+    """
+    return int(os.environ.get("TRT_MAX_SEQ_LEN", 100))
+
+
 def export_model_trt(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> None:
@@ -166,7 +184,9 @@ def export_model_trt(
     emb_trace_gpu = torch.jit.script(emb_trace_gpu)
 
     # dynamic shapes
-    batch = torch.export.Dim("batch", min=1, max=10000)
+    max_batch_size = get_trt_max_batch_size()
+    max_seq_len = get_trt_max_seq_len()
+    batch = torch.export.Dim("batch", min=1, max=max_batch_size)
     dynamic_shapes_list = []
     values_list_cuda = []
     for i, value in enumerate(emb_res):
@@ -174,7 +194,7 @@ def export_model_trt(
         values_list_cuda.append(v)
         dict_dy = {0: batch}
         if v.dim() == 3:
-            dict_dy[1] = torch.export.Dim("seq_len" + str(i), min=1, max=10000)
+            dict_dy[1] = torch.export.Dim("seq_len" + str(i), min=1, max=max_seq_len)
         dynamic_shapes_list.append(dict_dy)
 
     # convert dense
