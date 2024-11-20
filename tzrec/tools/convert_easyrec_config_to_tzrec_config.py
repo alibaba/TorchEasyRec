@@ -18,7 +18,6 @@ import tarfile
 import tempfile
 import zipfile
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
 
 import requests
 from google.protobuf import descriptor_pool, symbol_database, text_format
@@ -36,41 +35,35 @@ from tzrec.protos import (
 from tzrec.protos import pipeline_pb2 as tzrec_pipeline_pb2
 from tzrec.protos.data_pb2 import DatasetType
 from tzrec.protos.models import match_model_pb2, multi_task_rank_pb2, rank_model_pb2
-from tzrec.protos.pipeline_pb2 import EasyRecConfig as TZRecConfig
 from tzrec.utils.logging_util import logger
 
 
-def _get_easyrec_whl(local_cache_dir: str) -> Optional[str]:
+def _get_easyrec(local_cache_dir):
     """Get easyrec whl and extract."""
-    whl_path = (
-        f"https://easyrec.oss-cn-beijing.aliyuncs.com/release/whls/"
-        f"easy_rec-{EASYREC_VERSION}-py2.py3-none-any.whl"
-    )
+    whl_path = os.environ.get("EASYREC_URL")
+    if whl_path is None:
+        whl_path = (
+            f"https://easyrec.oss-cn-beijing.aliyuncs.com/release/whls/"
+            f"easy_rec-{EASYREC_VERSION}-py2.py3-none-any.whl"
+        )
     r = requests.get(whl_path)
-    try:
-        with zipfile.ZipFile(io.BytesIO(r.content)) as f:
-            f.extractall(local_cache_dir)
-        local_package_dir = local_cache_dir
-    except zipfile.BadZipfile:
-        logger.error(f"invalid {EASYREC_VERSION} whl.")
-        local_package_dir = None
-    return local_package_dir
-
-
-def _get_easyrec_tar(local_cache_dir: str) -> Optional[str]:
-    """Get easyrec tar and extract."""
-    tar_path = (
-        f"https://easyrec.oss-cn-beijing.aliyuncs.com/releases/"
-        f"easy_rec_ext_{EASYREC_VERSION}_res.tar.gz"
-    )
-    r = requests.get(tar_path)
-    try:
-        with tarfile.open(fileobj=io.BytesIO(r.content)) as tar:
-            tar.extractall(path=local_cache_dir)
-        local_package_dir = local_cache_dir
-    except Exception:
-        logger.error(f"invalid {EASYREC_VERSION} tar.")
-        local_package_dir = None
+    logger.info(f"down easyrec whl from {whl_path}")
+    if "tar.gz" in whl_path:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(r.content)) as tar:
+                tar.extractall(path=local_cache_dir)
+            local_package_dir = local_cache_dir
+        except Exception:
+            logger.error(f"invalid {EASYREC_VERSION} tar.")
+            local_package_dir = None
+    else:
+        try:
+            with zipfile.ZipFile(io.BytesIO(r.content)) as f:
+                f.extractall(local_cache_dir)
+            local_package_dir = local_cache_dir
+        except zipfile.BadZipfile:
+            logger.error(f"invalid {EASYREC_VERSION} whl.")
+            local_package_dir = None
     return local_package_dir
 
 
@@ -78,9 +71,7 @@ try:
     import easyrec  # noqa: F401
 except ImportError:
     local_cache_dir = tempfile.mkdtemp(prefix="tzrec_tmp")
-    local_package_dir = _get_easyrec_whl(local_cache_dir)
-    if local_package_dir is None:
-        local_package_dir = _get_easyrec_tar(local_cache_dir)
+    local_package_dir = _get_easyrec(local_cache_dir)
     with open(os.path.join(local_package_dir, "easy_rec/__init__.py"), "w") as f:
         f.write("")
     sys.path.append(local_package_dir)
@@ -88,15 +79,7 @@ except ImportError:
     _sym.pool = descriptor_pool.DescriptorPool()
 finally:
     os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-    from easy_rec.python.protos import dssm_pb2 as easy_dssm_pb2
-    from easy_rec.python.protos import easy_rec_model_pb2
-    from easy_rec.python.protos import feature_config_pb2 as easy_feature_config_pb2
-    from easy_rec.python.protos import loss_pb2 as easy_loss_pb2
     from easy_rec.python.protos import pipeline_pb2 as easyrec_pipeline_pb2
-    from easy_rec.python.protos import ple_pb2 as easy_ple_pb2
-    from easy_rec.python.protos import tower_pb2 as easy_tower_pb2
-    from easy_rec.python.protos.dnn_pb2 import DNN
-    from easy_rec.python.protos.eval_pb2 import EvalMetrics
     from easy_rec.python.protos.feature_config_pb2 import FeatureConfig, WideOrDeep
     from easy_rec.python.protos.loss_pb2 import LossType
 
@@ -110,9 +93,7 @@ class ConvertConfig(object):
         output_tzrec_config_path (str): TzRec config file path will create.
     """
 
-    def __init__(
-        self, easyrec_config_path: str, fg_json_path: str, output_tzrec_config_path: str
-    ):
+    def __init__(self, easyrec_config_path, fg_json_path, output_tzrec_config_path):
         self.output_tzrec_config_path = output_tzrec_config_path
         self.easyrec_config = self.load_easyrec_config(easyrec_config_path)
         self.fg_json = self.load_easyrec_fg_json(fg_json_path)
@@ -121,7 +102,7 @@ class ConvertConfig(object):
         self.sequence_feature_to_fg = {}
         self.analyse_fg()
 
-    def analyse_fg(self) -> None:
+    def analyse_fg(self):
         """Analysis fg.json."""
         for feat in self.fg_json["features"]:
             if "sequence_name" in feat:
@@ -136,7 +117,7 @@ class ConvertConfig(object):
                 feature_name = feat["feature_name"]
                 self.feature_to_fg[feature_name] = feat
 
-    def load_easyrec_config(self, path: str) -> easyrec_pipeline_pb2.EasyRecConfig:
+    def load_easyrec_config(self, path):
         """Load easyrec config."""
         easyrec_config = easyrec_pipeline_pb2.EasyRecConfig()
         with open(path, "r", encoding="utf-8") as f:
@@ -144,13 +125,13 @@ class ConvertConfig(object):
             text_format.Merge(cfg_str, easyrec_config)
         return easyrec_config
 
-    def load_easyrec_fg_json(self, path: str) -> Dict[str, Any]:
+    def load_easyrec_fg_json(self, path):
         """Load easyrec use fg.json."""
         with open(path, "r", encoding="utf-8") as f:
             fg_json = json.load(f)
         return fg_json
 
-    def _create_train_config(self, pipeline_config: TZRecConfig) -> TZRecConfig:
+    def _create_train_config(self, pipeline_config):
         """Create easy_rec train config."""
         if not pipeline_config.HasField("train_config"):
             train_config_str = """
@@ -175,14 +156,14 @@ class ConvertConfig(object):
             text_format.Merge(train_config_str, pipeline_config)
         return pipeline_config
 
-    def _create_eval_config(self, pipeline_config: TZRecConfig) -> TZRecConfig:
+    def _create_eval_config(self, pipeline_config):
         """Create tzrec train config."""
         if not pipeline_config.HasField("eval_config"):
             eval_config_str = "eval_config {}"
             text_format.Merge(eval_config_str, pipeline_config)
         return pipeline_config
 
-    def _create_data_config(self, pipeline_config: TZRecConfig) -> TZRecConfig:
+    def _create_data_config(self, pipeline_config):
         """Create tzrec data config."""
         label_fields = list(self.easyrec_config.data_config.label_fields)
         pipeline_config.data_config.batch_size = (
@@ -195,7 +176,7 @@ class ConvertConfig(object):
         pipeline_config.data_config.odps_data_quota_name = ""
         return pipeline_config
 
-    def _create_feature_config(self, pipeline_config: TZRecConfig) -> TZRecConfig:
+    def _create_feature_config(self, pipeline_config):
         """Create tzrec feature config."""
         easyrec_feature_config = FeatureConfig()
         seq_group_cfg = OrderedDict()
@@ -380,7 +361,7 @@ class ConvertConfig(object):
 
         return pipeline_config
 
-    def _easyrec_dnn_2_tzrec_mlp(self, dnn: DNN) -> module_pb2.MLP:
+    def _easyrec_dnn_2_tzrec_mlp(self, dnn):
         """Convert easyrec dnn to tzrec mlp."""
         mlp = module_pb2.MLP()
         mlp.hidden_units.extend(dnn.hidden_units)
@@ -388,9 +369,7 @@ class ConvertConfig(object):
         mlp.use_bn = dnn.use_bn
         return mlp
 
-    def _easyrec_loss_2_tzrec_loss(
-        self, easyrec_loss: easy_loss_pb2.Loss
-    ) -> loss_pb2.LossConfig:
+    def _easyrec_loss_2_tzrec_loss(self, easyrec_loss):
         """Convert easyrec loss to tzrec loss."""
         tzrec_loss = loss_pb2.LossConfig()
         loss_type = easyrec_loss.loss_type
@@ -408,9 +387,7 @@ class ConvertConfig(object):
             )
         return tzrec_loss
 
-    def _easyrec_metrics_2_tzrec_metrics(
-        self, easyrec_metric: EvalMetrics
-    ) -> metric_pb2.MetricConfig:
+    def _easyrec_metrics_2_tzrec_metrics(self, easyrec_metric):
         """Convert easyrec metric to tzrec metric."""
         metric = metric_pb2.MetricConfig()
         metric_type = easyrec_metric.WhichOneof("metric")
@@ -436,9 +413,7 @@ class ConvertConfig(object):
             )
         return metric
 
-    def _easyrec_bayes_tower_2_tzrec_bayes_tower(
-        self, easyrec_bayes_task_tower: easy_tower_pb2.BayesTaskTower
-    ) -> tower_pb2.BayesTaskTower:
+    def _easyrec_bayes_tower_2_tzrec_bayes_tower(self, easyrec_bayes_task_tower):
         """Convert easyrec bayes tower to tzrec bayes tower."""
         tzrec_bayes_task_tower = tower_pb2.BayesTaskTower()
         tzrec_bayes_task_tower.tower_name = easyrec_bayes_task_tower.tower_name
@@ -461,9 +436,7 @@ class ConvertConfig(object):
             )
         return tzrec_bayes_task_tower
 
-    def _easyrec_task_tower_2_tzrec_task_tower(
-        self, easyrec_task_tower: easy_tower_pb2.TaskTower
-    ) -> tower_pb2.TaskTower:
+    def _easyrec_task_tower_2_tzrec_task_tower(self, easyrec_task_tower):
         """Convert easyrec task tower to tzrec task tower."""
         tzrec_task_tower = tower_pb2.TaskTower()
         tzrec_task_tower.tower_name = easyrec_task_tower.tower_name
@@ -479,9 +452,7 @@ class ConvertConfig(object):
             )
         return tzrec_task_tower
 
-    def _easyrec_tower_2_tzrec_tower(
-        self, easyrec_tower: easy_tower_pb2.Tower
-    ) -> tower_pb2.Tower:
+    def _easyrec_tower_2_tzrec_tower(self, easyrec_tower):
         """Convert easyrec tower to tzrec tower."""
         tzrec_tower = tower_pb2.Tower()
         tzrec_tower.input = easyrec_tower.input
@@ -489,9 +460,7 @@ class ConvertConfig(object):
         tzrec_tower.mlp.CopyFrom(mlp)
         return tzrec_tower
 
-    def _easyrec_dssm_tower_2_tzrec_tower(
-        self, easyrec_dssm_tower: easy_dssm_pb2.DSSMTower
-    ) -> tower_pb2.Tower:
+    def _easyrec_dssm_tower_2_tzrec_tower(self, easyrec_dssm_tower):
         """Convert easyrec dssm tower to tzrec tower."""
         tzrec_tower = tower_pb2.Tower()
         tzrec_tower.input = easyrec_dssm_tower.id
@@ -500,8 +469,8 @@ class ConvertConfig(object):
         return tzrec_tower
 
     def _easyrec_extraction_network_2_tzrec_extraction_network(
-        self, easyrec_extraction_network: easy_ple_pb2.ExtractionNetwork
-    ) -> module_pb2.ExtractionNetwork:
+        self, easyrec_extraction_network
+    ):
         """Convert easyrec extraction net to tzrec extraction net."""
         tzrec_extraction_network = module_pb2.ExtractionNetwork()
         tzrec_extraction_network.network_name = easyrec_extraction_network.network_name
@@ -519,9 +488,7 @@ class ConvertConfig(object):
         tzrec_extraction_network.share_expert_net = share_expert_net
         return tzrec_extraction_network
 
-    def _convert_model_feature_group(
-        self, easyrec_feature_groups: List[easy_feature_config_pb2.FeatureGroupConfig]
-    ) -> List[model_pb2.FeatureGroupConfig]:
+    def _convert_model_feature_group(self, easyrec_feature_groups):
         """Convert easyrec feature group to tzrec feature group."""
         tz_feature_groups = []
         for easy_feature_group in easyrec_feature_groups:
@@ -556,11 +523,7 @@ class ConvertConfig(object):
             tz_feature_groups.append(tz_feature_group)
         return tz_feature_groups
 
-    def _convert_model_config(
-        self,
-        easyrec_model_config: easy_rec_model_pb2.EasyRecModel,
-        tz_model_config: model_pb2.ModelConfig,
-    ) -> model_pb2.ModelConfig:
+    def _convert_model_config(self, easyrec_model_config, tz_model_config):
         """Convert easyrec model config to tzrec model config."""
         model_class = easyrec_model_config.model_class
         model_type = easyrec_model_config.WhichOneof("model")
@@ -646,9 +609,7 @@ class ConvertConfig(object):
             )
         return tz_model_config
 
-    def _create_model_config(
-        self, pipeline_config: tzrec_pipeline_pb2.EasyRecConfig
-    ) -> tzrec_pipeline_pb2.EasyRecConfig:
+    def _create_model_config(self, pipeline_config):
         """Convert easyrec model config to tzrec model config."""
         tz_model_config = model_pb2.ModelConfig()
         easyrec_model_config = self.easyrec_config.model_config
@@ -661,7 +622,7 @@ class ConvertConfig(object):
         pipeline_config.model_config.CopyFrom(tz_model_config)
         return pipeline_config
 
-    def build(self) -> None:
+    def build(self):
         """Create tzrec model config order by easyrec config and fg file."""
         tzrec_config = tzrec_pipeline_pb2.EasyRecConfig()
         tzrec_config = self._create_train_config(tzrec_config)
