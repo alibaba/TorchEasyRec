@@ -36,6 +36,7 @@ Welcome to TorchEasyRec's documentation!
    usage/predict
    usage/serving
    usage/feature_selection
+   usage/convert_easyrec_config_to_tzrec_config
 
 .. toctree::
    :maxdepth: 1

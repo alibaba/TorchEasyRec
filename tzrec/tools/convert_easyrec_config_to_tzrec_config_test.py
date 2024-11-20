@@ -700,12 +700,8 @@ class ConvertConfigTest(unittest.TestCase):
         f.close()
 
     def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
-        os.environ.pop("QUANT_EMB", None)
-        os.environ.pop("INPUT_TILE", None)
-        os.environ.pop("ENABLE_TRT", None)
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
 
     def test_create_train_config(self):
         convert = ConvertConfig(self.easyrec_path, self.fg_path, self.tzrec_path)
