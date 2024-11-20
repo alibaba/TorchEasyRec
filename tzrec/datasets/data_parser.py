@@ -94,8 +94,7 @@ class DataParser:
                 self._fg_handler.user_inputs()
                 | self._fg_handler.item_inputs()
                 | self._fg_handler.context_inputs()
-                | set(self._fg_handler.sequence_input_to_name().keys())
-            ) - set(self._fg_handler.sequence_feature_inputs().keys())
+            ) - set(self._fg_handler.sequence_feature_pks().values())
         else:
             for feature in features:
                 self.feature_input_names |= set(feature.inputs)
@@ -216,6 +215,9 @@ class DataParser:
             else 0
         )
 
+        input_data = {
+            k: v for k, v in input_data.items() if k in self.feature_input_names
+        }
         fg_output, status = self._fg_handler.process_arrow(input_data)
         assert status.ok(), status.message()
 

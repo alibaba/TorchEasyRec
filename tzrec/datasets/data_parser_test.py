@@ -439,6 +439,7 @@ class DataParserTest(unittest.TestCase):
                 "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
                 "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
                 "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
             }
         )
 
