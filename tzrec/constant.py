@@ -19,3 +19,6 @@ class Mode(Enum):
     TRAIN = 1
     EVAL = 2
     PREDICT = 3
+
+
+EASYREC_VERSION = "0.7.5"
