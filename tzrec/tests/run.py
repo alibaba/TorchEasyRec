@@ -24,7 +24,7 @@ SUBPROC_TEST_PATTERN = [
     ".dataset_test.",
     ".sampler_test.",
     ".tdm.gen_tree.",
-    ".convert_easyrec_config_to_tzrec_config.",
+    ".convert_easyrec_config_to_tzrec_config_test.",
 ]
 
 
@@ -62,7 +62,6 @@ def _error_info_of_subproc_result(result):
     start = False
     endline = 0
     error_info = ""
-    # print(result.stderr)
     for line in result.stderr.splitlines():
         if "====" in line:
             start = True
