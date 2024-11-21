@@ -78,7 +78,7 @@ except ImportError:
     _sym = symbol_database.Default()
     _sym.pool = descriptor_pool.DescriptorPool()
 finally:
-    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+    # os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
     from easy_rec.python.protos import pipeline_pb2 as easyrec_pipeline_pb2
     from easy_rec.python.protos.feature_config_pb2 import FeatureConfig, WideOrDeep
     from easy_rec.python.protos.loss_pb2 import LossType
