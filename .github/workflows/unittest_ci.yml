@@ -11,11 +11,18 @@ jobs:
     container:
       image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.6
       options: --gpus all --ipc host
+    env:
+      WORK_DIR: ${{ github.workspace }}/work_${{ github.run_id }}
     steps:
+      - name: Create a new work directory
+        run: mkdir -p $WORK_DIR
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
         uses: actions/checkout@v2
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          path: $WORK_DIR
       - name: RunUnitTestCI
         id: run_unittest_ci
-        run: bash scripts/ci_test.sh
+        run: |
+          cd $WORK_DIR
+          bash scripts/ci_test.sh
