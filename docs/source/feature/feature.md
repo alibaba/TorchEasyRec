@@ -277,34 +277,37 @@ feature_configs: {
 
 - **内置函数**:
 
-  | 函数名  | 参数数量 | 解释                               |
-  | ------- | -------- | ---------------------------------- |
-  | sin     | 1        | sine function                      |
-  | cos     | 1        | cosine function                    |
-  | tan     | 1        | tangens function                   |
-  | asin    | 1        | arcus sine function                |
-  | acos    | 1        | arcus cosine function              |
-  | atan    | 1        | arcus tangens function             |
-  | sinh    | 1        | hyperbolic sine function           |
-  | cosh    | 1        | hyperbolic cosine                  |
-  | tanh    | 1        | hyperbolic tangens function        |
-  | asinh   | 1        | hyperbolic arcus sine function     |
-  | acosh   | 1        | hyperbolic arcus tangens function  |
-  | atanh   | 1        | hyperbolic arcur tangens function  |
-  | log2    | 1        | logarithm to the base 2            |
-  | log10   | 1        | logarithm to the base 10           |
-  | log     | 1        | logarithm to base e (2.71828...)   |
-  | ln      | 1        | logarithm to base e (2.71828...)   |
-  | exp     | 1        | e raised to the power of x         |
-  | sqrt    | 1        | square root of a value             |
-  | sign    | 1        | sign function -1 if x\<0; 1 if x>0 |
-  | rint    | 1        | round to nearest integer           |
-  | abs     | 1        | absolute value                     |
-  | sigmoid | 1        | sigmoid function                   |
-  | min     | var.     | min of all arguments               |
-  | max     | var.     | max of all arguments               |
-  | sum     | var.     | sum of all arguments               |
-  | avg     | var.     | mean value of all arguments        |
+  | 函数名      | 参数数量 | 解释                                   |
+  | ----------- | -------- | -------------------------------------- |
+  | sin         | 1        | sine function                          |
+  | cos         | 1        | cosine function                        |
+  | tan         | 1        | tangens function                       |
+  | asin        | 1        | arcus sine function                    |
+  | acos        | 1        | arcus cosine function                  |
+  | atan        | 1        | arcus tangens function                 |
+  | sinh        | 1        | hyperbolic sine function               |
+  | cosh        | 1        | hyperbolic cosine                      |
+  | tanh        | 1        | hyperbolic tangens function            |
+  | asinh       | 1        | hyperbolic arcus sine function         |
+  | acosh       | 1        | hyperbolic arcus tangens function      |
+  | atanh       | 1        | hyperbolic arcur tangens function      |
+  | log2        | 1        | logarithm to the base 2                |
+  | log10       | 1        | logarithm to the base 10               |
+  | log         | 1        | logarithm to base e (2.71828...)       |
+  | ln          | 1        | logarithm to base e (2.71828...)       |
+  | exp         | 1        | e raised to the power of x             |
+  | sqrt        | 1        | square root of a value                 |
+  | sign        | 1        | sign function -1 if x\<0; 1 if x>0     |
+  | rint        | 1        | round to nearest integer               |
+  | abs         | 1        | absolute value                         |
+  | sigmoid     | 1        | sigmoid function                       |
+  | l2_norm     | 1        | l2 normalize of a vector               |
+  | dot         | 2        | dot product of two vectors             |
+  | euclid_dist | 2        | euclidean distance between two vectors |
+  | min         | var.     | min of all arguments                   |
+  | max         | var.     | max of all arguments                   |
+  | sum         | var.     | sum of all arguments                   |
+  | avg         | var.     | mean value of all arguments            |
 
 - **内置二元操作符**:
 
@@ -394,6 +397,8 @@ feature_configs: {
 - **expression**: 特征FG所依赖分词字段的来源
 
 - **vocab_file**: 分词字典，完全兼容 https://github.com/mlc-ai/tokenizers-cpp 库的分词文件
+
+- **tokenizer_type**: 分词类型，支持bpe、sentencepiece，默认为bpe
 
 - **text_normalizer**: 可选，是否对文本进行归一化
 

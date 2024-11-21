@@ -24,6 +24,7 @@ IGNORE_PATTERNS = [
     "Annotation `pa.Field` is not defined as a type",
     "Annotation `pa.DataType` is not defined as a type",
     "Annotation `pa.RecordBatch` is not defined as a type",
+    "Annotation `pa.Scalar` is not defined as a type",
     "Annotation `faiss.Index` is not defined as a type.",
     "Undefined attribute [16]: Module `pyarrow` has no attribute",
     "Undefined attribute [16]: Module `pyarrow.compute` has no attribute",

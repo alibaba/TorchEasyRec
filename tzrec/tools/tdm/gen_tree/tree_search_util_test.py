@@ -15,6 +15,8 @@ import shutil
 import tempfile
 import unittest
 
+import pyarrow.dataset as ds
+
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import TreeSearch
 
@@ -52,6 +54,7 @@ class TreeSearchtest(unittest.TestCase):
         search = TreeSearch(output_file=self.test_dir, root=root, child_num=2)
         search.save()
         search.save_predict_edge()
+        search.save_node_feature("int_a,str_c", "float_b")
         search.save_serving_tree(self.test_dir)
 
         node_table = []
@@ -61,7 +64,6 @@ class TreeSearchtest(unittest.TestCase):
         with open(os.path.join(self.test_dir, "node_table.txt")) as f:
             for line in f:
                 node_table.append(line)
-
         with open(os.path.join(self.test_dir, "edge_table.txt")) as f:
             for line in f:
                 edge_table.append(line)
@@ -71,11 +73,15 @@ class TreeSearchtest(unittest.TestCase):
         with open(os.path.join(self.test_dir, "serving_tree")) as f:
             for line in f:
                 serving_tree.append(line)
+        node_feat_table = ds.dataset(
+            os.path.join(self.test_dir, "node_feature")
+        ).to_table()
 
         self.assertEqual(len(node_table), 15)
         self.assertEqual(len(edge_table), 13)
         self.assertEqual(len(predict_edge_table), 14)
         self.assertEqual(len(serving_tree), 14)
+        self.assertEqual(len(node_feat_table), 13)
 
 
 if __name__ == "__main__":

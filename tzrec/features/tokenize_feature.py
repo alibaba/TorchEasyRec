@@ -147,12 +147,17 @@ class TokenizeFeature(IdFeature):
         if self.config.HasField("asset_dir"):
             vocab_file = os.path.join(self.config.asset_dir, vocab_file)
 
+        assert self.config.tokenizer_type in [
+            "bpe",
+            "sentencepiece",
+        ], "tokenizer_type only support [bpe, sentencepiece] now."
         fg_cfg = {
             "feature_type": "tokenize_feature",
             "feature_name": self.name,
             "default_value": self.config.default_value,
             "vocab_file": vocab_file,
             "expression": expression,
+            "tokenizer_type": self.config.tokenizer_type,
             "output_type": "word_id",
             "output_delim": self._fg_encoded_multival_sep,
         }

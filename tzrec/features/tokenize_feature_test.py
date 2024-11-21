@@ -130,6 +130,51 @@ class TokenizeFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
+    @parameterized.expand(
+        [
+            [
+                "",
+                ["abc efg", "", "hij"],
+                [703, 75, 3, 15, 89, 122, 7102, 354],
+                [6, 0, 2],
+            ],
+            [
+                "xyz",
+                ["abc efg", "", "hij"],
+                [703, 75, 3, 15, 89, 122, 3, 226, 63, 172, 7102, 354],
+                [6, 4, 2],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_tokenize_feature_sentencepiece(
+        self,
+        default_value,
+        input_data,
+        expected_values,
+        expected_lengths,
+    ):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                vocab_file="data/test/spiece.model",
+                embedding_dim=16,
+                tokenizer_type="sentencepiece",
+                expression="user:token_input",
+                default_value=default_value,
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(
+            token_feat_cfg, fg_mode=FgMode.NORMAL
+        )
+        self.assertEqual(token_feat.inputs, ["token_input"])
+
+        input_data = {"token_input": pa.array(input_data)}
+        parsed_feat = token_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
 
 if __name__ == "__main__":
     unittest.main()
