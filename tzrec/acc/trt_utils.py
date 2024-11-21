@@ -195,12 +195,11 @@ def export_model_trt(
         if v.dim() == 3:
             # workaround -> 0/1 specialization
             if v.size(1) < 2:
-                v = torch.zeros(v.size(0), 2, v.size(2), device="cuda:0")
+                v = torch.zeros(v.size(0), 2, v.size(2), device="cuda:0", dtype=v.dtype)
             dict_dy[1] = torch.export.Dim("seq_len" + str(i), min=1, max=max_seq_len)
 
         if v.size(0) < 2:
-            v = torch.zeros((2,) + v.size()[1:], device="cuda:0")
-
+            v = torch.zeros((2,) + v.size()[1:], device="cuda:0", dtype=v.dtype)
         values_list_cuda.append(v)
         dynamic_shapes_list.append(dict_dy)
 
