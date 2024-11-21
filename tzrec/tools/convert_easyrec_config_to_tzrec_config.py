@@ -71,42 +71,15 @@ def _get_easyrec(pkg_path=None):
     with open(os.path.join(local_package_dir, "easy_rec/__init__.py"), "w") as f:
         f.write("")
     sys.path.append(local_package_dir)
-    if "easyrec_pipeline_pb2" not in globals():
-        _sym = symbol_database.Default()
-        _sym.pool = descriptor_pool.DescriptorPool()
-        os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-        from easy_rec.python.protos import feature_config_pb2 as _feature_config_pb2
-        from easy_rec.python.protos import loss_pb2 as _loss_pb2
-        from easy_rec.python.protos import pipeline_pb2 as _pipeline_pb2
+    _sym = symbol_database.Default()
+    _sym.pool = descriptor_pool.DescriptorPool()
+    from easy_rec.python.protos import feature_config_pb2 as _feature_config_pb2
+    from easy_rec.python.protos import loss_pb2 as _loss_pb2
+    from easy_rec.python.protos import pipeline_pb2 as _pipeline_pb2
 
-        # del os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"]
-        # global easyrec_pipeline_pb2
-        # global easyrec_feature_config_pb2
-        # global easyrec_loss_pb2
-        globals()["easyrec_pipeline_pb2"] = _pipeline_pb2
-        globals()["easyrec_feature_config_pb2"] = _feature_config_pb2
-        globals()["easyrec_loss_pb2"] = _loss_pb2
-
-
-# easyrec_pipeline_pb2 = None
-# easyrec_feature_config_pb2 = None
-# easyrec_loss_pb2 = None
-
-# try:
-#     import easyrec  # noqa: F401
-# except ImportError:
-#     local_cache_dir = tempfile.mkdtemp(prefix="tzrec_tmp")
-#     local_package_dir = _get_easyrec(local_cache_dir)
-#     with open(os.path.join(local_package_dir, "easy_rec/__init__.py"), "w") as f:
-#         f.write("")
-#     sys.path.append(local_package_dir)
-#     _sym = symbol_database.Default()
-#     _sym.pool = descriptor_pool.DescriptorPool()
-# finally:
-#     # os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-#     from easy_rec.python.protos import pipeline_pb2 as easyrec_pipeline_pb2
-#     from easy_rec.python.protos.feature_config_pb2 import FeatureConfig, WideOrDeep
-#     from easy_rec.python.protos.loss_pb2 import LossType
+    globals()["easyrec_pipeline_pb2"] = _pipeline_pb2
+    globals()["easyrec_feature_config_pb2"] = _feature_config_pb2
+    globals()["easyrec_loss_pb2"] = _loss_pb2
 
 
 class ConvertConfig(object):
@@ -125,7 +98,8 @@ class ConvertConfig(object):
         output_tzrec_config_path,
         easyrec_package_path=None,
     ):
-        _get_easyrec(easyrec_package_path)
+        if "easyrec_pipeline_pb2" not in globals():
+            _get_easyrec(easyrec_package_path)
         self.output_tzrec_config_path = output_tzrec_config_path
         self.easyrec_config = self.load_easyrec_config(easyrec_config_path)
         self.fg_json = self.load_easyrec_fg_json(fg_json_path)
@@ -403,7 +377,6 @@ class ConvertConfig(object):
 
     def _easyrec_loss_2_tzrec_loss(self, easyrec_loss):
         """Convert easyrec loss to tzrec loss."""
-        # from easy_rec.python.protos import loss_pb2 as easyrec_loss_pb2
         tzrec_loss = loss_pb2.LossConfig()
         loss_type = easyrec_loss.loss_type
         if loss_type == easyrec_loss_pb2.LossType.JRC_LOSS:  # NOQA
@@ -695,19 +668,6 @@ if __name__ == "__main__":
         help="easyrec whl or tar package path or url",
     )
     args, extra_args = parser.parse_known_args()
-
-    _get_easyrec(pkg_path=args.easyrec_package_path)
-    # from easy_rec.python.protos import pipeline_pb2 as _pipeline_pb2
-    # from easy_rec.python.protos import feature_config_pb2 as _feature_config_pb2
-    # from easy_rec.python.protos import loss_pb2 as _loss_pb2
-    # del os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"]
-    # global easyrec_pipeline_pb2
-    # global easyrec_feature_config_pb2
-    # global easyrec_loss_pb2
-    # globals()["easyrec_pipeline_pb2"] = _pipeline_pb2
-    # globals()["easyrec_loss_pb2"] = _feature_config_pb2
-    # globals()["easyrec_loss_pb2"] = _loss_pb2
-
     fs = ConvertConfig(
         args.easyrec_config_path,
         args.fg_json_path,

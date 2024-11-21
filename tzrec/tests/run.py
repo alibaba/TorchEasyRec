@@ -20,7 +20,12 @@ import warnings
 from unittest.runner import TextTestRunner
 from unittest.signals import registerResult
 
-SUBPROC_TEST_PATTERN = [".dataset_test.", ".sampler_test.", ".tdm.gen_tree."]
+SUBPROC_TEST_PATTERN = [
+    ".dataset_test.",
+    ".sampler_test.",
+    ".tdm.gen_tree.",
+    ".convert_easyrec_config_to_tzrec_config.",
+]
 
 
 def _gather_test_cases(args):
@@ -36,11 +41,12 @@ def _gather_test_cases(args):
             is_subproc = False
             for subp_pattern in SUBPROC_TEST_PATTERN:
                 if subp_pattern in test_case_str:
-                    test_suite_subproc.addTest(test_case)
                     is_subproc = True
                     break
             if not is_subproc:
                 test_suite_main.addTest(test_case)
+            else:
+                test_suite_subproc.addTest(test_case)
 
             if hasattr(test_case, "__iter__"):
                 for subcase in test_case:
@@ -53,17 +59,20 @@ def _gather_test_cases(args):
 
 
 def _error_info_of_subproc_result(result):
+    start = False
+    endline = 0
     error_info = ""
+    # print(result.stderr)
     for line in result.stderr.splitlines():
         if "====" in line:
             start = True
             endline = 0
-        if "----" in line:
-            endline += 1
         if start:
             error_info += line + "\n"
-        if endline == 2:
-            break
+            if "----" in line:
+                endline += 1
+            if endline == 2:
+                break
     return error_info
 
 
@@ -107,11 +116,15 @@ class TZRecTestRunner(TextTestRunner):
                         subp_test_module = f"tzrec.{one_subp_test.__module__}"
                         subp_test_name = f"{one_subp_test.__class__.__name__}.{one_subp_test._testMethodName}"  # NOQA
                         try:
+                            run_env = {}
+                            if hasattr(one_subp_test, "_run_env"):
+                                run_env = one_subp_test._run_env()
                             subp_result = subprocess.run(
                                 ["python", "-m", subp_test_module, subp_test_name],
                                 capture_output=True,
                                 text=True,
                                 timeout=600,
+                                env=dict(os.environ, **run_env),
                             )
                             if subp_result.returncode != 0:
                                 result.failures.append(
