@@ -731,6 +731,9 @@ class ConvertConfigTest(unittest.TestCase):
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG)
 
+    def _run_env(self):
+        return {"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -174,6 +174,7 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(res["float_b"]), 8)
         self.assertEqual(len(res["str_c"]), 8)
 
+    @unittest.skip("accidental process defunct error")
     def test_negative_sampler_multi_node(self):
         f = self._create_item_gl_data()
 

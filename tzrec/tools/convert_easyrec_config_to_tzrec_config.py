@@ -38,50 +38,48 @@ from tzrec.protos.models import match_model_pb2, multi_task_rank_pb2, rank_model
 from tzrec.utils.logging_util import logger
 
 
-def _get_easyrec(local_cache_dir):
+def _get_easyrec(pkg_path=None):
     """Get easyrec whl and extract."""
-    whl_path = os.environ.get("EASYREC_URL")
-    if whl_path is None:
-        whl_path = (
+    local_cache_dir = tempfile.mkdtemp(prefix="tzrec_tmp")
+    if pkg_path is None:
+        pkg_path = (
             f"https://easyrec.oss-cn-beijing.aliyuncs.com/release/whls/"
             f"easy_rec-{EASYREC_VERSION}-py2.py3-none-any.whl"
         )
-    r = requests.get(whl_path)
-    logger.info(f"down easyrec from {whl_path}")
-    if "tar.gz" in whl_path:
+    if pkg_path.startswith("http"):
+        logger.info(f"downloading easyrec from {pkg_path}")
+        r = requests.get(pkg_path)
+        content = r.content
+    else:
+        with open(pkg_path, "rb") as f:
+            content = f.read()
+    if ".tar" in pkg_path:
         try:
-            with tarfile.open(fileobj=io.BytesIO(r.content)) as tar:
+            with tarfile.open(fileobj=io.BytesIO(content)) as tar:
                 tar.extractall(path=local_cache_dir)
             local_package_dir = local_cache_dir
-        except Exception:
-            logger.error(f"invalid {EASYREC_VERSION} tar.")
-            local_package_dir = None
+        except Exception as e:
+            raise RuntimeError(f"invalid {pkg_path} tar.") from e
     else:
         try:
-            with zipfile.ZipFile(io.BytesIO(r.content)) as f:
+            with zipfile.ZipFile(io.BytesIO(content)) as f:
                 f.extractall(local_cache_dir)
             local_package_dir = local_cache_dir
-        except zipfile.BadZipfile:
-            logger.error(f"invalid {EASYREC_VERSION} whl.")
-            local_package_dir = None
-    return local_package_dir
+        except zipfile.BadZipfile as e:
+            raise RuntimeError(f"invalid {pkg_path} whl.") from e
 
-
-try:
-    import easyrec  # noqa: F401
-except ImportError:
-    local_cache_dir = tempfile.mkdtemp(prefix="tzrec_tmp")
-    local_package_dir = _get_easyrec(local_cache_dir)
     with open(os.path.join(local_package_dir, "easy_rec/__init__.py"), "w") as f:
         f.write("")
     sys.path.append(local_package_dir)
     _sym = symbol_database.Default()
     _sym.pool = descriptor_pool.DescriptorPool()
-finally:
-    # os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-    from easy_rec.python.protos import pipeline_pb2 as easyrec_pipeline_pb2
-    from easy_rec.python.protos.feature_config_pb2 import FeatureConfig, WideOrDeep
-    from easy_rec.python.protos.loss_pb2 import LossType
+    from easy_rec.python.protos import feature_config_pb2 as _feature_config_pb2
+    from easy_rec.python.protos import loss_pb2 as _loss_pb2
+    from easy_rec.python.protos import pipeline_pb2 as _pipeline_pb2
+
+    globals()["easyrec_pipeline_pb2"] = _pipeline_pb2
+    globals()["easyrec_feature_config_pb2"] = _feature_config_pb2
+    globals()["easyrec_loss_pb2"] = _loss_pb2
 
 
 class ConvertConfig(object):
@@ -93,7 +91,15 @@ class ConvertConfig(object):
         output_tzrec_config_path (str): TzRec config file path will create.
     """
 
-    def __init__(self, easyrec_config_path, fg_json_path, output_tzrec_config_path):
+    def __init__(
+        self,
+        easyrec_config_path,
+        fg_json_path,
+        output_tzrec_config_path,
+        easyrec_package_path=None,
+    ):
+        if "easyrec_pipeline_pb2" not in globals():
+            _get_easyrec(easyrec_package_path)
         self.output_tzrec_config_path = output_tzrec_config_path
         self.easyrec_config = self.load_easyrec_config(easyrec_config_path)
         self.fg_json = self.load_easyrec_fg_json(fg_json_path)
@@ -119,7 +125,7 @@ class ConvertConfig(object):
 
     def load_easyrec_config(self, path):
         """Load easyrec config."""
-        easyrec_config = easyrec_pipeline_pb2.EasyRecConfig()
+        easyrec_config = easyrec_pipeline_pb2.EasyRecConfig()  # NOQA
         with open(path, "r", encoding="utf-8") as f:
             cfg_str = f.read()
             text_format.Merge(cfg_str, easyrec_config)
@@ -178,7 +184,7 @@ class ConvertConfig(object):
 
     def _create_feature_config(self, pipeline_config):
         """Create tzrec feature config."""
-        easyrec_feature_config = FeatureConfig()
+        easyrec_feature_config = easyrec_feature_config_pb2.FeatureConfig()  # NOQA
         seq_group_cfg = OrderedDict()
         for cfg in self.easyrec_config.feature_configs:
             if cfg.feature_name:
@@ -373,13 +379,13 @@ class ConvertConfig(object):
         """Convert easyrec loss to tzrec loss."""
         tzrec_loss = loss_pb2.LossConfig()
         loss_type = easyrec_loss.loss_type
-        if loss_type == LossType.JRC_LOSS:
+        if loss_type == easyrec_loss_pb2.LossType.JRC_LOSS:  # NOQA
             tzrec_loss.jrc_loss.CopyFrom(loss_pb2.JRCLoss())
-        elif loss_type == LossType.L2_LOSS:
+        elif loss_type == easyrec_loss_pb2.LossType.L2_LOSS:  # NOQA
             tzrec_loss.l2_loss.CopyFrom(loss_pb2.L2Loss())
-        elif loss_type == LossType.SOFTMAX_CROSS_ENTROPY:
+        elif loss_type == easyrec_loss_pb2.LossType.SOFTMAX_CROSS_ENTROPY:  # NOQA
             tzrec_loss.softmax_cross_entropy.CopyFrom(loss_pb2.SoftmaxCrossEntropy())
-        elif loss_type == LossType.CLASSIFICATION:
+        elif loss_type == easyrec_loss_pb2.LossType.CLASSIFICATION:  # NOQA
             tzrec_loss.binary_cross_entropy.CopyFrom(loss_pb2.BinaryCrossEntropy())
         else:
             logger.error(
@@ -495,7 +501,10 @@ class ConvertConfig(object):
             tz_feature_group = model_pb2.FeatureGroupConfig()
             tz_feature_group.group_name = easy_feature_group.group_name
             tz_feature_group.feature_names.extend(easy_feature_group.feature_names)
-            if easy_feature_group.wide_deep == WideOrDeep.WIDE:
+            if (
+                easy_feature_group.wide_deep
+                == easyrec_feature_config_pb2.WideOrDeep.WIDE  # NOQA
+            ):
                 tz_feature_group.group_type = model_pb2.FeatureGroupType.WIDE
             else:
                 tz_feature_group.group_type = model_pb2.FeatureGroupType.DEEP
@@ -652,10 +661,17 @@ if __name__ == "__main__":
         default=None,
         help="output tzrec config path",
     )
+    parser.add_argument(
+        "--easyrec_package_path",
+        type=str,
+        default=None,
+        help="easyrec whl or tar package path or url",
+    )
     args, extra_args = parser.parse_known_args()
     fs = ConvertConfig(
         args.easyrec_config_path,
         args.fg_json_path,
         args.output_tzrec_config_path,
+        args.easyrec_package_path,
     )
     fs.build()
