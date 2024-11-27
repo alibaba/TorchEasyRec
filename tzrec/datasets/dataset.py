@@ -184,6 +184,17 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._selected_input_names |= set(data_config.label_fields)
         if self._mode == Mode.PREDICT:
             self._selected_input_names |= set(self._reserved_columns)
+        if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
+            sampler_type = self._data_config.WhichOneof("sampler")
+            sampler_config = getattr(self._data_config, sampler_type)
+            if hasattr(sampler_config, "item_id_field") and sampler_config.HasField(
+                "item_id_field"
+            ):
+                self._selected_input_names.add(sampler_config.item_id_field)
+            if hasattr(sampler_config, "user_id_field") and sampler_config.HasField(
+                "user_id_field"
+            ):
+                self._selected_input_names.add(sampler_config.user_id_field)
         # if set selected_input_names to None,
         # all columns will be reserved.
         if (
