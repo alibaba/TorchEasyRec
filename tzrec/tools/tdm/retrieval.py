@@ -25,7 +25,7 @@ import torch
 from torch import distributed as dist
 from torch.distributed import ReduceOp
 
-from tzrec.constant import Mode
+from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.dataset import BaseWriter, create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
@@ -83,10 +83,10 @@ def _tdm_predict_data_worker(
     sampler.init_sampler(n_cluster)
 
     while True:
-        record_batch_t, node_ids = in_queue.get()
+        record_batch_t, node_ids = in_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
 
         if record_batch_t is None:
-            out_queue.put((None, None, None))
+            out_queue.put((None, None, None), timeout=PREDICT_QUEUE_TIMEOUT)
             time.sleep(10)
             break
 
@@ -111,7 +111,10 @@ def _tdm_predict_data_worker(
         output_data = data_parser.parse(updated_inputs)
         batch = data_parser.to_batch(output_data, force_no_tile=True)
 
-        out_queue.put((batch, record_batch_t, updated_inputs[item_id_field]))
+        out_queue.put(
+            (batch, record_batch_t, updated_inputs[item_id_field]),
+            timeout=PREDICT_QUEUE_TIMEOUT,
+        )
 
 
 def tdm_retrieval(
@@ -285,24 +288,26 @@ def tdm_retrieval(
     def _forward_loop(data_queue: Queue, pred_queue: Queue, layer_id: int) -> None:
         stop_cnt = 0
         while True:
-            batch, record_batch_t, node_ids = data_queue.get()
+            batch, record_batch_t, node_ids = data_queue.get(
+                timeout=PREDICT_QUEUE_TIMEOUT
+            )
             if batch is None:
                 stop_cnt += 1
                 if stop_cnt == num_worker_per_level:
                     for _ in range(num_worker_per_level):
-                        pred_queue.put((None, None))
+                        pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
                     break
                 else:
                     continue
             assert batch is not None
             pred = _forward(batch, record_batch_t, node_ids, layer_id)
-            pred_queue.put(pred)
+            pred_queue.put(pred, timeout=PREDICT_QUEUE_TIMEOUT)
 
     def _write_loop(pred_queue: Queue, metric_queue: Queue) -> None:
         total = 0
         recall = 0
         while True:
-            record_batch_t, node_ids = pred_queue.get()
+            record_batch_t, node_ids = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
             if record_batch_t is None:
                 break
 
@@ -326,7 +331,7 @@ def tdm_retrieval(
             )
             total += cur_batch_size
             recall += np.sum(retrieval_result)
-        metric_queue.put((total, recall))
+        metric_queue.put((total, recall), timeout=PREDICT_QUEUE_TIMEOUT)
 
     in_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer + 1)]
     out_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer)]
@@ -369,7 +374,7 @@ def tdm_retrieval(
     while True:
         try:
             batch = next(infer_iterator)
-            in_queues[0].put((batch.reserves, None))
+            in_queues[0].put((batch.reserves, None), timeout=PREDICT_QUEUE_TIMEOUT)
             if is_local_rank_zero:
                 plogger.log(i_step)
             if is_profiling:
@@ -379,7 +384,7 @@ def tdm_retrieval(
             break
 
     for _ in range(num_worker_per_level):
-        in_queues[0].put((None, None))
+        in_queues[0].put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
     for p in data_p_list:
         p.join()
     for t in forward_t_list:
@@ -387,7 +392,7 @@ def tdm_retrieval(
     write_t.join()
     writer.close()
 
-    total, recall = metric_queue.get()
+    total, recall = metric_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
     total_t = torch.tensor(total, device=device)
     recall_t = torch.tensor(recall, device=device)
     dist.all_reduce(total_t, op=ReduceOp.SUM)

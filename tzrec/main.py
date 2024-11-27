@@ -56,7 +56,7 @@ from tzrec.acc.utils import (
     is_trt_predict,
     write_mapping_file_for_input_tile,
 )
-from tzrec.constant import Mode
+from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
@@ -1101,7 +1101,7 @@ def predict(
 
     def _write_loop(output_cols: List[str]) -> None:
         while True:
-            predictions, reserves = pred_queue.get()
+            predictions, reserves = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
             if predictions is None:
                 break
             assert predictions is not None and reserves is not None
@@ -1109,12 +1109,12 @@ def predict(
 
     def _forward_loop() -> None:
         while True:
-            batch = data_queue.get()
+            batch = data_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
             if batch is None:
                 break
             assert batch is not None
             pred = _forward(batch)
-            pred_queue.put(pred)
+            pred_queue.put(pred, timeout=PREDICT_QUEUE_TIMEOUT)
 
     forward_t_list = []
     write_t = None
@@ -1136,7 +1136,7 @@ def predict(
                 write_t = Thread(target=_write_loop, args=(output_cols,))
                 write_t.start()
             else:
-                data_queue.put(batch)
+                data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
 
             if is_local_rank_zero:
                 plogger.log(i_step)
@@ -1147,10 +1147,10 @@ def predict(
             break
 
     for _ in range(predict_threads):
-        data_queue.put(None)
+        data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
     for t in forward_t_list:
         t.join()
-    pred_queue.put((None, None))
+    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
     assert write_t is not None
     write_t.join()
     writer.close()

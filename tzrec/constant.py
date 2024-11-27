@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import os
 from enum import Enum
 
 
@@ -22,3 +22,5 @@ class Mode(Enum):
 
 
 EASYREC_VERSION = "0.7.5"
+
+PREDICT_QUEUE_TIMEOUT = int(os.environ.get("PREDICT_QUEUE_TIMEOUT") or 600)
