@@ -364,10 +364,8 @@ class DatasetTest(unittest.TestCase):
             input_fields=input_fields,
         )
         self.assertEqual(
-            sorted(
-                list(dataset._selected_input_names),
-                ["float_b", "float_d", "int_a", "int_d", "item_id", "label", "str_c"],
-            )
+            sorted(list(dataset._selected_input_names)),
+            ["float_b", "float_d", "int_a", "int_d", "item_id", "label", "str_c"],
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
