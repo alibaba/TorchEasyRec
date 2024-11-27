@@ -28,6 +28,7 @@ from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
 from tzrec.utils import config_util
+from tzrec.utils.test_util import dfs_are_close
 
 
 class TrainEvalExportTest(unittest.TestCase):
@@ -722,8 +723,7 @@ class TrainEvalExportTest(unittest.TestCase):
             df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            # differences = df.compare(df_t)
-            # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
         # quant and input-tile and trt
         if self.success:
@@ -754,8 +754,7 @@ class TrainEvalExportTest(unittest.TestCase):
             )
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            # differences = df.compare(df_t)
-            # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
         # quant and input-tile emb and trt
         if self.success:
@@ -786,8 +785,7 @@ class TrainEvalExportTest(unittest.TestCase):
             )
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            # differences = df.compare(df_t)
-            # self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
 
         self.assertTrue(self.success)
 
