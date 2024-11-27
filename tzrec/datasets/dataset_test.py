@@ -313,6 +313,7 @@ class DatasetTest(unittest.TestCase):
         f.flush()
 
         input_fields = [
+            pa.field(name="item_id", type=pa.int64()),
             pa.field(name="int_a", type=pa.int64()),
             pa.field(name="float_b", type=pa.float64()),
             pa.field(name="str_c", type=pa.string()),
@@ -354,13 +355,19 @@ class DatasetTest(unittest.TestCase):
                     input_path=f.name,
                     num_sample=32,
                     attr_fields=["int_a", "float_b", "str_c"],
-                    item_id_field="int_a",
+                    item_id_field="item_id",
                 ),
             ),
             features=features,
             input_path="",
             mode=Mode.TRAIN,
             input_fields=input_fields,
+        )
+        self.assertEqual(
+            sorted(
+                list(dataset._selected_input_names),
+                ["float_b", "float_d", "int_a", "int_d", "item_id", "label", "str_c"],
+            )
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
