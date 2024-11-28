@@ -18,9 +18,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import urllib3
-from alibabacloud_credentials import providers
+from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
-from odps.accounts import AliyunAccount, BaseAccount, StsAccount
+from odps.accounts import AliyunAccount, BaseAccount, CredentialProviderAccount
 from odps.apis.storage_api import (
     ArrowReader,
     ReadRowsRequest,
@@ -34,7 +34,6 @@ from odps.apis.storage_api import (
     WriteRowsRequest,
 )
 from odps.errors import ODPSError
-from Tea.exceptions import RetryError
 from torch import distributed as dist
 
 from tzrec.constant import Mode
@@ -78,38 +77,6 @@ TYPE_TABLE_TO_PA = {
 TYPE_PA_TO_TABLE = {v: k for k, v in TYPE_TABLE_TO_PA.items()}
 
 
-class _CredentialProviderAccount(StsAccount):
-    # pyre-ignore [2,3]
-    def __init__(self, credential_provider):
-        self.provider = credential_provider
-        try:
-            self.credential = self.provider.get_credential()
-        except Exception:
-            self.credential = self.provider.get_credentials()
-        super(_CredentialProviderAccount, self).__init__(None, None, None)
-
-    # pyre-ignore [2,3]
-    def sign_request(self, req, endpoint, region_name=None):
-        max_retry_count = 3
-        retry_cnt = 0
-        while True:
-            try:
-                credential = self.credential.get_credential()
-                self.access_id = credential.get_access_key_id()
-                self.secret_access_key = credential.get_access_key_secret()
-                self.sts_token = credential.get_security_token()
-                break
-            except RetryError as e:
-                if retry_cnt >= max_retry_count:
-                    raise e
-                retry_cnt += 1
-                time.sleep(random.choice([5, 9, 12]))
-                continue
-        return super(_CredentialProviderAccount, self).sign_request(
-            req, endpoint, region_name=region_name
-        )
-
-
 def _parse_odps_config_file(odps_config_path: str) -> Tuple[str, str, str]:
     """Parse odps config file."""
     if os.path.exists(odps_config_path):
@@ -142,8 +109,10 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         )
         account = AliyunAccount(account_id, account_key)
     elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
-        p = providers.DefaultCredentialsProvider()
-        account = _CredentialProviderAccount(p)
+        credentials_client = CredClient()
+        # prevent too much request to credential server after forked
+        credentials_client.get_credential()
+        account = CredentialProviderAccount(credentials_client)
         try:
             odps_endpoint = os.environ["ODPS_ENDPOINT"]
         except KeyError as err:
