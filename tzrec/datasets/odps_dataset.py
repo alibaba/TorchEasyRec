@@ -79,6 +79,7 @@ TYPE_PA_TO_TABLE = {v: k for k, v in TYPE_TABLE_TO_PA.items()}
 
 
 class _CredentialProviderAccount(StsAccount):
+    # pyre-ignore [2,3]
     def __init__(self, credential_provider):
         self.provider = credential_provider
         try:
@@ -87,6 +88,7 @@ class _CredentialProviderAccount(StsAccount):
             self.credential = self.provider.get_credentials()
         super(_CredentialProviderAccount, self).__init__(None, None, None)
 
+    # pyre-ignore [2,3]
     def sign_request(self, req, endpoint, region_name=None):
         max_retry_count = 3
         retry_cnt = 0
