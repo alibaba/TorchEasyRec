@@ -43,6 +43,7 @@ message ModelConfig {
         MMoE mmoe = 201;
         DBMTL dbmtl = 202;
         PLE ple = 203;
+        DC2VR dc2vr = 204;
 
         DSSM dssm = 301;
         DSSMV2 dssm_v2 = 302;
