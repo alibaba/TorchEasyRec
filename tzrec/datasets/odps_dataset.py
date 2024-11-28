@@ -94,9 +94,10 @@ class _CredentialProviderAccount(StsAccount):
         retry_cnt = 0
         while True:
             try:
-                self.access_id = self.credential.get_access_key_id()
-                self.secret_access_key = self.credential.get_access_key_secret()
-                self.sts_token = self.credential.get_security_token()
+                credential = self.credential.get_credential()
+                self.access_id = credential.get_access_key_id()
+                self.secret_access_key = credential.get_access_key_secret()
+                self.sts_token = credential.get_security_token()
                 break
             except RetryError as e:
                 if retry_cnt >= max_retry_count:
