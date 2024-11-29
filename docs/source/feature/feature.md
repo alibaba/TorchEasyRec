@@ -468,30 +468,32 @@ feature_configs: {
 
 ```
 feature_configs: {
-    sequence_name: "click_seq"
-    sequence_length: 50
-    sequence_delim: ";"
-    sequence_pk: "user:click_seq"
-    features {
-        id_feature {
-            feature_name: "item_id"
-            expression: "item:iid"
-            embedding_dim: 32
-            hash_bucket_size: 100000
+    sequence_feature {
+        sequence_name: "click_seq"
+        sequence_length: 50
+        sequence_delim: ";"
+        sequence_pk: "user:click_seq_pk"
+        features {
+            id_feature {
+                feature_name: "item_id"
+                expression: "item:iid"
+                embedding_dim: 32
+                hash_bucket_size: 100000
+            }
         }
-    }
-    features {
-        id_feature {
-            feature_name: "cate"
-            expression: "item:cate"
-            embedding_dim: 32
-            hash_bucket_size: 1000
+        features {
+            id_feature {
+                feature_name: "cate"
+                expression: "item:cate"
+                embedding_dim: 32
+                hash_bucket_size: 1000
+            }
         }
-    }
-    features {
-        raw_feature {
-            feature_name: "ts"
-            expression: "user:ts"
+        features {
+            raw_feature {
+                feature_name: "ts"
+                expression: "user:ts"
+            }
         }
     }
 }
