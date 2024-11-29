@@ -819,6 +819,12 @@ def export(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
+    # make dataparser to get user feats before create model
+    data_config.num_workers = 1
+    dataloader = _get_dataloader(
+        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
+    )
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
@@ -879,11 +885,6 @@ def export(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
-    )
-
-    data_config.num_workers = 1
-    dataloader = _get_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
     )
 
     if isinstance(device_model, MatchModel):
