@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import urllib3
-from alibabacloud_credentials import providers
+from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
 from odps.accounts import AliyunAccount, BaseAccount, CredentialProviderAccount
 from odps.apis.storage_api import (
@@ -109,10 +109,10 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         )
         account = AliyunAccount(account_id, account_key)
     elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
-        p = providers.DefaultCredentialsProvider()
+        credentials_client = CredClient()
         # prevent too much request to credential server after forked
-        p.get_credentials().get_credential()
-        account = CredentialProviderAccount(p)
+        credentials_client.get_credential()
+        account = CredentialProviderAccount(credentials_client)
         try:
             odps_endpoint = os.environ["ODPS_ENDPOINT"]
         except KeyError as err:
