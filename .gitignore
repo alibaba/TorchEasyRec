@@ -38,3 +38,5 @@ protoc*
 # Generated Docs
 docs/source/intro.md
 docs/source/proto.html
+
+.vscode/

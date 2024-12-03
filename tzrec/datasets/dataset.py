@@ -173,6 +173,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._data_parser = DataParser(
             features=features,
             labels=list(data_config.label_fields),
+            sample_weights=list(data_config.sample_weight_fields),
             is_training=self._mode == Mode.TRAIN,
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
@@ -182,6 +183,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._selected_input_names = set()
         self._selected_input_names |= self._data_parser.feature_input_names
         self._selected_input_names |= set(data_config.label_fields)
+        self._selected_input_names |= set(data_config.sample_weight_fields)
         if self._mode == Mode.PREDICT:
             self._selected_input_names |= set(self._reserved_columns)
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:

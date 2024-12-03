@@ -32,12 +32,13 @@ class TDM(RankModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = None
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights)
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
         )

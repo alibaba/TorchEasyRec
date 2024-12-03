@@ -54,12 +54,14 @@ class DataParser:
         self,
         features: List[BaseFeature],
         labels: Optional[List[str]] = None,
+        sample_weights: Optional[List[str]] = None,
         is_training: bool = False,
         fg_threads: int = 1,
         force_base_data_group: bool = False,
     ) -> None:
         self._features = features
         self._labels = labels or []
+        self._sample_weights = sample_weights or []
         self._is_training = is_training
         self._force_base_data_group = force_base_data_group
 
@@ -153,6 +155,10 @@ class DataParser:
 
         for label_name in self._labels:
             output_data[label_name] = _to_tensor(input_data[label_name].to_numpy())
+        
+        for weight in self._sample_weights:
+            output_data[weight] = _to_tensor(input_data[weight].to_numpy())
+
         return output_data
 
     def _parse_feature_normal(
@@ -320,12 +326,17 @@ class DataParser:
         labels = {}
         for label_name in self._labels:
             labels[label_name] = input_data[label_name]
+        
+        sample_weights = {}
+        for weight in self._sample_weights:
+            sample_weights[weight] = input_data[weight]
 
         batch = Batch(
             dense_features=dense_features,
             sparse_features=sparse_features,
             sequence_dense_features=sequence_dense_features,
             labels=labels,
+            sample_weights=sample_weights,
             # pyre-ignore [6]
             batch_size=batch_size,
         )
