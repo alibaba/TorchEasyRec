@@ -87,7 +87,7 @@ class DSSMV2(MatchModel):
         model_config: model_pb2.ModelConfig,
         features: List[BaseFeature],
         labels: List[str],
-        sample_weights: List[str] = None
+        sample_weights: List[str] = []
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights)
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}

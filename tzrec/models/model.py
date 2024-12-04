@@ -44,7 +44,7 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = None
+        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
     ) -> None:
         super().__init__()
         self._base_model_config = model_config

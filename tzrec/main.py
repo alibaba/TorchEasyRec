@@ -218,7 +218,7 @@ def _get_dataloader(
 
 
 def _create_model(
-    model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = None
+    model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
 ) -> BaseModel:
     """Build model.
 

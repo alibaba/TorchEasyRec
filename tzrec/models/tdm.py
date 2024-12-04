@@ -36,7 +36,7 @@ class TDM(RankModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = None
+        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights)
         self.embedding_group = EmbeddingGroup(
