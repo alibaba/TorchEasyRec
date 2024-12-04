@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -88,7 +88,7 @@ class DSSMV2(MatchModel):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}

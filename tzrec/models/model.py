@@ -12,7 +12,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from itertools import chain
 from queue import Queue
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torchmetrics
@@ -49,7 +49,7 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._base_model_config = model_config

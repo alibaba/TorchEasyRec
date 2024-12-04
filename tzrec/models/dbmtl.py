@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -40,7 +40,7 @@ class DBMTL(MultiTaskRank):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         assert model_config.WhichOneof("model") == "dbmtl", (

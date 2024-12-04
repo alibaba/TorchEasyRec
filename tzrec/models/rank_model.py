@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torchmetrics
@@ -51,7 +51,7 @@ class RankModel(BaseModel):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
