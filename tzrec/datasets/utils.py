@@ -136,7 +136,7 @@ class Batch(Pipelineable):
             sample_weights={
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sample_weights.items()
-            }
+            },
         )
 
     def record_stream(self, stream: torch.Stream) -> None:

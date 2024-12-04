@@ -155,7 +155,7 @@ class DataParser:
 
         for label_name in self._labels:
             output_data[label_name] = _to_tensor(input_data[label_name].to_numpy())
-        
+
         for weight in self._sample_weights:
             output_data[weight] = _to_tensor(input_data[weight].to_numpy())
 
@@ -326,7 +326,7 @@ class DataParser:
         labels = {}
         for label_name in self._labels:
             labels[label_name] = input_data[label_name]
-        
+
         sample_weights = {}
         for weight in self._sample_weights:
             sample_weights[weight] = input_data[weight]
