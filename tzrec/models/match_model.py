@@ -159,9 +159,14 @@ class MatchModel(BaseModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0]
         self._sample_weight = sample_weights[0] if sample_weights else sample_weights
@@ -190,7 +195,8 @@ class MatchModel(BaseModel):
         assert (
             loss_type == "softmax_cross_entropy"
         ), "match model only support softmax_cross_entropy loss now."
-        self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction='none')
+        reduction = "none" if self._sample_weight else "mean"
+        self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
@@ -210,7 +216,9 @@ class MatchModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         losses = {}
         label = batch.labels[label_name]
-        sample_weight = batch.sample_weights[self._sample_weight] if self._sample_weight else 1.0
+        sample_weight = (
+            batch.sample_weights[self._sample_weight] if self._sample_weight else 1.0
+        )
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
@@ -223,7 +231,10 @@ class MatchModel(BaseModel):
             label = _arange_int_label(pred)
         else:
             label = _zero_int_label(pred)
-        losses[loss_name] = torch.mean(self._loss_modules[loss_name](pred, label) * sample_weight)
+        losses[loss_name] = self._loss_modules[loss_name](pred, label)
+        if self._sample_weight:
+            losses[loss_name] = torch.mean(losses[loss_name] * sample_weight)
+
         return losses
 
     def loss(

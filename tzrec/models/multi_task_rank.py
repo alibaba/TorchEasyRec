@@ -30,9 +30,14 @@ class MultiTaskRank(RankModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._task_tower_cfgs = list(self._model_config.task_towers)
 
     def _multi_task_output_to_prediction(

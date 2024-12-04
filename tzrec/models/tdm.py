@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -36,9 +36,14 @@ class TDM(RankModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
         )

@@ -10,7 +10,7 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -54,9 +54,10 @@ class MultiTowerDINDense(RankModel):
         model_config: ModelConfig,
         features: List[BaseFeature],
         labels: List[str],
-        sample_weights: List[str] = []
+        sample_weights: Optional[List[str]] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         self.grouped_features_keys = embedding_group.grouped_features_keys()
 
@@ -129,9 +130,14 @@ class MultiTowerDINTRT(RankModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str], sample_weights: List[str] = []
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
         )
