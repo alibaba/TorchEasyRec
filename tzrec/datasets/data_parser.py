@@ -150,10 +150,30 @@ class DataParser:
             self._parse_feature_normal(input_data, output_data)
 
         for label_name in self._labels:
-            output_data[label_name] = _to_tensor(input_data[label_name].to_numpy())
+            label = input_data[label_name]
+            if pa.types.is_floating(label.type):
+                output_data[label_name] = _to_tensor(
+                    label.cast(pa.float32(), safe=False).to_numpy()
+                )
+            elif pa.types.is_integer(label.type):
+                output_data[label_name] = _to_tensor(
+                    label.cast(pa.int64(), safe=False).to_numpy()
+                )
+            else:
+                raise ValueError(
+                    f"label column [{label_name}] only support int or float dtype now."
+                )
 
-        for weight in self._sample_weights:
-            output_data[weight] = _to_tensor(input_data[weight].to_numpy())
+        for weight_name in self._sample_weights:
+            weight = input_data[weight_name]
+            if pa.types.is_floating(weight.type):
+                output_data[weight_name] = _to_tensor(
+                    weight.cast(pa.float32(), safe=False).to_numpy()
+                )
+            else:
+                raise ValueError(
+                    f"sample weight column [{weight_name}] should be float dtype."
+                )
 
         return output_data
 
