@@ -99,7 +99,7 @@ model_config {
     - output_dim: user/item输出embedding维度
     - similarity: 向量相似度函数，包括\[COSINE, INNER_PRODUCT\]，默认INNER_PRODUCT
   - dssm_v2: 参数同dssm
-    - dssm_v2可以支持user与item塔 跨塔share embedding，但会有一些训练性能损失
+    - dssm_v2可以支持user与item塔 跨塔share embedding，但训练速度相对dssm_v1稍慢
     - 注意如果使用dssm_v2，data_config.force_base_data_group需要设置为true
 - losses: 损失函数配置, 目前只支持softmax_cross_entropy
 - metrics: 评估指标配置，目前只支持recall_at_topk
