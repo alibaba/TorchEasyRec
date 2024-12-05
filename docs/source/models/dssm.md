@@ -99,7 +99,7 @@ model_config {
     - output_dim: user/item输出embedding维度
     - similarity: 向量相似度函数，包括\[COSINE, INNER_PRODUCT\]，默认INNER_PRODUCT
   - dssm_v2: 参数同dssm
-    - dssm_v2可以支持user与item塔 跨塔share embedding，但会有一些训练性能损失
+    - dssm_v2可以支持user与item塔 跨塔share embedding，但训练速度相对dssm_v1稍慢
     - 注意如果使用dssm_v2，data_config.force_base_data_group需要设置为true
 - losses: 损失函数配置, 目前只支持softmax_cross_entropy
 - metrics: 评估指标配置，目前只支持recall_at_topk
@@ -125,7 +125,6 @@ model_config {
 
 注:
 
-- 如果负采样表为MaxCompute表，int64类型实际对应MaxCompute表中的bigint类型，float类型实际对应MaxCompute表中的double类型，其他类型暂不支持
 - 如果负采样表为本地文件，分隔符必须是"\\t"。以负采样Item表为例，第一行固定为 "id:int64\\tweight:float\\tattrs:string"，后续列中的id，weight，attr也以"\\t"分隔
 
 ## 示例Config
