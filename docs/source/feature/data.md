@@ -45,7 +45,7 @@ data_config {
     - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
     - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
   - 运行训练/评估/导出/预测等命令时
-    - **本地环境 或 召回算法**：
+    - **本地环境**：
       - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
       ```bash
       cat << EOF >> odps_conf

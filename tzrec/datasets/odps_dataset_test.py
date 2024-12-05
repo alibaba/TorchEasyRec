@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _calc_slice_position
 from tzrec.features.feature import FgMode, create_features
-from tzrec.protos import data_pb2, feature_pb2
+from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
 from tzrec.utils.misc_util import get_free_port, random_name
 
@@ -49,6 +49,7 @@ class OdpsDatasetTest(unittest.TestCase):
     def tearDown(self):
         if self.o is not None:
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
+            self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
 
     def test_calc_slice_position(self):
         num_tables = 81
@@ -70,9 +71,7 @@ class OdpsDatasetTest(unittest.TestCase):
         self.assertTrue(np.all(np.ceil(np.array(worker_row_counts) / batch_size) == 82))
         self.assertEqual(sum(worker_row_counts), num_tables * 81 - 1)
 
-    @parameterized.expand([[False], [True]])
-    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
-    def test_odps_dataset(self, is_orderby_partition):
+    def _create_test_table_and_feature_cfgs(self, has_lookup=True):
         self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
         t = self.o.create_table(
             f"test_odps_dataset_{self.test_suffix}",
@@ -92,7 +91,7 @@ class OdpsDatasetTest(unittest.TestCase):
                         [
                             "unused",
                             "1",
-                            "\x1d".join(["2\x1d3"] * 10000),
+                            "\x1d".join(["2\x1d3"]),  # * 10000),
                             4,
                             5.0,
                             3,
@@ -104,11 +103,10 @@ class OdpsDatasetTest(unittest.TestCase):
                     ]
                     * 10000
                 )
-
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
-                    feature_name="id_a", expression="user:id_a", num_buckets=10
+                    feature_name="id_a", expression="item:id_a", num_buckets=100000
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -118,12 +116,12 @@ class OdpsDatasetTest(unittest.TestCase):
             ),
             feature_pb2.FeatureConfig(
                 raw_feature=feature_pb2.RawFeature(
-                    feature_name="raw_c", expression="user:raw_c"
+                    feature_name="raw_c", expression="item:raw_c"
                 )
             ),
             feature_pb2.FeatureConfig(
                 raw_feature=feature_pb2.RawFeature(
-                    feature_name="raw_d", expression="user:raw_d"
+                    feature_name="raw_d", expression="item:raw_d"
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -141,12 +139,21 @@ class OdpsDatasetTest(unittest.TestCase):
                     feature_name="raw_g", expression="user:raw_g", value_dim=3
                 ),
             ),
-            feature_pb2.FeatureConfig(
-                lookup_feature=feature_pb2.LookupFeature(
-                    feature_name="lookup_h", map="item:map_h", key="user:id_a"
-                ),
-            ),
         ]
+        if has_lookup:
+            feature_cfgs.append(
+                feature_pb2.FeatureConfig(
+                    lookup_feature=feature_pb2.LookupFeature(
+                        feature_name="lookup_h", map="item:map_h", key="user:id_a"
+                    ),
+                )
+            )
+        return feature_cfgs
+
+    @parameterized.expand([[False], [True]])
+    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
+    def test_odps_dataset(self, is_orderby_partition):
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.DAG)
 
         dataset = OdpsDataset(
@@ -194,6 +201,74 @@ class OdpsDatasetTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
+
+    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
+    def test_odps_dataset_with_sampler(self):
+        feature_cfgs = self._create_test_table_and_feature_cfgs(has_lookup=False)
+
+        self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
+        t = self.o.create_table(
+            f"test_odps_sampler_{self.test_suffix}",
+            (
+                "id bigint, weight double, features string",
+                "dt string",
+            ),
+            if_not_exists=True,
+            hints={"odps.sql.type.system.odps2": "true"},
+        )
+        with t.open_writer(partition="dt=20240319", create_partition=True) as writer:
+            writer.write([[i, 1.0, f"{i}:4:5.0"] for i in range(10000)])
+
+        features = create_features(
+            feature_cfgs, fg_mode=FgMode.DAG, neg_fields=["id_a", "raw_c", "raw_d"]
+        )
+        dataset = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_encoded=False,
+                label_fields=["label"],
+                odps_data_quota_name="",
+                negative_sampler=sampler_pb2.NegativeSampler(
+                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319',
+                    num_sample=100,
+                    attr_fields=["id_a", "raw_c", "raw_d"],
+                    item_id_field="id_a",
+                ),
+            ),
+            features=features,
+            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320',
+        )
+        dataset.launch_sampler_cluster(2)
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        for _ in range(2):
+            data = next(iterator)
+            data_dict = data.to_dict()
+            self.assertEqual(
+                sorted(data_dict.keys()),
+                [
+                    "id_a.lengths",
+                    "id_a.values",
+                    "label",
+                    "raw_c.values",
+                    "raw_d.values",
+                    "raw_e.values",
+                    "raw_f.values",
+                    "raw_g.values",
+                    "tag_b.lengths",
+                    "tag_b.values",
+                ],
+            )
+            self.assertEqual(len(data_dict["id_a.lengths"]), 8296)
+            self.assertEqual(len(data_dict["raw_c.values"]), 8296)
+            self.assertEqual(len(data_dict["raw_e.values"]), 8196)
 
 
 class OdpsWriterTest(unittest.TestCase):

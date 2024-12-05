@@ -20,7 +20,11 @@ import pyarrow as pa
 import urllib3
 from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
-from odps.accounts import AliyunAccount, BaseAccount, CredentialProviderAccount
+from odps.accounts import (
+    AliyunAccount,
+    BaseAccount,
+    CredentialProviderAccount,
+)
 from odps.apis.storage_api import (
     ArrowReader,
     ReadRowsRequest,
@@ -90,19 +94,20 @@ def _parse_odps_config_file(odps_config_path: str) -> Tuple[str, str, str]:
         raise ValueError("No such file: %s" % odps_config_path)
 
     try:
-        os.environ["ACCESS_ID"] = odps_config["access_id"]
-        os.environ["ACCESS_KEY"] = odps_config["access_key"]
-        os.environ["ODPS_ENDPOINT"] = odps_config["end_point"]
+        access_id = odps_config["access_id"]
+        access_key = odps_config["access_key"]
+        end_point = odps_config["end_point"]
     except KeyError as err:
         raise IOError(
             "%s key does not exist in the %s file." % (str(err), odps_config_path)
         ) from err
 
-    return odps_config["access_id"], odps_config["access_key"], odps_config["end_point"]
+    return access_id, access_key, end_point
 
 
 def _create_odps_account() -> Tuple[BaseAccount, str]:
     account = None
+    sts_token = None
     if "ODPS_CONFIG_FILE_PATH" in os.environ:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.environ["ODPS_CONFIG_FILE_PATH"]
@@ -111,7 +116,10 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
     elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
-        credentials_client.get_credential()
+        credential = credentials_client.get_credential()
+        account_id = credential.access_key_id
+        account_key = credential.access_key_secret
+        sts_token = credential.security_token
         account = CredentialProviderAccount(credentials_client)
         try:
             odps_endpoint = os.environ["ODPS_ENDPOINT"]
@@ -124,6 +132,13 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
             os.path.join(os.getenv("HOME", "/home/admin"), ".odps_config.ini")
         )
         account = AliyunAccount(account_id, account_key)
+
+    # prevent graph-learn parse odps config hang
+    os.environ["ACCESS_ID"] = account_id
+    os.environ["ACCESS_KEY"] = account_key
+    os.environ["END_POINT"] = odps_endpoint
+    if sts_token:
+        os.environ["STS_TOKEN"] = sts_token
 
     return account, odps_endpoint
 
@@ -315,8 +330,6 @@ class OdpsDataset(BaseDataset):
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
         )
         self._init_input_fields()
-        # prevent graph-learn parse odps config hang
-        os.environ["END_POINT"] = os.environ["ODPS_ENDPOINT"]
 
 
 class OdpsReader(BaseReader):
@@ -347,6 +360,7 @@ class OdpsReader(BaseReader):
         super().__init__(input_path, batch_size, selected_cols, drop_remainder)
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
+        os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
         self._account, self._odps_endpoint = _create_odps_account()
@@ -459,6 +473,7 @@ class OdpsWriter(BaseWriter):
         super().__init__(output_path)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
+        os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
 
         self._project, self._table_name, partitions = _parse_table_path(output_path)
         if partitions is None:

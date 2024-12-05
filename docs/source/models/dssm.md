@@ -125,7 +125,6 @@ model_config {
 
 注:
 
-- 如果负采样表为MaxCompute表，int64类型实际对应MaxCompute表中的bigint类型，float类型实际对应MaxCompute表中的double类型，其他类型暂不支持
 - 如果负采样表为本地文件，分隔符必须是"\\t"。以负采样Item表为例，第一行固定为 "id:int64\\tweight:float\\tattrs:string"，后续列中的id，weight，attr也以"\\t"分隔
 
 ## 示例Config
