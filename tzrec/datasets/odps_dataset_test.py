@@ -91,7 +91,7 @@ class OdpsDatasetTest(unittest.TestCase):
                         [
                             "unused",
                             "1",
-                            "\x1d".join(["2\x1d3"]),  # * 10000),
+                            "\x1d".join(["2\x1d3"] * 10000),
                             4,
                             5.0,
                             3,
