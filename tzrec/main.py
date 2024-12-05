@@ -218,7 +218,10 @@ def _get_dataloader(
 
 
 def _create_model(
-    model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+    model_config: ModelConfig,
+    features: List[BaseFeature],
+    labels: List[str],
+    sample_weights: Optional[List[str]] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -226,6 +229,7 @@ def _create_model(
         model_config (ModelConfig): easyrec model config.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): list of sample weight names.
 
     Return:
         model: a EasyRec Model.
@@ -234,7 +238,7 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
-    model = model_cls(model_config, features, labels)
+    model = model_cls(model_config, features, labels, sample_weights)
     return model
 
 
@@ -538,6 +542,7 @@ def train_and_evaluate(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
+        list(data_config.sample_weight_fields),
     )
     model = TrainWrapper(model)
 

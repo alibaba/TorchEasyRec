@@ -109,6 +109,8 @@ class Batch(Pipelineable):
     reserves: RecordBatchTensor = field(default_factory=RecordBatchTensor)
     # batch_size for input-tile
     batch_size: int = field(default=-1)
+    # sample_weight
+    sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -131,6 +133,10 @@ class Batch(Pipelineable):
             },
             reserves=self.reserves,
             batch_size=self.batch_size,
+            sample_weights={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.sample_weights.items()
+            },
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -142,6 +148,8 @@ class Batch(Pipelineable):
         for v in self.sequence_dense_features.values():
             v.record_stream(stream)
         for v in self.labels.values():
+            v.record_stream(stream)
+        for v in self.sample_weights.values():
             v.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
@@ -175,6 +183,7 @@ class Batch(Pipelineable):
             labels={k: v.pin_memory() for k, v in self.labels.items()},
             reserves=self.reserves,
             batch_size=self.batch_size,
+            sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
         )
 
     def to_dict(
@@ -202,6 +211,8 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}.values"] = v.values()
             tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.labels.items():
+            tensor_dict[f"{k}"] = v
+        for k, v in self.sample_weights.items():
             tensor_dict[f"{k}"] = v
         if self.batch_size > 0:
             tensor_dict["batch_size"] = torch.tensor(self.batch_size, dtype=torch.int64)

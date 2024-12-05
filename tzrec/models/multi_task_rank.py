@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -26,12 +26,18 @@ class MultiTaskRank(RankModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._task_tower_cfgs = list(self._model_config.task_towers)
 
     def _multi_task_output_to_prediction(

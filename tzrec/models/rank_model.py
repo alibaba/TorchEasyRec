@@ -9,13 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torchmetrics
 from torch import nn
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch, Optional
+from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.grouped_auc import GroupedAUC
@@ -42,6 +42,7 @@ class RankModel(BaseModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
@@ -49,8 +50,10 @@ class RankModel(BaseModel):
         model_config: model_pb2.ModelConfig,
         features: List[BaseFeature],
         labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0]
         self._loss_collection = {}

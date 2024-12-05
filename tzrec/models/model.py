@@ -12,7 +12,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from itertools import chain
 from queue import Queue
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torchmetrics
@@ -40,12 +40,18 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__()
+        super().__init__(**kwargs)
         self._base_model_config = model_config
         self._model_type = model_config.WhichOneof("model")
         self._features = features
@@ -55,6 +61,9 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         )
         self._metric_modules = nn.ModuleDict()
         self._loss_modules = nn.ModuleDict()
+
+        if sample_weights:
+            self._sample_weights = sample_weights
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.

@@ -73,6 +73,9 @@ message DataConfig {
     // force padding data into same data group with same batch_size
     optional bool force_base_data_group = 18 [default = false];
 
+    // sample weights
+    repeated string sample_weight_fields = 19;
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;
