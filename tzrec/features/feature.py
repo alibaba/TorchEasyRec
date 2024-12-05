@@ -578,12 +578,31 @@ def create_features(
             )
             features.append(feature)
 
+    has_dag = False
     for feature in features:
         if neg_fields:
             if len(set(feature.inputs) & set(neg_fields)):
                 feature.is_neg = True
         if force_base_data_group:
             feature.data_group = BASE_DATA_GROUP
+        try:
+            side_inputs = feature.side_inputs()
+            for k, _ in side_inputs:
+                if k == "feature":
+                    has_dag = True
+                    break
+        except Exception:
+            pass
+
+    if has_dag:
+        fg_json = create_fg_json(features)
+        # pyre-ignore [16]
+        fg_handler = pyfg.FgArrowHandler(fg_json, 1)
+        user_feats = fg_handler.user_features() | set(
+            fg_handler.sequence_feature_to_name().keys()
+        )
+        for feature in features:
+            feature.is_user_feat = feature.name in user_feats
 
     return features
 
