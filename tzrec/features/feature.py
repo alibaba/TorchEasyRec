@@ -596,6 +596,7 @@ def create_features(
 
     if has_dag:
         fg_json = create_fg_json(features)
+        # pyre-ignore [16]
         fg_handler = pyfg.FgArrowHandler(fg_json, 1)
         user_feats = fg_handler.user_features() | set(
             fg_handler.sequence_feature_to_name().keys()
