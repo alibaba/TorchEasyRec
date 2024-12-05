@@ -215,6 +215,7 @@ class BaseSampler(metaclass=_meta_cls):
         cluster: Optional[Dict[str, Union[int, str]]] = None,
     ) -> None:
         """Set client in cluster info."""
+        gl.set_load_graph_thread_num(max(num_client_per_rank // 2, 1))
         self._num_client_per_rank = num_client_per_rank
         self._client_id_bias = client_id_bias
         if cluster:
