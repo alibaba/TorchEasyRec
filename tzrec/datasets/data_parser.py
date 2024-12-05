@@ -101,18 +101,14 @@ class DataParser:
             for feature in features:
                 self.feature_input_names |= set(feature.inputs)
 
-        self.user_inputs = []
-        self.user_feats = []
+        self.user_inputs = set()
+        self.user_feats = set()
         if is_input_tile():
             self._init_fg_hander()
             self.user_inputs = self._fg_handler.user_inputs() | set(
                 self._fg_handler.sequence_input_to_name().keys()
             )
-            self.user_feats = self._fg_handler.user_features() | set(
-                self._fg_handler.sequence_feature_to_name().keys()
-            )
-            for feature in features:
-                feature.is_user_feat = feature.name in self.user_feats
+            self.user_feats = set([x.name for x in self._features if x.is_user_feat])
             is_rank_zero = os.environ.get("RANK", "0") == "0"
             if is_rank_zero:
                 logger.info(f"self.user_feats: {self.user_feats}")
