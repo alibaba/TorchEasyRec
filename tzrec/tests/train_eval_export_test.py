@@ -299,6 +299,30 @@ class TrainEvalExportTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
+        
+    def test_hstu_with_fg_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/hstu_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            print("First test_eval")
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
 
     def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
         self.success = utils.test_train_eval(

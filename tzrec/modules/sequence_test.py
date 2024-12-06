@@ -19,6 +19,7 @@ from tzrec.modules.sequence import (
     MultiWindowDINEncoder,
     PoolingEncoder,
     SimpleAttention,
+    HSTUEncoder,
     create_seq_encoder,
 )
 from tzrec.protos import module_pb2, seq_encoder_pb2
@@ -65,6 +66,46 @@ class DINEncoderTest(unittest.TestCase):
                 use_bn=False,
                 dropout_ratio=0.9,
             ),
+        )
+        self.assertEqual(din.output_dim(), 16)
+        din = create_test_module(din, graph_type)
+        embedded = {
+            "click_seq.query": torch.randn(4, 12),
+            "click_seq.sequence": torch.randn(4, 10, 16),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = din(embedded)
+        self.assertEqual(result.size(), (4, 16))
+        
+
+class HSTUEncoderTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_hstu_encoder(self, graph_type) -> None:
+        din = HSTUEncoder(
+            sequence_dim=16,
+            input="click_seq",
+            max_seq_length=10,
+        )
+        self.assertEqual(din.output_dim(), 16)
+        din = create_test_module(din, graph_type)
+        embedded = {
+            "click_seq.query": torch.randn(4, 16),
+            "click_seq.sequence": torch.randn(4, 10, 16),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = din(embedded)
+        self.assertEqual(result.size(), (4, 16))
+
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_hstu_encoder_padding(self, graph_type) -> None:
+        din = HSTUEncoder(
+            sequence_dim=16,
+            input="click_seq",
+            max_seq_length=10,
         )
         self.assertEqual(din.output_dim(), 16)
         din = create_test_module(din, graph_type)
