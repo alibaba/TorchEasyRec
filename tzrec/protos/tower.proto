@@ -58,6 +58,29 @@ message BayesTaskTower {
     optional MLP relation_mlp = 9;
 };
 
+message InterventionTaskTower {
+    // task name for the task tower
+    required string tower_name = 1;
+    // label for the task, default is label_fields by order
+    optional string label_name = 2;
+    // metrics for the task
+    repeated MetricConfig metrics = 3;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // num_class for multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
+    // task specific mlp
+    optional MLP mlp = 6;
+    // training loss weights
+    optional float weight = 7 [default = 1.0];
+
+    // intervention tower names
+    repeated string intervention_tower_names = 8;
+    // low_rank_dim
+    required uint32 low_rank_dim = 9;
+};
+
+
 message MultiWindowDINTower {
     // time windows len
     repeated uint32 windows_len = 1;
