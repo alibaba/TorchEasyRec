@@ -101,7 +101,7 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
-        expected_label = torch.tensor([0, 0, 1], dtype=torch.int32)
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
         torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)
@@ -259,7 +259,7 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
-        expected_label = torch.tensor([0, 0, 1], dtype=torch.int32)
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
         torch.testing.assert_close(data["cat_a.weights"], expected_cat_a_weights)
@@ -461,7 +461,7 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
-        expected_label = torch.tensor([0, 0, 1], dtype=torch.int32)
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
         torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)
@@ -583,7 +583,7 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
-        expected_label = torch.tensor([0, 0, 1], dtype=torch.int32)
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
         torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)
@@ -707,7 +707,7 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
-        expected_label = torch.tensor([0, 0, 1], dtype=torch.int32)
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
         torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)

@@ -157,7 +157,7 @@ class DataParser:
                 )
             elif pa.types.is_integer(label.type):
                 output_data[label_name] = _to_tensor(
-                    label.cast(pa.int32(), safe=False).to_numpy()
+                    label.cast(pa.int64(), safe=False).to_numpy()
                 )
             else:
                 raise ValueError(
