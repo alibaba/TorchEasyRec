@@ -264,6 +264,8 @@ def _reader_iter(
             drop_redundant_bs_eq_one if i == num_sess - 1 else False,
             remain_row_count,
         )
+        if start == end:
+            return
 
         offset = 0
         retry_cnt = 0

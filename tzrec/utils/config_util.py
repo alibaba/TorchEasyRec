@@ -20,11 +20,15 @@ from google.protobuf.message import Message
 from tzrec.protos import pipeline_pb2
 
 
-def load_pipeline_config(pipeline_config_path: str) -> pipeline_pb2.EasyRecConfig:
+def load_pipeline_config(
+    pipeline_config_path: str, allow_unknown_field: bool = False
+) -> pipeline_pb2.EasyRecConfig:
     """Load pipeline config.
 
     Args:
-        pipeline_config_path(str): path to pipeline_pb2.EasyRecConfig.
+        pipeline_config_path (str): path to pipeline_pb2.EasyRecConfig.
+        allow_unknown_field (bool): skip over unknown field and keep
+            parsing. Avoid to use this option if possible.
 
     Return:
         a object of pipeline_pb2.EasyRecConfig.
@@ -32,9 +36,11 @@ def load_pipeline_config(pipeline_config_path: str) -> pipeline_pb2.EasyRecConfi
     config = pipeline_pb2.EasyRecConfig()
     with open(pipeline_config_path) as f:
         if pipeline_config_path.endswith(".json"):
-            json_format.Parse(f.read(), config)
+            json_format.Parse(
+                f.read(), config, ignore_unknown_fields=allow_unknown_field
+            )
         else:
-            text_format.Merge(f.read(), config)
+            text_format.Merge(f.read(), config, allow_unknown_field=allow_unknown_field)
     return config
 
 

@@ -238,7 +238,7 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
-    model = model_cls(model_config, features, labels, sample_weights)
+    model = model_cls(model_config, features, labels, sample_weights=sample_weights)
     return model
 
 
@@ -542,7 +542,7 @@ def train_and_evaluate(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
-        list(data_config.sample_weight_fields),
+        sample_weights=list(data_config.sample_weight_fields),
     )
     model = TrainWrapper(model)
 
@@ -674,6 +674,7 @@ def evaluate(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
+        sample_weights=list(data_config.sample_weight_fields),
     )
     model = TrainWrapper(model)
 
@@ -982,7 +983,7 @@ def predict(
         output_cols = [x.strip() for x in output_columns.split(",")]
 
     pipeline_config = config_util.load_pipeline_config(
-        os.path.join(scripted_model_path, "pipeline.config")
+        os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
     )
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
