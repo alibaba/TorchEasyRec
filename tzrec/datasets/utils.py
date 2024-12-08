@@ -18,12 +18,22 @@ import torch
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
 
+from tzrec.protos.data_pb2 import FieldType
+
 BASE_DATA_GROUP = "__BASE__"
 NEG_DATA_GROUP = "__NEG__"
 CROSS_NEG_DATA_GROUP = "__CNEG__"
 
 C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
+
+FIELD_TYPE_TO_PA = {
+    FieldType.INT32: pa.int32(),
+    FieldType.INT64: pa.int64(),
+    FieldType.FLOAT: pa.float32(),
+    FieldType.DOUBLE: pa.float64(),
+    FieldType.STRING: pa.string(),
+}
 
 
 @dataclass

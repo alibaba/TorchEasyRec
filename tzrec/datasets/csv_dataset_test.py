@@ -23,9 +23,8 @@ from pyarrow import csv
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.csv_dataset import CsvDataset, CsvWriter
-from tzrec.features.feature import BaseFeature
+from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
-from tzrec.utils import config_util
 
 
 class CsvDatasetTest(unittest.TestCase):
@@ -45,10 +44,7 @@ class CsvDatasetTest(unittest.TestCase):
                 raw_feature=feature_pb2.RawFeature(feature_name="raw_d")
             ),
         ]
-        features = []
-        for cfg in feature_cfgs:
-            feature_cls_name = config_util.which_msg(cfg, "feature")
-            features.append(BaseFeature.create_class(feature_cls_name)(cfg))
+        features = create_features(feature_cfgs)
 
         t = pa.Table.from_arrays(
             [
@@ -86,6 +82,98 @@ class CsvDatasetTest(unittest.TestCase):
                         data_pb2.Field(input_name="label"),
                     ]
                 )
+            dataset = CsvDataset(
+                data_config,
+                features=features,
+                input_path=f"{test_dir}/*.csv",
+            )
+            self.assertEqual(len(dataset.input_fields), 5)
+            dataloader = DataLoader(
+                dataset=dataset,
+                batch_size=None,
+                num_workers=2,
+                pin_memory=True,
+                collate_fn=lambda x: x,
+            )
+            iterator = iter(dataloader)
+            for _ in range(10):
+                data = next(iterator)
+            self.assertEqual(
+                sorted(data.to_dict().keys()),
+                [
+                    "id_a.lengths",
+                    "id_a.values",
+                    "label",
+                    "raw_c.values",
+                    "raw_d.values",
+                    "tag_b.lengths",
+                    "tag_b.values",
+                ],
+            )
+
+    def test_csv_dataset_with_all_nulls(self):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="id_a", expression="user:id_a", hash_bucket_size=1000
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="tag_b", expression="user:tag_b", hash_bucket_size=100
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="raw_c", expression="user:raw_c"
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="raw_d", expression="user:raw_d"
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs, fg_mode=FgMode.DAG)
+
+        t = pa.Table.from_arrays(
+            [
+                pa.array(["unused"] * 10000),
+                pa.array(["1"] * 10000),
+                pa.array([None] * 10000),
+                pa.array([4] * 10000),
+                pa.array([None] * 10000),
+                pa.array([0] * 10000),
+            ],
+            names=["unused", "id_a", "tag_b", "raw_c", "raw_d", "label"],
+        )
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            for i in range(2):
+                csv.write_csv(
+                    t,
+                    os.path.join(test_dir, f"part-{i}.csv"),
+                    csv.WriteOptions(include_header=False),
+                )
+            data_config = data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.CsvDataset,
+                fg_encoded=False,
+                label_fields=["label"],
+            )
+            data_config.input_fields.extend(
+                [
+                    data_pb2.Field(input_name="unused"),
+                    data_pb2.Field(input_name="id_a"),
+                    data_pb2.Field(
+                        input_name="tag_b", input_type=data_pb2.FieldType.STRING
+                    ),
+                    data_pb2.Field(input_name="raw_c"),
+                    data_pb2.Field(
+                        input_name="raw_d", input_type=data_pb2.FieldType.DOUBLE
+                    ),
+                    data_pb2.Field(input_name="label"),
+                ]
+            )
             dataset = CsvDataset(
                 data_config,
                 features=features,

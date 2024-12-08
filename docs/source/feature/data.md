@@ -201,6 +201,22 @@ data_config {
 
 - fg_encoded=true时，数据的多值分割符，默认为chr(3)
 
+### input_fields
+
+```
+input_fields: {
+    input_name: "input1"
+}
+input_fields: {
+    input_name: "input2"
+    input_type: DOUBLE
+}
+```
+
+- 当使用CsvDataset，如果出现以下情况，需要按如下方式指定`input_fields`，其余Dataset可以自动推理字段类型
+  - 情况一：csv文件没有header行时 => 只需设置`input_name`
+  - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32|INT64|STRING|FLOAT|DOUBLE
+
 ### 更多配置
 
 - [参考文档](../proto.html#tzrec.protos.DataConfig)

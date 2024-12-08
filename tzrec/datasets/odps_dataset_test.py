@@ -144,7 +144,7 @@ class OdpsDatasetTest(unittest.TestCase):
             feature_cfgs.append(
                 feature_pb2.FeatureConfig(
                     lookup_feature=feature_pb2.LookupFeature(
-                        feature_name="lookup_h", map="item:map_h", key="user:id_a"
+                        feature_name="lookup_h", map="user:map_h", key="item:id_a"
                     ),
                 )
             )

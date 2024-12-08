@@ -21,6 +21,7 @@ import pyarrow.dataset as ds
 from pyarrow import csv
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.utils import FIELD_TYPE_TO_PA
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 
@@ -43,8 +44,18 @@ class CsvDataset(BaseDataset):
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
         column_names = None
+        column_types = {}
         if not self._data_config.with_header:
             column_names = [f.input_name for f in self._data_config.input_fields]
+        for f in self._data_config.input_fields:
+            if f.HasField("input_type"):
+                if f.input_type in FIELD_TYPE_TO_PA:
+                    column_types[f.input_name] = FIELD_TYPE_TO_PA[f.input_type]
+                else:
+                    raise ValueError(
+                        f"{f.input_type} of column [{f.input_name}] "
+                        "is not supported by CsvDataset."
+                    )
         # pyre-ignore [29]
         self._reader = CsvReader(
             input_path,
@@ -53,6 +64,7 @@ class CsvDataset(BaseDataset):
             self._data_config.drop_remainder,
             column_names,
             self._data_config.delimiter,
+            column_types,
         )
         self._init_input_fields()
 
@@ -77,11 +89,13 @@ class CsvReader(BaseReader):
         drop_remainder: bool = False,
         column_names: Optional[List[str]] = None,
         delimiter: str = ",",
+        column_types: Optional[Dict[str, pa.DataType]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(input_path, batch_size, selected_cols, drop_remainder)
         self._csv_fmt = ds.CsvFileFormat(
             parse_options=pa.csv.ParseOptions(delimiter=delimiter),
+            convert_options=pa.csv.ConvertOptions(column_types=column_types),
             read_options=csv.ReadOptions(
                 column_names=column_names, block_size=64 * 1024 * 1024
             ),
