@@ -10,8 +10,19 @@ enum DatasetType {
     OdpsDatasetV1 = 4;
 }
 
+enum FieldType {
+    INT32 = 0;
+    INT64 = 1;
+    STRING = 2;
+    FLOAT = 4;
+    DOUBLE = 5;
+}
+
 message Field {
     required string input_name = 1;
+    // only need specify it when use CsvDataset and
+    // value dtype can not be inferred (all values in the column are null)
+    optional FieldType input_type = 2;
 }
 
 message DataConfig {
