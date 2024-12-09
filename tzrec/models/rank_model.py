@@ -56,6 +56,7 @@ class RankModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0]
+        self._sample_weight = sample_weights[0] if sample_weights else sample_weights
         self._loss_collection = {}
         self.embedding_group = None
         self.group_variational_dropouts = None
@@ -153,17 +154,18 @@ class RankModel(BaseModel):
     ) -> None:
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
+        reduction = "none" if self._sample_weight else "mean"
         if loss_type == "binary_cross_entropy":
-            self._loss_modules[loss_name] = nn.BCEWithLogitsLoss()
+            self._loss_modules[loss_name] = nn.BCEWithLogitsLoss(reduction=reduction)
         elif loss_type == "softmax_cross_entropy":
-            self._loss_modules[loss_name] = nn.CrossEntropyLoss()
+            self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
         elif loss_type == "jrc_loss":
             assert num_class == 2, f"num_class must be 2 when loss type is {loss_type}"
             self._loss_modules[loss_name] = JRCLoss(
-                alpha=loss_cfg.jrc_loss.alpha,
+                alpha=loss_cfg.jrc_loss.alpha, reduction=reduction
             )
         elif loss_type == "l2_loss":
-            self._loss_modules[loss_name] = nn.MSELoss()
+            self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
@@ -183,6 +185,9 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         losses = {}
         label = batch.labels[label_name]
+        sample_weights = (
+            batch.sample_weights[self._sample_weight] if self._sample_weight else None
+        )
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
@@ -205,6 +210,9 @@ class RankModel(BaseModel):
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
+
+        if self._sample_weight:
+            losses[loss_name] = torch.mean(losses[loss_name] * sample_weights)
         return losses
 
     def loss(
