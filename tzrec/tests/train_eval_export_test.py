@@ -16,12 +16,6 @@ import tempfile
 import unittest
 
 import torch
-
-# cpu image has no torch_tensorrt
-try:
-    import torch_tensorrt
-except Exception:
-    pass
 from pyarrow import dataset as ds
 
 from tzrec.constant import Mode
@@ -844,7 +838,6 @@ class TrainEvalExportTest(unittest.TestCase):
         utils.save_predict_result_json(result_gpu, result_dict_json_path)
 
         # quant and trt
-        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
         model_gpu_trt = torch.jit.load(
             os.path.join(self.test_dir, "trt/export/scripted_model.pt"),
             map_location=device,
