@@ -34,6 +34,8 @@ message TaskTower {
     optional MLP mlp = 6;
     // training loss weights
     optional float weight = 7 [default = 1.0];
+    // sample weight for the task
+    optional string sample_weight_name = 8;
 };
 
 message BayesTaskTower {
@@ -56,6 +58,8 @@ message BayesTaskTower {
     repeated string relation_tower_names = 8;
     // relation mlp
     optional MLP relation_mlp = 9;
+    // sample weight for the task
+    optional string sample_weight_name = 10;
 };
 
 message MultiWindowDINTower {

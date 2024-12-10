@@ -8,11 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# cpu image has no torch_tensorrt
-try:
-    import torch_tensorrt
-except Exception:
-    pass
+
 import copy
 import itertools
 import json
@@ -1041,9 +1037,6 @@ def predict(
     # disable jit compile， as it compile too slow now.
     if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
         os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-
-    if is_trt_convert:
-        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
 
     model: torch.jit.ScriptModule = torch.jit.load(
         os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device

@@ -33,15 +33,27 @@ class JRCLoss(_Loss):
 
     Args:
         alpha (float): cross entropy loss weight.
-        same_label_loss (bool): whether use same label jrc loss.
+        reduction (str, optional): Specifies the reduction to apply to the
+            output: `none` | `mean`. `none`: no reduction will be applied
+            , `mean`: the weighted mean of the output is taken.
     """
 
-    def __init__(self, alpha: float = 0.5) -> None:
+    def __init__(
+        self,
+        alpha: float = 0.5,
+        reduction: str = "mean",
+    ) -> None:
         super().__init__()
         self._alpha = alpha
-        self._ce_loss = CrossEntropyLoss()
+        self._reduction = reduction
+        self._ce_loss = CrossEntropyLoss(reduction=reduction)
 
-    def forward(self, logits: Tensor, labels: Tensor, session_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        logits: Tensor,
+        labels: Tensor,
+        session_ids: Tensor,
+    ) -> Tensor:
         """JRC loss.
 
         Args:
@@ -50,9 +62,11 @@ class JRCLoss(_Loss):
             session_ids: a `Tensor` with shape [batch_size].
 
         Return:
-            loss: a `Tensor`.
+            loss: a `Tensor` with shape [batch_size] if reduction is 'none',
+                    otherwise with shape ().
         """
         ce_loss = self._ce_loss(logits, labels)
+
         batch_size = labels.shape[0]
         mask = torch.eq(session_ids.unsqueeze(1), session_ids.unsqueeze(0)).float()
         diag_index = _diag_index(labels)
@@ -89,7 +103,15 @@ class JRCLoss(_Loss):
         )
         loss_neg = self._ce_loss(logits_neg, neg_diag_label)
 
-        ge_loss = (loss_pos * pos_num + loss_neg * neg_num) / batch_size
+        if self._reduction != "none":
+            loss_pos = loss_pos * pos_num / batch_size
+            loss_neg = loss_neg * neg_num / batch_size
+            ge_loss = loss_pos + loss_neg
+        else:
+            ge_loss = torch.zeros_like(labels, dtype=torch.float)
+            ge_loss.index_put_(torch.where(labels == 1.0), loss_pos)
+            ge_loss.index_put_(torch.where(labels == 0.0), loss_neg)
+
         loss = self._alpha * ce_loss + (1 - self._alpha) * ge_loss
         # pyre-ignore [7]
         return loss
