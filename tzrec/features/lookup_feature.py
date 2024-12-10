@@ -23,6 +23,7 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import (
+    MAX_HASH_BUCKET_SIZE,
     BaseFeature,
     FgMode,
     _parse_fg_encoded_dense_feature_impl,
@@ -201,7 +202,11 @@ class LookupFeature(BaseFeature):
                 fg_cfg["separator"] = self.config.separator
             if self.config.HasField("normalizer"):
                 fg_cfg["normalizer"] = self.config.normalizer
-            if self.config.HasField("hash_bucket_size"):
+            if self.config.HasField("zch"):
+                fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+                fg_cfg["value_type"] = "string"
+                fg_cfg["needDiscrete"] = True
+            elif self.config.HasField("hash_bucket_size"):
                 fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
                 fg_cfg["value_type"] = "string"
                 fg_cfg["needDiscrete"] = True

@@ -15,6 +15,7 @@ from functools import partial
 
 import numpy as np
 import pyarrow as pa
+import torch
 from parameterized import parameterized
 from torch import nn
 from torchrec.modules.embedding_configs import (
@@ -87,6 +88,45 @@ class IdFeatureTest(unittest.TestCase):
             init_fn=partial(nn.init.uniform_, b=0.01),
         )
         self.assertEqual(repr(id_feat.emb_config), repr(expected_emb_config))
+
+    def test_zch_id_feature(self):
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                embedding_dim=16,
+                zch=feature_pb2.ZeroCollisionHash(
+                    zch_size=100,
+                    eviction_interval=5,
+                    distance_lfu=feature_pb2.DistanceLFU_EvictionPolicy(
+                        decay_exponent=1.0,
+                        threshold_filtering_func="lambda x:"
+                        " probabilistic_threshold_filter(x,0.05)",
+                    ),
+                ),
+            )
+        )
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg)
+        expected_emb_bag_config = EmbeddingBagConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="id_feat_emb",
+            feature_names=["id_feat"],
+            pooling=PoolingType.SUM,
+        )
+        self.assertEqual(repr(id_feat.emb_bag_config), repr(expected_emb_bag_config))
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="id_feat_emb",
+            feature_names=["id_feat"],
+        )
+        self.assertEqual(repr(id_feat.emb_config), repr(expected_emb_config))
+        mc_module = id_feat.mc_module(torch.device("meta"))
+        self.assertEqual(mc_module._zch_size, 100)
+        self.assertEqual(mc_module._eviction_interval, 5)
+        self.assertTrue(
+            mc_module._eviction_policy._threshold_filtering_func is not None
+        )
 
     def test_fg_encoded_with_weighted(self):
         id_feat_cfg = feature_pb2.FeatureConfig(

@@ -20,11 +20,22 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pyarrow as pa
 import pyfg
+import torch
 from torch import nn  # NOQA
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
     PoolingType,
+)
+from torchrec.modules.mc_modules import (
+    DistanceLFU_EvictionPolicy,
+    LFU_EvictionPolicy,
+    LRU_EvictionPolicy,
+    ManagedCollisionModule,
+    MCHManagedCollisionModule,
+    average_threshold_filter,  # NOQA
+    dynamic_threshold_filter,  # NOQA
+    probabilistic_threshold_filter,  # NOQA
 )
 
 from tzrec.datasets.utils import (
@@ -50,6 +61,9 @@ class FgMode(Enum):
     ENCODED = 1
     NORMAL = 2
     DAG = 3
+
+
+MAX_HASH_BUCKET_SIZE = 2**31 - 1
 
 
 def _parse_fg_encoded_sparse_feature_impl(
@@ -385,6 +399,41 @@ class BaseFeature(object, metaclass=_meta_cls):
             )
         else:
             return None
+
+    def mc_module(self, device: torch.device) -> Optional[ManagedCollisionModule]:
+        """Get ManagedCollisionModule."""
+        if self.is_sparse:
+            if hasattr(self.config, "zch") and self.config.HasField("zch"):
+                evict_type = self.config.zch.WhichOneof("eviction_policy")
+                evict_config = getattr(self.config.zch, evict_type)
+                threshold_filtering_func = None
+                if evict_config.HasField("threshold_filtering_func"):
+                    threshold_filtering_func = eval(
+                        evict_config.threshold_filtering_func
+                    )
+                if evict_type == "lfu":
+                    eviction_policy = LFU_EvictionPolicy(
+                        threshold_filtering_func=threshold_filtering_func
+                    )
+                elif evict_type == "lru":
+                    eviction_policy = LRU_EvictionPolicy(
+                        decay_exponent=evict_config.decay_exponent,
+                        threshold_filtering_func=threshold_filtering_func,
+                    )
+                elif evict_type == "distance_lfu":
+                    eviction_policy = DistanceLFU_EvictionPolicy(
+                        decay_exponent=evict_config.decay_exponent,
+                        threshold_filtering_func=threshold_filtering_func,
+                    )
+                else:
+                    raise ValueError("Unknown evict policy type: {evict_type}")
+                return MCHManagedCollisionModule(
+                    zch_size=self.config.zch.zch_size,
+                    device=device,
+                    eviction_interval=self.config.zch.eviction_interval,
+                    eviction_policy=eviction_policy,
+                )
+        return None
 
     @property
     def inputs(self) -> List[str]:

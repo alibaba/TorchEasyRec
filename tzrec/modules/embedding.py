@@ -19,6 +19,15 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.modules.mc_embedding_modules import (
+    ManagedCollisionEmbeddingBagCollection,
+    ManagedCollisionEmbeddingCollection,
+)
+from torchrec.modules.mc_modules import (
+    ManagedCollisionCollection,
+    ManagedCollisionModule,
+    MCHManagedCollisionModule,
+)
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.acc.utils import is_input_tile, is_input_tile_emb
@@ -464,17 +473,14 @@ class EmbeddingGroup(nn.Module):
         return values_list
 
 
-def add_embedding_bag_config(
+def _add_embedding_bag_config(
     emb_bag_configs: Dict[str, EmbeddingBagConfig], emb_bag_config: EmbeddingBagConfig
 ) -> None:
-    """Add embedding bag config .
+    """Add embedding bag config to a dict of embedding bag config.
 
     Args:
-        emb_bag_configs: Dict[str, EmbeddingBagConfig]: a dict contains emb_bag_configs
-        emb_bag_config: EmbeddingBagConfig
-
-    Returns:
-        None
+        emb_bag_configs(Dict[str, EmbeddingBagConfig]): a dict contains emb_bag_configs
+        emb_bag_config(EmbeddingBagConfig): an instance of EmbeddingBagConfig
     """
     if emb_bag_config.name in emb_bag_configs:
         existed_emb_bag_config = emb_bag_configs[emb_bag_config.name]
@@ -494,17 +500,14 @@ def add_embedding_bag_config(
         emb_bag_configs[emb_bag_config.name] = emb_bag_config
 
 
-def add_embedding_config(
+def _add_embedding_config(
     emb_configs: Dict[str, EmbeddingConfig], emb_config: EmbeddingConfig
 ) -> None:
-    """Add embedding config .
+    """Add embedding config to a dict of embedding config.
 
     Args:
-        emb_configs: Dict[str, EmbeddingConfig]: a dict contains emb_configs
-        emb_config: EmbeddingConfig
-
-    Returns:
-        None
+        emb_configs(Dict[str, EmbeddingConfig]): a dict contains emb_configs
+        emb_config(EmbeddingConfig): an instance of EmbeddingConfig
     """
     if emb_config.name in emb_configs:
         existed_emb_config = emb_configs[emb_config.name]
@@ -521,6 +524,28 @@ def add_embedding_config(
                 existed_emb_config.feature_names.append(feature_name)
     else:
         emb_configs[emb_config.name] = emb_config
+
+
+def _add_mc_module(
+    mc_modules: Dict[str, ManagedCollisionModule],
+    emb_name: str,
+    mc_module: ManagedCollisionModule,
+):
+    """Add ManagedCollisionModule to a dict of ManagedCollisionModule.
+
+    Args:
+        mc_modules(Dict[str, ManagedCollisionModule]): a dict of ManagedCollisionModule.
+        emb_name(str): embedding_name.
+        mc_module(ManagedCollisionModule): an instance of ManagedCollisionModule.
+    """
+    if emb_name in mc_modules:
+        existed_mc_module = mc_modules[emb_name]
+        if isinstance(mc_module, MCHManagedCollisionModule):
+            assert isinstance(existed_mc_module, MCHManagedCollisionModule)
+            assert mc_module._zch_size == existed_mc_module._zch_size
+            assert mc_module._eviction_interval == existed_mc_module._eviction_interval
+            assert repr(mc_module._eviction_policy) == repr(mc_module._eviction_policy)
+    mc_modules[emb_name] = mc_module
 
 
 class EmbeddingGroupImpl(nn.Module):
@@ -545,9 +570,13 @@ class EmbeddingGroupImpl(nn.Module):
             device = torch.device("meta")
         name_to_feature = {x.name: x for x in features}
         emb_bag_configs = OrderedDict()
+        mc_emb_bag_configs = OrderedDict()
+        mc_modules = OrderedDict()
 
         self.has_sparse = False
         self.has_sparse_user = False
+        self.has_mc_sparse = False
+        self.has_mc_sparse_user = False
         self.has_dense = False
         self.has_dense_user = False
 
@@ -580,6 +609,10 @@ class EmbeddingGroupImpl(nn.Module):
         input_tile = is_input_tile()
         emb_bag_configs_user = OrderedDict()
         emb_bag_configs_item = OrderedDict()
+        mc_emb_bag_configs_user = OrderedDict()
+        mc_emb_bag_configs_item = OrderedDict()
+        mc_modules_item = OrderedDict()
+        mc_modules_user = OrderedDict()
 
         for feature_group in feature_groups:
             total_dim = 0
@@ -595,6 +628,7 @@ class EmbeddingGroupImpl(nn.Module):
                 if feature.is_sparse:
                     output_dim = feature.output_dim
                     emb_bag_config = feature.emb_bag_config
+                    mc_module = feature.mc_module(device)
                     assert emb_bag_config is not None
                     if is_wide:
                         # TODO(hongsheng.jhs): change to embedding_dim to 1
@@ -607,24 +641,45 @@ class EmbeddingGroupImpl(nn.Module):
 
                     if input_tile_emb:
                         if feature.is_user_feat:
-                            add_embedding_bag_config(
-                                emb_bag_configs=emb_bag_configs_user,
+                            _add_embedding_bag_config(
+                                emb_bag_configs=mc_emb_bag_configs_user
+                                if mc_module
+                                else emb_bag_configs_user,
                                 emb_bag_config=emb_bag_config,
                             )
+                            if mc_module:
+                                _add_mc_module(
+                                    mc_modules_user, emb_bag_config.name, mc_module
+                                )
+                                self.has_mc_sparse_user = True
+                            else:
+                                self.has_sparse_user = True
                         else:
-                            add_embedding_bag_config(
-                                emb_bag_configs=emb_bag_configs_item,
+                            _add_embedding_bag_config(
+                                emb_bag_configs=mc_emb_bag_configs_item
+                                if mc_module
+                                else emb_bag_configs_item,
                                 emb_bag_config=emb_bag_config,
                             )
+                            if mc_module:
+                                _add_mc_module(
+                                    mc_modules_item, emb_bag_config.name, mc_module
+                                )
+                                self.has_mc_sparse = True
+                            else:
+                                self.has_sparse = True
                     else:
-                        add_embedding_bag_config(
-                            emb_bag_configs=emb_bag_configs,
+                        _add_embedding_bag_config(
+                            emb_bag_configs=mc_emb_bag_configs
+                            if mc_module
+                            else emb_bag_configs,
                             emb_bag_config=emb_bag_config,
                         )
-                    if input_tile_emb and feature.is_user_feat:
-                        self.has_sparse_user = True
-                    else:
-                        self.has_sparse = True
+                        if mc_module:
+                            _add_mc_module(mc_modules, emb_bag_config.name, mc_module)
+                            self.has_mc_sparse = True
+                        else:
+                            self.has_sparse = True
 
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_bag_config.name
@@ -656,10 +711,37 @@ class EmbeddingGroupImpl(nn.Module):
             self.ebc_item = EmbeddingBagCollection(
                 list(emb_bag_configs_item.values()), device=device
             )
+            if self.has_mc_sparse_user:
+                self.mc_ebc_user = ManagedCollisionEmbeddingBagCollection(
+                    EmbeddingBagCollection(
+                        list(mc_emb_bag_configs_user.values()), device=device
+                    ),
+                    ManagedCollisionCollection(
+                        mc_modules_user, list(mc_emb_bag_configs_user.values())
+                    ),
+                )
+            if self.has_mc_sparse:
+                self.mc_ebc_item = ManagedCollisionEmbeddingBagCollection(
+                    EmbeddingBagCollection(
+                        list(mc_emb_bag_configs_item.values()), device=device
+                    ),
+                    ManagedCollisionCollection(
+                        mc_modules_item, list(mc_emb_bag_configs_item.values())
+                    ),
+                )
         else:
             self.ebc = EmbeddingBagCollection(
                 list(emb_bag_configs.values()), device=device
             )
+            if self.has_mc_sparse:
+                self.mc_ebc = ManagedCollisionEmbeddingBagCollection(
+                    EmbeddingBagCollection(
+                        list(mc_emb_bag_configs.values()), device=device
+                    ),
+                    ManagedCollisionCollection(
+                        mc_modules, list(mc_emb_bag_configs.values())
+                    ),
+                )
 
     def group_dims(self, group_name: str) -> List[int]:
         """Output dimension of each feature in a feature group."""
@@ -689,8 +771,24 @@ class EmbeddingGroupImpl(nn.Module):
             else:
                 kts.append(self.ebc(sparse_feature))
 
+        if self.has_mc_sparse:
+            if is_input_tile_emb():
+                kts.append(self.mc_ebc_item(sparse_feature)[0])
+            else:
+                kts.append(self.mc_ebc(sparse_feature)[0])
+
         if self.has_sparse_user:
             keyed_tensor_user = self.ebc_user(sparse_feature_user)
+            values_tile = keyed_tensor_user.values().tile(batch_size, 1)
+            keyed_tensor_user_tile = KeyedTensor(
+                keys=keyed_tensor_user.keys(),
+                length_per_key=keyed_tensor_user.length_per_key(),
+                values=values_tile,
+            )
+            kts.append(keyed_tensor_user_tile)
+
+        if self.has_mc_sparse_user:
+            keyed_tensor_user = self.mc_ebc_user(sparse_feature_user)[0]
             values_tile = keyed_tensor_user.values().tile(batch_size, 1)
             keyed_tensor_user_tile = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
@@ -734,9 +832,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             device = torch.device("meta")
         name_to_feature = {x.name: x for x in features}
         dim_to_emb_configs = defaultdict(OrderedDict)
+        dim_to_mc_emb_configs = defaultdict(OrderedDict)
+        dim_to_mc_modules = defaultdict(OrderedDict)
 
         self.has_sparse = False
         self.has_sparse_user = False
+        self.has_mc_sparse = False
+        self.has_mc_sparse_user = False
         self.has_dense = False
         self.has_dense_user = False
         self.has_sequence_dense = False
@@ -768,6 +870,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         need_input_tile_emb = is_input_tile_emb()
         dim_to_emb_configs_user = defaultdict(OrderedDict)
         dim_to_emb_configs_item = defaultdict(OrderedDict)
+        dim_to_mc_emb_configs_user = defaultdict(OrderedDict)
+        dim_to_mc_emb_configs_item = defaultdict(OrderedDict)
+        dim_to_mc_modules_user = defaultdict(OrderedDict)
+        dim_to_mc_modules_item = defaultdict(OrderedDict)
 
         for feature_group in feature_groups:
             query_dim = 0
@@ -785,35 +891,71 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 if feature.is_sparse:
                     output_dim = feature.output_dim
                     emb_config = feature.emb_config
+                    mc_module = feature.mc_module(device)
+                    assert emb_config is not None
                     # we may/could modify ec name at feat_to_group_to_emb_name
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
-                    assert emb_config is not None
-                    emb_configs = dim_to_emb_configs[emb_config.embedding_dim]
+                    embedding_dim = emb_config.embedding_dim
 
                     if need_input_tile_emb:
                         if feature.is_user_feat:
-                            add_embedding_config(
-                                emb_configs=dim_to_emb_configs_user[
-                                    emb_config.embedding_dim
-                                ],
+                            emb_configs = (
+                                dim_to_mc_emb_configs_user[embedding_dim]
+                                if mc_module
+                                else dim_to_emb_configs_user[embedding_dim]
+                            )
+                            _add_embedding_config(
+                                emb_configs=emb_configs,
                                 emb_config=emb_config,
                             )
+                            if mc_module:
+                                _add_mc_module(
+                                    dim_to_mc_modules_user[embedding_dim],
+                                    emb_config.name,
+                                    mc_module,
+                                )
+                                self.has_mc_sparse_user = True
+                            else:
+                                self.has_sparse_user = True
                         else:
-                            add_embedding_config(
-                                emb_configs=dim_to_emb_configs_item[
-                                    emb_config.embedding_dim
-                                ],
+                            emb_configs = (
+                                dim_to_mc_emb_configs_item[embedding_dim]
+                                if mc_module
+                                else dim_to_emb_configs_item[embedding_dim]
+                            )
+                            _add_embedding_config(
+                                emb_configs=emb_configs,
                                 emb_config=emb_config,
                             )
+                            if mc_module:
+                                _add_mc_module(
+                                    dim_to_mc_modules_item[embedding_dim],
+                                    emb_config.name,
+                                    mc_module,
+                                )
+                                self.has_mc_sparse = True
+                            else:
+                                self.has_sparse = True
                     else:
-                        add_embedding_config(
+                        emb_configs = (
+                            dim_to_mc_emb_configs[embedding_dim]
+                            if mc_module
+                            else dim_to_emb_configs[embedding_dim]
+                        )
+                        _add_embedding_config(
                             emb_configs=emb_configs,
                             emb_config=emb_config,
                         )
-                    if need_input_tile_emb and feature.is_user_feat:
-                        self.has_sparse_user = True
-                    else:
-                        self.has_sparse = True
+                        if mc_module:
+                            _add_mc_module(
+                                dim_to_mc_modules[embedding_dim],
+                                emb_config.name,
+                                mc_module,
+                            )
+                            self.has_mc_sparse = True
+                        else:
+                            self.has_sparse = True
+
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_config.name
                 else:
@@ -857,11 +999,41 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 self.ec_list_item.append(
                     EmbeddingCollection(list(emb_configs.values()), device=device)
                 )
+            self.mc_ec_list_user = nn.ModuleList()
+            for k, emb_configs in dim_to_mc_emb_configs_user.items():
+                self.mc_ec_list_user.append(
+                    ManagedCollisionEmbeddingCollection(
+                        EmbeddingCollection(list(emb_configs.values()), device=device),
+                        ManagedCollisionCollection(
+                            dim_to_mc_modules_user[k], list(emb_configs.values())
+                        ),
+                    )
+                )
+            self.mc_ec_list_item = nn.ModuleList()
+            for k, emb_configs in dim_to_mc_emb_configs_item.items():
+                self.mc_ec_list_item.append(
+                    ManagedCollisionEmbeddingCollection(
+                        EmbeddingCollection(list(emb_configs.values()), device=device),
+                        ManagedCollisionCollection(
+                            dim_to_mc_modules_item[k], list(emb_configs.values())
+                        ),
+                    )
+                )
         else:
             self.ec_list = nn.ModuleList()
             for _, emb_configs in dim_to_emb_configs.items():
                 self.ec_list.append(
                     EmbeddingCollection(list(emb_configs.values()), device=device)
+                )
+            self.mc_ec_list = nn.ModuleList()
+            for k, emb_configs in dim_to_mc_emb_configs.items():
+                self.mc_ec_list.append(
+                    ManagedCollisionEmbeddingCollection(
+                        EmbeddingCollection(list(emb_configs.values()), device=device),
+                        ManagedCollisionCollection(
+                            dim_to_mc_modules[k], list(emb_configs.values())
+                        ),
+                    )
                 )
 
     def group_dims(self, group_name: str) -> List[int]:
@@ -911,9 +1083,21 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 for ec in self.ec_list:
                     sparse_jt_dict_list.append(ec(sparse_feature))
 
+        if self.has_mc_sparse:
+            if need_input_tile_emb:
+                for ec in self.mc_ec_list_item:
+                    sparse_jt_dict_list.append(ec(sparse_feature)[0])
+            else:
+                for ec in self.mc_ec_list:
+                    sparse_jt_dict_list.append(ec(sparse_feature)[0])
+
         if self.has_sparse_user:
             for ec in self.ec_list_user:
                 sparse_jt_dict_list.append(ec(sparse_feature_user))
+
+        if self.has_mc_sparse_user:
+            for ec in self.mc_ec_list_user:
+                sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
         sparse_jt_dict = _merge_list_of_jt_dict(sparse_jt_dict_list)
 

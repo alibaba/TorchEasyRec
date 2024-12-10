@@ -20,6 +20,7 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import (
+    MAX_HASH_BUCKET_SIZE,
     BaseFeature,
     FgMode,
     _parse_fg_encoded_sparse_feature_impl,
@@ -71,7 +72,9 @@ class IdFeature(BaseFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             num_embeddings = self.config.num_buckets
@@ -89,7 +92,7 @@ class IdFeature(BaseFeature):
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
-                " or num_buckets or vocab_list or vocab_dict"
+                " or num_buckets or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
 
@@ -156,7 +159,10 @@ class IdFeature(BaseFeature):
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+            fg_cfg["value_type"] = "string"
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
             fg_cfg["value_type"] = "string"
         elif len(self.config.vocab_list) > 0:

@@ -31,7 +31,7 @@ from tzrec.utils import config_util
 from tzrec.utils.test_util import dfs_are_close
 
 
-class TrainEvalExportTest(unittest.TestCase):
+class RankIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False
         if not os.path.exists("./tmp"):
@@ -89,59 +89,9 @@ class TrainEvalExportTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
-    def test_dssm_fg_encoded_train_eval_export(self):
+    def _test_rank_with_fg(self, pipeline_config_path, comp_cpu_gpu_pred_result=False):
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dssm_mock.config", self.test_dir, item_id="item_id"
-        )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export/item"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "predict_result"),
-                reserved_columns="item_id",
-                output_columns="item_tower_emb",
-                test_dir=self.test_dir,
-            )
-        self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "train/model.ckpt-63"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
-        )
-
-    def test_dssm_fg_encoded_variational_dropout(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dssm_variational_dropout_mock.config",
-            self.test_dir,
-            item_id="item_id",
-        )
-        if self.success:
-            self.success = utils.test_feature_selection(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "train/model.ckpt-63"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
-        )
-
-    def test_multi_tower_din_with_fg_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
+            pipeline_config_path,
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
@@ -154,6 +104,14 @@ class TrainEvalExportTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="user_id,item_id",
+                test_dir=self.test_dir,
+            )
         self.assertTrue(self.success)
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
@@ -161,7 +119,7 @@ class TrainEvalExportTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
-        if torch.cuda.is_available():
+        if comp_cpu_gpu_pred_result and torch.cuda.is_available():
             pipeline_config = config_util.load_pipeline_config(
                 os.path.join(self.test_dir, "pipeline.config")
             )
@@ -187,120 +145,16 @@ class TrainEvalExportTest(unittest.TestCase):
                 os.path.join(self.test_dir, "export/scripted_model.pt"),
                 map_location=device,
             )
-            result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
+            result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int64), device)
             for k, v in result_gpu.items():
                 torch.testing.assert_close(
                     result_cpu[k].to(device), v, rtol=5e-3, atol=1e-5
                 )
 
-    def test_dssm_with_fg_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dssm_fg_mock.config",
-            self.test_dir,
-            user_id="user_id",
-            item_id="item_id",
-        )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export/item"),
-                predict_input_path=os.path.join(self.test_dir, r"item_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "item_emb"),
-                reserved_columns="item_id",
-                output_columns="item_tower_emb",
-                test_dir=self.test_dir,
-            )
-        if self.success:
-            self.success = utils.test_create_faiss_index(
-                embedding_input_path=os.path.join(
-                    self.test_dir, r"item_emb/\*.parquet"
-                ),
-                index_output_dir=os.path.join(self.test_dir, "export/user"),
-                id_field="item_id",
-                embedding_field="item_tower_emb",
-                test_dir=self.test_dir,
-            )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export/user"),
-                predict_input_path=os.path.join(self.test_dir, r"user_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "user_emb"),
-                reserved_columns="user_id,click_50_seq__item_id",
-                output_columns="user_tower_emb",
-                test_dir=self.test_dir,
-            )
-        if self.success:
-            self.success = utils.test_hitrate(
-                user_gt_input=os.path.join(self.test_dir, r"user_emb/\*.parquet"),
-                item_embedding_input=os.path.join(
-                    self.test_dir, r"item_emb/\*.parquet"
-                ),
-                total_hitrate_output=os.path.join(self.test_dir, "total_hitrate"),
-                hitrate_details_output=os.path.join(self.test_dir, "hitrate_details"),
-                request_id_field="user_id",
-                gt_items_field="click_50_seq__item_id",
-                test_dir=self.test_dir,
-            )
-        if self.success:
-            self.success = utils.test_create_fg_json(
-                os.path.join(self.test_dir, "pipeline.config"),
-                fg_output_dir=os.path.join(self.test_dir, "fg_output"),
-                reserves="clk",
-                test_dir=self.test_dir,
-            )
-        self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/user/faiss_index"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/user/id_mapping"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "fg_output/fg.json"))
-        )
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(self.test_dir, "fg_output/item_title_tokenizer.json")
-            )
-        )
-
-    def test_dssm_v2_with_fg_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dssm_v2_fg_mock.config",
-            self.test_dir,
-            user_id="user_id",
-            item_id="item_id",
-        )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
-        )
-
-    def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
+    def _test_rank_with_fg_input_tile(
+        self,
+        pipeline_config_path,
+    ):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config",
             self.test_dir,
@@ -463,7 +317,7 @@ class TrainEvalExportTest(unittest.TestCase):
                 os.path.join(self.test_dir, "export/scripted_model.pt"),
                 map_location=device,
             )
-            result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
+            result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int64), device)
             result_dict_json_path = os.path.join(self.test_dir, "result_gpu.json")
             utils.save_predict_result_json(result_gpu, result_dict_json_path)
             for k, v in result_gpu.items():
@@ -477,7 +331,7 @@ class TrainEvalExportTest(unittest.TestCase):
                 map_location=device,
             )
             result_gpu_no_quant = model_gpu_no_quant(
-                data.to_dict(sparse_dtype=torch.int32), device
+                data.to_dict(sparse_dtype=torch.int64), device
             )
             result_dict_json_path = os.path.join(
                 self.test_dir, "result_gpu_no_quant.json"
@@ -499,7 +353,7 @@ class TrainEvalExportTest(unittest.TestCase):
             iterator_input_tile = iter(dataloader)
             data_input_tile = next(iterator_input_tile)
             result_gpu_input_tile = model_gpu_input_tile(
-                data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32),
+                data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int64),
                 device,
             )
             result_dict_json_path = os.path.join(
@@ -513,7 +367,7 @@ class TrainEvalExportTest(unittest.TestCase):
                 map_location=device,
             )
             result_gpu_input_tile_emb = model_gpu_input_tile_emb(
-                data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32),
+                data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int64),
                 device,
             )
 
@@ -531,35 +385,29 @@ class TrainEvalExportTest(unittest.TestCase):
                     result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
                 )
 
-    def test_dbmtl_has_sequence_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dbmtl_has_sequence_mock.config",
-            self.test_dir,
+    def test_multi_tower_din_with_fg_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
+            comp_cpu_gpu_pred_result=True,
         )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
 
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "predict_result"),
-                reserved_columns="clk,buy",
-                output_columns="probs_ctr,probs_cvr",
-                test_dir=self.test_dir,
-            )
-        self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
+    def test_multi_tower_din_zch_with_fg_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+            comp_cpu_gpu_pred_result=True,
         )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+
+    def test_dbmtl_has_sequence_train_eval_export(self):
+        self._test_rank_with_fg("tzrec/tests/configs/dbmtl_has_sequence_mock.config")
+
+    def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
+        self._test_rank_with_fg_input_tile(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+        )
+
+    def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
+        self._test_rank_with_fg_input_tile(
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
         )
 
     def test_dbmtl_has_sequence_variational_dropout_train_eval_export(self):
@@ -589,70 +437,6 @@ class TrainEvalExportTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
-
-    def test_tdm_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/tdm_fg_mock.config",
-            self.test_dir,
-            user_id="user_id",
-            item_id="item_id",
-            cate_id="cate_id",
-        )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"),
-                self.test_dir,
-                asset_files=os.path.join(self.test_dir, "init_tree/serving_tree"),
-            )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export/embedding"),
-                predict_input_path=os.path.join(self.test_dir, r"item_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "item_emb"),
-                reserved_columns="item_id,cate_id,id_4,id_5,raw_1,raw_2",
-                output_columns="item_emb",
-                test_dir=self.test_dir,
-            )
-        if self.success:
-            self.success = utils.test_tdm_cluster_train_eval(
-                pipeline_config_path=os.path.join(self.test_dir, "pipeline.config"),
-                test_dir=self.test_dir,
-                item_input_path=os.path.join(self.test_dir, r"item_emb/\*.parquet"),
-                item_id="item_id",
-                embedding_field="item_emb",
-            )
-        if self.success:
-            self.success = utils.test_tdm_retrieval(
-                scripted_model_path=os.path.join(self.test_dir, "export/model"),
-                eval_data_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
-                retrieval_output_path=os.path.join(self.test_dir, "retrieval_result"),
-                reserved_columns="user_id,item_id",
-                test_dir=self.test_dir,
-            )
-
-        self.assertTrue(self.success)
-        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "learnt_tree")))
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
-        )
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(self.test_dir, "export/embedding/scripted_model.pt")
-            )
-        )
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(self.test_dir, "export/model/scripted_model.pt")
-            )
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/model/serving_tree"))
-        )
-        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "retrieval_result")))
 
     @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
@@ -839,7 +623,7 @@ class TrainEvalExportTest(unittest.TestCase):
         model_gpu = torch.jit.load(
             os.path.join(self.test_dir, "export/scripted_model.pt"), map_location=device
         )
-        result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int32), device)
+        result_gpu = model_gpu(data.to_dict(sparse_dtype=torch.int64), device)
         result_dict_json_path = os.path.join(self.test_dir, "result_gpu.json")
         utils.save_predict_result_json(result_gpu, result_dict_json_path)
 
@@ -849,7 +633,7 @@ class TrainEvalExportTest(unittest.TestCase):
             os.path.join(self.test_dir, "trt/export/scripted_model.pt"),
             map_location=device,
         )
-        result_gpu_trt = model_gpu_trt(data.to_dict(sparse_dtype=torch.int32))
+        result_gpu_trt = model_gpu_trt(data.to_dict(sparse_dtype=torch.int64))
         result_dict_json_path = os.path.join(self.test_dir, "result_gpu_trt.json")
         utils.save_predict_result_json(result_gpu_trt, result_dict_json_path)
 
@@ -868,7 +652,7 @@ class TrainEvalExportTest(unittest.TestCase):
         iterator_input_tile = iter(dataloader)
         data_input_tile = next(iterator_input_tile)
         result_gpu_input_tile = model_gpu_input_tile(
-            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32)
+            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int64)
         )
         result_dict_json_path = os.path.join(
             self.test_dir, "result_gpu_input_tile.json"
@@ -881,7 +665,7 @@ class TrainEvalExportTest(unittest.TestCase):
             map_location=device,
         )
         result_gpu_input_tile_emb = model_gpu_input_tile_emb(
-            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int32)
+            data_input_tile.to(device=device).to_dict(sparse_dtype=torch.int64)
         )
 
         # trt is all same sa no-trt
