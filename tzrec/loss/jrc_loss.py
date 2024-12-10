@@ -102,9 +102,10 @@ class JRCLoss(_Loss):
             logits_neg + ((1 - neg_session_mask) + (1 - diag_neg) * y_neg) * -1e9
         )
         loss_neg = self._ce_loss(logits_neg, neg_diag_label)
-        loss_pos = loss_pos * pos_num / batch_size
-        loss_neg = loss_neg * neg_num / batch_size
+
         if self._reduction != "none":
+            loss_pos = loss_pos * pos_num / batch_size
+            loss_neg = loss_neg * neg_num / batch_size
             ge_loss = loss_pos + loss_neg
         else:
             ge_loss = torch.zeros_like(labels, dtype=torch.float)
