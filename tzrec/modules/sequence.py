@@ -9,14 +9,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
+import fbgemm_gpu
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from tzrec.modules.mlp import MLP
+from tzrec.modules.hstu import RelativeBucketedTimeAndPositionBasedBias, SequentialTransductionUnitJagged
+from tzrec.modules.hstu import HSTUCacheState
 from tzrec.protos.seq_encoder_pb2 import SeqEncoderConfig
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
@@ -295,3 +298,212 @@ def create_seq_encoder(
     seq_config_dict["query_dim"] = query_dim
     seq_encoder = model_cls(**seq_config_dict)
     return seq_encoder
+
+
+class HSTUEncoder(SequenceEncoder):
+    """HSTU sequence encoder.
+
+    Args:
+        sequence_dim (int): sequence tensor channel dimension.
+        query_dim (int): query tensor channel dimension.
+        input(str): input feature group name.
+        attn_mlp (dict): target attention MLP module parameters.
+    """
+
+    def __init__(
+        self,
+        sequence_dim: int,
+        input: str,
+        max_seq_length: int,
+        pos_dropout_rate: float = 0.5,
+        linear_dropout_rate: float = 0.2,
+        attn_dropout_rate: float = 0.0,
+        normalization: str = 'rel_bias',
+        linear_activation: str = 'silu',
+        linear_config: str = 'uvqk',
+        num_heads: int = 4,
+        num_blocks: int = 4,
+        max_output_len: int = 2,
+        time_bucket_size: int = 128,
+        **kwargs: Optional[Dict[str, Any]]
+    ) -> None:
+        super().__init__(input)
+        self._sequence_dim = sequence_dim
+        self._max_seq_length = max_seq_length
+        self._query_name = f"{input}.query"
+        self._sequence_name = f"{input}.sequence"
+        self._sequence_length_name = f"{input}.sequence_length"
+        self.position_embed = nn.Embedding(self._max_seq_length + max_output_len + 1, self._sequence_dim, padding_idx=0)
+        self.dropout_rate = pos_dropout_rate
+        self.enable_relative_attention_bias = True
+        self.autocast_dtype = None
+        self._attention_layers: nn.ModuleList = nn.ModuleList(
+            modules=[
+                SequentialTransductionUnitJagged(
+                    embedding_dim=self._sequence_dim,
+                    linear_hidden_dim=self._sequence_dim,
+                    attention_dim=self._sequence_dim,
+                    normalization=normalization,
+                    linear_config=linear_config,
+                    linear_activation=linear_activation,
+                    num_heads=num_heads,
+                    relative_attention_bias_module=(
+                        RelativeBucketedTimeAndPositionBasedBias(
+                            max_seq_len=max_seq_length + max_output_len,
+                            num_buckets=time_bucket_size,
+                            bucketization_fn=lambda x: (
+                                torch.log(torch.abs(x).clamp(min=1)) / 0.301
+                            ).long(),
+                        )
+                        if self.enable_relative_attention_bias
+                        else None
+                    ),
+                    dropout_ratio=linear_dropout_rate,
+                    attn_dropout_ratio=attn_dropout_rate,
+                    concat_ua=False,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.register_buffer(
+            "_attn_mask",
+            torch.triu(
+                torch.ones(
+                    (
+                        self._max_seq_length + max_output_len,
+                        self._max_seq_length + max_output_len,
+                    ),
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            ),
+        )
+        self._autocast_dtype = None
+        
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._sequence_dim
+
+    def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward the module."""
+        sequence = sequence_embedded[self._sequence_name]  # B, N, E
+        sequence_length = sequence_embedded[self._sequence_length_name]  # N
+        # max_seq_length = sequence.size(1)
+        float_dtype = sequence.dtype
+        
+        # Add positional embeddings and apply dropout
+        positions = _arange(sequence.size(1), device=sequence.device).unsqueeze(0).expand(sequence.size(0), -1)
+        sequence = sequence * (self._sequence_dim**0.5) + self.position_embed(positions)
+        sequence = F.dropout(sequence, p=self.dropout_rate, training=self.training)
+        sequence_mask = _arange(sequence.size(1), device=sequence_length.device).unsqueeze(0) < sequence_length.unsqueeze(1)
+        sequence = sequence * sequence_mask.unsqueeze(-1).to(float_dtype)
+        
+        invalid_attn_mask = 1.0 - self._attn_mask.to(float_dtype)
+        sequence_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_length)
+        sequence = torch.ops.fbgemm.dense_to_jagged(sequence, [sequence_offsets])[0]
+        
+        all_timestamps = None
+        jagged_x, cache_states = self.jagged_forward(
+            x=sequence,
+            x_offsets=sequence_offsets,
+            all_timestamps=all_timestamps,
+            invalid_attn_mask=invalid_attn_mask,
+            delta_x_offsets=None,
+            cache=None,
+            return_cache_states=False,
+        )
+        output_embeddings = torch.ops.fbgemm.jagged_to_padded_dense(
+                                values=jagged_x,
+                                offsets=[sequence_offsets],
+                                max_lengths=[invalid_attn_mask.size(1)],
+                                padding_value=0.0,
+                            )
+        # post processing
+        output_embeddings = output_embeddings[..., : self._sequence_dim]
+        output_embeddings = output_embeddings / torch.clamp(
+                                torch.linalg.norm(output_embeddings, ord=None, dim=-1, keepdim=True),
+                                min=1e-6,
+                            )
+        output_embeddings = self.get_current_embeddings(sequence_length, output_embeddings)
+        return output_embeddings
+
+    def jagged_forward(
+        self,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        all_timestamps: Optional[torch.Tensor],
+        invalid_attn_mask: torch.Tensor,
+        delta_x_offsets: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache: Optional[List[HSTUCacheState]] = None,
+        return_cache_states: bool = False,
+    ) -> Tuple[torch.Tensor, List[HSTUCacheState]]:
+        """
+        Args:
+            x: (\sum_i N_i, D) x float
+            x_offsets: (B + 1) x int32
+            all_timestamps: (B, 1 + N) x int64
+            invalid_attn_mask: (B, N, N) x float, each element in {0, 1}
+            return_cache_states: bool. True if we should return cache states.
+
+        Returns:
+            x' = f(x), (\sum_i N_i, D) x float
+        """
+        cache_states: List[HSTUCacheState] = []
+
+        with torch.autocast(
+            "cuda",
+            enabled=self._autocast_dtype is not None,
+            dtype=self._autocast_dtype or torch.float16,
+        ):
+            for i, layer in enumerate(self._attention_layers):
+                x, cache_states_i = layer(
+                    x=x,
+                    x_offsets=x_offsets,
+                    all_timestamps=all_timestamps,
+                    invalid_attn_mask=invalid_attn_mask,
+                    delta_x_offsets=delta_x_offsets,
+                    cache=cache[i] if cache is not None else None,
+                    return_cache_states=return_cache_states,
+                )
+                print(f"\n--- Layer {i} ---")
+                print(f"Layer type: {type(layer).__name__}")
+                important_attrs = [
+                    'embedding_dim',
+                    'linear_dim',
+                    'attention_dim',
+                    'dropout_ratio',
+                    'attn_dropout_ratio',
+                    'num_heads',
+                    'linear_activation',
+                    'normalization',
+                    'linear_config',
+                    'concat_ua'
+                ]
+                for attr_name in important_attrs:
+                    attr_value = getattr(layer, f"_{attr_name}", None)
+                    if attr_value is not None:
+                        print(f"{attr_name}: {attr_value}")
+                print(f"\nAfter Layer {i}:")
+                print(f"sequence.size: {x.size()}\nsequence: {x}")
+                print(f"x_offsets: {x_offsets}")
+                if return_cache_states:
+                    cache_states.append(cache_states_i)
+
+        return x, cache_states
+
+    def get_current_embeddings(
+        self,
+        lengths: torch.Tensor,
+        encoded_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            lengths: (B,) x int
+            seq_embeddings: (B, N, D,) x float
+
+        Returns:
+            (B, D,) x float, where [i, :] == encoded_embeddings[i, lengths[i] - 1, :]
+        """
+        B, N, D = encoded_embeddings.size()
+        flattened_offsets = (lengths - 1) + _arange(B, device=lengths.device) * N
+        return encoded_embeddings.reshape(-1, D)[flattened_offsets, :].reshape(B, D)
