@@ -76,12 +76,18 @@ class MultiTaskRank(RankModel):
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name
+            sample_weight_name = (
+                task_tower_cfg.sample_weight_name
+                if task_tower_cfg.sample_weight_name
+                else ""
+            )
             for loss_cfg in task_tower_cfg.losses:
                 losses.update(
                     self._loss_impl(
                         predictions,
                         batch,
                         label_name,
+                        sample_weight_name,
                         loss_cfg,
                         num_class=task_tower_cfg.num_class,
                         suffix=f"_{tower_name}",

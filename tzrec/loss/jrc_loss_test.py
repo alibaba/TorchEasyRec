@@ -39,5 +39,32 @@ class JRCLossTest(unittest.TestCase):
         self.assertEqual(0.7199, round(loss.item(), 4))
 
 
+class JRCLossTestReduceNone(unittest.TestCase):
+    def test_jrc_loss_reduce_none(self) -> None:
+        loss_class = JRCLoss(reduction="none")
+        logits = torch.tensor(
+            [
+                [0.9, 0.1],
+                [0.5, 0.5],
+                [0.3, 0.7],
+                [0.2, 0.8],
+                [0.8, 0.2],
+                [0.55, 0.45],
+                [0.33, 0.67],
+                [0.55, 0.45],
+            ],
+            dtype=torch.float32,
+        )
+        labels = torch.tensor([0, 0, 1, 1, 0, 0, 1, 1])
+        session_ids = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.int8)
+        loss = loss_class(logits, labels, session_ids)
+        rounded_loss = list(map(lambda x: round(x, 4), loss.numpy().tolist()))
+
+        answer = [0.3644, 0.5815, 0.4720, 0.4201, 0.4380, 0.5798, 0.4905, 0.6277]
+        diff = sum((map(lambda x, y: abs(x - y), answer, rounded_loss)))
+
+        self.assertEqual(0.0, diff)
+
+
 if __name__ == "__main__":
     unittest.main()
