@@ -58,6 +58,17 @@ feature_configs {
         embedding_dim: 32
         vocab_dict: [{key:"a" value:2}, {key:"b" value:3}, {key:"c" value:2}]
     }
+feature_configs {
+    id_feature {
+        feature_name: "cate"
+        expression: "item:cate"
+        embedding_dim: 32
+        zch: {
+            zch_size: 1000000
+            eviction_interval: 2
+            lfu {}
+        }
+    }
 }
 ```
 
@@ -74,6 +85,8 @@ feature_configs {
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等
 
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
@@ -207,6 +220,7 @@ feature_configs: {
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
 如果Map的值为连续值，可设置:
@@ -247,6 +261,7 @@ feature_configs: {
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
 如果Map的值为连续值，可设置:

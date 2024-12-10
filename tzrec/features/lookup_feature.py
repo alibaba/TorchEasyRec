@@ -85,7 +85,9 @@ class LookupFeature(BaseFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             num_embeddings = self.config.num_buckets

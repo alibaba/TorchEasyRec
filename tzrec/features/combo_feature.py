@@ -57,7 +57,9 @@ class ComboFeature(IdFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif len(self.config.vocab_list) > 0:
             num_embeddings = len(self.config.vocab_list) + 2
@@ -73,7 +75,7 @@ class ComboFeature(IdFeature):
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
-                " or vocab_list or vocab_dict"
+                " or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
 

@@ -119,7 +119,6 @@ class DataParser:
         if not self._fg_handler:
             fg_json = create_fg_json(self._features)
             # pyre-ignore [16]
-            print(fg_json)
             self._fg_handler = pyfg.FgArrowHandler(fg_json, self._fg_threads)
 
     def parse(self, input_data: Dict[str, pa.Array]) -> Dict[str, torch.Tensor]:
