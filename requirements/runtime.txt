@@ -13,6 +13,7 @@ pyodps>=0.12.0
 scikit-learn
 tensorboard
 torch==2.5.0
-torch-tensorrt @ http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torch_tensorrt-2.5.0a0-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
+torch-tensorrt @ http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/trt/torch_tensorrt-2.5.0a0-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
+torch-tensorrt @ http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/trt/torch_tensorrt-2.5.0a0-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 torchmetrics==1.0.3
 torchrec==1.0.0
