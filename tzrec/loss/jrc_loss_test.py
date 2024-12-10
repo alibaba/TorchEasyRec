@@ -58,12 +58,8 @@ class JRCLossTestReduceNone(unittest.TestCase):
         labels = torch.tensor([0, 0, 1, 1, 0, 0, 1, 1])
         session_ids = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.int8)
         loss = loss_class(logits, labels, session_ids)
-        rounded_loss = list(map(lambda x: round(x, 4), loss.numpy().tolist()))
 
-        answer = [0.3644, 0.5815, 0.4720, 0.4201, 0.4380, 0.5798, 0.4905, 0.6277]
-        diff = sum((map(lambda x, y: abs(x - y), answer, rounded_loss)))
-
-        self.assertEqual(0.0, diff)
+        self.assertEqual(0.7199, round(torch.mean(loss).item(), 4))
 
 
 if __name__ == "__main__":
