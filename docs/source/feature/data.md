@@ -18,6 +18,9 @@ data_config {
 }
 ```
 
+如果希望在训练过程带上样本权重，支持在data_config中增加配置项
+sample_weight_fields: 'col_name'
+
 ### dataset_type
 
 目前支持一下几种[input_type](../proto.html#tzrec.protos.DatasetType):
