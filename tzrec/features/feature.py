@@ -407,9 +407,9 @@ class BaseFeature(object, metaclass=_meta_cls):
                 evict_type = self.config.zch.WhichOneof("eviction_policy")
                 evict_config = getattr(self.config.zch, evict_type)
                 threshold_filtering_func = None
-                if evict_config.HasField("threshold_filtering_func"):
+                if self.config.zch.HasField("threshold_filtering_func"):
                     threshold_filtering_func = eval(
-                        evict_config.threshold_filtering_func
+                        self.config.zch.threshold_filtering_func
                     )
                 if evict_type == "lfu":
                     eviction_policy = LFU_EvictionPolicy(

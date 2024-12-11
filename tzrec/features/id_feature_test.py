@@ -99,9 +99,9 @@ class IdFeatureTest(unittest.TestCase):
                     eviction_interval=5,
                     distance_lfu=feature_pb2.DistanceLFU_EvictionPolicy(
                         decay_exponent=1.0,
-                        threshold_filtering_func="lambda x:"
-                        " probabilistic_threshold_filter(x,0.05)",
                     ),
+                    threshold_filtering_func="lambda x:"
+                    " probabilistic_threshold_filter(x,0.05)",
                 ),
             )
         )

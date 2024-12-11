@@ -530,7 +530,7 @@ def _add_mc_module(
     mc_modules: Dict[str, ManagedCollisionModule],
     emb_name: str,
     mc_module: ManagedCollisionModule,
-):
+) -> None:
     """Add ManagedCollisionModule to a dict of ManagedCollisionModule.
 
     Args:

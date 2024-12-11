@@ -4,33 +4,18 @@ package tzrec.protos;
 
 // LFU: evict_score = access_cnt
 message LFU_EvictionPolicy {
-    // lambda function string used to filter incoming ids before update/eviction. experimental feature.
-    //        [input: Tensor] the function takes as input a 1-d tensor of unique id counts.
-    //        [output1: Tensor] the function returns a boolean_mask or index array of corresponding elements in the input tensor that pass the filter.
-    //        [output2: float, Tensor] the function returns the threshold that will be used to filter ids before update/eviction. all values <= this value will be filtered out.
-    optional string threshold_filtering_func = 1;
 }
 
 // LRU: evict_score = 1 / pow((current_iter - last_access_iter), decay_exponent)
 message LRU_EvictionPolicy {
     // decay rate is access step
     optional float decay_exponent = 1 [default = 1.0];
-    // lambda function used to filter incoming ids before update/eviction. experimental feature.
-    //        [input: Tensor] the function takes as input a 1-d tensor of unique id counts.
-    //        [output1: Tensor] the function returns a boolean_mask or index array of corresponding elements in the input tensor that pass the filter.
-    //        [output2: float, Tensor] the function returns the threshold that will be used to filter ids before update/eviction. all values <= this value will be filtered out.
-    optional string threshold_filtering_func = 2;
 }
 
 // DistanceLFU: evict_score = access_cnt / pow((current_iter - last_access_iter), decay_exponent)
 message DistanceLFU_EvictionPolicy {
     // decay rate is access step
     optional float decay_exponent = 1 [default = 1.0];
-    // lambda function string used to filter incoming ids before update/eviction. experimental feature.
-    //        [input: Tensor] the function takes as input a 1-d tensor of unique id counts.
-    //        [output1: Tensor] the function returns a boolean_mask or index array of corresponding elements in the input tensor that pass the filter.
-    //        [output2: float, Tensor] the function returns the threshold that will be used to filter ids before update/eviction. all values <= this value will be filtered out.
-    optional string threshold_filtering_func = 2;
 }
 
 message ZeroCollisionHash {
@@ -44,6 +29,11 @@ message ZeroCollisionHash {
         LRU_EvictionPolicy lru = 102;
         DistanceLFU_EvictionPolicy distance_lfu = 103;
     }
+    // lambda function string used to filter incoming ids before update/eviction. experimental feature.
+    //        [input: Tensor] the function takes as input a 1-d tensor of unique id counts.
+    //        [output1: Tensor] the function returns a boolean_mask or index array of corresponding elements in the input tensor that pass the filter.
+    //        [output2: float, Tensor] the function returns the threshold that will be used to filter ids before update/eviction. all values <= this value will be filtered out.
+    optional string threshold_filtering_func = 3;
 }
 
 
