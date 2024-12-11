@@ -89,7 +89,14 @@ class IdFeatureTest(unittest.TestCase):
         )
         self.assertEqual(repr(id_feat.emb_config), repr(expected_emb_config))
 
-    def test_zch_id_feature(self):
+    @parameterized.expand(
+        [
+            ["lambda x: probabilistic_threshold_filter(x,0.05)"],
+            ["lambda x: (x > 10, 10)"],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_zch_id_feature(self, threshold_filtering_func):
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="id_feat",
@@ -100,8 +107,7 @@ class IdFeatureTest(unittest.TestCase):
                     distance_lfu=feature_pb2.DistanceLFU_EvictionPolicy(
                         decay_exponent=1.0,
                     ),
-                    threshold_filtering_func="lambda x:"
-                    " probabilistic_threshold_filter(x,0.05)",
+                    threshold_filtering_func=threshold_filtering_func,
                 ),
             )
         )
