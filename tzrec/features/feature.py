@@ -63,7 +63,7 @@ class FgMode(Enum):
     DAG = 3
 
 
-MAX_HASH_BUCKET_SIZE = 2**31 - 1
+MAX_HASH_BUCKET_SIZE = 2**63 - 1
 
 
 def _parse_fg_encoded_sparse_feature_impl(

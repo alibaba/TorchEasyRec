@@ -41,10 +41,10 @@ class RankIntegrationTest(unittest.TestCase):
         os.environ.pop("INPUT_TILE", None)
         os.environ.pop("ENABLE_TRT", None)
 
-    def test_multi_tower_din_fg_encoded_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/multi_tower_din_mock.config", self.test_dir
-        )
+    def _test_rank_fg_encoded(
+        self, pipeline_config_path, reserved_columns, output_columns
+    ):
+        self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
         if self.success:
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
@@ -58,8 +58,8 @@ class RankIntegrationTest(unittest.TestCase):
                 scripted_model_path=os.path.join(self.test_dir, "export"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=os.path.join(self.test_dir, "predict_result"),
-                reserved_columns="clk",
-                output_columns="probs",
+                reserved_columns=reserved_columns,
+                output_columns=output_columns,
                 test_dir=self.test_dir,
             )
         self.assertTrue(self.success)
@@ -68,6 +68,20 @@ class RankIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+        )
+
+    def test_multi_tower_din_fg_encoded_train_eval_export(self):
+        self._test_rank_fg_encoded(
+            "tzrec/tests/configs/multi_tower_din_mock.config",
+            reserved_columns="clk",
+            output_columns="probs",
+        )
+
+    def test_dbmtl_has_sequence_fg_encoded_train_eval_export(self):
+        self._test_rank_fg_encoded(
+            "tzrec/tests/configs/dbmtl_has_sequence_mock.config",
+            reserved_columns="clk,buy",
+            output_columns="probs_ctr,probs_cvr",
         )
 
     def test_multi_tower_din_fg_encoded_finetune(self):
@@ -391,9 +405,6 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
             comp_cpu_gpu_pred_result=True,
         )
-
-    def test_dbmtl_has_sequence_train_eval_export(self):
-        self._test_rank_with_fg("tzrec/tests/configs/dbmtl_has_sequence_mock.config")
 
     def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
