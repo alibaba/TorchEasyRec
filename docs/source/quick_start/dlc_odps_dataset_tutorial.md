@@ -4,86 +4,19 @@
 
 ## 环境准备
 
-### 创建oss数据集
+### 创建数据集
 
-1. 登录[PAI控制台](https://pai.console.aliyun.com/)。
-1. 点击 **AI资源管理 - 数据集 -> 创建数据集**。
-1. 选择数据存储为 **阿里云文件存储(NAS)**，并挂载到 `/mnt/data` 下。
+进入[PAI控制台](https://pai.console.aliyun.com/)，点击 **AI资源管理-数据集** -> **创建数据集**。选择数据存储为**阿里云文件存储(NAS)**，挂载到`/mnt/data`下。任务运行时，会从挂载路径下读取训练数据和配置文件以及写入模型检查点等。
 
-### 加载训练数据到maxcompute
 
-1. 下载数据到本地
+### 加载训练数据到MaxCompute
 
-- 训练数据: [taobao_data_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz)
-- 评估数据: [taobao_data_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz)
+1. 下载脚本
 
-2. 在maxcompute创建数据表
+- 加载数据脚本: [upload_data.sh](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/upload_data.sh)
 
-- 创建训练表：
+2. 执行脚本创建数据表并上传至MaxCompute
 
-```bash
-CREATE TABLE taobao_data_train (
-    user_id BIGINT,
-    cms_segid DOUBLE,
-    cms_group_id DOUBLE,
-    final_gender_code DOUBLE,
-    age_level DOUBLE,
-    pvalue_level DOUBLE,
-    shopping_level DOUBLE,
-    occupation DOUBLE,
-    new_user_class_level DOUBLE,
-    time_stamp BIGINT,
-    click_50_seq__adgroup_id STRING,
-    click_50_seq__cate_id STRING,
-    click_50_seq__brand STRING,
-    adgroup_id BIGINT,
-    cate_id BIGINT,
-    campaign_id BIGINT,
-    customer BIGINT,
-    brand DOUBLE,
-    price DOUBLE,
-    pid STRING,
-    clk INT,
-    buy INT
-)
-;
-```
-
-- 创建评估表：
-
-```bash
-CREATE TABLE taobao_data_test (
-    user_id BIGINT,
-    cms_segid DOUBLE,
-    cms_group_id DOUBLE,
-    final_gender_code DOUBLE,
-    age_level DOUBLE,
-    pvalue_level DOUBLE,
-    shopping_level DOUBLE,
-    occupation DOUBLE,
-    new_user_class_level DOUBLE,
-    time_stamp BIGINT,
-    click_50_seq__adgroup_id STRING,
-    click_50_seq__cate_id STRING,
-    click_50_seq__brand STRING,
-    adgroup_id BIGINT,
-    cate_id BIGINT,
-    campaign_id BIGINT,
-    customer BIGINT,
-    brand DOUBLE,
-    price DOUBLE,
-    pid STRING,
-    clk INT,
-    buy INT,
-    ds STRING
-)
-;
-```
-
-4. 将数据导入maxcompute数据表
-
-- 将数据上传oss
-- 在dataworks中使用数据集成将数据导入MC。参考:[dataworks数据集成](https://help.aliyun.com/zh/dataworks/user-guide/overview-6?spm=a2c4g.11186623.0.i1)
 
 ### 前置条件
 
@@ -137,8 +70,8 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.train_eval \
 --pipeline_config_path /mnt/data/multi_tower_din_taobao_dlc_mc.config \
---train_input_path odps://rec_template/tables/taobao_data_train \
---eval_input_path odps://rec_template/tables/taobao_data_test \
+--train_input_path odps://{project_name}/tables/taobao_data_train \
+--eval_input_path odps://{project_name}/tables/taobao_data_test \
 --model_dir /mnt/data/multi_tower_din_odps_dlc
 ```
 
@@ -160,8 +93,11 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.eval \
 --pipeline_config_path /mnt/data/multi_tower_din_odps_dlc/pipeline.config \
---eval_input_path odps://rec_template/tables/taobao_data_test
+--eval_input_path odps://{project_name}/tables/taobao_data_test
 ```
+- --pipeline_config_path: 评估用的配置文件
+- --checkpoint_path: 指定要评估的checkpoint, 默认评估model_dir下面最新的checkpoint
+- --eval_input_path: 指定评估用的MaxCompute表
 
 ### 导出模型
 
@@ -175,6 +111,9 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --pipeline_config_path /mnt/data/multi_tower_din_odps_dlc/pipeline.config \
 --export_dir /mnt/data/multi_tower_din_odps_dlc/exported_model
 ```
+- --pipeline_config_path: 导出用的配置文件
+- --checkpoint_path: 指定要导出的checkpoint, 默认导出model_dir下面最新的checkpoint
+- --export_dir: 导出到的模型目录
 
 ### 预测
 
@@ -186,10 +125,16 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.predict \
 --scripted_model_path /mnt/data/multi_tower_din_odps_dlc/exported_model \
---predict_input_path odps://rec_template/tables/taobao_data_test \
---predict_output_path odps://rec_template/tables/taobao_data_test_output \
+--predict_input_path odps://{project_name}/tables/taobao_data_test \
+--predict_output_path odps://{project_name}/tables/taobao_data_test_output \
 --reserved_columns user_id,adgroup_id,clk
 ```
+
+- --scripted_model_path: 要预测的导出模型
+- --predict_input_path: 指定预测用的MaxCompute表
+- --predict_output_path: 预测结果的输出MaxCompute表
+- --reserved_columns: 预测结果中要保留的输入列
+- --output_columns: 预测结果中的模型输出列
 
 ## 注意事项
 
