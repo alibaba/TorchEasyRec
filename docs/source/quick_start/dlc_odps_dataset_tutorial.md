@@ -8,7 +8,6 @@
 
 进入[PAI控制台](https://pai.console.aliyun.com/)，点击 **AI资源管理-数据集** -> **创建数据集**。选择数据存储为**阿里云文件存储(NAS)**，挂载到`/mnt/data`下。任务运行时，会从挂载路径下读取训练数据和配置文件以及写入模型检查点等。
 
-
 ### 加载训练数据到MaxCompute
 
 1. 下载脚本
@@ -16,7 +15,6 @@
 - 加载数据脚本: [upload_data.sh](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/upload_data.sh)
 
 2. 执行脚本创建数据表并上传至MaxCompute
-
 
 ### 前置条件
 
@@ -95,6 +93,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --pipeline_config_path /mnt/data/multi_tower_din_odps_dlc/pipeline.config \
 --eval_input_path odps://{project_name}/tables/taobao_data_test
 ```
+
 - --pipeline_config_path: 评估用的配置文件
 - --checkpoint_path: 指定要评估的checkpoint, 默认评估model_dir下面最新的checkpoint
 - --eval_input_path: 指定评估用的MaxCompute表
@@ -111,6 +110,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --pipeline_config_path /mnt/data/multi_tower_din_odps_dlc/pipeline.config \
 --export_dir /mnt/data/multi_tower_din_odps_dlc/exported_model
 ```
+
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认导出model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录
