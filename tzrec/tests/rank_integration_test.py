@@ -394,62 +394,9 @@ class RankIntegrationTest(unittest.TestCase):
                     result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
                 )
 
-    def test_multi_tower_din_with_fg_train_eval_export(self):
-        self._test_rank_with_fg(
-            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
-            comp_cpu_gpu_pred_result=True,
-        )
-
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
-    def test_multi_tower_din_zch_with_fg_train_eval_export(self):
-        self._test_rank_with_fg(
-            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
-            comp_cpu_gpu_pred_result=True,
-        )
-
-    def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
-        self._test_rank_with_fg_input_tile(
-            "tzrec/tests/configs/multi_tower_din_fg_mock.config"
-        )
-
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
-    def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
-        self._test_rank_with_fg_input_tile(
-            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
-        )
-
-    def test_dbmtl_has_sequence_variational_dropout_train_eval_export(self):
+    def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dbmtl_has_sequence_variational_dropout_mock.config",
-            self.test_dir,
-        )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-        if self.success:
-            self.success = utils.test_feature_selection(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
-        )
-
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
-    def test_multi_tower_with_fg_train_eval_export_trt(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
+            pipeline_config_path,
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
@@ -473,7 +420,6 @@ class RankIntegrationTest(unittest.TestCase):
             self.test_dir, "predict_result_tile_emb_trt"
         )
 
-        predict_columns = ["user_id", "item_id", "clk", "probs"]
         # quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
@@ -692,6 +638,72 @@ class RankIntegrationTest(unittest.TestCase):
             torch.testing.assert_close(
                 result_gpu_input_tile_emb[k].to(device), v, rtol=1e-6, atol=1e-6
             )
+
+    def test_multi_tower_din_with_fg_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
+            comp_cpu_gpu_pred_result=True,
+        )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    def test_multi_tower_din_zch_with_fg_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+            comp_cpu_gpu_pred_result=True,
+        )
+
+    def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
+        self._test_rank_with_fg_input_tile(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+        )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
+        self._test_rank_with_fg_input_tile(
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
+        )
+
+    def test_dbmtl_has_sequence_variational_dropout_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dbmtl_has_sequence_variational_dropout_mock.config",
+            self.test_dir,
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_feature_selection(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
+        )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    def test_multi_tower_with_fg_train_eval_export_trt(self):
+        self._test_rank_with_fg_trt(
+            "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
+            predict_columns=["user_id", "item_id", "clk", "probs"],
+        )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
+        self._test_rank_with_fg_trt(
+            "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",
+            predict_columns=["user_id", "item_id", "clk", "probs"],
+        )
 
 
 if __name__ == "__main__":
