@@ -14,6 +14,7 @@ Welcome to TorchEasyRec's documentation!
 
    feature/data
    feature/feature
+   feature/zch
 
 .. toctree::
    :maxdepth: 2

@@ -22,6 +22,7 @@ from tzrec.datasets.utils import (
     SequenceDenseData,
     SequenceSparseData,
 )
+from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
 from tzrec.features.id_feature import FgMode, IdFeature
 from tzrec.features.raw_feature import RawFeature
 from tzrec.protos import feature_pb2
@@ -303,7 +304,9 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["sequence_length"] = self.config.sequence_length
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets

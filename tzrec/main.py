@@ -31,7 +31,6 @@ from torchrec.distributed.model_parallel import (
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
-from torchrec.fx import symbolic_trace
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.inference.state_dict_transform import (
     state_dict_gather,
@@ -81,6 +80,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
@@ -747,7 +747,7 @@ def _script_model(
         model.eval()
 
         if is_trt_convert:
-            data_cuda = batch.to_dict(sparse_dtype=torch.int32)
+            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data_cuda, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
@@ -1004,7 +1004,6 @@ def predict(
 
     device_and_backend = init_process_group()
     device: torch.device = device_and_backend[0]
-    sparse_dtype: torch.dtype = torch.int32 if device.type == "cuda" else torch.int64
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
@@ -1070,7 +1069,7 @@ def predict(
 
     def _forward(batch: Batch) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            parsed_inputs = batch.to_dict(sparse_dtype=sparse_dtype)
+            parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)

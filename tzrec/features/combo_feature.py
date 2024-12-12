@@ -20,7 +20,11 @@ from tzrec.datasets.utils import (
     ParsedData,
     SparseData,
 )
-from tzrec.features.feature import FgMode, _parse_fg_encoded_sparse_feature_impl
+from tzrec.features.feature import (
+    MAX_HASH_BUCKET_SIZE,
+    FgMode,
+    _parse_fg_encoded_sparse_feature_impl,
+)
 from tzrec.features.id_feature import IdFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.utils.logging_util import logger
@@ -53,7 +57,9 @@ class ComboFeature(IdFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif len(self.config.vocab_list) > 0:
             num_embeddings = len(self.config.vocab_list) + 2
@@ -69,7 +75,7 @@ class ComboFeature(IdFeature):
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
-                " or vocab_list or vocab_dict"
+                " or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
 
@@ -116,7 +122,9 @@ class ComboFeature(IdFeature):
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif len(self.config.vocab_list) > 0:
             fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
