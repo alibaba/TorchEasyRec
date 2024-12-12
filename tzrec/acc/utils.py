@@ -115,25 +115,26 @@ def write_mapping_file_for_input_tile(
         state_dict (Dict[str, torch.Tensor]): model state_dict
         remap_file_path (str) : store new_params_name\told_params_name\n
     """
-    input_tile_keys = [
-        ".ebc_user.embedding_bags.",
-        ".ebc_item.embedding_bags.",
-    ]
-    input_tile_keys_ec = [
-        ".ec_list_user.",
-        ".ec_list_item.",
-    ]
+    input_tile_mapping = {
+        ".ebc_user.embedding_bags.": ".ebc.embedding_bags.",
+        ".ebc_item.embedding_bags.": ".ebc.embedding_bags.",
+        ".mc_ebc_user._embedding_module.": ".mc_ebc._embedding_module.",
+        ".mc_ebc_item._embedding_module.": ".mc_ebc._embedding_module.",
+        ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
+        ".mc_ebc_item._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
+        ".ec_list_user.": ".ec_list.",
+        ".ec_list_item.": ".ec_list.",
+        ".mc_ec_list_user.": ".mc_ec_list.",
+        ".mc_ec_list_item.": ".mc_ec_list.",
+    }
 
     remap_str = ""
     for key, _ in state_dict.items():
-        for input_tile_key in input_tile_keys:
+        for input_tile_key in input_tile_mapping:
             if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ebc.embedding_bags.")
-                remap_str += key + "\t" + src_key + "\n"
-
-        for input_tile_key in input_tile_keys_ec:
-            if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ec_list.")
+                src_key = key.replace(
+                    input_tile_key, input_tile_mapping[input_tile_key]
+                )
                 remap_str += key + "\t" + src_key + "\n"
 
     with open(remap_file_path, "w") as f:
