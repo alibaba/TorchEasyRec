@@ -10,14 +10,13 @@
 
 ### 加载训练数据到MaxCompute
 
-1. 下载脚本
+1. [安装并配置MaxCompute客户端](https://help.aliyun.com/zh/maxcompute/user-guide/maxcompute-client?spm=a2c4g.11186623.0.0.7e4e4be52z9TXQ#section-vd2-4me-7uu)
 
-- 加载数据脚本: [upload_data.sh](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/upload_data.sh)
-
-2. 执行脚本创建数据表并上传至MaxCompute
+1. 获取并执行脚本来创建数据表并上传数据至MaxCompute
 
 ```bash
-sh upload_data.sh ${PROJECT_NAME}
+wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/upload_data.sh
+bash upload_data.sh ${ODPS_PROJECT_NAME}
 ```
 
 ### 前置条件
