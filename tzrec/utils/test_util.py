@@ -17,9 +17,9 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.fx import GraphModule
-from torchrec.fx import symbolic_trace
 
 from tzrec.models.model import ScriptWrapper
+from tzrec.utils.fx_util import symbolic_trace
 
 
 class TestGraphType(Enum):

@@ -940,8 +940,9 @@ def test_predict(
         f"--predict_input_path {predict_input_path} "
         f"--predict_output_path {predict_output_path} "
         f"--reserved_columns {reserved_columns} "
-        f"--output_columns {output_columns}"
     )
+    if output_columns:
+        cmd_str += f"--output_columns {output_columns}"
 
     p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_predict.txt"))
     p.wait(600)
