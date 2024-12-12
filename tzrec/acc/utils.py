@@ -142,7 +142,8 @@ def write_mapping_file_for_input_tile(
 
 def export_acc_config() -> Dict[str, str]:
     """Export acc config for model online inference."""
-    acc_config = dict()
+    # use int64 sparse id as input
+    acc_config = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
         acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
     if "QUANT_EMB" in os.environ:

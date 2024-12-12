@@ -165,7 +165,7 @@ class RankIntegrationTest(unittest.TestCase):
         pipeline_config_path,
     ):
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
+            pipeline_config_path,
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
@@ -400,6 +400,7 @@ class RankIntegrationTest(unittest.TestCase):
             comp_cpu_gpu_pred_result=True,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
     def test_multi_tower_din_zch_with_fg_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
@@ -411,6 +412,7 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
     def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
