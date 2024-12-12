@@ -5,16 +5,22 @@
 ## 环境准备
 
 ### 创建oss数据集
+
 1. 登录[PAI控制台](https://pai.console.aliyun.com/)。
-2. 点击 **AI资源管理 - 数据集 -> 创建数据集**。
-3. 选择数据存储为 **阿里云文件存储(NAS)**，并挂载到 `/mnt/data` 下。
+1. 点击 **AI资源管理 - 数据集 -> 创建数据集**。
+1. 选择数据存储为 **阿里云文件存储(NAS)**，并挂载到 `/mnt/data` 下。
 
 ### 加载训练数据到maxcompute
+
 1. 下载数据到本地
+
 - 训练数据: [taobao_data_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz)
 - 评估数据: [taobao_data_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz)
+
 2. 在maxcompute创建数据表
+
 - 创建训练表：
+
 ```bash
 CREATE TABLE taobao_data_train (
     user_id BIGINT,
@@ -42,7 +48,9 @@ CREATE TABLE taobao_data_train (
 )
 ;
 ```
+
 - 创建评估表：
+
 ```bash
 CREATE TABLE taobao_data_test (
     user_id BIGINT,
@@ -71,13 +79,14 @@ CREATE TABLE taobao_data_test (
 )
 ;
 ```
-   
+
 4. 将数据导入maxcompute数据表
+
 - 将数据上传oss
 - 在dataworks中使用数据集成将数据导入MC。参考:[dataworks数据集成](https://help.aliyun.com/zh/dataworks/user-guide/overview-6?spm=a2c4g.11186623.0.i1)
 
-
 ### 前置条件
+
 - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**。
 - 根据需要赋予用户权限，具体参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/perform-access-control-based-on-tenant-level-roles#section-mt7-tmu-f49)。
 
@@ -115,6 +124,7 @@ CREATE TABLE taobao_data_test (
 **执行命令** 如下
 
 ### 训练命令
+
 设置`ODPS_ENDPOINT`为对应的MaxCompute服务地址，执行训练命令：
 
 ```bash
@@ -140,8 +150,8 @@ MaxCompute表按如下格式设置：
 odps://{project}/tables/{table_name}/{partition}，多表按逗号分隔
 如果单表需要设置多个分区，可以用&简写，来分隔多个分区，odps://{project}/tables/{table_name}/{partition1}&{partition2}
 
-
 ### 评估命令
+
 完成模型训练后，进行模型评估：
 
 ```bash
@@ -154,6 +164,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ```
 
 ### 导出模型
+
 导出训练好的模型：
 
 ```bash
@@ -166,6 +177,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ```
 
 ### 预测
+
 使用导出的模型进行预测：
 
 ```bash
@@ -180,5 +192,6 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ```
 
 ## 注意事项
+
 1. 确保在MaxCompute控制台中已为相关用户授予必要的权限以访问数据表。
-2. 在训练命令中，`ODPS_ENDPOINT`环境变量需设置为对应的MaxCompute服务地址。
+1. 在训练命令中，`ODPS_ENDPOINT`环境变量需设置为对应的MaxCompute服务地址。
