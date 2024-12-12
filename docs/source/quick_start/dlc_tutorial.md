@@ -25,7 +25,7 @@ pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nig
 
 #### 配置文件
 
-配置文件以DIN为例 [multi_tower_din_taobao_local.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_local.config)
+配置文件以DIN为例 [multi_tower_din_taobao_dlc.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc.config)
 
 ### 配置任务
 
