@@ -16,6 +16,10 @@
 
 2. 执行脚本创建数据表并上传至MaxCompute
 
+```bash
+sh upload_data.sh ${PROJECT_NAME}
+```
+
 ### 前置条件
 
 - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**。
@@ -51,6 +55,8 @@
 **数据集配置** 选择刚新建的NAS数据集
 
 **资源配置** 选择框架为PyTorch，任务资源我们以选择单机8卡V100为例（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型）
+
+**角色信息** 选择**PAI默认角色**
 
 **执行命令** 如下
 
