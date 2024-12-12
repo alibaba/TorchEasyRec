@@ -78,5 +78,6 @@ setup(
     extras_require={
         "all": parse_requirements("requirements.txt"),
         "tests": parse_requirements("requirements/test.txt"),
+        "gpu": parse_requirements("requirements/gpu.txt"),
     },
 )
