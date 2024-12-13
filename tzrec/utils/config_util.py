@@ -17,7 +17,7 @@ import numpy as np
 from google.protobuf import json_format, text_format
 from google.protobuf.message import Message
 
-from tzrec.protos import pipeline_pb2
+from tzrec.protos import data_pb2, pipeline_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.utils.logging_util import logger
 
@@ -75,7 +75,7 @@ def which_msg(config: Message, oneof_group: str) -> str:
     return getattr(config, config.WhichOneof(oneof_group)).__class__.__name__
 
 
-def _get_compatible_fg_mode(data_config: Message) -> FgMode:
+def _get_compatible_fg_mode(data_config: data_pb2.DataConfig) -> FgMode:
     """Compat for fg_encoded."""
     if data_config.HasField("fg_encoded"):
         logger.warning(

@@ -160,7 +160,7 @@ class OdpsDatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=8196,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_mode=data_pb2.FgMode.FG_DAG,
+                fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
                 is_orderby_partition=is_orderby_partition,
                 odps_data_quota_name="",
@@ -226,7 +226,7 @@ class OdpsDatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=8196,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_mode=data_pb2.FgMode.FG_DAG,
+                fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(

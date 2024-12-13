@@ -33,7 +33,7 @@ class DataParserTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
 
-    def test_fg_none(self):
+    def test_nofg(self):
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(

@@ -11,6 +11,7 @@
 
 
 import argparse
+import copy
 import json
 import os
 
@@ -61,6 +62,12 @@ if __name__ == "__main__":
         help="if true will update fg.json.",
     )
     parser.add_argument(
+        "--remove_bucketizer",
+        type=bool,
+        default=False,
+        help="remove bucktizer params in fg json.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=False,
@@ -85,6 +92,14 @@ if __name__ == "__main__":
         os.makedirs(args.fg_output_dir)
 
     fg_json = create_fg_json(features, asset_dir=args.fg_output_dir)
+    if args.remove_bucketizer:
+        fg_json = copy.copy(fg_json)
+        for feature in fg_json["features"]:
+            feature.pop("hash_bucket_size")
+            feature.pop("vocab_dict")
+            feature.pop("vocab_list")
+            feature.pop("boundaries")
+
     if args.reserves is not None:
         reserves = []
         for column in args.reserves.strip().split(","):

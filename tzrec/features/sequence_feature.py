@@ -431,7 +431,7 @@ class SequenceRawFeature(RawFeature):
                     value_dim=self.config.value_dim,
                     **self._fg_encoded_kwargs,
                 )
-        elif self.fg_mode == FgMode.FG_NONE:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])

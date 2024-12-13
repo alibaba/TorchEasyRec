@@ -1035,9 +1035,14 @@ def create_predict_data(
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(pipeline_config_path)
     )
+    data_config = pipeline_config.data_config
+    assert data_config.fg_mode in [
+        FgMode.FG_NORMAL,
+        FgMode.FG_DAG,
+    ], "You should not use fg encoded data for input_path."
     features = create_features(
         pipeline_config.feature_configs,
-        fg_mode=pipeline_config.data_config.fg_mode,
+        fg_mode=data_config.fg_mode,
     )
     user_inputs = []
     for feature in features:
@@ -1048,7 +1053,7 @@ def create_predict_data(
     reader = create_reader(
         input_path=pipeline_config.train_input_path,
         batch_size=batch_size,
-        quota_name=pipeline_config.data_config.odps_data_quota_name,
+        quota_name=data_config.odps_data_quota_name,
     )
 
     infer_arrow = OrderedDict()
