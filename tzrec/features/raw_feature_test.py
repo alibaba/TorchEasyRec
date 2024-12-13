@@ -172,7 +172,7 @@ class RawFeatureTest(unittest.TestCase):
                 value_dim=value_dim,
             )
         )
-        raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg, fg_mode=FgMode.NORMAL)
+        raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         np.testing.assert_allclose(
             raw_feat.fg_encoded_default_value(), expected_fg_default
         )
@@ -241,7 +241,7 @@ class RawFeatureTest(unittest.TestCase):
                 value_dim=value_dim,
             )
         )
-        raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg, fg_mode=FgMode.NORMAL)
+        raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         fg_default = raw_feat.fg_encoded_default_value()
         if expected_fg_default:
             np.testing.assert_allclose(fg_default, expected_fg_default)

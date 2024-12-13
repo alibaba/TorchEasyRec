@@ -41,9 +41,7 @@ class RankIntegrationTest(unittest.TestCase):
         os.environ.pop("INPUT_TILE", None)
         os.environ.pop("ENABLE_TRT", None)
 
-    def _test_rank_fg_encoded(
-        self, pipeline_config_path, reserved_columns, output_columns
-    ):
+    def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
         if self.success:
             self.success = utils.test_eval(
@@ -71,14 +69,14 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
-        self._test_rank_fg_encoded(
+        self._test_rank_nofg(
             "tzrec/tests/configs/multi_tower_din_mock.config",
             reserved_columns="clk",
             output_columns="probs",
         )
 
     def test_dbmtl_has_sequence_fg_encoded_train_eval_export(self):
-        self._test_rank_fg_encoded(
+        self._test_rank_nofg(
             "tzrec/tests/configs/dbmtl_has_sequence_mock.config",
             reserved_columns="clk,buy",
             output_columns="probs_ctr,probs_cvr",

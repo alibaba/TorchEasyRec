@@ -110,7 +110,9 @@ class ExprFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        expr_feat = expr_feature_lib.ExprFeature(expr_feat_cfg, fg_mode=FgMode.NORMAL)
+        expr_feat = expr_feature_lib.ExprFeature(
+            expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(expr_feat.output_dim, 1)
         self.assertEqual(expr_feat.is_sparse, False)
         self.assertEqual(expr_feat.inputs, ["a", "b"])
@@ -154,7 +156,9 @@ class ExprFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        expr_feat = expr_feature_lib.ExprFeature(expr_feat_cfg, fg_mode=FgMode.NORMAL)
+        expr_feat = expr_feature_lib.ExprFeature(
+            expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(expr_feat.output_dim, 16)
         self.assertEqual(expr_feat.is_sparse, True)
         self.assertEqual(expr_feat.inputs, ["a", "b"])
@@ -216,7 +220,9 @@ class ExprFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        expr_feat = expr_feature_lib.ExprFeature(expr_feat_cfg, fg_mode=FgMode.NORMAL)
+        expr_feat = expr_feature_lib.ExprFeature(
+            expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(expr_feat.output_dim, 16)
         self.assertEqual(expr_feat.is_sparse, True)
         self.assertEqual(expr_feat.inputs, ["a", "b"])

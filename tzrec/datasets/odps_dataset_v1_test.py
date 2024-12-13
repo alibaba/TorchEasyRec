@@ -80,7 +80,7 @@ class OdpsDatasetV1Test(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
             ),
             features=features,

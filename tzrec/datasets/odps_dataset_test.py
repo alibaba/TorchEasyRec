@@ -154,13 +154,13 @@ class OdpsDatasetTest(unittest.TestCase):
     @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
     def test_odps_dataset(self, is_orderby_partition):
         feature_cfgs = self._create_test_table_and_feature_cfgs()
-        features = create_features(feature_cfgs, fg_mode=FgMode.DAG)
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
         dataset = OdpsDataset(
             data_config=data_pb2.DataConfig(
                 batch_size=8196,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=False,
+                fg_mode=data_pb2.FgMode.FG_DAG,
                 label_fields=["label"],
                 is_orderby_partition=is_orderby_partition,
                 odps_data_quota_name="",
@@ -220,13 +220,13 @@ class OdpsDatasetTest(unittest.TestCase):
             writer.write([[i, 1.0, f"{i}:4:5.0"] for i in range(10000)])
 
         features = create_features(
-            feature_cfgs, fg_mode=FgMode.DAG, neg_fields=["id_a", "raw_c", "raw_d"]
+            feature_cfgs, fg_mode=FgMode.FG_DAG, neg_fields=["id_a", "raw_c", "raw_d"]
         )
         dataset = OdpsDataset(
             data_config=data_pb2.DataConfig(
                 batch_size=8196,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=False,
+                fg_mode=data_pb2.FgMode.FG_DAG,
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(

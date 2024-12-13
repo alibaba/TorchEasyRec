@@ -169,7 +169,7 @@ class SequenceIdFeature(IdFeature):
         sequence_length (int): max sequence length.
         sequence_pk (str): sequence primary key name for serving.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
@@ -179,7 +179,7 @@ class SequenceIdFeature(IdFeature):
         sequence_delim: Optional[str] = None,
         sequence_length: Optional[int] = None,
         sequence_pk: Optional[str] = None,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -238,7 +238,7 @@ class SequenceIdFeature(IdFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             feat = input_data[self.name]
             parsed_feat = _parse_fg_encoded_sequence_sparse_feature_impl(
                 self.name,
@@ -246,7 +246,7 @@ class SequenceIdFeature(IdFeature):
                 sequence_delim=self.sequence_delim,
                 **self._fg_encoded_kwargs,
             )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
@@ -259,6 +259,10 @@ class SequenceIdFeature(IdFeature):
                 values=values,
                 lengths=key_lengths,
                 seq_lengths=seq_lengths,
+            )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
             )
         return parsed_feat
 
@@ -341,7 +345,7 @@ class SequenceRawFeature(RawFeature):
         sequence_length (int): max sequence length.
         sequence_pk (str): sequence primary key name for serving.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
@@ -351,7 +355,7 @@ class SequenceRawFeature(RawFeature):
         sequence_delim: Optional[str] = None,
         sequence_length: Optional[int] = None,
         sequence_pk: Optional[str] = None,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -410,7 +414,7 @@ class SequenceRawFeature(RawFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             feat = input_data[self.name]
             if self.is_sparse:
                 parsed_feat = _parse_fg_encoded_sequence_sparse_feature_impl(
@@ -427,7 +431,7 @@ class SequenceRawFeature(RawFeature):
                     value_dim=self.config.value_dim,
                     **self._fg_encoded_kwargs,
                 )
-        else:
+        elif self.fg_mode == FgMode.FG_NONE:
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
@@ -447,6 +451,10 @@ class SequenceRawFeature(RawFeature):
                     values=values,
                     seq_lengths=lengths,
                 )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
         return parsed_feat
 
     def init_fg(self) -> None:

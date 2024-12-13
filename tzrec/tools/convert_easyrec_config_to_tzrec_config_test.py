@@ -455,7 +455,6 @@ TRAIN_CONFIG = """train_config {
 DATA_CONFIG = """data_config {
   batch_size: 4096
   dataset_type: OdpsDataset
-  fg_encoded: true
   label_fields: "is_click_cover"
   label_fields: "is_click_video"
   num_workers: 8

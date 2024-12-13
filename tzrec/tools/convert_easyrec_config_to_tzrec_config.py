@@ -178,7 +178,6 @@ class ConvertConfig(object):
             self.easyrec_config.data_config.batch_size
         )
         pipeline_config.data_config.dataset_type = DatasetType.OdpsDataset
-        pipeline_config.data_config.fg_encoded = True
         pipeline_config.data_config.label_fields.extend(label_fields)
         pipeline_config.data_config.num_workers = 8
         pipeline_config.data_config.odps_data_quota_name = ""

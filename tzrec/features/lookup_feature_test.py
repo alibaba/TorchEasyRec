@@ -211,7 +211,7 @@ class LookupFeatureTest(unittest.TestCase):
             )
         )
         lookup_feat = lookup_feature_lib.LookupFeature(
-            lookup_feat_cfg, fg_mode=FgMode.NORMAL
+            lookup_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(
             lookup_feat.fg_encoded_default_value(), expected_fg_encoded_default
@@ -253,7 +253,7 @@ class LookupFeatureTest(unittest.TestCase):
             )
         )
         lookup_feat = lookup_feature_lib.LookupFeature(
-            lookup_feat_cfg, fg_mode=FgMode.NORMAL
+            lookup_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(lookup_feat.output_dim, 16)
         self.assertEqual(lookup_feat.is_sparse, True)
@@ -310,7 +310,7 @@ class LookupFeatureTest(unittest.TestCase):
             )
         )
         lookup_feat = lookup_feature_lib.LookupFeature(
-            lookup_feat_cfg, fg_mode=FgMode.NORMAL
+            lookup_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(lookup_feat.output_dim, 16)
         self.assertEqual(lookup_feat.is_sparse, True)
@@ -366,7 +366,7 @@ class LookupFeatureTest(unittest.TestCase):
             )
         )
         lookup_feat = lookup_feature_lib.LookupFeature(
-            lookup_feat_cfg, fg_mode=FgMode.NORMAL
+            lookup_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(lookup_feat.output_dim, 16)
         self.assertEqual(lookup_feat.is_sparse, True)

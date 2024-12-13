@@ -696,12 +696,12 @@ def load_config_for_test(
 
     features = create_features(
         list(pipeline_config.feature_configs),
-        fg_mode=FgMode.ENCODED if data_config.fg_encoded else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
 
     data_config.num_workers = 2
     num_parts = data_config.num_workers * 2
-    if data_config.fg_encoded:
+    if data_config.fg_mode == FgMode.FG_NONE:
         inputs = build_mock_input_fg_encoded(features, user_id, item_id)
         item_inputs = inputs
         pipeline_config.train_input_path, _ = create_mock_data(
@@ -1037,9 +1037,7 @@ def create_predict_data(
     )
     features = create_features(
         pipeline_config.feature_configs,
-        fg_mode=FgMode.ENCODED
-        if pipeline_config.data_config.fg_encoded
-        else FgMode.DAG,
+        fg_mode=pipeline_config.data_config.fg_mode,
     )
     user_inputs = []
     for feature in features:

@@ -89,9 +89,11 @@ class DataParser:
             if feature.is_weighted:
                 self.has_weight_keys[feature.data_group].append(feature.name)
 
-        self.feature_input_names = set()
-        if self._fg_mode == FgMode.DAG:
+        if self._fg_mode in [FgMode.FG_DAG, FgMode.FG_BUCKETIZE]:
             self._init_fg_hander()
+
+        self.feature_input_names = set()
+        if self._fg_mode == FgMode.FG_DAG:
             self.feature_input_names = (
                 self._fg_handler.user_inputs()
                 | self._fg_handler.item_inputs()
@@ -118,8 +120,11 @@ class DataParser:
         """Init pyfg dag handler."""
         if not self._fg_handler:
             fg_json = create_fg_json(self._features)
+            bucketize_only = self._fg_mode == FgMode.FG_BUCKETIZE
             # pyre-ignore [16]
-            self._fg_handler = pyfg.FgArrowHandler(fg_json, self._fg_threads)
+            self._fg_handler = pyfg.FgArrowHandler(
+                fg_json, self._fg_threads, bucketize_only=bucketize_only
+            )
 
     def parse(self, input_data: Dict[str, pa.Array]) -> Dict[str, torch.Tensor]:
         """Parse input data dict and build batch.
@@ -134,7 +139,7 @@ class DataParser:
         if is_input_tile():
             flag = False
             for k, v in input_data.items():
-                if self._fg_mode == FgMode.ENCODED:
+                if self._fg_mode == FgMode.FG_NONE:
                     if k in self.user_feats:
                         input_data[k] = v.take([0])
                 else:
@@ -144,8 +149,8 @@ class DataParser:
                     output_data["batch_size"] = torch.tensor(v.__len__())
                     flag = True
 
-        if self._fg_mode == FgMode.DAG:
-            self._parse_feature_fg_dag(input_data, output_data)
+        if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_BUCKETIZE):
+            self._parse_feature_fg_handler(input_data, output_data)
         else:
             self._parse_feature_normal(input_data, output_data)
 
@@ -228,7 +233,7 @@ class DataParser:
                     )
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
 
-    def _parse_feature_fg_dag(
+    def _parse_feature_fg_handler(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
     ) -> None:
         max_batch_size = (

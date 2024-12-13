@@ -72,7 +72,7 @@ message IdFeature {
     // zero collision hash
     optional ZeroCollisionHash zch = 16;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -110,7 +110,7 @@ message RawFeature {
     // mask value in training progress
     optional bool use_mask =  14;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -148,7 +148,7 @@ message ComboFeature {
     // zero collision hash
     optional ZeroCollisionHash zch = 15;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -208,7 +208,7 @@ message LookupFeature {
     // zero collision hash
     optional ZeroCollisionHash zch = 26;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -270,7 +270,7 @@ message MatchFeature {
     // zero collision hash
     optional ZeroCollisionHash zch = 26;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -298,7 +298,7 @@ message ExprFeature {
     // mask value in training progress
     optional bool use_mask =  13;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -336,7 +336,7 @@ message OverlapFeature {
     // mask value in training progress
     optional bool use_mask =  14;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -395,7 +395,7 @@ message TokenizeFeature {
     // mask value in training progress
     optional bool use_mask =  15;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -439,7 +439,7 @@ message SequenceIdFeature {
     // zero collision hash
     optional ZeroCollisionHash zch = 21;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
@@ -480,7 +480,7 @@ message SequenceRawFeature {
     // mask value in training progress
     optional bool use_mask =  14;
 
-    // default value when fg_encoded = true,
+    // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
