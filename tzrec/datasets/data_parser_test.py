@@ -536,7 +536,9 @@ class DataParserTest(unittest.TestCase):
                 "cat_a": pa.array([["1"], ["2"], ["3"]]),
                 "tag_b": pa.array([["4", "5"], [], ["6"]]),
                 "int_a": pa.array([7, 8, 9], pa.float32()),
-                "int_b": pa.array([[27, 37], [28, 38], [29, 39]]),
+                "int_b": pa.array(
+                    [[27, 37], [28, 38], [29, 39]], type=pa.list_(pa.float32())
+                ),
                 "lookup_a": pa.array([0.1, 0.0, 0.2], type=pa.float32()),
                 "click_seq__cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
                 "click_seq__int_a": pa.array([["14", "15", "16"], ["17"], ["0"]]),

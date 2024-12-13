@@ -91,8 +91,6 @@ sample_weight_fields: 'col_name'
     - 暂不支持没有header的csv文件
     - csv格式数据读性能有瓶颈
 
-<!-- 输入数据是否为FG(Feature Generator)进行特征编码后的数据 -->
-
 ### fg_mode
 
 - FG(Feature Generator) 的运行模式，支持FG_DAG, FG_NONE, FG_BUCKETIZE, FG_NORMAL
