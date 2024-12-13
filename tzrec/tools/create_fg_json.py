@@ -91,12 +91,12 @@ if __name__ == "__main__":
             reserves.append(column.strip())
         fg_json["reserves"] = reserves
 
-    fg_path = os.path.join(args.fg_output_dir, "fg.json")
+    fg_resource_name = args.fg_resource_name
+    fg_path = os.path.join(args.fg_output_dir, fg_resource_name)
     with open(fg_path, "w") as f:
         json.dump(fg_json, f, indent=4)
 
     project = args.odps_project_name
-    fg_resource_name = args.fg_resource_name
     if project is not None and fg_resource_name is not None:
         account, odps_endpoint = _create_odps_account()
         o = ODPS(
