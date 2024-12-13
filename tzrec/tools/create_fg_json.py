@@ -91,7 +91,8 @@ if __name__ == "__main__":
             reserves.append(column.strip())
         fg_json["reserves"] = reserves
 
-    fg_path = os.path.join(args.fg_output_dir, "fg.json")
+    fg_name = args.fg_resource_name if args.fg_resource_name else "fg.json"
+    fg_path = os.path.join(args.fg_output_dir, fg_name)
     with open(fg_path, "w") as f:
         json.dump(fg_json, f, indent=4)
 
