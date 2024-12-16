@@ -233,7 +233,9 @@ class MatchModel(BaseModel):
             label = _zero_int_label(pred)
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
         if self._sample_weight:
-            losses[loss_name] = torch.mean(losses[loss_name] * sample_weight)
+            losses[loss_name] = torch.sum(
+                losses[loss_name] * sample_weight
+            ) / torch.sum(sample_weight)
 
         return losses
 

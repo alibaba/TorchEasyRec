@@ -215,7 +215,9 @@ class RankModel(BaseModel):
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
         if sample_weight_name:
-            losses[loss_name] = torch.mean(losses[loss_name] * sample_weights)
+            losses[loss_name] = torch.sum(
+                losses[loss_name] * sample_weights
+            ) / torch.sum(sample_weights)
         return losses
 
     def loss(
