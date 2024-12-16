@@ -217,7 +217,9 @@ class MatchModel(BaseModel):
         losses = {}
         label = batch.labels[label_name]
         sample_weight = (
-            batch.sample_weights[self._sample_weight] if self._sample_weight else 1.0
+            batch.sample_weights[self._sample_weight]
+            if self._sample_weight
+            else torch.Tensor([1.0])
         )
 
         loss_type = loss_cfg.WhichOneof("loss")
