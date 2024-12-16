@@ -78,6 +78,7 @@ class LookupFeature(BaseFeature):
                 self.config.HasField("hash_bucket_size")
                 or self.config.HasField("num_buckets")
                 or len(self.config.vocab_list) > 0
+                or len(self.config.vocab_dict) > 0
                 or len(self.config.boundaries) > 0
             )
         return self._is_sparse
