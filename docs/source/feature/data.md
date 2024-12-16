@@ -149,7 +149,7 @@ sample_weight_fields: 'col_name'
 - 训练时不会在Dataset中执行FG，输入数据为Fg编码后的数据，数据列名与**特征名**(`feature_name`)同名，Dataset会自动分析所有特征的特征名来读取数据
   - 以上文LookupFeature为例，**特征名**为`lookup_feat`，Dataset会从输入表中直接读取编码后的`lookup_feat`列直接进行模型训练和推理
 - 该模式训练速度最佳，但需提前对数据提前进行FG编码，目前仅提供MaxCompute方式，步骤如下：
-  - 在DLC/DSW/Local环境中生成fg json配置，上传至Dataworks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
+  - 在DLC/DSW/Local环境中生成fg json配置，上传至DataWorks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
     ```shell
     python -m tzrec.tools.create_fg_json \
         --pipeline_config_path ${PIPELINE_CONFIG_PATH} \
@@ -159,11 +159,11 @@ sample_weight_fields: 'col_name'
     - --pipeline_config_path: 模型配置文件。
     - --fg_output_dir: fg json的输出文件夹。
     - --reserves: 需要透传到输出表的列，列名用逗号分隔。一般需要保留Label列，也可以保留request_id，user_id，item_id列，注意：如果模型的feature_config中有user_id，item_id作为特征，feature_name需避免与样本中的user_id，item_id列名冲突。
-  - 在[Dataworks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
+  - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
     /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg039-0.3.9-cp37-cp37m-linux_x86_64.whl
     ```
-  - 在Dataworks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
+  - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
     from pyfg039 import offline_pyfg
     offline_pyfg.run(
@@ -187,7 +187,7 @@ sample_weight_fields: 'col_name'
 
 #### fg_mode=FG_BUCKETIZE
 
-- 训练时在Dataset中执行FG的Bucketize部分，输入数据为Fg编码但未进行Bucketize的数据，Bucketize配置包含`hash_bucket_size`,`boundaries`,`vocab_dict`,`vocab_list`
+- 训练时在Dataset中执行FG的Bucketize部分，输入数据为Fg编码但未进行Bucketize的数据，Bucketize配置包含`hash_bucket_size`,`boundaries`,`vocab_dict`,`vocab_list`,`num_buckets`
 
   - 数据列名与**特征名**(`feature_name`)同名，Dataset会自动分析所有特征的特征名来读取数据
   - 以上文LookupFeature为例，**特征名**为`lookup_feat`，Dataset会从输入表中直接读取编码后的`lookup_feat`列直接进行模型训练和推理

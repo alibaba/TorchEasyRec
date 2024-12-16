@@ -99,6 +99,7 @@ if __name__ == "__main__":
             feature.pop("vocab_dict")
             feature.pop("vocab_list")
             feature.pop("boundaries")
+            feature.pop("num_buckets")
 
     if args.reserves is not None:
         reserves = []
