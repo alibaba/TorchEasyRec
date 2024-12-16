@@ -67,7 +67,7 @@ class CsvDatasetTest(unittest.TestCase):
             data_config = data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.CsvDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 with_header=with_header,
             )
@@ -134,7 +134,7 @@ class CsvDatasetTest(unittest.TestCase):
                 )
             ),
         ]
-        features = create_features(feature_cfgs, fg_mode=FgMode.DAG)
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
         t = pa.Table.from_arrays(
             [
@@ -157,7 +157,7 @@ class CsvDatasetTest(unittest.TestCase):
             data_config = data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.CsvDataset,
-                fg_encoded=False,
+                fg_mode=data_pb2.FgMode.FG_DAG,
                 label_fields=["label"],
             )
             data_config.input_fields.extend(

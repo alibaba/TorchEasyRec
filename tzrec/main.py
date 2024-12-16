@@ -56,7 +56,6 @@ from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
-    FgMode,
     create_feature_configs,
     create_features,
     create_fg_json,
@@ -111,15 +110,9 @@ def _create_features(
                 getattr(data_config, data_config.WhichOneof("sampler")).attr_fields
             )
 
-    if data_config.fg_encoded:
-        fg_mode = FgMode.ENCODED
-    elif data_config.fg_threads > 0:
-        fg_mode = FgMode.DAG
-    else:
-        fg_mode = FgMode.NORMAL
     features = create_features(
         feature_configs,
-        fg_mode=fg_mode,
+        fg_mode=data_config.fg_mode,
         neg_fields=neg_fields,
         fg_encoded_multival_sep=data_config.fg_encoded_multival_sep,
         force_base_data_group=data_config.force_base_data_group,

@@ -696,12 +696,12 @@ def load_config_for_test(
 
     features = create_features(
         list(pipeline_config.feature_configs),
-        fg_mode=FgMode.ENCODED if data_config.fg_encoded else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
 
     data_config.num_workers = 2
     num_parts = data_config.num_workers * 2
-    if data_config.fg_encoded:
+    if data_config.fg_mode == FgMode.FG_NONE:
         inputs = build_mock_input_fg_encoded(features, user_id, item_id)
         item_inputs = inputs
         pipeline_config.train_input_path, _ = create_mock_data(
@@ -1035,11 +1035,14 @@ def create_predict_data(
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(pipeline_config_path)
     )
+    data_config = pipeline_config.data_config
+    assert data_config.fg_mode in [
+        FgMode.FG_NORMAL,
+        FgMode.FG_DAG,
+    ], "You should not use fg encoded data for input_path."
     features = create_features(
         pipeline_config.feature_configs,
-        fg_mode=FgMode.ENCODED
-        if pipeline_config.data_config.fg_encoded
-        else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
     user_inputs = []
     for feature in features:
@@ -1050,7 +1053,7 @@ def create_predict_data(
     reader = create_reader(
         input_path=pipeline_config.train_input_path,
         batch_size=batch_size,
-        quota_name=pipeline_config.data_config.odps_data_quota_name,
+        quota_name=data_config.odps_data_quota_name,
     )
 
     infer_arrow = OrderedDict()

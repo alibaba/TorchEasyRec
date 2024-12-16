@@ -151,7 +151,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
             sequence_name="click_50_seq",
             sequence_delim=";",
             sequence_length=50,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, 16)
         self.assertEqual(seq_feat.is_sparse, True)
@@ -196,7 +196,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         )
         seq_feat = sequence_feature_lib.SequenceIdFeature(
             seq_feat_cfg,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, 16)
         self.assertEqual(seq_feat.is_sparse, True)
@@ -273,7 +273,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
             sequence_name="click_50_seq",
             sequence_delim=";",
             sequence_length=50,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, 16)
         self.assertEqual(seq_feat.is_sparse, True)
@@ -310,7 +310,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
             sequence_name="click_50_seq",
             sequence_delim="|",
             sequence_length=50,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         input_data = {"click_50_seq__id_str": pa.array(["c||a|b|b|", "", "a|b||c"])}
         parsed_feat = seq_feat.parse(input_data)
@@ -561,7 +561,7 @@ class SequenceRawFeatureTest(unittest.TestCase):
             sequence_name="click_50_seq",
             sequence_delim=";",
             sequence_length=50,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, value_dim)
         self.assertEqual(seq_feat.is_sparse, False)
@@ -608,7 +608,7 @@ class SequenceRawFeatureTest(unittest.TestCase):
         )
         seq_feat = sequence_feature_lib.SequenceRawFeature(
             seq_feat_cfg,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, value_dim)
         self.assertEqual(seq_feat.is_sparse, False)
@@ -667,7 +667,7 @@ class SequenceRawFeatureTest(unittest.TestCase):
             sequence_name="click_50_seq",
             sequence_delim=";",
             sequence_length=50,
-            fg_mode=FgMode.NORMAL,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, 16)
         self.assertEqual(seq_feat.is_sparse, True)

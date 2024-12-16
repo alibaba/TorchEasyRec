@@ -30,7 +30,7 @@ class MatchIntegrationTest(unittest.TestCase):
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
 
-    def test_dssm_fg_encoded_train_eval_export(self):
+    def test_dssm_nofg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dssm_mock.config", self.test_dir, item_id="item_id"
         )
@@ -62,7 +62,7 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
-    def test_dssm_fg_encoded_variational_dropout(self):
+    def test_dssm_nofg_variational_dropout(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dssm_variational_dropout_mock.config",
             self.test_dir,

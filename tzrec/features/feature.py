@@ -13,7 +13,6 @@ import os
 import shutil
 from collections import OrderedDict
 from copy import copy
-from enum import Enum
 from functools import partial  # NOQA
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -47,21 +46,13 @@ from tzrec.datasets.utils import (
     ParsedData,
     SparseData,
 )
+from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
 
 _FEATURE_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
-
-
-class FgMode(Enum):
-    """ENCODED/NORMAL/DAG Mode."""
-
-    ENCODED = 1
-    NORMAL = 2
-    DAG = 3
-
 
 MAX_HASH_BUCKET_SIZE = 2**63 - 1
 
@@ -211,13 +202,13 @@ class BaseFeature(object, metaclass=_meta_cls):
     Args:
         feature_config (FeatureConfig): a instance of feature config.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -225,7 +216,6 @@ class BaseFeature(object, metaclass=_meta_cls):
         self.config = getattr(self._feature_config, fc_type)
 
         self.fg_mode = fg_mode
-        self.fg_encoded = fg_mode == FgMode.ENCODED
 
         self._fg_op = None
         self._is_neg = False
@@ -238,7 +228,7 @@ class BaseFeature(object, metaclass=_meta_cls):
 
         self._fg_encoded_kwargs = {}
         self._fg_encoded_multival_sep = fg_encoded_multival_sep or chr(3)
-        if self.fg_mode == FgMode.ENCODED:
+        if self.fg_mode == FgMode.FG_NONE:
             if self.config.HasField("fg_encoded_default_value"):
                 self._fg_encoded_kwargs["default_value"] = (
                     self.fg_encoded_default_value()
@@ -255,7 +245,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                     ) from None
             self._fg_encoded_kwargs["multival_sep"] = self._fg_encoded_multival_sep
 
-        if self.fg_mode == FgMode.NORMAL:
+        if self.fg_mode == FgMode.FG_NORMAL:
             self.init_fg()
 
     @property
@@ -439,7 +429,7 @@ class BaseFeature(object, metaclass=_meta_cls):
     def inputs(self) -> List[str]:
         """Input field names."""
         if not self._inputs:
-            if self.fg_encoded:
+            if self.fg_mode in [FgMode.FG_NONE, FgMode.FG_BUCKETIZE]:
                 self._inputs = [self.name]
             else:
                 self._inputs = [v for _, v in self.side_inputs]
@@ -579,7 +569,7 @@ class BaseFeature(object, metaclass=_meta_cls):
 
 def create_features(
     feature_configs: List[FeatureConfig],
-    fg_mode: FgMode = FgMode.ENCODED,
+    fg_mode: FgMode = FgMode.FG_NONE,
     neg_fields: Optional[List[str]] = None,
     fg_encoded_multival_sep: Optional[str] = None,
     force_base_data_group: bool = False,
@@ -590,7 +580,7 @@ def create_features(
         feature_configs (list): list of feature_config.
         fg_mode (FgMode): input data fg mode.
         neg_fields (list, optional): negative sampled input fields.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
         force_base_data_group (bool): force padding data into same
             data group with same batch_size.
 

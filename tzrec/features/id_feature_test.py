@@ -194,7 +194,7 @@ class IdFeatureTest(unittest.TestCase):
                 weighted=True,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         self.assertEqual(id_feat.inputs, ["cate"])
 
         input_data = {
@@ -235,7 +235,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         self.assertEqual(id_feat.inputs, ["id_input"])
 
         expected_emb_bag_config = EmbeddingBagConfig(
@@ -285,7 +285,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
 
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=4,
@@ -329,7 +329,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
 
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=3,
@@ -369,7 +369,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
 
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=100,

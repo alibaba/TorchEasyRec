@@ -310,7 +310,7 @@ class FeatureTest(unittest.TestCase):
             asset_dir = self.test_dir
             token_file = "token_g_tokenizer.json"
         feature_cfgs = self._create_test_feature_cfgs()
-        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.DAG)
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
         fg_json = feature_lib.create_fg_json(features, asset_dir=asset_dir)
         self.maxDiff = None
         self.assertEqual(
@@ -438,7 +438,7 @@ class FeatureTest(unittest.TestCase):
     @parameterized.expand([[False], [True]])
     def test_create_feauture_configs(self, with_asset_dir=False):
         feature_cfgs = self._create_test_feature_cfgs()
-        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.DAG)
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
         asset_dir = None
         token_file = "data/test/tokenizer.json"

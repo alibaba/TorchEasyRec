@@ -205,7 +205,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        self._fg_encoded = data_config.fg_encoded
+        self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
 
         if mode != Mode.TRAIN and data_config.HasField("eval_batch_size"):
@@ -235,7 +235,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 self._batch_size,
                 is_training=self._mode == Mode.TRAIN,
                 multival_sep=self._fg_encoded_multival_sep
-                if self._fg_encoded
+                if self._fg_mode == data_pb2.FgMode.FG_NONE
                 else chr(29),
             )
             self._sampler.init_cluster(num_client_per_rank, client_id_bias, cluster)

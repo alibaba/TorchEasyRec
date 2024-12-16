@@ -108,7 +108,7 @@ class ComboFeatureTest(unittest.TestCase):
             )
         )
         combo_feat = combo_feature_lib.ComboFeature(
-            combo_feat_cfg, fg_mode=FgMode.NORMAL
+            combo_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(combo_feat.output_dim, 16)
         self.assertEqual(combo_feat.is_sparse, True)
@@ -162,7 +162,7 @@ class ComboFeatureTest(unittest.TestCase):
             )
         )
         combo_feat = combo_feature_lib.ComboFeature(
-            combo_feat_cfg, fg_mode=FgMode.NORMAL
+            combo_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(combo_feat.output_dim, 16)
         self.assertEqual(combo_feat.is_sparse, True)

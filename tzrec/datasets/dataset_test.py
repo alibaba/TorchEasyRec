@@ -122,7 +122,7 @@ class DatasetTest(unittest.TestCase):
                 data_config=data_pb2.DataConfig(
                     batch_size=4,
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
-                    fg_encoded=True,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
                 ),
                 features=features,
@@ -189,7 +189,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f.name,
@@ -284,7 +284,7 @@ class DatasetTest(unittest.TestCase):
                 data_config=data_pb2.DataConfig(
                     batch_size=32,
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
-                    fg_encoded=True,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
                     sample_mask_prob=0.4,
                 ),
@@ -348,7 +348,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=32,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 negative_sample_mask_prob=0.4,
                 negative_sampler=sampler_pb2.NegativeSampler(
@@ -408,7 +408,7 @@ class DatasetTest(unittest.TestCase):
                 data_config=data_pb2.DataConfig(
                     batch_size=4,
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
-                    fg_encoded=True,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=[],
                 ),
                 features=features,
@@ -501,7 +501,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 tdm_sampler=sampler_pb2.TDMSampler(
                     item_input_path=node.name,
