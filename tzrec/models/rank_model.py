@@ -189,7 +189,9 @@ class RankModel(BaseModel):
         losses = {}
         label = batch.labels[label_name]
         sample_weights = (
-            batch.sample_weights[sample_weight_name] if sample_weight_name else None
+            batch.sample_weights[sample_weight_name]
+            if sample_weight_name
+            else torch.Tensor([1.0])
         )
 
         loss_type = loss_cfg.WhichOneof("loss")
@@ -215,7 +217,9 @@ class RankModel(BaseModel):
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
         if sample_weight_name:
-            losses[loss_name] = torch.mean(losses[loss_name] * sample_weights)
+            losses[loss_name] = torch.mean(
+                losses[loss_name] * sample_weights
+            ) / torch.mean(sample_weights)
         return losses
 
     def loss(
