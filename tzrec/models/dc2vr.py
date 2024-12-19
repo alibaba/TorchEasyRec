@@ -17,17 +17,16 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.multi_task_rank import MultiTaskRank
+from tzrec.modules.intervention import Intervention
 from tzrec.modules.mlp import MLP
 from tzrec.modules.mmoe import MMoE as MMoEModule
-from tzrec.modules.intervention import Intervention 
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
-
 class DC2VR(MultiTaskRank):
-    """ DeCoudounding Conversion Rate.
+    """DeCoudounding Conversion Rate.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -83,19 +82,23 @@ class DC2VR(MultiTaskRank):
                     base_intervention_dim = self.task_mlps[tower_name].output_dim()
                 else:
                     base_intervention_dim = feature_in
+                source_intervention_dim = 0
                 for intervention_tower_name in task_tower_cfg.intervention_tower_names:
                     if intervention_tower_name in self.intervention:
-                        source_intervention_dim = self.intervention[
+                        source_intervention_dim += self.intervention[
                             intervention_tower_name
                         ].output_dim()
                     elif intervention_tower_name in self.task_mlps:
-                        source_intervention_dim = self.task_mlps[
+                        source_intervention_dim += self.task_mlps[
                             intervention_tower_name
                         ].output_dim()
                     else:
-                        source_intervention_dim = feature_in
+                        source_intervention_dim += feature_in
                 intervention = Intervention(
-                    base_intervention_dim, source_intervention_dim, task_tower_cfg.low_rank_dim
+                    base_intervention_dim,
+                    source_intervention_dim,
+                    task_tower_cfg.low_rank_dim,
+                    task_tower_cfg.dropout_ratio,
                 )
                 self.intervention[tower_name] = intervention
 
@@ -146,9 +149,9 @@ class DC2VR(MultiTaskRank):
                 intervention_source = []
                 for intervention_tower_name in task_tower_cfg.intervention_tower_names:
                     intervention_source.append(intervention[intervention_tower_name])
-                intervention_source = torch.stack(intervention_source, dim=0).mean(0)
+                intervention_source = torch.cat(intervention_source, dim=-1)  # .mean(0)
                 intervention[tower_name] = self.intervention[tower_name](
-                    intervention_base,intervention_source
+                    intervention_base, intervention_source
                 )
             else:
                 intervention[tower_name] = task_net[tower_name]

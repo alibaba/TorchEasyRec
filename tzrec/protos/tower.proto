@@ -78,6 +78,8 @@ message InterventionTaskTower {
     repeated string intervention_tower_names = 8;
     // low_rank_dim
     required uint32 low_rank_dim = 9;
+    // dropout_ratio
+    optional float dropout_ratio = 10 [default = 0.1];
 };
 
 
