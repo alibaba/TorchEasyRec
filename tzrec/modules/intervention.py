@@ -21,15 +21,16 @@ class RotateLayer(nn.Module):
         low_rank_dim (int): The dimension of the low-rank space.
     """
 
-    def __init__(self, base_dim, low_rank_dim):
+    def __init__(self, base_dim: int, low_rank_dim: int) -> None:
         super().__init__()
         # n > m
+        assert base_dim > low_rank_dim, "Low-rank dimension should lower than the base"
         self.weight = torch.nn.Parameter(
             torch.empty(base_dim, low_rank_dim), requires_grad=True
         )
         torch.nn.init.orthogonal_(self.weight)
 
-    def forward(self, base):
+    def forward(self, base: torch.Tensor) -> torch.Tensor:
         """Forward the module."""
         return torch.matmul(base.to(self.weight.dtype), self.weight)
 
@@ -51,9 +52,8 @@ class Intervention(nn.Module):
         source_dim: int,
         low_rank_dim: int,
         dropout_ratio: float = 0.0,
-    ):
+    ) -> None:
         super().__init__()
-        assert base_dim > low_rank_dim, "Low-rank dimension should lower than the base"
         self.base_dim = base_dim
         base_rotate_layer = RotateLayer(base_dim, low_rank_dim)
         self.base_rotate_layer = torch.nn.utils.parametrizations.orthogonal(
