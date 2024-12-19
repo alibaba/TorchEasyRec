@@ -688,7 +688,8 @@ class EmbeddingGroupImpl(nn.Module):
                     # TODO (hongsheng.jhs) make dense feature support embedding_dim
                     if is_wide:
                         raise ValueError(
-                            "dense feature should not be configured in wide group."
+                            f"dense feature [{name}] should not be configured in "
+                            "wide group."
                         )
                     else:
                         if input_tile and feature.is_user_feat:
