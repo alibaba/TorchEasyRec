@@ -36,6 +36,14 @@ message ZeroCollisionHash {
     optional string threshold_filtering_func = 3;
 }
 
+message AutoDisEmbedding {
+    required uint32 embedding_dim = 1;
+    // number of embedding channels
+    required uint32 num_channels = 2;
+    // temperature coefficient for softmax
+    required float  temperature = 3 [default = 0.1];
+    optional float  keep_prob = 4 [default = 0.8];
+}
 
 message IdFeature {
     // feature name, e.g. item_id
@@ -109,6 +117,9 @@ message RawFeature {
     optional string init_fn = 13;
     // mask value in training progress
     optional bool use_mask =  14;
+    // autodis embedding
+    optional AutoDisEmbedding atd = 15;
+
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.

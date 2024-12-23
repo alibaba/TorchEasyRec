@@ -390,6 +390,26 @@ class BaseFeature(object, metaclass=_meta_cls):
         else:
             return None
 
+    @property
+    def autodis_config(
+        self,
+    ) -> Optional[Dict]:
+        """Get config dict of the autodis feature."""
+        if not self.is_sparse:
+            atd_config = dict()
+            if hasattr(self.config, "atd") and self.config.HasField("atd"):
+                num_channels = self.config.atd.num_channels
+                embedding_dim = self.config.atd.embedding_dim
+                temperature = self.config.atd.temperature
+                keep_prob = self.config.atd.keep_prob
+                atd_config["num_channels"] = num_channels
+                atd_config["embedding_dim"] = embedding_dim
+                atd_config["temperature"] = temperature
+                atd_config["keep_prob"] = keep_prob
+                return atd_config
+        else:
+            return None
+
     def mc_module(self, device: torch.device) -> Optional[ManagedCollisionModule]:
         """Get ManagedCollisionModule."""
         if self.is_sparse:

@@ -53,7 +53,10 @@ class RawFeature(BaseFeature):
     def output_dim(self) -> int:
         """Output dimension of the feature."""
         if self.is_sparse:
-            return self.config.embedding_dim
+            if self.config.HasField("atd"):
+                return self.config.atd.embedding_dim
+            else:
+                return self.config.embedding_dim
         else:
             return self.config.value_dim
 
@@ -67,6 +70,8 @@ class RawFeature(BaseFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
+        if self.config.HasField("atd"):
+            return self.config.atd.num_bins
         return len(self.config.boundaries) + 1
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
