@@ -317,7 +317,6 @@ def _calculate_shard_storages(  # NOQA
     input_data_type_size: float,
     output_data_type_size: float,
     pipeline_type: PipelineType = PipelineType.NONE,
-    count_ephemeral_storage_cost: bool = False,
     is_inference: bool = False,
     multipass_prefetch_max_pass: Optional[int] = None,
 ) -> List[Storage]:
@@ -407,7 +406,6 @@ def _calculate_shard_storages(  # NOQA
                 prefetch_size=input_size if table_cached else 0,
                 pipeline_type=pipeline_type,
                 multipass_prefetch_max_pass=multipass_prefetch_max_pass,
-                count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                 is_inference=is_inference,
             )
             if compute_device == "cuda"
