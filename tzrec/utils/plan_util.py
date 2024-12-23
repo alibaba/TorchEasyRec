@@ -18,8 +18,14 @@ import torch
 from torch import distributed as dist
 from torch import nn
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.planner import EmbeddingShardingPlanner
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.planner import EmbeddingShardingPlanner, shard_estimators
 from torchrec.distributed.planner.proposers import UniformProposer
+from torchrec.distributed.planner.shard_estimators import (
+    _calculate_shard_io_sizes,
+    _calculate_storage_specific_sizes,
+    calculate_pipeline_io_cost,
+)
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
@@ -27,11 +33,15 @@ from torchrec.distributed.planner.types import (
     Enumerator,
     Proposer,
     ShardingOption,
+    Storage,
     Topology,
 )
-from torchrec.distributed.sharding_plan import ModuleSharder
 from torchrec.distributed.sharding_plan import (
     get_default_sharders as _get_default_sharders,
+)
+from torchrec.distributed.types import (
+    ModuleSharder,
+    PipelineType,
 )
 
 
@@ -288,3 +298,148 @@ class DynamicProgrammingProposer(Proposer):
             self._current_proposal += 1
             if self._current_proposal >= len(self._proposal_list):
                 self._current_proposal = -1
+
+
+def _calculate_shard_storages(  # NOQA
+    sharder: ModuleSharder[nn.Module],
+    sharding_type: str,
+    tensor: torch.Tensor,
+    compute_device: str,
+    compute_kernel: str,
+    shard_sizes: List[List[int]],
+    batch_sizes: List[int],
+    world_size: int,
+    local_world_size: int,
+    input_lengths: List[float],
+    num_poolings: List[float],
+    caching_ratio: float,
+    is_pooled: bool,
+    input_data_type_size: float,
+    output_data_type_size: float,
+    pipeline_type: PipelineType = PipelineType.NONE,
+    count_ephemeral_storage_cost: bool = False,
+    is_inference: bool = False,
+    multipass_prefetch_max_pass: Optional[int] = None,
+) -> List[Storage]:
+    """Calculates estimated storage sizes for each sharded tensor, comprised of input,
+    output, tensor, gradient, and optimizer sizes.
+
+    Args:
+        sharder (ModuleSharder[nn.Module]): sharder for module that supports sharding.
+        sharding_type (str): provided ShardingType value.
+        tensor (torch.Tensor): tensor to be sharded.
+        compute_device (str): compute device to be used.
+        compute_kernel (str): compute kernel to be used.
+        shard_sizes (List[List[int]]): list of dimensions of each sharded tensor.
+        batch_sizes (List[int]): batch size for each input feature.
+        world_size (int): total number of devices in topology.
+        local_world_size (int): total number of devices in host group topology.
+        input_lengths (List[float]): average input lengths synonymous with pooling
+            factors.
+        num_poolings (List[float]): average number of poolings per sample
+            (typically 1.0).
+        caching_ratio (float): ratio of HBM to DDR memory for UVM caching.
+        is_pooled (bool): True if embedding output is pooled (ie. `EmbeddingBag`), False
+            if unpooled/sequential (ie. `Embedding`).
+        input_data_type_size (int): number of bytes of input data type.
+        output_data_type_size (int): number of bytes of output data type.
+        pipeline_type: PipelineType: pipeline type if for training.
+        is_inference: bool, whether the model is for inference.
+
+    Returns:
+        List[Storage]: storage object for each device in topology.
+    """  # NOQA
+    input_sizes, output_sizes = _calculate_shard_io_sizes(
+        sharding_type=sharding_type,
+        batch_sizes=batch_sizes,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        input_lengths=input_lengths,
+        emb_dim=tensor.shape[1],
+        shard_sizes=shard_sizes,
+        input_data_type_size=input_data_type_size,
+        output_data_type_size=output_data_type_size,
+        num_poolings=num_poolings,
+        is_pooled=is_pooled,
+    )
+
+    tensor_storage = sharder.storage_usage(tensor, compute_device, compute_kernel)
+    hbm_storage: int = tensor_storage.get("hbm", 0)
+    ddr_storage: int = tensor_storage.get("ddr", 0)
+
+    table_cached: bool = False
+    if compute_kernel in {
+        EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+        EmbeddingComputeKernel.QUANT_UVM_CACHING.value,
+        EmbeddingComputeKernel.KEY_VALUE.value,
+    }:
+        hbm_storage = round(ddr_storage * caching_ratio)
+        table_cached = True
+    if compute_kernel in {EmbeddingComputeKernel.KEY_VALUE.value}:
+        ddr_storage = 0
+
+    optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+
+    hbm_specific_sizes: List[int] = _calculate_storage_specific_sizes(
+        storage=hbm_storage,
+        shape=tensor.shape,
+        shard_sizes=shard_sizes,
+        sharding_type=sharding_type,
+        optimizer_class=optimizer_class,
+        is_inference=is_inference,
+        clf=caching_ratio if table_cached else None,
+    )
+    ddr_specific_sizes: List[int] = _calculate_storage_specific_sizes(
+        storage=ddr_storage,
+        shape=tensor.shape,
+        shard_sizes=shard_sizes,
+        sharding_type=sharding_type,
+        optimizer_class=optimizer_class,
+        is_inference=is_inference,
+    )
+
+    hbm_sizes: List[int] = [
+        (
+            hbm_specific_size
+            + calculate_pipeline_io_cost(
+                input_size=input_size,
+                output_size=output_size,
+                prefetch_size=input_size if table_cached else 0,
+                pipeline_type=pipeline_type,
+                multipass_prefetch_max_pass=multipass_prefetch_max_pass,
+                count_ephemeral_storage_cost=count_ephemeral_storage_cost,
+                is_inference=is_inference,
+            )
+            if compute_device == "cuda"
+            else 0
+        )
+        for input_size, output_size, hbm_specific_size in zip(
+            input_sizes,
+            output_sizes,
+            hbm_specific_sizes,
+        )
+    ]
+    ddr_sizes: List[int] = [
+        (
+            input_size + output_size + ddr_specific_size
+            if compute_device in {"cpu", "mtia"} and not is_inference
+            else ddr_specific_size
+        )
+        for input_size, output_size, ddr_specific_size in zip(
+            input_sizes,
+            output_sizes,
+            ddr_specific_sizes,
+        )
+    ]
+
+    return [
+        Storage(
+            hbm=hbm_size,
+            ddr=ddr_size,
+        )
+        for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
+    ]
+
+
+# temporarily fix optimizer storage of trec calculate_shard_storages
+shard_estimators.calculate_shard_storages = _calculate_shard_storages
