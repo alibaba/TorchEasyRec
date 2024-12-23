@@ -440,4 +440,5 @@ def _calculate_shard_storages(  # NOQA
 
 
 # temporarily fix optimizer storage of trec calculate_shard_storages
+# pyre-ignore [9]
 shard_estimators.calculate_shard_storages = _calculate_shard_storages
