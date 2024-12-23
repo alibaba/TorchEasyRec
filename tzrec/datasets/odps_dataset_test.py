@@ -50,6 +50,7 @@ class OdpsDatasetTest(unittest.TestCase):
         if self.o is not None:
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
             self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
+        os.environ.pop("USE_HASH_NODE_ID", None)
 
     def test_calc_slice_position(self):
         num_tables = 81
@@ -202,15 +203,18 @@ class OdpsDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
+    @parameterized.expand([["bigint"], ["string"]])
     @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
-    def test_odps_dataset_with_sampler(self):
+    def test_odps_dataset_with_sampler(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
         feature_cfgs = self._create_test_table_and_feature_cfgs(has_lookup=False)
 
         self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
         t = self.o.create_table(
             f"test_odps_sampler_{self.test_suffix}",
             (
-                "id bigint, weight double, features string",
+                f"id {id_type}, weight double, features string",
                 "dt string",
             ),
             if_not_exists=True,
