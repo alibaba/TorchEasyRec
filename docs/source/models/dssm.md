@@ -126,6 +126,7 @@ model_config {
 注:
 
 - 如果负采样表为本地文件，分隔符必须是"\\t"。以负采样Item表为例，第一行固定为 "id:int64\\tweight:float\\tattrs:string"，后续列中的id，weight，attr也以"\\t"分隔
+- 负采样表中的id列也可以为string类型，当id为string类型时，模型训练和评估命令中需设置环境变量USE_HASH_NODE_ID=1来启动对id自动进行hash64操作，一般情况下hash冲突概率极低
 
 ## 示例Config
 
