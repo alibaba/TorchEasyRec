@@ -766,7 +766,7 @@ class EmbeddingGroupImpl(nn.Module):
                                 num_autodis_features += 1
                                 self.has_autodis_dense = True
                                 autodis_feature_names.append(name)
-                                autodis_conf_tmp = feature.autodis_config()
+                                autodis_conf_tmp = feature.autodis_config
                                 output_dim = autodis_conf_tmp["embedding_dim"]
                                 if len(autodis_config) == 0:
                                     autodis_config.update(autodis_conf_tmp)
@@ -903,7 +903,8 @@ class EmbeddingGroupImpl(nn.Module):
                 autodis_embeddings = self.autodis_module(autodis_dense_tensor)
                 kts_autodis = KeyedTensor(
                     keys=autodis_names,
-                    length_per_key=[self.autodis_module.embedding_dim],
+                    length_per_key=[self.autodis_module.embedding_dim]
+                    * len(autodis_names),
                     values=autodis_embeddings,
                     key_dim=1,
                 )
@@ -918,7 +919,7 @@ class EmbeddingGroupImpl(nn.Module):
                 if len(other_dense_feature_names) > 0:
                     other_dense_features = KeyedTensor(
                         keys=other_dense_feature_names,
-                        length_per_key=[1],
+                        length_per_key=[1] * len(other_dense_feature_names),
                         values=torch.concat(
                             [dense_feature[key] for key in other_dense_feature_names],
                             dim=1,
