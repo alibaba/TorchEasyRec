@@ -28,7 +28,7 @@ repos:
     rev: v2.3.0
     hooks:
       - id: codespell
-        args: ["--skip", "*.json"]
+        args: ["--skip", "*.json", "-L", "TBE"]
   - repo: https://github.com/executablebooks/mdformat
     rev: 0.7.18
     hooks:

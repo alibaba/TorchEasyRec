@@ -33,5 +33,11 @@ import logging as _logging  # NOQA
 
 from tzrec.utils import load_class as _load_class  # NOQA
 
-_logging.basicConfig(format="[%(asctime)s][%(levelname)s] %(message)s")
+_log_level = _os.getenv("LOG_LEVEL")
+if _log_level:
+    _log_level = getattr(_logging, _log_level)
+
+_logging.basicConfig(
+    format="[%(asctime)s][%(levelname)s] %(message)s", level=_log_level
+)
 _load_class.auto_import()
