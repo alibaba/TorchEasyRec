@@ -223,6 +223,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         ivf_nlist=args.ivf_nlist,
         reader_type=args.reader_type,
+        odps_data_quota_name=args.odps_data_quota_name,
     )
     index.nprobe = args.ivf_nprobe
 

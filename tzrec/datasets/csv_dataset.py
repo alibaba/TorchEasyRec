@@ -103,6 +103,8 @@ class CsvReader(BaseReader):
         self._input_files = []
         for input_path in self._input_path.split(","):
             self._input_files.extend(glob.glob(input_path))
+        if len(self._input_files) == 0:
+            raise RuntimeError(f"No csv files exist in {self._input_path}.")
         dataset = ds.dataset(self._input_files[0], format=self._csv_fmt)
         self.schema = []
         self._ordered_cols = None

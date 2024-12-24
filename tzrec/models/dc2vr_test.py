@@ -17,7 +17,7 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.ple import PLE
+from tzrec.models.dc2vr import DC2VR
 from tzrec.protos import (
     feature_pb2,
     loss_pb2,
@@ -30,11 +30,15 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
 
 
-class PLETest(unittest.TestCase):
+class DC2VRTest(unittest.TestCase):
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            # [TestGraphType.JIT_SCRIPT]
+        ]
     )
-    def test_ple(self, graph_type) -> None:
+    def test_dc2vr(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -61,32 +65,13 @@ class PLETest(unittest.TestCase):
 
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            ple=multi_task_rank_pb2.PLE(
-                extraction_networks=[
-                    module_pb2.ExtractionNetwork(
-                        network_name="layer1",
-                        expert_num_per_task=3,
-                        share_num=4,
-                        task_expert_net=module_pb2.MLP(hidden_units=[12, 8, 4]),
-                        share_expert_net=module_pb2.MLP(hidden_units=[12, 8, 6, 4]),
-                    ),
-                    module_pb2.ExtractionNetwork(
-                        network_name="layer2",
-                        expert_num_per_task=3,
-                        share_num=3,
-                        task_expert_net=module_pb2.MLP(hidden_units=[8, 12, 8]),
-                        share_expert_net=module_pb2.MLP(hidden_units=[8, 12, 8]),
-                    ),
-                    module_pb2.ExtractionNetwork(
-                        network_name="layer3",
-                        expert_num_per_task=2,
-                        share_num=2,
-                        task_expert_net=module_pb2.MLP(hidden_units=[12, 6]),
-                        share_expert_net=module_pb2.MLP(hidden_units=[12, 6]),
-                    ),
-                ],
+            dc2vr=multi_task_rank_pb2.DC2VR(
+                bottom_mlp=module_pb2.MLP(hidden_units=[16, 8]),
+                expert_mlp=module_pb2.MLP(hidden_units=[16, 8]),
+                num_expert=6,
+                gate_mlp=module_pb2.MLP(hidden_units=[4]),
                 task_towers=[
-                    tower_pb2.TaskTower(
+                    tower_pb2.InterventionTaskTower(
                         tower_name="is_click",
                         label_name="label1",
                         mlp=module_pb2.MLP(hidden_units=[8, 4]),
@@ -96,7 +81,7 @@ class PLETest(unittest.TestCase):
                             )
                         ],
                     ),
-                    tower_pb2.TaskTower(
+                    tower_pb2.InterventionTaskTower(
                         tower_name="is_buy",
                         label_name="label2",
                         # mlp=module_pb2.MLP(hidden_units=[12, 6]),
@@ -105,8 +90,10 @@ class PLETest(unittest.TestCase):
                                 binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
                             )
                         ],
+                        intervention_tower_names=["is_click"],
+                        low_rank_dim=2,
                     ),
-                    tower_pb2.TaskTower(
+                    tower_pb2.InterventionTaskTower(
                         tower_name="cost_price",
                         label_name="label3",
                         mlp=module_pb2.MLP(hidden_units=[12, 6]),
@@ -115,13 +102,13 @@ class PLETest(unittest.TestCase):
                 ],
             ),
         )
-        ple = PLE(
+        dc2vr = DC2VR(
             model_config=model_config,
             features=features,
             labels=["label1", "label2", "label3"],
         )
-        init_parameters(ple, device=torch.device("cpu"))
-        ple = create_test_model(ple, graph_type)
+        init_parameters(dc2vr, device=torch.device("cpu"))
+        dc2vr = create_test_model(dc2vr, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b"],
@@ -138,9 +125,9 @@ class PLETest(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = ple(batch.to_dict())
+            predictions = dc2vr(batch.to_dict())
         else:
-            predictions = ple(batch)
+            predictions = dc2vr(batch)
         self.assertEqual(predictions["logits_is_click"].size(), (2,))
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
@@ -148,9 +135,13 @@ class PLETest(unittest.TestCase):
         self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            # [TestGraphType.JIT_SCRIPT]
+        ]
     )
-    def test_ple_has_sequences(self, graph_type) -> None:
+    def test_dc2vr_has_sequences(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -259,34 +250,16 @@ class PLETest(unittest.TestCase):
                 ],
             )
         ]
+
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            ple=multi_task_rank_pb2.PLE(
-                extraction_networks=[
-                    module_pb2.ExtractionNetwork(
-                        network_name="layer1",
-                        expert_num_per_task=3,
-                        share_num=4,
-                        task_expert_net=module_pb2.MLP(hidden_units=[12, 8, 4]),
-                        share_expert_net=module_pb2.MLP(hidden_units=[12, 8, 6, 4]),
-                    ),
-                    module_pb2.ExtractionNetwork(
-                        network_name="layer2",
-                        expert_num_per_task=3,
-                        share_num=3,
-                        task_expert_net=module_pb2.MLP(hidden_units=[8, 12, 8]),
-                        share_expert_net=module_pb2.MLP(hidden_units=[8, 12, 8]),
-                    ),
-                    module_pb2.ExtractionNetwork(
-                        network_name="layer3",
-                        expert_num_per_task=2,
-                        share_num=2,
-                        task_expert_net=module_pb2.MLP(hidden_units=[12, 6]),
-                        share_expert_net=module_pb2.MLP(hidden_units=[12, 6]),
-                    ),
-                ],
+            dc2vr=multi_task_rank_pb2.DC2VR(
+                bottom_mlp=module_pb2.MLP(hidden_units=[16, 8]),
+                expert_mlp=module_pb2.MLP(hidden_units=[16, 8]),
+                num_expert=6,
+                gate_mlp=module_pb2.MLP(hidden_units=[4]),
                 task_towers=[
-                    tower_pb2.TaskTower(
+                    tower_pb2.InterventionTaskTower(
                         tower_name="is_click",
                         label_name="label1",
                         mlp=module_pb2.MLP(hidden_units=[8, 4]),
@@ -296,7 +269,7 @@ class PLETest(unittest.TestCase):
                             )
                         ],
                     ),
-                    tower_pb2.TaskTower(
+                    tower_pb2.InterventionTaskTower(
                         tower_name="is_buy",
                         label_name="label2",
                         # mlp=module_pb2.MLP(hidden_units=[12, 6]),
@@ -305,8 +278,10 @@ class PLETest(unittest.TestCase):
                                 binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
                             )
                         ],
+                        intervention_tower_names=["is_click"],
+                        low_rank_dim=2,
                     ),
-                    tower_pb2.TaskTower(
+                    tower_pb2.InterventionTaskTower(
                         tower_name="cost_price",
                         label_name="label3",
                         mlp=module_pb2.MLP(hidden_units=[12, 6]),
@@ -315,13 +290,14 @@ class PLETest(unittest.TestCase):
                 ],
             ),
         )
-        ple = PLE(
+        dc2vr = DC2VR(
             model_config=model_config,
             features=features,
             labels=["label1", "label2", "label3"],
         )
-        init_parameters(ple, device=torch.device("cpu"))
-        ple = create_test_model(ple, graph_type)
+        init_parameters(dc2vr, device=torch.device("cpu"))
+        dc2vr = create_test_model(dc2vr, graph_type)
+
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=[
                 "cat_a",
@@ -342,6 +318,7 @@ class PLETest(unittest.TestCase):
             values=torch.tensor([[x] for x in range(8)], dtype=torch.float32),
             lengths=torch.tensor([3, 2, 2, 1]),
         ).to_dict()
+
         batch = Batch(
             dense_features={BASE_DATA_GROUP: dense_feature},
             sparse_features={BASE_DATA_GROUP: sparse_feature},
@@ -349,9 +326,9 @@ class PLETest(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = ple(batch.to_dict())
+            predictions = dc2vr(batch.to_dict())
         else:
-            predictions = ple(batch)
+            predictions = dc2vr(batch)
         self.assertEqual(predictions["logits_is_click"].size(), (2,))
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))

@@ -752,7 +752,8 @@ class EmbeddingGroupImpl(nn.Module):
 
                     if is_wide:
                         raise ValueError(
-                            "dense feature should not be configured in wide group."
+                            f"dense feature [{name}] should not be configured in "
+                            "wide group."
                         )
                     else:
                         if input_tile and feature.is_user_feat:
