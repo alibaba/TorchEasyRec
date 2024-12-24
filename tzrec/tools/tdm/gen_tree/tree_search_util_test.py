@@ -16,6 +16,7 @@ import tempfile
 import unittest
 
 import pyarrow.dataset as ds
+from parameterized import parameterized
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import TreeSearch
@@ -37,8 +38,12 @@ class TreeSearchtest(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir)
+        os.environ.pop("USE_HASH_NODE_ID", None)
 
-    def test_tree_search(self) -> None:
+    @parameterized.expand([[False], [True]])
+    def test_tree_search(self, use_hash_id) -> None:
+        if use_hash_id:
+            os.environ["USE_HASH_NODE_ID"] = "1"
         cluster = TreeCluster(
             item_input_path=self.tmp_file.name,
             item_id_field="item_id",

@@ -187,6 +187,10 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --n_cluster:(可选, 默认为2) 数的分叉数量, 应与建树时输入保持一致
 - --reserved_columns: 预测结果中要保留的输入列
 
+#### 注
+
+- 如果item_id为string类型，建树、模型训练、评估命令中需设置环境变量USE_HASH_NODE_ID=1来启动对id自动进行hash64操作，一般情况下hash冲突概率极低
+
 #### 参考手册
 
 [TorchEasyRec配置参考手册](../reference.md)

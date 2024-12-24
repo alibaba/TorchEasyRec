@@ -13,13 +13,14 @@ import math
 import os
 import pickle
 from collections import Counter
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
 from anytree import NodeMixin
 from anytree.exporter.dictexporter import DictExporter
 
+from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.logging_util import logger
 
 
@@ -35,7 +36,7 @@ class TDMTreeNode(BaseClass, NodeMixin):
     def __init__(
         self,
         tree_code: int = -1,
-        item_id: Optional[int] = None,
+        item_id: Optional[Union[int, str]] = None,
         cate: Optional[str] = None,
         attrs: Optional[List[pa.Scalar]] = None,
         raw_attrs: Optional[List[pa.Scalar]] = None,
@@ -95,7 +96,8 @@ class TreeBuilder:
             max_code = max(leaf_nodes[i].tree_code, max_code)
             leaf_item_id = leaf_nodes[i].item_id
             assert leaf_item_id is not None
-            max_item_id = max(leaf_item_id, max_item_id)
+            if not use_hash_node_id():
+                max_item_id = max(leaf_item_id, max_item_id)
 
         tree_nodes: List[Optional[TDMTreeNode]] = [None for _ in range(max_code + 1)]
         logger.info("start gen code_list")
@@ -119,7 +121,9 @@ class TreeBuilder:
             if node.item_id is None:
                 node.attrs = self._column_modes(node.attrs_list)
                 node.raw_attrs = self._column_means(node.raw_attrs_list)
-                node.item_id = max_item_id + code + 1
+                node.item_id = (
+                    f"leaf#{code}" if use_hash_node_id() else max_item_id + code + 1
+                )
 
             if code > 0:
                 ancestor = int((code - 1) / self.n_cluster)
