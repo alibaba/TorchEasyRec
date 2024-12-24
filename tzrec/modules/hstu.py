@@ -1,22 +1,47 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-import abc
+# Copyright (c) 2024, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+import abc
+import math
 from typing import Callable, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
 
 TIMESTAMPS_KEY = "timestamps"
 
 
 class RelativeAttentionBiasModule(torch.nn.Module):
+    """Relative Attention Bias Module for transformer-based architectures.
+
+    This module computes relative positional biases for attention mechanisms,
+    allowing the model to consider relative positions between tokens in the sequence.
+    Implements learnable relative position embeddings that can be
+    added to attention scores.
+
+    Inherits from:
+        torch.nn.Module: Base PyTorch Module class
+
+    Note:
+        The relative attention bias is typically added to the attention scores
+        before the softmax operation in the attention mechanism.
+    """
 
     @abc.abstractmethod
     def forward(
         self,
         all_timestamps: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Calculate bias with timestamps.
+
         Args:
             all_timestamps: [B, N] x int64
         Returns:
@@ -26,6 +51,14 @@ class RelativeAttentionBiasModule(torch.nn.Module):
 
 
 class RelativePositionalBias(RelativeAttentionBiasModule):
+    """Implements relative positional bias for attention mechanisms.
+
+    This class provides learnable position-based attention biases based on the relative
+    positions of elements in a sequence, up to a maximum sequence length.
+
+    Args:
+        max_seq_len (int): Maximum sequence length supported by this bias module.
+    """
 
     def __init__(self, max_seq_len: int) -> None:
         super().__init__()
@@ -39,6 +72,20 @@ class RelativePositionalBias(RelativeAttentionBiasModule):
         self,
         all_timestamps: torch.Tensor,
     ) -> torch.Tensor:
+        """Computes relative positional biases for attention.
+
+        This method generates position-based attention biases based on
+        relative positions, ignoring the actual timestamps provided
+        (as this implementation only cares about
+        relative positions, not temporal information).
+
+        Args:
+            all_timestamps: Tensor of shape [B, N] containing int64 timestamps
+                (unused in this implementation)
+
+        Returns:
+            torch.Tensor: Attention bias tensor broadcastable to shape [B, N, N]
+        """
         del all_timestamps
         n: int = self._max_seq_len
         t = F.pad(self._w[: 2 * n - 1], [0, n]).repeat(n)
@@ -48,9 +95,7 @@ class RelativePositionalBias(RelativeAttentionBiasModule):
 
 
 class RelativeBucketedTimeAndPositionBasedBias(RelativeAttentionBiasModule):
-    """
-    Bucketizes timespans based on ts(next-item) - ts(current-item).
-    """
+    """Bucketizes timespans based on ts(next-item) - ts(current-item)."""
 
     def __init__(
         self,
@@ -76,9 +121,11 @@ class RelativeBucketedTimeAndPositionBasedBias(RelativeAttentionBiasModule):
         self,
         all_timestamps: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Forward function.
+
         Args:
             all_timestamps: (B, N).
+
         Returns:
             (B, N, N).
         """
@@ -187,6 +234,52 @@ def _hstu_attention_maybe_from_cache(
 
 
 class SequentialTransductionUnitJagged(torch.nn.Module):
+    """A jagged sequential transduction unit for variable-length sequences.
+
+    This module processes jagged (variable-length) sequences using a
+    combination of attention mechanisms and linear transformations.
+    It supports various normalization strategies and attention bias configurations.
+
+    Args:
+        embedding_dim (int): Dimension of input embeddings
+        linear_hidden_dim (int): Dimension of hidden linear layers
+        attention_dim (int): Dimension of attention mechanism
+        dropout_ratio (float): Dropout probability for linear layers
+        attn_dropout_ratio (float): Dropout probability for attention
+        num_heads (int): Number of attention heads
+        linear_activation (str):
+            Activation function for linear layers ('silu' or 'none')
+        relative_attention_bias_module (Optional[RelativeAttentionBiasModule]):
+            Module for relative position biases
+        normalization (str, optional):
+            Normalization strategy. Defaults to "rel_bias".
+            Options: "rel_bias", "hstu_rel_bias", "softmax_rel_bias"
+        linear_config (str, optional):
+            Linear layer configuration. Defaults to "uvqk".
+        concat_ua (bool, optional):
+            Whether to concatenate u and a in output. Defaults to False.
+        epsilon (float, optional):
+            Small constant for numerical stability. Defaults to 1e-6.
+        max_length (Optional[int], optional):
+            Maximum sequence length. Defaults to None.
+
+    Attributes:
+        _embedding_dim (int): Dimension of input embeddings
+        _linear_dim (int): Dimension of hidden linear layers
+        _attention_dim (int): Dimension of attention mechanism
+        _num_heads (int): Number of attention heads
+        _rel_attn_bias (Optional[RelativeAttentionBiasModule]):
+            Module for relative position biases
+        _normalization (str): Normalization strategy
+        _linear_config (str): Linear layer configuration
+        _concat_ua (bool): Whether to concatenate u and a in output
+        _eps (float): Small constant for numerical stability
+
+    Note:
+        This implementation supports caching for efficient sequential processing and
+        handles jagged sequences through FBGEMM operations for dense-jagged conversions.
+    """
+
     def __init__(
         self,
         embedding_dim: int,
@@ -254,17 +347,20 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         cache: Optional[HSTUCacheState] = None,
         return_cache_states: bool = False,
     ):
-        """
+        r"""Forward function.
+
         Args:
             x: (\sum_i N_i, D) x float.
             x_offsets: (B + 1) x int32.
             all_timestamps: optional (B, N) x int64.
             invalid_attn_mask: (B, N, N) x float, each element in {0, 1}.
             delta_x_offsets: optional 2-tuple ((B,) x int32, (B,) x int32).
-                For the 1st element in the tuple, each element is in [0, x_offsets[-1]). For the
-                2nd element in the tuple, each element is in [0, N).
+                For the 1st element in the tuple, each element is in [0, x_offsets[-1]).
+                For the 2nd element in the tuple, each element is in [0, N).
             cache: Optional 4-tuple of (v, padded_q, padded_k, output) from prior runs,
                 where all except padded_q, padded_k are jagged.
+            return_cache_states: Return cache status or not.
+
         Returns:
             x' = f(x), (\sum_i N_i, D) x float.
         """
@@ -272,8 +368,8 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         cached_q = None
         cached_k = None
         if delta_x_offsets is not None:
-            # In this case, for all the following code, x, u, v, q, k become restricted to
-            # [delta_x_offsets[0], :].
+            # In this case, for all the following code, x, u, v, q, k
+            # become restricted to [delta_x_offsets[0], :].
             assert cache is not None
             x = x[delta_x_offsets[0], :]
             cached_v, cached_q, cached_k, cached_outputs = cache

@@ -16,10 +16,10 @@ from parameterized import parameterized
 
 from tzrec.modules.sequence import (
     DINEncoder,
+    HSTUEncoder,
     MultiWindowDINEncoder,
     PoolingEncoder,
     SimpleAttention,
-    HSTUEncoder,
     create_seq_encoder,
 )
 from tzrec.protos import module_pb2, seq_encoder_pb2
@@ -76,7 +76,7 @@ class DINEncoderTest(unittest.TestCase):
         }
         result = din(embedded)
         self.assertEqual(result.size(), (4, 16))
-        
+
 
 class HSTUEncoderTest(unittest.TestCase):
     @parameterized.expand(

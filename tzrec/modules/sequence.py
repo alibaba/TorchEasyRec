@@ -9,17 +9,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import fbgemm_gpu
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from tzrec.modules.hstu import (
+    HSTUCacheState,
+    RelativeBucketedTimeAndPositionBasedBias,
+    SequentialTransductionUnitJagged,
+)
 from tzrec.modules.mlp import MLP
-from tzrec.modules.hstu import RelativeBucketedTimeAndPositionBasedBias, SequentialTransductionUnitJagged
-from tzrec.modules.hstu import HSTUCacheState
 from tzrec.protos.seq_encoder_pb2 import SeqEncoderConfig
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
@@ -315,17 +317,17 @@ class HSTUEncoder(SequenceEncoder):
         sequence_dim: int,
         input: str,
         max_seq_length: int,
-        pos_dropout_rate: float = 0.5,
+        pos_dropout_rate: float = 0.2,
         linear_dropout_rate: float = 0.2,
         attn_dropout_rate: float = 0.0,
-        normalization: str = 'rel_bias',
-        linear_activation: str = 'silu',
-        linear_config: str = 'uvqk',
-        num_heads: int = 4,
-        num_blocks: int = 4,
-        max_output_len: int = 2,
+        normalization: str = "rel_bias",
+        linear_activation: str = "silu",
+        linear_config: str = "uvqk",
+        num_heads: int = 1,
+        num_blocks: int = 2,
+        max_output_len: int = 10,
         time_bucket_size: int = 128,
-        **kwargs: Optional[Dict[str, Any]]
+        **kwargs: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__(input)
         self._sequence_dim = sequence_dim
@@ -333,7 +335,9 @@ class HSTUEncoder(SequenceEncoder):
         self._query_name = f"{input}.query"
         self._sequence_name = f"{input}.sequence"
         self._sequence_length_name = f"{input}.sequence_length"
-        self.position_embed = nn.Embedding(self._max_seq_length + max_output_len + 1, self._sequence_dim, padding_idx=0)
+        self.position_embed = nn.Embedding(
+            self._max_seq_length + max_output_len + 1, self._sequence_dim, padding_idx=0
+        )
         self.dropout_rate = pos_dropout_rate
         self.enable_relative_attention_bias = True
         self.autocast_dtype = None
@@ -379,7 +383,7 @@ class HSTUEncoder(SequenceEncoder):
             ),
         )
         self._autocast_dtype = None
-        
+
     def output_dim(self) -> int:
         """Output dimension of the module."""
         return self._sequence_dim
@@ -390,18 +394,26 @@ class HSTUEncoder(SequenceEncoder):
         sequence_length = sequence_embedded[self._sequence_length_name]  # N
         # max_seq_length = sequence.size(1)
         float_dtype = sequence.dtype
-        
+
         # Add positional embeddings and apply dropout
-        positions = _arange(sequence.size(1), device=sequence.device).unsqueeze(0).expand(sequence.size(0), -1)
+        positions = (
+            _arange(sequence.size(1), device=sequence.device)
+            .unsqueeze(0)
+            .expand(sequence.size(0), -1)
+        )
         sequence = sequence * (self._sequence_dim**0.5) + self.position_embed(positions)
         sequence = F.dropout(sequence, p=self.dropout_rate, training=self.training)
-        sequence_mask = _arange(sequence.size(1), device=sequence_length.device).unsqueeze(0) < sequence_length.unsqueeze(1)
+        sequence_mask = _arange(
+            sequence.size(1), device=sequence_length.device
+        ).unsqueeze(0) < sequence_length.unsqueeze(1)
         sequence = sequence * sequence_mask.unsqueeze(-1).to(float_dtype)
-        
+
         invalid_attn_mask = 1.0 - self._attn_mask.to(float_dtype)
-        sequence_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_length)
+        sequence_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            sequence_length
+        )
         sequence = torch.ops.fbgemm.dense_to_jagged(sequence, [sequence_offsets])[0]
-        
+
         all_timestamps = None
         jagged_x, cache_states = self.jagged_forward(
             x=sequence,
@@ -413,18 +425,20 @@ class HSTUEncoder(SequenceEncoder):
             return_cache_states=False,
         )
         output_embeddings = torch.ops.fbgemm.jagged_to_padded_dense(
-                                values=jagged_x,
-                                offsets=[sequence_offsets],
-                                max_lengths=[invalid_attn_mask.size(1)],
-                                padding_value=0.0,
-                            )
-        # post processing
+            values=jagged_x,
+            offsets=[sequence_offsets],
+            max_lengths=[invalid_attn_mask.size(1)],
+            padding_value=0.0,
+        )
+        # post processing: L2 Normalization
         output_embeddings = output_embeddings[..., : self._sequence_dim]
         output_embeddings = output_embeddings / torch.clamp(
-                                torch.linalg.norm(output_embeddings, ord=None, dim=-1, keepdim=True),
-                                min=1e-6,
-                            )
-        output_embeddings = self.get_current_embeddings(sequence_length, output_embeddings)
+            torch.linalg.norm(output_embeddings, ord=None, dim=-1, keepdim=True),
+            min=1e-6,
+        )
+        output_embeddings = self.get_current_embeddings(
+            sequence_length, output_embeddings
+        )
         return output_embeddings
 
     def jagged_forward(
@@ -437,12 +451,15 @@ class HSTUEncoder(SequenceEncoder):
         cache: Optional[List[HSTUCacheState]] = None,
         return_cache_states: bool = False,
     ) -> Tuple[torch.Tensor, List[HSTUCacheState]]:
-        """
+        r"""Jagged forward.
+
         Args:
             x: (\sum_i N_i, D) x float
             x_offsets: (B + 1) x int32
             all_timestamps: (B, 1 + N) x int64
             invalid_attn_mask: (B, N, N) x float, each element in {0, 1}
+            delta_x_offsets: offsets for x
+            cache: cache contents
             return_cache_states: bool. True if we should return cache states.
 
         Returns:
@@ -465,27 +482,6 @@ class HSTUEncoder(SequenceEncoder):
                     cache=cache[i] if cache is not None else None,
                     return_cache_states=return_cache_states,
                 )
-                print(f"\n--- Layer {i} ---")
-                print(f"Layer type: {type(layer).__name__}")
-                important_attrs = [
-                    'embedding_dim',
-                    'linear_dim',
-                    'attention_dim',
-                    'dropout_ratio',
-                    'attn_dropout_ratio',
-                    'num_heads',
-                    'linear_activation',
-                    'normalization',
-                    'linear_config',
-                    'concat_ua'
-                ]
-                for attr_name in important_attrs:
-                    attr_value = getattr(layer, f"_{attr_name}", None)
-                    if attr_value is not None:
-                        print(f"{attr_name}: {attr_value}")
-                print(f"\nAfter Layer {i}:")
-                print(f"sequence.size: {x.size()}\nsequence: {x}")
-                print(f"x_offsets: {x_offsets}")
                 if return_cache_states:
                     cache_states.append(cache_states_i)
 
@@ -496,10 +492,11 @@ class HSTUEncoder(SequenceEncoder):
         lengths: torch.Tensor,
         encoded_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Get the embeddings of the last past_id as the current embeds.
+
         Args:
             lengths: (B,) x int
-            seq_embeddings: (B, N, D,) x float
+            encoded_embeddings: (B, N, D,) x float
 
         Returns:
             (B, D,) x float, where [i, :] == encoded_embeddings[i, lengths[i] - 1, :]

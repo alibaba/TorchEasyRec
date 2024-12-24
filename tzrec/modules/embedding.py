@@ -399,15 +399,22 @@ class EmbeddingGroup(nn.Module):
 
             if emb_impl.has_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
-            result_dicts.append(
-                emb_impl(
-                    sparse_feat_kjt,
-                    dense_feat_kt,
-                    sparse_feat_kjt_user,
-                    dense_feat_kt_user,
-                    batch.batch_size,
+
+            if (
+                emb_impl.has_dense
+                or emb_impl.has_dense_user
+                or emb_impl.has_sparse
+                or emb_impl.has_sparse_user
+            ):
+                result_dicts.append(
+                    emb_impl(
+                        sparse_feat_kjt,
+                        dense_feat_kt,
+                        sparse_feat_kjt_user,
+                        dense_feat_kt_user,
+                        batch.batch_size,
+                    )
                 )
-            )
 
         for key, seq_emb_impl in self.seq_emb_impls.items():
             sparse_feat_kjt = None

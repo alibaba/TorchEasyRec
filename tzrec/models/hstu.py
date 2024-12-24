@@ -14,16 +14,13 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 from torch._tensor import Tensor
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
-from tzrec.modules.mlp import MLP
 from tzrec.protos import model_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
-from tzrec.utils.config_util import config_to_kwargs
 
 
 @torch.fx.wrap
@@ -62,10 +59,7 @@ class HSTUTower(MatchTower):
             tower_config, output_dim, similarity, feature_group, features, model_config
         )
         self.init_input()
-        tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
-        self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
-        if self._output_dim > 0:
-            self.output = nn.Linear(self.mlp.output_dim(), output_dim)
+        self.tower_config = tower_config
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower.
@@ -76,18 +70,13 @@ class HSTUTower(MatchTower):
         Return:
             embedding (dict): tower output embedding.
         """
+        # print(batch)
         grouped_features = self.build_input(batch)
-        output = self.mlp(grouped_features[self._group_name])
-        # TODO: this will cause dimension unmatch in self.output, considering resolutions
-        # if self._tower_config.input == 'user':
-        #     output = grouped_features[self._group_name]  
-        # else:
-        #     output = self.mlp(grouped_features[self._group_name])
-            
-        if self._output_dim > 0:
-            output = self.output(output)
-        if self._similarity == match_model_pb2.Similarity.COSINE:
-            output = F.normalize(output, p=2.0, dim=1)
+        output = grouped_features[self._group_name]
+
+        if self.tower_config.input == "item":
+            if self._similarity == match_model_pb2.Similarity.COSINE:
+                output = F.normalize(output, p=2.0, dim=1, eps=1e-6)
         return output
 
 
@@ -108,7 +97,7 @@ class HSTU(MatchModel):
         sample_weights: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights, **kwargs) 
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
 
         user_group = name_to_feature_group[self._model_config.user_tower.input]
@@ -158,7 +147,6 @@ class HSTU(MatchModel):
         _update_dict_tensor(
             self._loss_collection, self.item_tower.group_variational_dropout_loss
         )
-
         ui_sim = (
             self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature
         )
