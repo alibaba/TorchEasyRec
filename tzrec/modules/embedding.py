@@ -10,6 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict, defaultdict
+from operator import itemgetter
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -761,9 +762,7 @@ class EmbeddingGroupImpl(nn.Module):
                         else:
                             self.has_dense = True
                             dense_feature_names.append(name)
-                            if hasattr(
-                                feature.config, "autodis"
-                            ) and feature.config.HasField("autodis"):
+                            if feature.autodis_config:
                                 num_autodis_features += 1
                                 self.has_autodis_dense = True
                                 autodis_feature_names.append(name)
@@ -899,8 +898,9 @@ class EmbeddingGroupImpl(nn.Module):
                     for f in flist
                 ]
                 autodis_dense_tensor = torch.concat(
-                    [dense_feature[key] for key in autodis_names], dim=1
+                    itemgetter(*autodis_names)(dense_feature), dim=1
                 )
+
                 autodis_embeddings = self.autodis_module(autodis_dense_tensor)
                 kts_autodis = KeyedTensor(
                     keys=autodis_names,
@@ -922,7 +922,7 @@ class EmbeddingGroupImpl(nn.Module):
                         keys=other_dense_feature_names,
                         length_per_key=[1] * len(other_dense_feature_names),
                         values=torch.concat(
-                            [dense_feature[key] for key in other_dense_feature_names],
+                            itemgetter(*other_dense_feature_names)(dense_feature),
                             dim=1,
                         ),
                         key_dim=1,

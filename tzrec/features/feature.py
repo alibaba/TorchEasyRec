@@ -407,6 +407,8 @@ class BaseFeature(object, metaclass=_meta_cls):
                 atd_config["temperature"] = temperature
                 atd_config["keep_prob"] = keep_prob
                 return atd_config
+            else:
+                return None
         else:
             return None
 

@@ -41,7 +41,7 @@ message AutoDisEmbedding {
     // number of embedding channels
     required uint32 num_channels = 2;
     // temperature coefficient for softmax
-    required float  temperature = 3 [default = 0.1];
+    optional float  temperature = 3 [default = 0.1];
     optional float  keep_prob = 4 [default = 0.8];
 }
 
