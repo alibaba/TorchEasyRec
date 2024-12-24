@@ -761,8 +761,8 @@ class EmbeddingGroupImpl(nn.Module):
                             self.has_dense = True
                             dense_feature_names.append(name)
                             if hasattr(
-                                feature.config, "atd"
-                            ) and feature.config.HasField("atd"):
+                                feature.config, "autodis"
+                            ) and feature.config.HasField("autodis"):
                                 num_autodis_features += 1
                                 self.has_autodis_dense = True
                                 autodis_feature_names.append(name)

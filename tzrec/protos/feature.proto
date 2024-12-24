@@ -118,7 +118,7 @@ message RawFeature {
     // mask value in training progress
     optional bool use_mask =  14;
     // autodis embedding
-    optional AutoDisEmbedding atd = 15;
+    optional AutoDisEmbedding autodis = 15;
 
 
     // default value when fg_mode = FG_NONE,

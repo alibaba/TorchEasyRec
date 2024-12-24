@@ -397,11 +397,11 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Get config dict of the autodis feature."""
         if not self.is_sparse:
             atd_config = dict()
-            if hasattr(self.config, "atd") and self.config.HasField("atd"):
-                num_channels = self.config.atd.num_channels
-                embedding_dim = self.config.atd.embedding_dim
-                temperature = self.config.atd.temperature
-                keep_prob = self.config.atd.keep_prob
+            if hasattr(self.config, "autodis") and self.config.HasField("autodis"):
+                num_channels = self.config.autodis.num_channels
+                embedding_dim = self.config.autodis.embedding_dim
+                temperature = self.config.autodis.temperature
+                keep_prob = self.config.autodis.keep_prob
                 atd_config["num_channels"] = num_channels
                 atd_config["embedding_dim"] = embedding_dim
                 atd_config["temperature"] = temperature
