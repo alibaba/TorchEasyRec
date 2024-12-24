@@ -155,3 +155,17 @@ Tag: TUNNEL Endpoint: http://dt.cn-shanghai-vpc.maxcompute.aliyun-inc.com
 **原因：** 离线预测输出表已存在，并且schema不正确
 
 **解决方法：** 删除已存在的输出表或修改输出表名
+
+______________________________________________________________________
+
+**Q11: fbgemm的embedding lookup op的EmbeddingBoundsCheck error**
+
+**报错信息：** fbgemm的embedding lookup op报错：
+
+```
+EmbeddingBoundsCheck (VBE false): (at least one) Out of bounds access for batch: 12, table: 2, bag element: 0, idx: 3, num_rows: 3, indices_start: 1815, indices_end: 1816, T: 244, B: 67, b_t: 1955. Setting idx to zero.
+```
+
+**原因：** 第2个embedding table只有3行embedding（num_rows: 3)，但是传入的id是3（idx: 3），越界了
+
+**解决方法：** 只通过报错日志很难直接确定第2个embedding table是关联哪一个特征。需设置环境变量`LOG_LEVEL=INFO`或`LOG_LEVEL=DEBUG`重新执行训练命令，可以看到训练日志中包含如下内容`[TBE=xxx] Contents: ['id_3_emb', 'lookup_2_emb', 'lookup_3_emb', ...`，就可以得知`lookup_3`这个特征的输入值存在问题需要进一步检查输入数据。
