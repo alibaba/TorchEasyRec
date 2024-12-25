@@ -37,7 +37,7 @@ class TreeClusterTest(unittest.TestCase):
         os.environ.pop("USE_HASH_NODE_ID", None)
 
     @parameterized.expand([[False], [True]])
-    def test_cluster(self, use_hash_id) -> None:
+    def test_cluster(self, use_hash_id: bool) -> None:
         if use_hash_id:
             os.environ["USE_HASH_NODE_ID"] = "1"
         cluster = TreeCluster(

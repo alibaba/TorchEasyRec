@@ -122,6 +122,7 @@ class TreeBuilder:
                 node.attrs = self._column_modes(node.attrs_list)
                 node.raw_attrs = self._column_means(node.raw_attrs_list)
                 node.item_id = (
+                    # pyre-ignore [58]
                     f"nonleaf#{code}" if use_hash_node_id() else max_item_id + code + 1
                 )
 
