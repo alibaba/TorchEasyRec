@@ -27,6 +27,7 @@ from torch import distributed as dist
 from torch.utils.data import get_worker_info
 
 from tzrec.protos import sampler_pb2
+from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.misc_util import get_free_port
 
@@ -166,15 +167,10 @@ def _to_arrow_array(
     return result
 
 
-def use_hash_node_id() -> bool:
-    """Use hash node id or not."""
-    return os.environ.get("USE_HASH_NODE_ID", "0") == "1"
-
-
 def _pa_ids_to_npy(ids: pa.Array) -> npt.NDArray:
     """Convert pyarrow id array to numpy array."""
     if use_hash_node_id():
-        ids = ids.to_numpy(zero_copy_only=False)
+        ids = ids.cast(pa.string()).to_numpy(zero_copy_only=False)
     else:
         ids = ids.cast(pa.int64()).fill_null(0).to_numpy()
     return ids

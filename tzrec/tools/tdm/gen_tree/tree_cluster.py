@@ -24,6 +24,7 @@ from sklearn.cluster import KMeans
 from tzrec.datasets.dataset import create_reader
 from tzrec.tools.tdm.gen_tree import tree_builder
 from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode
+from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.logging_util import logger
 
 
@@ -97,7 +98,10 @@ class TreeCluster:
         )
 
         for data_dict in reader.to_batches():
-            ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
+            if use_hash_node_id():
+                ids = data_dict[self.item_id_field].cast(pa.string()).to_pylist()
+            else:
+                ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
             data += data_dict[self.embedding_field].to_pylist()
 
             batch_tree_nodes = []

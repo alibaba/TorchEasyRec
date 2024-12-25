@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 import pyarrow as pa
+from parameterized import parameterized
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import LevelOrderIter
@@ -33,8 +34,12 @@ class TreeClusterTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         os.remove(self.tmp_file.name)
+        os.environ.pop("USE_HASH_NODE_ID", None)
 
-    def test_cluster(self) -> None:
+    @parameterized.expand([[False], [True]])
+    def test_cluster(self, use_hash_id: bool) -> None:
+        if use_hash_id:
+            os.environ["USE_HASH_NODE_ID"] = "1"
         cluster = TreeCluster(
             item_input_path=self.tmp_file.name,
             item_id_field="item_id",
@@ -61,7 +66,12 @@ class TreeClusterTest(unittest.TestCase):
             ids.append(node.item_id)
             if level == 5:
                 leaf_feas.append(node.attrs + node.raw_attrs)
-        self.assertEqual(true_ids, ids)
+        if use_hash_id:
+            self.assertEqual(
+                [str(x) if x < 10 else f"nonleaf#{x-10}" for x in true_ids], ids
+            )
+        else:
+            self.assertEqual(true_ids, ids)
         self.assertEqual(true_levels, levels)
         self.assertEqual(true_leaf_feas, leaf_feas)
 

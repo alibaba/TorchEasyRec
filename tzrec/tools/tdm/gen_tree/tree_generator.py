@@ -15,6 +15,7 @@ import pyarrow as pa
 
 from tzrec.datasets.dataset import create_reader
 from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode, TreeBuilder
+from tzrec.utils.env_util import use_hash_node_id
 
 
 class TreeGenerator:
@@ -78,7 +79,10 @@ class TreeGenerator:
         )
 
         for data_dict in reader.to_batches():
-            ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
+            if use_hash_node_id():
+                ids = data_dict[self.item_id_field].cast(pa.string()).to_pylist()
+            else:
+                ids = data_dict[self.item_id_field].cast(pa.int64()).to_pylist()
             cates = (
                 data_dict[self.cate_id_field]
                 .cast(pa.string())
