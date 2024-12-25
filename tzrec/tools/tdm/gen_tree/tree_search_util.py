@@ -21,6 +21,7 @@ from anytree.walker import Walker
 
 from tzrec.datasets.dataset import create_writer
 from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode
+from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.logging_util import logger
 
 
@@ -152,7 +153,7 @@ class TreeSearch(object):
 
                     # add a node with id -1 for graph-learn to get root node
                     if first_node:
-                        ids.append(-1)
+                        ids.append("-1" if use_hash_node_id() else -1)
                         weight.append(1.0)
                         features.append(",".join(["-1"] + list(map(str, fea[1:]))))
                         first_node = False
@@ -190,7 +191,8 @@ class TreeSearch(object):
             if not os.path.exists(self.output_file):
                 os.makedirs(self.output_file)
             with open(os.path.join(self.output_file, "node_table.txt"), "w") as f:
-                f.write("id:int64\tweight:float\tfeature:string\n")
+                id_type = "string" if use_hash_node_id() else "int64"
+                f.write(f"id:{id_type}\tweight:float\tfeature:string\n")
                 first_node = True
                 for level, nodes in enumerate(self.level_code):
                     for node in nodes:
@@ -220,7 +222,8 @@ class TreeSearch(object):
                         f.write(f"{node.item_id}\t1.0\t{','.join(map(str, fea))}\n")
 
             with open(os.path.join(self.output_file, "edge_table.txt"), "w") as f:
-                f.write("src_id:int64\tdst_id:int64\tweight:float\n")
+                id_type = "string" if use_hash_node_id() else "int64"
+                f.write(f"src_id:{id_type}\tdst_id:{id_type}\tweight:float\n")
                 for travel in self.travel_list:
                     # do not include edge from leaf to root
                     for i in range(self.max_level - 1):
@@ -234,7 +237,7 @@ class TreeSearch(object):
             )
             writer = create_writer(output_path, **self.dataset_kwargs)
             # add a edge from -1 to root for graph-learn to get root node
-            src_ids = [-1]
+            src_ids = ["-1" if use_hash_node_id() else -1]
             dst_ids = [self.root.item_id]
             weight = [1.0]
             for i in range(self.max_level):
@@ -253,7 +256,8 @@ class TreeSearch(object):
             with open(
                 os.path.join(self.output_file, "predict_edge_table.txt"), "w"
             ) as f:
-                f.write("src_id:int64\tdst_id:int64\tweight:float\n")
+                id_type = "string" if use_hash_node_id() else "int64"
+                f.write(f"src_id:{id_type}\tdst_id:{id_type}\tweight:float\n")
                 # add a edge from  with id -1 to root for graph-learn to get root node
                 f.write(f"-1\t{self.root.item_id}\t1.0\n")
                 for i in range(self.max_level):
