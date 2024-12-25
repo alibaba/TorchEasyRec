@@ -67,8 +67,6 @@ class RawFeature(BaseFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("atd"):
-            return self.config.atd.num_bins
         return len(self.config.boundaries) + 1
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
