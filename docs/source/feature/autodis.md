@@ -22,7 +22,7 @@ feature_configs {
 ```
 
 embedding_dim为embedding维度， num_channels为embedding的通道数， temperature为softmax温度系数， keep_prob为隐含层保留概率。
-其中embedding_dim和num_channels为必选参数， temperature和keep_prob为可选参数。
+其中embedding_dim和num_channels为必选参数， temperature和keep_prob为可选参数。如果对多个raw_feature配置autodis embedding，建议使用相同的autodis参数, 以保证训练推理速度。多组不同的autodis参数配置，可能会导致性能下降。
 
 ## 参考文章
 
