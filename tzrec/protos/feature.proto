@@ -45,6 +45,10 @@ message AutoDisEmbedding {
     optional float  keep_prob = 4 [default = 0.8];
 }
 
+message MLPEmbedding {
+    required uint32 embedding_dim = 1;
+}
+
 message IdFeature {
     // feature name, e.g. item_id
     required string feature_name = 1;
@@ -119,7 +123,8 @@ message RawFeature {
     optional bool use_mask =  14;
     // autodis embedding
     optional AutoDisEmbedding autodis = 15;
-
+    // mlp embedding
+    optional MLPEmbedding mlp = 16;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.

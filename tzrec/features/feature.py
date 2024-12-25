@@ -412,6 +412,22 @@ class BaseFeature(object, metaclass=_meta_cls):
         else:
             return None
 
+    @property
+    def mlp_config(
+        self,
+    ) -> Optional[Dict]:
+        """Get config dict of the mlp dense feature."""
+        if not self.is_sparse:
+            mlp_config = dict()
+            if hasattr(self.config, "mlp") and self.config.HasField("mlp"):
+                embedding_dim = self.config.mlp.embedding_dim
+                mlp_config["embedding_dim"] = embedding_dim
+                return mlp_config
+            else:
+                return None
+        else:
+            return None
+
     def mc_module(self, device: torch.device) -> Optional[ManagedCollisionModule]:
         """Get ManagedCollisionModule."""
         if self.is_sparse:

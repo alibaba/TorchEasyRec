@@ -14,7 +14,7 @@ from operator import itemgetter
 from typing import Dict, List, Optional, Union
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -34,6 +34,11 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, Keyed
 from tzrec.acc.utils import is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.modules.dense_embedding_collection import (
+    AutoDisEmbeddingConfig,
+    DenseEmbeddingCollection,
+    MLPDenseEmbeddingConfig,
+)
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
@@ -549,62 +554,6 @@ def _add_mc_module(
     mc_modules[emb_name] = mc_module
 
 
-class AutoDisModule(nn.Module):
-    """An Embedding Learning Framework for Numerical Features in CTR Prediction.
-
-    https://arxiv.org/pdf/2012.08986
-    """
-
-    def __init__(
-        self,
-        num_dense_feature: int,
-        embedding_dim: int,
-        num_channels: int,
-        temperature: float = 0.1,
-        keep_prob: float = 0.8,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        super().__init__()
-        self.num_dense_feature = num_dense_feature
-        self.embedding_dim = embedding_dim
-        self.keep_prob = keep_prob
-        self.temperature = temperature
-
-        self.meta_emb = nn.Parameter(
-            torch.randn(num_dense_feature, num_channels, embedding_dim, device=device)
-        )
-        self.proj_w = nn.Parameter(
-            torch.randn(num_dense_feature, num_channels, device=device)
-        )
-        self.proj_m = nn.Parameter(
-            torch.randn(num_dense_feature, num_channels, num_channels, device=device)
-        )
-        self.leaky_relu = nn.LeakyReLU()
-
-    def forward(self, dense_input: Tensor):
-        """Forward the module.
-
-        Args:
-            dense_input (Tensor): dense input feature, shape = [b, n],
-                where b is batch_size, n is the number of dense features
-
-        Returns:
-            atde (Tensor): Tensor of autodis embedding.
-        """
-        hidden = self.leaky_relu(
-            torch.einsum("nc,bn->bnc", self.proj_w, dense_input)
-        )  # shape [b, n, c]
-        x_bar = (
-            torch.einsum("nij,bnj->bni", self.proj_m, hidden) + self.keep_prob * hidden
-        )  # shape [b, n, c]
-        x_hat = nn.Softmax(dim=-1)(x_bar / self.temperature)  # shape = [b, n, c]
-        emb = torch.einsum("ncd,bnc->bnd", self.meta_emb, x_hat)  # shape = [b, n, d]
-        output = emb.reshape(
-            (-1, self.num_dense_feature * self.embedding_dim)
-        )  # shape = [b, n * d]
-        return output
-
-
 class EmbeddingGroupImpl(nn.Module):
     """Applies embedding lookup transformation for feature group.
 
@@ -629,7 +578,6 @@ class EmbeddingGroupImpl(nn.Module):
         emb_bag_configs = OrderedDict()
         mc_emb_bag_configs = OrderedDict()
         mc_modules = OrderedDict()
-        autodis_config = OrderedDict()
 
         self.has_sparse = False
         self.has_sparse_user = False
@@ -637,15 +585,14 @@ class EmbeddingGroupImpl(nn.Module):
         self.has_mc_sparse_user = False
         self.has_dense = False
         self.has_dense_user = False
-        self.has_autodis_dense = False
+        self.has_dense_embedding = False
 
         self._group_to_feature_names = OrderedDict()
         self._group_to_shared_feature_names = OrderedDict()
         self._group_total_dim = dict()
         self._group_feature_output_dims = dict()
-        self._group_num_of_autodis_features = dict()
-        self._group_autodis_feature_names = dict()
         self._group_dense_feature_names = dict()
+        self._group_dense_embedding_feature_names = dict()
 
         feat_to_group_to_emb_name = defaultdict(dict)
         for feature_group in feature_groups:
@@ -676,9 +623,9 @@ class EmbeddingGroupImpl(nn.Module):
         mc_modules_item = OrderedDict()
         mc_modules_user = OrderedDict()
 
-        num_autodis_features = 0
-        autodis_feature_names = []
         dense_feature_names = []
+        dense_embedding_feature_names = []
+        dense_embedding_configs = []
         for feature_group in feature_groups:
             total_dim = 0
             feature_output_dims = OrderedDict()
@@ -749,7 +696,6 @@ class EmbeddingGroupImpl(nn.Module):
                         shared_name = shared_name + "@" + emb_bag_config.name
                 else:
                     output_dim = feature.output_dim
-                    # TODO (hongsheng.jhs) make dense feature support embedding_dim
 
                     if is_wide:
                         raise ValueError(
@@ -761,20 +707,37 @@ class EmbeddingGroupImpl(nn.Module):
                             self.has_dense_user = True
                         else:
                             self.has_dense = True
+                            if feature.autodis_config and feature.mlp_config:
+                                raise ValueError(
+                                    f"feature [{name}] can not be configured in\
+                                        both autodis and mlp embedding."
+                                )
                             dense_feature_names.append(name)
                             if feature.autodis_config:
-                                num_autodis_features += 1
-                                self.has_autodis_dense = True
-                                autodis_feature_names.append(name)
-                                autodis_conf_tmp = feature.autodis_config
-                                output_dim = autodis_conf_tmp["embedding_dim"]
-                                if len(autodis_config) == 0:
-                                    autodis_config.update(autodis_conf_tmp)
-                                else:
-                                    assert (
-                                        autodis_conf_tmp == autodis_config
-                                    ), "Autodis config should be \
-                                    the same for all dense features"
+                                self.has_dense_embedding = True
+                                dense_embedding_feature_names.append(name)
+                                pb_conf = feature.autodis_config
+                                output_dim = pb_conf["embedding_dim"]
+                                dense_embedding_configs.append(
+                                    AutoDisEmbeddingConfig(
+                                        embedding_dim=pb_conf["embedding_dim"],
+                                        n_channels=pb_conf["num_channels"],
+                                        temperature=pb_conf["temperature"],
+                                        keep_prob=pb_conf["keep_prob"],
+                                        feature_names=[name],
+                                    )
+                                )
+                            if feature.mlp_config:
+                                self.has_dense_embedding = True
+                                dense_embedding_feature_names.append(name)
+                                pb_conf = feature.mlp_config
+                                output_dim = pb_conf["embedding_dim"]
+                                dense_embedding_configs.append(
+                                    MLPDenseEmbeddingConfig(
+                                        embedding_dim=pb_conf["embedding_dim"],
+                                        feature_names=[name],
+                                    )
+                                )
 
                 total_dim += output_dim
                 feature_output_dims[name] = output_dim
@@ -784,9 +747,12 @@ class EmbeddingGroupImpl(nn.Module):
                 self._group_to_shared_feature_names[group_name] = shared_feature_names
             self._group_total_dim[group_name] = total_dim
             self._group_feature_output_dims[group_name] = feature_output_dims
-            self._group_num_of_autodis_features[group_name] = num_autodis_features
-            self._group_autodis_feature_names[group_name] = autodis_feature_names
+            # self._group_autodis_feature_names[group_name] = autodis_feature_names
             self._group_dense_feature_names[group_name] = dense_feature_names
+            # self._group_autodis_feature_confs[group_name] = autodis_configs
+            self._group_dense_embedding_feature_names[group_name] = (
+                dense_embedding_feature_names
+            )
 
         if input_tile_emb:
             self.ebc_user = EmbeddingBagCollection(
@@ -826,14 +792,9 @@ class EmbeddingGroupImpl(nn.Module):
                         mc_modules, list(mc_emb_bag_configs.values())
                     ),
                 )
-            if self.has_autodis_dense:
-                self.autodis_module = AutoDisModule(
-                    num_dense_feature=num_autodis_features,
-                    embedding_dim=autodis_config["embedding_dim"],
-                    num_channels=autodis_config["num_channels"],
-                    keep_prob=autodis_config["keep_prob"],
-                    temperature=autodis_config["temperature"],
-                    device=device,
+            if self.has_dense_embedding:
+                self.dense_emb_collection = DenseEmbeddingCollection(
+                    dense_embedding_configs, device=device
                 )
 
     def group_dims(self, group_name: str) -> List[int]:
@@ -891,31 +852,33 @@ class EmbeddingGroupImpl(nn.Module):
             kts.append(keyed_tensor_user_tile)
 
         if self.has_dense:
-            if self.has_autodis_dense:
-                autodis_names = [
+            if self.has_dense_embedding:
+                dense_emb_names = [
                     f
-                    for g, flist in self._group_autodis_feature_names.items()
+                    for g, flist in self._group_dense_embedding_feature_names.items()
                     for f in flist
                 ]
-                autodis_dense_tensor = torch.concat(
-                    itemgetter(*autodis_names)(dense_feature), dim=1
-                )
+                # autodis_dense_tensor = torch.concat(
+                #     itemgetter(*autodis_names)(dense_feature), dim=1
+                # )
 
-                autodis_embeddings = self.autodis_module(autodis_dense_tensor)
-                kts_autodis = KeyedTensor(
-                    keys=autodis_names,
-                    length_per_key=[self.autodis_module.embedding_dim]
-                    * len(autodis_names),
-                    values=autodis_embeddings,
-                    key_dim=1,
-                )
-                kts.append(kts_autodis)
+                # autodis_embeddings = self.autodis_module(autodis_dense_tensor)
+                # kts_autodis = KeyedTensor(
+                #     keys=autodis_names,
+                #     length_per_key=[self.autodis_module.embedding_dim]
+                #     * len(autodis_names),
+                #     values=autodis_embeddings,
+                #     key_dim=1,
+                # )
+
+                kts_dense = self.dense_emb_collection(dense_feature)
+                kts.append(kts_dense)
 
                 other_dense_feature_names = [
                     f
                     for g, flist in self._group_dense_feature_names.items()
                     for f in flist
-                    if f not in autodis_names
+                    if f not in dense_emb_names
                 ]
                 if len(other_dense_feature_names) > 0:
                     other_dense_features = KeyedTensor(
