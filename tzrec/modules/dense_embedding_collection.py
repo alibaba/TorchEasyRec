@@ -107,6 +107,7 @@ class AutoDisEmbedding(nn.Module):
             * sqrt(1 / num_channels)
         )
         self.leaky_relu = nn.LeakyReLU()
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, dense_input: Tensor):
         """Forward the module.
@@ -124,7 +125,7 @@ class AutoDisEmbedding(nn.Module):
         x_bar = (
             torch.einsum("nij,bnj->bni", self.proj_m, hidden) + self.keep_prob * hidden
         )  # shape [b, n, c]
-        x_hat = nn.Softmax(dim=-1)(x_bar / self.temperature)  # shape = [b, n, c]
+        x_hat = self.softmax(x_bar / self.temperature)  # shape = [b, n, c]
         emb = torch.einsum("ncd,bnc->bnd", self.meta_emb, x_hat)  # shape = [b, n, d]
         output = emb.reshape(
             (-1, self.num_dense_feature * self.embedding_dim)
