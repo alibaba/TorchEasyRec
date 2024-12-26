@@ -10,7 +10,6 @@
 # limitations under the License.
 
 from collections import OrderedDict, defaultdict
-from operator import itemgetter
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -35,9 +34,7 @@ from tzrec.acc.utils import is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.modules.dense_embedding_collection import (
-    AutoDisEmbeddingConfig,
     DenseEmbeddingCollection,
-    MLPDenseEmbeddingConfig,
 )
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
@@ -707,37 +704,16 @@ class EmbeddingGroupImpl(nn.Module):
                             self.has_dense_user = True
                         else:
                             self.has_dense = True
-                            if feature.autodis_config and feature.mlp_config:
-                                raise ValueError(
-                                    f"feature [{name}] can not be configured in\
-                                        both autodis and mlp embedding."
-                                )
                             dense_feature_names.append(name)
-                            if feature.autodis_config:
+
+                            if feature.dense_embedding_config:
                                 self.has_dense_embedding = True
-                                dense_embedding_feature_names.append(name)
-                                pb_conf = feature.autodis_config
-                                output_dim = pb_conf["embedding_dim"]
-                                dense_embedding_configs.append(
-                                    AutoDisEmbeddingConfig(
-                                        embedding_dim=pb_conf["embedding_dim"],
-                                        n_channels=pb_conf["num_channels"],
-                                        temperature=pb_conf["temperature"],
-                                        keep_prob=pb_conf["keep_prob"],
-                                        feature_names=[name],
-                                    )
+                                output_dim = (
+                                    feature.dense_embedding_config.embedding_dim
                                 )
-                            if feature.mlp_config:
-                                self.has_dense_embedding = True
                                 dense_embedding_feature_names.append(name)
-                                pb_conf = feature.mlp_config
-                                output_dim = pb_conf["embedding_dim"]
-                                dense_embedding_configs.append(
-                                    MLPDenseEmbeddingConfig(
-                                        embedding_dim=pb_conf["embedding_dim"],
-                                        feature_names=[name],
-                                    )
-                                )
+                                conf_obj = feature.dense_embedding_config
+                                dense_embedding_configs.append(conf_obj)
 
                 total_dim += output_dim
                 feature_output_dims[name] = output_dim
@@ -796,6 +772,17 @@ class EmbeddingGroupImpl(nn.Module):
                 self.dense_emb_collection = DenseEmbeddingCollection(
                     dense_embedding_configs, device=device
                 )
+                self.dense_emb_names = [
+                    f
+                    for g, flist in self._group_dense_embedding_feature_names.items()
+                    for f in flist
+                ]
+                self.non_emb_dense_feature_names = [
+                    f
+                    for g, flist in self._group_dense_feature_names.items()
+                    for f in flist
+                    if f not in self.dense_emb_names
+                ]
 
     def group_dims(self, group_name: str) -> List[int]:
         """Output dimension of each feature in a feature group."""
@@ -853,44 +840,19 @@ class EmbeddingGroupImpl(nn.Module):
 
         if self.has_dense:
             if self.has_dense_embedding:
-                dense_emb_names = [
-                    f
-                    for g, flist in self._group_dense_embedding_feature_names.items()
-                    for f in flist
-                ]
-                # autodis_dense_tensor = torch.concat(
-                #     itemgetter(*autodis_names)(dense_feature), dim=1
-                # )
-
-                # autodis_embeddings = self.autodis_module(autodis_dense_tensor)
-                # kts_autodis = KeyedTensor(
-                #     keys=autodis_names,
-                #     length_per_key=[self.autodis_module.embedding_dim]
-                #     * len(autodis_names),
-                #     values=autodis_embeddings,
-                #     key_dim=1,
-                # )
-
                 kts_dense = self.dense_emb_collection(dense_feature)
                 kts.append(kts_dense)
 
-                other_dense_feature_names = [
-                    f
-                    for g, flist in self._group_dense_feature_names.items()
-                    for f in flist
-                    if f not in dense_emb_names
-                ]
-                if len(other_dense_feature_names) > 0:
-                    other_dense_features = KeyedTensor(
-                        keys=other_dense_feature_names,
-                        length_per_key=[1] * len(other_dense_feature_names),
-                        values=torch.concat(
-                            itemgetter(*other_dense_feature_names)(dense_feature),
-                            dim=1,
-                        ),
+                if len(self.non_emb_dense_feature_names) > 0:
+                    non_emb_dense_features = KeyedTensor(
+                        keys=self.non_emb_dense_feature_names,
+                        length_per_key=[1] * len(self.non_emb_dense_feature_names),
+                        values=KeyedTensor.regroup_as_dict(
+                            [dense_feature], [self.non_emb_dense_feature_names], ["grp"]
+                        )["grp"],
                         key_dim=1,
                     )
-                    kts.append(other_dense_features)
+                    kts.append(non_emb_dense_features)
 
             else:
                 kts.append(dense_feature)

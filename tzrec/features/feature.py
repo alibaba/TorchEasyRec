@@ -46,6 +46,11 @@ from tzrec.datasets.utils import (
     ParsedData,
     SparseData,
 )
+from tzrec.modules.dense_embedding_collection import (
+    AutoDisEmbeddingConfig,
+    DenseEmbeddingConfig,
+    MLPDenseEmbeddingConfig,
+)
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
 from tzrec.utils import config_util
@@ -391,38 +396,37 @@ class BaseFeature(object, metaclass=_meta_cls):
             return None
 
     @property
-    def autodis_config(
+    def dense_embedding_config(
         self,
-    ) -> Optional[Dict]:
-        """Get config dict of the autodis feature."""
+    ) -> Optional[DenseEmbeddingConfig]:
+        """Get DenseEmbeddingConfig of the feature."""
         if not self.is_sparse:
-            atd_config = dict()
+            if hasattr(self.config, "autodis") and hasattr(self.config, "mlp"):
+                raise ValueError(
+                    f"feature [{self.name}] can not be configured in\
+                     both autodis and mlp embedding."
+                )
+
+            if self.value_dim > 1:
+                return None
+
             if hasattr(self.config, "autodis") and self.config.HasField("autodis"):
                 num_channels = self.config.autodis.num_channels
                 embedding_dim = self.config.autodis.embedding_dim
                 temperature = self.config.autodis.temperature
                 keep_prob = self.config.autodis.keep_prob
-                atd_config["num_channels"] = num_channels
-                atd_config["embedding_dim"] = embedding_dim
-                atd_config["temperature"] = temperature
-                atd_config["keep_prob"] = keep_prob
-                return atd_config
-            else:
-                return None
-        else:
-            return None
-
-    @property
-    def mlp_config(
-        self,
-    ) -> Optional[Dict]:
-        """Get config dict of the mlp dense feature."""
-        if not self.is_sparse:
-            mlp_config = dict()
-            if hasattr(self.config, "mlp") and self.config.HasField("mlp"):
+                return AutoDisEmbeddingConfig(
+                    embedding_dim=embedding_dim,
+                    n_channels=num_channels,
+                    temperature=temperature,
+                    keep_prob=keep_prob,
+                    feature_names=[self.name],
+                )
+            elif hasattr(self.config, "mlp") and self.config.HasField("mlp"):
                 embedding_dim = self.config.mlp.embedding_dim
-                mlp_config["embedding_dim"] = embedding_dim
-                return mlp_config
+                return MLPDenseEmbeddingConfig(
+                    embedding_dim=embedding_dim, feature_names=[self.name]
+                )
             else:
                 return None
         else:
