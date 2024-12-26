@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from math import sqrt
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import Tensor, nn
@@ -20,19 +20,27 @@ from torchrec.sparse.jagged_tensor import KeyedTensor
 class DenseEmbeddingConfig:
     """DenseEmbeddingConfig base class."""
 
-    def __init__(self, embedding_dim: int, feature_names: List[str]) -> None:
+    def __init__(
+        self, embedding_dim: int, feature_names: List[str], embedding_type: str
+    ) -> None:
         self.embedding_dim = embedding_dim
         self.feature_names = feature_names
+        self.embedding_type = embedding_type
+
+    def to_dict(self) -> Dict[str, Union[int, str, List[str]]]:
+        """Convert the config to a dict."""
+        raise NotImplementedError(
+            "Subclasses of DenseEmbeddingConfig should implement this."
+        )
 
 
 class MLPDenseEmbeddingConfig(DenseEmbeddingConfig):
     """MLPDenseEmbeddingConfig class."""
 
     def __init__(self, embedding_dim: int, feature_names: List[str]) -> None:
-        super().__init__(embedding_dim, feature_names)
-        self.embedding_type = "MLP"
+        super().__init__(embedding_dim, feature_names, "MLP")
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Union[int, str, List[str]]]:
         """Convert the config to a dict."""
         return {
             "embedding_dim": self.embedding_dim,
@@ -52,13 +60,12 @@ class AutoDisEmbeddingConfig(DenseEmbeddingConfig):
         keep_prob: float,
         feature_names: List[str],
     ) -> None:
-        super().__init__(embedding_dim, feature_names)
+        super().__init__(embedding_dim, feature_names, "AutoDis")
         self.n_channels = n_channels
         self.temperature = temperature
         self.keep_prob = keep_prob
-        self.embedding_type = "AutoDis"
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Union[int, str, float, List[str]]]:
         """Convert to a dict."""
         return {
             "embedding_dim": self.embedding_dim,
@@ -109,7 +116,7 @@ class AutoDisEmbedding(nn.Module):
         self.leaky_relu = nn.LeakyReLU()
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, dense_input: Tensor):
+    def forward(self, dense_input: Tensor) -> Tensor:
         """Forward the module.
 
         Args:
@@ -150,7 +157,7 @@ class MLPEmbedding(nn.Module):
             * sqrt(2 / (1 + embedding_dim))  # glorot normal initialization
         )
 
-    def forward(self, input: Tensor):
+    def forward(self, input: Tensor) -> Tensor:
         """Forward the module.
 
         Args:
@@ -166,7 +173,9 @@ class MLPEmbedding(nn.Module):
         )
 
 
-def merge_same_config_features(dict_list: List[Dict], keys: List[str]):
+def merge_same_config_features(
+    dict_list: List[Dict[str, Union[int, str, float, List[str]]]], keys: List[str]
+) -> List[Dict[str, Union[int, str, float, List[str]]]]:
     """Merge features with same configs.
 
     For example:
