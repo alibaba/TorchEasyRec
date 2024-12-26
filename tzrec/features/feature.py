@@ -412,7 +412,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                      both autodis and mlp embedding."
                 )
 
-            if self.config.value_dim > 1:
+            if hasattr(self.config, "value_dim") and self.config.value_dim > 1:
                 return None
 
             if hasattr(self.config, "autodis") and self.config.HasField("autodis"):
