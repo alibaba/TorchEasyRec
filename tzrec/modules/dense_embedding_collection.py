@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from operator import itemgetter
 from typing import Dict, List, Optional
 
 import torch
@@ -70,7 +69,7 @@ class AutoDisEmbeddingConfig(DenseEmbeddingConfig):
         }
 
 
-class AutoDisModule(nn.Module):
+class AutoDisEmbedding(nn.Module):
     """An Embedding Learning Framework for Numerical Features in CTR Prediction.
 
     https://arxiv.org/pdf/2012.08986
@@ -126,7 +125,7 @@ class AutoDisModule(nn.Module):
         return output
 
 
-class MLPModule(nn.Module):
+class MLPEmbedding(nn.Module):
     """MLP embedding for dense features."""
 
     def __init__(
@@ -224,9 +223,9 @@ class DenseEmbeddingCollection(nn.Module):
         )
 
         if len(self.mlp_grouped_configs) > 0:
-            self.mlp_module_list = nn.ModuleList(
+            self.mlp_emb_module_list = nn.ModuleList(
                 [
-                    MLPModule(
+                    MLPEmbedding(
                         num_dense_feature=len(
                             self.mlp_grouped_configs[i]["feature_names"]
                         ),
@@ -240,7 +239,7 @@ class DenseEmbeddingCollection(nn.Module):
         if len(self.autodis_grouped_configs) > 0:
             self.autodis_module_list = nn.ModuleList(
                 [
-                    AutoDisModule(
+                    AutoDisEmbedding(
                         num_dense_feature=len(
                             self.autodis_grouped_configs[i]["feature_names"]
                         ),
@@ -260,14 +259,14 @@ class DenseEmbeddingCollection(nn.Module):
         all_dense_names = []
         all_dense_dims = []
 
-        if hasattr(self, "mlp_module_list") and len(self.mlp_module_list) > 0:
+        if hasattr(self, "mlp_emb_module_list") and len(self.mlp_emb_module_list) > 0:
             mlp_emb_list = []
             for i, config in enumerate(self.mlp_grouped_configs):
-                feature_tensor = itemgetter(*(config["feature_names"]))(dense_feature)
-                if isinstance(feature_tensor, tuple):
-                    feature_tensor = torch.concat(feature_tensor, dim=1)
+                feature_tensor = KeyedTensor.regroup_as_dict(
+                    [dense_feature], [config["feature_names"]], ["grp"]
+                )["grp"]
                 mlp_emb_list.append(
-                    self.mlp_module_list[i](torch.unsqueeze(feature_tensor, dim=-1))
+                    self.mlp_emb_module_list[i](torch.unsqueeze(feature_tensor, dim=-1))
                 )
             mlp_emb = torch.cat(mlp_emb_list, dim=1)
             emb_list.append(mlp_emb)
@@ -289,9 +288,9 @@ class DenseEmbeddingCollection(nn.Module):
         if hasattr(self, "autodis_module_list") and len(self.autodis_module_list) > 0:
             autodis_emb_list = []
             for i, config in enumerate(self.autodis_grouped_configs):
-                feature_tensor = itemgetter(*config["feature_names"])(dense_feature)
-                if isinstance(feature_tensor, tuple):
-                    feature_tensor = torch.concat(feature_tensor, dim=1)
+                feature_tensor = KeyedTensor.regroup_as_dict(
+                    [dense_feature], [config["feature_names"]], ["grp"]
+                )["grp"]
                 autodis_emb_list.append(self.autodis_module_list[i](feature_tensor))
             autodis_emb = torch.cat(autodis_emb_list, dim=1)
             emb_list.append(autodis_emb)
