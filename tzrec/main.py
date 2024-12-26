@@ -1055,7 +1055,7 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = data_config.num_workers
+        predict_threads = max(data_config.num_workers, 1)
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[
         Tuple[Optional[Dict[str, torch.Tensor]], Optional[RecordBatchTensor]]
