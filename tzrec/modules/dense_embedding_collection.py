@@ -93,11 +93,17 @@ class AutoDisEmbedding(nn.Module):
         self.meta_emb = nn.Parameter(
             torch.randn(num_dense_feature, num_channels, embedding_dim, device=device)
         )
+
+        # glorot normal initialization, std = sqrt(2 /(1+c))
         self.proj_w = nn.Parameter(
             torch.randn(num_dense_feature, num_channels, device=device)
+            * torch.sqrt(2 / (1 + num_channels))
         )
+
+        # glorot normal initialization, std = sqrt(2 /(c+c))
         self.proj_m = nn.Parameter(
             torch.randn(num_dense_feature, num_channels, num_channels, device=device)
+            * torch.sqrt(1 / num_channels)
         )
         self.leaky_relu = nn.LeakyReLU()
 
@@ -139,6 +145,7 @@ class MLPEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.proj_w = nn.Parameter(
             torch.randn(num_dense_feature, embedding_dim, 1, device=device)
+            * torch.sqrt(2 / (1 + embedding_dim))  # glorot normal initialization
         )
 
     def forward(self, input: Tensor):
