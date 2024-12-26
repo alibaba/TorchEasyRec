@@ -401,13 +401,13 @@ class BaseFeature(object, metaclass=_meta_cls):
     ) -> Optional[DenseEmbeddingConfig]:
         """Get DenseEmbeddingConfig of the feature."""
         if not self.is_sparse:
-            if hasattr(self.config, "autodis") and hasattr(self.config, "mlp"):
+            if self.config.HasField("autodis") and self.config.HasField("mlp"):
                 raise ValueError(
                     f"feature [{self.name}] can not be configured in\
                      both autodis and mlp embedding."
                 )
 
-            if self.value_dim > 1:
+            if self.config.value_dim > 1:
                 return None
 
             if hasattr(self.config, "autodis") and self.config.HasField("autodis"):
