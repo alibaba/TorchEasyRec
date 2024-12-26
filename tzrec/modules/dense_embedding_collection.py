@@ -27,7 +27,7 @@ class DenseEmbeddingConfig:
         self.feature_names = feature_names
         self.embedding_type = embedding_type
 
-    def to_dict(self) -> Dict[str, Union[int, str, List[str]]]:
+    def to_dict(self) -> Dict[str, Union[int, str, float, List[str]]]:
         """Convert the config to a dict."""
         raise NotImplementedError(
             "Subclasses of DenseEmbeddingConfig should implement this."
@@ -40,7 +40,7 @@ class MLPDenseEmbeddingConfig(DenseEmbeddingConfig):
     def __init__(self, embedding_dim: int, feature_names: List[str]) -> None:
         super().__init__(embedding_dim, feature_names, "MLP")
 
-    def to_dict(self) -> Dict[str, Union[int, str, List[str]]]:
+    def to_dict(self) -> Dict[str, Union[int, str, float, List[str]]]:
         """Convert the config to a dict."""
         return {
             "embedding_dim": self.embedding_dim,
