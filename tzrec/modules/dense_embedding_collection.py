@@ -222,6 +222,9 @@ class DenseEmbeddingCollection(nn.Module):
             keys=["embedding_dim", "n_channels", "keep_prob", "temperature"],
         )
 
+        self.all_dense_names = []
+        self.all_dense_dims = []
+
         if len(self.mlp_grouped_configs) > 0:
             self.mlp_emb_module_list = nn.ModuleList(
                 [
@@ -235,6 +238,19 @@ class DenseEmbeddingCollection(nn.Module):
                     for i in range(len(self.mlp_grouped_configs))
                 ]
             )
+            mlp_names = [
+                name
+                for conf in self.mlp_grouped_configs
+                for name in conf["feature_names"]
+            ]
+            mlp_dims = [
+                dim
+                for conf in self.mlp_grouped_configs
+                for dim in [conf["embedding_dim"]] * len(conf["feature_names"])
+            ]
+
+            self.all_dense_names.extend(mlp_names)
+            self.all_dense_dims.extend(mlp_dims)
 
         if len(self.autodis_grouped_configs) > 0:
             self.autodis_module_list = nn.ModuleList(
@@ -252,12 +268,23 @@ class DenseEmbeddingCollection(nn.Module):
                     for i in range(len(self.autodis_grouped_configs))
                 ]
             )
+            autodis_names = [
+                name
+                for conf in self.autodis_grouped_configs
+                for name in conf["feature_names"]
+            ]
+            autodis_dims = [
+                dim
+                for conf in self.autodis_grouped_configs
+                for dim in [conf["embedding_dim"]] * len(conf["feature_names"])
+            ]
+
+            self.all_dense_names.extend(autodis_names)
+            self.all_dense_dims.extend(autodis_dims)
 
     def forward(self, dense_feature: KeyedTensor) -> KeyedTensor:
         """Forward the module."""
         emb_list = []
-        all_dense_names = []
-        all_dense_dims = []
 
         if hasattr(self, "mlp_emb_module_list") and len(self.mlp_emb_module_list) > 0:
             mlp_emb_list = []
@@ -271,20 +298,6 @@ class DenseEmbeddingCollection(nn.Module):
             mlp_emb = torch.cat(mlp_emb_list, dim=1)
             emb_list.append(mlp_emb)
 
-            mlp_names = [
-                name
-                for conf in self.mlp_grouped_configs
-                for name in conf["feature_names"]
-            ]
-            mlp_dims = [
-                dim
-                for conf in self.mlp_grouped_configs
-                for dim in [conf["embedding_dim"]] * len(conf["feature_names"])
-            ]
-
-            all_dense_names.extend(mlp_names)
-            all_dense_dims.extend(mlp_dims)
-
         if hasattr(self, "autodis_module_list") and len(self.autodis_module_list) > 0:
             autodis_emb_list = []
             for i, config in enumerate(self.autodis_grouped_configs):
@@ -295,23 +308,9 @@ class DenseEmbeddingCollection(nn.Module):
             autodis_emb = torch.cat(autodis_emb_list, dim=1)
             emb_list.append(autodis_emb)
 
-            autodis_names = [
-                name
-                for conf in self.autodis_grouped_configs
-                for name in conf["feature_names"]
-            ]
-            autodis_dims = [
-                dim
-                for conf in self.autodis_grouped_configs
-                for dim in [conf["embedding_dim"]] * len(conf["feature_names"])
-            ]
-
-            all_dense_names.extend(autodis_names)
-            all_dense_dims.extend(autodis_dims)
-
         kts_dense_emb = KeyedTensor(
-            keys=all_dense_names,
-            length_per_key=all_dense_dims,
+            keys=self.all_dense_names,
+            length_per_key=self.all_dense_dims,
             values=torch.cat(emb_list, dim=1),
             key_dim=1,
         )

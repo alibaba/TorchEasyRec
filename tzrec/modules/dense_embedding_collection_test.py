@@ -68,7 +68,7 @@ class DenseEmbeddingCollectionTest(unittest.TestCase):
         ]
 
         emb_collection = DenseEmbeddingCollection(emb_dense_configs)
-        # emb_collection = create_test_module(emb_collection, graph_type)
+        emb_collection = create_test_module(emb_collection, graph_type)
 
         batch_size = 4
         dense_feature = KeyedTensor(
@@ -102,7 +102,7 @@ class DenseEmbeddingCollectionTest(unittest.TestCase):
         ]
 
         emb_collection = DenseEmbeddingCollection(emb_dense_configs)
-        # emb_collection = create_test_module(emb_collection, graph_type)
+        emb_collection = create_test_module(emb_collection, graph_type)
 
         batch_size = 4
         dense_feature = KeyedTensor(
