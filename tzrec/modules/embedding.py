@@ -385,12 +385,12 @@ class EmbeddingGroup(nn.Module):
                 if key + "_user" in batch.dense_features.keys():
                     kt = batch.dense_features[key + "_user"]
                     kt_keys.extend(kt.keys())
-                    kt_length_per_key(kt.length_per_key())
+                    kt_length_per_key.extend(kt.length_per_key())
                     kt_values.append(kt.values().tile(batch.batch_size, 1))
                 elif key + "_item" in batch.dense_features.keys():
                     kt = batch.dense_features[key + "_item"]
                     kt_keys.extend(kt.keys())
-                    kt_length_per_key(kt.length_per_key())
+                    kt_length_per_key.extend(kt.length_per_key())
                     kt_values.append(kt.values().tile(batch.batch_size, 1))
                 batch.dense_features[key] = KeyedTensor(
                     keys=kt_keys,

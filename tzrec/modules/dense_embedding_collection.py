@@ -161,7 +161,7 @@ class MLPEmbedding(nn.Module):
         self.num_dense_feature = num_dense_feature
         self.embedding_dim = embedding_dim
         self.proj_w = nn.Parameter(
-            torch.randn(num_dense_feature, embedding_dim, 1, device=device)
+            torch.randn(num_dense_feature, embedding_dim, device=device)
             * sqrt(2 / (1 + embedding_dim))  # glorot normal initialization
         )
 
@@ -169,14 +169,14 @@ class MLPEmbedding(nn.Module):
         """Forward the module.
 
         Args:
-            input (Tensor): dense input feature, shape = [b, n, 1],
+            input (Tensor): dense input feature, shape = [b, n],
                 where b is batch_size, n is the number of dense features.
 
         Returns:
             output (Tensor): Tensor of mlp embedding, shape = [b, n * d],
                 where d is the embedding_dim.
         """
-        return torch.einsum("nij,bnj->bni", self.proj_w, input).reshape(
+        return torch.einsum("ni,bn->bni", self.proj_w, input).reshape(
             (-1, self.num_dense_feature * self.embedding_dim)
         )
 
@@ -215,8 +215,8 @@ def merge_same_config_features(
             unique_dict[conf.group_key] = copy.copy(conf)
 
     for key in unique_dict:
-        unique_dict[key].feature_names = list(
-            sorted(set(unique_dict[key].feature_names))
+        unique_dict[key].feature_names = sorted(
+            list(set(unique_dict[key].feature_names))
         )
 
     unique_list = list(unique_dict.values())
@@ -238,7 +238,7 @@ class DenseEmbeddingCollection(nn.Module):
         self,
         emb_dense_configs: List[DenseEmbeddingConfig],
         device: Optional[torch.device] = None,
-        raw_dense_feature_to_dim: Optional[Dict[str, int]] = False,
+        raw_dense_feature_to_dim: Optional[Dict[str, int]] = None,
     ) -> None:
         super(DenseEmbeddingCollection, self).__init__()
 
@@ -274,11 +274,14 @@ class DenseEmbeddingCollection(nn.Module):
             self.all_dense_dims.extend([embedding_dim] * len(feature_names))
             self._group_to_feature_names[conf.group_key] = feature_names
 
-        if self._raw_dense_feature_to_dim:
-            feature_names = list(raw_dense_feature_to_dim.keys())
-            self._group_to_feature_names["raw_dense_group"] = feature_names
+        if raw_dense_feature_to_dim is not None and len(raw_dense_feature_to_dim) > 0:
+            feature_names, feature_dims = (
+                list(raw_dense_feature_to_dim.keys()),
+                list(raw_dense_feature_to_dim.values()),
+            )
+            self._group_to_feature_names["__raw_dense_group__"] = feature_names
             self.all_dense_names.extend(feature_names)
-            self.all_dense_dims.extend(list(raw_dense_feature_to_dim.values()))
+            self.all_dense_dims.extend(feature_dims)
 
     def forward(self, dense_feature: KeyedTensor) -> KeyedTensor:
         """Forward the module."""
@@ -292,7 +295,7 @@ class DenseEmbeddingCollection(nn.Module):
             emb_list.append(emb_module(grouped_features[group_key]))
 
         if self._raw_dense_feature_to_dim:
-            emb_list.append(grouped_features["raw_dense_group"])
+            emb_list.append(grouped_features["__raw_dense_group__"])
 
         kts_dense_emb = KeyedTensor(
             keys=self.all_dense_names,
