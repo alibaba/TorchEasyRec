@@ -83,7 +83,7 @@ class RawFeature(BaseFeature):
             dense_emb_type = self.config.WhichOneof("dense_emb")
             if dense_emb_type:
                 dense_emb_config = getattr(self.config, dense_emb_type)
-                if hasattr(self.config, "value_dim") and self.config.value_dim > 1:
+                if self.config.value_dim > 1:
                     return ValueError(
                         "autodis and mlp embedding do not support feature "
                         f"[{self.name}] with value dim > 1 now."
