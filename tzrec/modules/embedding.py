@@ -33,6 +33,9 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, Keyed
 from tzrec.acc.utils import is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.modules.dense_embedding_collection import (
+    DenseEmbeddingCollection,
+)
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
@@ -579,11 +582,14 @@ class EmbeddingGroupImpl(nn.Module):
         self.has_mc_sparse_user = False
         self.has_dense = False
         self.has_dense_user = False
+        self.has_dense_embedding = False
 
         self._group_to_feature_names = OrderedDict()
         self._group_to_shared_feature_names = OrderedDict()
         self._group_total_dim = dict()
         self._group_feature_output_dims = dict()
+        self._group_dense_feature_names = dict()
+        self._group_dense_embedding_feature_names = dict()
 
         feat_to_group_to_emb_name = defaultdict(dict)
         for feature_group in feature_groups:
@@ -614,13 +620,15 @@ class EmbeddingGroupImpl(nn.Module):
         mc_modules_item = OrderedDict()
         mc_modules_user = OrderedDict()
 
+        dense_feature_names = []
+        dense_embedding_feature_names = []
+        dense_embedding_configs = []
         for feature_group in feature_groups:
             total_dim = 0
             feature_output_dims = OrderedDict()
             group_name = feature_group.group_name
             feature_names = list(feature_group.feature_names)
             shared_feature_names = []
-
             is_wide = feature_group.group_type == model_pb2.WIDE
             for name in feature_names:
                 shared_name = name
@@ -685,7 +693,7 @@ class EmbeddingGroupImpl(nn.Module):
                         shared_name = shared_name + "@" + emb_bag_config.name
                 else:
                     output_dim = feature.output_dim
-                    # TODO (hongsheng.jhs) make dense feature support embedding_dim
+
                     if is_wide:
                         raise ValueError(
                             f"dense feature [{name}] should not be configured in "
@@ -696,6 +704,17 @@ class EmbeddingGroupImpl(nn.Module):
                             self.has_dense_user = True
                         else:
                             self.has_dense = True
+                            dense_feature_names.append(name)
+
+                            if feature.dense_embedding_config:
+                                self.has_dense_embedding = True
+                                output_dim = (
+                                    feature.dense_embedding_config.embedding_dim
+                                )
+                                dense_embedding_feature_names.append(name)
+                                conf_obj = feature.dense_embedding_config
+                                dense_embedding_configs.append(conf_obj)
+
                 total_dim += output_dim
                 feature_output_dims[name] = output_dim
                 shared_feature_names.append(shared_name)
@@ -704,6 +723,12 @@ class EmbeddingGroupImpl(nn.Module):
                 self._group_to_shared_feature_names[group_name] = shared_feature_names
             self._group_total_dim[group_name] = total_dim
             self._group_feature_output_dims[group_name] = feature_output_dims
+            # self._group_autodis_feature_names[group_name] = autodis_feature_names
+            self._group_dense_feature_names[group_name] = dense_feature_names
+            # self._group_autodis_feature_confs[group_name] = autodis_configs
+            self._group_dense_embedding_feature_names[group_name] = (
+                dense_embedding_feature_names
+            )
 
         if input_tile_emb:
             self.ebc_user = EmbeddingBagCollection(
@@ -743,6 +768,21 @@ class EmbeddingGroupImpl(nn.Module):
                         mc_modules, list(mc_emb_bag_configs.values())
                     ),
                 )
+            if self.has_dense_embedding:
+                self.dense_emb_collection = DenseEmbeddingCollection(
+                    dense_embedding_configs, device=device
+                )
+                self.dense_emb_names = [
+                    f
+                    for g, flist in self._group_dense_embedding_feature_names.items()
+                    for f in flist
+                ]
+                self.non_emb_dense_feature_names = [
+                    f
+                    for g, flist in self._group_dense_feature_names.items()
+                    for f in flist
+                    if f not in self.dense_emb_names
+                ]
 
     def group_dims(self, group_name: str) -> List[int]:
         """Output dimension of each feature in a feature group."""
@@ -799,7 +839,23 @@ class EmbeddingGroupImpl(nn.Module):
             kts.append(keyed_tensor_user_tile)
 
         if self.has_dense:
-            kts.append(dense_feature)
+            if self.has_dense_embedding:
+                kts_dense = self.dense_emb_collection(dense_feature)
+                kts.append(kts_dense)
+
+                if len(self.non_emb_dense_feature_names) > 0:
+                    non_emb_dense_features = KeyedTensor(
+                        keys=self.non_emb_dense_feature_names,
+                        length_per_key=[1] * len(self.non_emb_dense_feature_names),
+                        values=KeyedTensor.regroup_as_dict(
+                            [dense_feature], [self.non_emb_dense_feature_names], ["grp"]
+                        )["grp"],
+                        key_dim=1,
+                    )
+                    kts.append(non_emb_dense_features)
+
+            else:
+                kts.append(dense_feature)
 
         if self.has_dense_user:
             kts.append(dense_feature_user)

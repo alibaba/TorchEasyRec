@@ -46,6 +46,11 @@ from tzrec.datasets.utils import (
     ParsedData,
     SparseData,
 )
+from tzrec.modules.dense_embedding_collection import (
+    AutoDisEmbeddingConfig,
+    DenseEmbeddingConfig,
+    MLPDenseEmbeddingConfig,
+)
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
 from tzrec.utils import config_util
@@ -387,6 +392,48 @@ class BaseFeature(object, metaclass=_meta_cls):
                 feature_names=[self.name],
                 init_fn=init_fn,
             )
+        else:
+            return None
+
+    @property
+    def dense_embedding_config(
+        self,
+    ) -> Optional[DenseEmbeddingConfig]:
+        """Get DenseEmbeddingConfig of the feature."""
+        if not self.is_sparse:
+            if (
+                hasattr(self.config, "autodis")
+                and self.config.HasField("autodis")
+                and hasattr(self.config, "mlp")
+                and self.config.HasField("mlp")
+            ):
+                raise ValueError(
+                    f"feature [{self.name}] can not be configured in\
+                     both autodis and mlp embedding."
+                )
+
+            if hasattr(self.config, "value_dim") and self.config.value_dim > 1:
+                return None
+
+            if hasattr(self.config, "autodis") and self.config.HasField("autodis"):
+                num_channels = self.config.autodis.num_channels
+                embedding_dim = self.config.autodis.embedding_dim
+                temperature = self.config.autodis.temperature
+                keep_prob = self.config.autodis.keep_prob
+                return AutoDisEmbeddingConfig(
+                    embedding_dim=embedding_dim,
+                    n_channels=num_channels,
+                    temperature=temperature,
+                    keep_prob=keep_prob,
+                    feature_names=[self.name],
+                )
+            elif hasattr(self.config, "mlp") and self.config.HasField("mlp"):
+                embedding_dim = self.config.mlp.embedding_dim
+                return MLPDenseEmbeddingConfig(
+                    embedding_dim=embedding_dim, feature_names=[self.name]
+                )
+            else:
+                return None
         else:
             return None
 
