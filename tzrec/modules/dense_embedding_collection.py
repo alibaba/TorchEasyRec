@@ -9,26 +9,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+from collections import OrderedDict
+from enum import Enum
 from math import sqrt
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import torch
 from torch import Tensor, nn
 from torchrec.sparse.jagged_tensor import KeyedTensor
 
 
+class DenseEmbeddingType(Enum):
+    """Dense Embedding Type."""
+
+    MLP = 0
+    AUTO_DIS = 1
+
+
 class DenseEmbeddingConfig:
     """DenseEmbeddingConfig base class."""
 
     def __init__(
-        self, embedding_dim: int, feature_names: List[str], embedding_type: str
+        self,
+        embedding_dim: int,
+        feature_names: List[str],
+        embedding_type: DenseEmbeddingType,
     ) -> None:
         self.embedding_dim = embedding_dim
         self.feature_names = feature_names
         self.embedding_type = embedding_type
 
-    def to_dict(self) -> Dict[str, Union[int, str, float, List[str]]]:
-        """Convert the config to a dict."""
+    @property
+    def group_key(self) -> str:
+        """Config group key."""
         raise NotImplementedError(
             "Subclasses of DenseEmbeddingConfig should implement this."
         )
@@ -38,15 +52,12 @@ class MLPDenseEmbeddingConfig(DenseEmbeddingConfig):
     """MLPDenseEmbeddingConfig class."""
 
     def __init__(self, embedding_dim: int, feature_names: List[str]) -> None:
-        super().__init__(embedding_dim, feature_names, "MLP")
+        super().__init__(embedding_dim, feature_names, DenseEmbeddingType.MLP)
 
-    def to_dict(self) -> Dict[str, Union[int, str, float, List[str]]]:
-        """Convert the config to a dict."""
-        return {
-            "embedding_dim": self.embedding_dim,
-            "embedding_type": self.embedding_type,
-            "feature_names": self.feature_names,
-        }
+    @property
+    def group_key(self) -> str:
+        """Config group key."""
+        return f"mlp_{self.embedding_dim}"
 
 
 class AutoDisEmbeddingConfig(DenseEmbeddingConfig):
@@ -60,21 +71,18 @@ class AutoDisEmbeddingConfig(DenseEmbeddingConfig):
         keep_prob: float,
         feature_names: List[str],
     ) -> None:
-        super().__init__(embedding_dim, feature_names, "AutoDis")
+        super().__init__(embedding_dim, feature_names, DenseEmbeddingType.AUTO_DIS)
         self.n_channels = n_channels
         self.temperature = temperature
         self.keep_prob = keep_prob
 
-    def to_dict(self) -> Dict[str, Union[int, str, float, List[str]]]:
-        """Convert to a dict."""
-        return {
-            "embedding_dim": self.embedding_dim,
-            "n_channels": self.n_channels,
-            "temperature": self.temperature,
-            "keep_prob": self.keep_prob,
-            "embedding_type": self.embedding_type,
-            "feature_names": self.feature_names,
-        }
+    @property
+    def group_key(self) -> str:
+        """Config group key."""
+        return (
+            f"autodis#{self.embedding_dim}#{self.n_channels}#{self.keep_prob}"
+            f"#{self.temperature}".replace(".", "_")
+        )
 
 
 class AutoDisEmbedding(nn.Module):
@@ -174,21 +182,21 @@ class MLPEmbedding(nn.Module):
 
 
 def merge_same_config_features(
-    dict_list: List[Dict[str, Union[int, str, float, List[str]]]], keys: List[str]
-) -> List[Dict[str, Union[int, str, float, List[str]]]]:
-    """Merge features with same configs.
+    conf_list: List[DenseEmbeddingConfig],
+) -> List[DenseEmbeddingConfig]:
+    """Merge features with same group_key configs.
 
     For example:
 
-    dict_list = [
+        conf_list: List[DenseEmbeddingConfig]
+    = [
         {'embedding_dim': 128, 'n_channels': 32, 'keep_prob': 0.5,
             'temperature': 1.0, 'feature_names': ['f1']},
         {'embedding_dim': 128, 'n_channels': 32, 'keep_prob': 0.5,
             'temperature': 1.0, 'feature_names': ['f2', 'f3']},
         {'embedding_dim': 256, 'n_channels': 64, 'keep_prob': 0.5,
             'temperature': 0.8, 'feature_names': ['f4']}
-    ],
-    keys = ['embedding_dim', 'n_channels', 'keep_prob', 'temperature']
+    ]
 
     will be merged as:
         [
@@ -200,131 +208,91 @@ def merge_same_config_features(
     """
     unique_dict = {}
 
-    for item in dict_list:
-        key = tuple(item[k] for k in keys)
-        if key in unique_dict:
-            unique_dict[key]["feature_names"].extend(item["feature_names"])
+    for conf in conf_list:
+        if conf.group_key in unique_dict:
+            unique_dict[conf.group_key].feature_names.extend(conf.feature_names)
         else:
-            unique_dict[key] = item.copy()
+            unique_dict[conf.group_key] = copy.copy(conf)
 
     for key in unique_dict:
-        unique_dict[key]["feature_names"] = list(set(unique_dict[key]["feature_names"]))
+        unique_dict[key].feature_names = list(
+            sorted(set(unique_dict[key].feature_names))
+        )
 
     unique_list = list(unique_dict.values())
     return unique_list
 
 
 class DenseEmbeddingCollection(nn.Module):
-    """DenseEmbeddingCollection module."""
+    """DenseEmbeddingCollection module.
+
+    Args:
+        emb_dense_configs (list): list of DenseEmbeddingConfig.
+        device (torch.device): embedding device, default is meta.
+        raw_dense_feature_to_dim (dict): a feature_name to feature dim dict for
+            raw dense features do not need to do embedding. If specified,
+            the returned keyed tensor will also include these features.
+    """
 
     def __init__(
         self,
         emb_dense_configs: List[DenseEmbeddingConfig],
         device: Optional[torch.device] = None,
+        raw_dense_feature_to_dim: Optional[Dict[str, int]] = False,
     ) -> None:
         super(DenseEmbeddingCollection, self).__init__()
 
         self.emb_dense_configs = emb_dense_configs
-        mlp_configs, autodis_configs = [], []
-        for config in emb_dense_configs:
-            if config.embedding_type == "MLP":
-                mlp_configs.append(config.to_dict())
-            elif config.embedding_type == "AutoDis":
-                autodis_configs.append(config.to_dict())
+        self._raw_dense_feature_to_dim = raw_dense_feature_to_dim
 
-        self.mlp_grouped_configs = merge_same_config_features(
-            mlp_configs, keys=["embedding_dim"]
-        )
-        self.autodis_grouped_configs = merge_same_config_features(
-            autodis_configs,
-            keys=["embedding_dim", "n_channels", "keep_prob", "temperature"],
-        )
+        self.grouped_configs = merge_same_config_features(emb_dense_configs)
 
         self.all_dense_names = []
         self.all_dense_dims = []
+        self._group_to_feature_names = OrderedDict()
 
-        if len(self.mlp_grouped_configs) > 0:
-            self.mlp_emb_module_list = nn.ModuleList(
-                [
-                    MLPEmbedding(
-                        num_dense_feature=len(
-                            self.mlp_grouped_configs[i]["feature_names"]
-                        ),
-                        embedding_dim=self.mlp_grouped_configs[i]["embedding_dim"],
-                        device=device,
-                    )
-                    for i in range(len(self.mlp_grouped_configs))
-                ]
-            )
-            mlp_names = [
-                name
-                for conf in self.mlp_grouped_configs
-                for name in conf["feature_names"]
-            ]
-            mlp_dims = [
-                dim
-                for conf in self.mlp_grouped_configs
-                for dim in [conf["embedding_dim"]] * len(conf["feature_names"])
-            ]
+        self.dense_embs = nn.ModuleDict()
+        for conf in self.grouped_configs:
+            feature_names = conf.feature_names
+            embedding_dim = conf.embedding_dim
+            if conf.embedding_type == DenseEmbeddingType.MLP:
+                self.dense_embs[conf.group_key] = MLPEmbedding(
+                    num_dense_feature=len(feature_names),
+                    embedding_dim=embedding_dim,
+                    device=device,
+                )
+            elif conf.embedding_type == DenseEmbeddingType.AUTO_DIS:
+                self.dense_embs[conf.group_key] = AutoDisEmbedding(
+                    num_dense_feature=len(feature_names),
+                    embedding_dim=embedding_dim,
+                    num_channels=conf.n_channels,
+                    temperature=conf.temperature,
+                    keep_prob=conf.keep_prob,
+                    device=device,
+                )
+            self.all_dense_names.extend(feature_names)
+            self.all_dense_dims.extend([embedding_dim] * len(feature_names))
+            self._group_to_feature_names[conf.group_key] = feature_names
 
-            self.all_dense_names.extend(mlp_names)
-            self.all_dense_dims.extend(mlp_dims)
-
-        if len(self.autodis_grouped_configs) > 0:
-            self.autodis_module_list = nn.ModuleList(
-                [
-                    AutoDisEmbedding(
-                        num_dense_feature=len(
-                            self.autodis_grouped_configs[i]["feature_names"]
-                        ),
-                        embedding_dim=self.autodis_grouped_configs[i]["embedding_dim"],
-                        num_channels=self.autodis_grouped_configs[i]["n_channels"],
-                        temperature=self.autodis_grouped_configs[i]["temperature"],
-                        keep_prob=self.autodis_grouped_configs[i]["keep_prob"],
-                        device=device,
-                    )
-                    for i in range(len(self.autodis_grouped_configs))
-                ]
-            )
-            autodis_names = [
-                name
-                for conf in self.autodis_grouped_configs
-                for name in conf["feature_names"]
-            ]
-            autodis_dims = [
-                dim
-                for conf in self.autodis_grouped_configs
-                for dim in [conf["embedding_dim"]] * len(conf["feature_names"])
-            ]
-
-            self.all_dense_names.extend(autodis_names)
-            self.all_dense_dims.extend(autodis_dims)
+        if self._raw_dense_feature_to_dim:
+            feature_names = list(raw_dense_feature_to_dim.keys())
+            self._group_to_feature_names["raw_dense_group"] = feature_names
+            self.all_dense_names.extend(feature_names)
+            self.all_dense_dims.extend(list(raw_dense_feature_to_dim.values()))
 
     def forward(self, dense_feature: KeyedTensor) -> KeyedTensor:
         """Forward the module."""
+        grouped_features = KeyedTensor.regroup_as_dict(
+            [dense_feature],
+            list(self._group_to_feature_names.values()),
+            list(self._group_to_feature_names.keys()),
+        )
         emb_list = []
+        for group_key, emb_module in self.dense_embs.items():
+            emb_list.append(emb_module(grouped_features[group_key]))
 
-        if hasattr(self, "mlp_emb_module_list") and len(self.mlp_emb_module_list) > 0:
-            mlp_emb_list = []
-            for i, config in enumerate(self.mlp_grouped_configs):
-                feature_tensor = KeyedTensor.regroup_as_dict(
-                    [dense_feature], [config["feature_names"]], ["grp"]
-                )["grp"]
-                mlp_emb_list.append(
-                    self.mlp_emb_module_list[i](torch.unsqueeze(feature_tensor, dim=-1))
-                )
-            mlp_emb = torch.cat(mlp_emb_list, dim=1)
-            emb_list.append(mlp_emb)
-
-        if hasattr(self, "autodis_module_list") and len(self.autodis_module_list) > 0:
-            autodis_emb_list = []
-            for i, config in enumerate(self.autodis_grouped_configs):
-                feature_tensor = KeyedTensor.regroup_as_dict(
-                    [dense_feature], [config["feature_names"]], ["grp"]
-                )["grp"]
-                autodis_emb_list.append(self.autodis_module_list[i](feature_tensor))
-            autodis_emb = torch.cat(autodis_emb_list, dim=1)
-            emb_list.append(autodis_emb)
+        if self._raw_dense_feature_to_dim:
+            emb_list.append(grouped_features["raw_dense_group"])
 
         kts_dense_emb = KeyedTensor(
             keys=self.all_dense_names,

@@ -83,11 +83,9 @@ def update_state_dict_for_input_tile(state_dict: Dict[str, torch.Tensor]) -> Non
     """
     input_tile_keys = [
         ".ebc_user.embedding_bags.",
-        ".ebc_item.embedding_bags.",
     ]
     input_tile_keys_ec = [
         ".ec_list_user.",
-        ".ec_list_item.",
     ]
 
     for key, dst_tensor in state_dict.items():
