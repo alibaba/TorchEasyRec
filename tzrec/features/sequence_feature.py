@@ -25,6 +25,7 @@ from tzrec.datasets.utils import (
 from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
 from tzrec.features.id_feature import FgMode, IdFeature
 from tzrec.features.raw_feature import RawFeature
+from tzrec.modules.dense_embedding_collection import DenseEmbeddingConfig
 from tzrec.protos import feature_pb2
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.utils.logging_util import logger
@@ -396,6 +397,14 @@ class SequenceRawFeature(RawFeature):
     def is_grouped_sequence(self) -> bool:
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
+
+    @property
+    def dense_emb_config(
+        self,
+    ) -> Optional[DenseEmbeddingConfig]:
+        """Get DenseEmbeddingConfig of the feature."""
+        # TODO: sequence dense feature not support now.
+        return None
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""

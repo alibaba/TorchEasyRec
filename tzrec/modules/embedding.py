@@ -668,9 +668,9 @@ class EmbeddingGroupImpl(nn.Module):
                         )
                     else:
                         self.has_dense = True
-                        if feature.dense_embedding_config:
+                        if feature.dense_emb_config:
                             self.has_dense_embedding = True
-                            conf_obj = feature.dense_embedding_config
+                            conf_obj = feature.dense_emb_config
                             dense_embedding_configs.append(conf_obj)
                         else:
                             non_emb_dense_feature_to_dim[name] = output_dim

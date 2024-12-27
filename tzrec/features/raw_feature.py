@@ -24,6 +24,11 @@ from tzrec.features.feature import (
     _parse_fg_encoded_dense_feature_impl,
     _parse_fg_encoded_sparse_feature_impl,
 )
+from tzrec.modules.dense_embedding_collection import (
+    AutoDisEmbeddingConfig,
+    DenseEmbeddingConfig,
+    MLPDenseEmbeddingConfig,
+)
 from tzrec.protos.feature_pb2 import FeatureConfig
 
 
@@ -52,7 +57,7 @@ class RawFeature(BaseFeature):
     @property
     def output_dim(self) -> int:
         """Output dimension of the feature."""
-        if self.is_sparse:
+        if self.is_sparse or self.dense_emb_config is not None:
             return self.config.embedding_dim
         else:
             return self.config.value_dim
@@ -68,6 +73,37 @@ class RawFeature(BaseFeature):
     def num_embeddings(self) -> int:
         """Get embedding row count."""
         return len(self.config.boundaries) + 1
+
+    @property
+    def dense_emb_config(
+        self,
+    ) -> Optional[DenseEmbeddingConfig]:
+        """Get DenseEmbeddingConfig of the feature."""
+        if not self.is_sparse:
+            dense_emb_type = self.config.WhichOneof("dense_emb")
+            if dense_emb_type:
+                dense_emb_config = getattr(self.config, dense_emb_type)
+                if hasattr(self.config, "value_dim") and self.config.value_dim > 1:
+                    return ValueError(
+                        "autodis and mlp embedding do not support feature "
+                        f"[{self.name}] with value dim > 1 now."
+                    )
+
+                if dense_emb_type == "autodis":
+                    return AutoDisEmbeddingConfig(
+                        embedding_dim=self.config.embedding_dim,
+                        n_channels=dense_emb_config.num_channels,
+                        temperature=dense_emb_config.temperature,
+                        keep_prob=dense_emb_config.keep_prob,
+                        feature_names=[self.name],
+                    )
+                elif dense_emb_type == "mlp":
+                    return MLPDenseEmbeddingConfig(
+                        embedding_dim=self.config.embedding_dim,
+                        feature_names=[self.name],
+                    )
+
+        return None
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
