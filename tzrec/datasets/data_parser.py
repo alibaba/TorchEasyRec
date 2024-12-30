@@ -311,9 +311,9 @@ class DataParser:
         input_tile = is_input_tile()
         input_tile_emb = is_input_tile_emb()
 
-        batch_size = -1
+        tile_size = -1
         if input_tile:
-            batch_size = input_data["batch_size"].item()
+            tile_size = input_data["batch_size"].item()
 
         if input_tile_emb:
             # For INPUT_TILE = 3 mode, batch_size of user features for sparse and dense
@@ -359,7 +359,7 @@ class DataParser:
             labels=labels,
             sample_weights=sample_weights,
             # pyre-ignore [6]
-            batch_size=batch_size,
+            tile_size=tile_size,
         )
         return batch
 
@@ -492,7 +492,7 @@ class DataParser:
             a dict of KeyedJaggedTensor.
         """
         sparse_features = {}
-        batch_size = input_data["batch_size"].item()
+        tile_size = input_data["batch_size"].item()
 
         for dg, keys in self.sparse_keys.items():
             values = []
@@ -505,9 +505,9 @@ class DataParser:
                 length = input_data[f"{key}.lengths"]
                 if key in self.user_feats:
                     # pyre-ignore [6]
-                    value = value.tile(batch_size)
+                    value = value.tile(tile_size)
                     # pyre-ignore [6]
-                    length = length.tile(batch_size)
+                    length = length.tile(tile_size)
                 values.append(value)
                 lengths.append(length)
 
@@ -520,7 +520,7 @@ class DataParser:
                         )
                     if key in self.user_feats:
                         # pyre-ignore [6]
-                        weight = weight.tile(batch_size)
+                        weight = weight.tile(tile_size)
                     weights.append(weights)
 
             sparse_feature = KeyedJaggedTensor(
