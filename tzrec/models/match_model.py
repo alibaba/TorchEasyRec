@@ -250,10 +250,10 @@ class MatchModel(BaseModel):
             ]
         ):
             batch_size = pred.size(0)
-            losses["amm_loss_u"] = self._loss_modules["augment_u"](
+            losses["amm_loss_u"] = self.amm_u_weight * self._loss_modules["augment_u"](
                 predictions["augmented_a_u"], predictions["augmented_p_i"][:batch_size]
             )
-            losses["amm_loss_i"] = self._loss_modules["augment_i"](
+            losses["amm_loss_i"] = self.amm_i_weight * self._loss_modules["augment_i"](
                 predictions["augmented_a_i"][:batch_size], predictions["augmented_p_u"]
             )
 

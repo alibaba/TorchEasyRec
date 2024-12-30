@@ -175,6 +175,9 @@ class DAT(MatchModel):
             model_config,
         )
 
+        self.amm_u_weight = self._model_config.amm_u_weight
+        self.amm_i_weight = self._model_config.amm_i_weight
+
     def predict(self, batch: Batch) -> Dict[str, Tensor]:
         """Forward the model.
 

@@ -52,4 +52,8 @@ message DAT {
     optional float temperature = 5 [default = 1.0];
     // use in batch items as negative items.
     optional bool in_batch_negative = 6 [default = false];
+    // loss weight for amm_i
+    required float amm_i_weight = 7 [default = 1.0];
+    // loss weight for amm_u
+    required float amm_u_weight = 8 [default = 1.0];
 }
