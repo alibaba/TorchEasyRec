@@ -57,7 +57,7 @@ class MLPDenseEmbeddingConfig(DenseEmbeddingConfig):
     @property
     def group_key(self) -> str:
         """Config group key."""
-        return f"mlp_{self.embedding_dim}"
+        return f"mlp#{self.embedding_dim}"
 
 
 class AutoDisEmbeddingConfig(DenseEmbeddingConfig):
