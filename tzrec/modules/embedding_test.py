@@ -159,9 +159,6 @@ def _create_test_sequence_features(has_zch=False):
 
 
 EMPTY_KJT = KeyedJaggedTensor.empty()
-EMPTY_KT = KeyedTensor(
-    keys=[], length_per_key=[], values=torch.empty(0, dtype=torch.float32)
-)
 
 
 class _EGScriptWrapper(nn.Module):
@@ -176,14 +173,14 @@ class _EGScriptWrapper(nn.Module):
         sparse_features: Dict[str, KeyedJaggedTensor],
         dense_features: Dict[str, KeyedTensor],
         sequence_dense_features: Dict[str, JaggedTensor],
-        batch_size: int = -1,
+        tile_size: int = -1,
     ):
         return self._module(
             Batch(
                 sparse_features=sparse_features,
                 dense_features=dense_features,
                 sequence_dense_features=sequence_dense_features,
-                batch_size=batch_size,
+                tile_size=tile_size,
             )
         )
 
@@ -238,7 +235,6 @@ class EmbeddingGroupTest(unittest.TestCase):
             sparse_feature,
             dense_feature,
             EMPTY_KJT,
-            EMPTY_KT,
         )
 
         self.assertEqual(result["wide"].size(), (2, 8))
@@ -283,7 +279,6 @@ class EmbeddingGroupTest(unittest.TestCase):
             sparse_feature,
             dense_feature,
             EMPTY_KJT,
-            EMPTY_KT,
         )
         self.assertEqual(result["deep"].size(), (2, 25))
 
@@ -415,7 +410,6 @@ class EmbeddingGroupTest(unittest.TestCase):
             dense_feature,
             sequence_dense_feature,
             EMPTY_KJT,
-            EMPTY_KT,
         )
         self.assertEqual(result["click.query"].size(), (2, 25))
         self.assertEqual(result["click.sequence"].size(), (2, 3, 25))
@@ -684,7 +678,6 @@ class EmbeddingGroupTest(unittest.TestCase):
             dense_feature,
             sequence_dense_feature,
             EMPTY_KJT,
-            EMPTY_KT,
             2,
         )
 
@@ -773,7 +766,6 @@ class EmbeddingGroupTest(unittest.TestCase):
             dense_feature,
             sequence_dense_feature,
             sparse_feature_user,
-            EMPTY_KT,
             2,
         )
 

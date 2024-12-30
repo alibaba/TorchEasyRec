@@ -117,8 +117,8 @@ class Batch(Pipelineable):
     labels: Dict[str, torch.Tensor] = field(default_factory=dict)
     # reserved inputs [for predict]
     reserves: RecordBatchTensor = field(default_factory=RecordBatchTensor)
-    # batch_size for input-tile
-    batch_size: int = field(default=-1)
+    # size for user side input tile when do inference and INPUT_TILE=2 or 3
+    tile_size: int = field(default=-1)
     # sample_weight
     sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
 
@@ -142,7 +142,7 @@ class Batch(Pipelineable):
                 for k, v in self.labels.items()
             },
             reserves=self.reserves,
-            batch_size=self.batch_size,
+            tile_size=self.tile_size,
             sample_weights={
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sample_weights.items()
@@ -192,7 +192,7 @@ class Batch(Pipelineable):
             sequence_dense_features=sequence_dense_features,
             labels={k: v.pin_memory() for k, v in self.labels.items()},
             reserves=self.reserves,
-            batch_size=self.batch_size,
+            tile_size=self.tile_size,
             sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
         )
 
@@ -224,6 +224,6 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}"] = v
         for k, v in self.sample_weights.items():
             tensor_dict[f"{k}"] = v
-        if self.batch_size > 0:
-            tensor_dict["batch_size"] = torch.tensor(self.batch_size, dtype=torch.int64)
+        if self.tile_size > 0:
+            tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
         return tensor_dict

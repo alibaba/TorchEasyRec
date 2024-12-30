@@ -58,8 +58,13 @@ class IdFeature(BaseFeature):
         return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return self.config.value_dim
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
+        """Output dimension of the feature after embedding."""
         return self.config.embedding_dim
 
     @property

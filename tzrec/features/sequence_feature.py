@@ -397,6 +397,11 @@ class SequenceRawFeature(RawFeature):
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
 
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        # TODO: support dense embedding for sequence raw feature.
+        return None
+
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
         if self._is_grouped_seq:

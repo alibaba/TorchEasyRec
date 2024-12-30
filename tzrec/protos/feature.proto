@@ -36,6 +36,16 @@ message ZeroCollisionHash {
     optional string threshold_filtering_func = 3;
 }
 
+message AutoDisEmbedding {
+    // number of embedding channels
+    required uint32 num_channels = 2;
+    // temperature coefficient for softmax
+    optional float  temperature = 3 [default = 0.1];
+    optional float  keep_prob = 4 [default = 0.8];
+}
+
+message MLPEmbedding {
+}
 
 message IdFeature {
     // feature name, e.g. item_id
@@ -114,6 +124,13 @@ message RawFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
 
     // TODO: constrains
 }
@@ -213,6 +230,13 @@ message LookupFeature {
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
 
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
+
     // TODO: optional string kv_separator = 13 [default = ":"];
     // TODO: constrains
 }
@@ -274,6 +298,13 @@ message MatchFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
 }
 
 message ExprFeature {
@@ -302,6 +333,13 @@ message ExprFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
 }
 
 message OverlapFeature {
@@ -340,6 +378,13 @@ message OverlapFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
 }
 
 

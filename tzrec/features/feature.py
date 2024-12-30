@@ -46,6 +46,11 @@ from tzrec.datasets.utils import (
     ParsedData,
     SparseData,
 )
+from tzrec.modules.dense_embedding_collection import (
+    AutoDisEmbeddingConfig,
+    DenseEmbeddingConfig,
+    MLPDenseEmbeddingConfig,
+)
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
 from tzrec.utils import config_util
@@ -306,8 +311,13 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._is_user_feat = value
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        raise NotImplementedError
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
+        """Output dimension of the feature after embedding."""
         raise NotImplementedError
 
     @property
@@ -333,6 +343,14 @@ class BaseFeature(object, metaclass=_meta_cls):
         return self._is_weighted
 
     @property
+    def has_embedding(self) -> bool:
+        """Feature has embedding or not."""
+        if self.is_sparse:
+            return True
+        else:
+            return self._dense_emb_type is not None
+
+    @property
     def pooling_type(self) -> PoolingType:
         """Get embedding pooling type."""
         pooling_type = self.config.pooling.upper()
@@ -346,12 +364,16 @@ class BaseFeature(object, metaclass=_meta_cls):
 
     @property
     def _embedding_dim(self) -> int:
-        if self.is_sparse:
+        if self.has_embedding:
             assert self.config.embedding_dim > 0, (
                 f"embedding_dim of {self.__class__.__name__}[{self.name}] "
                 "should be greater than 0."
             )
         return self.config.embedding_dim
+
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        return None
 
     @property
     def emb_bag_config(self) -> Optional[EmbeddingBagConfig]:
@@ -389,6 +411,33 @@ class BaseFeature(object, metaclass=_meta_cls):
             )
         else:
             return None
+
+    @property
+    def dense_emb_config(
+        self,
+    ) -> Optional[DenseEmbeddingConfig]:
+        """Get DenseEmbeddingConfig of the feature."""
+        if self._dense_emb_type:
+            dense_emb_config = getattr(self.config, self._dense_emb_type)
+            assert self.value_dim <= 1, (
+                "dense embedding do not support"
+                f" feature [{self.name}] with value_dim > 1 now."
+            )
+            if self._dense_emb_type == "autodis":
+                return AutoDisEmbeddingConfig(
+                    embedding_dim=self._embedding_dim,
+                    n_channels=dense_emb_config.num_channels,
+                    temperature=dense_emb_config.temperature,
+                    keep_prob=dense_emb_config.keep_prob,
+                    feature_names=[self.name],
+                )
+            elif self._dense_emb_type == "mlp":
+                return MLPDenseEmbeddingConfig(
+                    embedding_dim=self._embedding_dim,
+                    feature_names=[self.name],
+                )
+
+        return None
 
     def mc_module(self, device: torch.device) -> Optional[ManagedCollisionModule]:
         """Get ManagedCollisionModule."""
