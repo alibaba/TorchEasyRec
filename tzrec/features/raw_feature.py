@@ -55,9 +55,19 @@ class RawFeature(BaseFeature):
         return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        elif self._is_sparse:
+            return 0
+        else:
+            return 1
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
-        if self.is_sparse or self.dense_emb_config is not None:
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
             return self.config.embedding_dim
         else:
             return self.config.value_dim
@@ -68,6 +78,15 @@ class RawFeature(BaseFeature):
         if self._is_sparse is None:
             self._is_sparse = len(self.config.boundaries) > 0
         return self._is_sparse
+
+    @property
+    def has_embedding(self) -> bool:
+        """Feature has embedding or not."""
+        if self.is_sparse:
+            return True
+        else:
+            dense_emb_type = self.config.WhichOneof("dense_emb")
+            return dense_emb_type is not None
 
     @property
     def num_embeddings(self) -> int:
@@ -83,15 +102,13 @@ class RawFeature(BaseFeature):
             dense_emb_type = self.config.WhichOneof("dense_emb")
             if dense_emb_type:
                 dense_emb_config = getattr(self.config, dense_emb_type)
-                if self.config.value_dim > 1:
-                    return ValueError(
-                        "autodis and mlp embedding do not support feature "
-                        f"[{self.name}] with value dim > 1 now."
-                    )
-
+                assert self.value_dim <= 1, (
+                    "dense embedding do not support"
+                    f" feature [{self.name}] with value_dim > 1 now."
+                )
                 if dense_emb_type == "autodis":
                     return AutoDisEmbeddingConfig(
-                        embedding_dim=self.config.embedding_dim,
+                        embedding_dim=self._embedding_dim,
                         n_channels=dense_emb_config.num_channels,
                         temperature=dense_emb_config.temperature,
                         keep_prob=dense_emb_config.keep_prob,
@@ -99,7 +116,7 @@ class RawFeature(BaseFeature):
                     )
                 elif dense_emb_type == "mlp":
                     return MLPDenseEmbeddingConfig(
-                        embedding_dim=self.config.embedding_dim,
+                        embedding_dim=self._embedding_dim,
                         feature_names=[self.name],
                     )
 

@@ -80,8 +80,8 @@ class AutoDisEmbeddingConfig(DenseEmbeddingConfig):
     def group_key(self) -> str:
         """Config group key."""
         return (
-            f"autodis#{self.embedding_dim}#{self.n_channels}#{self.keep_prob}"
-            f"#{self.temperature}".replace(".", "_")
+            f"autodis#{self.embedding_dim}#{self.n_channels}#{self.keep_prob:.6f}"
+            f"#{self.temperature:.6f}".replace(".", "_")
         )
 
 
@@ -293,14 +293,13 @@ class DenseEmbeddingCollection(nn.Module):
         emb_list = []
         for group_key, emb_module in self.dense_embs.items():
             emb_list.append(emb_module(grouped_features[group_key]))
-
         if self._raw_dense_feature_to_dim:
             emb_list.append(grouped_features["__raw_dense_group__"])
 
-        kts_dense_emb = KeyedTensor(
+        kt_dense_emb = KeyedTensor(
             keys=self.all_dense_names,
             length_per_key=self.all_dense_dims,
             values=torch.cat(emb_list, dim=1),
             key_dim=1,
         )
-        return kts_dense_emb
+        return kt_dense_emb

@@ -74,6 +74,28 @@ def _merge_list_of_jt_dict(
 
 
 @torch.fx.wrap
+def _tile_and_combine_dense_kt(
+    user_kt: Optional[KeyedTensor], item_kt: Optional[KeyedTensor], batch_size: int
+) -> KeyedTensor:
+    kt_keys: List[str] = []
+    kt_length_per_key: List[int] = []
+    kt_values: List[torch.Tensor] = []
+    if user_kt is not None:
+        kt_keys.extend(user_kt.keys())
+        kt_length_per_key.extend(user_kt.length_per_key())
+        kt_values.append(user_kt.values().tile(batch_size, 1))
+    if item_kt is not None:
+        kt_keys.extend(item_kt.keys())
+        kt_length_per_key.extend(item_kt.length_per_key())
+        kt_values.append(item_kt.values())
+    return KeyedTensor(
+        keys=kt_keys,
+        length_per_key=kt_length_per_key,
+        values=torch.cat(kt_values, dim=1),
+    )
+
+
+@torch.fx.wrap
 def _cast_away_kjt_optional(arg: Optional[KeyedJaggedTensor]) -> KeyedJaggedTensor:
     assert arg is not None
     return arg
@@ -371,32 +393,21 @@ class EmbeddingGroup(nn.Module):
         """
         result_dicts = []
 
+        need_input_tile_emb = is_input_tile_emb()
         need_input_tile = is_input_tile()
 
         if need_input_tile:
             emb_keys = list(self.emb_impls.keys())
             seq_emb_keys = list(self.seq_emb_impls.keys())
             unique_keys = list(set(emb_keys + seq_emb_keys))
-            # combine tiled user dense feat & item dense feat
+            # tile user dense feat & combine item dense feat
             for key in unique_keys:
-                kt_keys = []
-                kt_length_per_key = []
-                kt_values = []
-                if key + "_user" in batch.dense_features.keys():
-                    kt = batch.dense_features[key + "_user"]
-                    kt_keys.extend(kt.keys())
-                    kt_length_per_key.extend(kt.length_per_key())
-                    kt_values.append(kt.values().tile(batch.batch_size, 1))
-                elif key + "_item" in batch.dense_features.keys():
-                    kt = batch.dense_features[key + "_item"]
-                    kt_keys.extend(kt.keys())
-                    kt_length_per_key.extend(kt.length_per_key())
-                    kt_values.append(kt.values().tile(batch.batch_size, 1))
-                batch.dense_features[key] = KeyedTensor(
-                    keys=kt_keys,
-                    length_per_key=kt_length_per_key,
-                    values=torch.cat(kt_values, dim=1),
-                )
+                user_kt = batch.dense_features.get(key + "_user", None)
+                item_kt = batch.dense_features.get(key + "_item", None)
+                if user_kt is not None or item_kt is not None:
+                    batch.dense_features[key] = _tile_and_combine_dense_kt(
+                        user_kt, item_kt, batch.batch_size
+                    )
 
         for key, emb_impl in self.emb_impls.items():
             sparse_feat_kjt = None
@@ -406,7 +417,10 @@ class EmbeddingGroup(nn.Module):
             if emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
             if emb_impl.has_sparse:
-                sparse_feat_kjt = batch.sparse_features[key]
+                if need_input_tile_emb:
+                    sparse_feat_kjt = batch.sparse_features[key + "_item"]
+                else:
+                    sparse_feat_kjt = batch.sparse_features[key]
             if emb_impl.has_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
 
@@ -427,7 +441,10 @@ class EmbeddingGroup(nn.Module):
             if seq_emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
             if seq_emb_impl.has_sparse:
-                sparse_feat_kjt = batch.sparse_features[key]
+                if need_input_tile_emb:
+                    sparse_feat_kjt = batch.sparse_features[key + "_item"]
+                else:
+                    sparse_feat_kjt = batch.sparse_features[key]
             if seq_emb_impl.has_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
 
@@ -615,6 +632,7 @@ class EmbeddingGroupImpl(nn.Module):
             for name in feature_names:
                 shared_name = name
                 feature = name_to_feature[name]
+
                 if feature.is_sparse:
                     output_dim = feature.output_dim
                     emb_bag_config = feature.emb_bag_config
@@ -766,8 +784,7 @@ class EmbeddingGroupImpl(nn.Module):
 
         if self.has_dense:
             if self.has_dense_embedding:
-                kts_dense = self.dense_ec(dense_feature)
-                kts.append(kts_dense)
+                kts.append(self.dense_ec(dense_feature))
             else:
                 kts.append(dense_feature)
 

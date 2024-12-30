@@ -399,6 +399,11 @@ class SequenceRawFeature(RawFeature):
         return self._is_grouped_seq
 
     @property
+    def has_embedding(self) -> bool:
+        """Feature has embedding or not."""
+        return self.is_sparse
+
+    @property
     def dense_emb_config(
         self,
     ) -> Optional[DenseEmbeddingConfig]:

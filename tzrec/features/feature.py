@@ -307,8 +307,13 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._is_user_feat = value
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        raise NotImplementedError
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
+        """Output dimension of the feature after embedding."""
         raise NotImplementedError
 
     @property
@@ -334,6 +339,11 @@ class BaseFeature(object, metaclass=_meta_cls):
         return self._is_weighted
 
     @property
+    def has_embedding(self) -> bool:
+        """Feature has embedding or not."""
+        return self.is_sparse
+
+    @property
     def pooling_type(self) -> PoolingType:
         """Get embedding pooling type."""
         pooling_type = self.config.pooling.upper()
@@ -347,7 +357,7 @@ class BaseFeature(object, metaclass=_meta_cls):
 
     @property
     def _embedding_dim(self) -> int:
-        if self.is_sparse:
+        if self.has_embedding:
             assert self.config.embedding_dim > 0, (
                 f"embedding_dim of {self.__class__.__name__}[{self.name}] "
                 "should be greater than 0."
