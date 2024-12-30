@@ -75,7 +75,7 @@ def _merge_list_of_jt_dict(
 
 @torch.fx.wrap
 def _tile_and_combine_dense_kt(
-    user_kt: Optional[KeyedTensor], item_kt: Optional[KeyedTensor], batch_size: int
+    user_kt: Optional[KeyedTensor], item_kt: Optional[KeyedTensor], tile_size: int
 ) -> KeyedTensor:
     kt_keys: List[str] = []
     kt_length_per_key: List[int] = []
@@ -83,7 +83,7 @@ def _tile_and_combine_dense_kt(
     if user_kt is not None:
         kt_keys.extend(user_kt.keys())
         kt_length_per_key.extend(user_kt.length_per_key())
-        kt_values.append(user_kt.values().tile(batch_size, 1))
+        kt_values.append(user_kt.values().tile(tile_size, 1))
     if item_kt is not None:
         kt_keys.extend(item_kt.keys())
         kt_length_per_key.extend(item_kt.length_per_key())
@@ -406,7 +406,7 @@ class EmbeddingGroup(nn.Module):
                 item_kt = batch.dense_features.get(key + "_item", None)
                 if user_kt is not None or item_kt is not None:
                     batch.dense_features[key] = _tile_and_combine_dense_kt(
-                        user_kt, item_kt, batch.batch_size
+                        user_kt, item_kt, batch.tile_size
                     )
 
         for key, emb_impl in self.emb_impls.items():
@@ -429,7 +429,7 @@ class EmbeddingGroup(nn.Module):
                     sparse_feat_kjt,
                     dense_feat_kt,
                     sparse_feat_kjt_user,
-                    batch.batch_size,
+                    batch.tile_size,
                 )
             )
 
@@ -454,7 +454,7 @@ class EmbeddingGroup(nn.Module):
                     dense_feat_kt,
                     batch.sequence_dense_features,
                     sparse_feat_kjt_user,
-                    batch.batch_size,
+                    batch.tile_size,
                 )
             )
 
@@ -750,9 +750,20 @@ class EmbeddingGroupImpl(nn.Module):
         sparse_feature: KeyedJaggedTensor,
         dense_feature: KeyedTensor,
         sparse_feature_user: KeyedJaggedTensor,
-        batch_size: int = -1,
+        tile_size: int = -1,
     ) -> Dict[str, torch.Tensor]:
-        """Forward the module."""
+        """Forward the module.
+
+        Args:
+            sparse_feature (KeyedJaggedTensor): sparse id feature.
+            dense_feature (dense_feature): dense feature.
+            sparse_feature_user (KeyedJaggedTensor): user-side sparse feature
+                with batch_size=1, when use INPUT_TILE=3.
+            tile_size: size for user-side feature input tile.
+
+        Returns:
+            group_features (dict): dict of feature_group to embedded tensor.
+        """
         kts: List[KeyedTensor] = []
         if self.has_sparse:
             kts.append(self.ebc(sparse_feature))
@@ -763,7 +774,7 @@ class EmbeddingGroupImpl(nn.Module):
         # do user-side embedding input-tile
         if self.has_sparse_user:
             keyed_tensor_user = self.ebc_user(sparse_feature_user)
-            values_tile = keyed_tensor_user.values().tile(batch_size, 1)
+            values_tile = keyed_tensor_user.values().tile(tile_size, 1)
             keyed_tensor_user_tile = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
@@ -774,7 +785,7 @@ class EmbeddingGroupImpl(nn.Module):
         # do user-side mc embedding input-tile
         if self.has_mc_sparse_user:
             keyed_tensor_user = self.mc_ebc_user(sparse_feature_user)[0]
-            values_tile = keyed_tensor_user.values().tile(batch_size, 1)
+            values_tile = keyed_tensor_user.values().tile(tile_size, 1)
             keyed_tensor_user_tile = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
@@ -1007,9 +1018,21 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_feature: KeyedTensor,
         sequence_dense_features: Dict[str, JaggedTensor],
         sparse_feature_user: KeyedJaggedTensor,
-        batch_size: int = -1,
+        tile_size: int = -1,
     ) -> Dict[str, torch.Tensor]:
-        """Forward the module."""
+        """Forward the module.
+
+        Args:
+            sparse_feature (KeyedJaggedTensor): sparse id feature.
+            dense_feature (dense_feature): dense feature.
+            sequence_dense_features (Dict[str, JaggedTensor]): dense sequence feature.
+            sparse_feature_user (KeyedJaggedTensor): user-side sparse feature
+                with batch_size=1, when use INPUT_TILE=3.
+            tile_size: size for user-side feature input tile.
+
+        Returns:
+            group_features (dict): dict of feature_group to embedded tensor.
+        """
         # TODO (hongsheng.jhs): deal with tag sequence feature.
         sparse_jt_dict_list = []
         dense_t_dict = {}
@@ -1047,7 +1070,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     # TODO(hongsheng.jhs): support multi-value id feature
                     query_t = sparse_jt_dict[name].to_padded_dense(1).squeeze(1)
                     if is_user and need_input_tile_emb:
-                        query_t = query_t.tile(batch_size, 1)
+                        query_t = query_t.tile(tile_size, 1)
                 else:
                     query_t = dense_t_dict[name]
                 query_t_list.append(query_t)
@@ -1060,7 +1083,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for i, (name, is_sparse, is_user) in enumerate(v):
                 # when is_user is True
                 #   sequence_sparse_features
-                #       when input_tile_emb need to tile(batch_size,1):
+                #       when input_tile_emb need to tile(tile_size,1):
                 #   sequence_dense_features always need to tile
                 need_tile = False
                 if is_user:
@@ -1076,14 +1099,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     group_sequence_length = _int_item(torch.max(sequence_length))
                     if need_tile:
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
-                            batch_size
+                            tile_size
                         )
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
                 jt = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:
-                    jt = jt.tile(batch_size, 1, 1)
+                    jt = jt.tile(tile_size, 1, 1)
                 seq_t_list.append(jt)
 
             if seq_t_list:

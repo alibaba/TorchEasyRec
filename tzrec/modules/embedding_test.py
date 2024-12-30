@@ -173,14 +173,14 @@ class _EGScriptWrapper(nn.Module):
         sparse_features: Dict[str, KeyedJaggedTensor],
         dense_features: Dict[str, KeyedTensor],
         sequence_dense_features: Dict[str, JaggedTensor],
-        batch_size: int = -1,
+        tile_size: int = -1,
     ):
         return self._module(
             Batch(
                 sparse_features=sparse_features,
                 dense_features=dense_features,
                 sequence_dense_features=sequence_dense_features,
-                batch_size=batch_size,
+                tile_size=tile_size,
             )
         )
 
