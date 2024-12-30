@@ -378,6 +378,13 @@ message OverlapFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
 }
 
 

@@ -24,11 +24,6 @@ from tzrec.features.feature import (
     _parse_fg_encoded_dense_feature_impl,
     _parse_fg_encoded_sparse_feature_impl,
 )
-from tzrec.modules.dense_embedding_collection import (
-    AutoDisEmbeddingConfig,
-    DenseEmbeddingConfig,
-    MLPDenseEmbeddingConfig,
-)
 from tzrec.protos.feature_pb2 import FeatureConfig
 
 
@@ -80,47 +75,13 @@ class RawFeature(BaseFeature):
         return self._is_sparse
 
     @property
-    def has_embedding(self) -> bool:
-        """Feature has embedding or not."""
-        if self.is_sparse:
-            return True
-        else:
-            dense_emb_type = self.config.WhichOneof("dense_emb")
-            return dense_emb_type is not None
-
-    @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
         return len(self.config.boundaries) + 1
 
     @property
-    def dense_emb_config(
-        self,
-    ) -> Optional[DenseEmbeddingConfig]:
-        """Get DenseEmbeddingConfig of the feature."""
-        if not self.is_sparse:
-            dense_emb_type = self.config.WhichOneof("dense_emb")
-            if dense_emb_type:
-                dense_emb_config = getattr(self.config, dense_emb_type)
-                assert self.value_dim <= 1, (
-                    "dense embedding do not support"
-                    f" feature [{self.name}] with value_dim > 1 now."
-                )
-                if dense_emb_type == "autodis":
-                    return AutoDisEmbeddingConfig(
-                        embedding_dim=self._embedding_dim,
-                        n_channels=dense_emb_config.num_channels,
-                        temperature=dense_emb_config.temperature,
-                        keep_prob=dense_emb_config.keep_prob,
-                        feature_names=[self.name],
-                    )
-                elif dense_emb_type == "mlp":
-                    return MLPDenseEmbeddingConfig(
-                        embedding_dim=self._embedding_dim,
-                        feature_names=[self.name],
-                    )
-
-        return None
+    def _dense_emb_type(self) -> Optional[str]:
+        return self.config.WhichOneof("dense_emb")
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""

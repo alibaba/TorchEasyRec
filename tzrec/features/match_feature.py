@@ -119,6 +119,10 @@ class MatchFeature(BaseFeature):
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
 
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        return self.config.WhichOneof("dense_emb")
+
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
         return [
