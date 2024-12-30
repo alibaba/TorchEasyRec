@@ -22,6 +22,7 @@ from unittest.signals import registerResult
 
 SUBPROC_TEST_PATTERN = [
     ".dataset_test.",
+    ".odps_dataset_test.",
     ".sampler_test.",
     ".tdm.gen_tree.",
     ".convert_easyrec_config_to_tzrec_config_test.",
