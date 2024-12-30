@@ -93,3 +93,13 @@ message MultiWindowDINTower {
     // mlp config for target attention score
     required MLP attn_mlp = 2;
 }
+
+
+message DATTower {
+    // input feature group name
+    required string input = 1;
+    // augmented feature group name
+    required string augment_input = 2;
+    // mlp config
+    required MLP mlp = 3;
+}

@@ -198,6 +198,9 @@ class MatchModel(BaseModel):
         reduction = "none" if self._sample_weight else "mean"
         self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
 
+        self._loss_modules["augment_u"] = nn.MSELoss(reduction=reduction)
+        self._loss_modules["augment_i"] = nn.MSELoss(reduction=reduction)
+
     def init_loss(self) -> None:
         """Initialize loss modules."""
         assert (
@@ -234,10 +237,31 @@ class MatchModel(BaseModel):
         else:
             label = _zero_int_label(pred)
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
+
+        if all(
+            [
+                k + suffix in predictions.keys()
+                for k in [
+                    "augmented_p_u",
+                    "augmented_p_i",
+                    "augmented_a_u",
+                    "augmented_a_i",
+                ]
+            ]
+        ):
+            batch_size = pred.size(0)
+            losses["amm_loss_u"] = self._loss_modules["augment_u"](
+                predictions["augmented_a_u"], predictions["augmented_p_i"][:batch_size]
+            )
+            losses["amm_loss_i"] = self._loss_modules["augment_i"](
+                predictions["augmented_a_i"][:batch_size], predictions["augmented_p_u"]
+            )
+
         if self._sample_weight:
-            losses[loss_name] = torch.mean(
-                losses[loss_name] * sample_weight
-            ) / torch.mean(sample_weight)
+            for loss_name in losses.keys():
+                losses[loss_name] = torch.mean(
+                    losses[loss_name] * sample_weight
+                ) / torch.mean(sample_weight)
 
         return losses
 
