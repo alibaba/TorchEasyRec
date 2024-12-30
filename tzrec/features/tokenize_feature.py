@@ -65,6 +65,11 @@ class TokenizeFeature(IdFeature):
             )
         return num_embeddings
 
+    @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return 0
+
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
 

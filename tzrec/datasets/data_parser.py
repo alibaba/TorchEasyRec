@@ -85,7 +85,7 @@ class DataParser:
                 self.sparse_keys[feature.data_group].append(feature.name)
             else:
                 self.dense_keys[feature.data_group].append(feature.name)
-                self.dense_length_per_key[feature.data_group].append(feature.output_dim)
+                self.dense_length_per_key[feature.data_group].append(feature.value_dim)
             if feature.is_weighted:
                 self.has_weight_keys[feature.data_group].append(feature.name)
 

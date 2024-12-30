@@ -53,9 +53,14 @@ class OverlapFeature(RawFeature):
         self._data_group = CROSS_NEG_DATA_GROUP
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return 1
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
-        if self.is_sparse:
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
             return self.config.embedding_dim
         else:
             return 1

@@ -53,10 +53,15 @@ class ExprFeature(RawFeature):
         self._data_group = CROSS_NEG_DATA_GROUP
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return 1
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
-        if self.is_sparse:
-            return self.config.embedding_dim
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
+            return self._embedding_dim
         else:
             return 1
 

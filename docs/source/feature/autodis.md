@@ -11,8 +11,8 @@ feature_configs {
     raw_feature {
         feature_name: "price"
         expression: "item:price"
+        embedding_dim: 12
         autodis {
-           embedding_dim: 12
            num_channels: 3
            temperature: 0.1
            keep_prob: 0.8

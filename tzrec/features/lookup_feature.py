@@ -63,9 +63,19 @@ class LookupFeature(BaseFeature):
         self._data_group = CROSS_NEG_DATA_GROUP
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        elif self._is_sparse:
+            return 0
+        else:
+            return 1
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
-        if self.is_sparse:
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
             return self.config.embedding_dim
         else:
             return max(self.config.value_dim, 1)
@@ -106,6 +116,10 @@ class LookupFeature(BaseFeature):
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
+
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        return self.config.WhichOneof("dense_emb")
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
