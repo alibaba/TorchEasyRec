@@ -43,10 +43,12 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
+from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.utils import (
     export_acc_config,
     is_input_tile_emb,
     is_quant,
+    is_aot,
     is_trt,
     is_trt_predict,
     write_mapping_file_for_input_tile,
@@ -67,7 +69,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper, ScriptWrapperAOT
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -737,6 +739,8 @@ def _script_model(
             logger.info("quantize embeddings...")
             quantize_embeddings(model, dtype=torch.qint8, inplace=True)
 
+        if is_aot():
+            model = model.cuda()
         model.eval()
 
         if is_trt_convert:
@@ -746,6 +750,9 @@ def _script_model(
             logger.info(f"Model Outputs: {result_info}")
 
             export_model_trt(model, data_cuda, save_dir)
+        elif is_aot():
+            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
+            export_model_aot(model, data_cuda, save_dir)
         else:
             data = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data)
@@ -920,6 +927,16 @@ def export(
         )
         for asset in assets:
             shutil.copy(asset, os.path.join(export_dir, "model"))
+    elif is_aot():
+        _script_model(
+            ori_pipeline_config,
+            ScriptWrapperAOT(device_model),
+            device_state_dict,
+            dataloader,
+            export_dir,
+        )
+        for asset in assets:
+            shutil.copy(asset, export_dir)
     else:
         _script_model(
             ori_pipeline_config,

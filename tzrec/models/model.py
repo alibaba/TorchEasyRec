@@ -236,3 +236,21 @@ class ScriptWrapper(nn.Module):
         """
         batch = self.get_batch(data, device)
         return self.model.predict(batch)
+
+
+class ScriptWrapperAOT(ScriptWrapper):
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+
+        Args:
+            data (dict): a dict of input data for Batch.
+
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        batch = self._data_parser.to_batch(data)
+        batch = batch.to(torch.device('cuda'), non_blocking=True)
+        return self.model.predict(batch)
