@@ -42,13 +42,13 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
-from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.aot_utils import export_model_aot
+from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
+    is_aot,
     is_input_tile_emb,
     is_quant,
-    is_aot,
     is_trt,
     is_trt_predict,
     write_mapping_file_for_input_tile,
@@ -69,7 +69,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper, ScriptWrapperAOT
+from tzrec.models.model import BaseModel, ScriptWrapper, ScriptWrapperAOT, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder

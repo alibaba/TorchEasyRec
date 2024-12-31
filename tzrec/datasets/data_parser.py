@@ -423,8 +423,8 @@ class DataParser:
                 weights=torch.cat(weights, dim=-1)
                 if len(dg_has_weight_keys) > 0
                 else None,
-                stride=lengths[0].size(0), # input_data['input_batch_size']
-                length_per_key=[x.numel() for x in values]
+                stride=lengths[0].size(0),  # input_data['input_batch_size']
+                length_per_key=[x.numel() for x in values],
             )
             sparse_features[dg] = sparse_feature
         return sparse_features
@@ -532,8 +532,8 @@ class DataParser:
                 weights=torch.cat(weights, dim=-1)
                 if len(dg_has_weight_keys) > 0
                 else None,
-                stride=lengths[0].size(0), # input_data['input_batch_size']
-                length_per_key=[x.numel() for x in values]
+                stride=lengths[0].size(0),  # input_data['input_batch_size']
+                length_per_key=[x.numel() for x in values],
             )
             sparse_features[dg] = sparse_feature
         return sparse_features
@@ -600,8 +600,8 @@ class DataParser:
                     weights=torch.cat(weights_user, dim=-1)
                     if len(dg_has_weight_keys) > 0
                     else None,
-                    stride=lengths[0].size(0),   # input_data['input_batch_size']
-                    length_per_key=[x.numel() for x in values_user]
+                    stride=lengths_user[0].size(0),  # input_data['input_batch_size']
+                    length_per_key=[x.numel() for x in values_user],
                 )
                 sparse_features[dg + "_user"] = sparse_feature_user
             if len(keys_item) > 0:
@@ -612,8 +612,8 @@ class DataParser:
                     weights=torch.cat(weights_item, dim=-1)
                     if len(dg_has_weight_keys) > 0
                     else None,
-                    stride=lengths[0].size(0), # input_data['input_batch_size']
-                    length_per_key=[x.numel() for x in values_item]
+                    stride=lengths_item[0].size(0),  # input_data['input_batch_size']
+                    length_per_key=[x.numel() for x in values_item],
                 )
                 sparse_features[dg + "_item"] = sparse_feature_item
 

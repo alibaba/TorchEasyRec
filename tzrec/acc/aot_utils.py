@@ -10,18 +10,16 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-from torch import nn
-from torch.profiler import ProfilerActivity, profile, record_function
+from typing import Dict
 
+import torch
 import torch.nn.functional as F
+from torch import nn
+from torch.export import Dim
 
-from tzrec.models.model import ScriptWrapper, ScriptWrapperAOT
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
-import torch
-from torch.export import Dim
 
 def export_model_aot(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
@@ -46,44 +44,50 @@ def export_model_aot(
     batch = Dim("batch")
     dynamic_shapes = {}
     for key in data:
-        if key.endswith('.lengths'):
+        if key.endswith(".lengths"):
             if data[key].shape[0] == 1:
-                logger.info('uniq user sparse fea %s length=1' % key)
+                logger.info("uniq user sparse fea %s length=1" % key)
                 dynamic_shapes[key] = {}
             else:
                 dynamic_shapes[key] = {0: batch}
-        elif key == 'batch_size':
+        elif key == "batch_size":
             dynamic_shapes[key] = {}
-        elif data[key].dtype == torch.float32 and '__' not in key:
+        elif data[key].dtype == torch.float32 and "__" not in key:
             if data[key].shape[0] == 1:
-                logger.info('uniq user dense_fea=%s shape=%s' % (key, data[key].shape))
+                logger.info("uniq user dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {}
             else:
-                logger.info('dense_fea=%s shape=%s' % (key, data[key].shape))
+                logger.info("dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
-        elif data[key].dtype == torch.float32 and '__' in key and data[key].shape[0] == 1:
-            logger.info('uniq seq_dense_fea=%s shape=%s' % (key, data[key].shape))
+        elif (
+            data[key].dtype == torch.float32 and "__" in key and data[key].shape[0] == 1
+        ):
+            logger.info("uniq seq_dense_fea=%s shape=%s" % (key, data[key].shape))
             dynamic_shapes[key] = {}
         else:
-            tmp_val_dim = Dim(key.replace('.', '__') + "__batch", min=0)
+            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
             # to handle torch.export 0/1 specialization problem
             if data[key].shape[0] < 2:
-                data[key] = F.pad(data[key], 
-                    [0, 2] + [0, 0] * (len(data[key].shape) - 1), mode='constant')
+                data[key] = F.pad(
+                    data[key],
+                    [0, 2] + [0, 0] * (len(data[key].shape) - 1),
+                    mode="constant",
+                )
             dynamic_shapes[key] = {0: tmp_val_dim}
 
-    exported_gm = torch.export.export(gm, args=(data, ), 
-             dynamic_shapes=(dynamic_shapes, ))
+    exported_gm = torch.export.export(
+        gm, args=(data,), dynamic_shapes=(dynamic_shapes,)
+    )
     print(exported_gm)
 
-    export_path = os.path.join(save_dir, 'exported_gm.code')
-    with open(export_path, 'w') as fout:
+    export_path = os.path.join(save_dir, "exported_gm.code")
+    with open(export_path, "w") as fout:
         fout.write(str(exported_gm))
 
-    exported_gm_path = os.path.join(save_dir, 'debug_exported_gm.py')
-    with open(exported_gm_path, 'w') as fout:
+    exported_gm_path = os.path.join(save_dir, "debug_exported_gm.py")
+    with open(exported_gm_path, "w") as fout:
         fout.write(str(exported_gm))
 
-    output = exported_gm.module()(data)
+    exported_gm.module()(data)
 
     return exported_gm

@@ -239,6 +239,8 @@ class ScriptWrapper(nn.Module):
 
 
 class ScriptWrapperAOT(ScriptWrapper):
+    """Model inference wrapper for aot export."""
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
@@ -252,5 +254,5 @@ class ScriptWrapperAOT(ScriptWrapper):
             predictions (dict): a dict of predicted result.
         """
         batch = self._data_parser.to_batch(data)
-        batch = batch.to(torch.device('cuda'), non_blocking=True)
+        batch = batch.to(torch.device("cuda"), non_blocking=True)
         return self.model.predict(batch)
