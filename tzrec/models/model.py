@@ -241,6 +241,7 @@ class ScriptWrapper(nn.Module):
 class ScriptWrapperAOT(ScriptWrapper):
     """Model inference wrapper for aot export."""
 
+    # pyre-ignore [14]
     def forward(
         self,
         data: Dict[str, torch.Tensor],

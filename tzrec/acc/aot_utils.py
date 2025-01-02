@@ -32,6 +32,7 @@ from tzrec.utils.logging_util import logger
 
 # skip default bound check which is not allow by aot
 if "ENABLE_AOT" in os.environ:
+    # pyre-ignore [8]
     IntNBitTableBatchedEmbeddingBagsCodegen.__init__ = functools.partialmethod(
         IntNBitTableBatchedEmbeddingBagsCodegen.__init__,
         bounds_check_mode=BoundsCheckMode.NONE,
@@ -45,9 +46,10 @@ if aten._softmax.default in decomposition_table:
     del decomposition_table[aten._softmax.out]
 
 
+# pyre-ignore [56]
 @register_decomposition(aten._softmax)
 @out_wrapper()
-def _softmax(x: torch.Tensor, dim: int, half_to_float: bool):
+def _softmax(x: torch.Tensor, dim: int, half_to_float: bool) -> torch.Tensor:
     # eager softmax returns a contiguous tensor. Ensure that decomp also returns
     # a contiguous tensor.
     x = x.contiguous()
@@ -67,7 +69,7 @@ def _softmax(x: torch.Tensor, dim: int, half_to_float: bool):
 
 def export_model_aot(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
-) -> None:
+) -> torch.export.ExportedProgram:
     """Export aot model.
 
     Args:
