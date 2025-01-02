@@ -4,7 +4,7 @@ repos:
     hooks:
       - id: insert-license
         files: \.py$
-        args: ["--license-filepath", "data/.license_header.txt", "--use-current-year", "--allow-past-years"]
+        args: ["--license-filepath", "data/.license_header.txt", "--allow-past-years"]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.7.1
     hooks:
