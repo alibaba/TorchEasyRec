@@ -215,12 +215,14 @@ class OdpsDatasetTest(unittest.TestCase):
             f"test_odps_sampler_{self.test_suffix}",
             (
                 f"id {id_type}, weight double, features string",
-                "dt string",
+                "dt string, alpha string",
             ),
             if_not_exists=True,
             hints={"odps.sql.type.system.odps2": "true"},
         )
-        with t.open_writer(partition="dt=20240319", create_partition=True) as writer:
+        with t.open_writer(
+            partition="dt=20240319,alpha=1", create_partition=True
+        ) as writer:
             writer.write([[i, 1.0, f"{i}:4:5.0"] for i in range(10000)])
 
         features = create_features(
@@ -234,7 +236,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319',
+                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1',
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",
