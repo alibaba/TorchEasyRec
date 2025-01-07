@@ -181,18 +181,13 @@ class RankModel(BaseModel):
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
         label_name: str,
-        sample_weight_name: str,
+        loss_weight: torch.Tensor,
         loss_cfg: LossConfig,
         num_class: int = 1,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
         losses = {}
         label = batch.labels[label_name]
-        sample_weights = (
-            batch.sample_weights[sample_weight_name]
-            if sample_weight_name
-            else torch.Tensor([1.0])
-        )
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
@@ -216,10 +211,7 @@ class RankModel(BaseModel):
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
-        if sample_weight_name:
-            losses[loss_name] = torch.mean(
-                losses[loss_name] * sample_weights
-            ) / torch.mean(sample_weights)
+        losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
         return losses
 
     def loss(

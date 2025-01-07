@@ -76,18 +76,28 @@ class MultiTaskRank(RankModel):
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name
-            sample_weight_name = (
-                task_tower_cfg.sample_weight_name
-                if task_tower_cfg.sample_weight_name
-                else ""
-            )
+            if task_tower_cfg.sample_weight_name:
+                loss_weight = batch.sample_weights[task_tower_cfg.sample_weight_name]
+                loss_weight = loss_weight / torch.mean(loss_weight)
+            else:
+                loss_weight = torch.Tensor([1.0]).to(batch.labels[label_name].device)
+            loss_weight *= task_tower_cfg.weight
+            if task_tower_cfg.HasField("task_space_indicator_label"):
+                in_task_space = (
+                    batch.labels[task_tower_cfg.task_space_indicator_label] > 0
+                ).float()
+                loss_weight = loss_weight * (
+                    task_tower_cfg.in_task_space_weight * in_task_space
+                    + task_tower_cfg.out_task_space_weight * (1 - in_task_space)
+                )
+
             for loss_cfg in task_tower_cfg.losses:
                 losses.update(
                     self._loss_impl(
                         predictions,
                         batch,
                         label_name,
-                        sample_weight_name,
+                        loss_weight,
                         loss_cfg,
                         num_class=task_tower_cfg.num_class,
                         suffix=f"_{tower_name}",
