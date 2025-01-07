@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,6 +12,7 @@
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from tzrec.datasets.utils import Batch
@@ -198,9 +199,6 @@ class MatchModel(BaseModel):
         reduction = "none" if self._sample_weight else "mean"
         self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
 
-        self._loss_modules["augment_u"] = nn.MSELoss(reduction=reduction)
-        self._loss_modules["augment_i"] = nn.MSELoss(reduction=reduction)
-
     def init_loss(self) -> None:
         """Initialize loss modules."""
         assert (
@@ -250,11 +248,19 @@ class MatchModel(BaseModel):
             ]
         ):
             batch_size = pred.size(0)
-            losses["amm_loss_u"] = self.amm_u_weight * self._loss_modules["augment_u"](
-                predictions["augmented_a_u"], predictions["augmented_p_i"][:batch_size]
+            losses["amm_loss_u"] = self.amm_u_weight * torch.sum(
+                torch.square(
+                    F.normalize(predictions["augmented_a_u"], p=2.0, dim=1)
+                    - predictions["augmented_p_i"][:batch_size]
+                ),
+                dim=1 if self._sample_weight else (0, 1),
             )
-            losses["amm_loss_i"] = self.amm_i_weight * self._loss_modules["augment_i"](
-                predictions["augmented_a_i"][:batch_size], predictions["augmented_p_u"]
+            losses["amm_loss_i"] = self.amm_i_weight * torch.sum(
+                torch.square(
+                    F.normalize(predictions["augmented_a_i"][:batch_size], p=2.0, dim=1)
+                    - predictions["augmented_p_u"]
+                ),
+                dim=1 if self._sample_weight else (0, 1),
             )
 
         if self._sample_weight:

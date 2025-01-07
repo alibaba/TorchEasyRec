@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -105,7 +105,11 @@ class DATTower(MatchTower):
             output = self.output(output)
         if self._similarity == match_model_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
-        return output, augmented_feature
+
+        if self.training:
+            return output, augmented_feature
+        else:
+            return output
 
 
 class DAT(MatchModel):
@@ -187,8 +191,13 @@ class DAT(MatchModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        user_tower_emb, user_augment = self.user_tower(batch)
-        item_tower_emb, item_augment = self.item_tower(batch)
+        if self.training:
+            user_tower_emb, user_augment = self.user_tower(batch)
+            item_tower_emb, item_augment = self.item_tower(batch)
+        else:
+            user_tower_emb = self.user_tower(batch)
+            item_tower_emb = self.item_tower(batch)
+
         _update_dict_tensor(
             self._loss_collection, self.user_tower.group_variational_dropout_loss
         )
@@ -199,10 +208,13 @@ class DAT(MatchModel):
         ui_sim = (
             self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature
         )
-        return {
-            "similarity": ui_sim,
-            "augmented_p_u": user_tower_emb.detach(),
-            "augmented_p_i": item_tower_emb.detach(),
-            "augmented_a_u": user_augment,
-            "augmented_a_i": item_augment,
-        }
+        if self.training:
+            return {
+                "similarity": ui_sim,
+                "augmented_p_u": user_tower_emb.detach(),
+                "augmented_p_i": item_tower_emb.detach(),
+                "augmented_a_u": user_augment,
+                "augmented_a_i": item_augment,
+            }
+        else:
+            return {"similarity": ui_sim}
