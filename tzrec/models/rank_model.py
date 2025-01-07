@@ -219,13 +219,19 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
         losses = {}
+        if self._sample_weight_name:
+            loss_weight = batch.sample_weights[self._sample_weight_name]
+            loss_weight = loss_weight / torch.mean(loss_weight)
+        else:
+            loss_weight = torch.Tensor([1.0]).to(batch.labels[self._label_name].device)
+
         for loss_cfg in self._base_model_config.losses:
             losses.update(
                 self._loss_impl(
                     predictions,
                     batch,
                     self._label_name,
-                    self._sample_weight_name,
+                    loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
                 )
