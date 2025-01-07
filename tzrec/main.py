@@ -69,7 +69,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ScriptWrapper, ScriptWrapperAOT, TrainWrapper
+from tzrec.models.model import BaseModel, ExportWrapperAOT, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -735,12 +735,13 @@ def _script_model(
     if is_rank_zero:
         batch = next(iter(dataloader))
 
+        if is_aot():
+            model = model.cuda()
+
         if is_quant():
             logger.info("quantize embeddings...")
             quantize_embeddings(model, dtype=torch.qint8, inplace=True)
 
-        if is_aot():
-            model = model.cuda()
         model.eval()
 
         if is_trt_convert:
@@ -752,6 +753,7 @@ def _script_model(
             export_model_trt(model, data_cuda, save_dir)
         elif is_aot():
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
+            result = model(data_cuda)
             export_model_aot(model, data_cuda, save_dir)
         else:
             data = batch.to_dict(sparse_dtype=torch.int64)
@@ -930,7 +932,7 @@ def export(
     elif is_aot():
         _script_model(
             ori_pipeline_config,
-            ScriptWrapperAOT(device_model),
+            ExportWrapperAOT(device_model),
             device_state_dict,
             dataloader,
             export_dir,

@@ -80,12 +80,14 @@ def export_model_aot(
     gm = symbolic_trace(model)
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(gm.code)
-    # with open(os.path.join(save_dir, "gm.graph"), "w") as f:
-    #     f.write(gm.graph.print_tabular())
 
     gm = gm.cuda()
 
-    print(gm)
+    def _is_dense(key, data):
+        return data[key].dtype in (torch.float32, torch.bfloat16, torch.float16)
+
+    def _is_dense_seq(key, data):
+        return (key.split(".")[0] + ".lengths") in data and _is_dense(key, data)
 
     batch = Dim("batch")
     dynamic_shapes = {}
@@ -98,18 +100,16 @@ def export_model_aot(
                 dynamic_shapes[key] = {0: batch}
         elif key == "batch_size":
             dynamic_shapes[key] = {}
-        elif data[key].dtype == torch.float32 and "__" not in key:
+        elif _is_dense_seq(key, data) and data[key].shape[0] == 1:
+            logger.info("uniq seq_dense_fea=%s shape=%s" % (key, data[key].shape))
+            dynamic_shapes[key] = {}
+        elif _is_dense(key, data) and not _is_dense_seq(key, data):
             if data[key].shape[0] == 1:
                 logger.info("uniq user dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {}
             else:
-                logger.info("dense_fea=%s shape=%s" % (key, data[key].shape))
+                logger.info("batch dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
-        elif (
-            data[key].dtype == torch.float32 and "__" in key and data[key].shape[0] == 1
-        ):
-            logger.info("uniq seq_dense_fea=%s shape=%s" % (key, data[key].shape))
-            dynamic_shapes[key] = {}
         else:
             tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
             # to handle torch.export 0/1 specialization problem
@@ -121,19 +121,14 @@ def export_model_aot(
                 )
             dynamic_shapes[key] = {0: tmp_val_dim}
 
-    exported_gm = torch.export.export(
+    exported_pg = torch.export.export(
         gm, args=(data,), dynamic_shapes=(dynamic_shapes,)
     )
-    print(exported_gm)
 
-    export_path = os.path.join(save_dir, "exported_gm.code")
+    export_path = os.path.join(save_dir, "exported_pg.py")
     with open(export_path, "w") as fout:
-        fout.write(str(exported_gm))
+        fout.write(str(exported_pg))
 
-    exported_gm_path = os.path.join(save_dir, "debug_exported_gm.py")
-    with open(exported_gm_path, "w") as fout:
-        fout.write(str(exported_gm))
+    exported_pg.module()(data)
 
-    exported_gm.module()(data)
-
-    return exported_gm
+    return exported_pg

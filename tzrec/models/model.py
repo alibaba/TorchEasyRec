@@ -238,7 +238,7 @@ class ScriptWrapper(nn.Module):
         return self.model.predict(batch)
 
 
-class ScriptWrapperAOT(ScriptWrapper):
+class ExportWrapperAOT(ScriptWrapper):
     """Model inference wrapper for aot export."""
 
     # pyre-ignore [14]

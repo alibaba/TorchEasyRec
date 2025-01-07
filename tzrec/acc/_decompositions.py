@@ -20,7 +20,6 @@ from torch_tensorrt.dynamo._defaults import default_device
 from torch_tensorrt.dynamo.conversion.converter_utils import get_positive_dim
 from torch_tensorrt.dynamo.utils import to_torch_device
 
-
 from ._decomposition_groups import (
     ENABLED_TORCH_DECOMPOSITIONS,
     TORCH_TRT_DECOMPOSITIONS,

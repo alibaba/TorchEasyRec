@@ -21,3 +21,5 @@ torchrun --master_addr=localhost --master_port=32555 \
 - INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间。必须在fg_mode=normal下使用，并且TorchEasyRec导出时需加上此环境变量
   - **INPUT_TILE=2**：user侧特征fg仅计算一次
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
+- ENABLE_AOT:
+  - **ENABLE_AOT=1**: 使用AOT(Ahead Of Time)编译优化导出优化的模型(experimental)
