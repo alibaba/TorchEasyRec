@@ -42,9 +42,11 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
+from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
+    is_aot,
     is_input_tile_emb,
     is_quant,
     is_trt,
@@ -67,7 +69,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, ExportWrapperAOT, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -739,6 +741,9 @@ def _script_model(
     if is_rank_zero:
         batch = next(iter(dataloader))
 
+        if is_aot():
+            model = model.cuda()
+
         if is_quant():
             logger.info("quantize embeddings...")
             quantize_embeddings(model, dtype=torch.qint8, inplace=True)
@@ -752,6 +757,10 @@ def _script_model(
             logger.info(f"Model Outputs: {result_info}")
 
             export_model_trt(model, data_cuda, save_dir)
+        elif is_aot():
+            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
+            result = model(data_cuda)
+            export_model_aot(model, data_cuda, save_dir)
         else:
             data = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data)
@@ -888,13 +897,14 @@ def export(
         list(data_config.label_fields),
     )
 
+    InferWrapper = ExportWrapperAOT if is_aot() else ScriptWrapper
     if isinstance(device_model, MatchModel):
         for name, module in device_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                tower = ScriptWrapper(wrapper(module, name))
+                tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 _script_model(
                     ori_pipeline_config,
@@ -908,7 +918,7 @@ def export(
     elif isinstance(device_model, TDM):
         for name, module in device_model.named_children():
             if isinstance(module, EmbeddingGroup):
-                emb_module = ScriptWrapper(TDMEmbedding(module, name))
+                emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
@@ -919,7 +929,7 @@ def export(
                 break
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(device_model),
+            InferWrapper(device_model),
             device_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
@@ -929,7 +939,7 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(device_model),
+            InferWrapper(device_model),
             device_state_dict,
             dataloader,
             export_dir,

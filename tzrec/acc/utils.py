@@ -36,6 +36,15 @@ def is_input_tile_emb() -> bool:
     return False
 
 
+def is_aot() -> bool:
+    """Judge is inductor or not."""
+    is_aot = os.environ.get("ENABLE_AOT")
+    if is_aot and is_aot[0] == "1":
+        return True
+    else:
+        return False
+
+
 def is_trt() -> bool:
     """Judge is trt or not."""
     is_trt = os.environ.get("ENABLE_TRT")
