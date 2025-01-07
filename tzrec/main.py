@@ -891,13 +891,14 @@ def export(
         list(data_config.label_fields),
     )
 
+    InferWrapper = ExportWrapperAOT if is_aot() else ScriptWrapper
     if isinstance(device_model, MatchModel):
         for name, module in device_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                tower = ScriptWrapper(wrapper(module, name))
+                tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 _script_model(
                     ori_pipeline_config,
@@ -911,7 +912,7 @@ def export(
     elif isinstance(device_model, TDM):
         for name, module in device_model.named_children():
             if isinstance(module, EmbeddingGroup):
-                emb_module = ScriptWrapper(TDMEmbedding(module, name))
+                emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
@@ -922,27 +923,17 @@ def export(
                 break
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(device_model),
+            InferWrapper(device_model),
             device_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
         )
         for asset in assets:
             shutil.copy(asset, os.path.join(export_dir, "model"))
-    elif is_aot():
-        _script_model(
-            ori_pipeline_config,
-            ExportWrapperAOT(device_model),
-            device_state_dict,
-            dataloader,
-            export_dir,
-        )
-        for asset in assets:
-            shutil.copy(asset, export_dir)
     else:
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(device_model),
+            InferWrapper(device_model),
             device_state_dict,
             dataloader,
             export_dir,

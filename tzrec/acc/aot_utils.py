@@ -83,10 +83,10 @@ def export_model_aot(
 
     gm = gm.cuda()
 
-    def _is_dense(key, data):
+    def _is_dense(key: str, data: Dict[str, torch.Tensor]) -> bool:
         return data[key].dtype in (torch.float32, torch.bfloat16, torch.float16)
 
-    def _is_dense_seq(key, data):
+    def _is_dense_seq(key: str, data: Dict[str, torch.Tensor]) -> bool:
         return (key.split(".")[0] + ".lengths") in data and _is_dense(key, data)
 
     batch = Dim("batch")
