@@ -251,6 +251,35 @@ class MatchIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "retrieval_result")))
 
+    def test_dat_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dat_mock.config", self.test_dir, item_id="item_id"
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/item"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="item_id",
+                output_columns="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
