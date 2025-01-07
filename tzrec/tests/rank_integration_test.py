@@ -68,6 +68,7 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
     def test_aot_export(self):
         pipeline_config_path = "tzrec/tests/configs/multi_tower_din_mock.config"
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
