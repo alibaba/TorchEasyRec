@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -84,7 +84,9 @@ class DATTower(MatchTower):
         if self._output_dim > 0:
             self.output = nn.Linear(self.mlp.output_dim(), output_dim)
 
-    def forward(self, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, batch: Batch
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward the tower.
 
         Args:
@@ -197,6 +199,7 @@ class DAT(MatchModel):
         else:
             user_tower_emb = self.user_tower(batch)
             item_tower_emb = self.item_tower(batch)
+            user_augment, item_augment = None, None
 
         _update_dict_tensor(
             self._loss_collection, self.user_tower.group_variational_dropout_loss
@@ -209,12 +212,26 @@ class DAT(MatchModel):
             self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature
         )
         if self.training:
+            batch_size = ui_sim.size(0)
+            amm_loss_u = self.amm_u_weight * torch.sum(
+                torch.square(
+                    F.normalize(user_augment, p=2.0, dim=1)
+                    - item_tower_emb.detach()[:batch_size]
+                ),
+                dim=1 if self._sample_weight else (0, 1),
+            )
+            amm_loss_i = self.amm_i_weight * torch.sum(
+                torch.square(
+                    F.normalize(item_augment[:batch_size], p=2.0, dim=1)
+                    - user_tower_emb.detach()
+                ),
+                dim=1 if self._sample_weight else (0, 1),
+            )
+
             return {
                 "similarity": ui_sim,
-                "augmented_p_u": user_tower_emb.detach(),
-                "augmented_p_i": item_tower_emb.detach(),
-                "augmented_a_u": user_augment,
-                "augmented_a_i": item_augment,
+                "amm_loss_u": amm_loss_u,
+                "amm_loss_i": amm_loss_i,
             }
         else:
             return {"similarity": ui_sim}

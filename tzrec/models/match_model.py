@@ -9,10 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from tzrec.datasets.utils import Batch
@@ -60,7 +59,7 @@ class MatchTower(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        tower_config: Union[tower_pb2.Tower, tower_pb2.DATTower],
         output_dim: int,
         similarity: match_model_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
@@ -236,32 +235,10 @@ class MatchModel(BaseModel):
             label = _zero_int_label(pred)
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
 
-        if all(
-            [
-                k + suffix in predictions.keys()
-                for k in [
-                    "augmented_p_u",
-                    "augmented_p_i",
-                    "augmented_a_u",
-                    "augmented_a_i",
-                ]
-            ]
-        ):
-            batch_size = pred.size(0)
-            losses["amm_loss_u"] = self.amm_u_weight * torch.sum(
-                torch.square(
-                    F.normalize(predictions["augmented_a_u"], p=2.0, dim=1)
-                    - predictions["augmented_p_i"][:batch_size]
-                ),
-                dim=1 if self._sample_weight else (0, 1),
-            )
-            losses["amm_loss_i"] = self.amm_i_weight * torch.sum(
-                torch.square(
-                    F.normalize(predictions["augmented_a_i"][:batch_size], p=2.0, dim=1)
-                    - predictions["augmented_p_u"]
-                ),
-                dim=1 if self._sample_weight else (0, 1),
-            )
+        if "amm_loss_u" + suffix in predictions.keys():
+            losses["amm_loss_u"] = predictions["amm_loss_u" + suffix]
+        if "amm_loss_i" + suffix in predictions.keys():
+            losses["amm_loss_i"] = predictions["amm_loss_i" + suffix]
 
         if self._sample_weight:
             for loss_name in losses.keys():
