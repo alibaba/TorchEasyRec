@@ -152,11 +152,14 @@ class RankModel(BaseModel):
         return predictions
 
     def _init_loss_impl(
-        self, loss_cfg: LossConfig, num_class: int = 1, suffix: str = ""
+        self,
+        loss_cfg: LossConfig,
+        num_class: int = 1,
+        reduction: str = "none",
+        suffix: str = "",
     ) -> None:
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        reduction = "none" if self._sample_weight_name else "mean"
         if loss_type == "binary_cross_entropy":
             self._loss_modules[loss_name] = nn.BCEWithLogitsLoss(reduction=reduction)
         elif loss_type == "softmax_cross_entropy":
@@ -174,14 +177,15 @@ class RankModel(BaseModel):
     def init_loss(self) -> None:
         """Initialize loss modules."""
         for loss_cfg in self._base_model_config.losses:
-            self._init_loss_impl(loss_cfg, self._num_class)
+            reduction = "none" if self._sample_weight_name else "mean"
+            self._init_loss_impl(loss_cfg, self._num_class, reduction=reduction)
 
     def _loss_impl(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
         label_name: str,
-        loss_weight: torch.Tensor,
+        loss_weight: Optional[torch.Tensor],
         loss_cfg: LossConfig,
         num_class: int = 1,
         suffix: str = "",
@@ -210,8 +214,8 @@ class RankModel(BaseModel):
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
-
-        losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
+        if loss_weight is not None:
+            losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
         return losses
 
     def loss(
@@ -223,7 +227,7 @@ class RankModel(BaseModel):
             loss_weight = batch.sample_weights[self._sample_weight_name]
             loss_weight = loss_weight / torch.mean(loss_weight)
         else:
-            loss_weight = torch.Tensor([1.0]).to(batch.labels[self._label_name].device)
+            loss_weight = None
 
         for loss_cfg in self._base_model_config.losses:
             losses.update(

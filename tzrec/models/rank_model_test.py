@@ -10,7 +10,7 @@
 # limitations under the License.
 
 import unittest
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from parameterized import parameterized
@@ -27,9 +27,13 @@ from tzrec.utils.test_util import TestGraphType, create_test_model
 
 class _TestRankModel(RankModel):
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         dense_feat_kt = batch.dense_features[BASE_DATA_GROUP]
@@ -38,8 +42,15 @@ class _TestRankModel(RankModel):
 
 
 class RankModelTest(unittest.TestCase):
-    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
-    def test_rank_model(self, graph_type):
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+        ]
+    )
+    def test_rank_model(self, graph_type, weighted):
         model_config = model_pb2.ModelConfig(
             losses=[
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
@@ -51,7 +62,17 @@ class RankModelTest(unittest.TestCase):
                 ),
             ],
         )
-        model = _TestRankModel(model_config=model_config, features=[], labels=["label"])
+        if weighted:
+            model = _TestRankModel(
+                model_config=model_config,
+                features=[],
+                labels=["label"],
+                sample_weights=["weight"],
+            )
+        else:
+            model = _TestRankModel(
+                model_config=model_config, features=[], labels=["label"]
+            )
         model = TrainWrapper(model)
         model = create_test_model(model, graph_type)
 
@@ -62,14 +83,19 @@ class RankModelTest(unittest.TestCase):
             keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
         )
         label = torch.tensor([0, 1])
+        weight = torch.tensor([1.0, 2.0])
         batch = Batch(
             dense_features={BASE_DATA_GROUP: dense_feature},
             sparse_features={BASE_DATA_GROUP: sparse_feature},
             labels={"label": label},
+            sample_weights={"weight": weight},
         )
         total_loss, (losses, predictions, batch) = model(batch)
 
-        expected_total_loss = torch.tensor(0.6762)
+        if weighted:
+            expected_total_loss = torch.tensor(0.6356)
+        else:
+            expected_total_loss = torch.tensor(0.6762)
         expected_logits = torch.tensor([0.2000, 0.3000])
         expected_probs = torch.tensor([0.5498, 0.5744])
         expected_auc = torch.tensor(1.0)
