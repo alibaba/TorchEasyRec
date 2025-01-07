@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -521,7 +521,7 @@ class DataParser:
                     if key in self.user_feats:
                         # pyre-ignore [6]
                         weight = weight.tile(tile_size)
-                    weights.append(weights)
+                    weights.append(weight)
 
             sparse_feature = KeyedJaggedTensor(
                 keys=keys,
