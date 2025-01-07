@@ -73,35 +73,6 @@ def is_quant() -> bool:
     return True
 
 
-def update_state_dict_for_input_tile(state_dict: Dict[str, torch.Tensor]) -> None:
-    """Copy the ebc params to ebc_user and ebc_item Updates the model's state.
-
-    dictionary with adapted parameters for the input tile.
-
-    Args:
-        state_dict (Dict[str, torch.Tensor]): model state_dict
-    """
-    input_tile_keys = [
-        ".ebc_user.embedding_bags.",
-    ]
-    input_tile_keys_ec = [
-        ".ec_list_user.",
-    ]
-
-    for key, dst_tensor in state_dict.items():
-        for input_tile_key in input_tile_keys:
-            if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ebc.embedding_bags.")
-                src_tensor = state_dict[src_key]
-                dst_tensor.copy_(src_tensor)
-
-        for input_tile_key in input_tile_keys_ec:
-            if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ec_list.")
-                src_tensor = state_dict[src_key]
-                dst_tensor.copy_(src_tensor)
-
-
 def write_mapping_file_for_input_tile(
     state_dict: Dict[str, torch.Tensor], remap_file_path: str
 ) -> None:
@@ -115,15 +86,10 @@ def write_mapping_file_for_input_tile(
     """
     input_tile_mapping = {
         ".ebc_user.embedding_bags.": ".ebc.embedding_bags.",
-        ".ebc_item.embedding_bags.": ".ebc.embedding_bags.",
         ".mc_ebc_user._embedding_module.": ".mc_ebc._embedding_module.",
-        ".mc_ebc_item._embedding_module.": ".mc_ebc._embedding_module.",
         ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
-        ".mc_ebc_item._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
         ".ec_list_user.": ".ec_list.",
-        ".ec_list_item.": ".ec_list.",
         ".mc_ec_list_user.": ".mc_ec_list.",
-        ".mc_ec_list_item.": ".mc_ec_list.",
     }
 
     remap_str = ""
