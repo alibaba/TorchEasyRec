@@ -247,16 +247,6 @@ class MatchModel(BaseModel):
                 ]
             ]
         ):
-            assert (
-                predictions["augmented_a_u"].shape[1]
-                == predictions["augmented_p_i"].shape[1]
-            ), "dimension of user augmented group embedding and \
-                item tower output should be the same"
-            assert (
-                predictions["augmented_a_i"].shape[1]
-                == predictions["augmented_p_u"].shape[1]
-            ), "dimension of item augmented group embedding and \
-                user tower output should be the same"
             batch_size = pred.size(0)
             losses["amm_loss_u"] = self.amm_u_weight * torch.sum(
                 torch.square(
