@@ -223,8 +223,10 @@ class DAT(MatchModel):
         else:
             return {"similarity": ui_sim}
 
-
-    def loss(self, predictions: Dict[str, torch.Tensor], batch: Batch) -> Dict[str, torch.Tensor]:
+    def loss(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Compute the Adaptive-Mimic Mechanism loss."""
         losses = super().loss(predictions, batch)
 
         sample_weight = (
@@ -234,10 +236,10 @@ class DAT(MatchModel):
         )
 
         amm_loss = {}
-        batch_size = predictions['similarity'].size(0)
+        batch_size = predictions["similarity"].size(0)
         if "user_augment" in predictions and "item_tower_emb" in predictions:
-            user_augment = predictions['user_augment']
-            item_tower_emb = predictions['item_tower_emb']
+            user_augment = predictions["user_augment"]
+            item_tower_emb = predictions["item_tower_emb"]
             amm_loss_u = self.amm_u_weight * torch.sum(
                 torch.square(
                     F.normalize(user_augment, p=2.0, dim=1)
@@ -246,9 +248,9 @@ class DAT(MatchModel):
                 dim=1 if self._sample_weight else (0, 1),
             )
 
-        if 'item_augment' in predictions and 'user_tower_emb' in predictions:
-            item_augment = predictions['item_augment']
-            user_tower_emb = predictions['user_tower_emb']
+        if "item_augment" in predictions and "user_tower_emb" in predictions:
+            item_augment = predictions["item_augment"]
+            user_tower_emb = predictions["user_tower_emb"]
             amm_loss_i = self.amm_i_weight * torch.sum(
                 torch.square(
                     F.normalize(item_augment[:batch_size], p=2.0, dim=1)
@@ -256,16 +258,16 @@ class DAT(MatchModel):
                 ),
                 dim=1 if self._sample_weight else (0, 1),
             )
-        
+
         if self._sample_weight:
-            amm_loss_u = torch.mean(
-                    amm_loss_u * sample_weight
-                ) / torch.mean(sample_weight)
-            amm_loss_i = torch.mean(
-                    amm_loss_i * sample_weight
-                ) / torch.mean(sample_weight)
-        amm_loss['amm_loss_u'] = amm_loss_u
-        amm_loss['amm_loss_i'] = amm_loss_i
+            amm_loss_u = torch.mean(amm_loss_u * sample_weight) / torch.mean(
+                sample_weight
+            )
+            amm_loss_i = torch.mean(amm_loss_i * sample_weight) / torch.mean(
+                sample_weight
+            )
+        amm_loss["amm_loss_u"] = amm_loss_u
+        amm_loss["amm_loss_i"] = amm_loss_i
         losses.update(amm_loss)
-        
+
         return losses
