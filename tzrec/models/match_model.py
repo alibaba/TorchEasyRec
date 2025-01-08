@@ -235,16 +235,10 @@ class MatchModel(BaseModel):
             label = _zero_int_label(pred)
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
 
-        if "amm_loss_u" + suffix in predictions.keys():
-            losses["amm_loss_u"] = predictions["amm_loss_u" + suffix]
-        if "amm_loss_i" + suffix in predictions.keys():
-            losses["amm_loss_i"] = predictions["amm_loss_i" + suffix]
-
         if self._sample_weight:
-            for loss_name in losses.keys():
-                losses[loss_name] = torch.mean(
-                    losses[loss_name] * sample_weight
-                ) / torch.mean(sample_weight)
+            losses[loss_name] = torch.mean(
+                losses[loss_name] * sample_weight
+            ) / torch.mean(sample_weight)
 
         return losses
 
