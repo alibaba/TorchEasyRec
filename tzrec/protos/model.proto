@@ -47,6 +47,7 @@ message ModelConfig {
 
         DSSM dssm = 301;
         DSSMV2 dssm_v2 = 302;
+        DAT dat = 303;
 
         TDM tdm = 400;
 

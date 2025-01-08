@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from torch import nn
@@ -59,7 +59,7 @@ class MatchTower(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        tower_config: Union[tower_pb2.Tower, tower_pb2.DATTower],
         output_dim: int,
         similarity: match_model_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
@@ -234,6 +234,7 @@ class MatchModel(BaseModel):
         else:
             label = _zero_int_label(pred)
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
+
         if self._sample_weight:
             losses[loss_name] = torch.mean(
                 losses[loss_name] * sample_weight
