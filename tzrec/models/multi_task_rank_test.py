@@ -10,7 +10,7 @@
 # limitations under the License.
 
 import unittest
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from parameterized import parameterized
@@ -29,9 +29,13 @@ from tzrec.utils.test_util import TestGraphType, create_test_model
 
 class _TestMultiTaskRankModel(MultiTaskRank):
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights)
         self._task_tower_cfgs = self._model_config.task_towers
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -44,8 +48,15 @@ class _TestMultiTaskRankModel(MultiTaskRank):
 
 
 class MultiTaskRankTest(unittest.TestCase):
-    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
-    def test_multi_task_rank_model(self, graph_type):
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+        ]
+    )
+    def test_multi_task_rank_model(self, graph_type, task_space):
         model_config = model_pb2.ModelConfig(
             simple_multi_task=multi_task_rank_pb2.SimpleMultiTask(
                 task_towers=[
@@ -72,6 +83,11 @@ class MultiTaskRankTest(unittest.TestCase):
                 ]
             )
         )
+        if task_space:
+            second_task = model_config.simple_multi_task.task_towers[1]
+            second_task.task_space_indicator_label = "label1"
+            second_task.in_task_space_weight = 1
+            second_task.out_task_space_weight = 0
         model = _TestMultiTaskRankModel(
             model_config=model_config, features=[], labels=["label1", "label2"]
         )
@@ -94,11 +110,18 @@ class MultiTaskRankTest(unittest.TestCase):
             model.model.update_metric(predictions, batch)
             metric_result = model.model.compute_metric()
 
-        expected_total_loss = torch.tensor(1.5784)
-        expected_losses = {
-            "binary_cross_entropy_t1": torch.tensor(0.6762),
-            "binary_cross_entropy_t2": torch.tensor(0.9021),
-        }
+        if task_space:
+            expected_total_loss = torch.tensor(2.2173)
+            expected_losses = {
+                "binary_cross_entropy_t1": torch.tensor(0.6762),
+                "binary_cross_entropy_t2": torch.tensor(1.5410),
+            }
+        else:
+            expected_total_loss = torch.tensor(1.5784)
+            expected_losses = {
+                "binary_cross_entropy_t1": torch.tensor(0.6762),
+                "binary_cross_entropy_t2": torch.tensor(0.9021),
+            }
         expected_logits = {
             "logits_t1": torch.tensor([0.2000, 0.3000]),
             "logits_t2": torch.tensor([1.2000, 1.3000]),

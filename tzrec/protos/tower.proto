@@ -36,6 +36,12 @@ message TaskTower {
     optional float weight = 7 [default = 1.0];
     // sample weight for the task
     optional string sample_weight_name = 8;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 9;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 10 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 11 [default = 1.0];
 };
 
 message BayesTaskTower {
@@ -60,6 +66,12 @@ message BayesTaskTower {
     optional MLP relation_mlp = 9;
     // sample weight for the task
     optional string sample_weight_name = 10;
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 11;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 12 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 13 [default = 1.0];
 };
 
 message InterventionTaskTower {
@@ -84,6 +96,12 @@ message InterventionTaskTower {
     required uint32 low_rank_dim = 9;
     // dropout_ratio
     optional float dropout_ratio = 10 [default = 0.1];
+    // label name for indicating the sample space for the task tower
+    optional string task_space_indicator_label = 11;
+    // the loss weight for sample in the task space
+    optional float in_task_space_weight = 12 [default = 1.0];
+    // the loss weight for sample out the task space
+    optional float out_task_space_weight = 13 [default = 1.0];
 };
 
 

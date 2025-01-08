@@ -63,7 +63,7 @@
   "tzrec/benchmark/configs/taobao/mmoe.config": {
     "label": {
       "auc_ctr": 0.634,
-      "auc_cvr": 0.705
+      "auc_cvr": 0.785
     },
     "threshold": {
       "auc_ctr": 0.002,
