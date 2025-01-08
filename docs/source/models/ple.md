@@ -101,6 +101,9 @@ model_config {
     - mlp: TaskTower的MLP参数配置
     - losses: 任务损失函数配置
     - metrics: 任务评估指标配置
+    - task_space_indicator_label: 作用在当前任务上的其他目标名称，配合in_task_space_weight、out_task_space_weight使用
+    - in_task_space_weight: 当其他目标大于0时，该权重会和当前任务的loss相乘
+    - out_task_space_weight: 当其他目标小于0时，该权重和当前任务的loss相乘
 
 ## 示例Config
 
