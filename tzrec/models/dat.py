@@ -247,6 +247,7 @@ class DAT(MatchModel):
                 ),
                 dim=1 if self._sample_weight else (0, 1),
             )
+            amm_loss["amm_loss_u"] = amm_loss_u
 
         if "item_augment" in predictions and "user_tower_emb" in predictions:
             item_augment = predictions["item_augment"]
@@ -258,16 +259,14 @@ class DAT(MatchModel):
                 ),
                 dim=1 if self._sample_weight else (0, 1),
             )
+            amm_loss["amm_loss_i"] = amm_loss_i
 
         if self._sample_weight:
-            amm_loss_u = torch.mean(amm_loss_u * sample_weight) / torch.mean(
-                sample_weight
-            )
-            amm_loss_i = torch.mean(amm_loss_i * sample_weight) / torch.mean(
-                sample_weight
-            )
-        amm_loss["amm_loss_u"] = amm_loss_u
-        amm_loss["amm_loss_i"] = amm_loss_i
+            for loss_name in amm_loss.keys():
+                amm_loss[loss_name] = torch.mean(
+                    amm_loss[loss_name] * sample_weight
+                ) / torch.mean(sample_weight)
+
         losses.update(amm_loss)
 
         return losses
