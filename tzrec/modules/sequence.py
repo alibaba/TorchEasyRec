@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -315,6 +315,8 @@ class HSTUEncoder(SequenceEncoder):
     def __init__(
         self,
         sequence_dim: int,
+        attn_dim: int,
+        linear_dim: int,
         input: str,
         max_seq_length: int,
         pos_dropout_rate: float = 0.2,
@@ -331,12 +333,15 @@ class HSTUEncoder(SequenceEncoder):
     ) -> None:
         super().__init__(input)
         self._sequence_dim = sequence_dim
+        self._attn_dim = attn_dim
+        self._linear_dim = linear_dim
         self._max_seq_length = max_seq_length
         self._query_name = f"{input}.query"
         self._sequence_name = f"{input}.sequence"
         self._sequence_length_name = f"{input}.sequence_length"
+        max_output_len = max_output_len + 1  # for target
         self.position_embed = nn.Embedding(
-            self._max_seq_length + max_output_len + 1, self._sequence_dim, padding_idx=0
+            self._max_seq_length + max_output_len, self._sequence_dim, padding_idx=0
         )
         self.dropout_rate = pos_dropout_rate
         self.enable_relative_attention_bias = True
@@ -345,8 +350,8 @@ class HSTUEncoder(SequenceEncoder):
             modules=[
                 SequentialTransductionUnitJagged(
                     embedding_dim=self._sequence_dim,
-                    linear_hidden_dim=self._sequence_dim,
-                    attention_dim=self._sequence_dim,
+                    linear_hidden_dim=self._linear_dim,
+                    attention_dim=self._attn_dim,
                     normalization=normalization,
                     linear_config=linear_config,
                     linear_activation=linear_activation,

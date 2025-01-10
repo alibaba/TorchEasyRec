@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -70,13 +70,12 @@ class HSTUTower(MatchTower):
         Return:
             embedding (dict): tower output embedding.
         """
-        # print(batch)
         grouped_features = self.build_input(batch)
         output = grouped_features[self._group_name]
 
         if self.tower_config.input == "item":
-            if self._similarity == match_model_pb2.Similarity.COSINE:
-                output = F.normalize(output, p=2.0, dim=1, eps=1e-6)
+            output = F.normalize(output, p=2.0, dim=1, eps=1e-6)
+
         return output
 
 
@@ -148,6 +147,7 @@ class HSTU(MatchModel):
             self._loss_collection, self.item_tower.group_variational_dropout_loss
         )
         ui_sim = (
-            self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature
+            self.sim(user_tower_emb, item_tower_emb, neg_for_each_sample=False)
+            / self._model_config.temperature
         )
         return {"similarity": ui_sim}

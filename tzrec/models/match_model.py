@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -175,7 +175,12 @@ class MatchModel(BaseModel):
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
 
-    def sim(self, user_emb: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
+    def sim(
+        self,
+        user_emb: torch.Tensor,
+        item_emb: torch.Tensor,
+        neg_for_each_sample: bool = False,
+    ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
@@ -186,7 +191,16 @@ class MatchModel(BaseModel):
             pos_ui_sim = torch.sum(
                 torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
             )
-            neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+            neg_ui_sim = None
+            if not neg_for_each_sample:
+                neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+            else:
+                # Calculate similarity for each user with corresponding negative items
+                num_neg_per_user = neg_item_emb.size(0) // batch_size
+                neg_size = batch_size * num_neg_per_user
+                neg_item_emb = neg_item_emb[:neg_size]
+                neg_item_emb = neg_item_emb.view(batch_size, num_neg_per_user, -1)
+                neg_ui_sim = torch.sum(user_emb.unsqueeze(1) * neg_item_emb, dim=-1)
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
 
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:

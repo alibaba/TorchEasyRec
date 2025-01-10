@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -574,7 +574,7 @@ class HardNegativeSampler(BaseSampler):
 class HardNegativeSamplerV2(BaseSampler):
     """HardNegativeSampler.
 
-    Weighted random sampling items which  do not have positive edge with the user.,
+    Weighted random sampling items which do not have positive edge with the user,
     and sampling destination nodes in hard_neg_edge as hard negative samples.
 
     Args:
