@@ -50,6 +50,7 @@ from tzrec.acc.utils import (
     is_input_tile_emb,
     is_quant,
     is_trt,
+    is_cuda_export,
     is_trt_predict,
     write_mapping_file_for_input_tile,
 )
@@ -69,7 +70,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ExportWrapperAOT, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, CudaScriptWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -727,12 +728,8 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        if is_trt_convert:
-            model = model.to_empty(device="cuda:0")
-            logger.info("gather states to cuda model...")
-        else:
-            model = model.to_empty(device="cpu")
-            logger.info("gather states to cpu model...")
+        model = model.to_empty(device="cpu")
+        logger.info("gather states to cpu model...")
 
     state_dict_gather(state_dict, model.state_dict())
 
@@ -741,7 +738,7 @@ def _script_model(
     if is_rank_zero:
         batch = next(iter(dataloader))
 
-        if is_aot():
+        if is_cuda_export():
             model = model.cuda()
 
         if is_quant():
@@ -752,11 +749,27 @@ def _script_model(
 
         if is_trt_convert:
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda, "cuda:0")
+            #print(data_cuda)
+            data_cuda_list = batch.to_list(sparse_dtype=torch.int64)
+            #print(data_cuda_list)
+            # result = model(data_cuda_list)
+            # result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+            # logger.info(f"Model Outputs: {result_info}")
+
+            # export_model_trt(model, data_cuda_list, save_dir)
+            
+            result = model(data_cuda)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
 
             export_model_trt(model, data_cuda, save_dir)
+            # data_cuda = batch.to_dict(sparse_dtype=torch.int64)
+            # result = model(data_cuda, "cuda:0")
+            # result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+            # logger.info(f"Model Outputs: {result_info}")
+
+            # export_model_trt(model, data_cuda, save_dir)
+
         elif is_aot():
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data_cuda)
@@ -876,20 +889,12 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    if is_trt_convert:
-        checkpoint_pg = dist.new_group(backend="nccl")
-        if is_rank_zero:
-            logger.info("copy sharded state_dict to cuda...")
-        device_state_dict = state_dict_to_device(
-            model.state_dict(), pg=checkpoint_pg, device=torch.device(device)
-        )
-    else:
-        checkpoint_pg = dist.new_group(backend="gloo")
-        if is_rank_zero:
-            logger.info("copy sharded state_dict to cpu...")
-        device_state_dict = state_dict_to_device(
-            model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-        )
+    checkpoint_pg = dist.new_group(backend="gloo")
+    if is_rank_zero:
+        logger.info("copy sharded state_dict to cpu...")
+    device_state_dict = state_dict_to_device(
+        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
+    )
 
     device_model = _create_model(
         pipeline_config.model_config,
@@ -897,7 +902,11 @@ def export(
         list(data_config.label_fields),
     )
 
-    InferWrapper = ExportWrapperAOT if is_aot() else ScriptWrapper
+    InferWrapper = CudaScriptWrapper if is_aot() else ScriptWrapper
+    if is_trt_convert:
+        from tzrec.models.model import CudaListScriptWrapper
+        InferWrapper = CudaListScriptWrapper
+        InferWrapper = CudaScriptWrapper
     if isinstance(device_model, MatchModel):
         for name, module in device_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):

@@ -26,21 +26,18 @@ from tzrec.acc.utils import is_debug_trt
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
-
+from tzrec.acc.export_utils import export_pm_list,export_pm
 
 def trt_convert(
-    module: nn.Module,
+    exp_program: torch.export.ExportedProgram,
     # pyre-ignore [2]
     inputs: Optional[Sequence[Sequence[Any]]],
-    # pyre-ignore [2]
-    dynamic_shapes: Optional[Union[Dict[str, Any], Tuple[Any], List[Any]]],
 ) -> torch.fx.GraphModule:
     """Convert model use trt.
 
     Args:
-        module (nn.Module): Source module
+        exp_program (torch.export.ExportedProgram): Source exported program
         inputs (List[Union(torch_tensorrt.Input, torch.Tensor)]): inputs
-        dynamic_shapes: dynamic shapes
 
     Returns:
         torch.fx.GraphModule: Compiled FX Module, when run it will execute via TensorRT
@@ -56,7 +53,6 @@ def trt_convert(
     # (Lower value allows more graph segmentation)
     min_block_size = 2
 
-    exp_program = torch.export.export(module, (inputs,), dynamic_shapes=dynamic_shapes)
     #  use script model , unsupported the inputs : dict
     if is_debug_trt():
         with torch_tensorrt.logging.graphs():
@@ -71,6 +67,7 @@ def trt_convert(
                 assume_dynamic_shape_support=True,
                 # truncate_long_and_double=True,
                 allow_shape_tensors=True,
+                torch_executed_ops=["aten::split_with_sizes","aten::split"]
             )
 
     else:
@@ -85,6 +82,7 @@ def trt_convert(
             assume_dynamic_shape_support=True,
             # truncate_long_and_double=True,
             allow_shape_tensors=True,
+            torch_executed_ops=["aten::split_with_sizes","aten::split"]
         )
 
     logger.info("trt convert end")
@@ -167,7 +165,7 @@ def get_trt_max_seq_len() -> int:
     return int(os.environ.get("TRT_MAX_SEQ_LEN", 100))
 
 
-def export_model_trt(
+def export_model_trt1(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> None:
     """Export trt model.
@@ -201,6 +199,8 @@ def export_model_trt(
         if v.size(0) < 2:
             v = torch.zeros((2,) + v.size()[1:], device="cuda:0", dtype=v.dtype)
         values_list_cuda.append(v)
+        print(v.is_contiguous(memory_format=torch.contiguous_format))
+        print(v.is_contiguous(memory_format=torch.channels_last))
         dynamic_shapes_list.append(dict_dy)
 
     # convert dense
@@ -208,7 +208,8 @@ def export_model_trt(
     logger.info("dense res: %s", dense(values_list_cuda))
     dense_layer = symbolic_trace(dense)
     dynamic_shapes = {"args": dynamic_shapes_list}
-    dense_layer_trt = trt_convert(dense_layer, values_list_cuda, dynamic_shapes)
+    exp_program = torch.export.export(dense_layer, (values_list_cuda,), dynamic_shapes=dynamic_shapes)
+    dense_layer_trt = trt_convert(exp_program, values_list_cuda)
     dict_res = dense_layer_trt(values_list_cuda)
     logger.info("dense trt res: %s", dict_res)
 
@@ -255,3 +256,119 @@ def export_model_trt(
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
     logger.info("trt convert success")
+
+
+def export_model_trt(
+    model: nn.Module, data: List[torch.Tensor], save_dir: str
+) -> None:
+    """Export trt model.
+
+    Args:
+        model (nn.Module): the model
+        data (List[torch.Tensor]): the test data
+        save_dir (str): model save dir
+    """
+    
+    result = model(data)
+    logger.info("orign model result: %s", result)
+    
+    exported_pg,data = export_pm_list(model, data, save_dir)
+    model_trt = trt_convert(exported_pg, data)
+    gm = symbolic_trace(model_trt)
+    with open(os.path.join(save_dir, "gm.code"), "w") as f:
+        f.write(gm.code)
+
+    scripted_model = torch.jit.script(gm)
+    scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+    
+   
+    if is_debug_trt():
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function("model_inference"):
+                dict_res = model(data)
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function("model_inference_trt"):
+                dict_res = model_trt(data)
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
+        model_gpu = torch.jit.load(
+            os.path.join(save_dir, "scripted_model.pt"), map_location="cuda:0"
+        )
+        res = model_gpu(data)
+        logger.info("final res: %s", res)
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function("model_inference_combined_trt"):
+                dict_res = model_gpu(data)
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
+    logger.info("trt convert success")
+    
+
+def export_model_trt(
+    model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
+) -> None:
+    """Export trt model.
+
+    Args:
+        model (nn.Module): the model
+        data (List[torch.Tensor]): the test data
+        save_dir (str): model save dir
+    """
+    
+    result = model(data)
+    logger.info("orign model result: %s", result)
+    
+    exported_pg,data = export_pm(model, data, save_dir)
+    model_trt = trt_convert(exported_pg, data)
+    gm = symbolic_trace(model_trt)
+    with open(os.path.join(save_dir, "gm.code"), "w") as f:
+        f.write(gm.code)
+
+    scripted_model = torch.jit.script(gm)
+    scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+    
+   
+    if is_debug_trt():
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function("model_inference"):
+                dict_res = model(data)
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function("model_inference_trt"):
+                dict_res = model_trt(data)
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
+        model_gpu = torch.jit.load(
+            os.path.join(save_dir, "scripted_model.pt"), map_location="cuda:0"
+        )
+        res = model_gpu(data)
+        logger.info("final res: %s", res)
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function("model_inference_combined_trt"):
+                dict_res = model_gpu(data)
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
+    logger.info("trt convert success")
+    
+    
