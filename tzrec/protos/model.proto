@@ -46,7 +46,7 @@ message ModelConfig {
 
         DSSM dssm = 301;
         DSSMV2 dssm_v2 = 302;
-        HSTU hstu = 303;
+        HSTUMatch hstu_match = 303;
 
         TDM tdm = 400;
 

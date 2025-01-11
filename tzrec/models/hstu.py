@@ -34,8 +34,8 @@ def _update_dict_tensor(
                 tensor_dict[k] = v
 
 
-class HSTUTower(MatchTower):
-    """HSTU user/item tower.
+class HSTUMatchTower(MatchTower):
+    """HSTU Match model user/item tower.
 
     Args:
         tower_config (Tower): user/item tower config.
@@ -79,8 +79,8 @@ class HSTUTower(MatchTower):
         return output
 
 
-class HSTU(MatchModel):
-    """HSTU model.
+class HSTUMatch(MatchModel):
+    """HSTU Match model.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -111,7 +111,7 @@ class HSTU(MatchModel):
                 user_features[x] = name_to_feature[x]
         item_features = [name_to_feature[x] for x in item_group.feature_names]
 
-        self.user_tower = HSTUTower(
+        self.user_tower = HSTUMatchTower(
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
@@ -120,7 +120,7 @@ class HSTU(MatchModel):
             model_config,
         )
 
-        self.item_tower = HSTUTower(
+        self.item_tower = HSTUMatchTower(
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,

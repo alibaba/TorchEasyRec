@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -83,38 +83,40 @@ class HSTUEncoderTest(unittest.TestCase):
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_hstu_encoder(self, graph_type) -> None:
-        din = HSTUEncoder(
+        hstu = HSTUEncoder(
             sequence_dim=16,
             input="click_seq",
             max_seq_length=10,
+            attn_dim=16,
+            linear_dim=16,
         )
-        self.assertEqual(din.output_dim(), 16)
-        din = create_test_module(din, graph_type)
+        self.assertEqual(hstu.output_dim(), 16)
+        hstu = create_test_module(hstu, graph_type)
         embedded = {
-            "click_seq.query": torch.randn(4, 16),
             "click_seq.sequence": torch.randn(4, 10, 16),
             "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
         }
-        result = din(embedded)
+        result = hstu(embedded)
         self.assertEqual(result.size(), (4, 16))
 
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_hstu_encoder_padding(self, graph_type) -> None:
-        din = HSTUEncoder(
+        hstu = HSTUEncoder(
             sequence_dim=16,
             input="click_seq",
             max_seq_length=10,
+            attn_dim=16,
+            linear_dim=16,
         )
-        self.assertEqual(din.output_dim(), 16)
-        din = create_test_module(din, graph_type)
+        self.assertEqual(hstu.output_dim(), 16)
+        hstu = create_test_module(hstu, graph_type)
         embedded = {
-            "click_seq.query": torch.randn(4, 12),
             "click_seq.sequence": torch.randn(4, 10, 16),
             "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
         }
-        result = din(embedded)
+        result = hstu(embedded)
         self.assertEqual(result.size(), (4, 16))
 
 
