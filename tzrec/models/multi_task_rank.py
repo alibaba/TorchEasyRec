@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -17,6 +17,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.tower_pb2 import BayesTaskTower, InterventionTaskTower, TaskTower
 
 
 class MultiTaskRank(RankModel):
@@ -57,14 +58,29 @@ class MultiTaskRank(RankModel):
                 )
         return predictions
 
+    def has_weight(
+        self, task_cfg: Union[TaskTower, BayesTaskTower, InterventionTaskTower]
+    ) -> bool:
+        """Task cfg should have weight."""
+        if (
+            task_cfg.HasField("sample_weight_name")
+            or task_cfg.HasField("weight")
+            or task_cfg.HasField("task_space_indicator_label")
+        ):
+            return True
+        else:
+            return False
+
     def init_loss(self) -> None:
         """Initialize loss modules."""
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
+            reduction = "none" if self.has_weight(task_tower_cfg) else "mean"
             for loss_cfg in task_tower_cfg.losses:
                 self._init_loss_impl(
                     loss_cfg,
                     num_class=task_tower_cfg.num_class,
+                    reduction=reduction,
                     suffix=f"_{tower_name}",
                 )
 
@@ -76,12 +92,37 @@ class MultiTaskRank(RankModel):
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name
+            if self.has_weight(task_tower_cfg):
+                if task_tower_cfg.sample_weight_name:
+                    sample_weight = task_tower_cfg.sample_weight_name
+                    loss_weight = batch.sample_weights[sample_weight]
+                else:
+                    loss_weight = torch.Tensor([1.0]).to(
+                        batch.labels[label_name].device
+                    )
+
+                loss_weight *= task_tower_cfg.weight
+
+                if task_tower_cfg.HasField("task_space_indicator_label"):
+                    in_task_space = (
+                        batch.labels[task_tower_cfg.task_space_indicator_label] > 0
+                    ).float()
+                    loss_weight = loss_weight * (
+                        task_tower_cfg.in_task_space_weight * in_task_space
+                        + task_tower_cfg.out_task_space_weight * (1 - in_task_space)
+                    )
+
+                loss_weight = loss_weight / torch.mean(loss_weight)
+            else:
+                loss_weight = None
+
             for loss_cfg in task_tower_cfg.losses:
                 losses.update(
                     self._loss_impl(
                         predictions,
                         batch,
                         label_name,
+                        loss_weight,
                         loss_cfg,
                         num_class=task_tower_cfg.num_class,
                         suffix=f"_{tower_name}",

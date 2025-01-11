@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from torch import nn
@@ -59,7 +59,7 @@ class MatchTower(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        tower_config: Union[tower_pb2.Tower, tower_pb2.DATTower],
         output_dim: int,
         similarity: match_model_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
@@ -231,7 +231,9 @@ class MatchModel(BaseModel):
         losses = {}
         label = batch.labels[label_name]
         sample_weight = (
-            batch.sample_weights[self._sample_weight] if self._sample_weight else 1.0
+            batch.sample_weights[self._sample_weight]
+            if self._sample_weight
+            else torch.Tensor([1.0])
         )
 
         loss_type = loss_cfg.WhichOneof("loss")
@@ -246,8 +248,11 @@ class MatchModel(BaseModel):
         else:
             label = _zero_int_label(pred)
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
+
         if self._sample_weight:
-            losses[loss_name] = torch.mean(losses[loss_name] * sample_weight)
+            losses[loss_name] = torch.mean(
+                losses[loss_name] * sample_weight
+            ) / torch.mean(sample_weight)
 
         return losses
 

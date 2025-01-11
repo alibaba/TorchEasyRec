@@ -56,6 +56,9 @@ class RankModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0]
+        self._sample_weight_name = (
+            sample_weights[0] if sample_weights else sample_weights
+        )
         self._loss_collection = {}
         self.embedding_group = None
         self.group_variational_dropouts = None
@@ -149,34 +152,40 @@ class RankModel(BaseModel):
         return predictions
 
     def _init_loss_impl(
-        self, loss_cfg: LossConfig, num_class: int = 1, suffix: str = ""
+        self,
+        loss_cfg: LossConfig,
+        num_class: int = 1,
+        reduction: str = "none",
+        suffix: str = "",
     ) -> None:
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
         if loss_type == "binary_cross_entropy":
-            self._loss_modules[loss_name] = nn.BCEWithLogitsLoss()
+            self._loss_modules[loss_name] = nn.BCEWithLogitsLoss(reduction=reduction)
         elif loss_type == "softmax_cross_entropy":
-            self._loss_modules[loss_name] = nn.CrossEntropyLoss()
+            self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
         elif loss_type == "jrc_loss":
             assert num_class == 2, f"num_class must be 2 when loss type is {loss_type}"
             self._loss_modules[loss_name] = JRCLoss(
-                alpha=loss_cfg.jrc_loss.alpha,
+                alpha=loss_cfg.jrc_loss.alpha, reduction=reduction
             )
         elif loss_type == "l2_loss":
-            self._loss_modules[loss_name] = nn.MSELoss()
+            self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
         for loss_cfg in self._base_model_config.losses:
-            self._init_loss_impl(loss_cfg, self._num_class)
+            reduction = "none" if self._sample_weight_name else "mean"
+            self._init_loss_impl(loss_cfg, self._num_class, reduction=reduction)
 
     def _loss_impl(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
         label_name: str,
+        loss_weight: Optional[torch.Tensor],
         loss_cfg: LossConfig,
         num_class: int = 1,
         suffix: str = "",
@@ -205,6 +214,8 @@ class RankModel(BaseModel):
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
+        if loss_weight is not None:
+            losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
         return losses
 
     def loss(
@@ -212,12 +223,19 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
         losses = {}
+        if self._sample_weight_name:
+            loss_weight = batch.sample_weights[self._sample_weight_name]
+            loss_weight = loss_weight / torch.mean(loss_weight)
+        else:
+            loss_weight = None
+
         for loss_cfg in self._base_model_config.losses:
             losses.update(
                 self._loss_impl(
                     predictions,
                     batch,
                     self._label_name,
+                    loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
                 )

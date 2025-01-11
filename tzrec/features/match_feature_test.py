@@ -63,7 +63,7 @@ class MatchFeatureTest(unittest.TestCase):
             )
         )
         match_feat = match_feature_lib.MatchFeature(
-            match_feat_cfg, fg_mode=FgMode.NORMAL
+            match_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(match_feat.output_dim, 1)
         self.assertEqual(match_feat.is_sparse, False)
@@ -112,7 +112,7 @@ class MatchFeatureTest(unittest.TestCase):
             )
         )
         match_feat = match_feature_lib.MatchFeature(
-            match_feat_cfg, fg_mode=FgMode.NORMAL
+            match_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(match_feat.output_dim, 16)
         self.assertEqual(match_feat.is_sparse, True)
@@ -166,7 +166,7 @@ class MatchFeatureTest(unittest.TestCase):
             )
         )
         match_feat = match_feature_lib.MatchFeature(
-            match_feat_cfg, fg_mode=FgMode.NORMAL
+            match_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(match_feat.output_dim, 16)
         self.assertEqual(match_feat.is_sparse, True)
@@ -220,7 +220,7 @@ class MatchFeatureTest(unittest.TestCase):
             )
         )
         match_feat = match_feature_lib.MatchFeature(
-            match_feat_cfg, fg_mode=FgMode.NORMAL
+            match_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(match_feat.output_dim, 16)
         self.assertEqual(match_feat.is_sparse, True)

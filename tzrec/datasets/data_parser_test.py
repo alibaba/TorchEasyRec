@@ -33,7 +33,7 @@ class DataParserTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
 
-    def test_fg_encoded(self):
+    def test_nofg(self):
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -404,10 +404,10 @@ class DataParserTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [FgMode.NORMAL, False],
-            [FgMode.DAG, False],
-            [FgMode.NORMAL, True],
-            [FgMode.DAG, True],
+            [FgMode.FG_NORMAL, False],
+            [FgMode.FG_DAG, False],
+            [FgMode.FG_NORMAL, True],
+            [FgMode.FG_DAG, True],
         ]
     )
     def test_fg(self, fg_mode, weigted_id):
@@ -527,6 +527,64 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
+    def test_fg_bucketize_only(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_BUCKETIZE)
+        data_parser = DataParser(features=features, labels=["label"])
+        data = data_parser.parse(
+            input_data={
+                "cat_a": pa.array([["1"], ["2"], ["3"]]),
+                "tag_b": pa.array([["4", "5"], [], ["6"]]),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(
+                    [[27, 37], [28, 38], [29, 39]], type=pa.list_(pa.float32())
+                ),
+                "lookup_a": pa.array([0.1, 0.0, 0.2], type=pa.float32()),
+                "click_seq__cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
+                "click_seq__int_a": pa.array([["14", "15", "16"], ["17"], ["0"]]),
+                "label": pa.array([0, 0, 1], pa.int32()),
+            }
+        )
+
+        expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
+        expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
+        expected_tag_b_values = torch.tensor([4, 5, 6], dtype=torch.int64)
+        expected_tag_b_lengths = torch.tensor([2, 0, 1], dtype=torch.int32)
+        expected_int_a_values = torch.tensor([[7], [8], [9]], dtype=torch.float32)
+        expected_int_b_values = torch.tensor(
+            [[27, 37], [28, 38], [29, 39]], dtype=torch.float32
+        )
+        expected_lookup_a_values = torch.tensor(
+            [[0.1], [0.0], [0.2]], dtype=torch.float32
+        )
+        expected_seq_cat_a_values = torch.tensor([10, 11, 12, 13, 0], dtype=torch.int64)
+        expected_seq_cat_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
+        expected_seq_int_a_values = torch.tensor(
+            [[14], [15], [16], [17], [0]], dtype=torch.float32
+        )
+        expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
+        torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
+        torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
+        torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)
+        torch.testing.assert_close(data["tag_b.lengths"], expected_tag_b_lengths)
+        torch.testing.assert_close(data["int_a.values"], expected_int_a_values)
+        torch.testing.assert_close(data["int_b.values"], expected_int_b_values)
+        torch.testing.assert_close(data["lookup_a.values"], expected_lookup_a_values)
+        torch.testing.assert_close(
+            data["click_seq__cat_a.values"], expected_seq_cat_a_values
+        )
+        torch.testing.assert_close(
+            data["click_seq__cat_a.lengths"], expected_seq_cat_a_seq_lengths
+        )
+        torch.testing.assert_close(
+            data["click_seq__int_a.values"], expected_seq_int_a_values
+        )
+        torch.testing.assert_close(
+            data["click_seq__int_a.lengths"], expected_seq_int_a_seq_lengths
+        )
+        torch.testing.assert_close(data["label"], expected_label)
+
     @parameterized.expand(
         [
             [
@@ -540,7 +598,7 @@ class DataParserTest(unittest.TestCase):
                     "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
-                FgMode.ENCODED,
+                FgMode.FG_NONE,
             ],
             [
                 {
@@ -553,7 +611,7 @@ class DataParserTest(unittest.TestCase):
                     "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
-                FgMode.DAG,
+                FgMode.FG_DAG,
             ],
         ]
     )
@@ -664,7 +722,7 @@ class DataParserTest(unittest.TestCase):
                     "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
-                FgMode.ENCODED,
+                FgMode.FG_NONE,
             ],
             [
                 {
@@ -677,7 +735,7 @@ class DataParserTest(unittest.TestCase):
                     "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
-                FgMode.DAG,
+                FgMode.FG_DAG,
             ],
         ]
     )

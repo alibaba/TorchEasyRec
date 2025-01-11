@@ -158,6 +158,10 @@ python -m tzrec.tools.create_faiss_index \
 - --id_field: 物品池向量表中item_id的列名
 - --embedding_field: 物品池向量表中embedding的列名，该列支持数组或","分隔的string
 
+#### 注
+
+- 负采样表中的id列也可以为string类型，当id为string类型时，模型训练和评估命令中需设置环境变量USE_HASH_NODE_ID=1来启动对id自动进行hash64操作，一般情况下hash冲突概率极低
+
 ### 参考手册
 
 [TorchEasyRec配置参考手册](../reference.md)

@@ -536,7 +536,6 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
-            print(session_id)
         if dist.is_initialized():
             session_id = dist_util.broadcast_string(session_id)
         self._sess_req = SessionRequest(session_id=session_id)

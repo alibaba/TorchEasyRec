@@ -27,6 +27,7 @@ from torch import distributed as dist
 from torch.utils.data import get_worker_info
 
 from tzrec.protos import sampler_pb2
+from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.misc_util import get_free_port
 
@@ -166,6 +167,15 @@ def _to_arrow_array(
     return result
 
 
+def _pa_ids_to_npy(ids: pa.Array) -> npt.NDArray:
+    """Convert pyarrow id array to numpy array."""
+    if use_hash_node_id():
+        ids = ids.cast(pa.string()).to_numpy(zero_copy_only=False)
+    else:
+        ids = ids.cast(pa.int64()).fill_null(0).to_numpy()
+    return ids
+
+
 class BaseSampler(metaclass=_meta_cls):
     """Negative Sampler base class."""
 
@@ -204,6 +214,8 @@ class BaseSampler(metaclass=_meta_cls):
 
         if config.HasField("field_delimiter"):
             gl.set_field_delimiter(config.field_delimiter)
+        if use_hash_node_id():
+            gl.set_use_string_hash_id(1)
 
         self._num_client_per_rank = 1
         self._client_id_bias = 0
@@ -363,7 +375,7 @@ class NegativeSampler(BaseSampler):
         Returns:
             Negative sampled feature dict.
         """
-        ids = input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
+        ids = _pa_ids_to_npy(input_data[self._item_id_field])
         ids = np.pad(ids, (0, self._batch_size - len(ids)), "edge")
         nodes = self._sampler.get(ids)
         features = self._parse_nodes(nodes)
@@ -452,12 +464,8 @@ class NegativeSamplerV2(BaseSampler):
         Returns:
             Negative sampled feature dict.
         """
-        src_ids = (
-            input_data[self._user_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
-        dst_ids = (
-            input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
+        src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
+        dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
         src_ids = np.pad(src_ids, (0, self._batch_size - len(src_ids)), "edge")
         dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
         nodes = self._sampler.get(src_ids, dst_ids)
@@ -545,12 +553,8 @@ class HardNegativeSampler(BaseSampler):
             Negative sampled feature dict. The first batch_size is negative samples,
                 remainder is hard negative samples
         """
-        src_ids = (
-            input_data[self._user_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
-        dst_ids = (
-            input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
+        src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
+        dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
         dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
         nodes = self._neg_sampler.get(dst_ids)
         neg_features = self._parse_nodes(nodes)
@@ -650,12 +654,8 @@ class HardNegativeSamplerV2(BaseSampler):
             Negative sampled feature dict. The first batch_size is negative samples,
                 remainder is hard negative samples
         """
-        src_ids = (
-            input_data[self._user_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
-        dst_ids = (
-            input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
+        src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
+        dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
         padded_src_ids = np.pad(src_ids, (0, self._batch_size - len(src_ids)), "edge")
         dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
         nodes = self._neg_sampler.get(padded_src_ids, dst_ids)
@@ -773,7 +773,10 @@ class TDMSampler(BaseSampler):
         num_workers = worker_info.num_workers if worker_info else 1
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         time.sleep(random.randint(0, num_workers * local_world_size))
-        self.get({self._item_id_field: pa.array([0])})
+        if use_hash_node_id():
+            self.get({self._item_id_field: pa.array(["0"], type=np.object_)})
+        else:
+            self.get({self._item_id_field: pa.array([0])})
 
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
@@ -784,13 +787,7 @@ class TDMSampler(BaseSampler):
         Returns:
             Positive and negative sampled feature dict.
         """
-        ids = (
-            input_data[self._item_id_field]
-            .cast(pa.int64())
-            .fill_null(0)
-            .to_numpy()
-            .reshape(-1, 1)
-        )
+        ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
         batch_size = len(ids)
         num_fea = len(self._attr_names[1:])
 
@@ -940,13 +937,7 @@ class TDMPredictSampler(BaseSampler):
         Returns:
             Positive and negative sampled feature dict.
         """
-        ids = (
-            input_data[self._item_id_field]
-            .cast(pa.int64())
-            .fill_null(0)
-            .to_numpy()
-            .reshape(-1, 1)
-        )
+        ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
 
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]

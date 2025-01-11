@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -85,13 +85,15 @@ class DataParser:
                 self.sparse_keys[feature.data_group].append(feature.name)
             else:
                 self.dense_keys[feature.data_group].append(feature.name)
-                self.dense_length_per_key[feature.data_group].append(feature.output_dim)
+                self.dense_length_per_key[feature.data_group].append(feature.value_dim)
             if feature.is_weighted:
                 self.has_weight_keys[feature.data_group].append(feature.name)
 
-        self.feature_input_names = set()
-        if self._fg_mode == FgMode.DAG:
+        if self._fg_mode in [FgMode.FG_DAG, FgMode.FG_BUCKETIZE]:
             self._init_fg_hander()
+
+        self.feature_input_names = set()
+        if self._fg_mode == FgMode.FG_DAG:
             self.feature_input_names = (
                 self._fg_handler.user_inputs()
                 | self._fg_handler.item_inputs()
@@ -118,8 +120,11 @@ class DataParser:
         """Init pyfg dag handler."""
         if not self._fg_handler:
             fg_json = create_fg_json(self._features)
+            bucketize_only = self._fg_mode == FgMode.FG_BUCKETIZE
             # pyre-ignore [16]
-            self._fg_handler = pyfg.FgArrowHandler(fg_json, self._fg_threads)
+            self._fg_handler = pyfg.FgArrowHandler(
+                fg_json, self._fg_threads, bucketize_only=bucketize_only
+            )
 
     def parse(self, input_data: Dict[str, pa.Array]) -> Dict[str, torch.Tensor]:
         """Parse input data dict and build batch.
@@ -134,7 +139,7 @@ class DataParser:
         if is_input_tile():
             flag = False
             for k, v in input_data.items():
-                if self._fg_mode == FgMode.ENCODED:
+                if self._fg_mode == FgMode.FG_NONE:
                     if k in self.user_feats:
                         input_data[k] = v.take([0])
                 else:
@@ -144,8 +149,8 @@ class DataParser:
                     output_data["batch_size"] = torch.tensor(v.__len__())
                     flag = True
 
-        if self._fg_mode == FgMode.DAG:
-            self._parse_feature_fg_dag(input_data, output_data)
+        if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_BUCKETIZE):
+            self._parse_feature_fg_handler(input_data, output_data)
         else:
             self._parse_feature_normal(input_data, output_data)
 
@@ -228,7 +233,7 @@ class DataParser:
                     )
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
 
-    def _parse_feature_fg_dag(
+    def _parse_feature_fg_handler(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
     ) -> None:
         max_batch_size = (
@@ -306,9 +311,9 @@ class DataParser:
         input_tile = is_input_tile()
         input_tile_emb = is_input_tile_emb()
 
-        batch_size = -1
+        tile_size = -1
         if input_tile:
-            batch_size = input_data["batch_size"].item()
+            tile_size = input_data["batch_size"].item()
 
         if input_tile_emb:
             # For INPUT_TILE = 3 mode, batch_size of user features for sparse and dense
@@ -354,7 +359,7 @@ class DataParser:
             labels=labels,
             sample_weights=sample_weights,
             # pyre-ignore [6]
-            batch_size=batch_size,
+            tile_size=tile_size,
         )
         return batch
 
@@ -418,6 +423,8 @@ class DataParser:
                 weights=torch.cat(weights, dim=-1)
                 if len(dg_has_weight_keys) > 0
                 else None,
+                stride=lengths[0].size(0),  # input_data['input_batch_size']
+                length_per_key=[x.numel() for x in values],
             )
             sparse_features[dg] = sparse_feature
         return sparse_features
@@ -487,7 +494,7 @@ class DataParser:
             a dict of KeyedJaggedTensor.
         """
         sparse_features = {}
-        batch_size = input_data["batch_size"].item()
+        tile_size = input_data["batch_size"].item()
 
         for dg, keys in self.sparse_keys.items():
             values = []
@@ -500,9 +507,9 @@ class DataParser:
                 length = input_data[f"{key}.lengths"]
                 if key in self.user_feats:
                     # pyre-ignore [6]
-                    value = value.tile(batch_size)
+                    value = value.tile(tile_size)
                     # pyre-ignore [6]
-                    length = length.tile(batch_size)
+                    length = length.tile(tile_size)
                 values.append(value)
                 lengths.append(length)
 
@@ -515,8 +522,8 @@ class DataParser:
                         )
                     if key in self.user_feats:
                         # pyre-ignore [6]
-                        weight = weight.tile(batch_size)
-                    weights.append(weights)
+                        weight = weight.tile(tile_size)
+                    weights.append(weight)
 
             sparse_feature = KeyedJaggedTensor(
                 keys=keys,
@@ -525,6 +532,8 @@ class DataParser:
                 weights=torch.cat(weights, dim=-1)
                 if len(dg_has_weight_keys) > 0
                 else None,
+                stride=lengths[0].size(0),  # input_data['input_batch_size']
+                length_per_key=[x.numel() for x in values],
             )
             sparse_features[dg] = sparse_feature
         return sparse_features
@@ -591,6 +600,8 @@ class DataParser:
                     weights=torch.cat(weights_user, dim=-1)
                     if len(dg_has_weight_keys) > 0
                     else None,
+                    stride=lengths_user[0].size(0),  # input_data['input_batch_size']
+                    length_per_key=[x.numel() for x in values_user],
                 )
                 sparse_features[dg + "_user"] = sparse_feature_user
             if len(keys_item) > 0:
@@ -601,6 +612,8 @@ class DataParser:
                     weights=torch.cat(weights_item, dim=-1)
                     if len(dg_has_weight_keys) > 0
                     else None,
+                    stride=lengths_item[0].size(0),  # input_data['input_batch_size']
+                    length_per_key=[x.numel() for x in values_item],
                 )
                 sparse_features[dg + "_item"] = sparse_feature_item
 

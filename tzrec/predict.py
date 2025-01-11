@@ -85,7 +85,7 @@ if __name__ == "__main__":
         "--edit_config_json",
         type=str,
         default=None,
-        help='edit pipeline config str, example: {"data_config.fg_encoded":true}',
+        help='edit pipeline config str, example: {"data_config.fg_mode":"FG_DAG"}',
     )
     args, extra_args = parser.parse_known_args()
 

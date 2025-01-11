@@ -50,6 +50,7 @@ class OdpsDatasetTest(unittest.TestCase):
         if self.o is not None:
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
             self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
+        os.environ.pop("USE_HASH_NODE_ID", None)
 
     def test_calc_slice_position(self):
         num_tables = 81
@@ -144,7 +145,7 @@ class OdpsDatasetTest(unittest.TestCase):
             feature_cfgs.append(
                 feature_pb2.FeatureConfig(
                     lookup_feature=feature_pb2.LookupFeature(
-                        feature_name="lookup_h", map="item:map_h", key="user:id_a"
+                        feature_name="lookup_h", map="user:map_h", key="item:id_a"
                     ),
                 )
             )
@@ -154,13 +155,13 @@ class OdpsDatasetTest(unittest.TestCase):
     @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
     def test_odps_dataset(self, is_orderby_partition):
         feature_cfgs = self._create_test_table_and_feature_cfgs()
-        features = create_features(feature_cfgs, fg_mode=FgMode.DAG)
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
         dataset = OdpsDataset(
             data_config=data_pb2.DataConfig(
                 batch_size=8196,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=False,
+                fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
                 is_orderby_partition=is_orderby_partition,
                 odps_data_quota_name="",
@@ -202,35 +203,40 @@ class OdpsDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
+    @parameterized.expand([["bigint"], ["string"]])
     @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
-    def test_odps_dataset_with_sampler(self):
+    def test_odps_dataset_with_sampler(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
         feature_cfgs = self._create_test_table_and_feature_cfgs(has_lookup=False)
 
         self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
         t = self.o.create_table(
             f"test_odps_sampler_{self.test_suffix}",
             (
-                "id bigint, weight double, features string",
-                "dt string",
+                f"id {id_type}, weight double, features string",
+                "dt string, alpha string",
             ),
             if_not_exists=True,
             hints={"odps.sql.type.system.odps2": "true"},
         )
-        with t.open_writer(partition="dt=20240319", create_partition=True) as writer:
+        with t.open_writer(
+            partition="dt=20240319,alpha=1", create_partition=True
+        ) as writer:
             writer.write([[i, 1.0, f"{i}:4:5.0"] for i in range(10000)])
 
         features = create_features(
-            feature_cfgs, fg_mode=FgMode.DAG, neg_fields=["id_a", "raw_c", "raw_d"]
+            feature_cfgs, fg_mode=FgMode.FG_DAG, neg_fields=["id_a", "raw_c", "raw_d"]
         )
         dataset = OdpsDataset(
             data_config=data_pb2.DataConfig(
                 batch_size=8196,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=False,
+                fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319',
+                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1',
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",

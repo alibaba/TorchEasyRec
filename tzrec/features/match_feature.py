@@ -23,6 +23,7 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import (
+    MAX_HASH_BUCKET_SIZE,
     BaseFeature,
     FgMode,
     _parse_fg_encoded_dense_feature_impl,
@@ -38,13 +39,13 @@ class MatchFeature(BaseFeature):
     Args:
         feature_config (FeatureConfig): a instance of feature config.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
@@ -64,9 +65,19 @@ class MatchFeature(BaseFeature):
         self._data_group = CROSS_NEG_DATA_GROUP
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        elif self._is_sparse:
+            return 0
+        else:
+            return 1
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
-        if self.is_sparse:
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
             return self.config.embedding_dim
         else:
             return 1
@@ -79,6 +90,7 @@ class MatchFeature(BaseFeature):
                 self.config.HasField("hash_bucket_size")
                 or self.config.HasField("num_buckets")
                 or len(self.config.vocab_list) > 0
+                or len(self.config.vocab_dict) > 0
                 or len(self.config.boundaries) > 0
             )
         return self._is_sparse
@@ -86,7 +98,9 @@ class MatchFeature(BaseFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             num_embeddings = self.config.num_buckets
@@ -105,6 +119,10 @@ class MatchFeature(BaseFeature):
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
 
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        return self.config.WhichOneof("dense_emb")
+
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
         return [
@@ -122,7 +140,7 @@ class MatchFeature(BaseFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             # input feature is already lookuped
             feat = input_data[self.name]
             if self.is_sparse:
@@ -133,7 +151,7 @@ class MatchFeature(BaseFeature):
                 parsed_feat = _parse_fg_encoded_dense_feature_impl(
                     self.name, feat, **self._fg_encoded_kwargs
                 )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             inputs = copy.copy(self.inputs)
             input_feats = [input_data[inputs.pop(0)].cast(pa.string()).tolist()]
             if not self._wildcard_pkey:
@@ -150,6 +168,10 @@ class MatchFeature(BaseFeature):
             else:
                 values = self._fg_op.transform(*input_feats)
                 parsed_feat = DenseData(name=self.name, values=values)
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
         return parsed_feat
 
     def fg_json(self) -> List[Dict[str, Any]]:
@@ -174,7 +196,11 @@ class MatchFeature(BaseFeature):
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("normalizer"):
             fg_cfg["normalizer"] = self.config.normalizer
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+            fg_cfg["value_type"] = "string"
+            fg_cfg["needDiscrete"] = True
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True

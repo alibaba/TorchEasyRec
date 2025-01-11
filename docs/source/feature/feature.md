@@ -58,6 +58,17 @@ feature_configs {
         embedding_dim: 32
         vocab_dict: [{key:"a" value:2}, {key:"b" value:3}, {key:"c" value:2}]
     }
+feature_configs {
+    id_feature {
+        feature_name: "cate"
+        expression: "item:cate"
+        embedding_dim: 32
+        zch: {
+            zch_size: 1000000
+            eviction_interval: 2
+            lfu {}
+        }
+    }
 }
 ```
 
@@ -74,6 +85,8 @@ feature_configs {
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等
 
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
@@ -136,9 +149,31 @@ feature_configs {
         embedding_dim: 8
     }
 }
+feature_configs {
+    raw_feature {
+        feature_name: "price"
+        expression: "item:price"
+        embedding_dim: 8
+        mlp {}
+    }
+}
+feature_configs {
+    raw_feature {
+        feature_name: "price"
+        expression: "item:price"
+        embedding_dim: 8
+        autodis {
+           num_channels: 3
+           temperature: 0.1
+           keep_prob: 0.8
+        }
+    }
+}
 ```
 
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置。
+- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
+- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
 
 Embedding特征: 支持string类型如`"0.1|0.2|0.3|0.4"`；支持ARRAY<float>类型如`[0.1,0.2,0.3,0.4]`（建议，性能更好），配置方式如下
 
@@ -207,6 +242,7 @@ feature_configs: {
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
 如果Map的值为连续值，可设置:
@@ -215,6 +251,8 @@ feature_configs: {
 - **normalizer**: 连续值特征的变换方式，同RawFeature
 - **value_dim**: 默认值是1，连续值输出维度
 - **value_separator**: 连续值分隔符
+- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
+- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
 
 ## MatchFeature: 主从键字典查询特征
 
@@ -247,6 +285,7 @@ feature_configs: {
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
 如果Map的值为连续值，可设置:
@@ -254,6 +293,8 @@ feature_configs: {
 - **boundaries**: 分箱/分桶的值。
 - **normalizer**: 连续值特征的变换方式，同RawFeature
 - **value_dim**: 目前只支持value_dim=1
+- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
+- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
 
 ## ExprFeature: 表达式特征
 
@@ -342,6 +383,8 @@ feature_configs: {
   | \_pi   | The one and only pi. | 3.141592653589793238462643 |
   | \_e    | Euler's number.      | 2.718281828459045235360287 |
 
+- 其余配置同RawFeature
+
 ## OverlapFeature: 重合匹配特征
 
 `overlap_feature`会计算`query`和`title`两个字段字词重合比例，`query`和`title`中字词的分割符默认为`\x1d`，可以用多值分隔符由**separator**指定。
@@ -372,9 +415,7 @@ feature_configs: {
   | is_contain         | 计算query是否全部包含在title中，保持顺序      | 0表示未包含，1表示包含         |
   | is_equal           | 计算query是否与title完全相同                  | 0表示不完全相同，1表示完全相同 |
 
-- **boundaries**: 分箱/分桶的值。
-
-- **normalizer**: 连续值特征的变换方式，同RawFeature
+- 其余配置同RawFeature
 
 ## TokenizeFeature: 分词特征
 

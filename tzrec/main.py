@@ -8,11 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# cpu image has no torch_tensorrt
-try:
-    import torch_tensorrt
-except Exception:
-    pass
+
 import copy
 import itertools
 import json
@@ -35,7 +31,6 @@ from torchrec.distributed.model_parallel import (
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
-from torchrec.fx import symbolic_trace
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.inference.state_dict_transform import (
     state_dict_gather,
@@ -47,9 +42,11 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 
+from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
+    is_aot,
     is_input_tile_emb,
     is_quant,
     is_trt,
@@ -61,7 +58,6 @@ from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
-    FgMode,
     create_feature_configs,
     create_features,
     create_fg_json,
@@ -73,7 +69,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, ExportWrapperAOT, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -85,6 +81,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
@@ -115,15 +112,9 @@ def _create_features(
                 getattr(data_config, data_config.WhichOneof("sampler")).attr_fields
             )
 
-    if data_config.fg_encoded:
-        fg_mode = FgMode.ENCODED
-    elif data_config.fg_threads > 0:
-        fg_mode = FgMode.DAG
-    else:
-        fg_mode = FgMode.NORMAL
     features = create_features(
         feature_configs,
-        fg_mode=fg_mode,
+        fg_mode=data_config.fg_mode,
         neg_fields=neg_fields,
         fg_encoded_multival_sep=data_config.fg_encoded_multival_sep,
         force_base_data_group=data_config.force_base_data_group,
@@ -320,10 +311,16 @@ def _log_train(
             loss_strs.append(f"{k}:{v:.5f}")
         for i, g in enumerate(param_groups):
             lr_strs.append(f"lr_g{i}:{g['lr']:.5f}")
-        plogger.log(step, f"{' '.join(lr_strs)} {' '.join(loss_strs)}")
+        total_loss = sum(losses.values())
+        plogger.log(
+            step,
+            f"{' '.join(lr_strs)} {' '.join(loss_strs)} total_loss: {total_loss:.5f}",
+        )
     if summary_writer is not None:
+        total_loss = sum(losses.values())
         for k, v in losses.items():
             summary_writer.add_scalar(f"loss/{k}", v, step)
+        summary_writer.add_scalar("loss/total", total_loss, step)
         for i, g in enumerate(param_groups):
             summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
 
@@ -744,6 +741,9 @@ def _script_model(
     if is_rank_zero:
         batch = next(iter(dataloader))
 
+        if is_aot():
+            model = model.cuda()
+
         if is_quant():
             logger.info("quantize embeddings...")
             quantize_embeddings(model, dtype=torch.qint8, inplace=True)
@@ -751,12 +751,16 @@ def _script_model(
         model.eval()
 
         if is_trt_convert:
-            data_cuda = batch.to_dict(sparse_dtype=torch.int32)
+            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data_cuda, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
 
             export_model_trt(model, data_cuda, save_dir)
+        elif is_aot():
+            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
+            result = model(data_cuda)
+            export_model_aot(model, data_cuda, save_dir)
         else:
             data = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data)
@@ -893,13 +897,14 @@ def export(
         list(data_config.label_fields),
     )
 
+    InferWrapper = ExportWrapperAOT if is_aot() else ScriptWrapper
     if isinstance(device_model, MatchModel):
         for name, module in device_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                tower = ScriptWrapper(wrapper(module, name))
+                tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 _script_model(
                     ori_pipeline_config,
@@ -913,7 +918,7 @@ def export(
     elif isinstance(device_model, TDM):
         for name, module in device_model.named_children():
             if isinstance(module, EmbeddingGroup):
-                emb_module = ScriptWrapper(TDMEmbedding(module, name))
+                emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
@@ -924,7 +929,7 @@ def export(
                 break
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(device_model),
+            InferWrapper(device_model),
             device_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
@@ -934,7 +939,7 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            ScriptWrapper(device_model),
+            InferWrapper(device_model),
             device_state_dict,
             dataloader,
             export_dir,
@@ -1008,13 +1013,13 @@ def predict(
 
     device_and_backend = init_process_group()
     device: torch.device = device_and_backend[0]
-    sparse_dtype: torch.dtype = torch.int32 if device.type == "cuda" else torch.int64
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
     data_config: DataConfig = pipeline_config.data_config
     data_config.ClearField("label_fields")
+    data_config.ClearField("sample_weight_fields")
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
@@ -1043,9 +1048,6 @@ def predict(
     if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
         os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
 
-    if is_trt_convert:
-        torch_tensorrt.runtime.set_multi_device_safe_mode(True)
-
     model: torch.jit.ScriptModule = torch.jit.load(
         os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
     )
@@ -1069,7 +1071,7 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = data_config.num_workers
+        predict_threads = max(data_config.num_workers, 1)
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[
         Tuple[Optional[Dict[str, torch.Tensor]], Optional[RecordBatchTensor]]
@@ -1077,7 +1079,7 @@ def predict(
 
     def _forward(batch: Batch) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            parsed_inputs = batch.to_dict(sparse_dtype=sparse_dtype)
+            parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)

@@ -36,6 +36,15 @@ def is_input_tile_emb() -> bool:
     return False
 
 
+def is_aot() -> bool:
+    """Judge is inductor or not."""
+    is_aot = os.environ.get("ENABLE_AOT")
+    if is_aot and is_aot[0] == "1":
+        return True
+    else:
+        return False
+
+
 def is_trt() -> bool:
     """Judge is trt or not."""
     is_trt = os.environ.get("ENABLE_TRT")
@@ -73,37 +82,6 @@ def is_quant() -> bool:
     return True
 
 
-def update_state_dict_for_input_tile(state_dict: Dict[str, torch.Tensor]) -> None:
-    """Copy the ebc params to ebc_user and ebc_item Updates the model's state.
-
-    dictionary with adapted parameters for the input tile.
-
-    Args:
-        state_dict (Dict[str, torch.Tensor]): model state_dict
-    """
-    input_tile_keys = [
-        ".ebc_user.embedding_bags.",
-        ".ebc_item.embedding_bags.",
-    ]
-    input_tile_keys_ec = [
-        ".ec_list_user.",
-        ".ec_list_item.",
-    ]
-
-    for key, dst_tensor in state_dict.items():
-        for input_tile_key in input_tile_keys:
-            if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ebc.embedding_bags.")
-                src_tensor = state_dict[src_key]
-                dst_tensor.copy_(src_tensor)
-
-        for input_tile_key in input_tile_keys_ec:
-            if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ec_list.")
-                src_tensor = state_dict[src_key]
-                dst_tensor.copy_(src_tensor)
-
-
 def write_mapping_file_for_input_tile(
     state_dict: Dict[str, torch.Tensor], remap_file_path: str
 ) -> None:
@@ -115,25 +93,21 @@ def write_mapping_file_for_input_tile(
         state_dict (Dict[str, torch.Tensor]): model state_dict
         remap_file_path (str) : store new_params_name\told_params_name\n
     """
-    input_tile_keys = [
-        ".ebc_user.embedding_bags.",
-        ".ebc_item.embedding_bags.",
-    ]
-    input_tile_keys_ec = [
-        ".ec_list_user.",
-        ".ec_list_item.",
-    ]
+    input_tile_mapping = {
+        ".ebc_user.embedding_bags.": ".ebc.embedding_bags.",
+        ".mc_ebc_user._embedding_module.": ".mc_ebc._embedding_module.",
+        ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
+        ".ec_list_user.": ".ec_list.",
+        ".mc_ec_list_user.": ".mc_ec_list.",
+    }
 
     remap_str = ""
     for key, _ in state_dict.items():
-        for input_tile_key in input_tile_keys:
+        for input_tile_key in input_tile_mapping:
             if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ebc.embedding_bags.")
-                remap_str += key + "\t" + src_key + "\n"
-
-        for input_tile_key in input_tile_keys_ec:
-            if input_tile_key in key:
-                src_key = key.replace(input_tile_key, ".ec_list.")
+                src_key = key.replace(
+                    input_tile_key, input_tile_mapping[input_tile_key]
+                )
                 remap_str += key + "\t" + src_key + "\n"
 
     with open(remap_file_path, "w") as f:
@@ -142,7 +116,8 @@ def write_mapping_file_for_input_tile(
 
 def export_acc_config() -> Dict[str, str]:
     """Export acc config for model online inference."""
-    acc_config = dict()
+    # use int64 sparse id as input
+    acc_config = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
         acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
     if "QUANT_EMB" in os.environ:

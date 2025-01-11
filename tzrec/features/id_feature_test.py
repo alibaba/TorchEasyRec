@@ -15,6 +15,7 @@ from functools import partial
 
 import numpy as np
 import pyarrow as pa
+import torch
 from parameterized import parameterized
 from torch import nn
 from torchrec.modules.embedding_configs import (
@@ -88,6 +89,51 @@ class IdFeatureTest(unittest.TestCase):
         )
         self.assertEqual(repr(id_feat.emb_config), repr(expected_emb_config))
 
+    @parameterized.expand(
+        [
+            ["lambda x: probabilistic_threshold_filter(x,0.05)"],
+            ["lambda x: (x > 10, 10)"],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_zch_id_feature(self, threshold_filtering_func):
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                embedding_dim=16,
+                zch=feature_pb2.ZeroCollisionHash(
+                    zch_size=100,
+                    eviction_interval=5,
+                    distance_lfu=feature_pb2.DistanceLFU_EvictionPolicy(
+                        decay_exponent=1.0,
+                    ),
+                    threshold_filtering_func=threshold_filtering_func,
+                ),
+            )
+        )
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg)
+        expected_emb_bag_config = EmbeddingBagConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="id_feat_emb",
+            feature_names=["id_feat"],
+            pooling=PoolingType.SUM,
+        )
+        self.assertEqual(repr(id_feat.emb_bag_config), repr(expected_emb_bag_config))
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="id_feat_emb",
+            feature_names=["id_feat"],
+        )
+        self.assertEqual(repr(id_feat.emb_config), repr(expected_emb_config))
+        mc_module = id_feat.mc_module(torch.device("meta"))
+        self.assertEqual(mc_module._zch_size, 100)
+        self.assertEqual(mc_module._eviction_interval, 5)
+        self.assertTrue(
+            mc_module._eviction_policy._threshold_filtering_func is not None
+        )
+
     def test_fg_encoded_with_weighted(self):
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
@@ -148,7 +194,7 @@ class IdFeatureTest(unittest.TestCase):
                 weighted=True,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         self.assertEqual(id_feat.inputs, ["cate"])
 
         input_data = {
@@ -189,7 +235,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         self.assertEqual(id_feat.inputs, ["id_input"])
 
         expected_emb_bag_config = EmbeddingBagConfig(
@@ -239,7 +285,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
 
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=4,
@@ -283,7 +329,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
 
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=3,
@@ -323,7 +369,7 @@ class IdFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
-        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.NORMAL)
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
 
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=100,

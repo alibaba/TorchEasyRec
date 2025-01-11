@@ -696,12 +696,12 @@ def load_config_for_test(
 
     features = create_features(
         list(pipeline_config.feature_configs),
-        fg_mode=FgMode.ENCODED if data_config.fg_encoded else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
 
     data_config.num_workers = 2
     num_parts = data_config.num_workers * 2
-    if data_config.fg_encoded:
+    if data_config.fg_mode == FgMode.FG_NONE:
         inputs = build_mock_input_fg_encoded(features, user_id, item_id)
         item_inputs = inputs
         pipeline_config.train_input_path, _ = create_mock_data(
@@ -875,7 +875,7 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
 
 
 def test_export(
-    pipeline_config_path: str, test_dir: str, asset_files: str = ""
+    pipeline_config_path: str, test_dir: str, asset_files: str = "", enable_aot=False
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
@@ -886,6 +886,8 @@ def test_export(
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {test_dir}/export "
     )
+    if enable_aot:
+        cmd_str = "ENABLE_AOT=1 " + cmd_str
     if asset_files:
         cmd_str += f"--asset_files {asset_files}"
 
@@ -940,8 +942,9 @@ def test_predict(
         f"--predict_input_path {predict_input_path} "
         f"--predict_output_path {predict_output_path} "
         f"--reserved_columns {reserved_columns} "
-        f"--output_columns {output_columns}"
     )
+    if output_columns:
+        cmd_str += f"--output_columns {output_columns}"
 
     p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_predict.txt"))
     p.wait(600)
@@ -1034,11 +1037,14 @@ def create_predict_data(
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(pipeline_config_path)
     )
+    data_config = pipeline_config.data_config
+    assert data_config.fg_mode in [
+        FgMode.FG_NORMAL,
+        FgMode.FG_DAG,
+    ], "You should not use fg encoded data for input_path."
     features = create_features(
         pipeline_config.feature_configs,
-        fg_mode=FgMode.ENCODED
-        if pipeline_config.data_config.fg_encoded
-        else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
     user_inputs = []
     for feature in features:
@@ -1049,7 +1055,7 @@ def create_predict_data(
     reader = create_reader(
         input_path=pipeline_config.train_input_path,
         batch_size=batch_size,
-        quota_name=pipeline_config.data_config.odps_data_quota_name,
+        quota_name=data_config.odps_data_quota_name,
     )
 
     infer_arrow = OrderedDict()

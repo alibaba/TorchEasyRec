@@ -20,6 +20,7 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import (
+    MAX_HASH_BUCKET_SIZE,
     BaseFeature,
     FgMode,
     _parse_fg_encoded_sparse_feature_impl,
@@ -35,13 +36,13 @@ class IdFeature(BaseFeature):
     Args:
         feature_config (FeatureConfig): a instance of feature config.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
@@ -57,8 +58,13 @@ class IdFeature(BaseFeature):
         return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return self.config.value_dim
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
+        """Output dimension of the feature after embedding."""
         return self.config.embedding_dim
 
     @property
@@ -71,7 +77,9 @@ class IdFeature(BaseFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             num_embeddings = self.config.num_buckets
@@ -89,7 +97,7 @@ class IdFeature(BaseFeature):
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
-                " or num_buckets or vocab_list or vocab_dict"
+                " or num_buckets or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
 
@@ -97,7 +105,7 @@ class IdFeature(BaseFeature):
     def inputs(self) -> List[str]:
         """Input field names."""
         if not self._inputs:
-            if self.fg_encoded:
+            if self.fg_mode == FgMode.FG_NONE:
                 if self.is_weighted:
                     self._inputs = [f"{self.name}__values", f"{self.name}__weights"]
                 else:
@@ -119,7 +127,7 @@ class IdFeature(BaseFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             feat = input_data[self.inputs[0]]
             weight = None
             if len(self.inputs) == 2:
@@ -127,7 +135,7 @@ class IdFeature(BaseFeature):
             parsed_feat = _parse_fg_encoded_sparse_feature_impl(
                 self.name, feat, weight=weight, **self._fg_encoded_kwargs
             )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
@@ -141,6 +149,10 @@ class IdFeature(BaseFeature):
                 weights = None
             parsed_feat = SparseData(
                 name=self.name, values=values, lengths=lengths, weights=weights
+            )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
             )
         return parsed_feat
 
@@ -156,7 +168,10 @@ class IdFeature(BaseFeature):
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+            fg_cfg["value_type"] = "string"
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
             fg_cfg["value_type"] = "string"
         elif len(self.config.vocab_list) > 0:
