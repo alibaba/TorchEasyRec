@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,6 +16,7 @@ from parameterized import parameterized
 
 from tzrec.modules.sequence import (
     DINEncoder,
+    HSTUEncoder,
     MultiWindowDINEncoder,
     PoolingEncoder,
     SimpleAttention,
@@ -74,6 +75,48 @@ class DINEncoderTest(unittest.TestCase):
             "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
         }
         result = din(embedded)
+        self.assertEqual(result.size(), (4, 16))
+
+
+class HSTUEncoderTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_hstu_encoder(self, graph_type) -> None:
+        hstu = HSTUEncoder(
+            sequence_dim=16,
+            input="click_seq",
+            max_seq_length=10,
+            attn_dim=16,
+            linear_dim=16,
+        )
+        self.assertEqual(hstu.output_dim(), 16)
+        hstu = create_test_module(hstu, graph_type)
+        embedded = {
+            "click_seq.sequence": torch.randn(4, 10, 16),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = hstu(embedded)
+        self.assertEqual(result.size(), (4, 16))
+
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_hstu_encoder_padding(self, graph_type) -> None:
+        hstu = HSTUEncoder(
+            sequence_dim=16,
+            input="click_seq",
+            max_seq_length=10,
+            attn_dim=16,
+            linear_dim=16,
+        )
+        self.assertEqual(hstu.output_dim(), 16)
+        hstu = create_test_module(hstu, graph_type)
+        embedded = {
+            "click_seq.sequence": torch.randn(4, 10, 16),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = hstu(embedded)
         self.assertEqual(result.size(), (4, 16))
 
 
