@@ -875,8 +875,11 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
 
 
 def test_export(
-    pipeline_config_path: str, test_dir: str, asset_files: str = "", enable_aot=False,
-    enable_trt=False
+    pipeline_config_path: str,
+    test_dir: str,
+    asset_files: str = "",
+    enable_aot=False,
+    enable_trt=False,
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")

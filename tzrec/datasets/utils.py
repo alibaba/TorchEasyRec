@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 
 import numpy.typing as npt
 import pyarrow as pa
@@ -227,36 +227,3 @@ class Batch(Pipelineable):
         if self.tile_size > 0:
             tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
         return tensor_dict
-
-    def to_list(
-        self,
-        sparse_dtype: Optional[torch.dtype] = None
-    ) -> Dict[str, torch.Tensor]:
-        """Convert to feature tensor list.
-        used in export,we will skip the labels.
-        """
-        tensor_dict = {}
-        for x in self.dense_features.values():
-            for k, v in x.to_dict().items():
-                tensor_dict[f"{k}.values"] = v
-        for x in self.sparse_features.values():
-            if sparse_dtype:
-                x = KeyedJaggedTensor(
-                    keys=x.keys(),
-                    values=x.values().to(sparse_dtype),
-                    lengths=x.lengths().to(sparse_dtype),
-                    weights=x.weights_or_none(),
-                )
-            for k, v in x.to_dict().items():
-                tensor_dict[f"{k}.values"] = v.values()
-                tensor_dict[f"{k}.lengths"] = v.lengths()
-                if v.weights_or_none() is not None:
-                    tensor_dict[f"{k}.weights"] = v.weights()
-        for k, v in self.sequence_dense_features.items():
-            tensor_dict[f"{k}.values"] = v.values()
-            tensor_dict[f"{k}.lengths"] = v.lengths()
-        if self.tile_size > 0:
-            tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
-        sorted_dict = {k: tensor_dict[k] for k in sorted(tensor_dict)}
-        values_list = list(sorted_dict.values())
-        return values_list

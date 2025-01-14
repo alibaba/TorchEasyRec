@@ -47,10 +47,10 @@ from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
     is_aot,
+    is_cuda_export,
     is_input_tile_emb,
     is_quant,
     is_trt,
-    is_cuda_export,
     is_trt_predict,
     write_mapping_file_for_input_tile,
 )
@@ -743,39 +743,16 @@ def _script_model(
 
         if is_quant():
             logger.info("quantize embeddings...")
-            import torchrec
-            additional_qconfig_spec_keys = [torchrec.EmbeddingCollection]
-            from torchrec.quant.embedding_modules import EmbeddingCollection as quant_emb
-            additional_mapping = {torchrec.EmbeddingCollection: quant_emb}
-            quantize_embeddings(model, dtype=torch.qint8, inplace=True,
-                                additional_qconfig_spec_keys=additional_qconfig_spec_keys,
-                                additional_mapping=additional_mapping)
-            #quantize_embeddings(model, dtype=torch.qint8, inplace=True)
+            quantize_embeddings(model, dtype=torch.qint8, inplace=True)
 
         model.eval()
 
         if is_trt_convert:
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            #print(data_cuda)
-            data_cuda_list = batch.to_list(sparse_dtype=torch.int64)
-            print(data_cuda_list)
-            result = model(data_cuda_list)
+            result = model(data_cuda, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-
-            export_model_trt(model, data_cuda_list, save_dir)
-            
-            # result = model(data_cuda)
-            # result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            # logger.info(f"Model Outputs: {result_info}")
-
-            # export_model_trt(model, data_cuda, save_dir)
-            # data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            # result = model(data_cuda, "cuda:0")
-            # result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            # logger.info(f"Model Outputs: {result_info}")
-
-            # export_model_trt(model, data_cuda, save_dir)
+            export_model_trt(model, data_cuda, save_dir)
 
         elif is_aot():
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
@@ -910,10 +887,6 @@ def export(
     )
 
     InferWrapper = CudaScriptWrapper if is_aot() else ScriptWrapper
-    if is_trt_convert:
-        from tzrec.models.model import CudaListScriptWrapper
-        InferWrapper = CudaListScriptWrapper
-        #InferWrapper = CudaScriptWrapper
     if isinstance(device_model, MatchModel):
         for name, module in device_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):

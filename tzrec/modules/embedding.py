@@ -120,7 +120,6 @@ def _int_item(x: torch.Tensor) -> int:
     return int(x.item())
 
 
-
 class EmbeddingGroup(nn.Module):
     """Applies embedding lookup transformation for feature group.
 
@@ -964,8 +963,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self.ec_list.append(
                 EmbeddingCollection(list(emb_configs.values()), device=device)
             )
-            print("***emb configs")
-            print(emb_configs.values())
+
         self.mc_ec_list = nn.ModuleList()
         for k, emb_configs in dim_to_mc_emb_configs.items():
             self.mc_ec_list.append(
@@ -1079,7 +1077,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 query_t_list.append(query_t)
             if len(query_t_list) > 0:
                 results[f"{group_name}.query"] = torch.cat(query_t_list, dim=1)
-                print(f"{group_name}.query",results[f"{group_name}.query"].shape )
+
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
 
@@ -1101,24 +1099,21 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 if i == 0:
                     sequence_length = jt.lengths()
                     group_sequence_length = _int_item(torch.max(sequence_length))
-                    
+
                     if need_tile:
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
                             tile_size
                         )
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
-                
+
                 jt = jt.to_padded_dense(group_sequence_length)
-                
+
                 if need_tile:
                     jt = jt.tile(tile_size, 1, 1)
                 seq_t_list.append(jt)
 
             if seq_t_list:
                 results[f"{group_name}.sequence"] = torch.cat(seq_t_list, dim=2)
-                print("group_sequence_length:",group_sequence_length)
-                print(f"{group_name}.sequence",results[f"{group_name}.sequence"].shape )
-                print(f"{group_name}.sequence_length",results[f"{group_name}.sequence_length"].shape )
-            
+
         return results

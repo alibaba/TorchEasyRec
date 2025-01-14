@@ -12,7 +12,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict, List
+from typing import Dict
 
 import torch
 
@@ -52,9 +52,11 @@ def is_trt() -> bool:
         return True
     return False
 
-def is_cuda_export()->bool:
+
+def is_cuda_export() -> bool:
     """Judge is trt/aot or not."""
     return is_trt() or is_aot()
+
 
 def is_trt_predict(model_path: str) -> bool:
     """Judge is trt or not in predict."""
@@ -130,5 +132,3 @@ def export_acc_config() -> Dict[str, str]:
     if "ENABLE_AOT" in os.environ:
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
     return acc_config
-
-

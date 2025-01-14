@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-
 from typing import Dict
 
 import torch
@@ -29,7 +28,7 @@ def export_model_aot(
         data (Dict[str, torch.Tensor]): the test data
         save_dir (str): model save dir
     """
-    exported_pg,data = export_pm(model, data, save_dir)
-    
+    exported_pg, data = export_pm(model, data, save_dir)
+
     # TODO(aot cmpile)
     return exported_pg

@@ -126,9 +126,9 @@ class DataParser:
         self.sparse_keys_list = []
         self.sequence_dense_keys_list = []
         self.get_data_list_keys()
-        print("data list keys:", self.data_list_keys)
-    
+
     def get_data_list_keys(self) -> None:
+        """Get all data list keys."""
         for _, keys in self.sparse_keys.items():
             for key in keys:
                 self.sparse_keys_list.append(f"{key}.values")
@@ -139,12 +139,16 @@ class DataParser:
         for key in self.sequence_dense_keys:
             self.sequence_dense_keys_list.append(f"{key}.values")
             self.sequence_dense_keys_list.append(f"{key}.lengths")
-        
-        self.data_list_keys = list(set(self.sparse_keys_list) | set(self.dense_keys_list) | set(self.sequence_dense_keys_list))
+
+        self.data_list_keys = list(
+            set(self.sparse_keys_list)
+            | set(self.dense_keys_list)
+            | set(self.sequence_dense_keys_list)
+        )
         if is_input_tile():
             self.data_list_keys.append("batch_size")
         self.data_list_keys = sorted(self.data_list_keys)
-      
+
     def _init_fg_hander(self) -> None:
         """Init pyfg dag handler."""
         if not self._fg_handler:
