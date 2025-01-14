@@ -19,6 +19,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.metrics import recall_at_k
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2, tower_pb2
 from tzrec.protos.loss_pb2 import LossConfig
@@ -250,9 +251,9 @@ class MatchModel(BaseModel):
         losses[loss_name] = self._loss_modules[loss_name](pred, label)
 
         if self._sample_weight:
-            losses[loss_name] = torch.mean(
-                losses[loss_name] * sample_weight
-            ) / torch.mean(sample_weight)
+            losses[loss_name] = div_no_nan(
+                torch.mean(losses[loss_name] * sample_weight), torch.mean(sample_weight)
+            )
 
         return losses
 

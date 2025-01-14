@@ -22,6 +22,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
+from tzrec.modules.utils import div_no_nan
 from tzrec.protos import model_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
@@ -263,9 +264,10 @@ class DAT(MatchModel):
 
         if self._sample_weight:
             for loss_name in amm_loss.keys():
-                amm_loss[loss_name] = torch.mean(
-                    amm_loss[loss_name] * sample_weight
-                ) / torch.mean(sample_weight)
+                amm_loss[loss_name] = div_no_nan(
+                    torch.mean(amm_loss[loss_name] * sample_weight),
+                    torch.mean(sample_weight),
+                )
 
         losses.update(amm_loss)
 
