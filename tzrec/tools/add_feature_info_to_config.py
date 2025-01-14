@@ -169,7 +169,6 @@ class AddFeatureInfoToConfig(object):
         self,
         pipeline_config: EasyRecConfig,
         drop_feature_names: List[str],
-        general_feature: List[str],
     ) -> None:
         """Drop feature name for feature group."""
         for feature_group in pipeline_config.model_config.feature_groups:

@@ -378,11 +378,8 @@ class AddFeatureInfoToConfigTest(unittest.TestCase):
             "like_50_seq__item_id",
             "like_50_seq__author",
         ]
-        general_feature = ["user_id", "item_id", "day_h", "item_cnt"]
         text_format.Merge(BEFORE_MODEL_CONFIG, config)
-        self.add_feature_info._update_feature_group(
-            config, drop_feature_name, general_feature
-        )
+        self.add_feature_info._update_feature_group(config, drop_feature_name)
         self.assertEqual(str(config), AFTER_MODEL_CONFIG)
 
 
