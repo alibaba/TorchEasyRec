@@ -67,7 +67,6 @@ def trt_convert(
                 assume_dynamic_shape_support=True,
                 # truncate_long_and_double=True,
                 allow_shape_tensors=True,
-                torch_executed_ops=["aten::split_with_sizes","aten::split"]
             )
 
     else:
@@ -82,7 +81,6 @@ def trt_convert(
             assume_dynamic_shape_support=True,
             # truncate_long_and_double=True,
             allow_shape_tensors=True,
-            torch_executed_ops=["aten::split_with_sizes","aten::split"]
         )
 
     logger.info("trt convert end")
@@ -315,7 +313,7 @@ def export_model_trt(
     logger.info("trt convert success")
     
 
-def export_model_trt(
+def export_model_trt2(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> None:
     """Export trt model.

@@ -87,7 +87,7 @@ def export_pm(
 
     gm = gm.cuda()
 
-    batch = Dim("batch",min=1, max=2048)
+    batch = Dim("batch",min=1, max=8196)
     dynamic_shapes = {}
     for key in data:
         # .lengths
@@ -160,7 +160,7 @@ def export_pm_list(
 
     gm = gm.cuda()
 
-    batch = Dim("batch",min=1, max=2048)
+    batch = Dim("batch",min=1, max=8196)
     
     dynamic_shapes_list = []    
     for idx, key  in enumerate(model._data_parser.data_list_keys):
