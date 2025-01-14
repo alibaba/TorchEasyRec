@@ -39,7 +39,6 @@ def div_no_nan(
     Return:
         out (Tensor): the output tensor.
     """
-    # other = other.clamp_min(eps)
     return torch.nan_to_num(
         torch.div(input, other, rounding_mode=rounding_mode, out=out),
         nan=0.0,
