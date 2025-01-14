@@ -21,6 +21,7 @@ from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
@@ -225,7 +226,7 @@ class RankModel(BaseModel):
         losses = {}
         if self._sample_weight_name:
             loss_weight = batch.sample_weights[self._sample_weight_name]
-            loss_weight = loss_weight / torch.mean(loss_weight)
+            loss_weight = div_no_nan(loss_weight, torch.mean(loss_weight))
         else:
             loss_weight = None
 
