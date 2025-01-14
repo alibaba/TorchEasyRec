@@ -197,8 +197,6 @@ def export_model_trt(
         if v.size(0) < 2:
             v = torch.zeros((2,) + v.size()[1:], device="cuda:0", dtype=v.dtype)
         values_list_cuda.append(v)
-        print(v.is_contiguous(memory_format=torch.contiguous_format))
-        print(v.is_contiguous(memory_format=torch.channels_last))
         dynamic_shapes_list.append(dict_dy)
 
     # convert dense
