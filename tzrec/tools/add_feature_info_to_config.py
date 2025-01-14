@@ -208,8 +208,8 @@ class AddFeatureInfoToConfig(object):
             self.template_model_config_path
         )
         self._drop_feature_config(pipeline_config, drop_feature_names)
-        general_feature = self._update_feature_config(pipeline_config, feature_info_map)
-        self._update_feature_group(pipeline_config, drop_feature_names, general_feature)
+        self._update_feature_config(pipeline_config, feature_info_map)
+        self._update_feature_group(pipeline_config, drop_feature_names)
         config_util.save_message(pipeline_config, self.model_config_path)
 
 
