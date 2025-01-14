@@ -16,6 +16,7 @@ import torch
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
+from tzrec.modules.utils import div_no_nan
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.tower_pb2 import BayesTaskTower, InterventionTaskTower, TaskTower
 
@@ -112,7 +113,7 @@ class MultiTaskRank(RankModel):
                         + task_tower_cfg.out_task_space_weight * (1 - in_task_space)
                     )
 
-                loss_weight = loss_weight / torch.mean(loss_weight)
+                loss_weight = div_no_nan(loss_weight, torch.mean(loss_weight))
             else:
                 loss_weight = None
 
