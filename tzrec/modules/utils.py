@@ -9,6 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import torch
 
 
@@ -16,8 +18,8 @@ def div_no_nan(
     input: torch.Tensor,
     other: torch.Tensor,
     *,
-    rounding_mode=None,
-    out=None,
+    rounding_mode: Optional[str] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Divides input by other and avoid division by zero.
 
