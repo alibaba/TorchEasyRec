@@ -183,23 +183,20 @@ class AddFeatureInfoToConfig(object):
             feature_group.ClearField("feature_names")
             feature_group.feature_names.extend(reserved_features)
             del_sequence_groups = []
-            for sequence_group in feature_group.sequence_groups:
+            for sequence_group in list(feature_group.sequence_groups):
                 reserved_features = []
-                seq_feature_num = 0
                 for feature_name in sequence_group.feature_names:
                     if feature_name not in drop_feature_names:
                         reserved_features.append(feature_name)
-                        if feature_name in general_feature:
-                            seq_feature_num += 1
                     else:
                         logger.info("sequence group drop feature: %s" % feature_name)
                 sequence_group.ClearField("feature_names")
                 sequence_group.feature_names.extend(reserved_features)
-                if seq_feature_num == 0:
+                if len(reserved_features) == 0:
                     del_sequence_groups.append(sequence_group.group_name)
                     feature_group.sequence_groups.remove(sequence_group)
                     logger.info("drop sequence group: %s" % sequence_group.group_name)
-            for seq_encoded in feature_group.sequence_encoders:
+            for seq_encoded in list(feature_group.sequence_encoders):
                 seq_module = getattr(seq_encoded, seq_encoded.WhichOneof("seq_module"))
                 if seq_module.input in del_sequence_groups:
                     feature_group.sequence_encoders.remove(seq_encoded)

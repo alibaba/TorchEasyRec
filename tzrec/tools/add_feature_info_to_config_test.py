@@ -307,9 +307,21 @@ AFTER_MODEL_CONFIG = """model_config {
       feature_names: "click_50_seq__item_id"
       feature_names: "click_50_seq__ts"
     }
+    sequence_groups {
+      group_name: "like_50_seq"
+      feature_names: "like_50_seq__ts"
+    }
     sequence_encoders {
       din_encoder {
         input: "click_50_seq"
+        attn_mlp {
+          hidden_units: 32
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "like_50_seq"
         attn_mlp {
           hidden_units: 32
         }
