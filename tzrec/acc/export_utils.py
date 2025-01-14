@@ -117,29 +117,17 @@ def export_pm(
                 logger.info("batch dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
 
-        # seq dense values
-        elif (
-            key in model._data_parser.sequence_dense_keys_list
-            and key.split(".")[0] in model._data_parser.user_feats
-        ):
-            # user feats
-            assert data[key].shape[0] == 1
-            logger.info("uniq user seq_dense_fea=%s shape=%s" % (key, data[key].shape))
-            dynamic_shapes[key] = {}
-
-        # sparse or seq_dense values
+        # seq_dense or sparse
         else:
-            # sparse or seq_dense(seq_dense values is also sparse)
-            logger.info("sparse or seq_dense_fea=%s shape=%s" % (key, data[key].shape))
-            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
-            # to handle torch.export 0/1 specialization problem
             if data[key].shape[0] < 2:
                 data[key] = F.pad(
                     data[key],
-                    [0, 2] + [0, 0] * (len(data[key].shape) - 1),
+                    [0, 0] * (len(data[key].shape) - 1) + [0, 2],
                     mode="constant",
                 )
-                logger.info("update data key=%s for shape 0/1" % key)
+                data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
+            logger.info("uniq user seq_dense_fea=%s shape=%s" % (key, data[key].shape))
+            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
             dynamic_shapes[key] = {0: tmp_val_dim}
 
         # trt need contiguous format
