@@ -98,10 +98,11 @@ def export_pm(
             if key.split(".")[0] in model._data_parser.user_feats:
                 assert data[key].shape[0] == 1
                 logger.info(
-                    "uniq user sparse fea %s length=%s" % (key, data[key].shape)
+                    "uniq user length fea %s length=%s" % (key, data[key].shape)
                 )
                 dynamic_shapes[key] = {}
             else:
+                logger.info("batch length fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
         elif key == "batch_size":
             dynamic_shapes[key] = {}
@@ -126,7 +127,7 @@ def export_pm(
                     mode="constant",
                 )
                 data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
-            logger.info("uniq user seq_dense_fea=%s shape=%s" % (key, data[key].shape))
+            logger.info("sparse or seq dense fea=%s shape=%s" % (key, data[key].shape))
             tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
             dynamic_shapes[key] = {0: tmp_val_dim}
 
