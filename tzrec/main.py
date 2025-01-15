@@ -47,6 +47,7 @@ from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
     is_aot,
+    is_cuda_export,
     is_input_tile_emb,
     is_quant,
     is_trt,
@@ -69,7 +70,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ExportWrapperAOT, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -727,12 +728,8 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        if is_trt_convert:
-            model = model.to_empty(device="cuda:0")
-            logger.info("gather states to cuda model...")
-        else:
-            model = model.to_empty(device="cpu")
-            logger.info("gather states to cpu model...")
+        model = model.to_empty(device="cpu")
+        logger.info("gather states to cpu model...")
 
     state_dict_gather(state_dict, model.state_dict())
 
@@ -741,7 +738,7 @@ def _script_model(
     if is_rank_zero:
         batch = next(iter(dataloader))
 
-        if is_aot():
+        if is_cuda_export():
             model = model.cuda()
 
         if is_quant():
@@ -755,8 +752,8 @@ def _script_model(
             result = model(data_cuda, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-
             export_model_trt(model, data_cuda, save_dir)
+
         elif is_aot():
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data_cuda)
@@ -876,30 +873,22 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    if is_trt_convert:
-        checkpoint_pg = dist.new_group(backend="nccl")
-        if is_rank_zero:
-            logger.info("copy sharded state_dict to cuda...")
-        device_state_dict = state_dict_to_device(
-            model.state_dict(), pg=checkpoint_pg, device=torch.device(device)
-        )
-    else:
-        checkpoint_pg = dist.new_group(backend="gloo")
-        if is_rank_zero:
-            logger.info("copy sharded state_dict to cpu...")
-        device_state_dict = state_dict_to_device(
-            model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-        )
+    checkpoint_pg = dist.new_group(backend="gloo")
+    if is_rank_zero:
+        logger.info("copy sharded state_dict to cpu...")
+    cpu_state_dict = state_dict_to_device(
+        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
+    )
 
-    device_model = _create_model(
+    cpu_model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
     )
 
-    InferWrapper = ExportWrapperAOT if is_aot() else ScriptWrapper
-    if isinstance(device_model, MatchModel):
-        for name, module in device_model.named_children():
+    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    if isinstance(cpu_model, MatchModel):
+        for name, module in cpu_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -909,28 +898,28 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    device_state_dict,
+                    cpu_state_dict,
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(device_model, TDM):
-        for name, module in device_model.named_children():
+    elif isinstance(cpu_model, TDM):
+        for name, module in cpu_model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    device_state_dict,
+                    cpu_state_dict,
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            InferWrapper(device_model),
-            device_state_dict,
+            InferWrapper(cpu_model),
+            cpu_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -939,8 +928,8 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            InferWrapper(device_model),
-            device_state_dict,
+            InferWrapper(cpu_model),
+            cpu_state_dict,
             dataloader,
             export_dir,
         )

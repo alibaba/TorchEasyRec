@@ -70,16 +70,35 @@ class RankIntegrationTest(unittest.TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
     def test_aot_export(self):
-        pipeline_config_path = "tzrec/tests/configs/multi_tower_din_mock.config"
-        self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
+        pipeline_config_path = "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+        self.success = utils.test_train_eval(
+            pipeline_config_path, self.test_dir, user_id="user_id", item_id="item_id"
+        )
         if self.success:
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
+
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
+                enable_aot=True,
+            )
+        input_tile_dir = os.path.join(self.test_dir, "input_tile")
+        input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
+        if self.success:
+            os.environ["INPUT_TILE"] = "2"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir,
+                enable_aot=True,
+            )
+        if self.success:
+            os.environ["INPUT_TILE"] = "3"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir_emb,
                 enable_aot=True,
             )
         self.assertTrue(self.success)

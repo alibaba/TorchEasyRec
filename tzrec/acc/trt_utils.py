@@ -10,7 +10,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -29,18 +29,15 @@ from tzrec.utils.logging_util import logger
 
 
 def trt_convert(
-    module: nn.Module,
+    exp_program: torch.export.ExportedProgram,
     # pyre-ignore [2]
     inputs: Optional[Sequence[Sequence[Any]]],
-    # pyre-ignore [2]
-    dynamic_shapes: Optional[Union[Dict[str, Any], Tuple[Any], List[Any]]],
 ) -> torch.fx.GraphModule:
     """Convert model use trt.
 
     Args:
-        module (nn.Module): Source module
+        exp_program (torch.export.ExportedProgram): Source exported program
         inputs (List[Union(torch_tensorrt.Input, torch.Tensor)]): inputs
-        dynamic_shapes: dynamic shapes
 
     Returns:
         torch.fx.GraphModule: Compiled FX Module, when run it will execute via TensorRT
@@ -56,7 +53,6 @@ def trt_convert(
     # (Lower value allows more graph segmentation)
     min_block_size = 2
 
-    exp_program = torch.export.export(module, (inputs,), dynamic_shapes=dynamic_shapes)
     #  use script model , unsupported the inputs : dict
     if is_debug_trt():
         with torch_tensorrt.logging.graphs():
@@ -208,7 +204,10 @@ def export_model_trt(
     logger.info("dense res: %s", dense(values_list_cuda))
     dense_layer = symbolic_trace(dense)
     dynamic_shapes = {"args": dynamic_shapes_list}
-    dense_layer_trt = trt_convert(dense_layer, values_list_cuda, dynamic_shapes)
+    exp_program = torch.export.export(
+        dense_layer, (values_list_cuda,), dynamic_shapes=dynamic_shapes
+    )
+    dense_layer_trt = trt_convert(exp_program, values_list_cuda)
     dict_res = dense_layer_trt(values_list_cuda)
     logger.info("dense trt res: %s", dict_res)
 

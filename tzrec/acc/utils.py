@@ -53,6 +53,11 @@ def is_trt() -> bool:
     return False
 
 
+def is_cuda_export() -> bool:
+    """Judge is trt/aot or not."""
+    return is_trt() or is_aot()
+
+
 def is_trt_predict(model_path: str) -> bool:
     """Judge is trt or not in predict."""
     with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
@@ -124,4 +129,6 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
+    if "ENABLE_AOT" in os.environ:
+        acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
     return acc_config

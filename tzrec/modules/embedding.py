@@ -963,6 +963,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self.ec_list.append(
                 EmbeddingCollection(list(emb_configs.values()), device=device)
             )
+
         self.mc_ec_list = nn.ModuleList()
         for k, emb_configs in dim_to_mc_emb_configs.items():
             self.mc_ec_list.append(
@@ -1076,6 +1077,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 query_t_list.append(query_t)
             if len(query_t_list) > 0:
                 results[f"{group_name}.query"] = torch.cat(query_t_list, dim=1)
+
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
 
@@ -1097,12 +1099,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 if i == 0:
                     sequence_length = jt.lengths()
                     group_sequence_length = _int_item(torch.max(sequence_length))
+
                     if need_tile:
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
                             tile_size
                         )
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
+
                 jt = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:

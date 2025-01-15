@@ -20,7 +20,7 @@ import pyfg
 import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
-from tzrec.acc.utils import is_input_tile, is_input_tile_emb
+from tzrec.acc.utils import is_cuda_export, is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import (
     Batch,
     DenseData,
@@ -115,6 +115,17 @@ class DataParser:
             if is_rank_zero:
                 logger.info(f"self.user_feats: {self.user_feats}")
                 logger.info(f"self.user_inputs: {self.user_inputs}")
+
+        if is_cuda_export():
+            logger.info(f"self.sparse_keys: {self.sparse_keys}")
+            logger.info(f"self.dense_keys: {self.dense_keys}")
+            logger.info(f"self.sequence_dense_keys: {self.sequence_dense_keys}")
+
+            # get dense keys list
+            self.dense_keys_list = []
+            for _, keys in self.dense_keys.items():
+                for key in keys:
+                    self.dense_keys_list.append(f"{key}")
 
     def _init_fg_hander(self) -> None:
         """Init pyfg dag handler."""
@@ -416,6 +427,7 @@ class DataParser:
                                 input_data[f"{key}.values"], dtype=torch.float32
                             )
                         )
+
             sparse_feature = KeyedJaggedTensor(
                 keys=keys,
                 values=torch.cat(values, dim=-1),
