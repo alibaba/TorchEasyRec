@@ -238,7 +238,7 @@ class ScriptWrapper(nn.Module):
         return self.model.predict(batch)
 
 
-class CudaScriptWrapper(ScriptWrapper):
+class CudaExportWrapper(ScriptWrapper):
     """Model inference wrapper for cuda export(aot/trt)."""
 
     # pyre-ignore [14]

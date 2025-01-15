@@ -70,7 +70,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, CudaScriptWrapper, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -876,19 +876,19 @@ def export(
     checkpoint_pg = dist.new_group(backend="gloo")
     if is_rank_zero:
         logger.info("copy sharded state_dict to cpu...")
-    device_state_dict = state_dict_to_device(
+    cpu_state_dict = state_dict_to_device(
         model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
     )
 
-    device_model = _create_model(
+    cpu_model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
     )
 
-    InferWrapper = CudaScriptWrapper if is_aot() else ScriptWrapper
-    if isinstance(device_model, MatchModel):
-        for name, module in device_model.named_children():
+    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    if isinstance(cpu_model, MatchModel):
+        for name, module in cpu_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -898,28 +898,28 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    device_state_dict,
+                    cpu_state_dict,
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(device_model, TDM):
-        for name, module in device_model.named_children():
+    elif isinstance(cpu_model, TDM):
+        for name, module in cpu_model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    device_state_dict,
+                    cpu_state_dict,
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            InferWrapper(device_model),
-            device_state_dict,
+            InferWrapper(cpu_model),
+            cpu_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -928,8 +928,8 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            InferWrapper(device_model),
-            device_state_dict,
+            InferWrapper(cpu_model),
+            cpu_state_dict,
             dataloader,
             export_dir,
         )

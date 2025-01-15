@@ -108,7 +108,7 @@ def export_pm(
             dynamic_shapes[key] = {}
 
         # dense values
-        elif key in model._data_parser.dense_keys_list:
+        elif key.split(".")[0] in model._data_parser.dense_keys_list:
             # user feats
             if key.split(".")[0] in model._data_parser.user_feats:
                 assert data[key].shape[0] == 1
