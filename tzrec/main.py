@@ -763,6 +763,7 @@ def _script_model(
             export_model_aot(model, data_cuda, save_dir)
         else:
             data = batch.to_dict(sparse_dtype=torch.int64)
+            print(data)
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
@@ -1018,8 +1019,6 @@ def predict(
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
     data_config: DataConfig = pipeline_config.data_config
-    data_config.ClearField("label_fields")
-    data_config.ClearField("sample_weight_fields")
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
