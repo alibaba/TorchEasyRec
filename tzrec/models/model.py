@@ -32,6 +32,16 @@ from tzrec.utils.load_class import get_register_class_meta
 _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
 
+@torch.fx.wrap
+def _get_dict(
+    grouped_features_keys: List[str], args: List[torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    if len(grouped_features_keys) != len(args):
+        raise ValueError(
+            "The number of grouped_features_keys must match " "the number of arguments."
+        )
+    grouped_features = {key: value for key, value in zip(grouped_features_keys, args)}
+    return grouped_features
 
 class BaseModel(nn.Module, metaclass=_meta_cls):
     """TorchEasyRec base model.
@@ -238,8 +248,9 @@ class ScriptWrapper(nn.Module):
         return self.model.predict(batch)
 
 
-class ExportWrapperAOT(ScriptWrapper):
-    """Model inference wrapper for aot export."""
+
+class CudaScriptWrapper(ScriptWrapper):
+    """Model inference wrapper for cuda export(aot/trt)."""
 
     # pyre-ignore [14]
     def forward(
@@ -257,3 +268,68 @@ class ExportWrapperAOT(ScriptWrapper):
         batch = self._data_parser.to_batch(data)
         batch = batch.to(torch.device("cuda"), non_blocking=True)
         return self.model.predict(batch)
+
+class CudaListScriptWrapper(ScriptWrapper):
+    """Model inference wrapper for cuda export(aot/trt)."""
+
+    # pyre-ignore [14]
+    def forward(
+        self,
+        data: List[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+
+        Args:
+            data (dict): a dict of input data for Batch.
+
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        data_dict = _get_dict(self._data_parser.data_list_keys, data)
+        batch = self._data_parser.to_batch(data_dict)
+        batch = batch.to(torch.device("cuda"), non_blocking=True)
+        return self.model.predict(batch)
+
+# only when use TRT will use the wrapper
+class ScriptWrapper2(nn.Module):
+    """Model inference wrapper for jit.script."""
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.model = module
+        self._features = self.model._features
+        self._data_parser = DataParser(self._features)
+        
+    def forward(
+        self,
+        click_50_seq__item_id_lengths,
+        click_50_seq__item_id_values,
+        item_id_lengths,
+        item_id_values,
+        user_id_lengths,
+        user_id_values,
+        # pyre-ignore [9]
+        # data: Dict[str, torch.Tensor],
+        # device: torch.device = "cpu",
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+        Args:
+            data (dict): a dict of input data for Batch.
+            device (torch.device): inference device.
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        # data = dict(zip(self._data_parser.output_data_keys,args))
+        data = dict()
+        # for i, key in  enumerate(self._data_parser.output_data_keys):
+        #     data[key]=args[i]
+        data["click_50_seq__item_id.lengths"] = click_50_seq__item_id_lengths
+        data["click_50_seq__item_id.values"] = click_50_seq__item_id_values
+        data["item_id.lengths"] = item_id_lengths
+        data["item_id.values"] = item_id_values
+        data["user_id.lengths"] = user_id_lengths
+        data["user_id.values"] = user_id_values
+        batch = self._data_parser.to_batch(data)  # , long_lengths=True)
+        
+        batch = batch.to("cuda", non_blocking=True)
+        return self.model.predict(batch)
+    
