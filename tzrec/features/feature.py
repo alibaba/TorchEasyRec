@@ -619,7 +619,10 @@ class BaseFeature(object, metaclass=_meta_cls):
                     # `default_value` and <OOV> vocab to vocab_list
                     assert self.config.default_bucketize_value < len(
                         self.config.vocab_list
-                    ), "default_bucketize_value should be less than len(vocab_list)"
+                    ), (
+                        "default_bucketize_value should be less than len(vocab_list) "
+                        f"in {self.__class__.__name__}[{self.name}]"
+                    )
                     self._vocab_list = list(self.config.vocab_list)
                 else:
                     self._vocab_list = [self.config.default_value, "<OOV>"] + list(
