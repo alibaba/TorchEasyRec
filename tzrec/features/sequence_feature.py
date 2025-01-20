@@ -318,12 +318,12 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
                 self.config.vocab_list
             )
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["default_bucketize_value"] = 0
         elif len(self.config.vocab_dict) > 0:
             vocab_dict = OrderedDict(self.config.vocab_dict.items())
             vocab_dict[self.config.default_value] = 0
             fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["default_bucketize_value"] = 0
         if self.config.HasField("value_dim"):
             assert (
                 self.config.value_dim == 1

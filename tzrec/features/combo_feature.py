@@ -62,7 +62,7 @@ class ComboFeature(IdFeature):
         elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif len(self.config.vocab_list) > 0:
-            num_embeddings = len(self.config.vocab_list) + 2
+            num_embeddings = len(self.config.vocab_list) + 1
         elif len(self.config.vocab_dict) > 0:
             is_rank_zero = os.environ.get("RANK", "0") == "0"
             if min(list(self.config.vocab_dict.values())) <= 1 and is_rank_zero:
@@ -134,10 +134,10 @@ class ComboFeature(IdFeature):
             fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
                 self.config.vocab_list
             )
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["default_bucketize_value"] = 0
         elif len(self.config.vocab_dict) > 0:
             vocab_dict = OrderedDict(self.config.vocab_dict.items())
             vocab_dict[self.config.default_value] = 0
             fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["default_bucketize_value"] = 0
         return [fg_cfg]

@@ -103,7 +103,7 @@ class LookupFeature(BaseFeature):
         elif self.config.HasField("num_buckets"):
             num_embeddings = self.config.num_buckets
         elif len(self.config.vocab_list) > 0:
-            num_embeddings = len(self.config.vocab_list) + 2
+            num_embeddings = len(self.config.vocab_list) + 1
         elif len(self.config.vocab_dict) > 0:
             is_rank_zero = os.environ.get("RANK", "0") == "0"
             if min(list(self.config.vocab_dict.values())) <= 1 and is_rank_zero:
@@ -240,14 +240,14 @@ class LookupFeature(BaseFeature):
                 fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
                     self.config.vocab_list
                 )
-                fg_cfg["default_bucketize_value"] = 1
+                fg_cfg["default_bucketize_value"] = 0
                 fg_cfg["value_type"] = "string"
                 fg_cfg["needDiscrete"] = True
             elif len(self.config.vocab_dict) > 0:
                 vocab_dict = OrderedDict(self.config.vocab_dict.items())
                 vocab_dict[self.config.default_value] = 0
                 fg_cfg["vocab_dict"] = vocab_dict
-                fg_cfg["default_bucketize_value"] = 1
+                fg_cfg["default_bucketize_value"] = 0
                 fg_cfg["value_type"] = "string"
                 fg_cfg["needDiscrete"] = True
             elif len(self.config.boundaries) > 0:
