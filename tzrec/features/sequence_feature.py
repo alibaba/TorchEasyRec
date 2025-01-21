@@ -319,6 +319,9 @@ class SequenceIdFeature(IdFeature):
         elif len(self.config.vocab_dict) > 0:
             fg_cfg["vocab_dict"] = self.vocab_dict
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        elif self.config.HasField("vocab_file"):
+            fg_cfg["vocab_file"] = self.config.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("value_dim"):
             assert (
                 self.config.value_dim == 1

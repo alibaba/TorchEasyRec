@@ -172,6 +172,10 @@ class IdFeature(BaseFeature):
             fg_cfg["vocab_dict"] = self.vocab_dict
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
+        elif self.config.HasField("vocab_file"):
+            fg_cfg["vocab_file"] = self.config.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+            fg_cfg["value_type"] = "string"
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets
             if self.config.default_value:
@@ -185,3 +189,10 @@ class IdFeature(BaseFeature):
         else:
             fg_cfg["value_dim"] = 0
         return [fg_cfg]
+
+    def assets(self) -> Dict[str, str]:
+        """Asset file paths."""
+        assets = {}
+        if self.config.HasField("vocab_file"):
+            assets["vocab_file"] = self.config.vocab_file
+        return assets

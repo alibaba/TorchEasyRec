@@ -81,6 +81,8 @@ message IdFeature {
     optional bool use_mask =  15;
     // zero collision hash
     optional ZeroCollisionHash zch = 16;
+    // id vocabulary file path
+    optional string vocab_file = 17;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -168,6 +170,8 @@ message ComboFeature {
     optional bool use_mask =  14;
     // zero collision hash
     optional ZeroCollisionHash zch = 15;
+    // id vocabulary file path
+    optional string vocab_file = 16;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -227,11 +231,12 @@ message LookupFeature {
     optional uint32 value_dim = 19;
     // numeric lookup value separator
     optional string value_separator = 20 [default = ","];
-
     // mask value in training progress
-    optional bool use_mask =  25;
+    optional bool use_mask =  21;
     // zero collision hash
-    optional ZeroCollisionHash zch = 26;
+    optional ZeroCollisionHash zch = 22;
+    // id vocabulary file path
+    optional string vocab_file = 23;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -302,9 +307,11 @@ message MatchFeature {
     // match value dimensions
     optional uint32 value_dim = 20;
     // mask value in training progress
-    optional bool use_mask =  25;
+    optional bool use_mask =  21;
     // zero collision hash
-    optional ZeroCollisionHash zch = 26;
+    optional ZeroCollisionHash zch = 22;
+    // id vocabulary file path
+    optional string vocab_file = 23;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -496,9 +503,11 @@ message SequenceIdFeature {
     // id value dimensions, now only support value_dim = 1
     optional uint32 value_dim = 15 [default = 1];
     // mask value in training progress
-    optional bool use_mask =  20;
+    optional bool use_mask =  16;
     // zero collision hash
-    optional ZeroCollisionHash zch = 21;
+    optional ZeroCollisionHash zch = 17;
+    // id vocabulary file path
+    optional string vocab_file = 18;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
