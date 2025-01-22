@@ -149,13 +149,15 @@ sample_weight_fields: 'col_name'
         --pipeline_config_path ${PIPELINE_CONFIG_PATH} \
         --fg_output_dir fg_output \
         --reserves ${COLS_YOU_WANT_RESERVE} \
-        --fg_resource_name fg_v1.json
+        --fg_resource_name ${FG_RESOURCE_NAME} \
+        --odps_project_name {PROJECT_NAME}
     ```
     - --pipeline_config_path: 模型配置文件。
     - --fg_output_dir: fg json的输出文件夹。
     - --reserves: 需要透传到输出表的列，列名用逗号分隔。一般需要保留Label列，也可以保留request_id，user_id，item_id列，注意：如果模型的feature_config中有user_id，item_id作为特征，feature_name需避免与样本中的user_id，item_id列名冲突。
-    - --fg_resource_name: fg json的输出文件名，默认为`fg.json`。
-    - 对于环境变量ODPS_CONFIG_FILE_PATH指向得是odpcmd得配置文件，如果存在该配置文件，则生成得fg json文件后会上传一份到MaxCompute中,并且名称和参数fg_resource_name一样。
+    - --fg_resource_name: 可选，fg json在MaxCompute中的资源名，默认为fg.json
+    - --odps_project_name: 可选，将fg json文件上传到MaxCompute项目名,该参数必须配合参数fg_resource_name和环境变量ODPS_CONFIG_FILE_PATH一起使用
+    - ODPS_CONFIG_FILE_PATH: 该环境变量指向得是odpcmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
     /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg039-0.3.9-cp37-cp37m-linux_x86_64.whl
