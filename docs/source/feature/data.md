@@ -137,14 +137,22 @@ sample_weight_fields: 'col_name'
 - 该模式训练速度最佳，但需提前对数据提前进行FG编码，目前仅提供MaxCompute方式，步骤如下：
   - 在DLC/DSW/Local环境中生成fg json配置，上传至DataWorks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
     ```shell
+    ODPS_CONFIG_FILE_PATH=/workspace/config/torch_easyrec.ini \
     python -m tzrec.tools.create_fg_json \
         --pipeline_config_path ${PIPELINE_CONFIG_PATH} \
         --fg_output_dir fg_output \
-        --reserves ${COLS_YOU_WANT_RESERVE}
+        --reserves ${COLS_YOU_WANT_RESERVE} \
+        --fg_resource_name fg_v1.json
     ```
     - --pipeline_config_path: 模型配置文件。
     - --fg_output_dir: fg json的输出文件夹。
     - --reserves: 需要透传到输出表的列，列名用逗号分隔。一般需要保留Label列，也可以保留request_id，user_id，item_id列，注意：如果模型的feature_config中有user_id，item_id作为特征，feature_name需避免与样本中的user_id，item_id列名冲突。
+    - --fg_resource_name: fg json的输出文件名，默认为`fg.json`。
+    - 对于环境变量ODPS_CONFIG_FILE_PATH指向得是odpcmd得配置文件，如果存在该配置文件，则生成得fg json文件会上传一份到MaxCompute中,并且名称和fg_resource_name参数一样。torch_easyrec.ini文件内容样例如下：
+      - project_name=mc_project_name
+      - access_id={as}
+      - access_key={ak}
+      - end_point=http://service.{region}.maxcompute.aliyun-inc.com/api
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
     /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg039-0.3.9-cp37-cp37m-linux_x86_64.whl
