@@ -441,7 +441,7 @@ class EmbeddingGroup(nn.Module):
             if seq_emb_impl.has_sparse:
                 sparse_feat_kjt = batch.sparse_features[key]
             if seq_emb_impl.has_mulval_seq:
-                sequence_mulval_lengths = batch.sparse_features[key]
+                sequence_mulval_lengths = batch.sequence_mulval_lengths[key]
             if seq_emb_impl.has_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
             if seq_emb_impl.has_mulval_seq_user:
