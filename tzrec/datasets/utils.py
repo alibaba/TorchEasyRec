@@ -107,11 +107,26 @@ class RecordBatchTensor:
 class Batch(Pipelineable):
     """Input Batch."""
 
-    # key of dense_features is group name
+    # key of dense_features is data group name
     dense_features: Dict[str, KeyedTensor] = field(default_factory=dict)
-    # key of sparse_features is group name
+    # key of sparse_features is data group name
     sparse_features: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
-    # key of sparse_features is group name
+    # key of sequence_mulval_lengths is data group name
+    #
+    # for multi-value sequence, we flatten it, then store values & accumate lengths
+    # into sparse_features, store key_lengths & seq_lengths into sequence_mulval_lengths
+    #
+    # e.g.
+    # for the sequence `click_seq`: [[[3, 4], [5]], [6, [7, 8]]]
+    # we can denote it in jagged formular with:
+    #   values: [3, 4, 5, 6, 7, 8]
+    #   key_lengths: [2, 1, 1, 2]
+    #   seq_lengths: [2, 2]
+    # then:
+    #   sparse_features[dg]['click_seq'].values() = [3, 4, 5, 6, 7, 8]  # values
+    #   sparse_features[dg]['click_seq'].lengths() = [3, 3]  # accumate lengths
+    #   sequence_mulval_lengths[dg]['click_seq'].values() = [2, 1, 1, 2]  # key_lengths
+    #   sequence_mulval_lengths[dg]['click_seq'].lengths() = [2, 2]  # seq_lengths
     sequence_mulval_lengths: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
     # key of sequence_dense_features is feature name
     sequence_dense_features: Dict[str, JaggedTensor] = field(default_factory=dict)
@@ -157,6 +172,8 @@ class Batch(Pipelineable):
             v.record_stream(stream)
         for v in self.sparse_features.values():
             v.record_stream(stream)
+        for v in self.sequence_mulval_lengths.values():
+            v.record_stream(stream)
         for v in self.sequence_dense_features.values():
             v.record_stream(stream)
         for v in self.labels.values():
@@ -191,6 +208,9 @@ class Batch(Pipelineable):
             sparse_features={
                 k: v.pin_memory() for k, v in self.sparse_features.items()
             },
+            sequence_mulval_lengths={
+                k: v.pin_memory() for k, v in self.sequence_mulval_lengths.items()
+            },
             sequence_dense_features=sequence_dense_features,
             labels={k: v.pin_memory() for k, v in self.labels.items()},
             reserves=self.reserves,
@@ -219,6 +239,16 @@ class Batch(Pipelineable):
                 tensor_dict[f"{k}.lengths"] = v.lengths()
                 if v.weights_or_none() is not None:
                     tensor_dict[f"{k}.weights"] = v.weights()
+        for x in self.sequence_mulval_lengths.values():
+            if sparse_dtype:
+                x = KeyedJaggedTensor(
+                    keys=x.keys(),
+                    values=x.values().to(sparse_dtype),
+                    lengths=x.lengths().to(sparse_dtype),
+                )
+            for k, v in x.to_dict().items():
+                tensor_dict[f"{k}.key_lengths"] = v.values()
+                tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.sequence_dense_features.items():
             tensor_dict[f"{k}.values"] = v.values()
             tensor_dict[f"{k}.lengths"] = v.lengths()
