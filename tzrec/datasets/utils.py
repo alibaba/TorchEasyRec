@@ -64,7 +64,7 @@ class SequenceSparseData(ParsedData):
     """Internal data structure for sequence sparse feature."""
 
     values: npt.NDArray
-    lengths: npt.NDArray
+    key_lengths: npt.NDArray
     seq_lengths: npt.NDArray
 
 
@@ -111,6 +111,8 @@ class Batch(Pipelineable):
     dense_features: Dict[str, KeyedTensor] = field(default_factory=dict)
     # key of sparse_features is group name
     sparse_features: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
+    # key of sparse_features is group name
+    sequence_mulval_lengths: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
     # key of sequence_dense_features is feature name
     sequence_dense_features: Dict[str, JaggedTensor] = field(default_factory=dict)
     # key of labels is label name

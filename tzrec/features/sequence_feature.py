@@ -211,6 +211,14 @@ class SequenceIdFeature(IdFeature):
             return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        else:
+            return 1
+
+    @property
     def is_sequence(self) -> bool:
         """Feature is sequence or not."""
         return True
@@ -256,7 +264,7 @@ class SequenceIdFeature(IdFeature):
             parsed_feat = SequenceSparseData(
                 name=self.name,
                 values=values,
-                lengths=key_lengths,
+                key_lengths=key_lengths,
                 seq_lengths=seq_lengths,
             )
         else:
@@ -320,9 +328,6 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["vocab_dict"] = self.vocab_dict
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("value_dim"):
-            assert (
-                self.config.value_dim == 1
-            ), f"SequenceIdFeature {self.name} not support multi-value now."
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 1
@@ -441,7 +446,9 @@ class SequenceRawFeature(RawFeature):
                 parsed_feat = SequenceSparseData(
                     name=self.name,
                     values=values,
-                    lengths=np.array([self._fg_op.value_dimension()] * sum(lengths)),
+                    key_lengths=np.array(
+                        [self._fg_op.value_dimension()] * sum(lengths)
+                    ),
                     seq_lengths=lengths,
                 )
             else:
