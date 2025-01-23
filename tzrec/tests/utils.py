@@ -588,13 +588,21 @@ def build_mock_input_with_fg(
                 random.random() < 0.5 and feature.inputs[0] not in single_id_fields
             )
             side, name = feature.side_inputs[0]
-            inputs[side][name] = IdMockInput(
-                name,
-                is_multi=is_multi,
-                num_ids=feature.num_embeddings,
-                vocab_list=feature.config.vocab_list,
-                multival_sep=chr(29),
-            )
+            if feature.is_weighted:
+                inputs[side][name] = MapMockInput(
+                    name,
+                    is_sparse=feature.is_sparse,
+                    num_ids=feature.num_embeddings,
+                    vocab_list=feature.config.vocab_list,
+                )
+            else:
+                inputs[side][name] = IdMockInput(
+                    name,
+                    is_multi=is_multi,
+                    num_ids=feature.num_embeddings,
+                    vocab_list=feature.config.vocab_list,
+                    multival_sep=chr(29),
+                )
         elif type(feature) is RawFeature:
             side, name = feature.side_inputs[0]
             inputs[side][name] = RawMockInput(

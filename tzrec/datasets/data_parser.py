@@ -692,9 +692,9 @@ class DataParser:
                     keys_user.append(key)
                     if key in dg_sequence_mulval_sparse_keys:
                         mulval_keys_user.append(key)
-                        # pyre-ignore [16]
+                        # pyre-ignore [61]
                         mulval_seq_lengths_user.append(seq_length)
-                        # pyre-ignore [16]
+                        # pyre-ignore [61]
                         mulval_key_lengths_user.append(key_length)
                 else:
                     values_item.append(value)
@@ -702,9 +702,9 @@ class DataParser:
                     keys_item.append(key)
                     if key in dg_sequence_mulval_sparse_keys:
                         mulval_keys_item.append(key)
-                        # pyre-ignore [16]
+                        # pyre-ignore [61]
                         mulval_seq_lengths_item.append(seq_length)
-                        # pyre-ignore [16]
+                        # pyre-ignore [61]
                         mulval_key_lengths_item.append(key_length)
 
                 if len(dg_has_weight_keys) > 0:

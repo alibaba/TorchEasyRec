@@ -192,7 +192,7 @@ feature_configs: {
 ```
 
 - **separator**: FG多值分隔符，默认为`\x1d`
-- **value_dim**: 指定Embedding特征的输入维度
+- **value_dim**: 默认值为1， 指定Embedding特征的输入维度
 
 ## ComboFeature: 组合特征
 
@@ -245,7 +245,7 @@ feature_configs: {
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
 - **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
-- **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
+- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
 
 如果Map的值为连续值，可设置:
 
@@ -288,7 +288,7 @@ feature_configs: {
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
 - **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
-- **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
+- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
 
 如果Map的值为连续值，可设置:
 
@@ -478,7 +478,7 @@ feature_configs: {
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列特征分隔符
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- **value_dim**: 目前只支持value_dim=1，不支持多值ID序列
+- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
 - 其余配置同IdFeature
 
 ## SequenceRawFeature：数值型序列特征
@@ -550,4 +550,4 @@ feature_configs: {
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
   - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。在输入样本数据中列名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，`expression`为`item:iid`，输入样本数据中列名应为`click_seq__iid`。在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
   - 其中当类型为IdFeature时
-    - **value_dim**: 目前只支持value_dim=1，不支持多值ID序列
+    - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
