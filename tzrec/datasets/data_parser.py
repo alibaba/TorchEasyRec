@@ -453,9 +453,14 @@ class DataParser:
                     seq_length = length
                     key_length = input_data[f"{key}.key_lengths"]
                     # TODO: remove to_float when segment_reduce support int values
-                    length = torch.segment_reduce(
-                        key_length.float(), "sum", lengths=seq_length
-                    ).to(length.dtype)
+                    try:
+                        length = torch.segment_reduce(
+                            key_length.float(), "sum", lengths=seq_length
+                        ).to(length.dtype)
+                    except Exception:
+                        import pdb
+
+                        pdb.set_trace()
                     mulval_keys.append(key)
                     mulval_seq_lengths.append(seq_length)
                     mulval_key_lengths.append(key_length)
@@ -541,7 +546,7 @@ class DataParser:
 
     def _to_sparse_features_user1tile_itemb(
         self, input_data: Dict[str, torch.Tensor]
-    ) -> Dict[str, KeyedJaggedTensor]:
+    ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert batch sparse features user_bs = 1 then tile and item_bs = B.
 
         User feature and item feature use one KeyedJaggedTensor.
@@ -632,7 +637,7 @@ class DataParser:
 
     def _to_sparse_features_user1_itemb(
         self, input_data: Dict[str, torch.Tensor]
-    ) -> Dict[str, KeyedJaggedTensor]:
+    ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert to batch sparse features user_bs = 1 and item_bs = B.
 
         User feature and item feature use separate KeyedJaggedTensor.  because
@@ -687,7 +692,9 @@ class DataParser:
                     keys_user.append(key)
                     if key in dg_sequence_mulval_sparse_keys:
                         mulval_keys_user.append(key)
+                        # pyre-ignore [16]
                         mulval_seq_lengths_user.append(seq_length)
+                        # pyre-ignore [16]
                         mulval_key_lengths_user.append(key_length)
                 else:
                     values_item.append(value)
@@ -695,7 +702,9 @@ class DataParser:
                     keys_item.append(key)
                     if key in dg_sequence_mulval_sparse_keys:
                         mulval_keys_item.append(key)
+                        # pyre-ignore [16]
                         mulval_seq_lengths_item.append(seq_length)
+                        # pyre-ignore [16]
                         mulval_key_lengths_item.append(key_length)
 
                 if len(dg_has_weight_keys) > 0:

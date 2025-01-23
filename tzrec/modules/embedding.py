@@ -433,19 +433,19 @@ class EmbeddingGroup(nn.Module):
             sparse_feat_kjt = None
             sparse_feat_kjt_user = None
             dense_feat_kt = None
-            sequence_mulval_lengths = None
-            sequence_mulval_lengths_user = None
+            sequence_mulval_length_kjt = None
+            sequence_mulval_length_kjt_user = None
 
             if seq_emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
             if seq_emb_impl.has_sparse:
                 sparse_feat_kjt = batch.sparse_features[key]
             if seq_emb_impl.has_mulval_seq:
-                sequence_mulval_lengths = batch.sequence_mulval_lengths[key]
+                sequence_mulval_length_kjt = batch.sequence_mulval_lengths[key]
             if seq_emb_impl.has_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
             if seq_emb_impl.has_mulval_seq_user:
-                sequence_mulval_lengths_user = batch.sequence_mulval_lengths[
+                sequence_mulval_length_kjt_user = batch.sequence_mulval_lengths[
                     key + "_user"
                 ]
 
@@ -454,9 +454,9 @@ class EmbeddingGroup(nn.Module):
                     sparse_feat_kjt,
                     dense_feat_kt,
                     batch.sequence_dense_features,
-                    sequence_mulval_lengths,
+                    sequence_mulval_length_kjt,
                     sparse_feat_kjt_user,
-                    sequence_mulval_lengths_user,
+                    sequence_mulval_length_kjt_user,
                     batch.tile_size,
                 )
             )

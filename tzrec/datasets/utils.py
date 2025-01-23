@@ -150,6 +150,10 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sparse_features.items()
             },
+            sequence_mulval_lengths={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.sequence_mulval_lengths.items()
+            },
             sequence_dense_features={
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sequence_dense_features.items()
