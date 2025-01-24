@@ -14,7 +14,7 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **init_fn**: 特征嵌入初始化方式，默认不需要设置，如需自定义，可以设置任意的torch内置初始化函数，如`nn.init.uniform_,a=-0.01,b=0.01`
 
-- **default_value**: 特征默认值。如果默认值为""，则没有默认值，后续模型中对于空特征的嵌入为零向量。注意: 该默认值为`bucktize`前的默认值。`bucktize`的配置包括`hash_bucket_size`/`vocab_list`/`boundaries`
+- **default_value**: 特征默认值。如果默认值为""，则没有默认值，后续模型中对于空特征的嵌入为零向量。注意: 该默认值为`bucketize`前的默认值。`bucketize`的配置包括`num_buckets`/`hash_bucket_size`/`vocab_list`/`vocab_dict`/`vocab_file`/`boundaries`
 
 - **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`。更建议用数组（ARRAY）类型来表示多值，训练和推理性能更好
 
@@ -85,6 +85,11 @@ feature_configs {
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
 
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+
+- **vocab_file**: 指定词表或字典形式词表的文件路径，适合取值比较多兵可以枚举的特征，编码未预留，必须设置**default_bucketize_value**参数
+
+  - 词表形式：一行一个词
+  - 字典词表形式：一行一个词和编号，词和编号间用空格分隔
 
 - **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 
@@ -240,21 +245,13 @@ feature_configs: {
 
 如果Map的值为离散值 或 `need_key=true`，可设置:
 
-- **hash_bucket_size**: hash bucket的大小。
-- **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
-- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
-- **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
-- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
+- 其余配置同IdFeature
 
 如果Map的值为连续值，可设置:
 
-- **boundaries**: 分箱/分桶的值。
-- **normalizer**: 连续值特征的变换方式，同RawFeature
 - **value_dim**: 默认值是1，连续值输出维度
-- **value_separator**: 连续值分隔符
-- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
+- 其余配置同RawFeature
 
 ## MatchFeature: 主从键字典查询特征
 
@@ -283,20 +280,13 @@ feature_configs: {
 
 如果Map的值为离散值 或 `show_pkey=true` 或 `show_skey=true`，可设置:
 
-- **hash_bucket_size**: hash bucket的大小。
-- **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
-- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
-- **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
-- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
+- 其余配置同IdFeature
 
 如果Map的值为连续值，可设置:
 
-- **boundaries**: 分箱/分桶的值。
-- **normalizer**: 连续值特征的变换方式，同RawFeature
 - **value_dim**: 目前只支持value_dim=1
-- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
+- 其余配置同RawFeature
 
 ## ExprFeature: 表达式特征
 

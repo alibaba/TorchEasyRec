@@ -83,6 +83,8 @@ message IdFeature {
     optional ZeroCollisionHash zch = 16;
     // id vocabulary file path
     optional string vocab_file = 17;
+    // vocab file relative directory
+    optional string asset_dir = 18;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -172,6 +174,8 @@ message ComboFeature {
     optional ZeroCollisionHash zch = 15;
     // id vocabulary file path
     optional string vocab_file = 16;
+    // vocab file relative directory
+    optional string asset_dir = 17;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -237,6 +241,8 @@ message LookupFeature {
     optional ZeroCollisionHash zch = 22;
     // id vocabulary file path
     optional string vocab_file = 23;
+    // vocab file relative directory
+    optional string asset_dir = 24;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -312,6 +318,8 @@ message MatchFeature {
     optional ZeroCollisionHash zch = 22;
     // id vocabulary file path
     optional string vocab_file = 23;
+    // vocab file relative directory
+    optional string asset_dir = 24;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -508,6 +516,8 @@ message SequenceIdFeature {
     optional ZeroCollisionHash zch = 17;
     // id vocabulary file path
     optional string vocab_file = 18;
+    // vocab file relative directory
+    optional string asset_dir = 19;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
