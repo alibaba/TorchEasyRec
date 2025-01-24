@@ -588,11 +588,13 @@ def _get_vocab_list(feature: BaseFeature) -> Optional[List[str]]:
         for k, v in vocab_dict.items():
             vocab_list[v] = k
     elif config.HasField("vocab_file"):
-        # not support dict in vocab_file now
+        # TODO: support dict in vocab_file, now only support list
         vocab_list = []
         with open(config.vocab_file) as f:
             for line in f.readlines():
-                vocab_list.append(line.strip())
+                line = line.strip()
+                if len(line) > 0:
+                    vocab_list.append(line)
     return vocab_list
 
 
