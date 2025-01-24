@@ -11,7 +11,7 @@
 
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -72,6 +72,7 @@ class DataParser:
         self.dense_keys = defaultdict(list)
         self.dense_length_per_key = defaultdict(list)
         self.sparse_keys = defaultdict(list)
+        self.sequence_mulval_sparse_keys = defaultdict(list)
         self.sequence_dense_keys = []
         self.has_weight_keys = defaultdict(list)
 
@@ -79,6 +80,10 @@ class DataParser:
             if feature.is_sequence:
                 if feature.is_sparse:
                     self.sparse_keys[feature.data_group].append(feature.name)
+                    if feature.value_dim != 1:
+                        self.sequence_mulval_sparse_keys[feature.data_group].append(
+                            feature.name
+                        )
                 else:
                     self.sequence_dense_keys.append(feature.name)
             elif feature.is_sparse:
@@ -215,6 +220,10 @@ class DataParser:
                 output_data[f"{feature.name}.lengths"] = _to_tensor(
                     feat_data.seq_lengths
                 )
+                if feature.value_dim != 1:
+                    output_data[f"{feature.name}.key_lengths"] = _to_tensor(
+                        feat_data.key_lengths
+                    )
             elif isinstance(feat_data, SequenceDenseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
                 if self._force_base_data_group:
@@ -273,6 +282,10 @@ class DataParser:
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
                     output_data[f"{feat_name}.lengths"] = _to_tensor(feat_lengths)
+                    if feature.value_dim != 1:
+                        output_data[f"{feature.name}.key_lengths"] = torch.tensor(
+                            feat_data.key_lengths, dtype=torch.int32
+                        )
                 else:
                     output_data[f"{feat_name}.values"] = _to_tensor(
                         feat_data.dense_values
@@ -330,7 +343,9 @@ class DataParser:
             # For INPUT_TILE = 3 mode, batch_size of user features for sparse and dense
             # are all equal to 1, we tile it after embedding lookup in EmbeddingGroup
             dense_features = self._to_dense_features_user1_itemb(input_data)
-            sparse_features = self._to_sparse_features_user1_itemb(input_data)
+            sparse_features, sequence_mulval_lengths = (
+                self._to_sparse_features_user1_itemb(input_data)
+            )
         elif input_tile:
             # For INPUT_TILE = 2 mode,
             # batch_size of user features for sparse are all equal to 1, we tile it
@@ -340,12 +355,18 @@ class DataParser:
             dense_features = self._to_dense_features_user1_itemb(input_data)
             if force_no_tile:
                 # we prevent tile twice in PREDICT mode.
-                sparse_features = self._to_sparse_features_user1_itemb(input_data)
+                sparse_features, sequence_mulval_lengths = (
+                    self._to_sparse_features_user1_itemb(input_data)
+                )
             else:
-                sparse_features = self._to_sparse_features_user1tile_itemb(input_data)
+                sparse_features, sequence_mulval_lengths = (
+                    self._to_sparse_features_user1tile_itemb(input_data)
+                )
         else:
             dense_features = self._to_dense_features(input_data)
-            sparse_features = self._to_sparse_features(input_data)
+            sparse_features, sequence_mulval_lengths = self._to_sparse_features(
+                input_data
+            )
 
         sequence_dense_features = {}
         for key in self.sequence_dense_keys:
@@ -366,6 +387,7 @@ class DataParser:
         batch = Batch(
             dense_features=dense_features,
             sparse_features=sparse_features,
+            sequence_mulval_lengths=sequence_mulval_lengths,
             sequence_dense_features=sequence_dense_features,
             labels=labels,
             sample_weights=sample_weights,
@@ -400,24 +422,44 @@ class DataParser:
 
     def _to_sparse_features(
         self, input_data: Dict[str, torch.Tensor]
-    ) -> Dict[str, KeyedJaggedTensor]:
+    ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert to batch sparse features.
 
         Args:
             input_data (dict): input tensor dict.
 
         Returns:
-            a dict of KeyedTensor.
+            sparse_features: a dict of KeyedJaggedTensor .
+            sequence_mulval_lengths: a dict of KeyedJaggedTensor,
+                kjt.values is key_lengths, kjt.lengths is seq_lengths.
         """
         sparse_features = {}
+        sequence_mulval_lengths = {}
         for dg, keys in self.sparse_keys.items():
             values = []
             lengths = []
             weights = []
+            mulval_keys = []
+            mulval_seq_lengths = []
+            mulval_key_lengths = []
+
             dg_has_weight_keys = self.has_weight_keys[dg]
+            dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
             for key in keys:
                 values.append(input_data[f"{key}.values"])
-                lengths.append(input_data[f"{key}.lengths"])
+                length = input_data[f"{key}.lengths"]
+                if key in dg_sequence_mulval_sparse_keys:
+                    # for multi-value sequence we flatten the sequence first
+                    seq_length = length
+                    key_length = input_data[f"{key}.key_lengths"]
+                    # TODO: remove to_float when segment_reduce support int values
+                    length = torch.segment_reduce(
+                        key_length.float(), "sum", lengths=seq_length
+                    ).to(length.dtype)
+                    mulval_keys.append(key)
+                    mulval_seq_lengths.append(seq_length)
+                    mulval_key_lengths.append(key_length)
+                lengths.append(length)
                 if len(dg_has_weight_keys) > 0:
                     if key in dg_has_weight_keys:
                         weights.append(input_data[f"{key}.weights"])
@@ -439,7 +481,14 @@ class DataParser:
                 length_per_key=[x.numel() for x in values],
             )
             sparse_features[dg] = sparse_feature
-        return sparse_features
+            if len(mulval_keys) > 0:
+                sequence_mulval_length = KeyedJaggedTensor(
+                    keys=mulval_keys,
+                    values=torch.cat(mulval_key_lengths, dim=-1),
+                    lengths=torch.cat(mulval_seq_lengths, dim=-1),
+                )
+                sequence_mulval_lengths[dg] = sequence_mulval_length
+        return sparse_features, sequence_mulval_lengths
 
     def _to_dense_features_user1_itemb(
         self, input_data: Dict[str, torch.Tensor]
@@ -487,12 +536,12 @@ class DataParser:
                     length_per_key=length_per_key_item,
                     values=torch.cat(values_item, dim=-1),
                 )
-                dense_features[dg + "_item"] = dense_feature_item
+                dense_features[dg] = dense_feature_item
         return dense_features
 
     def _to_sparse_features_user1tile_itemb(
         self, input_data: Dict[str, torch.Tensor]
-    ) -> Dict[str, KeyedJaggedTensor]:
+    ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert batch sparse features user_bs = 1 then tile and item_bs = B.
 
         User feature and item feature use one KeyedJaggedTensor.
@@ -503,25 +552,49 @@ class DataParser:
             input_data (dict): input tensor dict.
 
         Returns:
-            a dict of KeyedJaggedTensor.
+            sparse_features: a dict of KeyedJaggedTensor .
+            sequence_mulval_lengths: a dict of KeyedJaggedTensor,
+                kjt.values is key_lengths, kjt.lengths is seq_lengths.
         """
         sparse_features = {}
+        sequence_mulval_lengths = {}
         tile_size = input_data["batch_size"].item()
 
         for dg, keys in self.sparse_keys.items():
             values = []
             lengths = []
             weights = []
+            mulval_keys = []
+            mulval_seq_lengths = []
+            mulval_key_lengths = []
+
             dg_has_weight_keys = self.has_weight_keys[dg]
+            dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
 
             for key in keys:
                 value = input_data[f"{key}.values"]
                 length = input_data[f"{key}.lengths"]
+                if key in dg_sequence_mulval_sparse_keys:
+                    seq_length = length
+                    key_length = input_data[f"{key}.key_lengths"]
+                    # TODO: remove to_float when segment_reduce support int values
+                    length = torch.segment_reduce(
+                        key_length.float(), "sum", lengths=seq_length
+                    ).to(length.dtype)
+                    if key in self.user_feats:
+                        # pyre-ignore [6]
+                        seq_length = seq_length.tile(tile_size)
+                        # pyre-ignore [6]
+                        key_length = key_length.tile(tile_size)
+                    mulval_keys.append(key)
+                    mulval_seq_lengths.append(seq_length)
+                    mulval_key_lengths.append(key_length)
                 if key in self.user_feats:
                     # pyre-ignore [6]
                     value = value.tile(tile_size)
                     # pyre-ignore [6]
                     length = length.tile(tile_size)
+
                 values.append(value)
                 lengths.append(length)
 
@@ -548,11 +621,18 @@ class DataParser:
                 length_per_key=[x.numel() for x in values],
             )
             sparse_features[dg] = sparse_feature
-        return sparse_features
+            if len(mulval_keys) > 0:
+                sequence_mulval_length = KeyedJaggedTensor(
+                    keys=mulval_keys,
+                    values=torch.cat(mulval_key_lengths, dim=-1),
+                    lengths=torch.cat(mulval_seq_lengths, dim=-1),
+                )
+                sequence_mulval_lengths[dg] = sequence_mulval_length
+        return sparse_features, sequence_mulval_lengths
 
     def _to_sparse_features_user1_itemb(
         self, input_data: Dict[str, torch.Tensor]
-    ) -> Dict[str, KeyedJaggedTensor]:
+    ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert to batch sparse features user_bs = 1 and item_bs = B.
 
         User feature and item feature use separate KeyedJaggedTensor.  because
@@ -564,33 +644,63 @@ class DataParser:
             input_data (dict): input tensor dict.
 
         Returns:
-            a dict of KeyedJaggedTensor.
+            sparse_features: a dict of KeyedJaggedTensor .
+            sequence_mulval_lengths: a dict of KeyedJaggedTensor,
+                kjt.values is key_lengths, kjt.lengths is seq_lengths.
         """
         sparse_features = {}
+        sequence_mulval_lengths = {}
 
         for dg, keys in self.sparse_keys.items():
             values_item = []
             lengths_item = []
             weights_item = []
             keys_item = []
+            mulval_keys_item = []
+            mulval_seq_lengths_item = []
+            mulval_key_lengths_item = []
 
             values_user = []
             lengths_user = []
             weights_user = []
             keys_user = []
+            mulval_keys_user = []
+            mulval_seq_lengths_user = []
+            mulval_key_lengths_user = []
 
             dg_has_weight_keys = self.has_weight_keys[dg]
+            dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
             for key in keys:
                 value = input_data[f"{key}.values"]
                 length = input_data[f"{key}.lengths"]
+                if key in dg_sequence_mulval_sparse_keys:
+                    # for multi-value sequence we flatten the sequence first
+                    seq_length = length
+                    key_length = input_data[f"{key}.key_lengths"]
+                    # TODO: remove to_float when segment_reduce support int values
+                    length = torch.segment_reduce(
+                        key_length.float(), "sum", lengths=seq_length
+                    ).to(length.dtype)
                 if key in self.user_feats:
                     values_user.append(value)
                     lengths_user.append(length)
                     keys_user.append(key)
+                    if key in dg_sequence_mulval_sparse_keys:
+                        mulval_keys_user.append(key)
+                        # pyre-ignore [61]
+                        mulval_seq_lengths_user.append(seq_length)
+                        # pyre-ignore [61]
+                        mulval_key_lengths_user.append(key_length)
                 else:
                     values_item.append(value)
                     lengths_item.append(length)
                     keys_item.append(key)
+                    if key in dg_sequence_mulval_sparse_keys:
+                        mulval_keys_item.append(key)
+                        # pyre-ignore [61]
+                        mulval_seq_lengths_item.append(seq_length)
+                        # pyre-ignore [61]
+                        mulval_key_lengths_item.append(key_length)
 
                 if len(dg_has_weight_keys) > 0:
                     if key in dg_has_weight_keys:
@@ -627,9 +737,23 @@ class DataParser:
                     stride=lengths_item[0].size(0),  # input_data['input_batch_size']
                     length_per_key=[x.numel() for x in values_item],
                 )
-                sparse_features[dg + "_item"] = sparse_feature_item
+                sparse_features[dg] = sparse_feature_item
+            if len(mulval_keys_user) > 0:
+                sequence_mulval_length_user = KeyedJaggedTensor(
+                    keys=mulval_keys_user,
+                    values=torch.cat(mulval_key_lengths_user, dim=-1),
+                    lengths=torch.cat(mulval_seq_lengths_user, dim=-1),
+                )
+                sequence_mulval_lengths[dg + "_user"] = sequence_mulval_length_user
+            if len(mulval_keys_item) > 0:
+                sequence_mulval_length_item = KeyedJaggedTensor(
+                    keys=mulval_keys_item,
+                    values=torch.cat(mulval_key_lengths_item, dim=-1),
+                    lengths=torch.cat(mulval_seq_lengths_item, dim=-1),
+                )
+                sequence_mulval_lengths[dg] = sequence_mulval_length_item
 
-        return sparse_features
+        return sparse_features, sequence_mulval_lengths
 
     def dump_parsed_inputs(self, input_data: Dict[str, torch.Tensor]) -> pa.Array:
         """Dump parsed inputs for debug."""

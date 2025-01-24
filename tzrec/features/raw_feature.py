@@ -54,8 +54,6 @@ class RawFeature(BaseFeature):
         """Fg value dimension of the feature."""
         if self.config.HasField("value_dim"):
             return self.config.value_dim
-        elif self._is_sparse:
-            return 0
         else:
             return 1
 
