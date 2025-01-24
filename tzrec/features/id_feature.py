@@ -87,6 +87,9 @@ class IdFeature(BaseFeature):
             num_embeddings = len(self.vocab_list)
         elif len(self.vocab_dict) > 0:
             num_embeddings = max(list(self.vocab_dict.values())) + 1
+        elif len(self.vocab_file) > 0:
+            self.init_fg()
+            num_embeddings = self._fg_op.vocab_list_size()
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
@@ -175,8 +178,8 @@ class IdFeature(BaseFeature):
             fg_cfg["vocab_dict"] = self.vocab_dict
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
-        elif self.config.HasField("vocab_file"):
-            fg_cfg["vocab_file"] = self.config.vocab_file
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
         elif self.config.HasField("num_buckets"):
@@ -196,6 +199,6 @@ class IdFeature(BaseFeature):
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
         assets = {}
-        if self.config.HasField("vocab_file"):
-            assets["vocab_file"] = self.config.vocab_file
+        if len(self.vocab_file) > 0:
+            assets["vocab_file"] = self.vocab_file
         return assets

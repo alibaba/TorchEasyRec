@@ -87,7 +87,7 @@ class MatchFeature(BaseFeature):
                 or self.config.HasField("num_buckets")
                 or len(self.config.vocab_list) > 0
                 or len(self.config.vocab_dict) > 0
-                or self.config.HasField("vocab_file")
+                or len(self.config.vocab_file) > 0
                 or len(self.config.boundaries) > 0
             )
         return self._is_sparse
@@ -105,6 +105,9 @@ class MatchFeature(BaseFeature):
             num_embeddings = len(self.vocab_list) + 1
         elif len(self.vocab_dict) > 0:
             num_embeddings = max(list(self.vocab_dict.values())) + 1
+        elif len(self.vocab_file) > 0:
+            self.init_fg()
+            num_embeddings = self._fg_op.vocab_list_size()
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
@@ -209,8 +212,8 @@ class MatchFeature(BaseFeature):
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
-        elif self.config.HasField("vocab_file"):
-            fg_cfg["vocab_file"] = self.config.vocab_file
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
@@ -225,6 +228,6 @@ class MatchFeature(BaseFeature):
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
         assets = {}
-        if self.config.HasField("vocab_file"):
-            assets["vocab_file"] = self.config.vocab_file
+        if len(self.vocab_file) > 0:
+            assets["vocab_file"] = self.vocab_file
         return assets
