@@ -66,8 +66,6 @@ class MatchFeature(BaseFeature):
         """Fg value dimension of the feature."""
         if self.config.HasField("value_dim"):
             return self.config.value_dim
-        elif self._is_sparse:
-            return 0
         else:
             return 1
 
@@ -84,7 +82,8 @@ class MatchFeature(BaseFeature):
         """Feature is sparse or dense."""
         if self._is_sparse is None:
             self._is_sparse = (
-                self.config.HasField("hash_bucket_size")
+                self.config.HasField("zch")
+                or self.config.HasField("hash_bucket_size")
                 or self.config.HasField("num_buckets")
                 or len(self.config.vocab_list) > 0
                 or len(self.config.vocab_dict) > 0
@@ -213,6 +212,6 @@ class MatchFeature(BaseFeature):
             fg_cfg["boundaries"] = list(self.config.boundaries)
 
         if fg_cfg["needDiscrete"]:
-            fg_cfg["value_dim"] = self.config.value_dim
+            fg_cfg["value_dim"] = self.value_dim
         #     del fg_cfg["combiner"]
         return [fg_cfg]

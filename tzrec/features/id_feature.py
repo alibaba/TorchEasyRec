@@ -57,7 +57,10 @@ class IdFeature(BaseFeature):
     @property
     def value_dim(self) -> int:
         """Fg value dimension of the feature."""
-        return self.config.value_dim
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        else:
+            return 0
 
     @property
     def output_dim(self) -> int:

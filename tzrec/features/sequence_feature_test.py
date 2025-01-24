@@ -99,7 +99,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
         np.testing.assert_allclose(
             parsed_feat.seq_lengths, np.array(expected_seq_lengths)
         )
@@ -124,7 +124,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq_id")
         np.testing.assert_allclose(parsed_feat.values, np.array([1, 2, 3, 4, 5, 6]))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 1, 2, 1]))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array([1, 1, 1, 2, 1]))
         np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 0, 1, 2]))
 
     @parameterized.expand(
@@ -168,7 +168,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
@@ -213,7 +213,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq_id_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
@@ -290,7 +290,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
@@ -320,7 +320,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         )
         self.assertTrue(
             np.allclose(
-                parsed_feat.lengths, np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+                parsed_feat.key_lengths, np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
             )
         )
         np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([6, 1, 4]))
