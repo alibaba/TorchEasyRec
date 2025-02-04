@@ -4,7 +4,6 @@
     "tzrec/*/*_test.py",
     "tzrec/tests/*.py",
     "tzrec/utils/load_class.py",
-    "tzrec/acc/_*.py",
     "tzrec/tools/convert_easyrec_config_to_tzrec_config.py",
     "tzrec/*/*_test_tmp.py"
   ],
@@ -16,5 +15,5 @@
     }
   ],
   "strict": true,
-  "version": "0.9.21"
+  "version": "0.9.23"
 }

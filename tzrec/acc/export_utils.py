@@ -9,37 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import os
 from typing import Dict, Tuple
 
 import torch
 import torch._prims_common as prims_utils
 import torch.nn.functional as F
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
-    BoundsCheckMode,
-)
-from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
-    IntNBitTableBatchedEmbeddingBagsCodegen,
-)
 from torch import nn
 from torch._decomp import decomposition_table, register_decomposition
 from torch._prims_common.wrappers import out_wrapper
 from torch.export import Dim
 
-from tzrec.acc.utils import is_cuda_export, is_trt
+from tzrec.acc.utils import is_trt
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
-
-# skip default bound check which is not allow by aot
-if is_cuda_export():
-    # pyre-ignore [8]
-    IntNBitTableBatchedEmbeddingBagsCodegen.__init__ = functools.partialmethod(
-        IntNBitTableBatchedEmbeddingBagsCodegen.__init__,
-        bounds_check_mode=BoundsCheckMode.NONE,
-    )
-    logger.info("update IntNBitTableBatchedEmbeddingBagsCodegen for export")
-
 
 # add new aten._softmax decomposition which is supported by dynamo
 aten = torch._ops.ops.aten
