@@ -111,7 +111,7 @@ class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
             "same Embedding Configs"
         )
 
-        # Assuming quantized MCEC is used in inference only
+        # Assuming quantized MC-EBC is used in inference only
         for (
             managed_collision_module
         ) in self._managed_collision_collection._managed_collision_modules.values():
