@@ -413,6 +413,59 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
+    @parameterized.expand(
+        [
+            ["", "data/test/id_vocab_list_0", 4, [2, 3, 1], [2, 0, 1]],
+            ["xyz", "data/test/id_vocab_list_1", 4, [2, 3, 0, 1], [2, 1, 1]],
+            ["", "data/test/id_vocab_dict_2", 3, [2, 2, 1], [2, 0, 1]],
+            ["xyz", "data/test/id_vocab_dict_3", 3, [2, 2, 0, 1], [2, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_id_feature_with_vocab_file(
+        self,
+        default_value,
+        vocab_file,
+        expected_num_embeddings,
+        expected_values,
+        expected_lengths,
+    ):
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                embedding_dim=16,
+                vocab_file=vocab_file,
+                default_bucketize_value=1,
+                expression="user:id_str",
+                pooling="mean",
+                default_value=default_value,
+            )
+        )
+
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
+
+        expected_emb_bag_config = EmbeddingBagConfig(
+            num_embeddings=expected_num_embeddings,
+            embedding_dim=16,
+            name="id_feat_emb",
+            feature_names=["id_feat"],
+            pooling=PoolingType.MEAN,
+        )
+        self.assertEqual(repr(id_feat.emb_bag_config), repr(expected_emb_bag_config))
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=expected_num_embeddings,
+            embedding_dim=16,
+            name="id_feat_emb",
+            feature_names=["id_feat"],
+        )
+        self.assertEqual(repr(id_feat.emb_config), repr(expected_emb_config))
+
+        input_data = {"id_str": pa.array(["abc\x1defg", "", "hij"])}
+        parsed_feat = id_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "id_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
 
 if __name__ == "__main__":
     unittest.main()
