@@ -657,6 +657,21 @@ class BaseFeature(object, metaclass=_meta_cls):
         return self._vocab_dict
 
     @property
+    def vocab_file(self) -> str:
+        """Vocab file."""
+        if self.config.HasField("vocab_file"):
+            if not self.config.HasField("default_bucketize_value"):
+                raise ValueError(
+                    "default_bucketize_value must be set when use vocab_file."
+                )
+            vocab_file = self.config.vocab_file
+            if self.config.HasField("asset_dir"):
+                vocab_file = os.path.join(self.config.asset_dir, vocab_file)
+            return vocab_file
+        else:
+            return ""
+
+    @property
     def default_bucketize_value(self) -> int:
         """Default bucketize value."""
         if self.config.HasField("default_bucketize_value"):

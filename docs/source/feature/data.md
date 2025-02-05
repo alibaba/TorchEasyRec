@@ -159,11 +159,11 @@ sample_weight_fields: 'col_name'
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg039-0.3.9-cp37-cp37m-linux_x86_64.whl
+    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg044-0.4.4-cp37-cp37m-linux_x86_64.whl
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg039 import offline_pyfg
+    from pyfg044 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",
