@@ -33,13 +33,21 @@ from torchrec.quant.embedding_modules import (
     MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS,
     MODULE_ATTR_REGISTER_TBES_BOOL,
     MODULE_ATTR_ROW_ALIGNMENT_INT,
-    _get_device,
     _update_embedding_configs,
 )
 from torchrec.quant.embedding_modules import (
     EmbeddingBagCollection as QuantEmbeddingBagCollection,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
+
+
+def _get_device(module: nn.Module) -> torch.device:
+    device = torch.device("cpu")
+
+    for _, tensor in module.state_dict().items():
+        device = tensor.device
+        break
+    return device
 
 
 class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
@@ -139,6 +147,7 @@ class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
         )
         return self
 
+    # pyre-ignore[15]
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -155,7 +164,7 @@ class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
         return "QuantManagedCollisionEmbeddingBagCollection"
 
     @classmethod
-    # pyre-ignore
+    # pyre-ignore[14]
     def from_float(
         cls,
         module: ManagedCollisionEmbeddingBagCollection,
@@ -165,14 +174,12 @@ class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
         mc_ebc = module
         ebc = module._embedding_module
 
-        # pyre-ignore[9]
         qconfig: torch.quantization.QConfig = module.qconfig
         assert hasattr(module, "qconfig"), (
             "QuantManagedCollisionEmbeddingBagCollection input float module must "
             "have qconfig defined"
         )
 
-        # pyre-ignore[29]
         embedding_configs = copy.deepcopy(ebc.embedding_bag_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_configs),
@@ -183,7 +190,6 @@ class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
             qconfig,
         )
 
-        # pyre-ignore[9]
         table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]] | None = (
             ebc._table_name_to_quantized_weights
             if hasattr(ebc, "_table_name_to_quantized_weights")
