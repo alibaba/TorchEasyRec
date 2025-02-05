@@ -85,23 +85,23 @@ class RankIntegrationTest(unittest.TestCase):
                 self.test_dir,
                 enable_aot=True,
             )
-        # input_tile_dir = os.path.join(self.test_dir, "input_tile")
-        # input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
-        # if self.success:
-        #     os.environ["INPUT_TILE"] = "2"
-        #     self.success = utils.test_export(
-        #         os.path.join(self.test_dir, "pipeline.config"),
-        #         input_tile_dir,
-        #         enable_aot=True,
-        #     )
-        # if self.success:
-        #     os.environ["INPUT_TILE"] = "3"
-        #     self.success = utils.test_export(
-        #         os.path.join(self.test_dir, "pipeline.config"),
-        #         input_tile_dir_emb,
-        #         enable_aot=True,
-        #     )
-        # self.assertTrue(self.success)
+        input_tile_dir = os.path.join(self.test_dir, "input_tile")
+        input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
+        if self.success:
+            os.environ["INPUT_TILE"] = "2"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir,
+                enable_aot=True,
+            )
+        if self.success:
+            os.environ["INPUT_TILE"] = "3"
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir_emb,
+                enable_aot=True,
+            )
+        self.assertTrue(self.success)
 
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
         self._test_rank_nofg(
