@@ -119,12 +119,6 @@ class QuantManagedCollisionEmbeddingBagCollection(QuantEmbeddingBagCollection):
             "same Embedding Configs"
         )
 
-        # Assuming quantized MC-EBC is used in inference only
-        for (
-            managed_collision_module
-        ) in self._managed_collision_collection._managed_collision_modules.values():
-            managed_collision_module.reset_inference_mode()
-
     def to(
         self, *args: List[Any], **kwargs: Dict[str, Any]
     ) -> "QuantManagedCollisionEmbeddingBagCollection":
