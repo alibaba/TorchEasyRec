@@ -102,7 +102,7 @@ class TDMEmbedding(nn.Module):
     """TDMEmbedding inference wrapper for jit.script."""
 
     def __init__(
-        self, module: nn.Module, embedding_group_name: str = "embedding_group"
+        self, module: EmbeddingGroup, embedding_group_name: str = "embedding_group"
     ) -> None:
         super().__init__()
         self._embedding_group_name = embedding_group_name
@@ -116,6 +116,7 @@ class TDMEmbedding(nn.Module):
 
         name_to_fea = {x.name: x for x in module._features}
         seq_group_query_fea = []
+        assert seq_feature_group is not None
         seq_feature_group_feature_names = list(seq_feature_group.feature_names)
         for feature_name in seq_feature_group_feature_names:
             feature = name_to_fea[feature_name]

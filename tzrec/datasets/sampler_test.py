@@ -101,8 +101,8 @@ class SamplerTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("src_id:int64\tdst_id:int\tweight:float\n")
         for i in range(31, 63):
-            for anc in _ancestor(i):
-                f.write(f"{i}\t{anc}\t{1.0}\n")
+            for ancestor in _ancestor(i):
+                f.write(f"{i}\t{ancestor}\t{1.0}\n")
         f.flush()
         return f
 

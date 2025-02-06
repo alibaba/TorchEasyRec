@@ -82,6 +82,7 @@ def symbolic_trace(
 
 
 def _forward_impl(
+    # pyre-ignore[2]
     self,
     indices: Tensor,
     offsets: Tensor,
@@ -134,8 +135,6 @@ def _forward_impl(
             self.index_remappings_array,
             self.index_remappings_array_offsets,
         )
-    # pyre-fixme[29]: `Union[(self: TensorBase) -> int, Module, Tensor]` is not
-    #  a function.
     if self.lxu_cache_weights.numel() > 0:
         if self.timestep_prefetch_size.get() <= 0:
             self.prefetch(indices, offsets)

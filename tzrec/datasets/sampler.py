@@ -71,6 +71,7 @@ def _get_np_type(field_type: pa.DataType) -> npt.DTypeLike:
         pa.float64(): np.double,
     }
     if field_type in type_map:
+        # pyre-ignore[7]
         return type_map[field_type]
     else:
         return np.str_
@@ -278,7 +279,7 @@ class BaseSampler(metaclass=_meta_cls):
                 feature = nodes.float_attrs[:, :, float_idx]
                 float_idx += 1
             elif attr_gl_type == "string":
-                feature = nodes.string_attrs[:, :, string_idx].astype(np.string_)
+                feature = nodes.string_attrs[:, :, string_idx].astype(np.str_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
             else:
@@ -305,7 +306,7 @@ class BaseSampler(metaclass=_meta_cls):
                 feature = nodes.float_attrs[:, float_idx]
                 float_idx += 1
             elif attr_gl_type == "string":
-                feature = nodes.string_attrs[:, string_idx].astype(np.string_)
+                feature = nodes.string_attrs[:, string_idx].astype(np.str_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
             else:
