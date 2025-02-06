@@ -71,7 +71,6 @@ def _get_np_type(field_type: pa.DataType) -> npt.DTypeLike:
         pa.float64(): np.double,
     }
     if field_type in type_map:
-        # pyre-ignore[7]
         return type_map[field_type]
     else:
         return np.str_
