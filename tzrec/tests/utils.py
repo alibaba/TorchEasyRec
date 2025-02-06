@@ -576,6 +576,28 @@ def build_mock_input_fg_encoded(
     return inputs
 
 
+def _get_vocab_list(feature: BaseFeature) -> Optional[List[str]]:
+    config = feature.config
+    vocab_list = None
+    if len(config.vocab_list) > 0:
+        vocab_list = list(config.vocab_list)
+    elif len(config.vocab_dict) > 0:
+        vocab_dict = OrderedDict(config.vocab_dict.items())
+        length = max(vocab_dict.values()) + 1
+        vocab_list = [""] * length
+        for k, v in vocab_dict.items():
+            vocab_list[v] = k
+    elif config.HasField("vocab_file"):
+        # TODO: support dict in vocab_file, now only support list
+        vocab_list = []
+        with open(config.vocab_file) as f:
+            for line in f.readlines():
+                line = line.strip()
+                if len(line) > 0:
+                    vocab_list.append(line)
+    return vocab_list
+
+
 def build_mock_input_with_fg(
     features: List[BaseFeature], user_id: str = "", item_id: str = ""
 ) -> Dict[str, MockInput]:
@@ -593,14 +615,14 @@ def build_mock_input_with_fg(
                     name,
                     is_sparse=feature.is_sparse,
                     num_ids=feature.num_embeddings,
-                    vocab_list=feature.config.vocab_list,
+                    vocab_list=_get_vocab_list(feature),
                 )
             else:
                 inputs[side][name] = IdMockInput(
                     name,
                     is_multi=is_multi,
                     num_ids=feature.num_embeddings,
-                    vocab_list=feature.config.vocab_list,
+                    vocab_list=_get_vocab_list(feature),
                     multival_sep=chr(29),
                 )
         elif type(feature) is RawFeature:
@@ -627,7 +649,7 @@ def build_mock_input_with_fg(
                         input_name,
                         is_sparse=feature.is_sparse,
                         num_ids=feature.num_embeddings,
-                        vocab_list=feature.config.vocab_list,
+                        vocab_list=_get_vocab_list(feature),
                     )
                 else:
                     is_multi = (
