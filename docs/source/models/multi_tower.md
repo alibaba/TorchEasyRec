@@ -51,7 +51,7 @@ model_config {
 }
 ```
 
-- feature_groups:  可配置多个feature_group，group name可以变
+- feature_groups: 可配置多个feature_group，group name可以变
 - multi_tower: multi_tower相关的参数
   - towers: 每个deep feature_group对应了一个tower。
     - input: 跟feature_group的group_name对应

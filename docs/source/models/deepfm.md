@@ -55,7 +55,7 @@ model_config {
 ```
 
 - feature_groups: 需要至少两个feature_group: wide和deep, fm可选
-- deepfm:  deepfm相关的参数
+- deepfm: deepfm相关的参数
   - deep: deep mlp的参数配置
     - hidden_units: mlp每一层的channel数目，即神经元的数目
   - wide_embedding_dim: wide部分输出的大小

@@ -87,9 +87,9 @@ def _forward_impl(
     offsets: Tensor,
     per_sample_weights: Optional[Tensor] = None,
 ) -> Tensor:
-    assert self.weight_initialized, (
-        "weight needs to be initialized before forward function"
-    )
+    assert (
+        self.weight_initialized
+    ), "weight needs to be initialized before forward function"
 
     # indices, offsets, per_sample_weights = inputs_to_device(
     #     indices, offsets, per_sample_weights, self.bounds_check_warning
