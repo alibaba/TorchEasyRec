@@ -206,6 +206,10 @@ def _get_dataloader(
         collate_fn=lambda x: x,
         **kwargs,
     )
+    # For PyTorch versions 2.6 and above, we initialize the data iterator before
+    # beginning the training process to avoid potential CUDA-related issues following
+    # model saving.
+    iter(dataloader)
     return dataloader
 
 
