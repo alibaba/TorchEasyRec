@@ -885,7 +885,7 @@ def test_train_eval(
     config_util.save_message(pipeline_config, test_config_path)
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
@@ -902,7 +902,7 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
@@ -925,7 +925,7 @@ def test_export(
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
@@ -949,7 +949,7 @@ def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_feature_selection")
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=1 --log_dir {log_dir} "
         "-m tzrec.tools.feature_selection "
         f"--pipeline_config_path {pipeline_config_path} "
@@ -982,7 +982,7 @@ def test_predict(
     else:
         nproc_per_node = 2
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={nproc_per_node} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/predict.py "
         f"--scripted_model_path {scripted_model_path} "
@@ -1035,7 +1035,7 @@ def test_hitrate(
     """Run hitrate integration test."""
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
-        f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun --{_standalone()} "
+        f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "
@@ -1160,7 +1160,7 @@ def test_tdm_retrieval(
     """Run tdm retrieval test."""
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
@@ -1244,7 +1244,7 @@ def test_tdm_cluster_train_eval(
 
     log_dir = os.path.join(test_dir, "log_learnt_train_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun --{_standalone()} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path}"
