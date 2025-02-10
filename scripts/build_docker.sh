@@ -3,7 +3,6 @@
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 DOCKER_TAG=0.7
 
-cp requirements.txt docker/
 rm -rf docker/requirements
 cp -r requirements/ docker/requirements
 cd docker
