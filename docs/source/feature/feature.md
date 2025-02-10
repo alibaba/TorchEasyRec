@@ -402,8 +402,8 @@ feature_configs: {
 
   | 方式               | 描述                                          | 备注                           |
   | ------------------ | --------------------------------------------- | ------------------------------ |
-  | query_common_ratio | 计算query与title间重复term数占query中term比例 | 取值为\[0,1\]                  |
-  | title_common_ratio | 计算query与title间重复term数占title中term比例 | 取值为\[0,1\]                  |
+  | query_common_ratio | 计算query与title间重复term数占query中term比例 | 取值为[0,1]                    |
+  | title_common_ratio | 计算query与title间重复term数占title中term比例 | 取值为[0,1]                    |
   | is_contain         | 计算query是否全部包含在title中，保持顺序      | 0表示未包含，1表示包含         |
   | is_equal           | 计算query是否与title完全相同                  | 0表示不完全相同，1表示完全相同 |
 

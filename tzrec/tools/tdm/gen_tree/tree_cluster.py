@@ -163,6 +163,7 @@ class TreeCluster:
         root = builder.build(self.leaf_nodes, save_tree)
         return root
 
+    # pyre-ignore [24]
     def _train(self, pipe: Connection, queue: mp.Queue) -> None:
         last_size = -1
         catch_time = 0

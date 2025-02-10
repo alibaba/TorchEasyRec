@@ -29,6 +29,14 @@ IGNORE_PATTERNS = [
     "Undefined attribute [16]: Module `pyarrow` has no attribute",
     "Undefined attribute [16]: Module `pyarrow.compute` has no attribute",
     "Undefined attribute [16]: Module `pyarrow.csv` has no attribute",
+    # type-safety of torch.nn.Module instances
+    # https://github.com/pytorch/pytorch/issues/81462
+    # Call error [29]: `typing.Union[nn.modules.module.Module, torch._tensor.Tensor]` is
+    # not a function.
+    "Union[nn.modules.module.Module, torch._tensor.Tensor]",
+    "Union[torch._tensor.Tensor, torch.nn.modules.module.Module]",
+    "Union[torch._tensor.Tensor, nn.modules.module.Module]",
+    "Union[Module, Tensor]",
 ]
 
 if __name__ == "__main__":

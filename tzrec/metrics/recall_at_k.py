@@ -43,9 +43,12 @@ class RecallAtK(Metric):
         """
         pred_idx = torch.argsort(preds, dim=-1, descending=True)[..., : self.top_k]
         true_pos = torch.gather(target, -1, pred_idx)
+        # pyre-ignore [16, 29]
         self.num_true_pos += torch.sum(true_pos)
+        # pyre-ignore [16, 29]
         self.num_total += torch.sum(target)
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
+        # pyre-ignore [29]
         return self.num_true_pos / self.num_total

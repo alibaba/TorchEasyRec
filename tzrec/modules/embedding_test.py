@@ -192,10 +192,17 @@ class EmbeddingGroupTest(unittest.TestCase):
         os.environ.pop("INPUT_TILE", None)
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.JIT_SCRIPT, False],
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+            [TestGraphType.JIT_SCRIPT, True],
+        ]
     )
-    def test_embedding_group_impl(self, graph_type) -> None:
-        features = _create_test_features()
+    def test_embedding_group_impl(self, graph_type, has_zch=False) -> None:
+        features = _create_test_features(has_zch=has_zch)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="wide",
@@ -223,6 +230,8 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertDictEqual(
             embedding_group.group_feature_dims("deep"), deep_feature_dims
         )
+        if has_zch and graph_type != TestGraphType.NORMAL:
+            embedding_group.eval()
         embedding_group = create_test_module(embedding_group, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
@@ -240,48 +249,6 @@ class EmbeddingGroupTest(unittest.TestCase):
         )
 
         self.assertEqual(result["wide"].size(), (2, 8))
-        self.assertEqual(result["deep"].size(), (2, 25))
-
-    @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
-    )
-    def test_zch_embedding_group_impl(self, graph_type) -> None:
-        features = _create_test_features(has_zch=True)
-        # TODO(hongsheng.jhs) zch not support wide group now.
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["cat_a", "cat_b", "int_a"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-        ]
-        embedding_group = EmbeddingGroupImpl(
-            features, feature_groups, device=torch.device("cpu")
-        )
-        self.assertEqual(embedding_group.group_dims("deep"), [16, 8, 1])
-        self.assertEqual(embedding_group.group_total_dim("deep"), 25)
-        deep_feature_dims = OrderedDict({"cat_a": 16, "cat_b": 8, "int_a": 1})
-        self.assertDictEqual(
-            embedding_group.group_feature_dims("deep"), deep_feature_dims
-        )
-
-        if graph_type != TestGraphType.NORMAL:
-            embedding_group.eval()
-        embedding_group = create_test_module(embedding_group, graph_type)
-
-        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-            keys=["cat_a", "cat_b"],
-            values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
-            lengths=torch.tensor([1, 2, 1, 3]),
-        )
-        dense_feature = KeyedTensor.from_tensor_list(
-            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
-        )
-        result = embedding_group(
-            sparse_feature,
-            dense_feature,
-            EMPTY_KJT,
-        )
         self.assertEqual(result["deep"].size(), (2, 25))
 
     @parameterized.expand(

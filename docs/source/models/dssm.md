@@ -97,7 +97,7 @@ model_config {
         - input: 输入feature_group名
         - hidden_units: mlp每一层的channel数目，即神经元的数目
     - output_dim: user/item输出embedding维度
-    - similarity: 向量相似度函数，包括\[COSINE, INNER_PRODUCT\]，默认INNER_PRODUCT
+    - similarity: 向量相似度函数，包括[COSINE, INNER_PRODUCT]，默认INNER_PRODUCT
   - dssm_v2: 参数同dssm
     - dssm_v2可以支持user与item塔 跨塔share embedding，但训练速度相对dssm_v1稍慢
     - 注意如果使用dssm_v2，data_config.force_base_data_group需要设置为true
