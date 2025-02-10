@@ -42,9 +42,16 @@ ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
 ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
 ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
 
-ADD requirements.txt /root/requirements.txt
 ADD requirements /root/requirements
-RUN cd /root && pip install -r requirements.txt && rm requirements.txt
+RUN cd /root && \
+    pip install -r requirements/runtime.txt && \
+    pip install -r requirements/test.txt && \
+    pip install -r requirements/docs.txt && \
+    case ${DEVICE} in \
+        "cu124") pip install -r requirements/gpu.txt ;; \
+    esac && \
+    rm -rf requirements && \
+    /opt/conda/bin/conda clean -ya
 
 RUN mkdir -p /home/pai/bin && \
     wget -O /home/pai/bin/prepare_dlc_environment https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pai/prepare_dlc_environment.sh && \
