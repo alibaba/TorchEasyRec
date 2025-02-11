@@ -80,6 +80,41 @@ def _modify_pipline_config(
     pipeline_config.train_input_path = train_input_path
     eval_input_path = pipeline_config.eval_input_path.format(PROJECT=project)
     pipeline_config.eval_input_path = eval_input_path
+
+    if pipeline_config.data_config.HasField("negative_sampler"):
+        sampler = pipeline_config.data_config.negative_sampler
+        sampler.input_path = sampler.input_path.format(PROJECT=project)
+    elif pipeline_config.data_config.HasField("negative_sampler_v2"):
+        sampler = pipeline_config.data_config.negative_sampler_v2
+        sampler.user_input_path = sampler.user_input_path.format(PROJECT=project)
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.pos_edge_input_path = sampler.pos_edge_input_path.format(
+            PROJECT=project
+        )
+    elif pipeline_config.data_config.HasField("hard_negative_sampler"):
+        sampler = pipeline_config.data_config.hard_negative_sampler
+        sampler.user_input_path = sampler.user_input_path.format(PROJECT=project)
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.hard_neg_edge_input_path = sampler.hard_neg_edge_input_path.format(
+            PROJECT=project
+        )
+    elif pipeline_config.data_config.HasField("hard_negative_sampler_v2"):
+        sampler = pipeline_config.data_config.hard_negative_sampler_v2
+        sampler.user_input_path = sampler.user_input_path.format(PROJECT=project)
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.pos_edge_input_path = sampler.pos_edge_input_path.format(
+            PROJECT=project
+        )
+        sampler.hard_neg_edge_input_path = sampler.hard_neg_edge_input_path.format(
+            PROJECT=project
+        )
+    elif pipeline_config.data_config.HasField("tdm_sampler"):
+        sampler = pipeline_config.data_config.tdm_sampler
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.edge_input_path = sampler.edge_input_path.format(PROJECT=project)
+        sampler.predict_edge_input_path = sampler.predict_edge_input_path.format(
+            PROJECT=project
+        )
     config_util.save_message(pipeline_config, run_config_path)
 
 
