@@ -68,7 +68,7 @@ def _create_test_features(has_zch=False):
     return features
 
 
-def _create_test_sequence_features(has_zch=False, has_mulval=False):
+def _create_test_sequence_features(has_zch=False, has_mulval=False, pooling_type=None):
     cat_a_kwargs = {}
     cat_b_kwargs = {}
     if has_zch:
@@ -83,6 +83,7 @@ def _create_test_sequence_features(has_zch=False, has_mulval=False):
         cat_b_kwargs["num_buckets"] = 1000
     if has_mulval:
         cat_a_kwargs["value_dim"] = 0
+        cat_a_kwargs["pooling"] = pooling_type
     feature_cfgs = [
         feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
@@ -253,21 +254,25 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, False, False],
-            [TestGraphType.FX_TRACE, False, False],
-            [TestGraphType.JIT_SCRIPT, False, False],
-            [TestGraphType.NORMAL, True, False],
-            [TestGraphType.FX_TRACE, True, False],
-            [TestGraphType.JIT_SCRIPT, True, False],
-            [TestGraphType.NORMAL, False, True],
-            [TestGraphType.FX_TRACE, False, True],
+            [TestGraphType.NORMAL, False, False, None],
+            [TestGraphType.FX_TRACE, False, False, None],
+            [TestGraphType.JIT_SCRIPT, False, False, None],
+            [TestGraphType.NORMAL, True, False, None],
+            [TestGraphType.FX_TRACE, True, False, None],
+            [TestGraphType.JIT_SCRIPT, True, False, None],
+            [TestGraphType.NORMAL, False, True, "sum"],
+            [TestGraphType.FX_TRACE, False, True, "sum"],
+            [TestGraphType.JIT_SCRIPT, False, True, "sum"],
+            [TestGraphType.NORMAL, False, True, "mean"],
+            [TestGraphType.FX_TRACE, False, True, "mean"],
             [TestGraphType.JIT_SCRIPT, False, True],
+            "mean",
         ]
     )
     def test_sequence_embedding_group_impl(
-        self, graph_type, has_zch=False, has_mulval=False
+        self, graph_type, has_zch=False, has_mulval=False, pooling_type=None
     ) -> None:
-        features = _create_test_sequence_features(has_zch, has_mulval)
+        features = _create_test_sequence_features(has_zch, has_mulval, pooling_type)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="click",
@@ -361,10 +366,10 @@ class EmbeddingGroupTest(unittest.TestCase):
 
         if has_mulval:
             values = torch.tensor(list(range(30)))
-            lengths = torch.tensor([1, 1, 1, 1, 4, 5, 3, 3, 3, 4, 2, 2])
+            lengths = torch.tensor([2, 0, 1, 1, 4, 5, 3, 3, 3, 4, 2, 2])
             sequence_mulval_lengths = KeyedJaggedTensor.from_lengths_sync(
                 keys=["click_seq__cat_a", "buy_seq__cat_a"],
-                values=torch.tensor([1, 1, 2, 1, 2, 2, 1, 2, 2, 2]),
+                values=torch.tensor([1, 0, 3, 1, 2, 2, 1, 2, 2, 2]),
                 lengths=torch.tensor([3, 3, 2, 2]),
             )
         else:
@@ -400,7 +405,9 @@ class EmbeddingGroupTest(unittest.TestCase):
             EMPTY_KJT,
         )
         self.assertEqual(result["click.query"].size(), (2, 25))
+        self.assertFalse(torch.any(torch.isnan(result["click.query"])).item())
         self.assertEqual(result["click.sequence"].size(), (2, 3, 25))
+        self.assertFalse(torch.any(torch.isnan(result["click.sequence"])).item())
         self.assertEqual(result["click.sequence_length"].size(), (2,))
         self.assertEqual(result["buy.query"].size(), (2, 17))
         self.assertEqual(result["buy.sequence"].size(), (2, 2, 17))
