@@ -222,6 +222,7 @@ class BaseSampler(metaclass=_meta_cls):
         if len(self._ignore_attr_names) > 0:
             logger.warning(
                 f"Features {self._ignore_attr_names} in "
+                # pyre-ignore [16]
                 f"{self.__class__.__name__} will be ignored."
             )
 
