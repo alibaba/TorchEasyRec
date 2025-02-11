@@ -100,6 +100,8 @@ if __name__ == "__main__":
             feature.pop("vocab_list")
             feature.pop("boundaries")
             feature.pop("num_buckets")
+            if feature["feature_type"] != "tokenize_feature":
+                feature.pop("vocab_file")
 
     if args.reserves is not None:
         reserves = []
