@@ -265,8 +265,7 @@ class EmbeddingGroupTest(unittest.TestCase):
             [TestGraphType.JIT_SCRIPT, False, True, "sum"],
             [TestGraphType.NORMAL, False, True, "mean"],
             [TestGraphType.FX_TRACE, False, True, "mean"],
-            [TestGraphType.JIT_SCRIPT, False, True],
-            "mean",
+            [TestGraphType.JIT_SCRIPT, False, True, "mean"],
         ]
     )
     def test_sequence_embedding_group_impl(
