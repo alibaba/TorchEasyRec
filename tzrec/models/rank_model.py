@@ -122,9 +122,9 @@ class RankModel(BaseModel):
             predictions["logits" + suffix] = output
             predictions["probs" + suffix] = torch.sigmoid(output)
         elif loss_type == "softmax_cross_entropy":
-            assert (
-                num_class > 1
-            ), f"num_class must be greater than 1 when loss type is {loss_type}"
+            assert num_class > 1, (
+                f"num_class must be greater than 1 when loss type is {loss_type}"
+            )
             probs = torch.softmax(output, dim=1)
             predictions["logits" + suffix] = output
             predictions["probs" + suffix] = probs
@@ -252,9 +252,9 @@ class RankModel(BaseModel):
         metric_kwargs = config_to_kwargs(oneof_metric_cfg)
         metric_name = metric_type + suffix
         if metric_type == "auc":
-            assert (
-                num_class <= 2
-            ), f"num_class must less than 2 when metric type is {metric_type}"
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
             self._metric_modules[metric_name] = torchmetrics.AUROC(
                 task="binary", **metric_kwargs
             )
@@ -269,9 +269,9 @@ class RankModel(BaseModel):
         elif metric_type == "accuracy":
             pass
         elif metric_type == "grouped_auc":
-            assert (
-                num_class <= 2
-            ), f"num_class must less than 2 when metric type is {metric_type}"
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
             self._metric_modules[metric_name] = GroupedAUC()
         else:
             raise ValueError(f"{metric_type} is not supported for this model")

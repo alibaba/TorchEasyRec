@@ -40,6 +40,6 @@ class ProgressLogger:
             cur_time = time.time()
             dt = cur_time - self._last_time
             if dt > self._mininterval:
-                logger.info(f"{self._desc}: {n}it [{dn/dt:.2f}it/s] {suffix}")
+                logger.info(f"{self._desc}: {n}it [{dn / dt:.2f}it/s] {suffix}")
                 self._last_time = cur_time
                 self._last_n = n

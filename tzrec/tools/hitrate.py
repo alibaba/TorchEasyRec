@@ -92,13 +92,13 @@ if __name__ == "__main__":
         help="Path to item embedding table with columns [item_id, item_tower_emb]",
     )
     parser.add_argument(
-        "--total_hitrate_output" "",
+        "--total_hitrate_output",
         type=str,
         default=None,
         help="Path to hitrate table with columns [hitrate]",
     )
     parser.add_argument(
-        "--hitrate_details_output" "",
+        "--hitrate_details_output",
         type=str,
         default=None,
         help="Path to hitrate detail table with columns [id, topk_ids, "
