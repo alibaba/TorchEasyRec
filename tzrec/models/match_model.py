@@ -207,17 +207,17 @@ class MatchModel(BaseModel):
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        assert (
-            loss_type == "softmax_cross_entropy"
-        ), "match model only support softmax_cross_entropy loss now."
+        assert loss_type == "softmax_cross_entropy", (
+            "match model only support softmax_cross_entropy loss now."
+        )
         reduction = "none" if self._sample_weight else "mean"
         self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
-        assert (
-            len(self._base_model_config.losses) == 1
-        ), "match model only support single loss now."
+        assert len(self._base_model_config.losses) == 1, (
+            "match model only support single loss now."
+        )
         for loss_cfg in self._base_model_config.losses:
             self._init_loss_impl(loss_cfg)
 
@@ -239,9 +239,9 @@ class MatchModel(BaseModel):
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        assert (
-            loss_type == "softmax_cross_entropy"
-        ), "match model only support softmax_cross_entropy loss now."
+        assert loss_type == "softmax_cross_entropy", (
+            "match model only support softmax_cross_entropy loss now."
+        )
 
         pred = predictions["similarity" + suffix]
         if self._in_batch_negative:

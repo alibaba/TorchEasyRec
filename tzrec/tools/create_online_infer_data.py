@@ -41,9 +41,9 @@ if __name__ == "__main__":
 
     args, extra_args = parser.parse_known_args()
     if args.item_id is None:
-        assert (
-            args.batch_size == 1
-        ), "embedding online predict only support batch_size=1"
+        assert args.batch_size == 1, (
+            "embedding online predict only support batch_size=1"
+        )
 
     data_dir = os.path.join(args.scripted_model_path, "debug_data")
     result_dir = os.path.join(args.scripted_model_path, "debug_result")

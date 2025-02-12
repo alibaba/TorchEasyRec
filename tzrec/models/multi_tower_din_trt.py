@@ -31,7 +31,7 @@ def _get_dict(
 ) -> Dict[str, torch.Tensor]:
     if len(grouped_features_keys) != len(args):
         raise ValueError(
-            "The number of grouped_features_keys must match " "the number of arguments."
+            "The number of grouped_features_keys must match the number of arguments."
         )
     grouped_features = {key: value for key, value in zip(grouped_features_keys, args)}
     return grouped_features

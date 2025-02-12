@@ -846,9 +846,9 @@ def load_config_for_test(
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
-            assert (
-                sampler_type == "negative_sampler"
-            ), "now only negative_sampler supported."
+            assert sampler_type == "negative_sampler", (
+                "now only negative_sampler supported."
+            )
             sampler_config.input_path = item_gl_path
 
     data_config.dataset_type = data_pb2.ParquetDataset

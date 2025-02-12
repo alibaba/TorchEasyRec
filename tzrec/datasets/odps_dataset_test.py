@@ -167,7 +167,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 odps_data_quota_name="",
             ),
             features=features,
-            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320',
+            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         self.assertEqual(len(dataset.input_fields), 9)
         self.assertEqual(
@@ -236,14 +236,14 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1',
+                    input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",
                 ),
             ),
             features=features,
-            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320',
+            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -313,7 +313,7 @@ class OdpsWriterTest(unittest.TestCase):
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
             writer = OdpsWriter(
-                f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}',
+                f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
             )
             for _ in range(5):
