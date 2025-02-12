@@ -19,7 +19,6 @@ from torch import distributed as dist
 from torch import nn
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.planner import EmbeddingShardingPlanner
-from torchrec.distributed.planner.proposers import UniformProposer
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
@@ -78,7 +77,7 @@ def create_planner(device: torch.device, batch_size: int) -> EmbeddingShardingPl
         topology=topology,
         batch_size=batch_size,
         storage_reservation=storage_reservation,
-        proposer=[DynamicProgrammingProposer(), UniformProposer()],
+        proposer=[DynamicProgrammingProposer()],  # UniformProposer()],
         debug=True,
     )
     return planner
@@ -168,6 +167,9 @@ class DynamicProgrammingProposer(Proposer):
             fqn = sharding_option.fqn
             if fqn not in self._sharding_options_by_fqn:
                 self._sharding_options_by_fqn[fqn] = []
+            if sharding_option.sharding_type != "row_wise":
+                # if sharding_option.sharding_type != "data_parallel":
+                continue
             self._sharding_options_by_fqn[fqn].append(sharding_option)
 
     def _reset(self) -> None:
