@@ -155,4 +155,5 @@ def _create_mean_pooling_divisor(
         return divisor.detach()
 
 
+# pyre-ignore [9]
 embeddingbag._create_mean_pooling_divisor = _create_mean_pooling_divisor
