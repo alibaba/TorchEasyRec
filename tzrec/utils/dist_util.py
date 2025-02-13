@@ -83,7 +83,8 @@ def gather_strings(s: str, dst: int = 0) -> List[str]:
     return gathered_strings
 
 
-# lengths of kjt will be modified by create_mean_pooling_divisor, we fit it temporarily.
+# lengths of kjt will be modified by create_mean_pooling_divisor, we fix it
+# with lengths = lengths.clone() temporarily.
 def _create_mean_pooling_divisor(
     lengths: torch.Tensor,
     keys: List[str],
