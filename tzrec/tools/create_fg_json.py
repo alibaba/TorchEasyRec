@@ -129,7 +129,7 @@ if __name__ == "__main__":
                 if args.force_update_resource:
                     o.delete_resource(fname)
                     logger.info(
-                        f"{fname} has already existed, " f"will update this resource !"
+                        f"{fname} has already existed, will update this resource !"
                     )
                     resource = o.create_resource(
                         fname, "file", file_obj=open(fpath, "rb")
