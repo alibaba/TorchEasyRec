@@ -317,9 +317,9 @@ class OdpsDataset(BaseDataset):
         **kwargs: Any,
     ) -> None:
         if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert (
-                dist.is_initialized()
-            ), "You should initialize distribute group first."
+            assert dist.is_initialized(), (
+                "You should initialize distribute group first."
+            )
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
         self._reader = OdpsReader(
@@ -469,9 +469,9 @@ class OdpsWriter(BaseWriter):
         self, output_path: str, quota_name: str = "pay-as-you-go", **kwargs: Any
     ) -> None:
         if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert (
-                dist.is_initialized()
-            ), "You should initialize distribute group first."
+            assert dist.is_initialized(), (
+                "You should initialize distribute group first."
+            )
         super().__init__(output_path)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name

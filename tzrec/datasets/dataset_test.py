@@ -151,7 +151,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -309,7 +309,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -437,7 +437,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(node)
         node.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(63):
-            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:{i*2}\n")
+            node.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:{i * 2}\n")
         node.flush()
 
         def _ancestor(code):

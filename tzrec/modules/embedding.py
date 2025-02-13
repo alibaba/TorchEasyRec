@@ -1123,6 +1123,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                         query_t = torch.segment_reduce(
                             query_jt.values(), pooling, lengths=query_jt.lengths()
                         )
+                        if pooling == "mean":
+                            query_t = torch.nan_to_num(query_t, nan=0.0)
                     if is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
                 else:
@@ -1160,10 +1162,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     length_jt = seq_mulval_length_jt_dict[raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
+                    jt_values = torch.segment_reduce(
+                        jt.values(), pooling, lengths=length_jt.values()
+                    )
+                    if pooling == "mean":
+                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
                     jt = JaggedTensor(
-                        values=torch.segment_reduce(
-                            jt.values(), pooling, lengths=length_jt.values()
-                        ),
+                        values=jt_values,
                         lengths=length_jt.lengths(),
                     )
                 if i == 0:

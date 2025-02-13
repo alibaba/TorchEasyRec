@@ -47,7 +47,7 @@ class SamplerTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:我们{i}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:我们{i}\n")
         f.flush()
         return f
 
@@ -74,7 +74,7 @@ class SamplerTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("userid:int64\titemid:int64\tweight:float\n")
         for i in range(100):
-            f.write(f"{i}\t{99-i}\t{1}\n")
+            f.write(f"{i}\t{99 - i}\t{1}\n")
         f.flush()
         return f
 
@@ -83,7 +83,7 @@ class SamplerTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(63):
-            f.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:我们{i}\n")
+            f.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:我们{i}\n")
         f.flush()
         return f
 
