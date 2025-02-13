@@ -123,17 +123,17 @@ if __name__ == "__main__":
             project=project,
             endpoint=odps_endpoint,
         )
-        if o.exist_resource(fg_resource_name):
-            if args.force_update_resource:
-                o.delete_resource(fg_resource_name)
-                logger.info(
-                    f"{fg_resource_name} has already existed, "
-                    f"will update this resource !"
-                )
-                resource = o.create_resource(
-                    fg_resource_name, "file", file_obj=open(fg_path, "r")
-                )
-        else:
-            resource = o.create_resource(
-                fg_resource_name, "file", file_obj=open(fg_path, "r")
-            )
+        for fname in os.listdir(args.fg_output_dir):
+            fpath = os.path.join(args.fg_output_dir, fname)
+            if o.exist_resource(fname):
+                if args.force_update_resource:
+                    o.delete_resource(fname)
+                    logger.info(
+                        f"{fname} has already existed, " f"will update this resource !"
+                    )
+                    resource = o.create_resource(
+                        fname, "file", file_obj=open(fpath, "rb")
+                    )
+            else:
+                logger.info(f"uploading resource [{fname}].")
+                resource = o.create_resource(fname, "file", file_obj=open(fpath, "rb"))

@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import shutil
 from collections import OrderedDict
@@ -780,7 +781,10 @@ def _copy_assets(
         feature = copy(feature)
         feature.feature_config = feature_config
         for k, v in feature.assets().items():
-            fname = f"{feature.name}_{os.path.basename(v)}"
+            with open(v, "rb") as f:
+                fhash = hashlib.md5(f.read()).hexdigest()
+            fprefix, fext = os.path.splitext(os.path.basename(v))
+            fname = f"{fprefix}_{fhash}{fext}"
             fpath = os.path.join(asset_dir, fname)
             if not os.path.exists(fpath):
                 shutil.copy(v, fpath)
