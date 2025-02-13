@@ -46,9 +46,6 @@ def run_cmd(cmd_str, log_file, env=None, timeout=None):
                 run_cmd_str, stdout=lfile, stderr=subprocess.STDOUT, shell=True, env=env
             )
         proc.wait(timeout)
-        import pdb
-
-        pdb.set_trace()
         if proc.returncode == 0:
             return True
         else:
