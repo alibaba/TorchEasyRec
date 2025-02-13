@@ -160,7 +160,10 @@ class MatchIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(
             os.path.exists(
-                os.path.join(self.test_dir, "fg_output/item_title_tokenizer.json")
+                os.path.join(
+                    self.test_dir,
+                    "fg_output/tokenizer_b2faab7921bbfb593973632993ca4c85.json",
+                )
             )
         )
 

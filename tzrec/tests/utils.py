@@ -824,11 +824,8 @@ def load_config_for_test(
                 f"--node_edge_output_file {test_dir}/init_tree "
                 f"--tree_output_dir {test_dir}/init_tree "
             )
-            assert (
-                misc_util.run_cmd(
-                    cmd_str, os.path.join(test_dir, "log_init_tree.txt"), timeout=600
-                )
-                == 0
+            assert misc_util.run_cmd(
+                cmd_str, os.path.join(test_dir, "log_init_tree.txt"), timeout=600
             )
 
             sampler_config.item_input_path = os.path.join(
@@ -1206,11 +1203,8 @@ def test_tdm_cluster_train_eval(
         f"--tree_output_dir {os.path.join(test_dir, 'learnt_tree')} "
         f"--parallel 1 "
     )
-    assert (
-        misc_util.run_cmd(
-            cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt"), timeout=600
-        )
-        == 0
+    assert misc_util.run_cmd(
+        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt"), timeout=600
     )
 
     sampler_config.item_input_path = os.path.join(
