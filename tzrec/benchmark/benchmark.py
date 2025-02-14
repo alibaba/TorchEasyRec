@@ -129,11 +129,7 @@ def _benchmark_train_eval(
         f"--log_dir {log_path} -r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {run_config_path}"
     )
-    p = misc_util.run_cmd(cmd_str, log_path + ".log")
-    p.wait(6000)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(cmd_str, log_path + ".log", timeout=6000)
 
 
 def _get_config_paths(pipeline_config_paths: str) -> List[str]:
