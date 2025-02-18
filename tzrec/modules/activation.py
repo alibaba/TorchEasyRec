@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -27,7 +27,7 @@ class Dice(nn.Module):
         dim: input dims.
     """
 
-    def __init__(self, hidden_size: int, dim: int = 2):
+    def __init__(self, hidden_size: int, dim: int = 2) -> None:
         super().__init__()
         assert dim in [2, 3]
         self.bn = nn.BatchNorm1d(hidden_size)
@@ -43,7 +43,7 @@ class Dice(nn.Module):
         if self.dim == 2:
             x_p = F.sigmoid(self.bn(x))
             out = self.alpha * (1 - x_p) * x + x_p * x
-        elif self.dim == 3:
+        else:
             x = x.transpose(1, 2)
             x_p = F.sigmoid(self.bn(x))
             out = self.alpha.unsqueeze(1) * (1 - x_p) * x + x_p * x
@@ -51,10 +51,11 @@ class Dice(nn.Module):
         return out
 
 
-def create_activation(act_str: str = "nn.ReLU", **kwargs) -> Optional[nn.Module]:
+def create_activation(act_str: str = "nn.ReLU", **kwargs: Any) -> Optional[nn.Module]:
     """Create activation module."""
     act_str = act_str.strip()
 
+    act_module = None
     if act_str == "Dice":
         assert "hidden_size" in kwargs and "dim" in kwargs, (
             "Dice activation method need hidden_size and dim params."
@@ -66,9 +67,7 @@ def create_activation(act_str: str = "nn.ReLU", **kwargs) -> Optional[nn.Module]
         act_strs = act_str.strip(")").split("(", 1)
 
         act_class = load_by_path(act_strs[0])
-
         if act_class is None:
-            act_module = None
             logger.error(f"Unknown activation [{act_str}]")
         else:
             act_params = {}
