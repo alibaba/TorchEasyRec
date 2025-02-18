@@ -14,13 +14,8 @@ from typing import List, Optional, Union
 import torch
 from torch import nn
 
-from tzrec.utils.load_class import load_by_path
-
-
-@torch.fx.wrap
-def _check_perceptron_input_dim(input: torch.Tensor, use_bn: bool) -> None:
-    if input.dim() != 2 and use_bn:
-        raise ValueError(f"expected 2D input when use_bn (got {input.dim()}D input)")
+from tzrec.modules.activation import create_activation
+from tzrec.modules.utils import Transpose
 
 
 class Perceptron(nn.Module):
@@ -34,6 +29,7 @@ class Perceptron(nn.Module):
             Default: torch.nn.Relu.
         use_bn (bool): use batch_norm or not.
         dropout_ratio (float): dropout ratio of the layer.
+        dim (int): input dims.
     """
 
     def __init__(
@@ -43,6 +39,7 @@ class Perceptron(nn.Module):
         activation: Optional[str] = "nn.ReLU",
         use_bn: bool = False,
         dropout_ratio: float = 0.0,
+        dim: int = 2,
     ) -> None:
         super().__init__()
         self.activation = activation
@@ -53,11 +50,18 @@ class Perceptron(nn.Module):
             nn.Linear(in_features, out_features, bias=False if use_bn else True)
         )
         if use_bn:
+            assert dim in [2, 3]
+            if dim == 3:
+                self.perceptron.append(Transpose(1, 2))
             self.perceptron.append(nn.BatchNorm1d(out_features))
+            if dim == 3:
+                self.perceptron.append(Transpose(1, 2))
         if activation and len(activation) > 0:
-            act_module = load_by_path(activation)
+            act_module = create_activation(
+                activation, hidden_size=out_features, dim=dim
+            )
             if act_module:
-                self.perceptron.append(act_module())
+                self.perceptron.append(act_module)
             else:
                 raise ValueError(f"Unknown activation method: {activation}")
         if dropout_ratio > 0.0:
@@ -65,7 +69,6 @@ class Perceptron(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Forward the module."""
-        _check_perceptron_input_dim(input, self.use_bn)
         return self.perceptron(input)
 
 
@@ -81,6 +84,7 @@ class MLP(nn.Module):
             linear transformation. Default: torch.nn.ReLU.
         use_bn (bool): use batch_norm or not.
         dropout_ratio (float|list, optional): dropout ratio of each layer.
+        dim (int): input dims.
     """
 
     def __init__(
@@ -90,6 +94,7 @@ class MLP(nn.Module):
         activation: Optional[str] = "nn.ReLU",
         use_bn: bool = False,
         dropout_ratio: Optional[Union[List[float], float]] = None,
+        dim: int = 2,
     ) -> None:
         super().__init__()
         self.hidden_units = hidden_units
@@ -120,6 +125,7 @@ class MLP(nn.Module):
                     activation=activation,
                     use_bn=use_bn,
                     dropout_ratio=dropout_ratio[i],
+                    dim=dim,
                 )
                 for i in range(len(hidden_units))
             ]
