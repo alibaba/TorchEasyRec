@@ -36,6 +36,7 @@ class Dice(nn.Module):
 
     def reset_parameters(self) -> None:
         """Initialize parameters."""
+        self.bn.reset_parameters()
         nn.init.zeros_(self.alpha)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
