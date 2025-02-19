@@ -32,7 +32,7 @@ class Dice(nn.Module):
         hidden_size: int,
         dim: int = 2,
         device: Optional[torch.device] = None,
-        dtype: Optional[torch.Type] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
