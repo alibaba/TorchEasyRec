@@ -27,16 +27,23 @@ class Dice(nn.Module):
         dim: input dims.
     """
 
-    def __init__(self, hidden_size: int, dim: int = 2) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        dim: int = 2,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.Type] = None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         assert dim in [2, 3]
-        self.bn = nn.BatchNorm1d(hidden_size)
-        self.alpha = nn.Parameter(torch.empty((hidden_size,)))
+        self.bn = nn.BatchNorm1d(hidden_size, affine=False)
+        self.alpha = nn.Parameter(torch.empty((hidden_size,), **factory_kwargs))
         self.dim = dim
+        self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Initialize parameters."""
-        self.bn.reset_parameters()
         nn.init.zeros_(self.alpha)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
