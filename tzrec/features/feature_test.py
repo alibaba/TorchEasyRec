@@ -308,7 +308,7 @@ class FeatureTest(unittest.TestCase):
         if with_asset_dir:
             self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
             asset_dir = self.test_dir
-            token_file = "token_g_tokenizer.json"
+            token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
         feature_cfgs = self._create_test_feature_cfgs()
         features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
         fg_json = feature_lib.create_fg_json(features, asset_dir=asset_dir)
@@ -445,7 +445,7 @@ class FeatureTest(unittest.TestCase):
         if with_asset_dir:
             self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
             asset_dir = self.test_dir
-            token_file = "token_g_tokenizer.json"
+            token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
 
         again_feature_cfgs = feature_lib.create_feature_configs(
             features, asset_dir=asset_dir

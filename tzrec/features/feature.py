@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import shutil
 from collections import OrderedDict
@@ -120,9 +121,9 @@ def _parse_fg_encoded_sparse_feature_impl(
             weight_values = weight.values.to_numpy()
             weight_offsets = weight.offsets.to_numpy()
             weight_lengths = weight_offsets[1:] - weight_offsets[:-1]
-            assert np.all(
-                feat_lengths == weight_lengths
-            ), f"{name}__values and {name}__weights length not equal"
+            assert np.all(feat_lengths == weight_lengths), (
+                f"{name}__values and {name}__weights length not equal"
+            )
     elif pa.types.is_integer(feat.type):
         # dtype = int
         if default_value is not None:
@@ -133,9 +134,9 @@ def _parse_fg_encoded_sparse_feature_impl(
                 weight = weight.fill_null(float(1.0))
                 weight_values = weight.cast(pa.float32(), safe=False).to_numpy()
                 weight_lengths = np.ones_like(weight_values, np.int32)
-                assert np.all(
-                    feat_lengths == weight_lengths
-                ), f"{name}__values and {name}__weights length not equal"
+                assert np.all(feat_lengths == weight_lengths), (
+                    f"{name}__values and {name}__weights length not equal"
+                )
         else:
             feat_values = feat.drop_null().cast(pa.int64()).to_numpy()
             feat_lengths = 1 - feat.is_null().cast(pa.int32()).to_numpy()
@@ -144,9 +145,9 @@ def _parse_fg_encoded_sparse_feature_impl(
                     weight.drop_null().cast(pa.float32(), safe=False).to_numpy()
                 )
                 weight_lengths = 1 - weight.is_null().cast(pa.int32()).to_numpy()
-                assert np.all(
-                    feat_lengths == weight_lengths
-                ), f"{name}__values and {name}__weights length not equal"
+                assert np.all(feat_lengths == weight_lengths), (
+                    f"{name}__values and {name}__weights length not equal"
+                )
     else:
         raise ValueError(
             f"{name} only support str|int|list<int> dtype input, but get {feat.type}."
@@ -780,7 +781,10 @@ def _copy_assets(
         feature = copy(feature)
         feature.feature_config = feature_config
         for k, v in feature.assets().items():
-            fname = f"{feature.name}_{os.path.basename(v)}"
+            with open(v, "rb") as f:
+                fhash = hashlib.md5(f.read()).hexdigest()
+            fprefix, fext = os.path.splitext(os.path.basename(v))
+            fname = f"{fprefix}_{fhash}{fext}"
             fpath = os.path.join(asset_dir, fname)
             if not os.path.exists(fpath):
                 shutil.copy(v, fpath)

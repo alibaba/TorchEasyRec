@@ -12,6 +12,25 @@
 from typing import Optional
 
 import torch
+from torch import nn
+
+
+class Transpose(nn.Module):
+    """Transpose Module.
+
+    Args:
+        dim0 (int): the first dimension to be transposed.
+        dim1 (int): the second dimension to be transposed
+    """
+
+    def __init__(self, dim0: int, dim1: int) -> None:
+        super().__init__()
+        self.dim0 = dim0
+        self.dim1 = dim1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward the module."""
+        return x.transpose(self.dim0, self.dim1)
 
 
 def div_no_nan(

@@ -79,8 +79,7 @@ def _get_compatible_fg_mode(data_config: data_pb2.DataConfig) -> FgMode:
     """Compat for fg_encoded."""
     if data_config.HasField("fg_encoded"):
         logger.warning(
-            "data_config.fg_encoded will be deprecated, "
-            "please use data_config.fg_mode."
+            "data_config.fg_encoded will be deprecated, please use data_config.fg_mode."
         )
         if data_config.fg_encoded:
             fg_mode = FgMode.FG_NONE
