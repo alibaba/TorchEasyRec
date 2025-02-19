@@ -32,3 +32,11 @@ message  VariationalDropout{
     // variational_dropout dimension
     optional bool embedding_wise_variational_dropout = 2 [default = false];
 }
+
+
+message B2ICapsule{
+    required uint32 max_k = 1;
+    required uint32 max_seq_len = 2;
+    required uint32 high_dim = 3;
+    required float squash_pow = 4;
+}

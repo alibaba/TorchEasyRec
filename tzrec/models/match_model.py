@@ -60,7 +60,12 @@ class MatchTower(nn.Module):
 
     def __init__(
         self,
-        tower_config: Union[tower_pb2.Tower, tower_pb2.DATTower],
+        tower_config: Union[
+            tower_pb2.Tower,
+            tower_pb2.DATTower,
+            tower_pb2.MINDUserTower,
+            tower_pb2.MINDItemTower,
+        ],
         output_dim: int,
         similarity: match_model_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
