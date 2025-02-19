@@ -1158,7 +1158,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 jt = (
                     sparse_jt_dict[name] if is_sparse else sequence_dense_features[name]
                 )
-                if value_dim != 1:
+                if is_sparse and value_dim != 1:
                     length_jt = seq_mulval_length_jt_dict[raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
