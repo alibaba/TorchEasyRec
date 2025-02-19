@@ -38,6 +38,7 @@ class Dice(nn.Module):
         super().__init__()
         assert dim in [2, 3]
         self.bn = nn.BatchNorm1d(hidden_size, affine=False)
+        # pyre-ignore [6]
         self.alpha = nn.Parameter(torch.empty((hidden_size,), **factory_kwargs))
         self.dim = dim
         self.reset_parameters()
