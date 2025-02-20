@@ -76,7 +76,7 @@ message DAT {
 message MIND {
     required MINDUserTower user_tower = 1;
     required Tower item_tower = 2;
-    optional MLP concat_mlp = 3;
+
     required int32 simi_pow = 4;
     optional Similarity similarity = 5 [default=COSINE];
     optional bool in_batch_negative = 6 [default = false];

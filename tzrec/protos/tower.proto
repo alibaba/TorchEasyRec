@@ -139,6 +139,8 @@ message MINDUserTower {
 
     // capsule config
     required B2ICapsule capsule_config = 6;
+    // concat mlp config for user interests vector
+    required MLP concat_mlp = 7;
 }
 
 

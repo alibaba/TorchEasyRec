@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from torch._tensor import Tensor
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -63,7 +64,16 @@ class MINDUserTower(MatchTower):
                 hist_feature_in, **config_to_kwargs(tower_config.hist_seq_mlp)
             )
 
-        self._capsule_layer = CapsuleLayer()
+        self._capsule_layer = CapsuleLayer(
+            tower_config.capsule_config,
+            hist_feature_in,
+            model_config.is_training,
+        )
+        self._concat_mlp = MLP(
+            tower_config.user_mlp.hidden_units[-1]
+            + tower_config.capsule_config.high_dim,
+            **config_to_kwargs(tower_config.concat_mlp),
+        )
 
     def init_input(self) -> None:
         """Initialize input."""
@@ -96,6 +106,7 @@ class MINDUserTower(MatchTower):
             user_feature, [1, high_capsules.shape[1]]
         )  # todo
         user_interests = torch.cat([user_feature_tile, high_capsules], dim=-1)
+        user_interests = self._concat_mlp(user_interests)
 
         if self._similarity == match_model_pb2.Similarity.COSINE:
             user_interests = F.normalize(user_interests, p=2.0, dim=1)
@@ -122,10 +133,18 @@ class MINDItemTower(MatchTower):
             item_features,
             model_config,
         )
+        self.init_input()
+        tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
+        self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower."""
-        pass
+        grouped_features = self.build_input(batch)
+        output = self.mlp(grouped_features[self._group_name])
+
+        if self._similarity == match_model_pb2.Similarity.COSINE:
+            output = F.normalize(output, p=2.0, dim=1)
+        return output
 
 
 class MIND(MatchModel):
@@ -141,18 +160,25 @@ class MIND(MatchModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
-        # user_group = name_to_feature_group[self._model_config.user_tower.input]
+        user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
-        # hist_group = name_to_feature_group[
-        #     self._model_config.user_tower.history_input
-        # ]
+        hist_group = name_to_feature_group[self._model_config.user_tower.history_input]
 
         name_to_feature = {x.name: x for x in features}
-        # user_features = [name_to_feature[x] for x in user_group.feature_names]
+        user_features = [name_to_feature[x] for x in user_group.feature_names]
         item_features = [name_to_feature[x] for x in item_group.feature_names]
-        # hist_features = [name_to_feature[x] for x in hist_group.feature_names]
+        hist_features = [name_to_feature[x] for x in hist_group.feature_names]
 
-        self.user_tower = MINDUserTower(self._model_config.user_tower)
+        self.user_tower = MINDUserTower(
+            self._model_config.user_tower,
+            self._model_config.output_dim,
+            self._model_config.similarity,
+            user_group,
+            hist_group,
+            user_features,
+            hist_features,
+            model_config,
+        )
         self.item_tower = MINDItemTower(
             self._model_config.item_tower,
             self._model_config.output_dim,
@@ -162,6 +188,30 @@ class MIND(MatchModel):
             model_config,
         )
 
-    def forward(self, batch: Batch) -> torch.Tensor:
+    def predict(self, batch: Batch) -> Dict[str, Tensor]:
         """Forward the model."""
-        pass
+        user_interests = self.user_tower(batch)
+        item_emb = self.item_tower(batch)
+
+        user_emb = self.label_aware_attention(user_interests, item_emb)
+        ui_sim = self.sim(user_emb, user_emb)
+        return {"similarity": ui_sim}
+
+    def label_aware_attention(
+        self,
+        user_interests: torch.Tensor,
+        item_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute label-aware attention for user interests."""
+        batch_size = user_interests.size(0)
+        pos_item_emb = item_emb[:batch_size]
+
+        simi_pow = self._model_config.simi_pow
+        interest_weight = torch.einsum("bkd, bd->bk", user_interests, pos_item_emb)
+        interest_weight = interest_weight.unsqueeze(-1)
+        interest_weight = torch.nn.functional.softmax(
+            torch.pow(interest_weight, simi_pow), dim=1
+        )
+
+        user_emb = torch.sum(torch.multiply(interest_weight, user_interests), dim=1)
+        return user_emb

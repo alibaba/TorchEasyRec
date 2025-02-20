@@ -36,18 +36,18 @@ class CapsuleLayer(nn.Module):
         # squash power
         self._squash_pow = capsule_config.squash_pow
         # scale ratio
-        self._scale_ratio = capsule_config.scale_ratio
-        self._const_caps_num = capsule_config.const_caps_num
+        # self._scale_ratio = capsule_config.scale_ratio
+        # self._const_caps_num = capsule_config.const_caps_num
         self._is_training = is_training
 
         self.bilinear_matrix = nn.Parameter(
-            torch.randn(self._low_dim, self._high_dim), dtype=torch.float32
+            torch.randn(self._low_dim, self._high_dim)
         )  # [ld, hd]
 
     def squash(self, inputs):  # double check
         """Squash inputs over the last dimension."""
         input_norm = torch.linalg.norm(inputs, dim=-1, keepdim=True)
-        input_norm_eps = torch.maximum(input_norm, 1e-7)
+        input_norm_eps = torch.max(input_norm, torch.tensor(1e-7))
         scale_factor = input_norm_eps**2 / ((1 + input_norm_eps**2) * input_norm_eps)
         return scale_factor * inputs
 
@@ -60,7 +60,7 @@ class CapsuleLayer(nn.Module):
         return:
             [batch_size, seq_len, high_dim]
         """
-        batch_size, seq_len, low_dim = inputs.size()
+        batch_size, seq_len, _ = inputs.size()
         routing_logits = torch.randn(
             batch_size, self._max_k, seq_len, dtype=torch.float32
         )
