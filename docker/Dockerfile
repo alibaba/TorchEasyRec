@@ -26,9 +26,15 @@ ENV PATH /opt/conda/bin:$PATH
 
 ARG DEVICE
 RUN case ${DEVICE} in \
+        "cu124") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+                 dpkg -i cuda-keyring_1.1-1_all.deb && \
+                 apt-get update && \
+                 apt-get install cuda-compat-12-4 && \
+                 rm -rf /var/lib/apt/lists/* && \
+                 ln -s /usr/local/cuda-12.4 /usr/local/cuda ;; \
+    esac
+RUN case ${DEVICE} in \
         "cu124") pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124 && \
-                 pip uninstall -y nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
-                 sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python3.11/site-packages/torch-2.6.0+cu124.dist-info/METADATA && \
                  pip install torchmetrics==1.0.3 torch_tensorrt==2.6.0 --extra-index-url https://download.pytorch.org/whl/cu124 && \
                  pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cu124 ;; \
         * )      pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cpu && \
@@ -39,8 +45,7 @@ RUN case ${DEVICE} in \
 
 ENV NVIDIA_VISIBLE_DEVICES all
 ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH /usr/local/cuda/compat
 
 ADD requirements /root/requirements
 RUN cd /root && \
