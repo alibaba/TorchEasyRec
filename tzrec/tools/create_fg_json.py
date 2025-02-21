@@ -57,8 +57,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--force_update_resource",
-        action="store_false",
-        default=True,
+        action="store_true",
+        default=False,
         help="if true will update fg.json.",
     )
     parser.add_argument(
