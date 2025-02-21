@@ -30,8 +30,7 @@ RUN case ${DEVICE} in \
                  dpkg -i cuda-keyring_1.1-1_all.deb && \
                  apt-get update && \
                  apt-get install cuda-compat-12-4 && \
-                 rm -rf /var/lib/apt/lists/* && \
-                 ln -s /usr/local/cuda-12.4 /usr/local/cuda ;; \
+                 rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
         "cu124") pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124 && \
@@ -45,7 +44,8 @@ RUN case ${DEVICE} in \
 
 ENV NVIDIA_VISIBLE_DEVICES all
 ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
-ENV LD_LIBRARY_PATH /usr/local/cuda/compat
+ARG LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 
 ADD requirements /root/requirements
 RUN cd /root && \
