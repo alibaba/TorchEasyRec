@@ -59,13 +59,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--force_update_resource",
-        type=bool,
-        default=True,
+        action="store_true",
+        default=False,
         help="if true will update fg.json.",
     )
     parser.add_argument(
         "--remove_bucketizer",
-        type=bool,
+        action="store_true",
         default=False,
         help="remove bucktizer params in fg json.",
     )
