@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -295,8 +296,24 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._sampler.init()
             self._sampler_inited = True
         worker_id, num_workers = self.get_worker_info()
+
+        shuffle_buffer = []
+        need_shuffle = self._data_config.shuffle and self._mode == Mode.TRAIN
         for input_data in self._reader.to_batches(worker_id, num_workers):
+            if need_shuffle:
+                shuffle_buffer.append(input_data)
+                if len(shuffle_buffer) < self._data_config.shuffle_buffer_size:
+                    continue
+                else:
+                    idx = random.randrange(len(shuffle_buffer))
+                    input_data = shuffle_buffer.pop(idx)
+
             yield self._build_batch(input_data)
+
+        if len(shuffle_buffer) > 0:
+            random.shuffle(shuffle_buffer)
+            for input_data in shuffle_buffer:
+                yield self._build_batch(input_data)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
         """Process input data and build batch.

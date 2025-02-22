@@ -106,6 +106,14 @@ message DataConfig {
     // sample weights
     repeated string sample_weight_fields = 19;
 
+    // whether to shuffle data
+    optional bool shuffle = 21 [default = false];
+
+    // shufffle buffer for better performance, even shuffle buffer is set,
+    // it is suggested to do full data shuffle before training
+    // especially when the performance of models is not good.
+    optional uint32 shuffle_buffer_size  = 22 [default = 32];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;

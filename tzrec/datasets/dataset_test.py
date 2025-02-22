@@ -97,7 +97,8 @@ class DatasetTest(unittest.TestCase):
         del utils.STATS_DICT
         utils.STATS_DICT = []
 
-    def test_dataset(self):
+    @parameterized.expand([[False], [True]])
+    def test_dataset(self, need_shuffle):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),
             pa.field(name="float_b", type=pa.float64()),
@@ -124,10 +125,12 @@ class DatasetTest(unittest.TestCase):
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
                     fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
+                    shuffle=need_shuffle,
                 ),
                 features=features,
                 input_path="",
                 input_fields=input_fields,
+                mode=Mode.TRAIN,
             ),
             batch_size=None,
             num_workers=2,
