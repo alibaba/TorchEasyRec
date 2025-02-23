@@ -65,7 +65,7 @@ class CapsuleLayer(nn.Module):
             torch.randn(self._low_dim, self._high_dim)
         )  # [ld, hd]
 
-    def squash(self, inputs):  # double check
+    def squash(self, inputs):
         """Squash inputs over the last dimension."""
         input_norm = torch.linalg.norm(inputs, dim=-1, keepdim=True)
         input_norm_eps = torch.max(input_norm, torch.tensor(1e-7))
