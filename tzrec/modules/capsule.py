@@ -13,10 +13,32 @@ import torch
 from torch import nn
 
 
+def sequence_mask(lengths, max_len=None, device=None):
+    """Create a boolean mask from sequence lengths.
+
+    Args:
+    lengths (Tensor): 1-D tensor containing actual sequence lengths.
+    max_len (int, optional): max length。If None, max_len is the maximum
+                            value in lengths.
+    device: device of the mask.
+
+    Returns:
+    mask (Tensor): boolean mask with shape [len(lengths), max_len],
+                   the first lengths[i] elements of i-th row are True,
+                   and the rest are False.
+    """
+    if max_len is None:
+        max_len = lengths.max()
+    mask = torch.arange(0, max_len, device=lengths.device).expand(
+        len(lengths), max_len
+    ) < lengths.unsqueeze(1)
+    return mask.to(device)
+
+
 class CapsuleLayer(nn.Module):
     """Capsule layer."""
 
-    def __init__(self, capsule_config, input_dim, is_training, *args, **kwargs) -> None:
+    def __init__(self, capsule_config, input_dim, *args, **kwargs) -> None:
         """Capsule layer."""
         super().__init__(*args, **kwargs)
         # max_seq_len: max behaviour sequence length(history length)
@@ -27,7 +49,7 @@ class CapsuleLayer(nn.Module):
         self._high_dim = capsule_config.high_dim
         # low_dim: low capsule vector dimension
         self._low_dim = input_dim
-        # number of Expectation-Maximization iterations
+        # number of dynamic routing iterations
         self._num_iters = capsule_config.num_iters
         # routing_logits_scale
         self._routing_logits_scale = capsule_config.routing_logits_scale
@@ -37,8 +59,7 @@ class CapsuleLayer(nn.Module):
         self._squash_pow = capsule_config.squash_pow
         # scale ratio
         # self._scale_ratio = capsule_config.scale_ratio
-        # self._const_caps_num = capsule_config.const_caps_num
-        self._is_training = is_training
+        self._const_caps_num = capsule_config.const_caps_num
 
         self.bilinear_matrix = nn.Parameter(
             torch.randn(self._low_dim, self._high_dim)
@@ -51,43 +72,80 @@ class CapsuleLayer(nn.Module):
         scale_factor = input_norm_eps**2 / ((1 + input_norm_eps**2) * input_norm_eps)
         return scale_factor * inputs
 
-    def dyanmic_routing(self, inputs, num_iters):
+    def dyanmic_routing(self, inputs, seq_mask, capsule_mask, num_iters):
         """Dynamic routing algorithm.
 
         Args:
-            inputs: [batch_size, seq_len, low_dim]
-            num_iters: number of iterations
-        return:
+            inputs: Tensor, shape: [batch_size, max_seq_len, low_dim]
+            num_iters: int, number of iterations
+            seq_mask: Tensor, shape: [batch_size, max_seq_len]
+            capsule_mask: Tensor, shape: [batch_size, max_k]
+
+        Return:
             [batch_size, seq_len, high_dim]
         """
-        batch_size, seq_len, _ = inputs.size()
+        batch_size, max_seq_len, _ = inputs.size()
         routing_logits = torch.randn(
-            batch_size, self._max_k, seq_len, dtype=torch.float32
-        )
+            batch_size, max_seq_len, self._max_k, dtype=torch.float32
+        ).to(inputs.device)
         routing_logits = (
             routing_logits * self._routing_logits_stddev + self._routing_logits_scale
         )
 
-        y_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
-        for _ in range(num_iters):
-            routing_logits = torch.nn.functional.softmax(
-                routing_logits, dim=-1
-            )  # [b, k, s]
-            z_vec = torch.einsum("bks, bsh -> bkh", routing_logits, y_vec)
-            u_vec = self.squash(z_vec)
-            routing_logits = routing_logits + torch.einsum(
-                "bkh, bsh -> bks", u_vec, y_vec
-            )
-        return u_vec
+        capsule_mask = capsule_mask.unsqueeze(1)  # [bs, 1, max_k]
+        capsule_mask_thresh = (capsule_mask.float() * 2 - 1) * 1e32
 
-    def forward(self, inputs):
+        low_capsule_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
+        for _ in range(num_iters):
+            routing_logits = torch.minimum(routing_logits, capsule_mask_thresh)
+            routing_logits = torch.nn.functional.softmax(
+                routing_logits, dim=1
+            )  # [b, s, k]
+            routing_logits = routing_logits * torch.float32(seq_mask.unsqueeze(2))
+
+            high_capsule_vec = torch.einsum(
+                "bsk, bsh -> bkh", routing_logits, low_capsule_vec
+            )
+            high_capsule_vec = self.squash(high_capsule_vec)
+            routing_logits = routing_logits + torch.einsum(
+                "bkh, bsh -> bsk", high_capsule_vec, low_capsule_vec
+            )
+        return high_capsule_vec
+
+    def forward(self, inputs, seq_len):
         """Forward method.
 
         Args:
             inputs: [batch_size, seq_len, low_dim]
+            seq_len: [batch_size]
 
         Return:
             [batch_size, max_k, high_dim]
         """
-        user_interests = self.dyanmic_routing(inputs, self._num_iters)
+        bs, s, low_dim = inputs.size()
+        device = inputs.device
+        if s < self._max_seq_len:  # padding
+            inputs = torch.cat(
+                [inputs, torch.zeros(bs, self._max_seq_len - s, low_dim).to(device)],
+                dim=1,
+            )  # [bs, max_seq_len, low_dim]
+        else:  # truncating
+            inputs = inputs[:, : self._max_seq_len, :]  # [bs, max_seq_len, low_dim]
+        seq_mask = sequence_mask(seq_len, self._max_seq_len, device)
+
+        if self._const_caps_num:
+            n_high_capsules = (
+                torch.zeros_like(seq_len, dtype=torch.float32) + self._max_k
+            )  # [bs,]
+            n_high_capsules = n_high_capsules.to(device)
+        else:
+            n_high_capsules = torch.max(
+                1, torch.min(self._max_k, torch.log2(seq_len.float()))
+            ).to(device)  # [bs,]
+
+        capsule_mask = sequence_mask(n_high_capsules, self._max_k, device)
+
+        user_interests = self.dyanmic_routing(
+            inputs, seq_mask, capsule_mask, self._num_iters
+        )
         return user_interests

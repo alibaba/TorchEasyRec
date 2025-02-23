@@ -53,25 +53,32 @@ class MINDUserTower(MatchTower):
         self._hist_feature_group = hist_feature_group
         self._hist_features = hist_features
 
+        self.init_input()
+
         user_feature_in = self.embedding_group.group_total_dim(self._group_name)
         self.user_mlp = MLP(user_feature_in, **config_to_kwargs(tower_config.user_mlp))
 
-        hist_feature_in = self.hist_embedding_group.group_total_dim(
-            self._hist_group_name
+        hist_feature_dim = self.hist_embedding_group.group_total_dim(
+            self._hist_group_name + ".sequence"
         )
         if self._tower_config.hist_seq_mlp:
-            self.hist_seq_mlp = MLP(
-                hist_feature_in, **config_to_kwargs(tower_config.hist_seq_mlp)
+            self._hist_seq_mlp = MLP(
+                in_features=hist_feature_dim,
+                dim=3,
+                **config_to_kwargs(tower_config.hist_seq_mlp),
             )
+            capsule_input_dim = tower_config.hist_seq_mlp.hidden_units[-1]
+        else:
+            capsule_input_dim = hist_feature_dim
 
         self._capsule_layer = CapsuleLayer(
-            tower_config.capsule_config,
-            hist_feature_in,
-            model_config.is_training,
+            capsule_config=tower_config.capsule_config,
+            input_dim=capsule_input_dim,
         )
         self._concat_mlp = MLP(
-            tower_config.user_mlp.hidden_units[-1]
+            in_features=tower_config.user_mlp.hidden_units[-1]
             + tower_config.capsule_config.high_dim,
+            dim=3,
             **config_to_kwargs(tower_config.concat_mlp),
         )
 
@@ -91,25 +98,26 @@ class MINDUserTower(MatchTower):
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower."""
         grp_user, grp_hist = self.build_input(batch)
+        grp_hist_seq = grp_hist[self._hist_group_name + ".sequence"]
+        grp_hist_len = grp_hist[self._hist_group_name + ".sequence_length"]
 
         user_feature = self.user_mlp(grp_user[self._group_name])
 
-        hist_seq_feas = torch.concat(grp_hist[self._hist_group_name], dim=-1)  # todo
+        if self._tower_config.hist_seq_mlp:
+            hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
+        else:
+            hist_seq_feas = grp_hist[self._hist_group_name]
 
-        if self._tower_config.user_seq_mlp:
-            hist_seq_feas = self.hist_seq_mlp(hist_seq_feas)
-
-        high_capsules = self._capsule_layer(hist_seq_feas)  # todo
+        high_capsules = self._capsule_layer(hist_seq_feas, grp_hist_len)
 
         # concatenate user feature and high_capsules
-        user_feature_tile = torch.tile(
-            user_feature, [1, high_capsules.shape[1]]
-        )  # todo
+        user_feature = torch.unsqueeze(user_feature, dim=1)
+        user_feature_tile = torch.tile(user_feature, [1, high_capsules.shape[1], 1])
         user_interests = torch.cat([user_feature_tile, high_capsules], dim=-1)
         user_interests = self._concat_mlp(user_interests)
 
         if self._similarity == match_model_pb2.Similarity.COSINE:
-            user_interests = F.normalize(user_interests, p=2.0, dim=1)
+            user_interests = F.normalize(user_interests, p=2.0, dim=-1)
         return user_interests
 
 
@@ -140,11 +148,11 @@ class MINDItemTower(MatchTower):
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower."""
         grouped_features = self.build_input(batch)
-        output = self.mlp(grouped_features[self._group_name])
+        item_emb = self.mlp(grouped_features[self._group_name])
 
         if self._similarity == match_model_pb2.Similarity.COSINE:
-            output = F.normalize(output, p=2.0, dim=1)
-        return output
+            item_emb = F.normalize(item_emb, p=2.0, dim=1)
+        return item_emb
 
 
 class MIND(MatchModel):
@@ -171,7 +179,7 @@ class MIND(MatchModel):
 
         self.user_tower = MINDUserTower(
             self._model_config.user_tower,
-            self._model_config.output_dim,
+            0,
             self._model_config.similarity,
             user_group,
             hist_group,
@@ -181,21 +189,12 @@ class MIND(MatchModel):
         )
         self.item_tower = MINDItemTower(
             self._model_config.item_tower,
-            self._model_config.output_dim,
+            0,
             self._model_config.similarity,
             item_group,
             item_features,
             model_config,
         )
-
-    def predict(self, batch: Batch) -> Dict[str, Tensor]:
-        """Forward the model."""
-        user_interests = self.user_tower(batch)
-        item_emb = self.item_tower(batch)
-
-        user_emb = self.label_aware_attention(user_interests, item_emb)
-        ui_sim = self.sim(user_emb, user_emb)
-        return {"similarity": ui_sim}
 
     def label_aware_attention(
         self,
@@ -215,3 +214,12 @@ class MIND(MatchModel):
 
         user_emb = torch.sum(torch.multiply(interest_weight, user_interests), dim=1)
         return user_emb
+
+    def predict(self, batch: Batch) -> Dict[str, Tensor]:
+        """Forward the model."""
+        user_interests = self.user_tower(batch)
+        item_emb = self.item_tower(batch)
+
+        user_emb = self.label_aware_attention(user_interests, item_emb)
+        ui_sim = self.sim(user_emb, item_emb)
+        return {"similarity": ui_sim}

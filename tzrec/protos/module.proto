@@ -49,4 +49,6 @@ message B2ICapsule{
     optional float routing_logits_stddev = 6 [default = 1];
     // squash power Default: 1
     optional float squash_pow = 7 [default = 1];
+    // whether to use constant capsule number, Default: false
+    optional bool const_caps_num = 8 [default = false];
 }
