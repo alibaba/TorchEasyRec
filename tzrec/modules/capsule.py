@@ -101,7 +101,7 @@ class CapsuleLayer(nn.Module):
             routing_logits = torch.nn.functional.softmax(
                 routing_logits, dim=1
             )  # [b, s, k]
-            routing_logits = routing_logits * torch.float32(seq_mask.unsqueeze(2))
+            routing_logits = routing_logits * seq_mask.unsqueeze(2).float()
 
             high_capsule_vec = torch.einsum(
                 "bsk, bsh -> bkh", routing_logits, low_capsule_vec
@@ -139,8 +139,12 @@ class CapsuleLayer(nn.Module):
             )  # [bs,]
             n_high_capsules = n_high_capsules.to(device)
         else:
-            n_high_capsules = torch.max(
-                1, torch.min(self._max_k, torch.log2(seq_len.float()))
+            n_high_capsules = torch.maximum(
+                torch.Tensor([1]).to(seq_len.device),
+                torch.minimum(
+                    torch.Tensor([self._max_k]).to(seq_len.device),
+                    torch.log2(seq_len.float()),
+                ),
             ).to(device)  # [bs,]
 
         capsule_mask = sequence_mask(n_high_capsules, self._max_k, device)
