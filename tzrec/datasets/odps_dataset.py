@@ -113,7 +113,11 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
             os.environ["ODPS_CONFIG_FILE_PATH"]
         )
         account = AliyunAccount(account_id, account_key)
-    elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
+    elif (
+        "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
+        or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
+        or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+    ):
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
         credential = credentials_client.get_credential()
