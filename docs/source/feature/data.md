@@ -221,6 +221,14 @@ sample_weight_fields: 'col_name'
 - 每个`proc`上的读数据并发度，`nproc-per-node * num_workers`建议小于单机CPU核数
 - 如果`num_workers==0`，数据进程和训练进程将会在一个进程中，便于调试
 
+### shuffle
+
+- 是否训练时打散数据，默认为false
+
+### shuffle_buffer_size
+
+- 最多缓存多少个batch用于打散数据，默认为32
+
 ### fg_encoded_multival_sep
 
 - fg_encoded=true时，数据的多值分割符，默认为chr(3)

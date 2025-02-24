@@ -296,24 +296,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._sampler.init()
             self._sampler_inited = True
         worker_id, num_workers = self.get_worker_info()
-
-        shuffle_buffer = []
-        need_shuffle = self._data_config.shuffle and self._mode == Mode.TRAIN
         for input_data in self._reader.to_batches(worker_id, num_workers):
-            if need_shuffle:
-                shuffle_buffer.append(input_data)
-                if len(shuffle_buffer) < self._data_config.shuffle_buffer_size:
-                    continue
-                else:
-                    idx = random.randrange(len(shuffle_buffer))
-                    input_data = shuffle_buffer.pop(idx)
-
             yield self._build_batch(input_data)
-
-        if len(shuffle_buffer) > 0:
-            random.shuffle(shuffle_buffer)
-            for input_data in shuffle_buffer:
-                yield self._build_batch(input_data)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
         """Process input data and build batch.
@@ -398,6 +382,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -406,12 +392,16 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
         self._batch_size = batch_size
         self._selected_cols = selected_cols
         self._drop_remainder = drop_remainder
+        self._shuffle = shuffle
+        self._shuffle_buffer_size = shuffle_buffer_size
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
@@ -422,6 +412,7 @@ class BaseReader(metaclass=_reader_meta_cls):
     def _arrow_reader_iter(
         self, reader: Iterator[pa.RecordBatch]
     ) -> Iterator[Dict[str, pa.Array]]:
+        shuffle_buffer = []
         buff_data = None
         while True:
             data = None
@@ -450,10 +441,24 @@ class BaseReader(metaclass=_reader_meta_cls):
                     if isinstance(column, pa.ChunkedArray):
                         column = column.combine_chunks()
                     data_dict[name] = column
+
+                if self._shuffle:
+                    shuffle_buffer.append(data_dict)
+                    if len(shuffle_buffer) < self._shuffle_buffer_size:
+                        continue
+                    else:
+                        idx = random.randrange(len(shuffle_buffer))
+                        data_dict = shuffle_buffer.pop(idx)
+
                 yield data_dict
 
             if data is None and buff_data is None:
                 break
+
+        if len(shuffle_buffer) > 0:
+            random.shuffle(shuffle_buffer)
+            for data_dict in shuffle_buffer:
+                yield data_dict
 
 
 class BaseWriter(metaclass=_writer_meta_cls):
