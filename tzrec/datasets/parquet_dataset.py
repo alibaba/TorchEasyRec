@@ -12,6 +12,7 @@
 
 import glob
 import os
+import random
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional
@@ -20,6 +21,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from pyarrow import parquet
 
+from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -48,6 +50,8 @@ class ParquetDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._data_config.drop_remainder,
+            shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
+            shuffle_buffer_size=self._data_config.shuffle_buffer_size,
         )
         self._init_input_fields()
 
@@ -60,6 +64,8 @@ class ParquetReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -68,9 +74,18 @@ class ParquetReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self._ordered_cols = None
         self.schema = []
         self._input_files = []
@@ -94,6 +109,8 @@ class ParquetReader(BaseReader):
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         input_files = self._input_files[worker_id::num_workers]
+        if self._shuffle:
+            random.shuffle(input_files)
         if len(input_files) > 0:
             dataset = ds.dataset(input_files, format="parquet")
             reader = dataset.to_batches(

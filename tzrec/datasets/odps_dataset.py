@@ -342,6 +342,8 @@ class OdpsReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch less than batch_size.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
         is_orderby_partition (bool): read data order by table partitions or not.
         quota_name (str): storage api quota name.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
@@ -354,12 +356,21 @@ class OdpsReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
