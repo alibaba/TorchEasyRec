@@ -45,7 +45,7 @@ class MINDUserTower(MatchTower):
             output_dim,
             similarity,
             user_feature_group,
-            user_features,
+            user_features + hist_features,
             model_config,
         )
 

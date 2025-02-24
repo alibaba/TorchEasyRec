@@ -13,14 +13,13 @@ import torch
 from torch import nn
 
 
-def sequence_mask(lengths, max_len=None, device=None):
+def sequence_mask(lengths, max_len=None):
     """Create a boolean mask from sequence lengths.
 
     Args:
     lengths (Tensor): 1-D tensor containing actual sequence lengths.
     max_len (int, optional): max length。If None, max_len is the maximum
                             value in lengths.
-    device: device of the mask.
 
     Returns:
     mask (Tensor): boolean mask with shape [len(lengths), max_len],
@@ -29,10 +28,12 @@ def sequence_mask(lengths, max_len=None, device=None):
     """
     if max_len is None:
         max_len = lengths.max()
-    mask = torch.arange(0, max_len, device=lengths.device).expand(
-        len(lengths), max_len
-    ) < lengths.unsqueeze(1)
-    return mask.to(device)
+    mask = torch.arange(0, max_len)
+    # symbolic tracing trick
+    zeros_padding = torch.zeros_like(lengths).unsqueeze(1).tile(1, max_len)
+    mask = mask + zeros_padding  # broadcasting
+    mask = mask < lengths.unsqueeze(1)
+    return mask
 
 
 class CapsuleLayer(nn.Module):
@@ -84,10 +85,18 @@ class CapsuleLayer(nn.Module):
         Return:
             [batch_size, seq_len, high_dim]
         """
-        batch_size, max_seq_len, _ = inputs.size()
-        routing_logits = torch.randn(
-            batch_size, max_seq_len, self._max_k, dtype=torch.float32
-        ).to(inputs.device)
+        routing_logits = torch.concat(
+            [
+                torch.randn_like(inputs, dtype=torch.float32),
+                torch.randn_like(inputs, dtype=torch.float32),
+            ],
+            dim=-1,
+        )
+        routing_logits = routing_logits[:, :, : self._max_k].to(inputs.device)
+
+        # routing_logits = torch.randn(
+        #     batch_size, max_seq_len, self._max_k, dtype=torch.float32
+        # ).to(inputs.device)
         routing_logits = (
             routing_logits * self._routing_logits_stddev + self._routing_logits_scale
         )
@@ -122,16 +131,19 @@ class CapsuleLayer(nn.Module):
         Return:
             [batch_size, max_k, high_dim]
         """
-        bs, s, low_dim = inputs.size()
+        _, s, _ = inputs.shape
         device = inputs.device
-        if s < self._max_seq_len:  # padding
-            inputs = torch.cat(
-                [inputs, torch.zeros(bs, self._max_seq_len - s, low_dim).to(device)],
-                dim=1,
-            )  # [bs, max_seq_len, low_dim]
-        else:  # truncating
-            inputs = inputs[:, : self._max_seq_len, :]  # [bs, max_seq_len, low_dim]
-        seq_mask = sequence_mask(seq_len, self._max_seq_len, device)
+
+        # truncating or padding to the input sequence,
+        # avoid using if-else statement since the symbolic
+        # traced variables are not allowed in control flow
+        padding_tensor = torch.zeros_like(inputs)[:, 0:1, :].to(device)
+        padding_tensor = padding_tensor.tile(1, self._max_seq_len, 1)
+        inputs = inputs[:, : self._max_seq_len, :]
+        inputs = torch.cat([inputs, padding_tensor[:, s:, :]], dim=1)
+
+        seq_mask = sequence_mask(seq_len, self._max_seq_len)
+        seq_mask = seq_mask.to(device)
 
         if self._const_caps_num:
             n_high_capsules = (
@@ -147,7 +159,8 @@ class CapsuleLayer(nn.Module):
                 ),
             ).to(device)  # [bs,]
 
-        capsule_mask = sequence_mask(n_high_capsules, self._max_k, device)
+        capsule_mask = sequence_mask(n_high_capsules, self._max_k)
+        capsule_mask = capsule_mask.to(device)
 
         user_interests = self.dyanmic_routing(
             inputs, seq_mask, capsule_mask, self._num_iters
