@@ -360,13 +360,11 @@ def _train_and_evaluate(
     epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
-    save_checkpoints_steps, save_checkpoints_epochs = (
-        0,
-        train_config.save_checkpoints_epochs
-        if train_config.save_checkpoints_epochs > 0
-        else train_config.save_checkpoints_steps,
-        0,
-    )
+    save_checkpoints_steps, save_checkpoints_epochs = 0, 0
+    if train_config.save_checkpoints_epochs > 0:
+        save_checkpoints_epochs = train_config.save_checkpoints_epochs
+    else:
+        save_checkpoints_steps = train_config.save_checkpoints_steps
 
     plogger = None
     summary_writer = None
