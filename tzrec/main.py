@@ -265,9 +265,9 @@ def _evaluate(
 
     desc_suffix = ""
     if global_epoch:
-        desc_suffix = f" Epoch {global_epoch}"
+        desc_suffix += f" Epoch-{global_epoch}"
     if global_step:
-        desc_suffix = f" model-{global_step}"
+        desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
     plogger = None
