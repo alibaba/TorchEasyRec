@@ -7,3 +7,4 @@
    dssm
    tdm
    dat
+   mind
