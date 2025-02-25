@@ -17,6 +17,7 @@ import common_io
 import pyarrow as pa
 from odps import options
 
+from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -84,6 +85,7 @@ class OdpsDatasetV1(BaseDataset):
             self._batch_size,
             list(self._selected_input_names),
             self._data_config.drop_remainder,
+            shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
         )
         self._init_input_fields()
 
@@ -113,6 +115,8 @@ class OdpsReaderV1(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -121,9 +125,18 @@ class OdpsReaderV1(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self.schema = []
         reader = common_io.table.TableReader(
             self._input_path.split(",")[0], selected_cols=",".join(selected_cols or [])

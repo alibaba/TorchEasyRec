@@ -113,7 +113,11 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
             os.environ["ODPS_CONFIG_FILE_PATH"]
         )
         account = AliyunAccount(account_id, account_key)
-    elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
+    elif (
+        "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
+        or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
+        or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+    ):
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
         credential = credentials_client.get_credential()
@@ -342,6 +346,8 @@ class OdpsReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch less than batch_size.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
         is_orderby_partition (bool): read data order by table partitions or not.
         quota_name (str): storage api quota name.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
@@ -354,12 +360,21 @@ class OdpsReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
