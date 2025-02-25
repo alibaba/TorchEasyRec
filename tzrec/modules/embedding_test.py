@@ -477,7 +477,7 @@ class EmbeddingGroupTest(unittest.TestCase):
                 group_type=model_pb2.FeatureGroupType.DEEP,
                 sequence_groups=[
                     model_pb2.SeqGroupConfig(
-                        group_name="buy_seq",
+                        group_name="only_buy_seq",
                         feature_names=[
                             "cat_a",
                             "int_a",
@@ -489,7 +489,7 @@ class EmbeddingGroupTest(unittest.TestCase):
                 sequence_encoders=[
                     seq_encoder_pb2.SeqEncoderConfig(
                         simple_attention=seq_encoder_pb2.SimpleAttention(
-                            input="buy_seq"
+                            input="only_buy_seq"
                         )
                     ),
                 ],
