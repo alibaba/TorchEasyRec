@@ -102,10 +102,7 @@ class IdFeature(BaseFeature):
         """Input field names."""
         if not self._inputs:
             if self.fg_mode == FgMode.FG_NONE:
-                if self.is_weighted:
-                    self._inputs = [f"{self.name}__values", f"{self.name}__weights"]
-                else:
-                    self._inputs = [self.name]
+                self._inputs = [self.name]
             else:
                 self._inputs = [v for _, v in self.side_inputs]
         return self._inputs
@@ -125,11 +122,11 @@ class IdFeature(BaseFeature):
         """
         if self.fg_mode == FgMode.FG_NONE:
             feat = input_data[self.inputs[0]]
-            weight = None
-            if len(self.inputs) == 2:
-                weight = input_data[self.inputs[1]]
             parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                self.name, feat, weight=weight, **self._fg_encoded_kwargs
+                self.name,
+                feat,
+                is_weighted=self._is_weighted,
+                **self._fg_encoded_kwargs,
             )
         elif self.fg_mode == FgMode.FG_NORMAL:
             input_feat = input_data[self.inputs[0]]
