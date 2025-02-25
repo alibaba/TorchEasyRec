@@ -134,7 +134,31 @@ class IdFeatureTest(unittest.TestCase):
             mc_module._eviction_policy._threshold_filtering_func is not None
         )
 
-    def test_fg_encoded_with_weighted(self):
+    @parameterized.expand(
+        [
+            [pa.array(["1:1.0", "2:1.5\x033:2.0", "4:2.5"])],
+            [
+                pa.array(
+                    [["1:1.0"], ["2:1.5", "3:2.0"], ["4:2.5"]],
+                    type=pa.list_(pa.string()),
+                )
+            ],
+            [
+                pa.array(
+                    [{1: 1.0}, {2: 1.5, 3: 2.0}, {4: 2.5}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                )
+            ],
+            [
+                pa.array(
+                    [{"1": 1.0}, {"2": 1.5, "3": 2.0}, {"4": 2.5}],
+                    type=pa.map_(pa.string(), pa.float32()),
+                )
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_fg_encoded_with_weighted(self, inputs):
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="cate",
@@ -145,17 +169,12 @@ class IdFeatureTest(unittest.TestCase):
             )
         )
         id_feat = id_feature_lib.IdFeature(id_feat_cfg)
-        self.assertEqual(id_feat.inputs[0], "cate__values")
-        self.assertEqual(id_feat.inputs[1], "cate__weights")
+        self.assertEqual(id_feat.inputs[0], "cate")
 
-        input_data = {
-            "cate__values": pa.array([1, 2, 3]),
-            "cate__weights": pa.array([1.0, 1.5, 2.0]),
-        }
-        parsed_feat = id_feat.parse(input_data)
-        expected_values = [1, 2, 3]
-        expected_lengths = [1, 1, 1]
-        expected_weights = [1.0, 1.5, 2.0]
+        parsed_feat = id_feat.parse({"cate": inputs})
+        expected_values = [1, 2, 3, 4]
+        expected_lengths = [1, 2, 1]
+        expected_weights = [1.0, 1.5, 2.0, 2.5]
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
         np.testing.assert_allclose(parsed_feat.weights, np.array(expected_weights))
