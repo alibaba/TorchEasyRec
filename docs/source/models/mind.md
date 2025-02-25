@@ -102,12 +102,9 @@ model_config {
                 use_bn: true
             }
         }
-
         simi_pow: 20
         in_batch_negative: false
-
     }
-
     losses {
         softmax_cross_entropy {}
     }
@@ -142,7 +139,45 @@ model_config {
 
 ## 示例Config
 
-[mind_taobao.config](<>)
+[mind_taobao.config](../../../examples/mind_taobao.config)
+
+## 模型导出
+
+```
+torchrun --master_addr=localhost --master_port=32555 \
+    --nnodes=1 --nproc-per-node=2 --node_rank=0 \
+    -m tzrec.export \
+    --pipeline_config_path {your_model_path}/pipeline.config \
+    --export_dir {your_model_path}/export
+```
+
+## 模型评估
+
+```
+torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.tools.hitrate \
+    --user_gt_input odps://{project}/tables/tbl_user_gt_input \
+    --item_embedding_input odps://{project}/tables/tbl_item_embedding_input \
+    --total_hitrate_output odps://{project}/tables/tbl_total_hitrate_output \
+    --hitrate_details_output odps://{project}/tables/tbl_hitrate_details_output \
+    --item_id_field docid_int \
+    --request_id_field uid \
+    --gt_items_field docid_int \
+    --ivf_nlist 1000 \
+    --ivf_nprobe 1000 \
+    --top_k 50 \
+    --batch_size 1024 \
+    --num_interests 5
+```
+
+- user_gt_input表： 用户真实序列(ground truth)表和embedding， 包含列[request_id, gt_items, user_tower_emb]
+- item_embedding_input表： item embedding表， 包含列[item_id, item_tower_emb]
+- request_id_field: user_gt_input表中的request id的列名
+- item_id_field: item embedding表中的item id列名
+- request_id_field: user_gt_input表中的request id列名
+- top_k: 召回top k个item
+- num_interests: 用户最大兴趣个数
 
 ## 参考论文
 
