@@ -106,12 +106,20 @@ def _parse_fg_encoded_sparse_feature_impl(
             if is_weighted:
                 assert pa.types.is_string(feat.values.type)
                 fw = pa.compute.split_pattern(feat.values, ":")
-                weight = pa.ListArray.from_arrays(feat.offsets, fw.values[1::2])
-                feat = pa.ListArray.from_arrays(feat.offsets, fw.values[::2])
+                weight = pa.ListArray.from_arrays(
+                    feat.offsets, fw.values[1::2], mask=feat.is_null()
+                )
+                feat = pa.ListArray.from_arrays(
+                    feat.offsets, fw.values[::2], mask=feat.is_null()
+                )
         else:
             # dtype = map<int,float> or others can cast to map<int,float>
-            weight = pa.ListArray.from_arrays(feat.offsets, feat.items)
-            feat = pa.ListArray.from_arrays(feat.offsets, feat.keys)
+            weight = pa.ListArray.from_arrays(
+                feat.offsets, feat.items, mask=feat.is_null()
+            )
+            feat = pa.ListArray.from_arrays(
+                feat.offsets, feat.keys, mask=feat.is_null()
+            )
 
         feat = feat.cast(pa.list_(pa.int64()), safe=False)
         if weight is not None:
