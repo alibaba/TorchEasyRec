@@ -392,6 +392,7 @@ def _train_and_evaluate(
 
     last_ckpt_step = -1
     i_step = 0
+    i_epoch = 0
     losses = {}
     for i_epoch in epoch_iter:
         pipeline = TrainPipelineSparseDist(
