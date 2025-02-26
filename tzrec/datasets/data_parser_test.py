@@ -219,14 +219,15 @@ class DataParserTest(unittest.TestCase):
 
         data = data_parser.parse(
             input_data={
-                "cat_a__values": pa.array([1, 2, 3]),
-                "cat_a__weights": pa.array([2.0, 1.0, 3.5]),
-                "cat_a1__values": pa.array([1, None, 3]),
-                "cat_a1__weights": pa.array([2.0, None, 3.5]),
-                "tag_b__values": pa.array(["4\x035", "", "6"]),
-                "tag_b__weights": pa.array(["2.3\x032.4", "", "2.5"]),
-                "tag_b1__values": pa.array(["4\x035", "", "6"]),
-                "tag_b1__weights": pa.array(["2.3\x032.4", "", "2.5"]),
+                "cat_a": pa.array(
+                    [{1: 2.0}, {2: 1.0}, {3: 3.5}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
+                "cat_a1": pa.array(
+                    [{1: 2.0}, None, {3: 3.5}], type=pa.map_(pa.int64(), pa.float32())
+                ),
+                "tag_b": pa.array(["4:2.3\x035:2.4", "", "6:2.5"]),
+                "tag_b1": pa.array(["4:2.3\x035:2.4", "", "6:2.5"]),
                 "int_a": pa.array([7, 8, 9], pa.float32()),
                 "int_b": pa.array(["27\x0337", "28\x0338", "29\x0339"]),
                 "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
