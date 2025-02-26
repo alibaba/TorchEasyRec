@@ -69,7 +69,7 @@ def _parse_fg_encoded_sparse_feature_impl(
     feat: pa.Array,
     multival_sep: str = chr(3),
     default_value: Optional[List[int]] = None,
-    weight: Optional[pa.Array] = None,
+    is_weighted: bool = False,
 ) -> SparseData:
     """Parse fg encoded sparse feature.
 
@@ -78,35 +78,51 @@ def _parse_fg_encoded_sparse_feature_impl(
         feat (pa.Array): input feature data.
         multival_sep (str): string separator for multi-val data.
         default_value (list): default value.
-        weight (pa.Array): input feature weights data.
+        is_weighted (bool): input feature is weighted or not.
 
     Returns:
         an instance of SparseData.
     """
     weight_values = None
-    if pa.types.is_string(feat.type) or pa.types.is_list(feat.type):
-        if pa.types.is_string(feat.type):
-            # dtype = string
-            is_empty = pa.compute.equal(feat, pa.scalar(""))
-            nulls = pa.nulls(len(feat))
-            feat = pa.compute.if_else(is_empty, nulls, feat)
-            if weight:
-                weight = pa.compute.if_else(is_empty, nulls, weight)
-
-            feat = pa.compute.split_pattern(feat, multival_sep)
-            if weight:
-                weight = pa.compute.split_pattern(weight, multival_sep)
-        else:
-            # dtype = list<int> or others can cast to list<int>
-            if default_value is not None:
-                is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+    if (
+        pa.types.is_string(feat.type)
+        or pa.types.is_list(feat.type)
+        or pa.types.is_map(feat.type)
+    ):
+        weight = None
+        if pa.types.is_string(feat.type) or pa.types.is_list(feat.type):
+            if pa.types.is_string(feat.type):
+                # dtype = string
+                is_empty = pa.compute.equal(feat, pa.scalar(""))
                 nulls = pa.nulls(len(feat))
                 feat = pa.compute.if_else(is_empty, nulls, feat)
-                if weight:
-                    weight = pa.compute.if_else(is_empty, nulls, weight)
+                feat = pa.compute.split_pattern(feat, multival_sep)
+            elif pa.types.is_list(feat.type):
+                # dtype = list<int> or others can cast to list<int>
+                if default_value is not None:
+                    is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+                    nulls = pa.nulls(len(feat))
+                    feat = pa.compute.if_else(is_empty, nulls, feat)
+            if is_weighted:
+                assert pa.types.is_string(feat.values.type)
+                fw = pa.compute.split_pattern(feat.values, ":")
+                weight = pa.ListArray.from_arrays(
+                    feat.offsets, fw.values[1::2], mask=feat.is_null()
+                )
+                feat = pa.ListArray.from_arrays(
+                    feat.offsets, fw.values[::2], mask=feat.is_null()
+                )
+        else:
+            # dtype = map<int,float> or others can cast to map<int,float>
+            weight = pa.ListArray.from_arrays(
+                feat.offsets, feat.items, mask=feat.is_null()
+            )
+            feat = pa.ListArray.from_arrays(
+                feat.offsets, feat.keys, mask=feat.is_null()
+            )
 
         feat = feat.cast(pa.list_(pa.int64()), safe=False)
-        if weight:
+        if weight is not None:
             weight = weight.cast(pa.list_(pa.float32()), safe=False)
 
         if default_value is not None:
@@ -117,40 +133,22 @@ def _parse_fg_encoded_sparse_feature_impl(
         feat_values = feat.values.to_numpy()
         feat_offsets = feat.offsets.to_numpy()
         feat_lengths = feat_offsets[1:] - feat_offsets[:-1]
-        if weight:
+        if weight is not None:
             weight_values = weight.values.to_numpy()
-            weight_offsets = weight.offsets.to_numpy()
-            weight_lengths = weight_offsets[1:] - weight_offsets[:-1]
-            assert np.all(feat_lengths == weight_lengths), (
-                f"{name}__values and {name}__weights length not equal"
-            )
     elif pa.types.is_integer(feat.type):
+        assert not is_weighted
         # dtype = int
         if default_value is not None:
             feat = feat.cast(pa.int64()).fill_null(default_value[0])
             feat_values = feat.to_numpy()
             feat_lengths = np.ones_like(feat_values, np.int32)
-            if weight:
-                weight = weight.fill_null(float(1.0))
-                weight_values = weight.cast(pa.float32(), safe=False).to_numpy()
-                weight_lengths = np.ones_like(weight_values, np.int32)
-                assert np.all(feat_lengths == weight_lengths), (
-                    f"{name}__values and {name}__weights length not equal"
-                )
         else:
             feat_values = feat.drop_null().cast(pa.int64()).to_numpy()
             feat_lengths = 1 - feat.is_null().cast(pa.int32()).to_numpy()
-            if weight:
-                weight_values = (
-                    weight.drop_null().cast(pa.float32(), safe=False).to_numpy()
-                )
-                weight_lengths = 1 - weight.is_null().cast(pa.int32()).to_numpy()
-                assert np.all(feat_lengths == weight_lengths), (
-                    f"{name}__values and {name}__weights length not equal"
-                )
     else:
         raise ValueError(
-            f"{name} only support str|int|list<int> dtype input, but get {feat.type}."
+            f"{name} only support str|int|list<int>|map<int,double> dtype input, "
+            f"but get {feat.type}."
         )
     return SparseData(name, feat_values, feat_lengths, weights=weight_values)
 
