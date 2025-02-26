@@ -422,10 +422,17 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["deep___click_no_query.sequence_length"].size(), (2,))
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.JIT_SCRIPT, False],
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+            [TestGraphType.JIT_SCRIPT, True],
+        ]
     )
-    def test_embedding_group(self, graph_type) -> None:
-        features = _create_test_sequence_features()
+    def test_embedding_group(self, graph_type, has_zch) -> None:
+        features = _create_test_sequence_features(has_zch)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="wide",
@@ -569,6 +576,8 @@ class EmbeddingGroupTest(unittest.TestCase):
             lengths=torch.tensor([3, 3, 2, 2]),
         ).to_dict()
 
+        if has_zch and graph_type != TestGraphType.NORMAL:
+            embedding_group = embedding_group.eval()
         if graph_type == TestGraphType.JIT_SCRIPT:
             embedding_group = create_test_module(
                 _EGScriptWrapper(embedding_group), graph_type
