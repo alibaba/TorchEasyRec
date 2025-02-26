@@ -155,10 +155,11 @@ class EmbeddingGroup(nn.Module):
         self._group_name_to_seq_encoder_configs = defaultdict(list)
         self._grouped_features_keys = list()
 
+        seq_group_names = []
         for feature_group in feature_groups:
             group_name = feature_group.group_name
-            self._respect_and_supplement_feature_group(feature_group)
-            self._add_feature_group_sign_for_sequence_groups(feature_group)
+            self._inspect_and_supplement_feature_group(feature_group, seq_group_names)
+            # self._add_feature_group_sign_for_sequence_groups(feature_group)
             features_data_group = defaultdict(list)
             for feature_name in feature_group.feature_names:
                 feature = self._name_to_feature[feature_name]
@@ -241,10 +242,10 @@ class EmbeddingGroup(nn.Module):
         """grouped_features_keys."""
         return self._grouped_features_keys
 
-    def _respect_and_supplement_feature_group(
-        self, feature_group: FeatureGroupConfig
+    def _inspect_and_supplement_feature_group(
+        self, feature_group: FeatureGroupConfig, seq_group_names: List[str]
     ) -> None:
-        """Respect feature group sequence_groups and sequence_encoders."""
+        """Inspect feature group sequence_groups and sequence_encoders."""
         group_name = feature_group.group_name
         sequence_groups = list(feature_group.sequence_groups)
         sequence_encoders = list(feature_group.sequence_encoders)
@@ -272,6 +273,14 @@ class EmbeddingGroup(nn.Module):
                 "group_name"
             ):
                 sequence_groups[0].group_name = group_name
+
+            for sequence_group in sequence_groups:
+                if sequence_group.group_name in seq_group_names:
+                    raise ValueError(
+                        f"has repeat sequences groups_name: {sequence_group.group_name}"
+                    )
+                else:
+                    seq_group_names.append(sequence_group.group_name)
 
             group_has_encoder = {
                 sequence_group.group_name: False for sequence_group in sequence_groups
@@ -304,23 +313,6 @@ class EmbeddingGroup(nn.Module):
                     f"{group_name} group group_type is not DEEP, "
                     f"sequence_groups and sequence_encoders must configured in DEEP"
                 )
-
-    def _add_feature_group_sign_for_sequence_groups(
-        self, feature_group: FeatureGroupConfig
-    ) -> None:
-        """Assign sequence_groups and sequence_encoder relation group name."""
-        group_name = feature_group.group_name
-        sequence_groups = list(feature_group.sequence_groups)
-        sequence_encoders = list(feature_group.sequence_encoders)
-        if len(sequence_groups) > 0:
-            for sequence_group in sequence_groups:
-                sequence_group.group_name = (
-                    group_name + "___" + sequence_group.group_name
-                )
-            for sequence_encoder in sequence_encoders:
-                seq_type = sequence_encoder.WhichOneof("seq_module")
-                seq_config = getattr(sequence_encoder, seq_type)
-                seq_config.input = group_name + "___" + seq_config.input
 
     def group_names(self) -> List[str]:
         """Feature group names."""
