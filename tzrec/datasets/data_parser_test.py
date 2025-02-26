@@ -489,10 +489,19 @@ class DataParserTest(unittest.TestCase):
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["cat_a.lengths"], expected_cat_a_lengths)
-        torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)
         torch.testing.assert_close(data["tag_b.lengths"], expected_tag_b_lengths)
         if weigted_id:
-            torch.testing.assert_close(data["tag_b.weights"], expected_tag_b_weights)
+            tag_b_idx = torch.argsort(data["tag_b.values"][:2])
+            tag_b_values = torch.cat(
+                [data["tag_b.values"][tag_b_idx], data["tag_b.values"][2:]]
+            )
+            tag_b_weights = torch.cat(
+                [data["tag_b.weights"][tag_b_idx], data["tag_b.weights"][2:]]
+            )
+            torch.testing.assert_close(tag_b_values, expected_tag_b_values)
+            torch.testing.assert_close(tag_b_weights, expected_tag_b_weights)
+        else:
+            torch.testing.assert_close(data["tag_b.values"], expected_tag_b_values)
         torch.testing.assert_close(data["int_a.values"], expected_int_a_values)
         torch.testing.assert_close(data["int_b.values"], expected_int_b_values)
         torch.testing.assert_close(data["lookup_a.values"], expected_lookup_a_values)
@@ -518,6 +527,8 @@ class DataParserTest(unittest.TestCase):
             data["click_seq__tag_b.lengths"], expected_seq_tag_b_seq_lengths
         )
         torch.testing.assert_close(data["label"], expected_label)
+
+        batch = data_parser.to_batch(data)
 
         expected_dense_feat = KeyedTensor(
             keys=["int_a", "int_b", "lookup_a"],
@@ -559,6 +570,31 @@ class DataParserTest(unittest.TestCase):
                     ]
                 ),
             )
+            sparse_feat = batch.sparse_features["__BASE__"]
+            sparse_feat_values = sparse_feat.values()
+            sparse_feat_weights = sparse_feat.weights()
+            tag_b_idx = torch.argsort(sparse_feat.values()[3:5]) + 3
+            sparse_feat_values = torch.cat(
+                [
+                    sparse_feat_values[:3],
+                    sparse_feat_values[tag_b_idx],
+                    sparse_feat_values[5:],
+                ]
+            )
+            sparse_feat_weights = torch.cat(
+                [
+                    sparse_feat_weights[:3],
+                    sparse_feat_weights[tag_b_idx],
+                    sparse_feat_weights[5:],
+                ]
+            )
+            sparse_feat = KeyedJaggedTensor(
+                keys=sparse_feat.keys(),
+                values=sparse_feat_values,
+                lengths=sparse_feat.lengths(),
+                weights=sparse_feat_weights,
+            )
+            self.assertTrue(kjt_is_equal(sparse_feat, expected_sparse_feat))
         else:
             expected_sparse_feat = KeyedJaggedTensor.from_lengths_sync(
                 keys=["cat_a", "tag_b", "click_seq__cat_a", "click_seq__tag_b"],
@@ -569,6 +605,9 @@ class DataParserTest(unittest.TestCase):
                     [1, 1, 1, 2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32
                 ),
             )
+            self.assertTrue(
+                kjt_is_equal(batch.sparse_features["__BASE__"], expected_sparse_feat)
+            )
         expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
             keys=["click_seq__tag_b"],
             values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
@@ -578,13 +617,11 @@ class DataParserTest(unittest.TestCase):
             values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
             lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
-        batch = data_parser.to_batch(data)
+
         torch.testing.assert_close(
             batch.dense_features["__BASE__"].values(), expected_dense_feat.values()
         )
-        self.assertTrue(
-            kjt_is_equal(batch.sparse_features["__BASE__"], expected_sparse_feat)
-        )
+
         self.assertTrue(
             kjt_is_equal(
                 batch.sequence_mulval_lengths["__BASE__"],
