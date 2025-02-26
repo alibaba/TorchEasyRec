@@ -9,16 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
 from torch import nn
 
+from tzrec.protos.tower_pb2 import B2ICapsule
 
-def sequence_mask(lengths, max_len=None):
+
+def sequence_mask(lengths: torch.Tensor, max_len: int = None) -> torch.Tensor:
     """Create a boolean mask from sequence lengths.
 
     Args:
     lengths (Tensor): 1-D tensor containing actual sequence lengths.
-    max_len (int, optional): max length。If None, max_len is the maximum
+    max_len (int, optional): max length. If None, max_len is the maximum
                             value in lengths.
 
     Returns:
@@ -39,7 +43,9 @@ def sequence_mask(lengths, max_len=None):
 class CapsuleLayer(nn.Module):
     """Capsule layer."""
 
-    def __init__(self, capsule_config, input_dim, *args, **kwargs) -> None:
+    def __init__(
+        self, capsule_config: B2ICapsule, input_dim: int, *args: Any, **kwargs: Any
+    ) -> None:
         """Capsule layer."""
         super().__init__(*args, **kwargs)
         # max_seq_len: max behaviour sequence length(history length)
@@ -66,21 +72,29 @@ class CapsuleLayer(nn.Module):
             torch.randn(self._low_dim, self._high_dim)
         )  # [ld, hd]
 
-    def squash(self, inputs):
+    def squash(self, inputs: torch.Tensor) -> torch.Tensor:
         """Squash inputs over the last dimension."""
         input_norm = torch.linalg.norm(inputs, dim=-1, keepdim=True)
         input_norm_eps = torch.max(input_norm, torch.tensor(1e-7))
-        scale_factor = input_norm_eps**2 / ((1 + input_norm_eps**2) * input_norm_eps)
+        scale_factor = torch.square(input_norm_eps) / (
+            (1 + torch.square(input_norm_eps)) * input_norm_eps
+        )
         return scale_factor * inputs
 
-    def dyanmic_routing(self, inputs, seq_mask, capsule_mask, num_iters):
+    def dyanmic_routing(
+        self,
+        inputs: torch.Tensor,
+        seq_mask: torch.Tensor,
+        capsule_mask: torch.Tensor,
+        num_iters: int,
+    ) -> torch.Tensor:
         """Dynamic routing algorithm.
 
         Args:
             inputs: Tensor, shape: [batch_size, max_seq_len, low_dim]
-            num_iters: int, number of iterations
             seq_mask: Tensor, shape: [batch_size, max_seq_len]
             capsule_mask: Tensor, shape: [batch_size, max_k]
+            num_iters: int, number of iterations
 
         Return:
             [batch_size, seq_len, high_dim]
@@ -94,9 +108,6 @@ class CapsuleLayer(nn.Module):
         )
         routing_logits = routing_logits[:, :, : self._max_k].to(inputs.device)
 
-        # routing_logits = torch.randn(
-        #     batch_size, max_seq_len, self._max_k, dtype=torch.float32
-        # ).to(inputs.device)
         routing_logits = (
             routing_logits * self._routing_logits_stddev + self._routing_logits_scale
         )
@@ -121,7 +132,7 @@ class CapsuleLayer(nn.Module):
             )
         return high_capsule_vec
 
-    def forward(self, inputs, seq_len):
+    def forward(self, inputs: torch.Tensor, seq_len: torch.Tensor) -> torch.Tensor:
         """Forward method.
 
         Args:

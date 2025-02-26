@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -89,7 +89,7 @@ class MINDUserTower(MatchTower):
             self._hist_features, [self._hist_feature_group]
         )
 
-    def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
+    def build_input(self, batch: Batch) -> Tuple[Dict[str, Tensor]]:
         """Build input."""
         feature_dict = super().build_input(batch)
         hist_feature_dict = self.hist_embedding_group(batch)
