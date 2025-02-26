@@ -14,7 +14,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from tzrec.protos.tower_pb2 import B2ICapsule
+from tzrec.protos.module_pb2 import B2ICapsule
 
 
 def sequence_mask(lengths: torch.Tensor, max_len: int = None) -> torch.Tensor:
