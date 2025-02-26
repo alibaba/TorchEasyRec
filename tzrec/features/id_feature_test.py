@@ -221,11 +221,17 @@ class IdFeatureTest(unittest.TestCase):
         }
         parsed_feat = id_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "cate")
-        np.testing.assert_allclose(parsed_feat.values, np.array([123, 1391, 123, 12]))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 2, 0]))
-        self.assertTrue(
-            np.allclose(parsed_feat.weights, np.array([0.5, 0.3, 0.9, 0.21]))
+
+        tag_idx = np.argsort(parsed_feat.values[2:])
+        parsed_values = np.concatenate(
+            [parsed_feat.values[:2], parsed_feat.values[2 + tag_idx]]
         )
+        parsed_weights = np.concatenate(
+            [parsed_feat.weights[:2], parsed_feat.weights[2 + tag_idx]]
+        )
+        np.testing.assert_allclose(parsed_values, np.array([123, 1391, 12, 123]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 2, 0]))
+        self.assertTrue(np.allclose(parsed_weights, np.array([0.5, 0.3, 0.9, 0.21])))
 
     @parameterized.expand(
         [
