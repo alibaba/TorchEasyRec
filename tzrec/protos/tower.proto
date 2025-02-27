@@ -121,3 +121,32 @@ message DATTower {
     // mlp config
     required MLP mlp = 3;
 }
+
+
+message MINDUserTower {
+    enum UserSeqCombineMethod {
+        CONCAT = 0;
+        SUM = 1;
+    }
+    // user feature group name
+    required string input = 1;
+    // user history group name
+    required string history_input = 2;
+
+    required MLP user_mlp = 3;
+    optional MLP hist_seq_mlp = 4;
+    optional UserSeqCombineMethod user_seq_combine = 5 [default=SUM];
+
+    // capsule config
+    required B2ICapsule capsule_config = 6;
+    // concat mlp config for user interests vector
+    required MLP concat_mlp = 7;
+}
+
+
+message MINDItemTower {
+    // item feature group name
+    required string input = 1;
+    // mlp config
+    required MLP mlp = 2;
+}

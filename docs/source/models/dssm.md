@@ -113,7 +113,7 @@ model_config {
 - negative_sampler：加权随机负采样，会排除Mini-Batch内的Item Id
   - input_path: 负采样Item表, Schema为: id:int64 | weight:float | attrs:string，其中attr默认为":"分隔符拼接的Item特征
   - num_sample: 训练worker的负采样数
-  - num_eval_sampler: 评估worker的负采样数
+  - num_eval_sample: 评估worker的负采样数
   - attr_fields: Item特征名，顺序与Item的attr中特征的拼接顺序保持一致
   - item_id_field: item_id列名
 - negative_sampler_v2：加权随机负采样，会跟排除Mini-Batch内的User有边的Item Id
