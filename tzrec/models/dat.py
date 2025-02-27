@@ -20,7 +20,6 @@ from torch._tensor import Tensor
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
-from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos import model_pb2, tower_pb2
@@ -56,26 +55,23 @@ class DATTower(MatchTower):
         tower_config: tower_pb2.DATTower,
         output_dim: int,
         similarity: match_model_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
-        augment_feature_group: model_pb2.FeatureGroupConfig,
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
-        augment_features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
     ) -> None:
         super().__init__(
-            tower_config, output_dim, similarity, feature_group, features, model_config
+            tower_config, output_dim, similarity, feature_groups, features, model_config
         )
         self.init_input()
-        self._augment_features = augment_features
-        self._augment_feature_group = augment_feature_group
         self._augment_group_name = tower_config.augment_input
-        self.augment_embedding_group = EmbeddingGroup(
-            augment_features, [augment_feature_group]
-        )
+
+        # self.augment_embedding_group = EmbeddingGroup(
+        #     augment_features, [augment_feature_group]
+        # )
 
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
-        tower_augment_feature_in = self.augment_embedding_group.group_total_dim(
-            tower_config.augment_input
+        tower_augment_feature_in = self.embedding_group.group_total_dim(
+            self._augment_group_name
         )
 
         self.mlp = MLP(
@@ -98,10 +94,7 @@ class DATTower(MatchTower):
         """
         grouped_features = self.build_input(batch)
         input_features = grouped_features[self._group_name]
-
-        augmented_feature = self.augment_embedding_group(batch)[
-            self._augment_group_name
-        ]
+        augmented_feature = grouped_features[self._augment_group_name]
 
         output = self.mlp(torch.concat([input_features, augmented_feature], dim=1))
         if self._output_dim > 0:
@@ -164,10 +157,8 @@ class DAT(MatchModel):
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
-            user_augment_group,
-            list(user_features.values()),
-            list(user_augment_features.values()),
+            [user_group, user_augment_group],
+            list(user_features.values()) + list(user_augment_features.values()),
             model_config,
         )
 
@@ -175,10 +166,8 @@ class DAT(MatchModel):
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            item_group,
-            item_augment_group,
-            item_features,
-            item_augment_features,
+            [item_group, item_augment_group],
+            item_features + item_augment_features,
             model_config,
         )
 

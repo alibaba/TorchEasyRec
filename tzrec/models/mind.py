@@ -19,7 +19,6 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.capsule import CapsuleLayer
-from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos import model_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
@@ -44,23 +43,22 @@ class MINDUserTower(MatchTower):
             tower_config,
             output_dim,
             similarity,
-            user_feature_group,
+            [user_feature_group, hist_feature_group],
             user_features + hist_features,
             model_config,
         )
 
         self._hist_group_name = tower_config.history_input
-        self._hist_feature_group = hist_feature_group
-        self._hist_features = hist_features
 
         self.init_input()
 
         user_feature_in = self.embedding_group.group_total_dim(self._group_name)
         self.user_mlp = MLP(user_feature_in, **config_to_kwargs(tower_config.user_mlp))
 
-        hist_feature_dim = self.hist_embedding_group.group_total_dim(
+        hist_feature_dim = self.embedding_group.group_total_dim(
             self._hist_group_name + ".sequence"
         )
+
         if tower_config.hist_seq_mlp:
             self._hist_seq_mlp = MLP(
                 in_features=hist_feature_dim,
@@ -82,27 +80,13 @@ class MINDUserTower(MatchTower):
             **config_to_kwargs(tower_config.concat_mlp),
         )
 
-    def init_input(self) -> None:
-        """Initialize input."""
-        super().init_input()
-        self.hist_embedding_group = EmbeddingGroup(
-            self._hist_features, [self._hist_feature_group]
-        )
-
-    def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Build input."""
-        feature_dict = super().build_input(batch)
-        hist_feature_dict = self.hist_embedding_group(batch)
-        feature_dict.update(hist_feature_dict)
-        return feature_dict
-
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower."""
-        grp_user = self.build_input(batch)
-        grp_hist_seq = grp_user[self._hist_group_name + ".sequence"]
-        grp_hist_len = grp_user[self._hist_group_name + ".sequence_length"]
+        user_feature_dict = self.build_input(batch)
+        grp_hist_seq = user_feature_dict[self._hist_group_name + ".sequence"]
+        grp_hist_len = user_feature_dict[self._hist_group_name + ".sequence_length"]
 
-        user_feature = self.user_mlp(grp_user[self._group_name])
+        user_feature = self.user_mlp(user_feature_dict[self._group_name])
 
         if self._hist_seq_mlp:
             hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)

@@ -54,12 +54,12 @@ class DSSMTower(MatchTower):
         tower_config: tower_pb2.Tower,
         output_dim: int,
         similarity: match_model_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
     ) -> None:
         super().__init__(
-            tower_config, output_dim, similarity, feature_group, features, model_config
+            tower_config, output_dim, similarity, feature_groups, features, model_config
         )
         self.init_input()
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
@@ -121,7 +121,7 @@ class DSSM(MatchModel):
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
+            list(user_group),
             list(user_features.values()),
             model_config,
         )
@@ -130,7 +130,7 @@ class DSSM(MatchModel):
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            item_group,
+            list(item_group),
             item_features,
             model_config,
         )
