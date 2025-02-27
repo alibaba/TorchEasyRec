@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -61,7 +61,7 @@ class MINDUserTower(MatchTower):
         hist_feature_dim = self.hist_embedding_group.group_total_dim(
             self._hist_group_name + ".sequence"
         )
-        if self._tower_config.hist_seq_mlp:
+        if tower_config.hist_seq_mlp:
             self._hist_seq_mlp = MLP(
                 in_features=hist_feature_dim,
                 dim=3,
@@ -89,24 +89,25 @@ class MINDUserTower(MatchTower):
             self._hist_features, [self._hist_feature_group]
         )
 
-    def build_input(self, batch: Batch) -> Tuple[Dict[str, Tensor]]:
+    def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Build input."""
         feature_dict = super().build_input(batch)
         hist_feature_dict = self.hist_embedding_group(batch)
-        return feature_dict, hist_feature_dict
+        feature_dict.update(hist_feature_dict)
+        return feature_dict
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower."""
-        grp_user, grp_hist = self.build_input(batch)
-        grp_hist_seq = grp_hist[self._hist_group_name + ".sequence"]
-        grp_hist_len = grp_hist[self._hist_group_name + ".sequence_length"]
+        grp_user = self.build_input(batch)
+        grp_hist_seq = grp_user[self._hist_group_name + ".sequence"]
+        grp_hist_len = grp_user[self._hist_group_name + ".sequence_length"]
 
         user_feature = self.user_mlp(grp_user[self._group_name])
 
         if self._tower_config.hist_seq_mlp:
             hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
         else:
-            hist_seq_feas = grp_hist[self._hist_group_name]
+            hist_seq_feas = grp_user[self._hist_group_name]
 
         high_capsules = self._capsule_layer(hist_seq_feas, grp_hist_len)
 

@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -17,7 +17,7 @@ from torch import nn
 from tzrec.protos.module_pb2 import B2ICapsule
 
 
-def sequence_mask(lengths: torch.Tensor, max_len: int = None) -> torch.Tensor:
+def sequence_mask(lengths: torch.Tensor, max_len: Optional[int] = None) -> torch.Tensor:
     """Create a boolean mask from sequence lengths.
 
     Args:
@@ -31,8 +31,8 @@ def sequence_mask(lengths: torch.Tensor, max_len: int = None) -> torch.Tensor:
                    and the rest are False.
     """
     if max_len is None:
-        max_len = lengths.max()
-    mask = torch.arange(0, max_len)
+        max_len = int(lengths.max().item())
+    mask = torch.arange(0, max_len).to(lengths.device)
     # symbolic tracing trick
     zeros_padding = torch.zeros_like(lengths).unsqueeze(1).tile(1, max_len)
     mask = mask + zeros_padding  # broadcasting
@@ -81,7 +81,7 @@ class CapsuleLayer(nn.Module):
         )
         return scale_factor * inputs
 
-    def dyanmic_routing(
+    def dynamic_routing(
         self,
         inputs: torch.Tensor,
         seq_mask: torch.Tensor,
@@ -97,7 +97,7 @@ class CapsuleLayer(nn.Module):
             num_iters: int, number of iterations
 
         Return:
-            [batch_size, seq_len, high_dim]
+            [batch_size, max_k, high_dim]
         """
         routing_logits = torch.concat(
             [
@@ -116,6 +116,8 @@ class CapsuleLayer(nn.Module):
         capsule_mask_thresh = (capsule_mask.float() * 2 - 1) * 1e32
 
         low_capsule_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
+
+        assert num_iters > 0, "num_iters should be greater than 0"
         for _ in range(num_iters):
             routing_logits = torch.minimum(routing_logits, capsule_mask_thresh)
             routing_logits = torch.nn.functional.softmax(
@@ -173,7 +175,7 @@ class CapsuleLayer(nn.Module):
         capsule_mask = sequence_mask(n_high_capsules, self._max_k)
         capsule_mask = capsule_mask.to(device)
 
-        user_interests = self.dyanmic_routing(
+        user_interests = self.dynamic_routing(
             inputs, seq_mask, capsule_mask, self._num_iters
         )
         return user_interests
