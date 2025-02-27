@@ -23,7 +23,7 @@ import torch
 
 from tzrec.acc.utils import is_trt_predict
 from tzrec.datasets.dataset import create_reader, create_writer
-from tzrec.datasets.odps_dataset import TYPE_PA_TO_TABLE
+from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
 from tzrec.features.expr_feature import ExprFeature
 from tzrec.features.feature import BaseFeature, FgMode, create_features
@@ -1101,13 +1101,13 @@ def create_predict_data(
                 infer_arrow[name] = column.take([0] * batch_size)
                 infer_json[name] = {
                     "values": [value_list[0]],
-                    "dtype": TYPE_PA_TO_TABLE[column.type],
+                    "dtype": _type_pa_to_table[column.type],
                 }
             else:
                 infer_arrow[name] = column
                 infer_json[name] = {
                     "values": value_list,
-                    "dtype": TYPE_PA_TO_TABLE[column.type],
+                    "dtype": _type_pa_to_table[column.type],
                 }
             if name == item_id:
                 infer_json["item_ids"] = infer_json[name]

@@ -78,7 +78,20 @@ TYPE_TABLE_TO_PA = {
     "MAP<INT,STRING>": pa.map_(pa.int32(), pa.string()),
     "MAP<INT,INT>": pa.map_(pa.int32(), pa.int32()),
 }
-TYPE_PA_TO_TABLE = {v: k for k, v in TYPE_TABLE_TO_PA.items()}
+
+
+def _type_pa_to_table(pa_type: pa.DataType) -> str:
+    """PyArrow type to MaxCompute Table type."""
+    mc_type = None
+    for k, v in TYPE_TABLE_TO_PA.items():
+        # list<element: int64> and list<item: int64> is equal
+        if v == pa_type:
+            mc_type = k
+            break
+    if mc_type:
+        return mc_type
+    else:
+        raise RuntimeError(f"{pa_type} is not supported now.")
 
 
 def _parse_odps_config_file(odps_config_path: str) -> Tuple[str, str, str]:
@@ -517,7 +530,7 @@ class OdpsWriter(BaseWriter):
         """Create output table."""
         schemas = []
         for k, v in output_dict.items():
-            schemas.append(f"{k} {TYPE_PA_TO_TABLE[v.type]}")
+            schemas.append(f"{k} {_type_pa_to_table(v.type)}")
         schema = ",".join(schemas)
         if self._partition_spec:
             pt_schemas = []
