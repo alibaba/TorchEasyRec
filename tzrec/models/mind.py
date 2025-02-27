@@ -104,10 +104,10 @@ class MINDUserTower(MatchTower):
 
         user_feature = self.user_mlp(grp_user[self._group_name])
 
-        if self._tower_config.hist_seq_mlp:
+        if self._hist_seq_mlp:
             hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
         else:
-            hist_seq_feas = grp_user[self._hist_group_name]
+            hist_seq_feas = grp_hist_seq
 
         high_capsules = self._capsule_layer(hist_seq_feas, grp_hist_len)
 

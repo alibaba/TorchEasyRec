@@ -307,9 +307,9 @@ class MatchIntegrationTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(self.test_dir, "export/user"),
-                predict_input_path=os.path.join(self.test_dir, r"user_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "user_emb"),
-                reserved_columns="user_id,click_50_seq__item_id",
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "user_predict_result"),
+                reserved_columns="user_id,click_50_seq__item_id_1,click_50_seq__item_id_2",
                 output_columns="user_tower_emb",
                 test_dir=self.test_dir,
             )

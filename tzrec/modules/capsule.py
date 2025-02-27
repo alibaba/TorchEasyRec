@@ -118,6 +118,7 @@ class CapsuleLayer(nn.Module):
         low_capsule_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
 
         assert num_iters > 0, "num_iters should be greater than 0"
+        high_capsule_vec = torch.Tensor([0])
         for _ in range(num_iters):
             routing_logits = torch.minimum(routing_logits, capsule_mask_thresh)
             routing_logits = torch.nn.functional.softmax(
