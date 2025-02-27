@@ -407,9 +407,9 @@ class EmbeddingGroup(nn.Module):
 
             if emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
-            if emb_impl.has_sparse:
+            if emb_impl.has_sparse or emb_impl.has_mc_sparse:
                 sparse_feat_kjt = batch.sparse_features[key]
-            if emb_impl.has_sparse_user:
+            if emb_impl.has_sparse_user or emb_impl.has_mc_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
 
             result_dicts.append(
@@ -430,11 +430,11 @@ class EmbeddingGroup(nn.Module):
 
             if seq_emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
-            if seq_emb_impl.has_sparse:
+            if seq_emb_impl.has_sparse or seq_emb_impl.has_mc_sparse:
                 sparse_feat_kjt = batch.sparse_features[key]
             if seq_emb_impl.has_mulval_seq:
                 sequence_mulval_length_kjt = batch.sequence_mulval_lengths[key]
-            if seq_emb_impl.has_sparse_user:
+            if seq_emb_impl.has_sparse_user or seq_emb_impl.has_mc_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
             if seq_emb_impl.has_mulval_seq_user:
                 sequence_mulval_length_kjt_user = batch.sequence_mulval_lengths[
