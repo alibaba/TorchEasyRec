@@ -1101,13 +1101,13 @@ def create_predict_data(
                 infer_arrow[name] = column.take([0] * batch_size)
                 infer_json[name] = {
                     "values": [value_list[0]],
-                    "dtype": _type_pa_to_table[column.type],
+                    "dtype": _type_pa_to_table(column.type),
                 }
             else:
                 infer_arrow[name] = column
                 infer_json[name] = {
                     "values": value_list,
-                    "dtype": _type_pa_to_table[column.type],
+                    "dtype": _type_pa_to_table(column.type),
                 }
             if name == item_id:
                 infer_json["item_ids"] = infer_json[name]
