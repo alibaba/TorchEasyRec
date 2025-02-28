@@ -122,7 +122,7 @@ class MINDItemTower(MatchTower):
             tower_config,
             output_dim,
             similarity,
-            item_feature_group,
+            [item_feature_group],
             item_features,
             model_config,
         )

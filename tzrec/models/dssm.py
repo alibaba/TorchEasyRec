@@ -121,7 +121,7 @@ class DSSM(MatchModel):
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            list(user_group),
+            [user_group],
             list(user_features.values()),
             model_config,
         )
@@ -130,7 +130,7 @@ class DSSM(MatchModel):
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            list(item_group),
+            [item_group],
             item_features,
             model_config,
         )
