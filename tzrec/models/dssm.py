@@ -45,7 +45,7 @@ class DSSMTower(MatchTower):
         output_dim (int): user/item output embedding dimension.
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
-        feature_group (FeatureGroupConfig): feature group config.
+        feature_groups (list[FeatureGroupConfig]): feature group configs.
         features (list): list of features.
     """
 
@@ -74,7 +74,7 @@ class DSSMTower(MatchTower):
             batch (Batch): input batch data.
 
         Return:
-            embedding (dict): tower output embedding.
+            embedding (Tensor): tower output embedding.
         """
         grouped_features = self.build_input(batch)
         output = self.mlp(grouped_features[self._group_name])
