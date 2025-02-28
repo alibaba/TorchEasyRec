@@ -317,7 +317,7 @@ class HSTUEncoder(SequenceEncoder):
         self._sequence_length_name = f"{input}.sequence_length"
         max_output_len = max_output_len + 1  # for target
         self.position_embed = nn.Embedding(
-            self._max_seq_length + max_output_len, self._sequence_dim, padding_idx=0
+            self._max_seq_length + max_output_len, self._sequence_dim
         )
         self.dropout_rate = pos_dropout_rate
         self.enable_relative_attention_bias = True
