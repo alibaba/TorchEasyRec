@@ -41,7 +41,13 @@ def sequence_mask(lengths: torch.Tensor, max_len: Optional[int] = None) -> torch
 
 
 class CapsuleLayer(nn.Module):
-    """Capsule layer."""
+    """Capsule layer.
+
+    Args:
+        capsule_config (B2ICapsule): capsule config.
+        input_dim (int): input dimension.
+
+    """
 
     def __init__(
         self, capsule_config: B2ICapsule, input_dim: int, *args: Any, **kwargs: Any
@@ -73,7 +79,14 @@ class CapsuleLayer(nn.Module):
         )  # [ld, hd]
 
     def squash(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Squash inputs over the last dimension."""
+        """Squash inputs over the last dimension.
+
+        Args:
+            inputs: Tensor, shape: [batch_size, max_k, high_dim]
+
+        Return:
+            Tensor, shape: [batch_size, max_k, high_dim]
+        """
         input_norm = torch.linalg.norm(inputs, dim=-1, keepdim=True)
         input_norm_eps = torch.max(input_norm, torch.tensor(1e-7))
         scale_factor = torch.square(input_norm_eps) / (

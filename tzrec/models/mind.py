@@ -26,7 +26,19 @@ from tzrec.utils.config_util import config_to_kwargs
 
 
 class MINDUserTower(MatchTower):
-    """MIND user tower."""
+    """MIND user tower.
+
+    Args:
+        tower_config (Tower): mind user tower config.
+        output_dim (int): user output embedding dimension.
+        similarity (Similarity): when use COSINE similarity,
+            will norm the output embedding.
+        user_feature_group (FeatureGroupConfig): user feature group config.
+        hist_feature_group (FeatureGroupConfig): history sequence feature group config.
+        user_features (list): list of user features.
+        hist_features (list): list of history sequence features.
+        model_config (ModelConfig): model config.
+    """
 
     def __init__(
         self,
@@ -81,7 +93,14 @@ class MINDUserTower(MatchTower):
         )
 
     def forward(self, batch: Batch) -> torch.Tensor:
-        """Forward the tower."""
+        """Forward the tower.
+
+        Args:
+            batch (Batch): input batch data.
+
+        Returns:
+            user_interests (Tensor): user interests.
+        """
         user_feature_dict = self.build_input(batch)
         grp_hist_seq = user_feature_dict[self._hist_group_name + ".sequence"]
         grp_hist_len = user_feature_dict[self._hist_group_name + ".sequence_length"]
@@ -107,7 +126,18 @@ class MINDUserTower(MatchTower):
 
 
 class MINDItemTower(MatchTower):
-    """MIND item tower."""
+    """MIND item tower.
+
+    Args:
+        tower_config (Tower): mind item tower config.
+        output_dim (int): item output embedding dimension.
+        similarity (Similarity): when use COSINE similarity,
+            will norm the output embedding.
+        item_feature_group (FeatureGroupConfig): item feature group config.
+        item_features (list): list of item features.
+        model_config (ModelConfig): model config.
+
+    """
 
     def __init__(
         self,
@@ -131,7 +161,15 @@ class MINDItemTower(MatchTower):
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
 
     def forward(self, batch: Batch) -> torch.Tensor:
-        """Forward the tower."""
+        """Forward the tower.
+
+        Args:
+            batch (Batch): input batch data.
+
+        Return:
+            item_emb (Tensor): item embedding.
+
+        """
         grouped_features = self.build_input(batch)
         item_emb = self.mlp(grouped_features[self._group_name])
 
@@ -141,7 +179,15 @@ class MINDItemTower(MatchTower):
 
 
 class MIND(MatchModel):
-    """MIND model."""
+    """MIND model.
+
+    Args:
+        model_config (ModelConfig): an instance of ModelConfig.
+        features (list): list of features.
+        labels (list): list of label names.
+        sample_weights (list): list of sample weight names.
+
+    """
 
     def __init__(
         self,
@@ -186,7 +232,15 @@ class MIND(MatchModel):
         user_interests: torch.Tensor,
         item_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute label-aware attention for user interests."""
+        """Compute label-aware attention for user interests.
+
+        Args:
+            user_interests (Tensor): user interests.
+            item_emb (Tensor): item embedding.
+
+        Returns:
+            user_emb (Tensor): user embedding.
+        """
         batch_size = user_interests.size(0)
         pos_item_emb = item_emb[:batch_size]
 
@@ -201,7 +255,15 @@ class MIND(MatchModel):
         return user_emb
 
     def predict(self, batch: Batch) -> Dict[str, Tensor]:
-        """Forward the model."""
+        """Forward the model.
+
+        Args:
+            batch (Batch): input batch data.
+
+        Returns:
+            simi (dict): a dict of predicted result.
+
+        """
         user_interests = self.user_tower(batch)
         item_emb = self.item_tower(batch)
 
