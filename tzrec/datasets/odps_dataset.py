@@ -46,11 +46,6 @@ from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 
-
-class OdpsReadSessionExpired(Exception):
-    """Odps read session expired exception."""
-
-
 ODPS_READ_SESSION_EXPIRED_TIME = 23 * 3600
 
 TYPE_TABLE_TO_PA = {
@@ -305,10 +300,14 @@ def _reader_iter(
         while True:
             try:
                 if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
-                    raise OdpsReadSessionExpired
+                    if worker_id == 0:
+                        client.get_read_session(
+                            SessionRequest(sess_req.session_id, refresh=True)
+                        )
+                    start_time = time.time()
                 read_data = reader.read()
                 retry_cnt = 0
-            except (urllib3.exceptions.HTTPError, OdpsReadSessionExpired) as e:
+            except urllib3.exceptions.HTTPError as e:
                 if retry_cnt >= max_retry_count:
                     raise e
                 retry_cnt += 1
@@ -319,7 +318,6 @@ def _reader_iter(
                     max_batch_rows=min(batch_size, 20000),
                 )
                 reader = _read_rows_arrow_with_retry(client, read_req)
-                start_time = time.time()
                 continue
             if read_data is None:
                 break
@@ -469,7 +467,7 @@ class OdpsReader(BaseReader):
             if dist.is_initialized():
                 dist.broadcast_object_list(session_ids)
             self._input_to_sess[input_path] = [
-                SessionRequest(session_id=x, refresh=True) for x in session_ids
+                SessionRequest(session_id=x) for x in session_ids
             ]
 
     def _iter_one_table(
