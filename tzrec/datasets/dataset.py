@@ -245,11 +245,28 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._sampler:
             return self._sampler._cluster
 
+    def _remove_nullable(self,field_type):
+        """
+        递归移除 list 和嵌套 list 中的 nullable=False 属性。
+        """
+        # 如果是列表类型，递归移除元素类型的 nullable 属性
+        if isinstance(field_type, pa.ListType):
+            # 获取元素字段
+            value_field = field_type.value_field
+            # 修改 nullable 属性为 True
+            normalized_value_field = value_field.with_nullable(True)
+            # 递归处理元素类型
+            normalized_value_type = self._remove_nullable(normalized_value_field.type)
+            # 构造新的 list 类型
+            return pa.list_(normalized_value_type)
+
+        else:
+            return field_type
     def _init_input_fields(self) -> None:
         """Init input fields info."""
         self._input_fields = []
         for field in self._reader.schema:
-            if any(map(lambda x: x == field.type, AVAILABLE_PA_TYPES)):
+            if any(map(lambda x: x == self._remove_nullable(field.type), AVAILABLE_PA_TYPES)):
                 self._input_fields.append(field)
             else:
                 raise ValueError(
