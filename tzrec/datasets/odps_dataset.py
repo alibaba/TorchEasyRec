@@ -46,7 +46,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 
-ODPS_READ_SESSION_EXPIRED_TIME = 23 * 3600
+ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
