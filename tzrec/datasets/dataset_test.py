@@ -545,6 +545,60 @@ class DatasetTest(unittest.TestCase):
         )
         self.assertEqual(batch.labels["label"].size(), (40,))
 
+    def test_dataset_with_new_list_dtype(self):
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="str_c", type=pa.string()),
+            pa.field(name="label", type=pa.int32()),
+            pa.field(name="list_str_d", type=pa.list_(pa.string()),nullable=False),  # 新增的数据类型
+            pa.field(name="list_list_str_e", type=pa.list_(pa.field('list_str_e', pa.string(),nullable=False)),nullable=False) # 新增的数据类型
+
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="list_str_d")  # 新增的数据类型
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="list_list_str_e")  # 新增的数据类型
+            ),
+        ]
+        features = create_features(feature_cfgs)
+
+        dataloader = DataLoader(
+            dataset=_TestDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=4,
+                    dataset_type=data_pb2.DatasetType.OdpsDataset,
+                    fg_encoded=True,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path="",
+                input_fields=input_fields,
+            ),
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+        self.assertIn("list_str_d", batch.dense_features[BASE_DATA_GROUP].keys())
+        self.assertEqual(batch.dense_features[BASE_DATA_GROUP]["list_str_d"].size(), (4,1))
+        self.assertIn("list_list_str_e", batch.dense_features[BASE_DATA_GROUP].keys())
+        self.assertEqual(batch.dense_features[BASE_DATA_GROUP]["list_list_str_e"].size(), (4,1))
+
+
 
 if __name__ == "__main__":
     unittest.main()
