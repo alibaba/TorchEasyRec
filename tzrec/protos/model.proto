@@ -4,6 +4,7 @@ package tzrec.protos;
 import "tzrec/protos/models/rank_model.proto";
 import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
+import "tzrec/protos/models/general_rank_model.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
@@ -53,6 +54,8 @@ message ModelConfig {
         TDM tdm = 400;
 
         MultiTowerDINTRT multi_tower_din_trt =500;
+
+        RocketLaunching rocket_launching = 600;
     }
 
     optional uint32 num_class = 2 [default = 1];
