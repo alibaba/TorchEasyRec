@@ -50,6 +50,7 @@ message ModelConfig {
         DSSMV2 dssm_v2 = 302;
         DAT dat = 303;
         HSTUMatch hstu_match = 304;
+        MIND mind = 305;
 
         TDM tdm = 400;
 
