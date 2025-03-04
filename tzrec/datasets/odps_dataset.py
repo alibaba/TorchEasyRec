@@ -334,6 +334,7 @@ def _refresh_sessions_daemon(client: StorageApiArrowClient, session_ids: List[st
         if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
             for session_id in session_ids:
                 client.get_read_session(SessionRequest(session_id, refresh=True))
+            start_time = time.time()
         time.sleep(5)
 
 
