@@ -247,17 +247,17 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
     def _remove_nullable(self,field_type):
         """
-        递归移除 list 和嵌套 list 中的 nullable=False 属性。
+        Recursive removal of the null=False property from lists and nested lists.
         """
-        # 如果是列表类型，递归移除元素类型的 nullable 属性
+        # If it is a list type, recursively remove the null attribute of the element type
         if isinstance(field_type, pa.ListType):
-            # 获取元素字段
+            # Get element fields
             value_field = field_type.value_field
-            # 修改 nullable 属性为 True
+            # Change the nullable to True
             normalized_value_field = value_field.with_nullable(True)
-            # 递归处理元素类型
+            # Recursive processing of element types
             normalized_value_type = self._remove_nullable(normalized_value_field.type)
-            # 构造新的 list 类型
+            # Construct a new list type
             return pa.list_(normalized_value_type)
 
         else:
