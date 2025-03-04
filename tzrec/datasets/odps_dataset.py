@@ -12,6 +12,7 @@
 
 import os
 import random
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -46,7 +47,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 
-ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
+ODPS_READ_SESSION_EXPIRED_TIME = 12 * 3600 + 5 * 60
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
@@ -327,6 +328,15 @@ def _reader_iter(
             yield read_data
 
 
+def _refresh_sessions_daemon(client: StorageApiArrowClient, session_ids: List[str]):
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
+            for session_id in session_ids:
+                client.get_read_session(SessionRequest(session_id, refresh=True))
+        time.sleep(5)
+
+
 class OdpsDataset(BaseDataset):
     """Dataset for reading data in Odps(Maxcompute).
 
@@ -464,6 +474,17 @@ class OdpsReader(BaseReader):
                     session_ids.append(scan_resp.session_id)
                 else:
                     session_ids.append(None)
+            if int(os.environ.get("RANK", 0)) == 0:
+                # refresh session
+                t = threading.Thread(
+                    target=_refresh_sessions_daemon,
+                    args=(
+                        client,
+                        session_ids,
+                    ),
+                    daemon=True,
+                )
+                t.start()
             if dist.is_initialized():
                 dist.broadcast_object_list(session_ids)
             self._input_to_sess[input_path] = [
