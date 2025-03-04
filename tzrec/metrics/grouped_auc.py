@@ -10,26 +10,46 @@
 # limitations under the License.
 
 
-from typing import Any
+import os
+from typing import Any, List
 
 import torch
 from torchmetrics import Metric
 from torchmetrics.functional.classification.auroc import _binary_auroc_compute
-from torchmetrics.utilities.data import dim_zero_cat
+
+
+def custom_reduce_fx(data_list: List[torch.Tensor]) -> torch.Tensor:
+    """Custom reduce func for distributed training. Distribute data to different GPUs.
+
+    Args:
+            data_list (list): list of tensors,
+                    each tensor is a 2d-tensor of shape (3, num_samples).
+
+    Returns:
+            Tensor: a 2d-tensor of shape (3, num_samples_on_one_gpu).
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("RANK", 0))
+
+    data_list_reduce = []
+    for data in data_list:
+        key_mask = data[2, :] % world_size == local_rank
+        pred_selected = torch.masked_select(data[0, :], key_mask)
+        target_selected = torch.masked_select(data[1, :], key_mask)
+        key_selected = torch.masked_select(data[2, :], key_mask)
+        data_list_reduce.append(
+            torch.stack([pred_selected, target_selected, key_selected])
+        )
+    return torch.cat(data_list_reduce, dim=1)
 
 
 class GroupedAUC(Metric):
-    """Grouped AUC.
-
-    Args:
-        top_k (int): k for @k metric, calculate top k predictions relevance.
-    """
+    """Grouped AUC."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.add_state("preds", default=[], dist_reduce_fx="cat")
-        self.add_state("target", default=[], dist_reduce_fx="cat")
-        self.add_state("grouping_key", default=[], dist_reduce_fx="cat")
+
+        self.add_state("eval_data", default=[], dist_reduce_fx=custom_reduce_fx)
 
     # pyre-ignore [14]
     def update(
@@ -42,18 +62,15 @@ class GroupedAUC(Metric):
             target (Tensor): a integer 1d-tensor of target.
             grouping_key (Tensor): a integer 1d-tensor with group id.
         """
-        self.preds.append(preds)
-        self.target.append(target)
-        self.grouping_key.append(grouping_key)
+        self.eval_data.append(torch.stack([preds, target, grouping_key]))
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
-        # pyre-ignore [6]
-        grouping_key = dim_zero_cat(self.grouping_key)
-        # pyre-ignore [6]
-        preds = dim_zero_cat(self.preds)
-        # pyre-ignore [6]
-        target = dim_zero_cat(self.target)
+        preds, target, grouping_key = (
+            self.eval_data[0, :],
+            self.eval_data[1, :],
+            self.eval_data[2, :],
+        )
 
         sorted_grouping_key, indices = torch.sort(grouping_key)
         sorted_preds = preds[indices]
@@ -70,5 +87,5 @@ class GroupedAUC(Metric):
             mean_target = torch.mean(target.to(torch.float32)).item()
             if mean_target > 0 and mean_target < 1:
                 aucs.append(_binary_auroc_compute((preds, target), None))
-
-        return torch.mean(torch.Tensor(aucs))
+        mean_gauc = torch.mean(torch.Tensor(aucs))
+        return mean_gauc
