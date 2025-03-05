@@ -84,9 +84,10 @@ TYPE_TABLE_TO_PA = {
 def _type_pa_to_table(pa_type: pa.DataType) -> str:
     """PyArrow type to MaxCompute Table type."""
     mc_type = None
+    pa_type = remove_nullable(pa_type)
     for k, v in TYPE_TABLE_TO_PA.items():
         # list<element: int64> and list<item: int64> is equal
-        if v == remove_nullable(pa_type):
+        if v == pa_type:
             mc_type = k
             break
     if mc_type:
