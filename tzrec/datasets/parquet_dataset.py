@@ -26,6 +26,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import calc_slice_position
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils.logging_util import logger
 
 
 def _reader_iter(
@@ -34,6 +35,7 @@ def _reader_iter(
     parquet_metas: List[parquet.FileMetaData],
     start: int,
     end: int,
+    worker_id: int,
 ) -> Iterator[pa.RecordBatch]:
     cnt = 0
     for input_file in input_files:
@@ -56,10 +58,19 @@ def _reader_iter(
 
             row_groups = list(range(i, metadata.num_row_groups))
             parquet_file = parquet.ParquetFile(input_file)
-            for batch in parquet_file.iter_batches(batch_size, row_groups=row_groups):
+            for batch in parquet_file.iter_batches(
+                batch_size, row_groups=row_groups, use_threads=False
+            ):
                 if cnt + len(batch) <= start:
-                    continue
-                elif cnt < start:
+                    logger.debug(
+                        f"worker {worker_id} skip batch. "
+                        f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
+                    )
+                elif cnt <= start:
+                    logger.debug(
+                        f"worker {worker_id} yield start batch. "
+                        f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
+                    )
                     yield batch[start - cnt :]
                 elif cnt + len(batch) > end:
                     yield batch[: end - cnt]
@@ -202,7 +213,12 @@ class ParquetReader(BaseReader):
 
         if len(self._input_files) > 0:
             reader = _reader_iter(
-                self._input_files, self._batch_size, self._parquet_metas, start, end
+                self._input_files,
+                self._batch_size,
+                self._parquet_metas,
+                start,
+                end,
+                worker_id,
             )
             yield from self._arrow_reader_iter(reader)
 
