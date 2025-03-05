@@ -292,21 +292,6 @@ def _evaluate(
 
     metric_result = _model.compute_metric()
 
-    # gather metric data across processes
-    if dist.get_world_size() > 1:
-        gather_metric_list = {}
-        for k, v in metric_result.items():
-            gather_metric_list[k] = [
-                torch.empty_like(v.cuda())
-                if dist.get_backend() == "nccl"
-                else torch.empty_like(v)
-                for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(
-                gather_metric_list[k], v.cuda() if dist.get_backend() == "nccl" else v
-            )
-            metric_result[k] = torch.mean(torch.stack(gather_metric_list[k]))
-
     if is_rank_zero:
         metric_str = " ".join([f"{k}:{v:0.6f}" for k, v in metric_result.items()])
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
