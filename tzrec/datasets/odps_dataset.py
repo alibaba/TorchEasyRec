@@ -45,6 +45,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+from tzrec.datasets.utils import remove_nullable
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
@@ -85,7 +86,7 @@ def _type_pa_to_table(pa_type: pa.DataType) -> str:
     mc_type = None
     for k, v in TYPE_TABLE_TO_PA.items():
         # list<element: int64> and list<item: int64> is equal
-        if v == pa_type:
+        if v == remove_nullable(pa_type):
             mc_type = k
             break
     if mc_type:
