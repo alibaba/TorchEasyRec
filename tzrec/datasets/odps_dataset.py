@@ -46,6 +46,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+from tzrec.utils.logging_util import logger
 
 ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
 
@@ -328,11 +329,12 @@ def _reader_iter(
             yield read_data
 
 
-def _refresh_sessions_daemon(client: StorageApiArrowClient, session_ids: List[str]):
+def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
     start_time = time.time()
     while True:
         if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
-            for session_id in session_ids:
+            for session_id, client in sess_id_to_cli.items():
+                logger.info(f"refresh session: {session_id}")
                 client.get_read_session(SessionRequest(session_id, refresh=True))
             start_time = time.time()
         time.sleep(5)
@@ -456,6 +458,7 @@ class OdpsReader(BaseReader):
 
     def _init_session(self) -> None:
         """Init table scan session."""
+        sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             session_ids = []
             _, table_name, partitions = _parse_table_path(input_path)
@@ -473,24 +476,23 @@ class OdpsReader(BaseReader):
                     )
                     scan_resp = client.create_read_session(scan_req)
                     session_ids.append(scan_resp.session_id)
+                    sess_id_to_cli[scan_resp.session_id] = client
                 else:
                     session_ids.append(None)
-            if int(os.environ.get("RANK", 0)) == 0:
-                # refresh session
-                t = threading.Thread(
-                    target=_refresh_sessions_daemon,
-                    args=(
-                        client,
-                        session_ids,
-                    ),
-                    daemon=True,
-                )
-                t.start()
+
             if dist.is_initialized():
                 dist.broadcast_object_list(session_ids)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
+        # refresh session
+        if int(os.environ.get("RANK", 0)) == 0:
+            t = threading.Thread(
+                target=_refresh_sessions_daemon,
+                args=(sess_id_to_cli,),
+                daemon=True,
+            )
+            t.start()
 
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
