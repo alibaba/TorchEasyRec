@@ -20,8 +20,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.capsule import CapsuleLayer
 from tzrec.modules.mlp import MLP
-from tzrec.protos import model_pb2, tower_pb2
-from tzrec.protos.models import match_model_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -44,7 +43,7 @@ class MINDUserTower(MatchTower):
         self,
         tower_config: tower_pb2.MINDUserTower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         user_feature_group: model_pb2.FeatureGroupConfig,
         hist_feature_group: model_pb2.FeatureGroupConfig,
         user_features: List[BaseFeature],
@@ -120,7 +119,7 @@ class MINDUserTower(MatchTower):
         user_interests = torch.cat([user_feature_tile, high_capsules], dim=-1)
         user_interests = self._concat_mlp(user_interests)
 
-        if self._similarity == match_model_pb2.Similarity.COSINE:
+        if self._similarity == simi_pb2.Similarity.COSINE:
             user_interests = F.normalize(user_interests, p=2.0, dim=-1)
         return user_interests
 
@@ -143,7 +142,7 @@ class MINDItemTower(MatchTower):
         self,
         tower_config: tower_pb2.MINDItemTower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         item_feature_group: model_pb2.FeatureGroupConfig,
         item_features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
@@ -173,7 +172,7 @@ class MINDItemTower(MatchTower):
         grouped_features = self.build_input(batch)
         item_emb = self.mlp(grouped_features[self._group_name])
 
-        if self._similarity == match_model_pb2.Similarity.COSINE:
+        if self._similarity == simi_pb2.Similarity.COSINE:
             item_emb = F.normalize(item_emb, p=2.0, dim=1)
         return item_emb
 

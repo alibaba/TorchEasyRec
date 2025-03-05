@@ -21,11 +21,10 @@ from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
-from tzrec.protos import model_pb2, tower_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -67,7 +66,7 @@ class MatchTower(nn.Module):
             tower_pb2.MINDItemTower,
         ],
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
@@ -145,7 +144,7 @@ class MatchTowerWoEG(nn.Module):
         self,
         tower_config: tower_pb2.Tower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
     ) -> None:

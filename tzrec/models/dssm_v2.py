@@ -22,8 +22,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
-from tzrec.protos import model_pb2, tower_pb2
-from tzrec.protos.models import match_model_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -44,7 +43,7 @@ class DSSMTower(MatchTowerWoEG):
         self,
         tower_config: tower_pb2.Tower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         feature_group_dims: List[int],
         features: List[BaseFeature],
@@ -67,7 +66,7 @@ class DSSMTower(MatchTowerWoEG):
         output = self.mlp(feature)
         if self._output_dim > 0:
             output = self.output(output)
-        if self._similarity == match_model_pb2.Similarity.COSINE:
+        if self._similarity == simi_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
         return output
 

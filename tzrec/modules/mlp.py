@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import nn
@@ -85,6 +85,7 @@ class MLP(nn.Module):
         use_bn (bool): use batch_norm or not.
         dropout_ratio (float|list, optional): dropout ratio of each layer.
         dim (int): input dims.
+        hidden_layer_feature_output (bool): output hidden layer or not.
     """
 
     def __init__(
@@ -95,11 +96,13 @@ class MLP(nn.Module):
         use_bn: bool = False,
         dropout_ratio: Optional[Union[List[float], float]] = None,
         dim: int = 2,
+        hidden_layer_feature_output: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_units = hidden_units
         self.activation = activation
         self.use_bn = use_bn
+        self.hidden_layer_feature_output = hidden_layer_feature_output
 
         if dropout_ratio is None:
             dropout_ratio = [0.0] * len(hidden_units)
@@ -117,24 +120,41 @@ class MLP(nn.Module):
             dropout_ratio = [dropout_ratio] * len(hidden_units)
         self.dropout_ratio = dropout_ratio
 
-        self.mlp = nn.Sequential(
-            *[
+        self.mlp = nn.ModuleList()
+        for i in range(len(hidden_units)):
+            if i == 0:
+                in_features = in_features
+            else:
+                in_features = hidden_units[i - 1]
+            self.mlp.append(
                 Perceptron(
-                    in_features=in_features if i == 0 else hidden_units[i - 1],
+                    in_features=in_features,
                     out_features=hidden_units[i],
                     activation=activation,
                     use_bn=use_bn,
                     dropout_ratio=dropout_ratio[i],
                     dim=dim,
                 )
-                for i in range(len(hidden_units))
-            ]
-        )
+            )
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
         return self.hidden_units[-1]
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input: torch.Tensor
+    ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
         """Forward the module."""
-        return self.mlp(input)
+        net = input
+        hidden_feature_dict = {}
+        for i, tmp_mlp in enumerate(self.mlp):
+            net = tmp_mlp(net)
+            if self.hidden_layer_feature_output:
+                hidden_feature_dict["hidden_layer" + str(i)] = net
+                if i + 1 == len(self.mlp):
+                    hidden_feature_dict["hidden_layer_end"] = net
+
+        if self.hidden_layer_feature_output:
+            return hidden_feature_dict
+        else:
+            return net

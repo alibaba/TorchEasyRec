@@ -22,8 +22,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import div_no_nan
-from tzrec.protos import model_pb2, tower_pb2
-from tzrec.protos.models import match_model_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -54,7 +53,7 @@ class DATTower(MatchTower):
         self,
         tower_config: tower_pb2.DATTower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
@@ -99,7 +98,7 @@ class DATTower(MatchTower):
         output = self.mlp(torch.concat([input_features, augmented_feature], dim=1))
         if self._output_dim > 0:
             output = self.output(output)
-        if self._similarity == match_model_pb2.Similarity.COSINE:
+        if self._similarity == simi_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
 
         if self.training:
