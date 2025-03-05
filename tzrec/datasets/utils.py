@@ -265,7 +265,7 @@ class Batch(Pipelineable):
         return tensor_dict
 
 
-def remove_nullable(field_type):
+def remove_nullable(field_type: pa.DataType) -> pa.DataType
     """Recursive removal of the null=False property from lists and nested lists."""
     if pa.is_list_(field_type):
         # Get element fields
