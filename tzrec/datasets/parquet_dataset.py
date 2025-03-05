@@ -14,7 +14,8 @@ import glob
 import os
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 from pyarrow import parquet
@@ -69,6 +70,13 @@ def _reader_iter(
                 if cnt >= end:
                     break
             parquet_file.close()
+
+
+def _get_metadata(input_file: str) -> Tuple[str, parquet.FileMetaData]:
+    parquet_file = parquet.ParquetFile(input_file)
+    metadata = parquet_file.metadata
+    parquet_file.close()
+    return input_file, metadata
 
 
 class ParquetDataset(BaseDataset):
@@ -160,13 +168,14 @@ class ParquetReader(BaseReader):
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+        # get parquet metadata
         self._parquet_metas = {}
         parquet_metas_per_rank = {}
-        for input_file in self._input_files[rank::world_size]:
-            parquet_file = parquet.ParquetFile(input_file)
-            parquet_metas_per_rank[input_file] = parquet_file.metadata
-            parquet_file.close()
-
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            for k, v in executor.map(
+                _get_metadata, self._input_files[rank::world_size]
+            ):
+                parquet_metas_per_rank[k] = v
         if dist.is_initialized():
             parquet_metas_list = [None] * world_size
             dist.all_gather_object(parquet_metas_list, parquet_metas_per_rank)
