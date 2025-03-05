@@ -17,7 +17,6 @@ import numpy as np
 import pyarrow as pa
 from torch import distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
-from tzrec.datasets.utils import remove_nullable
 
 from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
@@ -27,6 +26,7 @@ from tzrec.datasets.utils import (
     C_SAMPLE_MASK,
     Batch,
     RecordBatchTensor,
+    remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2

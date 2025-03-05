@@ -264,6 +264,7 @@ class Batch(Pipelineable):
             tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
         return tensor_dict
 
+
 def remove_nullable(field_type):
     """Recursive removal of the null=False property from lists and nested lists."""
     if pa.is_list_(field_type):

@@ -42,10 +42,10 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.utils import remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
-from tzrec.datasets.utils import remove_nullable
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
