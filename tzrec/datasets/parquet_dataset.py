@@ -33,6 +33,7 @@ def _reader_iter(
     input_files: List[str],
     batch_size: int,
     parquet_metas: List[parquet.FileMetaData],
+    columns: Optional[List[str]],
     start: int,
     end: int,
     worker_id: int,
@@ -59,7 +60,7 @@ def _reader_iter(
             row_groups = list(range(i, metadata.num_row_groups))
             parquet_file = parquet.ParquetFile(input_file)
             for batch in parquet_file.iter_batches(
-                batch_size, row_groups=row_groups, use_threads=False
+                batch_size, row_groups=row_groups, columns=columns, use_threads=False
             ):
                 if cnt + len(batch) <= start:
                     logger.debug(
@@ -216,6 +217,7 @@ class ParquetReader(BaseReader):
                 self._input_files,
                 self._batch_size,
                 self._parquet_metas,
+                self._ordered_cols,
                 start,
                 end,
                 worker_id,
