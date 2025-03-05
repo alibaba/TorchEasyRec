@@ -64,12 +64,12 @@ class GroupedAUC(Metric):
         """
         self.eval_data.append(torch.stack([preds, target, grouping_key]))
 
-    # pyre-ignore [14]
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
         if isinstance(self.eval_data, list):  # compatible with cpu mode
             self.eval_data = torch.cat(self.eval_data, dim=1)
 
+        # pyre-ignore [6]
         preds, target, grouping_key = (
             self.eval_data[0, :],
             self.eval_data[1, :],
