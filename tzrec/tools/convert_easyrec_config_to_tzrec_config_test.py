@@ -455,7 +455,6 @@ TRAIN_CONFIG = """train_config {
 DATA_CONFIG = """data_config {
   batch_size: 4096
   dataset_type: OdpsDataset
-  fg_encoded: true
   label_fields: "is_click_cover"
   label_fields: "is_click_video"
   num_workers: 8
@@ -589,6 +588,129 @@ feature_configs {
 }
 """
 
+FEATURE_CONFIG_NO_FG = """feature_configs {
+  id_feature {
+    feature_name: "user_id"
+    expression: "user:user_id"
+    embedding_dim: 4
+    hash_bucket_size: 1000
+  }
+}
+feature_configs {
+  id_feature {
+    feature_name: "item_id"
+    expression: "user:item_id"
+    embedding_dim: 24
+    hash_bucket_size: 1500000
+  }
+}
+feature_configs {
+  id_feature {
+    feature_name: "user_blue_level"
+    expression: "user:user_blue_level"
+    embedding_dim: 4
+    hash_bucket_size: 140
+  }
+}
+feature_configs {
+  id_feature {
+    feature_name: "host_price_level"
+    expression: "user:host_price_level"
+    embedding_dim: 8
+    hash_bucket_size: 180
+  }
+}
+feature_configs {
+  sequence_id_feature {
+    feature_name: "user_video_sequence"
+    expression: "user:user_video_sequence"
+    sequence_length: 1
+    sequence_delim: ","
+    embedding_dim: 24
+    hash_bucket_size: 1500000
+  }
+}
+feature_configs {
+  raw_feature {
+    feature_name: "item__kv_user_blue_level_exposure_cnt_7d"
+    expression: "user:item__kv_user_blue_level_exposure_cnt_7d"
+    embedding_dim: 4
+    boundaries: 1e-08
+    boundaries: 47.0
+    boundaries: 285.0
+    boundaries: 672.0
+    boundaries: 1186.0
+    boundaries: 1853.0
+    boundaries: 2716.0
+    boundaries: 3861.0
+    boundaries: 5459.0
+    boundaries: 7817.0
+    boundaries: 11722.0
+    boundaries: 19513.0
+    boundaries: 43334.0
+  }
+}
+feature_configs {
+  lookup_feature {
+    feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
+    map: "user:item__kv_user_blue_level_click_focus_cnt_7d"
+    key: "user:user_blue_level"
+    embedding_dim: 4
+    boundaries: 1e-08
+    boundaries: 1.0
+    boundaries: 2.0
+    boundaries: 5.0
+    boundaries: 8.0
+    boundaries: 13.0
+    boundaries: 19.0
+    boundaries: 28.0
+    boundaries: 42.0
+    boundaries: 67.0
+    boundaries: 123.0
+    boundaries: 298.0
+  }
+}
+feature_configs {
+  combo_feature {
+    feature_name: "combo_user_blue_level_x_host_price_level"
+    expression: "user:user_blue_level"
+    expression: "user:host_price_level"
+    embedding_dim: 4
+    hash_bucket_size: 140
+  }
+}
+feature_configs {
+  raw_feature {
+    feature_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    expression: "user:item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+  }
+}
+feature_configs {
+  sequence_id_feature {
+    feature_name: "click_100_seq__item_id"
+    expression: "user:click_100_seq__item_id"
+    sequence_length: 1
+    sequence_delim: ";"
+    embedding_dim: 24
+    hash_bucket_size: 1500000
+  }
+}
+feature_configs {
+  sequence_raw_feature {
+    feature_name: "click_100_seq__ts"
+    expression: "user:click_100_seq__ts"
+    sequence_length: 1
+    sequence_delim: ";"
+    embedding_dim: 4
+    boundaries: 1e-08
+    boundaries: 3.0
+    boundaries: 25.0
+    boundaries: 70.0
+  }
+}
+"""
+
+
 MODEL_CONFIG = """model_config {
   feature_groups {
     group_name: "all"
@@ -704,28 +826,35 @@ class ConvertConfigTest(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_create_train_config(self):
-        convert = ConvertConfig(self.easyrec_path, self.fg_path, self.tzrec_path)
+        convert = ConvertConfig(self.easyrec_path, self.tzrec_path, self.fg_path)
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert._create_train_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, TRAIN_CONFIG)
 
     def test_create_data_config(self):
-        convert = ConvertConfig(self.easyrec_path, self.fg_path, self.tzrec_path)
+        convert = ConvertConfig(self.easyrec_path, self.tzrec_path, self.fg_path)
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert._create_data_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, DATA_CONFIG)
 
     def test_create_feature_config(self):
-        convert = ConvertConfig(self.easyrec_path, self.fg_path, self.tzrec_path)
+        convert = ConvertConfig(self.easyrec_path, self.tzrec_path, self.fg_path)
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert._create_feature_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, FEATURE_CONFIG)
 
+    def test_create_feature_config_no_fg(self):
+        convert = ConvertConfig(self.easyrec_path, self.tzrec_path)
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert._create_feature_config_no_fg(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, FEATURE_CONFIG_NO_FG)
+
     def test_create_model_config(self):
-        convert = ConvertConfig(self.easyrec_path, self.fg_path, self.tzrec_path)
+        convert = ConvertConfig(self.easyrec_path, self.tzrec_path, self.fg_path)
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)

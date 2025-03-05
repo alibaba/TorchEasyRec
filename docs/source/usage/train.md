@@ -18,7 +18,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --eval_input_path: 评估数据的输入路径
 - --continue_train: 是否增量训练
 - --fine_tune_checkpoint: 增量训练的checkpoint路径，如experiments/multi_tower_din_taobao_local/model.ckpt-0，如果不设置，增量训练使用model_dir下最近的检查点
-- --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs\[0\].raw_feature.boundaries":\[4,5,6,7\]}
+- --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs[0].raw_feature.boundaries":[4,5,6,7]}
 
 ### 环境变量
 
@@ -61,6 +61,7 @@ LR策略可以支持按epoch更新或者按step更新
 - num_steps: 训练的步数，不能跟num_epochs同时设置
 - num_epochs: 训练的epoch数
 - save_checkpoints_steps: 保存模型的步数间隔，保存模型后会做一次评估
+- save_checkpoints_epochs: 保存模型的Epoch数间隔，保存模型后会做一次评估，与save_checkpoints_steps不能同时设置
 - fine_tune_checkpoint: 增量训练的checkpoint路径，也可以设置checkpoint目录，将会使用目录下最新的checkpoint
 - fine_tune_ckpt_var_map: 需要restore的参数列表文件路径，文件的每一行是{variable_name in current model}\\t{variable name in old model ckpt}
   - 需要设置fine_tune_ckpt_var_map的情形:

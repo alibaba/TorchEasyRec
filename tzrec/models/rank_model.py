@@ -9,18 +9,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torchmetrics
 from torch import nn
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch, Optional
+from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
@@ -42,6 +43,7 @@ class RankModel(BaseModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
@@ -49,10 +51,15 @@ class RankModel(BaseModel):
         model_config: model_pb2.ModelConfig,
         features: List[BaseFeature],
         labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0]
+        self._sample_weight_name = (
+            sample_weights[0] if sample_weights else sample_weights
+        )
         self._loss_collection = {}
         self.embedding_group = None
         self.group_variational_dropouts = None
@@ -115,9 +122,9 @@ class RankModel(BaseModel):
             predictions["logits" + suffix] = output
             predictions["probs" + suffix] = torch.sigmoid(output)
         elif loss_type == "softmax_cross_entropy":
-            assert (
-                num_class > 1
-            ), f"num_class must be greater than 1 when loss type is {loss_type}"
+            assert num_class > 1, (
+                f"num_class must be greater than 1 when loss type is {loss_type}"
+            )
             probs = torch.softmax(output, dim=1)
             predictions["logits" + suffix] = output
             predictions["probs" + suffix] = probs
@@ -146,34 +153,40 @@ class RankModel(BaseModel):
         return predictions
 
     def _init_loss_impl(
-        self, loss_cfg: LossConfig, num_class: int = 1, suffix: str = ""
+        self,
+        loss_cfg: LossConfig,
+        num_class: int = 1,
+        reduction: str = "none",
+        suffix: str = "",
     ) -> None:
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
         if loss_type == "binary_cross_entropy":
-            self._loss_modules[loss_name] = nn.BCEWithLogitsLoss()
+            self._loss_modules[loss_name] = nn.BCEWithLogitsLoss(reduction=reduction)
         elif loss_type == "softmax_cross_entropy":
-            self._loss_modules[loss_name] = nn.CrossEntropyLoss()
+            self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
         elif loss_type == "jrc_loss":
             assert num_class == 2, f"num_class must be 2 when loss type is {loss_type}"
             self._loss_modules[loss_name] = JRCLoss(
-                alpha=loss_cfg.jrc_loss.alpha,
+                alpha=loss_cfg.jrc_loss.alpha, reduction=reduction
             )
         elif loss_type == "l2_loss":
-            self._loss_modules[loss_name] = nn.MSELoss()
+            self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
         for loss_cfg in self._base_model_config.losses:
-            self._init_loss_impl(loss_cfg, self._num_class)
+            reduction = "none" if self._sample_weight_name else "mean"
+            self._init_loss_impl(loss_cfg, self._num_class, reduction=reduction)
 
     def _loss_impl(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
         label_name: str,
+        loss_weight: Optional[torch.Tensor],
         loss_cfg: LossConfig,
         num_class: int = 1,
         suffix: str = "",
@@ -202,6 +215,8 @@ class RankModel(BaseModel):
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
+        if loss_weight is not None:
+            losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
         return losses
 
     def loss(
@@ -209,12 +224,19 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
         losses = {}
+        if self._sample_weight_name:
+            loss_weight = batch.sample_weights[self._sample_weight_name]
+            loss_weight = div_no_nan(loss_weight, torch.mean(loss_weight))
+        else:
+            loss_weight = None
+
         for loss_cfg in self._base_model_config.losses:
             losses.update(
                 self._loss_impl(
                     predictions,
                     batch,
                     self._label_name,
+                    loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
                 )
@@ -230,9 +252,9 @@ class RankModel(BaseModel):
         metric_kwargs = config_to_kwargs(oneof_metric_cfg)
         metric_name = metric_type + suffix
         if metric_type == "auc":
-            assert (
-                num_class <= 2
-            ), f"num_class must less than 2 when metric type is {metric_type}"
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
             self._metric_modules[metric_name] = torchmetrics.AUROC(
                 task="binary", **metric_kwargs
             )
@@ -247,9 +269,9 @@ class RankModel(BaseModel):
         elif metric_type == "accuracy":
             pass
         elif metric_type == "grouped_auc":
-            assert (
-                num_class <= 2
-            ), f"num_class must less than 2 when metric type is {metric_type}"
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
             self._metric_modules[metric_name] = GroupedAUC()
         else:
             raise ValueError(f"{metric_type} is not supported for this model")

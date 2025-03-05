@@ -34,13 +34,13 @@ class OverlapFeature(RawFeature):
     Args:
         feature_config (FeatureConfig): a instance of feature config.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
@@ -53,9 +53,14 @@ class OverlapFeature(RawFeature):
         self._data_group = CROSS_NEG_DATA_GROUP
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return 1
+
+    @property
     def output_dim(self) -> int:
-        """Output dimension of the feature."""
-        if self.is_sparse:
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
             return self.config.embedding_dim
         else:
             return 1
@@ -73,7 +78,7 @@ class OverlapFeature(RawFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             # input feature is already lookuped
             feat = input_data[self.name]
             if self.is_sparse:
@@ -84,7 +89,7 @@ class OverlapFeature(RawFeature):
                 parsed_feat = _parse_fg_encoded_dense_feature_impl(
                     self.name, feat, **self._fg_encoded_kwargs
                 )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feats = []
             for name in self.inputs:
                 x = input_data[name]
@@ -97,6 +102,10 @@ class OverlapFeature(RawFeature):
             else:
                 values = self._fg_op.transform(input_feats)
                 parsed_feat = DenseData(name=self.name, values=values)
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
         return parsed_feat
 
     def fg_json(self) -> List[Dict[str, Any]]:

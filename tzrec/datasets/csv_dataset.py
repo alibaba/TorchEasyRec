@@ -12,6 +12,7 @@
 
 import glob
 import os
+import random
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional
@@ -20,7 +21,9 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from pyarrow import csv
 
+from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.utils import FIELD_TYPE_TO_PA
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 
@@ -43,16 +46,29 @@ class CsvDataset(BaseDataset):
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
         column_names = None
+        column_types = {}
         if not self._data_config.with_header:
             column_names = [f.input_name for f in self._data_config.input_fields]
+        for f in self._data_config.input_fields:
+            if f.HasField("input_type"):
+                if f.input_type in FIELD_TYPE_TO_PA:
+                    column_types[f.input_name] = FIELD_TYPE_TO_PA[f.input_type]
+                else:
+                    raise ValueError(
+                        f"{f.input_type} of column [{f.input_name}] "
+                        "is not supported by CsvDataset."
+                    )
         # pyre-ignore [29]
         self._reader = CsvReader(
             input_path,
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._data_config.drop_remainder,
-            column_names,
-            self._data_config.delimiter,
+            shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
+            shuffle_buffer_size=self._data_config.shuffle_buffer_size,
+            column_names=column_names,
+            delimiter=self._data_config.delimiter,
+            column_types=column_types,
         )
         self._init_input_fields()
 
@@ -65,6 +81,8 @@ class CsvReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
         column_names (list): set column name if csv without header.
         delimiter (str): csv delimiter.
     """
@@ -75,13 +93,24 @@ class CsvReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         column_names: Optional[List[str]] = None,
         delimiter: str = ",",
+        column_types: Optional[Dict[str, pa.DataType]] = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self._csv_fmt = ds.CsvFileFormat(
             parse_options=pa.csv.ParseOptions(delimiter=delimiter),
+            convert_options=pa.csv.ConvertOptions(column_types=column_types),
             read_options=csv.ReadOptions(
                 column_names=column_names, block_size=64 * 1024 * 1024
             ),
@@ -89,6 +118,8 @@ class CsvReader(BaseReader):
         self._input_files = []
         for input_path in self._input_path.split(","):
             self._input_files.extend(glob.glob(input_path))
+        if len(self._input_files) == 0:
+            raise RuntimeError(f"No csv files exist in {self._input_path}.")
         dataset = ds.dataset(self._input_files[0], format=self._csv_fmt)
         self.schema = []
         self._ordered_cols = None
@@ -107,6 +138,8 @@ class CsvReader(BaseReader):
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         input_files = self._input_files[worker_id::num_workers]
+        if self._shuffle:
+            random.shuffle(input_files)
         if len(input_files) > 0:
             dataset = ds.dataset(input_files, format=self._csv_fmt)
             reader = dataset.to_batches(

@@ -22,6 +22,19 @@ message DSSM {
     optional bool in_batch_negative = 6 [default = false];
 }
 
+message HSTUMatch {
+    required Tower user_tower = 1;
+    required Tower item_tower = 2;
+    // user and item tower output dimension
+    required int32 output_dim = 3;
+    // similarity method
+    optional Similarity similarity = 4 [default=INNER_PRODUCT];
+    // similarity scaling factor
+    optional float temperature = 5 [default = 1.0];
+    // use in batch items as negative items.
+    optional bool in_batch_negative = 6 [default = false];
+}
+
 message DSSMV2 {
     required Tower user_tower = 1;
     required Tower item_tower = 2;
@@ -38,4 +51,32 @@ message DSSMV2 {
 message TDM {
     required MultiWindowDINTower multiwindow_din =1;
     required MLP final = 2;
+}
+
+
+message DAT {
+    required DATTower user_tower = 1;
+    required DATTower item_tower = 2;
+    // user and item tower output dimension
+    required int32 output_dim = 3;
+    // similarity method
+    optional Similarity similarity = 4 [default=INNER_PRODUCT];
+    // similarity scaling factor
+    optional float temperature = 5 [default = 1.0];
+    // use in batch items as negative items.
+    optional bool in_batch_negative = 6 [default = false];
+    // loss weight for amm_i
+    required float amm_i_weight = 7 [default = 0.5];
+    // loss weight for amm_u
+    required float amm_u_weight = 8 [default = 0.5];
+}
+
+
+
+message MIND {
+    required MINDUserTower user_tower = 1;
+    required Tower item_tower = 2;
+    optional float simi_pow = 3 [default=10];
+    optional Similarity similarity = 4 [default=COSINE];
+    optional bool in_batch_negative = 5 [default = false];
 }

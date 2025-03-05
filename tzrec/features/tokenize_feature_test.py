@@ -104,7 +104,7 @@ class TokenizeFeatureTest(unittest.TestCase):
             )
             token_feat_cfg.tokenize_feature.text_normalizer.CopyFrom(text_norm)
         token_feat = tokenize_feature_lib.TokenizeFeature(
-            token_feat_cfg, fg_mode=FgMode.NORMAL
+            token_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(token_feat.inputs, ["token_input"])
 
@@ -165,7 +165,7 @@ class TokenizeFeatureTest(unittest.TestCase):
             )
         )
         token_feat = tokenize_feature_lib.TokenizeFeature(
-            token_feat_cfg, fg_mode=FgMode.NORMAL
+            token_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(token_feat.inputs, ["token_input"])
 

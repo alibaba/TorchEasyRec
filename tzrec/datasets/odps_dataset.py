@@ -18,9 +18,13 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import urllib3
-from alibabacloud_credentials import providers
+from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
-from odps.accounts import AliyunAccount, BaseAccount, CredentialProviderAccount
+from odps.accounts import (
+    AliyunAccount,
+    BaseAccount,
+    CredentialProviderAccount,
+)
 from odps.apis.storage_api import (
     ArrowReader,
     ReadRowsRequest,
@@ -74,7 +78,20 @@ TYPE_TABLE_TO_PA = {
     "MAP<INT,STRING>": pa.map_(pa.int32(), pa.string()),
     "MAP<INT,INT>": pa.map_(pa.int32(), pa.int32()),
 }
-TYPE_PA_TO_TABLE = {v: k for k, v in TYPE_TABLE_TO_PA.items()}
+
+
+def _type_pa_to_table(pa_type: pa.DataType) -> str:
+    """PyArrow type to MaxCompute Table type."""
+    mc_type = None
+    for k, v in TYPE_TABLE_TO_PA.items():
+        # list<element: int64> and list<item: int64> is equal
+        if v == pa_type:
+            mc_type = k
+            break
+    if mc_type:
+        return mc_type
+    else:
+        raise RuntimeError(f"{pa_type} is not supported now.")
 
 
 def _parse_odps_config_file(odps_config_path: str) -> Tuple[str, str, str]:
@@ -90,29 +107,37 @@ def _parse_odps_config_file(odps_config_path: str) -> Tuple[str, str, str]:
         raise ValueError("No such file: %s" % odps_config_path)
 
     try:
-        os.environ["ACCESS_ID"] = odps_config["access_id"]
-        os.environ["ACCESS_KEY"] = odps_config["access_key"]
-        os.environ["ODPS_ENDPOINT"] = odps_config["end_point"]
+        access_id = odps_config["access_id"]
+        access_key = odps_config["access_key"]
+        end_point = odps_config["end_point"]
     except KeyError as err:
         raise IOError(
             "%s key does not exist in the %s file." % (str(err), odps_config_path)
         ) from err
 
-    return odps_config["access_id"], odps_config["access_key"], odps_config["end_point"]
+    return access_id, access_key, end_point
 
 
 def _create_odps_account() -> Tuple[BaseAccount, str]:
     account = None
+    sts_token = None
     if "ODPS_CONFIG_FILE_PATH" in os.environ:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.environ["ODPS_CONFIG_FILE_PATH"]
         )
         account = AliyunAccount(account_id, account_key)
-    elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
-        p = providers.DefaultCredentialsProvider()
+    elif (
+        "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
+        or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
+        or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+    ):
+        credentials_client = CredClient()
         # prevent too much request to credential server after forked
-        p.get_credentials().get_credential()
-        account = CredentialProviderAccount(p)
+        credential = credentials_client.get_credential()
+        account_id = credential.access_key_id
+        account_key = credential.access_key_secret
+        sts_token = credential.security_token
+        account = CredentialProviderAccount(credentials_client)
         try:
             odps_endpoint = os.environ["ODPS_ENDPOINT"]
         except KeyError as err:
@@ -124,6 +149,13 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
             os.path.join(os.getenv("HOME", "/home/admin"), ".odps_config.ini")
         )
         account = AliyunAccount(account_id, account_key)
+
+    # prevent graph-learn parse odps config hang
+    os.environ["ACCESS_ID"] = account_id
+    os.environ["ACCESS_KEY"] = account_key
+    os.environ["END_POINT"] = odps_endpoint
+    if sts_token:
+        os.environ["STS_TOKEN"] = sts_token
 
     return account, odps_endpoint
 
@@ -249,6 +281,8 @@ def _reader_iter(
             drop_redundant_bs_eq_one if i == num_sess - 1 else False,
             remain_row_count,
         )
+        if start == end:
+            return
 
         offset = 0
         retry_cnt = 0
@@ -300,9 +334,9 @@ class OdpsDataset(BaseDataset):
         **kwargs: Any,
     ) -> None:
         if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert (
-                dist.is_initialized()
-            ), "You should initialize distribute group first."
+            assert dist.is_initialized(), (
+                "You should initialize distribute group first."
+            )
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
         self._reader = OdpsReader(
@@ -315,8 +349,6 @@ class OdpsDataset(BaseDataset):
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
         )
         self._init_input_fields()
-        # prevent graph-learn parse odps config hang
-        os.environ["END_POINT"] = os.environ["ODPS_ENDPOINT"]
 
 
 class OdpsReader(BaseReader):
@@ -327,6 +359,8 @@ class OdpsReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch less than batch_size.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
         is_orderby_partition (bool): read data order by table partitions or not.
         quota_name (str): storage api quota name.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
@@ -339,14 +373,24 @@ class OdpsReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
+        os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
         self._account, self._odps_endpoint = _create_odps_account()
@@ -453,12 +497,13 @@ class OdpsWriter(BaseWriter):
         self, output_path: str, quota_name: str = "pay-as-you-go", **kwargs: Any
     ) -> None:
         if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert (
-                dist.is_initialized()
-            ), "You should initialize distribute group first."
+            assert dist.is_initialized(), (
+                "You should initialize distribute group first."
+            )
         super().__init__(output_path)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
+        os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
 
         self._project, self._table_name, partitions = _parse_table_path(output_path)
         if partitions is None:
@@ -485,7 +530,7 @@ class OdpsWriter(BaseWriter):
         """Create output table."""
         schemas = []
         for k, v in output_dict.items():
-            schemas.append(f"{k} {TYPE_PA_TO_TABLE[v.type]}")
+            schemas.append(f"{k} {_type_pa_to_table(v.type)}")
         schema = ",".join(schemas)
         if self._partition_spec:
             pt_schemas = []
@@ -519,7 +564,6 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
-            print(session_id)
         if dist.is_initialized():
             session_id = dist_util.broadcast_string(session_id)
         self._sess_req = SessionRequest(session_id=session_id)

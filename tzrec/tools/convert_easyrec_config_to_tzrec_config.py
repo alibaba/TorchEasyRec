@@ -94,23 +94,25 @@ class ConvertConfig(object):
     def __init__(
         self,
         easyrec_config_path,
-        fg_json_path,
         output_tzrec_config_path,
+        fg_json_path=None,
         easyrec_package_path=None,
     ):
         if "easyrec_pipeline_pb2" not in globals():
             _get_easyrec(easyrec_package_path)
         self.output_tzrec_config_path = output_tzrec_config_path
         self.easyrec_config = self.load_easyrec_config(easyrec_config_path)
-        self.fg_json = self.load_easyrec_fg_json(fg_json_path)
+
         self.feature_to_fg = {}
         self.sub_sequence_to_group = {}
         self.sequence_feature_to_fg = {}
-        self.analyse_fg()
+        if fg_json_path is not None:
+            fg_json = self.load_easyrec_fg_json(fg_json_path)
+            self.analyse_fg(fg_json)
 
-    def analyse_fg(self):
+    def analyse_fg(self, fg_json):
         """Analysis fg.json."""
-        for feat in self.fg_json["features"]:
+        for feat in fg_json["features"]:
             if "sequence_name" in feat:
                 sequence_name = feat["sequence_name"]
                 for sub_feat in feat["features"]:
@@ -176,7 +178,6 @@ class ConvertConfig(object):
             self.easyrec_config.data_config.batch_size
         )
         pipeline_config.data_config.dataset_type = DatasetType.OdpsDataset
-        pipeline_config.data_config.fg_encoded = True
         pipeline_config.data_config.label_fields.extend(label_fields)
         pipeline_config.data_config.num_workers = 8
         pipeline_config.data_config.odps_data_quota_name = ""
@@ -330,7 +331,7 @@ class ConvertConfig(object):
             features = sequence_fg["features"]
             seq_feature_to_fg = {}
             for feature in features:
-                seq_feature_to_fg[f'{seq_name}__{feature["feature_name"]}'] = feature
+                seq_feature_to_fg[f"{seq_name}__{feature['feature_name']}"] = feature
             for cfg in sub_cfgs:
                 sub_feature_cfg = tzrec_feature_pb2.SeqFeatureConfig()
                 feature_name = (
@@ -364,6 +365,109 @@ class ConvertConfig(object):
 
             feature_config.sequence_feature.CopyFrom(sequence_feature_config)
             pipeline_config.feature_configs.append(feature_config)
+
+        return pipeline_config
+
+    def _create_feature_config_no_fg(self, pipeline_config):
+        """Create tzrec feature config no fg json."""
+        easyrec_feature_config = easyrec_feature_config_pb2.FeatureConfig()  # NOQA
+        for cfg in self.easyrec_config.feature_configs:
+            if cfg.feature_name:
+                feature_name = cfg.feature_name
+            else:
+                feature_name = list(cfg.input_names)[0]
+            input_names = cfg.input_names
+            feature_type = cfg.feature_type
+
+            feature_config = None
+            if feature_type == easyrec_feature_config.IdFeature:
+                feature_config = tzrec_feature_pb2.FeatureConfig()
+                feature = tzrec_feature_pb2.IdFeature()
+                feature.feature_name = feature_name
+                feature.expression = f"user:{input_names[0]}"
+                feature.embedding_dim = cfg.embedding_dim
+                feature.hash_bucket_size = cfg.hash_bucket_size
+                feature_config.ClearField("feature")
+                feature_config.id_feature.CopyFrom(feature)
+            elif feature_type == easyrec_feature_config.TagFeature:
+                feature_config = tzrec_feature_pb2.FeatureConfig()
+                feature = tzrec_feature_pb2.IdFeature()
+                feature.feature_name = feature_name
+                feature.expression = f"user:{input_names[0]}"
+                feature.embedding_dim = cfg.embedding_dim
+                feature.hash_bucket_size = cfg.hash_bucket_size
+                if cfg.HasField("kv_separator"):
+                    feature.weighted = True
+                feature_config.ClearField("feature")
+                feature_config.id_feature.CopyFrom(feature)
+            elif feature_type == easyrec_feature_config.SequenceFeature:
+                feature_config = tzrec_feature_pb2.FeatureConfig()
+                if cfg.sub_feature_type == easyrec_feature_config.RawFeature:
+                    feature = tzrec_feature_pb2.SequenceRawFeature()
+                    feature.feature_name = feature_name
+                    feature.expression = f"user:{input_names[0]}"
+                    feature.sequence_length = cfg.sequence_length
+                    feature.sequence_delim = cfg.separator
+                    feature.embedding_dim = cfg.embedding_dim
+                    boundaries = list(cfg.boundaries)
+                    if len(boundaries) > 0:
+                        feature.boundaries.extend(boundaries)
+                    feature_config.ClearField("feature")
+                    feature_config.sequence_raw_feature.CopyFrom(feature)
+                else:
+                    feature = tzrec_feature_pb2.SequenceIdFeature()
+                    feature.feature_name = feature_name
+                    feature.expression = f"user:{input_names[0]}"
+                    feature.sequence_length = cfg.sequence_length
+                    feature.sequence_delim = cfg.separator
+                    feature.embedding_dim = cfg.embedding_dim
+                    if cfg.HasField("hash_bucket_size"):
+                        feature.hash_bucket_size = cfg.hash_bucket_size
+                    if cfg.HasField("num_buckets"):
+                        feature.num_buckets = cfg.num_buckets
+                    feature_config.ClearField("feature")
+                    feature_config.sequence_id_feature.CopyFrom(feature)
+                if cfg.sequence_length <= 1:
+                    logger.error(f"{feature_name} sequence_length is invalid !!!")
+            elif feature_type == easyrec_feature_config.RawFeature:
+                feature_config = tzrec_feature_pb2.FeatureConfig()
+                feature = tzrec_feature_pb2.RawFeature()
+                feature.feature_name = feature_name
+                feature.expression = f"user:{input_names[0]}"
+                boundaries = list(cfg.boundaries)
+                if cfg.HasField("embedding_dim"):
+                    feature.embedding_dim = cfg.embedding_dim
+                if len(boundaries):
+                    feature.boundaries.extend(boundaries)
+                feature_config.ClearField("feature")
+                feature_config.raw_feature.CopyFrom(feature)
+            elif feature_type == easyrec_feature_config.ComboFeature:
+                feature_config = tzrec_feature_pb2.FeatureConfig()
+                feature = tzrec_feature_pb2.ComboFeature()
+                feature.feature_name = feature_name
+                for input in list(cfg.input_names):
+                    feature.expression.append(f"user:{input}")
+                feature.embedding_dim = cfg.embedding_dim
+                feature.hash_bucket_size = cfg.hash_bucket_size
+                feature_config.ClearField("feature")
+                feature_config.combo_feature.CopyFrom(feature)
+            elif feature_type == easyrec_feature_config.LookupFeature:
+                feature_config = tzrec_feature_pb2.FeatureConfig()
+                feature = tzrec_feature_pb2.LookupFeature()
+                feature.feature_name = feature_name
+                feature.map = f"user:{input_names[0]}"
+                feature.key = f"user:{input_names[1]}"
+                if cfg.HasField("embedding_dim"):
+                    feature.embedding_dim = cfg.embedding_dim
+                if len(list(cfg.boundaries)):
+                    feature.boundaries.extend(list(cfg.boundaries))
+                feature_config.ClearField("feature")
+                feature_config.lookup_feature.CopyFrom(feature)
+            else:
+                logger.error(f"{feature_name} can't converted")
+            if feature_config is not None:
+                logger.info(f"{feature_name} converted succeeded")
+                pipeline_config.feature_configs.append(feature_config)
 
         return pipeline_config
 
@@ -637,7 +741,10 @@ class ConvertConfig(object):
         tzrec_config = self._create_train_config(tzrec_config)
         tzrec_config = self._create_eval_config(tzrec_config)
         tzrec_config = self._create_data_config(tzrec_config)
-        tzrec_config = self._create_feature_config(tzrec_config)
+        if len(self.feature_to_fg):
+            tzrec_config = self._create_feature_config(tzrec_config)
+        else:
+            tzrec_config = self._create_feature_config_no_fg(tzrec_config)
         tzrec_config = self._create_model_config(tzrec_config)
         config_text = text_format.MessageToString(tzrec_config, as_utf8=True)
         with open(self.output_tzrec_config_path, "w") as f:
@@ -670,8 +777,8 @@ if __name__ == "__main__":
     args, extra_args = parser.parse_known_args()
     fs = ConvertConfig(
         args.easyrec_config_path,
-        args.fg_json_path,
         args.output_tzrec_config_path,
+        args.fg_json_path,
         args.easyrec_package_path,
     )
     fs.build()

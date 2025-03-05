@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2024-2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -27,7 +27,9 @@ from torch import distributed as dist
 from torch.utils.data import get_worker_info
 
 from tzrec.protos import sampler_pb2
+from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import get_free_port
 
 
@@ -166,6 +168,15 @@ def _to_arrow_array(
     return result
 
 
+def _pa_ids_to_npy(ids: pa.Array) -> npt.NDArray:
+    """Convert pyarrow id array to numpy array."""
+    if use_hash_node_id():
+        ids = ids.cast(pa.string()).to_numpy(zero_copy_only=False)
+    else:
+        ids = ids.cast(pa.int64()).fill_null(0).to_numpy()
+    return ids
+
+
 class BaseSampler(metaclass=_meta_cls):
     """Negative Sampler base class."""
 
@@ -195,15 +206,30 @@ class BaseSampler(metaclass=_meta_cls):
         self._attr_types = []
         self._attr_gl_types = []
         self._attr_np_types = []
+        self._valid_attr_names = []
+        self._ignore_attr_names = set()
         for field_name in config.attr_fields:
-            field = input_fields[field_name]
+            if field_name in input_fields:
+                field = input_fields[field_name]
+                self._valid_attr_names.append(field.name)
+            else:
+                field = pa.field(name=field_name, type=pa.string())
+                self._ignore_attr_names.add(field_name)
             self._attr_names.append(field.name)
             self._attr_types.append(field.type)
             self._attr_gl_types.append(_get_gl_type(field.type))
             self._attr_np_types.append(_get_np_type(field.type))
+        if len(self._ignore_attr_names) > 0:
+            logger.warning(
+                f"Features {self._ignore_attr_names} in "
+                # pyre-ignore [16]
+                f"{self.__class__.__name__} will be ignored."
+            )
 
         if config.HasField("field_delimiter"):
             gl.set_field_delimiter(config.field_delimiter)
+        if use_hash_node_id():
+            gl.set_use_string_hash_id(1)
 
         self._num_client_per_rank = 1
         self._client_id_bias = 0
@@ -215,6 +241,7 @@ class BaseSampler(metaclass=_meta_cls):
         cluster: Optional[Dict[str, Union[int, str]]] = None,
     ) -> None:
         """Set client in cluster info."""
+        gl.set_load_graph_thread_num(max(num_client_per_rank // 2, 1))
         self._num_client_per_rank = num_client_per_rank
         self._client_id_bias = client_id_bias
         if cluster:
@@ -255,9 +282,12 @@ class BaseSampler(metaclass=_meta_cls):
         int_idx = 0
         float_idx = 0
         string_idx = 0
-        for attr_type, attr_gl_type, attr_np_type in zip(
-            self._attr_types, self._attr_gl_types, self._attr_np_types
+        for attr_name, attr_type, attr_gl_type, attr_np_type in zip(
+            self._attr_names, self._attr_types, self._attr_gl_types, self._attr_np_types
         ):
+            if attr_name in self._ignore_attr_names:
+                string_idx += 1
+                continue
             if attr_gl_type == "int":
                 feature = nodes.int_attrs[:, :, int_idx]
                 int_idx += 1
@@ -282,9 +312,12 @@ class BaseSampler(metaclass=_meta_cls):
         int_idx = 0
         float_idx = 0
         string_idx = 0
-        for attr_type, attr_gl_type, attr_np_type in zip(
-            self._attr_types, self._attr_gl_types, self._attr_np_types
+        for attr_name, attr_type, attr_gl_type, attr_np_type in zip(
+            self._attr_names, self._attr_types, self._attr_gl_types, self._attr_np_types
         ):
+            if attr_name in self._ignore_attr_names:
+                string_idx += 1
+                continue
             if attr_gl_type == "int":
                 feature = nodes.int_attrs[:, int_idx]
                 int_idx += 1
@@ -362,11 +395,11 @@ class NegativeSampler(BaseSampler):
         Returns:
             Negative sampled feature dict.
         """
-        ids = input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
+        ids = _pa_ids_to_npy(input_data[self._item_id_field])
         ids = np.pad(ids, (0, self._batch_size - len(ids)), "edge")
         nodes = self._sampler.get(ids)
         features = self._parse_nodes(nodes)
-        result_dict = dict(zip(self._attr_names, features))
+        result_dict = dict(zip(self._valid_attr_names, features))
         return result_dict
 
     @property
@@ -451,17 +484,13 @@ class NegativeSamplerV2(BaseSampler):
         Returns:
             Negative sampled feature dict.
         """
-        src_ids = (
-            input_data[self._user_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
-        dst_ids = (
-            input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
+        src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
+        dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
         src_ids = np.pad(src_ids, (0, self._batch_size - len(src_ids)), "edge")
         dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
         nodes = self._sampler.get(src_ids, dst_ids)
         features = self._parse_nodes(nodes)
-        result_dict = dict(zip(self._attr_names, features))
+        result_dict = dict(zip(self._valid_attr_names, features))
         return result_dict
 
     @property
@@ -544,12 +573,8 @@ class HardNegativeSampler(BaseSampler):
             Negative sampled feature dict. The first batch_size is negative samples,
                 remainder is hard negative samples
         """
-        src_ids = (
-            input_data[self._user_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
-        dst_ids = (
-            input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
+        src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
+        dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
         dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
         nodes = self._neg_sampler.get(dst_ids)
         neg_features = self._parse_nodes(nodes)
@@ -560,7 +585,7 @@ class HardNegativeSampler(BaseSampler):
         for i, v in enumerate(hard_neg_features):
             results.append(pa.concat_arrays([neg_features[i], v]))
 
-        result_dict = dict(zip(self._attr_names, results))
+        result_dict = dict(zip(self._valid_attr_names, results))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
         return result_dict
 
@@ -573,7 +598,7 @@ class HardNegativeSampler(BaseSampler):
 class HardNegativeSamplerV2(BaseSampler):
     """HardNegativeSampler.
 
-    Weighted random sampling items which  do not have positive edge with the user.,
+    Weighted random sampling items which do not have positive edge with the user,
     and sampling destination nodes in hard_neg_edge as hard negative samples.
 
     Args:
@@ -649,12 +674,8 @@ class HardNegativeSamplerV2(BaseSampler):
             Negative sampled feature dict. The first batch_size is negative samples,
                 remainder is hard negative samples
         """
-        src_ids = (
-            input_data[self._user_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
-        dst_ids = (
-            input_data[self._item_id_field].cast(pa.int64()).fill_null(0).to_numpy()
-        )
+        src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
+        dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
         padded_src_ids = np.pad(src_ids, (0, self._batch_size - len(src_ids)), "edge")
         dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
         nodes = self._neg_sampler.get(padded_src_ids, dst_ids)
@@ -666,7 +687,7 @@ class HardNegativeSamplerV2(BaseSampler):
         for i, v in enumerate(hard_neg_features):
             results.append(pa.concat_arrays([neg_features[i], v]))
 
-        result_dict = dict(zip(self._attr_names, results))
+        result_dict = dict(zip(self._valid_attr_names, results))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
         return result_dict
 
@@ -772,7 +793,10 @@ class TDMSampler(BaseSampler):
         num_workers = worker_info.num_workers if worker_info else 1
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         time.sleep(random.randint(0, num_workers * local_world_size))
-        self.get({self._item_id_field: pa.array([0])})
+        if use_hash_node_id():
+            self.get({self._item_id_field: pa.array(["0"], type=np.object_)})
+        else:
+            self.get({self._item_id_field: pa.array([0])})
 
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
@@ -783,15 +807,9 @@ class TDMSampler(BaseSampler):
         Returns:
             Positive and negative sampled feature dict.
         """
-        ids = (
-            input_data[self._item_id_field]
-            .cast(pa.int64())
-            .fill_null(0)
-            .to_numpy()
-            .reshape(-1, 1)
-        )
+        ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
         batch_size = len(ids)
-        num_fea = len(self._attr_names[1:])
+        num_fea = len(self._valid_attr_names[1:])
 
         # positive node.
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
@@ -861,8 +879,8 @@ class TDMSampler(BaseSampler):
             for i in range(num_fea)
         ]
 
-        pos_result_dict = dict(zip(self._attr_names[1:], pos_fea_result))
-        neg_result_dict = dict(zip(self._attr_names[1:], neg_fea_result))
+        pos_result_dict = dict(zip(self._valid_attr_names[1:], pos_fea_result))
+        neg_result_dict = dict(zip(self._valid_attr_names[1:], neg_fea_result))
 
         return pos_result_dict, neg_result_dict
 
@@ -939,17 +957,11 @@ class TDMPredictSampler(BaseSampler):
         Returns:
             Positive and negative sampled feature dict.
         """
-        ids = (
-            input_data[self._item_id_field]
-            .cast(pa.int64())
-            .fill_null(0)
-            .to_numpy()
-            .reshape(-1, 1)
-        )
+        ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
 
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
-        pos_result_dict = dict(zip(self._attr_names[1:], pos_fea_result))
+        pos_result_dict = dict(zip(self._valid_attr_names[1:], pos_fea_result))
 
         return pos_result_dict
 

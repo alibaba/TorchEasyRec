@@ -11,8 +11,11 @@
 
 
 import argparse
+import copy
 import json
 import os
+import shutil
+import tempfile
 
 from odps import ODPS
 
@@ -56,9 +59,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--force_update_resource",
-        type=bool,
-        default=True,
+        action="store_true",
+        default=False,
         help="if true will update fg.json.",
+    )
+    parser.add_argument(
+        "--remove_bucketizer",
+        action="store_true",
+        default=False,
+        help="remove bucktizer params in fg json.",
     )
     parser.add_argument(
         "--debug",
@@ -81,19 +90,32 @@ if __name__ == "__main__":
         iterator = iter(dataloader)
         _ = next(iterator)
 
-    if not os.path.exists(args.fg_output_dir):
-        os.makedirs(args.fg_output_dir)
+    tmp_dir = tempfile.mkdtemp(prefix="tzrec_")
+    fg_json = create_fg_json(features, asset_dir=tmp_dir)
+    if args.remove_bucketizer:
+        fg_json = copy.copy(fg_json)
+        for feature in fg_json["features"]:
+            feature.pop("hash_bucket_size")
+            feature.pop("vocab_dict")
+            feature.pop("vocab_list")
+            feature.pop("boundaries")
+            feature.pop("num_buckets")
+            if feature["feature_type"] != "tokenize_feature":
+                feature.pop("vocab_file")
 
-    fg_json = create_fg_json(features, asset_dir=args.fg_output_dir)
     if args.reserves is not None:
         reserves = []
         for column in args.reserves.strip().split(","):
             reserves.append(column.strip())
         fg_json["reserves"] = reserves
 
-    fg_path = os.path.join(args.fg_output_dir, "fg.json")
+    fg_name = args.fg_resource_name if args.fg_resource_name else "fg.json"
+    fg_path = os.path.join(tmp_dir, fg_name)
     with open(fg_path, "w") as f:
         json.dump(fg_json, f, indent=4)
+
+    if args.fg_output_dir:
+        shutil.copytree(tmp_dir, args.fg_output_dir, dirs_exist_ok=True)
 
     project = args.odps_project_name
     fg_resource_name = args.fg_resource_name
@@ -104,17 +126,21 @@ if __name__ == "__main__":
             project=project,
             endpoint=odps_endpoint,
         )
-        if o.exist_resource(fg_resource_name):
-            if args.force_update_resource:
-                o.delete_resource(fg_resource_name)
-                logger.info(
-                    f"{fg_resource_name} has already existed, "
-                    f"will update this resource !"
-                )
-                resource = o.create_resource(
-                    fg_resource_name, "file", file_obj=open(fg_path, "r")
-                )
-        else:
-            resource = o.create_resource(
-                fg_resource_name, "file", file_obj=open(fg_path, "r")
-            )
+        for fname in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, fname)
+            if o.exist_resource(fname):
+                if args.force_update_resource:
+                    o.delete_resource(fname)
+                    logger.info(
+                        f"{fname} has already existed, will update this resource !"
+                    )
+                    resource = o.create_resource(
+                        fname, "file", file_obj=open(fpath, "rb")
+                    )
+            else:
+                logger.info(f"uploading resource [{fname}].")
+                resource = o.create_resource(fname, "file", file_obj=open(fpath, "rb"))
+
+    if tmp_dir is None:
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)

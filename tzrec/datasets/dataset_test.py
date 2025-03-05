@@ -97,7 +97,8 @@ class DatasetTest(unittest.TestCase):
         del utils.STATS_DICT
         utils.STATS_DICT = []
 
-    def test_dataset(self):
+    @parameterized.expand([[False], [True]])
+    def test_dataset(self, need_shuffle):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),
             pa.field(name="float_b", type=pa.float64()),
@@ -122,12 +123,14 @@ class DatasetTest(unittest.TestCase):
                 data_config=data_pb2.DataConfig(
                     batch_size=4,
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
-                    fg_encoded=True,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
+                    shuffle=need_shuffle,
                 ),
                 features=features,
                 input_path="",
                 input_fields=input_fields,
+                mode=Mode.TRAIN,
             ),
             batch_size=None,
             num_workers=2,
@@ -151,7 +154,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -189,7 +192,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f.name,
@@ -284,7 +287,7 @@ class DatasetTest(unittest.TestCase):
                 data_config=data_pb2.DataConfig(
                     batch_size=32,
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
-                    fg_encoded=True,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
                     sample_mask_prob=0.4,
                 ),
@@ -309,7 +312,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -348,7 +351,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=32,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 negative_sample_mask_prob=0.4,
                 negative_sampler=sampler_pb2.NegativeSampler(
@@ -408,7 +411,7 @@ class DatasetTest(unittest.TestCase):
                 data_config=data_pb2.DataConfig(
                     batch_size=4,
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
-                    fg_encoded=True,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=[],
                 ),
                 features=features,
@@ -437,7 +440,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(node)
         node.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(63):
-            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:{i*2}\n")
+            node.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:{i * 2}\n")
         node.flush()
 
         def _ancestor(code):
@@ -453,8 +456,8 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(edge)
         edge.write("src_id:int64\tdst_id:int\tweight:float\n")
         for i in range(31, 63):
-            for anc in _ancestor(i):
-                edge.write(f"{i}\t{anc}\t{1.0}\n")
+            for ancestor in _ancestor(i):
+                edge.write(f"{i}\t{ancestor}\t{1.0}\n")
         edge.flush()
 
         def _childern(code):
@@ -501,7 +504,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 tdm_sampler=sampler_pb2.TDMSampler(
                     item_input_path=node.name,

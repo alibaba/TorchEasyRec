@@ -6,3 +6,5 @@
 
    dssm
    tdm
+   dat
+   mind

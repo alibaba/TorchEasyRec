@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import os
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,6 +21,7 @@ from tzrec.datasets.utils import (
     SequenceDenseData,
     SequenceSparseData,
 )
+from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
 from tzrec.features.id_feature import FgMode, IdFeature
 from tzrec.features.raw_feature import RawFeature
 from tzrec.protos import feature_pb2
@@ -168,7 +168,7 @@ class SequenceIdFeature(IdFeature):
         sequence_length (int): max sequence length.
         sequence_pk (str): sequence primary key name for serving.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
@@ -178,7 +178,7 @@ class SequenceIdFeature(IdFeature):
         sequence_delim: Optional[str] = None,
         sequence_length: Optional[int] = None,
         sequence_pk: Optional[str] = None,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -211,6 +211,14 @@ class SequenceIdFeature(IdFeature):
             return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        else:
+            return 1
+
+    @property
     def is_sequence(self) -> bool:
         """Feature is sequence or not."""
         return True
@@ -237,7 +245,7 @@ class SequenceIdFeature(IdFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             feat = input_data[self.name]
             parsed_feat = _parse_fg_encoded_sequence_sparse_feature_impl(
                 self.name,
@@ -245,7 +253,7 @@ class SequenceIdFeature(IdFeature):
                 sequence_delim=self.sequence_delim,
                 **self._fg_encoded_kwargs,
             )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
@@ -256,8 +264,12 @@ class SequenceIdFeature(IdFeature):
             parsed_feat = SequenceSparseData(
                 name=self.name,
                 values=values,
-                lengths=key_lengths,
+                key_lengths=key_lengths,
                 seq_lengths=seq_lengths,
+            )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
             )
         return parsed_feat
 
@@ -303,24 +315,22 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["sequence_length"] = self.config.sequence_length
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets
-        elif len(self.config.vocab_list) > 0:
-            fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
-                self.config.vocab_list
-            )
-            fg_cfg["default_bucketize_value"] = 1
+        elif len(self.vocab_list) > 0:
+            fg_cfg["vocab_list"] = self.vocab_list
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         elif len(self.config.vocab_dict) > 0:
-            vocab_dict = OrderedDict(self.config.vocab_dict.items())
-            vocab_dict[self.config.default_value] = 0
-            fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["vocab_dict"] = self.vocab_dict
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("value_dim"):
-            assert (
-                self.config.value_dim == 1
-            ), f"SequenceIdFeature {self.name} not support multi-value now."
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 1
@@ -338,7 +348,7 @@ class SequenceRawFeature(RawFeature):
         sequence_length (int): max sequence length.
         sequence_pk (str): sequence primary key name for serving.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
@@ -348,7 +358,7 @@ class SequenceRawFeature(RawFeature):
         sequence_delim: Optional[str] = None,
         sequence_length: Optional[int] = None,
         sequence_pk: Optional[str] = None,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -390,6 +400,11 @@ class SequenceRawFeature(RawFeature):
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
 
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        # TODO: support dense embedding for sequence raw feature.
+        return None
+
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
         if self._is_grouped_seq:
@@ -407,7 +422,7 @@ class SequenceRawFeature(RawFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             feat = input_data[self.name]
             if self.is_sparse:
                 parsed_feat = _parse_fg_encoded_sequence_sparse_feature_impl(
@@ -424,7 +439,7 @@ class SequenceRawFeature(RawFeature):
                     value_dim=self.config.value_dim,
                     **self._fg_encoded_kwargs,
                 )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
@@ -434,7 +449,9 @@ class SequenceRawFeature(RawFeature):
                 parsed_feat = SequenceSparseData(
                     name=self.name,
                     values=values,
-                    lengths=np.array([self._fg_op.value_dimension()] * sum(lengths)),
+                    key_lengths=np.array(
+                        [self._fg_op.value_dimension()] * sum(lengths)
+                    ),
                     seq_lengths=lengths,
                 )
             else:
@@ -444,6 +461,10 @@ class SequenceRawFeature(RawFeature):
                     values=values,
                     seq_lengths=lengths,
                 )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
         return parsed_feat
 
     def init_fg(self) -> None:

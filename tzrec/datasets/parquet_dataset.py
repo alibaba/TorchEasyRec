@@ -12,17 +12,28 @@
 
 import glob
 import os
+import random
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional
 
 import pyarrow as pa
-import pyarrow.dataset as ds
 from pyarrow import parquet
 
+from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+
+
+def _reader_iter(
+    input_files: List[str],
+    batch_size: int,
+) -> Iterator[pa.RecordBatch]:
+    for input_file in input_files:
+        parquet_file = parquet.ParquetFile(input_file)
+        for batch in parquet_file.iter_batches(batch_size):
+            yield batch
 
 
 class ParquetDataset(BaseDataset):
@@ -48,6 +59,8 @@ class ParquetDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._data_config.drop_remainder,
+            shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
+            shuffle_buffer_size=self._data_config.shuffle_buffer_size,
         )
         self._init_input_fields()
 
@@ -60,6 +73,8 @@ class ParquetReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -68,35 +83,45 @@ class ParquetReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
         self._ordered_cols = None
         self.schema = []
         self._input_files = []
         for input_path in self._input_path.split(","):
             self._input_files.extend(glob.glob(input_path))
-        dataset = ds.dataset(self._input_files[0], format="parquet")
+        if len(self._input_files) == 0:
+            raise RuntimeError(f"No parquet files exist in {self._input_path}.")
+        parquet_file = parquet.ParquetFile(self._input_files[0])
         if self._selected_cols:
             self._ordered_cols = []
-            for field in dataset.schema:
+            for field in parquet_file.schema_arrow:
                 # pyre-ignore [58]
                 if field.name in selected_cols:
                     self.schema.append(field)
                     self._ordered_cols.append(field.name)
         else:
-            self.schema = dataset.schema
+            self.schema = parquet_file.schema_arrow
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         input_files = self._input_files[worker_id::num_workers]
+        if self._shuffle:
+            random.shuffle(input_files)
         if len(input_files) > 0:
-            dataset = ds.dataset(input_files, format="parquet")
-            reader = dataset.to_batches(
-                batch_size=self._batch_size, columns=self._ordered_cols
-            )
+            reader = _reader_iter(input_files, self._batch_size)
             yield from self._arrow_reader_iter(reader)
 
     def num_files(self) -> int:

@@ -4,13 +4,12 @@ repos:
     hooks:
       - id: insert-license
         files: \.py$
-        args: ["--license-filepath", "data/.license_header.txt", "--use-current-year"]
+        args: ["--license-filepath", "data/.license_header.txt", "--allow-past-years"]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.1
+    rev: v0.9.6
     hooks:
       - id: ruff
         args: [ --fix ]
-        exclude: tzrec/acc/_decompositions.py|tzrec/acc/_aten_lowering_pass.py
       - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -25,12 +24,12 @@ repos:
       - id: mixed-line-ending
         args: ["--fix=lf"]
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.3.0
+    rev: v2.4.1
     hooks:
       - id: codespell
-        args: ["--skip", "*.json"]
+        args: ["--skip", "*.json", "-L", "TBE"]
   - repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.18
+    rev: 0.7.22
     hooks:
     - id: mdformat
       additional_dependencies:

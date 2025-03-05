@@ -22,22 +22,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 ### 前置条件
 
 - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**。
-- 根据需要赋予用户权限，具体参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/perform-access-control-based-on-tenant-level-roles#section-mt7-tmu-f49)。
-
-```bash
-{
-    "Version": "1",
-    "Statement": [
-        {
-            "Action": "odps:Usage",
-            "Effect": "Allow",
-            "Resource": [
-                "acs:odps:*:regions/*/quotas/pay-as-you-go"
-            ]
-        }
-    ]
-}
-```
+- 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
 
 ## 创建DLC任务
 
@@ -49,7 +34,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:0.6.0-pytorch2.5.0-gpu-py311-cu121-ubuntu22.04`
+**节点镜像** 选择官方镜像`torcheasyrec:0.7.0-pytorch2.6.0-gpu-py311-cu124-ubuntu22.04`
 
 **数据集配置** 选择刚新建的NAS数据集
 

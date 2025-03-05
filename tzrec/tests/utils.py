@@ -23,7 +23,7 @@ import torch
 
 from tzrec.acc.utils import is_trt_predict
 from tzrec.datasets.dataset import create_reader, create_writer
-from tzrec.datasets.odps_dataset import TYPE_PA_TO_TABLE
+from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
 from tzrec.features.expr_feature import ExprFeature
 from tzrec.features.feature import BaseFeature, FgMode, create_features
@@ -576,6 +576,28 @@ def build_mock_input_fg_encoded(
     return inputs
 
 
+def _get_vocab_list(feature: BaseFeature) -> Optional[List[str]]:
+    config = feature.config
+    vocab_list = None
+    if len(config.vocab_list) > 0:
+        vocab_list = list(config.vocab_list)
+    elif len(config.vocab_dict) > 0:
+        vocab_dict = OrderedDict(config.vocab_dict.items())
+        length = max(vocab_dict.values()) + 1
+        vocab_list = [""] * length
+        for k, v in vocab_dict.items():
+            vocab_list[v] = k
+    elif config.HasField("vocab_file"):
+        # TODO: support dict in vocab_file, now only support list
+        vocab_list = []
+        with open(config.vocab_file) as f:
+            for line in f.readlines():
+                line = line.strip()
+                if len(line) > 0:
+                    vocab_list.append(line)
+    return vocab_list
+
+
 def build_mock_input_with_fg(
     features: List[BaseFeature], user_id: str = "", item_id: str = ""
 ) -> Dict[str, MockInput]:
@@ -588,13 +610,21 @@ def build_mock_input_with_fg(
                 random.random() < 0.5 and feature.inputs[0] not in single_id_fields
             )
             side, name = feature.side_inputs[0]
-            inputs[side][name] = IdMockInput(
-                name,
-                is_multi=is_multi,
-                num_ids=feature.num_embeddings,
-                vocab_list=feature.config.vocab_list,
-                multival_sep=chr(29),
-            )
+            if feature.is_weighted:
+                inputs[side][name] = MapMockInput(
+                    name,
+                    is_sparse=feature.is_sparse,
+                    num_ids=feature.num_embeddings,
+                    vocab_list=_get_vocab_list(feature),
+                )
+            else:
+                inputs[side][name] = IdMockInput(
+                    name,
+                    is_multi=is_multi,
+                    num_ids=feature.num_embeddings,
+                    vocab_list=_get_vocab_list(feature),
+                    multival_sep=chr(29),
+                )
         elif type(feature) is RawFeature:
             side, name = feature.side_inputs[0]
             inputs[side][name] = RawMockInput(
@@ -619,7 +649,7 @@ def build_mock_input_with_fg(
                         input_name,
                         is_sparse=feature.is_sparse,
                         num_ids=feature.num_embeddings,
-                        vocab_list=feature.config.vocab_list,
+                        vocab_list=_get_vocab_list(feature),
                     )
                 else:
                     is_multi = (
@@ -696,12 +726,12 @@ def load_config_for_test(
 
     features = create_features(
         list(pipeline_config.feature_configs),
-        fg_mode=FgMode.ENCODED if data_config.fg_encoded else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
 
     data_config.num_workers = 2
     num_parts = data_config.num_workers * 2
-    if data_config.fg_encoded:
+    if data_config.fg_mode == FgMode.FG_NONE:
         inputs = build_mock_input_fg_encoded(features, user_id, item_id)
         item_inputs = inputs
         pipeline_config.train_input_path, _ = create_mock_data(
@@ -794,8 +824,9 @@ def load_config_for_test(
                 f"--node_edge_output_file {test_dir}/init_tree "
                 f"--tree_output_dir {test_dir}/init_tree "
             )
-            p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_init_tree.txt"))
-            p.wait(600)
+            assert misc_util.run_cmd(
+                cmd_str, os.path.join(test_dir, "log_init_tree.txt"), timeout=600
+            )
 
             sampler_config.item_input_path = os.path.join(
                 test_dir, "init_tree/node_table.txt"
@@ -816,15 +847,25 @@ def load_config_for_test(
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
-            assert (
-                sampler_type == "negative_sampler"
-            ), "now only negative_sampler supported."
+            assert sampler_type == "negative_sampler", (
+                "now only negative_sampler supported."
+            )
             sampler_config.input_path = item_gl_path
 
     data_config.dataset_type = data_pb2.ParquetDataset
     pipeline_config.model_dir = os.path.join(test_dir, "train")
 
     return pipeline_config
+
+
+def _standalone():
+    if bool(os.environ.get("CI", "False")):
+        # When using GitHub Actions, a container network is created by GitHub, and
+        # the host network cannot be utilized. This can lead to the error:
+        # [c10d] The hostname of the client socket cannot be retrieved, error code: -3.
+        return "--master_addr=localhost --master_port=#MASTER_PORT#"
+    else:
+        return "--standalone"
 
 
 def test_train_eval(
@@ -844,63 +885,65 @@ def test_train_eval(
     config_util.save_message(pipeline_config, test_config_path)
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_train_eval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
+    )
 
 
 def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_eval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_eval.txt"), timeout=600
+    )
 
 
 def test_export(
-    pipeline_config_path: str, test_dir: str, asset_files: str = ""
+    pipeline_config_path: str,
+    test_dir: str,
+    asset_files: str = "",
+    enable_aot=False,
+    enable_trt=False,
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {test_dir}/export "
     )
+    if enable_aot:
+        cmd_str = "ENABLE_AOT=1 " + cmd_str
+    if enable_trt:
+        cmd_str = "ENABLE_TRT=1 " + cmd_str
     if asset_files:
         cmd_str += f"--asset_files {asset_files}"
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_export.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=600
+    )
 
 
 def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_feature_selection")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=1 --log_dir {log_dir} "
         "-m tzrec.tools.feature_selection "
         f"--pipeline_config_path {pipeline_config_path} "
@@ -909,11 +952,9 @@ def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
         f"--output_dir {test_dir}/output_dir"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_export.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=600
+    )
 
 
 def test_predict(
@@ -933,21 +974,20 @@ def test_predict(
     else:
         nproc_per_node = 2
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={nproc_per_node} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/predict.py "
         f"--scripted_model_path {scripted_model_path} "
         f"--predict_input_path {predict_input_path} "
         f"--predict_output_path {predict_output_path} "
         f"--reserved_columns {reserved_columns} "
-        f"--output_columns {output_columns}"
     )
+    if output_columns:
+        cmd_str += f"--output_columns {output_columns}"
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_predict.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
+    )
 
 
 def test_create_faiss_index(
@@ -966,11 +1006,9 @@ def test_create_faiss_index(
         f"--embedding_field {embedding_field}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_faiss.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_faiss.txt"), timeout=600
+    )
 
 
 def test_hitrate(
@@ -985,7 +1023,7 @@ def test_hitrate(
     """Run hitrate integration test."""
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
-        "OMP_NUM_THREADS=16 PYTHONPATH=. torchrun --standalone "
+        f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "
@@ -996,11 +1034,9 @@ def test_hitrate(
         f"--gt_items_field {gt_items_field}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_hitrate.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_hitrate.txt"), timeout=600
+    )
 
 
 def test_create_fg_json(
@@ -1017,11 +1053,9 @@ def test_create_fg_json(
         f"--reserves {reserves} "
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_create_fg_json.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_create_fg_json.txt"), timeout=600
+    )
 
 
 def create_predict_data(
@@ -1034,11 +1068,14 @@ def create_predict_data(
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(pipeline_config_path)
     )
+    data_config = pipeline_config.data_config
+    assert data_config.fg_mode in [
+        FgMode.FG_NORMAL,
+        FgMode.FG_DAG,
+    ], "You should not use fg encoded data for input_path."
     features = create_features(
         pipeline_config.feature_configs,
-        fg_mode=FgMode.ENCODED
-        if pipeline_config.data_config.fg_encoded
-        else FgMode.DAG,
+        fg_mode=data_config.fg_mode,
     )
     user_inputs = []
     for feature in features:
@@ -1049,7 +1086,7 @@ def create_predict_data(
     reader = create_reader(
         input_path=pipeline_config.train_input_path,
         batch_size=batch_size,
-        quota_name=pipeline_config.data_config.odps_data_quota_name,
+        quota_name=data_config.odps_data_quota_name,
     )
 
     infer_arrow = OrderedDict()
@@ -1064,13 +1101,13 @@ def create_predict_data(
                 infer_arrow[name] = column.take([0] * batch_size)
                 infer_json[name] = {
                     "values": [value_list[0]],
-                    "dtype": TYPE_PA_TO_TABLE[column.type],
+                    "dtype": _type_pa_to_table(column.type),
                 }
             else:
                 infer_arrow[name] = column
                 infer_json[name] = {
                     "values": value_list,
-                    "dtype": TYPE_PA_TO_TABLE[column.type],
+                    "dtype": _type_pa_to_table(column.type),
                 }
             if name == item_id:
                 infer_json["item_ids"] = infer_json[name]
@@ -1107,7 +1144,7 @@ def test_tdm_retrieval(
     """Run tdm retrieval test."""
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
@@ -1118,11 +1155,9 @@ def test_tdm_retrieval(
         f"--n_cluster 2 "
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_tdm_retrieval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_tdm_retrieval.txt"), timeout=600
+    )
 
 
 def test_tdm_cluster_train_eval(
@@ -1168,12 +1203,9 @@ def test_tdm_cluster_train_eval(
         f"--tree_output_dir {os.path.join(test_dir, 'learnt_tree')} "
         f"--parallel 1 "
     )
-    p = misc_util.run_cmd(
-        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt")
+    assert misc_util.run_cmd(
+        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt"), timeout=600
     )
-    p.wait(600)
-    if p.returncode != 0:
-        return False
 
     sampler_config.item_input_path = os.path.join(
         test_dir, "learnt_tree/node_table.txt"
@@ -1191,14 +1223,12 @@ def test_tdm_cluster_train_eval(
 
     log_dir = os.path.join(test_dir, "log_learnt_train_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_train_eval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
+    )

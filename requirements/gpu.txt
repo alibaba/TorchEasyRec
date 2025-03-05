@@ -1,0 +1,1 @@
+torch-tensorrt==2.6.0

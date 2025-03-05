@@ -113,7 +113,7 @@ class OverlapFeatureTest(unittest.TestCase):
             )
         )
         overlap_feat = overlap_feature_lib.OverlapFeature(
-            overlap_feat_cfg, fg_mode=FgMode.NORMAL
+            overlap_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(overlap_feat.output_dim, 1)
         self.assertEqual(overlap_feat.is_sparse, False)
@@ -150,7 +150,7 @@ class OverlapFeatureTest(unittest.TestCase):
             )
         )
         overlap_feat = overlap_feature_lib.OverlapFeature(
-            overlap_feat_cfg, fg_mode=FgMode.NORMAL
+            overlap_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )
         self.assertEqual(overlap_feat.output_dim, 16)
         self.assertEqual(overlap_feat.is_sparse, True)

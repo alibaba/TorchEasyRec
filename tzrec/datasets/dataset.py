@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -172,7 +173,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         self._data_parser = DataParser(
             features=features,
-            labels=list(data_config.label_fields),
+            labels=list(data_config.label_fields)
+            if self._mode != Mode.PREDICT
+            else None,
+            sample_weights=list(data_config.sample_weight_fields)
+            if self._mode != Mode.PREDICT
+            else None,
             is_training=self._mode == Mode.TRAIN,
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
@@ -181,9 +187,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._input_fields = None
         self._selected_input_names = set()
         self._selected_input_names |= self._data_parser.feature_input_names
-        self._selected_input_names |= set(data_config.label_fields)
         if self._mode == Mode.PREDICT:
             self._selected_input_names |= set(self._reserved_columns)
+        else:
+            self._selected_input_names |= set(data_config.label_fields)
+            self._selected_input_names |= set(data_config.sample_weight_fields)
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -203,7 +211,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        self._fg_encoded = data_config.fg_encoded
+        self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
 
         if mode != Mode.TRAIN and data_config.HasField("eval_batch_size"):
@@ -233,7 +241,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 self._batch_size,
                 is_training=self._mode == Mode.TRAIN,
                 multival_sep=self._fg_encoded_multival_sep
-                if self._fg_encoded
+                if self._fg_mode == data_pb2.FgMode.FG_NONE
                 else chr(29),
             )
             self._sampler.init_cluster(num_client_per_rank, client_id_bias, cluster)
@@ -374,6 +382,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -382,12 +392,16 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
         self._batch_size = batch_size
         self._selected_cols = selected_cols
         self._drop_remainder = drop_remainder
+        self._shuffle = shuffle
+        self._shuffle_buffer_size = shuffle_buffer_size
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
@@ -398,6 +412,7 @@ class BaseReader(metaclass=_reader_meta_cls):
     def _arrow_reader_iter(
         self, reader: Iterator[pa.RecordBatch]
     ) -> Iterator[Dict[str, pa.Array]]:
+        shuffle_buffer = []
         buff_data = None
         while True:
             data = None
@@ -426,10 +441,24 @@ class BaseReader(metaclass=_reader_meta_cls):
                     if isinstance(column, pa.ChunkedArray):
                         column = column.combine_chunks()
                     data_dict[name] = column
+
+                if self._shuffle:
+                    shuffle_buffer.append(data_dict)
+                    if len(shuffle_buffer) < self._shuffle_buffer_size:
+                        continue
+                    else:
+                        idx = random.randrange(len(shuffle_buffer))
+                        data_dict = shuffle_buffer.pop(idx)
+
                 yield data_dict
 
             if data is None and buff_data is None:
                 break
+
+        if len(shuffle_buffer) > 0:
+            random.shuffle(shuffle_buffer)
+            for data_dict in shuffle_buffer:
+                yield data_dict
 
 
 class BaseWriter(metaclass=_writer_meta_cls):

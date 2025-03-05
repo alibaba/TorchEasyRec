@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -32,12 +32,18 @@ class TDM(RankModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
         )
@@ -96,7 +102,7 @@ class TDMEmbedding(nn.Module):
     """TDMEmbedding inference wrapper for jit.script."""
 
     def __init__(
-        self, module: nn.Module, embedding_group_name: str = "embedding_group"
+        self, module: EmbeddingGroup, embedding_group_name: str = "embedding_group"
     ) -> None:
         super().__init__()
         self._embedding_group_name = embedding_group_name
@@ -110,6 +116,7 @@ class TDMEmbedding(nn.Module):
 
         name_to_fea = {x.name: x for x in module._features}
         seq_group_query_fea = []
+        assert seq_feature_group is not None
         seq_feature_group_feature_names = list(seq_feature_group.feature_names)
         for feature_name in seq_feature_group_feature_names:
             feature = name_to_fea[feature_name]

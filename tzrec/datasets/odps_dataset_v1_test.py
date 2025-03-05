@@ -80,11 +80,11 @@ class OdpsDatasetV1Test(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_encoded=True,
+                fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}',
+            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}",
         )
         self.assertEqual(len(dataset.input_fields), 5)
         dataloader = DataLoader(

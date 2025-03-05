@@ -17,14 +17,20 @@ import numpy as np
 from google.protobuf import json_format, text_format
 from google.protobuf.message import Message
 
-from tzrec.protos import pipeline_pb2
+from tzrec.protos import data_pb2, pipeline_pb2
+from tzrec.protos.data_pb2 import FgMode
+from tzrec.utils.logging_util import logger
 
 
-def load_pipeline_config(pipeline_config_path: str) -> pipeline_pb2.EasyRecConfig:
+def load_pipeline_config(
+    pipeline_config_path: str, allow_unknown_field: bool = False
+) -> pipeline_pb2.EasyRecConfig:
     """Load pipeline config.
 
     Args:
-        pipeline_config_path(str): path to pipeline_pb2.EasyRecConfig.
+        pipeline_config_path (str): path to pipeline_pb2.EasyRecConfig.
+        allow_unknown_field (bool): skip over unknown field and keep
+            parsing. Avoid to use this option if possible.
 
     Return:
         a object of pipeline_pb2.EasyRecConfig.
@@ -32,9 +38,13 @@ def load_pipeline_config(pipeline_config_path: str) -> pipeline_pb2.EasyRecConfi
     config = pipeline_pb2.EasyRecConfig()
     with open(pipeline_config_path) as f:
         if pipeline_config_path.endswith(".json"):
-            json_format.Parse(f.read(), config)
+            json_format.Parse(
+                f.read(), config, ignore_unknown_fields=allow_unknown_field
+            )
         else:
-            text_format.Merge(f.read(), config)
+            text_format.Merge(f.read(), config, allow_unknown_field=allow_unknown_field)
+    # compatible for fg_encoded
+    config.data_config.fg_mode = _get_compatible_fg_mode(config.data_config)
     return config
 
 
@@ -63,6 +73,23 @@ def config_to_kwargs(config: Message) -> Dict[str, Any]:
 def which_msg(config: Message, oneof_group: str) -> str:
     """Returns the name of the message that is set inside a oneof group."""
     return getattr(config, config.WhichOneof(oneof_group)).__class__.__name__
+
+
+def _get_compatible_fg_mode(data_config: data_pb2.DataConfig) -> FgMode:
+    """Compat for fg_encoded."""
+    if data_config.HasField("fg_encoded"):
+        logger.warning(
+            "data_config.fg_encoded will be deprecated, please use data_config.fg_mode."
+        )
+        if data_config.fg_encoded:
+            fg_mode = FgMode.FG_NONE
+        elif data_config.fg_threads > 0:
+            fg_mode = FgMode.FG_DAG
+        else:
+            fg_mode = FgMode.FG_NORMAL
+    else:
+        fg_mode = data_config.fg_mode
+    return fg_mode
 
 
 # pyre-ignore [24]

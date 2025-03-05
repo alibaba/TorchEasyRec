@@ -63,7 +63,7 @@
   "tzrec/benchmark/configs/taobao/mmoe.config": {
     "label": {
       "auc_ctr": 0.634,
-      "auc_cvr": 0.705
+      "auc_cvr": 0.785
     },
     "threshold": {
       "auc_ctr": 0.002,
@@ -101,6 +101,17 @@
     "threshold": {
       "auc_ctr": 0.002,
       "auc_cvr": 0.040
+    },
+    "run_cnt": 5
+  },
+  "tzrec/benchmark/configs/taobao/dssm_taobao.config": {
+    "label": {
+      "recall@1": 0.240,
+      "recall@5": 0.427
+    },
+    "threshold": {
+      "recall@1": 0.02,
+      "recall@5": 0.02
     },
     "run_cnt": 5
   },

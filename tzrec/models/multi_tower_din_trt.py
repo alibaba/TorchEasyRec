@@ -10,7 +10,7 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -31,7 +31,7 @@ def _get_dict(
 ) -> Dict[str, torch.Tensor]:
     if len(grouped_features_keys) != len(args):
         raise ValueError(
-            "The number of grouped_features_keys must match " "the number of arguments."
+            "The number of grouped_features_keys must match the number of arguments."
         )
     grouped_features = {key: value for key, value in zip(grouped_features_keys, args)}
     return grouped_features
@@ -45,6 +45,7 @@ class MultiTowerDINDense(RankModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
@@ -53,8 +54,10 @@ class MultiTowerDINDense(RankModel):
         model_config: ModelConfig,
         features: List[BaseFeature],
         labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         self.grouped_features_keys = embedding_group.grouped_features_keys()
 
@@ -123,12 +126,18 @@ class MultiTowerDINTRT(RankModel):
         model_config (ModelConfig): an instance of ModelConfig.
         features (list): list of features.
         labels (list): list of label names.
+        sample_weights (list): sample weight names.
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
         )

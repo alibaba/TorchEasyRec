@@ -18,12 +18,22 @@ import torch
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
 
+from tzrec.protos.data_pb2 import FieldType
+
 BASE_DATA_GROUP = "__BASE__"
 NEG_DATA_GROUP = "__NEG__"
 CROSS_NEG_DATA_GROUP = "__CNEG__"
 
 C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
+
+FIELD_TYPE_TO_PA = {
+    FieldType.INT32: pa.int32(),
+    FieldType.INT64: pa.int64(),
+    FieldType.FLOAT: pa.float32(),
+    FieldType.DOUBLE: pa.float64(),
+    FieldType.STRING: pa.string(),
+}
 
 
 @dataclass
@@ -54,7 +64,7 @@ class SequenceSparseData(ParsedData):
     """Internal data structure for sequence sparse feature."""
 
     values: npt.NDArray
-    lengths: npt.NDArray
+    key_lengths: npt.NDArray
     seq_lengths: npt.NDArray
 
 
@@ -97,18 +107,37 @@ class RecordBatchTensor:
 class Batch(Pipelineable):
     """Input Batch."""
 
-    # key of dense_features is group name
+    # key of dense_features is data group name
     dense_features: Dict[str, KeyedTensor] = field(default_factory=dict)
-    # key of sparse_features is group name
+    # key of sparse_features is data group name
     sparse_features: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
+    # key of sequence_mulval_lengths is data group name
+    #
+    # for multi-value sequence, we flatten it, then store values & accumate lengths
+    # into sparse_features, store key_lengths & seq_lengths into sequence_mulval_lengths
+    #
+    # e.g.
+    # for the sequence `click_seq`: [[[3, 4], [5]], [6, [7, 8]]]
+    # we can denote it in jagged formular with:
+    #   values: [3, 4, 5, 6, 7, 8]
+    #   key_lengths: [2, 1, 1, 2]
+    #   seq_lengths: [2, 2]
+    # then:
+    #   sparse_features[dg]['click_seq'].values() = [3, 4, 5, 6, 7, 8]  # values
+    #   sparse_features[dg]['click_seq'].lengths() = [3, 3]  # accumate lengths
+    #   sequence_mulval_lengths[dg]['click_seq'].values() = [2, 1, 1, 2]  # key_lengths
+    #   sequence_mulval_lengths[dg]['click_seq'].lengths() = [2, 2]  # seq_lengths
+    sequence_mulval_lengths: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
     # key of sequence_dense_features is feature name
     sequence_dense_features: Dict[str, JaggedTensor] = field(default_factory=dict)
     # key of labels is label name
     labels: Dict[str, torch.Tensor] = field(default_factory=dict)
     # reserved inputs [for predict]
     reserves: RecordBatchTensor = field(default_factory=RecordBatchTensor)
-    # batch_size for input-tile
-    batch_size: int = field(default=-1)
+    # size for user side input tile when do inference and INPUT_TILE=2 or 3
+    tile_size: int = field(default=-1)
+    # sample_weight
+    sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -121,6 +150,10 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sparse_features.items()
             },
+            sequence_mulval_lengths={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.sequence_mulval_lengths.items()
+            },
             sequence_dense_features={
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sequence_dense_features.items()
@@ -130,7 +163,11 @@ class Batch(Pipelineable):
                 for k, v in self.labels.items()
             },
             reserves=self.reserves,
-            batch_size=self.batch_size,
+            tile_size=self.tile_size,
+            sample_weights={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.sample_weights.items()
+            },
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -139,9 +176,13 @@ class Batch(Pipelineable):
             v.record_stream(stream)
         for v in self.sparse_features.values():
             v.record_stream(stream)
+        for v in self.sequence_mulval_lengths.values():
+            v.record_stream(stream)
         for v in self.sequence_dense_features.values():
             v.record_stream(stream)
         for v in self.labels.values():
+            v.record_stream(stream)
+        for v in self.sample_weights.values():
             v.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
@@ -171,10 +212,14 @@ class Batch(Pipelineable):
             sparse_features={
                 k: v.pin_memory() for k, v in self.sparse_features.items()
             },
+            sequence_mulval_lengths={
+                k: v.pin_memory() for k, v in self.sequence_mulval_lengths.items()
+            },
             sequence_dense_features=sequence_dense_features,
             labels={k: v.pin_memory() for k, v in self.labels.items()},
             reserves=self.reserves,
-            batch_size=self.batch_size,
+            tile_size=self.tile_size,
+            sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
         )
 
     def to_dict(
@@ -198,11 +243,23 @@ class Batch(Pipelineable):
                 tensor_dict[f"{k}.lengths"] = v.lengths()
                 if v.weights_or_none() is not None:
                     tensor_dict[f"{k}.weights"] = v.weights()
+        for x in self.sequence_mulval_lengths.values():
+            if sparse_dtype:
+                x = KeyedJaggedTensor(
+                    keys=x.keys(),
+                    values=x.values().to(sparse_dtype),
+                    lengths=x.lengths().to(sparse_dtype),
+                )
+            for k, v in x.to_dict().items():
+                tensor_dict[f"{k}.key_lengths"] = v.values()
+                tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.sequence_dense_features.items():
             tensor_dict[f"{k}.values"] = v.values()
             tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.labels.items():
             tensor_dict[f"{k}"] = v
-        if self.batch_size > 0:
-            tensor_dict["batch_size"] = torch.tensor(self.batch_size, dtype=torch.int64)
+        for k, v in self.sample_weights.items():
+            tensor_dict[f"{k}"] = v
+        if self.tile_size > 0:
+            tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
         return tensor_dict

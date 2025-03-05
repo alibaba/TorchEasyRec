@@ -9,8 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
@@ -20,10 +18,13 @@ from tzrec.datasets.utils import (
     ParsedData,
     SparseData,
 )
-from tzrec.features.feature import FgMode, _parse_fg_encoded_sparse_feature_impl
+from tzrec.features.feature import (
+    MAX_HASH_BUCKET_SIZE,
+    FgMode,
+    _parse_fg_encoded_sparse_feature_impl,
+)
 from tzrec.features.id_feature import IdFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
-from tzrec.utils.logging_util import logger
 
 
 class ComboFeature(IdFeature):
@@ -32,13 +33,13 @@ class ComboFeature(IdFeature):
     Args:
         feature_config (FeatureConfig): a instance of feature config.
         fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_encoded=true
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.ENCODED,
+        fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
     ) -> None:
         super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
@@ -53,23 +54,21 @@ class ComboFeature(IdFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
-        elif len(self.config.vocab_list) > 0:
-            num_embeddings = len(self.config.vocab_list) + 2
-        elif len(self.config.vocab_dict) > 0:
-            is_rank_zero = os.environ.get("RANK", "0") == "0"
-            if min(list(self.config.vocab_dict.values())) <= 1 and is_rank_zero:
-                logger.warn(
-                    "min index of vocab_dict in "
-                    f"{self.__class__.__name__}[{self.name}] should "
-                    "start from 2. index0 is default_value, index1 is <OOV>."
-                )
-            num_embeddings = max(list(self.config.vocab_dict.values())) + 1
+        elif len(self.vocab_list) > 0:
+            num_embeddings = len(self.vocab_list)
+        elif len(self.vocab_dict) > 0:
+            num_embeddings = max(list(self.vocab_dict.values())) + 1
+        elif len(self.vocab_file) > 0:
+            self.init_fg()
+            num_embeddings = self._fg_op.vocab_list_size()
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
-                " or vocab_list or vocab_dict"
+                " or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
 
@@ -82,13 +81,13 @@ class ComboFeature(IdFeature):
         Return:
             parsed feature data.
         """
-        if self.fg_encoded:
+        if self.fg_mode == FgMode.FG_NONE:
             # input feature is already bucktized
             feat = input_data[self.name]
             parsed_feat = _parse_fg_encoded_sparse_feature_impl(
                 self.name, feat, **self._fg_encoded_kwargs
             )
-        else:
+        elif self.fg_mode == FgMode.FG_NORMAL:
             input_feats = []
             for name in self.inputs:
                 x = input_data[name]
@@ -97,6 +96,10 @@ class ComboFeature(IdFeature):
                 input_feats.append(x.tolist())
             values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
             parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
+        else:
+            raise ValueError(
+                "fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
         return parsed_feat
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
@@ -116,16 +119,17 @@ class ComboFeature(IdFeature):
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("hash_bucket_size"):
+        if self.config.HasField("zch"):
+            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+        elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
-        elif len(self.config.vocab_list) > 0:
-            fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
-                self.config.vocab_list
-            )
-            fg_cfg["default_bucketize_value"] = 1
-        elif len(self.config.vocab_dict) > 0:
-            vocab_dict = OrderedDict(self.config.vocab_dict.items())
-            vocab_dict[self.config.default_value] = 0
-            fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+        elif len(self.vocab_list) > 0:
+            fg_cfg["vocab_list"] = self.vocab_list
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        elif len(self.vocab_dict) > 0:
+            fg_cfg["vocab_dict"] = self.vocab_dict
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         return [fg_cfg]

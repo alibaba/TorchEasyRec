@@ -10,8 +10,34 @@ enum DatasetType {
     OdpsDatasetV1 = 4;
 }
 
+enum FieldType {
+    INT32 = 0;
+    INT64 = 1;
+    STRING = 2;
+    FLOAT = 4;
+    DOUBLE = 5;
+}
+
+enum FgMode {
+    // input data is feature generate encoded,
+    // we do not do fg
+    FG_NONE = 1;
+    // input data is raw feature,
+    // we use python to run feature generate
+    FG_NORMAL = 2;
+    // input data is raw feature,
+    // we use fg_handler to run feature generate
+    FG_DAG = 3;
+    // input data is after feature generate but before do bucketize,
+    // we do bucketize only
+    FG_BUCKETIZE = 4;
+}
+
 message Field {
     required string input_name = 1;
+    // only need specify it when use CsvDataset and
+    // value dtype can not be inferred (all values in the column are null)
+    optional FieldType input_type = 2;
 }
 
 message DataConfig {
@@ -21,10 +47,14 @@ message DataConfig {
     // dataset type.
     required DatasetType dataset_type = 2 [default = OdpsDataset];
 
+    // [deprecated] please use fg_mode.
     // input data is feature generate encoded or not.
     // if fg_encoded = true, you should do fg offline first,
     //   and set fg_encoded_multival_sep for split multi-val feature
     optional bool fg_encoded = 3 [default = true];
+
+    // fg run mode.
+    optional FgMode fg_mode = 20 [default = FG_NONE];
 
     // separator for multi-val feature in fg encoded input data
     optional string fg_encoded_multival_sep  = 4 [default = '\x03'];
@@ -72,6 +102,17 @@ message DataConfig {
 
     // force padding data into same data group with same batch_size
     optional bool force_base_data_group = 18 [default = false];
+
+    // sample weights
+    repeated string sample_weight_fields = 19;
+
+    // whether to shuffle data
+    optional bool shuffle = 21 [default = false];
+
+    // shufffle buffer for better performance, even shuffle buffer is set,
+    // it is suggested to do full data shuffle before training
+    // especially when the performance of models is not good.
+    optional uint32 shuffle_buffer_size  = 22 [default = 32];
 
     // negative sampler
     oneof sampler {

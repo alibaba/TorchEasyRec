@@ -29,9 +29,11 @@ from torchrec.distributed.planner.types import (
     ShardingOption,
     Topology,
 )
-from torchrec.distributed.sharding_plan import ModuleSharder
 from torchrec.distributed.sharding_plan import (
     get_default_sharders as _get_default_sharders,
+)
+from torchrec.distributed.types import (
+    ModuleSharder,
 )
 
 

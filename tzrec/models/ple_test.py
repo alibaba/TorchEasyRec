@@ -108,7 +108,7 @@ class PLETest(unittest.TestCase):
                     ),
                     tower_pb2.TaskTower(
                         tower_name="cost_price",
-                        label_name="label2",
+                        label_name="label3",
                         mlp=module_pb2.MLP(hidden_units=[12, 6]),
                         losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
                     ),
@@ -308,7 +308,7 @@ class PLETest(unittest.TestCase):
                     ),
                     tower_pb2.TaskTower(
                         tower_name="cost_price",
-                        label_name="label2",
+                        label_name="label3",
                         mlp=module_pb2.MLP(hidden_units=[12, 6]),
                         losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
                     ),

@@ -155,3 +155,41 @@ Tag: TUNNEL Endpoint: http://dt.cn-shanghai-vpc.maxcompute.aliyun-inc.com
 **原因：** 离线预测输出表已存在，并且schema不正确
 
 **解决方法：** 删除已存在的输出表或修改输出表名
+
+______________________________________________________________________
+
+**Q11: fbgemm的embedding lookup op的EmbeddingBoundsCheck error**
+
+**报错信息：** fbgemm的embedding lookup op报错：
+
+```
+EmbeddingBoundsCheck (VBE false): (at least one) Out of bounds access for batch: 12, table: 2, bag element: 0, idx: 3, num_rows: 3, indices_start: 1815, indices_end: 1816, T: 244, B: 67, b_t: 1955. Setting idx to zero.
+```
+
+**原因：** 第2个embedding table只有3行embedding（num_rows: 3)，但是传入的id是3（idx: 3），越界了
+
+**解决方法：** 只通过报错日志很难直接确定第2个embedding table是关联哪一个特征。需设置环境变量`LOG_LEVEL=INFO`或`LOG_LEVEL=DEBUG`重新执行训练命令，可以看到训练日志中包含如下内容`[TBE=xxx] Contents: ['id_3_emb', 'lookup_2_emb', 'lookup_3_emb', ...`，就可以得知`lookup_3`这个特征的输入值存在问题需要进一步检查输入数据。
+
+______________________________________________________________________
+
+**Q12: CUDA initialization error**
+
+**报错信息：**
+
+```
+>>> torch.cuda.is_available()
+/opt/conda/lib/python3.11/site-packages/torch/cuda/__init__.py:129: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 804: forward compatibility was attempted on non supported HW (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:109.)
+  return torch._C._cuda_getDeviceCount() > 0
+False
+```
+
+**原因：** 部分显卡（如：RTX系列的）与torcheasyrec cuda镜像中的cuda-compat library不兼容
+
+**解决方法：** 在运行命令前增加环境变量LD_LIBRARY_PATH=，例如
+
+```bash
+LD_LIBRARY_PATH= torchrun --master_addr=localhost --master_port=32555 \
+    --nnodes=1 --nproc-per-node=2 --node_rank=0 \
+    -m tzrec.train_eval \
+    --pipeline_config_path multi_tower_din_taobao_local.config
+```

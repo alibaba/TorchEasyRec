@@ -41,6 +41,29 @@ class MLPTest(unittest.TestCase):
         result = mlp(input)
         self.assertEqual(result.size(), (4, 2))
 
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, [0.9]],
+            [TestGraphType.NORMAL, 0.9],
+            [TestGraphType.NORMAL, [0.9, 0.8, 0.7]],
+            [TestGraphType.FX_TRACE, [0.9]],
+            [TestGraphType.JIT_SCRIPT, [0.9]],
+        ]
+    )
+    def test_mlp_seq(self, graph_type, dropout_ratio) -> None:
+        mlp = MLP(
+            in_features=16,
+            hidden_units=[8, 4, 2],
+            activation="nn.ReLU",
+            use_bn=True,
+            dropout_ratio=dropout_ratio,
+            dim=3,
+        )
+        mlp = create_test_module(mlp, graph_type)
+        input = torch.randn(4, 2, 16)
+        result = mlp(input)
+        self.assertEqual(result.size(), (4, 2, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
