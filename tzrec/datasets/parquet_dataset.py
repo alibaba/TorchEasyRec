@@ -44,6 +44,7 @@ def _reader_iter(
             cnt += metadata.num_rows
             continue
         else:
+            i = 0
             for i in range(metadata.num_row_groups):
                 row_group_rows = metadata.row_group(i).num_rows
                 if cnt + row_group_rows <= start:
@@ -67,6 +68,7 @@ def _reader_iter(
                 cnt += len(batch)
                 if cnt >= end:
                     break
+            parquet_file.close()
 
 
 class ParquetDataset(BaseDataset):
@@ -173,16 +175,16 @@ class ParquetReader(BaseReader):
         else:
             self._parquet_metas = parquet_metas_per_rank
 
-        self._num_rows = 0
+        self._num_rows = []
         for input_file in self._input_files:
-            self._num_rows += self._parquet_metas[input_file].num_rows
+            self._num_rows.append(self._parquet_metas[input_file].num_rows)
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         start, end, _ = calc_slice_position(
-            self._num_rows,
+            sum(self._num_rows),
             worker_id,
             num_workers,
             self._batch_size,
