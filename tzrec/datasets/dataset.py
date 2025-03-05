@@ -250,7 +250,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         Recursive removal of the null=False property from lists and nested lists.
         """
         # If it is a list type, recursively remove the null attribute of the element type
-        if isinstance(field_type, pa.ListType):
+        if pa.is_list_(field_type):
             # Get element fields
             value_field = field_type.value_field
             # Change the nullable to True
@@ -266,7 +266,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Init input fields info."""
         self._input_fields = []
         for field in self._reader.schema:
-            if any(map(lambda x: x == self._remove_nullable(field.type), AVAILABLE_PA_TYPES)):
+            field_type = self._remove_nullable(field.type)
+            if any(map(lambda x: x == field_type, AVAILABLE_PA_TYPES)):
                 self._input_fields.append(field)
             else:
                 raise ValueError(

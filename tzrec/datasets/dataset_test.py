@@ -545,14 +545,14 @@ class DatasetTest(unittest.TestCase):
         )
         self.assertEqual(batch.labels["label"].size(), (40,))
 
-    def test_dataset_with_new_list_dtype(self):
+    def test_dataset_with_list_type_not_null(self):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),
             pa.field(name="float_b", type=pa.float64()),
             pa.field(name="str_c", type=pa.string()),
             pa.field(name="label", type=pa.int32()),
-            pa.field(name="list_str_d", type=pa.list_(pa.string()),nullable=False),  # 新增的数据类型
-            pa.field(name="list_list_str_e", type=pa.list_(pa.field('list_str_e', pa.string(),nullable=False)),nullable=False) # 新增的数据类型
+            pa.field(name="list_str_d", type=pa.list_(pa.string()),nullable=False),
+            pa.field(name="list_list_str_e", type=pa.list_(pa.field('list_str_e', pa.string(),nullable=False)),nullable=False)
 
         ]
         feature_cfgs = [
@@ -566,10 +566,10 @@ class DatasetTest(unittest.TestCase):
                 raw_feature=feature_pb2.RawFeature(feature_name="float_b")
             ),
             feature_pb2.FeatureConfig(
-                raw_feature=feature_pb2.RawFeature(feature_name="list_str_d")  # 新增的数据类型
+                raw_feature=feature_pb2.RawFeature(feature_name="list_str_d")
             ),
             feature_pb2.FeatureConfig(
-                raw_feature=feature_pb2.RawFeature(feature_name="list_list_str_e")  # 新增的数据类型
+                raw_feature=feature_pb2.RawFeature(feature_name="list_list_str_e")
             ),
         ]
         features = create_features(feature_cfgs)
