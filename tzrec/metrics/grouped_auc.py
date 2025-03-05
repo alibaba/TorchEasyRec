@@ -67,13 +67,12 @@ class GroupedAUC(Metric):
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
         if isinstance(self.eval_data, list):  # compatible with cpu mode
-            self.eval_data = torch.cat(self.eval_data, dim=1)
+            self.eval_data = torch.cat(self.eval_data, dim=1)  # pyre-ignore [16][6]
 
-        # pyre-ignore [6]
         preds, target, grouping_key = (
-            self.eval_data[0, :],
-            self.eval_data[1, :],
-            self.eval_data[2, :],
+            self.eval_data[0, :],  # pyre-ignore [29]
+            self.eval_data[1, :],  # pyre-ignore [29]
+            self.eval_data[2, :],  # pyre-ignore [29]
         )
 
         sorted_grouping_key, indices = torch.sort(grouping_key)
