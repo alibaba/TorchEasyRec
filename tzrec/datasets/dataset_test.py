@@ -61,8 +61,33 @@ class _TestReader(BaseReader):
                     data = np.random.randint(100, size=(self._batch_size,)).astype(
                         np.str_
                     )
+                elif f.type == pa.string():
+                    data = np.random.randint(100, size=(self._batch_size,)).astype(
+                        np.str_
+                    )
+                elif pa.types.is_list(f.type):
+                    if f.type.value_type == pa.string():
+                        data = [
+                            [str(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported list type: {f.type}")
+
+                elif pa.types.is_list(f.type) and pa.types.is_list(f.type.value_type):
+                    if f.type.value_type.value_type == pa.string():
+                        data = [
+                            [
+                                [str(np.random.randint(100)) for _ in range(2)],
+                                [str(np.random.randint(100)) for _ in range(2)],
+                            ]
+                            for _ in range(self._batch_size)
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported nested list type: {f.type}")
                 else:
-                    raise ValueError(f"Unknown input_type {f.input_type}")
+                    raise ValueError(f"Unknown input_type {f.type}")
+
                 input_data[f.name] = pa.array(data)
             yield input_data
 
