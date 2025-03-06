@@ -42,6 +42,7 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.utils import calc_slice_position
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
@@ -177,65 +178,6 @@ def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str
     return str_list[2], str_list[4], table_partitions
 
 
-def _calc_slice_position(
-    row_count: int,
-    slice_id: int,
-    slice_count: int,
-    batch_size: int,
-    drop_redundant_bs_eq_one: bool,
-    pre_total_remain: int = 0,
-) -> Tuple[int, int, int]:
-    """Calc table read position according to the slice information.
-
-    Args:
-        row_count (int): table total row count.
-        slice_id (int): worker id.
-        slice_count (int): total worker number.
-        batch_size (int): batch_size.
-        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
-        pre_total_remain (int): remaining total count in pre-table is
-            insufficient to meet the batch_size requirement for each worker.
-
-    Return:
-        start (int): start row position in table.
-        end (int): start row position in table.
-        total_remain (int): remaining total count in curr-table is
-            insufficient to meet the batch_size requirement for each worker.
-    """
-    pre_remain_size = int(pre_total_remain / slice_count)
-    pre_remain_split_point = pre_total_remain % slice_count
-
-    size = int((row_count + pre_total_remain) / slice_count)
-    split_point = (row_count + pre_total_remain) % slice_count
-    if slice_id < split_point:
-        start = slice_id * (size + 1)
-        end = start + (size + 1)
-    else:
-        start = split_point * (size + 1) + (slice_id - split_point) * size
-        end = start + size
-
-    real_start = (
-        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
-    )
-    real_end = (
-        end
-        - pre_remain_size * (slice_id + 1)
-        - min(pre_remain_split_point, slice_id + 1)
-    )
-    # when (end - start) % bz = 1 on some workers and
-    # (end - start) % bz = 0 on other workers, train_eval will hang
-    if (
-        drop_redundant_bs_eq_one
-        and split_point != 0
-        and (end - start) % batch_size == 1
-        and size % batch_size == 0
-    ):
-        real_end = real_end - 1
-        split_point = 0
-    return real_start, real_end, (size % batch_size) * slice_count + split_point
-
-
 def _read_rows_arrow_with_retry(
     client: StorageApiArrowClient,
     read_req: ReadRowsRequest,
@@ -272,7 +214,7 @@ def _reader_iter(
                 time.sleep(1)
                 continue
             break
-        start, end, remain_row_count = _calc_slice_position(
+        start, end, remain_row_count = calc_slice_position(
             # pyre-ignore [6]
             scan_resp.record_count,
             worker_id,
