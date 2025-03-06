@@ -14,7 +14,6 @@ import os
 from typing import Any, List
 
 import torch
-from torch import distributed as dist
 from torchmetrics import Metric
 from torchmetrics.functional.classification.auroc import _binary_auroc_compute
 
@@ -92,18 +91,4 @@ class GroupedAUC(Metric):
             if mean_target > 0 and mean_target < 1:
                 aucs.append(_binary_auroc_compute((preds, target), None))
         mean_gauc = torch.mean(torch.Tensor(aucs))
-
-        # gather metric data across processes
-        if dist.get_world_size() > 1:
-            gather_metric_list = [
-                torch.empty_like(mean_gauc.cuda())
-                if dist.get_backend() == "nccl"
-                else torch.empty_like(mean_gauc)
-                for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(
-                gather_metric_list,
-                mean_gauc.cuda() if dist.get_backend() == "nccl" else mean_gauc,
-            )
-            mean_gauc = torch.mean(torch.stack(gather_metric_list))
         return mean_gauc
