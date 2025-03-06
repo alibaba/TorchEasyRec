@@ -326,7 +326,7 @@ def calc_slice_position(
 
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:
     """Recursive removal of the null=False property from lists and nested lists."""
-    if pa.is_list_(field_type):
+    if pa.types.is_list(field_type):
         # Get element fields
         value_field = field_type.value_field
         # Change the nullable to True
