@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy.typing as npt
 import pyarrow as pa
@@ -265,17 +265,60 @@ class Batch(Pipelineable):
         return tensor_dict
 
 
-def remove_nullable(field_type: pa.DataType) -> pa.DataType:
-    """Recursive removal of the null=False property from lists and nested lists."""
-    if pa.is_list_(field_type):
-        # Get element fields
-        value_field = field_type.value_field
-        # Change the nullable to True
-        normalized_value_field = value_field.with_nullable(True)
-        # Recursive processing of element types
-        normalized_value_type = remove_nullable(normalized_value_field.type)
-        # Construct a new list type
-        return pa.list_(normalized_value_type)
+def calc_slice_position(
+    row_count: int,
+    slice_id: int,
+    slice_count: int,
+    batch_size: int,
+    drop_redundant_bs_eq_one: bool,
+    pre_total_remain: int = 0,
+) -> Tuple[int, int, int]:
+    """Calc table read position according to the slice information.
 
+    Args:
+        row_count (int): table total row count.
+        slice_id (int): worker id.
+        slice_count (int): total worker number.
+        batch_size (int): batch_size.
+        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
+            equal one to prevent train_eval hung.
+        pre_total_remain (int): remaining total count in pre-table is
+            insufficient to meet the batch_size requirement for each worker.
+
+    Return:
+        start (int): start row position in table.
+        end (int): start row position in table.
+        total_remain (int): remaining total count in curr-table is
+            insufficient to meet the batch_size requirement for each worker.
+    """
+    pre_remain_size = int(pre_total_remain / slice_count)
+    pre_remain_split_point = pre_total_remain % slice_count
+
+    size = int((row_count + pre_total_remain) / slice_count)
+    split_point = (row_count + pre_total_remain) % slice_count
+    if slice_id < split_point:
+        start = slice_id * (size + 1)
+        end = start + (size + 1)
     else:
-        return field_type
+        start = split_point * (size + 1) + (slice_id - split_point) * size
+        end = start + size
+
+    real_start = (
+        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
+    )
+    real_end = (
+        end
+        - pre_remain_size * (slice_id + 1)
+        - min(pre_remain_split_point, slice_id + 1)
+    )
+    # when (end - start) % bz = 1 on some workers and
+    # (end - start) % bz = 0 on other workers, train_eval will hang
+    if (
+        drop_redundant_bs_eq_one
+        and split_point != 0
+        and (end - start) % batch_size == 1
+        and size % batch_size == 0
+    ):
+        real_end = real_end - 1
+        split_point = 0
+    return real_start, real_end, (size % batch_size) * slice_count + split_point
