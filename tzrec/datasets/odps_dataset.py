@@ -42,7 +42,7 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import calc_slice_position
+from tzrec.datasets.utils import calc_slice_position, remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
@@ -84,6 +84,7 @@ TYPE_TABLE_TO_PA = {
 def _type_pa_to_table(pa_type: pa.DataType) -> str:
     """PyArrow type to MaxCompute Table type."""
     mc_type = None
+    pa_type = remove_nullable(pa_type)
     for k, v in TYPE_TABLE_TO_PA.items():
         # list<element: int64> and list<item: int64> is equal
         if v == pa_type:
