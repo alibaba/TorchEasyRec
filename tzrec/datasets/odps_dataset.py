@@ -297,16 +297,9 @@ def _reader_iter(
             max_batch_rows=min(batch_size, 20000),
         )
         reader = _read_rows_arrow_with_retry(client, read_req)
-        start_time = time.time()
         max_retry_count = 5
         while True:
             try:
-                if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
-                    if worker_id == 0:
-                        client.get_read_session(
-                            SessionRequest(sess_req.session_id, refresh=True)
-                        )
-                    start_time = time.time()
                 read_data = reader.read()
                 retry_cnt = 0
             except urllib3.exceptions.HTTPError as e:
