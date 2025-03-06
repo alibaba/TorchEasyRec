@@ -17,12 +17,10 @@ message ExtractionNetwork {
     // number of experts per task
     required uint32 expert_num_per_task = 2;
     // number of experts for share
-    // For the last extraction_network, no need to configure this
     optional uint32 share_num = 3;
     // mlp network of experts per task
     required MLP task_expert_net = 4;
     // mlp network of experts for share
-    // For the last extraction_network, no need to configure this
     optional MLP share_expert_net = 5;
 }
 

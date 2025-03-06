@@ -6,7 +6,7 @@ import "tzrec/protos/simi.proto";
 
 
 message RocketLaunching {
-    required MLP share_mlp = 1;
+    optional MLP share_mlp = 1;
     required MLP booster_mlp =2;
     required MLP light_mlp = 3;
     optional float l2_regularization = 4 [default = 1e-4];
