@@ -322,3 +322,19 @@ def calc_slice_position(
         real_end = real_end - 1
         split_point = 0
     return real_start, real_end, (size % batch_size) * slice_count + split_point
+
+
+def remove_nullable(field_type: pa.DataType) -> pa.DataType:
+    """Recursive removal of the null=False property from lists and nested lists."""
+    if pa.is_list_(field_type):
+        # Get element fields
+        value_field = field_type.value_field
+        # Change the nullable to True
+        normalized_value_field = value_field.with_nullable(True)
+        # Recursive processing of element types
+        normalized_value_type = remove_nullable(normalized_value_field.type)
+        # Construct a new list type
+        return pa.list_(normalized_value_type)
+
+    else:
+        return field_type
