@@ -181,6 +181,7 @@ def _create_mean_pooling_divisor(
 embeddingbag._create_mean_pooling_divisor = _create_mean_pooling_divisor
 
 
+# fix missing create_mean_pooling_callback of mc-ebc input_dist
 def _mc_input_dist(
     # pyre-ignore [2]
     self,
