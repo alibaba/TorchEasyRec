@@ -59,7 +59,7 @@ class RocketLaunching(RankModel):
             hidden_layer_feature_output=self.hidden_layer_feature_output,
             **config_to_kwargs(self._model_config.booster_mlp),
         )
-        self.booster_liner = torch.nn.Linear(
+        self.booster_linear = torch.nn.Linear(
             self.booster_mlp.output_dim(), self._num_class
         )
 
@@ -68,8 +68,22 @@ class RocketLaunching(RankModel):
             hidden_layer_feature_output=self.hidden_layer_feature_output,
             **config_to_kwargs(self._model_config.light_mlp),
         )
-        self.light_liner = torch.nn.Linear(self.light_mlp.output_dim(), self._num_class)
+        self.light_linear = torch.nn.Linear(
+            self.light_mlp.output_dim(), self._num_class
+        )
         self.hint_loss_name = "hint_l2_loss"
+        self.mlp_index_dict = self._get_distillation_mlp_index()
+
+    def _get_distillation_mlp_index(self) -> Dict[int, int]:
+        booster_hidden_units = self._model_config.booster_mlp.hidden_units
+        light_hidden_units = self._model_config.light_mlp.hidden_units
+        mlp_index_dict = {}
+        for i, unit_i in enumerate(light_hidden_units):
+            for j, unit_j in enumerate(booster_hidden_units):
+                if unit_i == unit_j:
+                    mlp_index_dict[i] = j
+                    break
+        return mlp_index_dict
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
@@ -86,32 +100,38 @@ class RocketLaunching(RankModel):
             share_net = self.share_mlp(net)
         else:
             share_net = net
-        self.light_net = self.light_mlp(share_net.detach())
+        light_net = self.light_mlp(share_net.detach())
         if self.hidden_layer_feature_output:
-            light_out = self.light_liner(self.light_net["hidden_layer_end"])
+            light_out = self.light_linear(light_net["hidden_layer_end"])
         else:
-            light_out = self.light_liner(self.light_net)
+            light_out = self.light_linear(light_net)
         prediction_dict = {}
         prediction_dict.update(self._output_to_prediction(light_out, suffix="_light"))
 
         if self.training:
-            self.booster_net = self.booster_mlp(share_net)
+            booster_net = self.booster_mlp(share_net)
             if self.hidden_layer_feature_output:
-                booster_out = self.booster_liner(self.booster_net["hidden_layer_end"])
+                # pyre-ignore [29]
+                booster_out = self.booster_linear(booster_net["hidden_layer_end"])
             else:
-                booster_out = self.booster_liner(self.booster_net)
+                booster_out = self.booster_linear(booster_net)
             prediction_dict.update(
                 self._output_to_prediction(booster_out, suffix="_booster")
             )
+            for i, j in self.mlp_index_dict.items():
+                prediction_dict[f"light_{i}"] = light_net["hidden_layer" + str(i)]
+                prediction_dict[f"booster_{j}"] = booster_net["hidden_layer" + str(j)]
         return prediction_dict
 
     def feature_based_sim(
-        self, i: int, j: int, loss_weight: Optional[torch.Tensor]
+        self,
+        light_feature: torch.Tensor,
+        booster_feature: torch.Tensor,
+        loss_weight: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Compute similarity between booster_net and light_net."""
         feature_distillation_function = self._model_config.feature_distillation_function
-        booster_feature_no_gradient = self.booster_net["hidden_layer" + str(j)].detach()
-        light_feature = self.light_net["hidden_layer" + str(i)]
+        booster_feature_no_gradient = booster_feature.detach()
         if feature_distillation_function == Similarity.COSINE:
             booster_feature_no_gradient_norm = F.normalize(
                 booster_feature_no_gradient, p=2, dim=1
@@ -157,6 +177,30 @@ class RocketLaunching(RankModel):
             self._init_loss_metric_impl(loss_cfg, "_booster")
             self._init_loss_metric_impl(loss_cfg, "_light")
 
+    def _distillation_loss(
+        self, predictions: Dict[str, torch.Tensor], loss_weight: Optional[torch.Tensor]
+    ):
+        losses = {}
+        # compute booster feature and light feature similarity loss
+        if self._model_config.feature_based_distillation:
+            for i, j in self.mlp_index_dict.items():
+                light_feature = predictions[f"light_{i}"]
+                booster_feature = predictions[f"booster_{j}"]
+                losses[f"similarity_{i}_{j}"] = self.feature_based_sim(
+                    light_feature, booster_feature, loss_weight
+                )
+        # computer booster logits and light logits mse loss
+        logits_booster = predictions["logits_booster"]
+        logits_light = predictions["logits_light"]
+        batch_hint_loss = self._loss_modules[self.hint_loss_name](
+            logits_light, logits_booster.detach()
+        )
+        if loss_weight is not None:
+            losses[self.hint_loss_name] = torch.mean(batch_hint_loss * loss_weight)
+        else:
+            losses[self.hint_loss_name] = batch_hint_loss
+        return losses
+
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
@@ -194,29 +238,8 @@ class RocketLaunching(RankModel):
             )
         losses.update(self._loss_collection)
         if self.training:
-            # compute booster net and light net similarity loss
-            if self._model_config.feature_based_distillation:
-                booster_hidden_units = self._model_config.booster_mlp.hidden_units
-                light_hidden_units = self._model_config.light_mlp.hidden_units
-                count = 0
-                for i, unit_i in enumerate(light_hidden_units):
-                    for j, unit_j in enumerate(booster_hidden_units):
-                        if unit_i == unit_j:
-                            losses["similarity_" + str(count)] = self.feature_based_sim(
-                                i, j, loss_weight
-                            )
-                            count += 1
-                            break
-            # computer booster logits and light logits mse loss
-            logits_booster = predictions["logits_booster"]
-            logits_light = predictions["logits_light"]
-            batch_hint_loss = self._loss_modules[self.hint_loss_name](
-                logits_light, logits_booster.detach()
-            )
-            if loss_weight is not None:
-                losses[self.hint_loss_name] = torch.mean(batch_hint_loss * loss_weight)
-            else:
-                losses[self.hint_loss_name] = batch_hint_loss
+            # compute distillation loss
+            losses.update(self._distillation_loss(predictions, loss_weight))
         return losses
 
     def update_metric(
