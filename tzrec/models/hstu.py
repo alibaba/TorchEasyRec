@@ -56,7 +56,12 @@ class HSTUMatchTower(MatchTower):
         model_config: model_pb2.ModelConfig,
     ) -> None:
         super().__init__(
-            tower_config, output_dim, similarity, feature_group, features, model_config
+            tower_config,
+            output_dim,
+            similarity,
+            [feature_group],
+            features,
+            model_config,
         )
         self.init_input()
         self.tower_config = tower_config

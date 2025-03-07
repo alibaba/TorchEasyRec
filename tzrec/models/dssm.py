@@ -45,7 +45,7 @@ class DSSMTower(MatchTower):
         output_dim (int): user/item output embedding dimension.
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
-        feature_group (FeatureGroupConfig): feature group config.
+        feature_groups (list[FeatureGroupConfig]): feature group configs.
         features (list): list of features.
     """
 
@@ -54,12 +54,12 @@ class DSSMTower(MatchTower):
         tower_config: tower_pb2.Tower,
         output_dim: int,
         similarity: match_model_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
     ) -> None:
         super().__init__(
-            tower_config, output_dim, similarity, feature_group, features, model_config
+            tower_config, output_dim, similarity, feature_groups, features, model_config
         )
         self.init_input()
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
@@ -74,7 +74,7 @@ class DSSMTower(MatchTower):
             batch (Batch): input batch data.
 
         Return:
-            embedding (dict): tower output embedding.
+            embedding (Tensor): tower output embedding.
         """
         grouped_features = self.build_input(batch)
         output = self.mlp(grouped_features[self._group_name])
@@ -121,7 +121,7 @@ class DSSM(MatchModel):
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
+            [user_group],
             list(user_features.values()),
             model_config,
         )
@@ -130,7 +130,7 @@ class DSSM(MatchModel):
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            item_group,
+            [item_group],
             item_features,
             model_config,
         )
