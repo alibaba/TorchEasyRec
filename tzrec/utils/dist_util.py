@@ -9,15 +9,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec.distributed import embeddingbag
+from torchrec.distributed.embedding import (
+    EmbeddingCollectionSharder,
+    ShardedEmbeddingCollection,
+)
+from torchrec.distributed.embedding_types import (
+    KJTList,
+)
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollectionSharder,
+    ShardedEmbeddingBagCollection,
+)
+from torchrec.distributed.mc_embedding_modules import (
+    BaseManagedCollisionEmbeddingCollection,
+    ShrdCtx,
+)
+from torchrec.distributed.mc_modules import (
+    ManagedCollisionCollectionSharder,
+    ShardedManagedCollisionCollection,
+)
+from torchrec.distributed.types import (
+    Awaitable,
+    ParameterSharding,
+    ShardingEnv,
+)
 from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import PoolingType
-from torchrec.sparse.jagged_tensor import _to_offsets
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.modules.mc_embedding_modules import (
+    ManagedCollisionEmbeddingBagCollection,
+    ManagedCollisionEmbeddingCollection,
+)
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, _to_offsets
 
 
 def broadcast_string(s: str, src: int = 0) -> str:
@@ -158,3 +190,127 @@ def _create_mean_pooling_divisor(
 
 # pyre-ignore [9]
 embeddingbag._create_mean_pooling_divisor = _create_mean_pooling_divisor
+
+
+# fix mean pooling for mc-ebc
+def _mc_init(
+    self,
+    module: Union[
+        ManagedCollisionEmbeddingBagCollection, ManagedCollisionEmbeddingCollection
+    ],
+    table_name_to_parameter_sharding: Dict[str, ParameterSharding],
+    e_sharder: Union[EmbeddingBagCollectionSharder, EmbeddingCollectionSharder],
+    mc_sharder: ManagedCollisionCollectionSharder,
+    # TODO: maybe we need this to manage unsharded/sharded consistency/state consistency
+    env: ShardingEnv,
+    device: torch.device,
+) -> None:
+    super().__init__()
+
+    self._device = device
+    self._env = env
+
+    if isinstance(module, ManagedCollisionEmbeddingBagCollection):
+        assert isinstance(e_sharder, EmbeddingBagCollectionSharder)
+        assert isinstance(module._embedding_module, EmbeddingBagCollection)
+        self.bagged: bool = True
+
+        self._embedding_module: ShardedEmbeddingBagCollection = e_sharder.shard(
+            module._embedding_module,
+            table_name_to_parameter_sharding,
+            env=env,
+            device=device,
+        )
+    else:
+        assert isinstance(e_sharder, EmbeddingCollectionSharder)
+        assert isinstance(module._embedding_module, EmbeddingCollection)
+        self.bagged: bool = False
+
+        self._embedding_module: ShardedEmbeddingCollection = e_sharder.shard(
+            module._embedding_module,
+            table_name_to_parameter_sharding,
+            env=env,
+            device=device,
+        )
+    # TODO: This is a hack since _embedding_module doesn't need input
+    # dist, so eliminating it so all fused a2a will ignore it.
+    # self._embedding_module._has_uninitialized_input_dist = False
+    embedding_shardings = (
+        self._embedding_module._embedding_shardings
+        if isinstance(self._embedding_module, ShardedEmbeddingBagCollection)
+        else list(self._embedding_module._sharding_type_to_sharding.values())
+    )
+    self._managed_collision_collection: ShardedManagedCollisionCollection = (
+        mc_sharder.shard(
+            module._managed_collision_collection,
+            table_name_to_parameter_sharding,
+            env=env,
+            device=device,
+            embedding_shardings=embedding_shardings,
+            use_index_dedup=(
+                e_sharder._use_index_dedup
+                if isinstance(e_sharder, EmbeddingCollectionSharder)
+                else False
+            ),
+        )
+    )
+    self._return_remapped_features: bool = module._return_remapped_features
+
+    # pyre-ignore
+    self._table_to_tbe_and_index = {}
+    for lookup in self._embedding_module._lookups:
+        # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Tensor, Module]` is not
+        #  a function.
+        for emb_module in lookup._emb_modules:
+            for table_idx, table in enumerate(emb_module._config.embedding_tables):
+                self._table_to_tbe_and_index[table.name] = (
+                    emb_module._emb_module,
+                    torch.tensor([table_idx], dtype=torch.int, device=self._device),
+                )
+    self._buffer_ids: torch.Tensor = torch.tensor(
+        [0], device=self._device, dtype=torch.int
+    )
+
+
+def _mc_input_dist(
+    self,
+    ctx: ShrdCtx,
+    features: KeyedJaggedTensor,
+) -> Awaitable[Awaitable[KJTList]]:
+    if self._embedding_module._has_uninitialized_input_dist:
+        if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+            if self._embedding_module._has_mean_pooling_callback:
+                self._embedding_module._init_mean_pooling_callback(
+                    features.keys(), ctx.inverse_indices
+                )
+        self._embedding_module._has_uninitialized_input_dist = False
+    if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+        with torch.no_grad():
+            if self._embedding_module._has_mean_pooling_callback:
+                ctx.divisor = _create_mean_pooling_divisor(
+                    lengths=features.lengths(),
+                    stride=features.stride(),
+                    keys=features.keys(),
+                    offsets=features.offsets(),
+                    pooling_type_to_rs_features=self._embedding_module._pooling_type_to_rs_features,
+                    stride_per_key=features.stride_per_key(),
+                    dim_per_key=self._embedding_module._dim_per_key,
+                    embedding_names=self._embedding_module._embedding_names,
+                    embedding_dims=self._embedding_module._embedding_dims,
+                    variable_batch_per_feature=ctx.variable_batch_per_feature,
+                    kjt_inverse_order=self._embedding_module._kjt_inverse_order,
+                    kjt_key_indices=self._embedding_module._kjt_key_indices,
+                    kt_key_ordering=self._embedding_module._kt_key_ordering,
+                    inverse_indices=ctx.inverse_indices,
+                    weights=features.weights_or_none(),
+                )
+    # TODO: resolve incompatibility with different contexts
+    return self._managed_collision_collection.input_dist(
+        # pyre-fixme [6]
+        ctx,
+        features,
+    )
+
+
+BaseManagedCollisionEmbeddingCollection.__init__ = _mc_init
+BaseManagedCollisionEmbeddingCollection.input_dist = _mc_input_dist
