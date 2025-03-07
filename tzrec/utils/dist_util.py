@@ -9,44 +9,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import distributed as dist
+from torch import nn
 from torch.autograd.profiler import record_function
 from torchrec.distributed import embeddingbag
-from torchrec.distributed.embedding import (
-    EmbeddingCollectionSharder,
-)
 from torchrec.distributed.embedding_types import (
     KJTList,
 )
 from torchrec.distributed.embeddingbag import (
-    EmbeddingBagCollectionSharder,
     ShardedEmbeddingBagCollection,
 )
 from torchrec.distributed.mc_embedding_modules import (
     BaseShardedManagedCollisionEmbeddingCollection,
     ShrdCtx,
 )
-from torchrec.distributed.mc_modules import (
-    ManagedCollisionCollectionSharder,
+from torchrec.distributed.model_parallel import DataParallelWrapper
+from torchrec.distributed.model_parallel import (
+    DistributedModelParallel as _DistributedModelParallel,
 )
 from torchrec.distributed.types import (
     Awaitable,
-    ParameterSharding,
+    ModuleSharder,
     ShardingEnv,
+    ShardingPlan,
 )
 from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import PoolingType
-from torchrec.modules.embedding_modules import (
-    EmbeddingBagCollection,
-    EmbeddingCollection,
-)
-from torchrec.modules.mc_embedding_modules import (
-    ManagedCollisionEmbeddingBagCollection,
-    ManagedCollisionEmbeddingCollection,
-)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, _to_offsets
 
 
@@ -190,80 +181,6 @@ def _create_mean_pooling_divisor(
 embeddingbag._create_mean_pooling_divisor = _create_mean_pooling_divisor
 
 
-# fix mean pooling for mc-ebc
-def _mc_init(
-    # pyre-ignore [2]
-    self,
-    module: Union[
-        ManagedCollisionEmbeddingBagCollection, ManagedCollisionEmbeddingCollection
-    ],
-    table_name_to_parameter_sharding: Dict[str, ParameterSharding],
-    e_sharder: Union[EmbeddingBagCollectionSharder, EmbeddingCollectionSharder],
-    mc_sharder: ManagedCollisionCollectionSharder,
-    # TODO: maybe we need this to manage unsharded/sharded consistency/state consistency
-    env: ShardingEnv,
-    device: torch.device,
-) -> None:
-    super().__init__()
-
-    self._device = device
-    self._env = env
-
-    if isinstance(module, ManagedCollisionEmbeddingBagCollection):
-        assert isinstance(e_sharder, EmbeddingBagCollectionSharder)
-        assert isinstance(module._embedding_module, EmbeddingBagCollection)
-        self.bagged = True
-
-        self._embedding_module = e_sharder.shard(
-            module._embedding_module,
-            table_name_to_parameter_sharding,
-            env=env,
-            device=device,
-        )
-    else:
-        assert isinstance(e_sharder, EmbeddingCollectionSharder)
-        assert isinstance(module._embedding_module, EmbeddingCollection)
-        self.bagged = False
-
-        self._embedding_module = e_sharder.shard(
-            module._embedding_module,
-            table_name_to_parameter_sharding,
-            env=env,
-            device=device,
-        )
-    # TODO: This is a hack since _embedding_module doesn't need input
-    # dist, so eliminating it so all fused a2a will ignore it.
-    # self._embedding_module._has_uninitialized_input_dist = False
-    embedding_shardings = (
-        self._embedding_module._embedding_shardings
-        if isinstance(self._embedding_module, ShardedEmbeddingBagCollection)
-        else list(self._embedding_module._sharding_type_to_sharding.values())
-    )
-    self._managed_collision_collection = mc_sharder.shard(
-        module._managed_collision_collection,
-        table_name_to_parameter_sharding,
-        env=env,
-        device=device,
-        embedding_shardings=embedding_shardings,
-        use_index_dedup=(
-            e_sharder._use_index_dedup
-            if isinstance(e_sharder, EmbeddingCollectionSharder)
-            else False
-        ),
-    )
-    self._return_remapped_features = module._return_remapped_features
-
-    self._table_to_tbe_and_index = {}
-    for lookup in self._embedding_module._lookups:
-        for emb_module in lookup._emb_modules:
-            for table_idx, table in enumerate(emb_module._config.embedding_tables):
-                self._table_to_tbe_and_index[table.name] = (
-                    emb_module._emb_module,
-                    torch.tensor([table_idx], dtype=torch.int, device=self._device),
-                )
-    self._buffer_ids = torch.tensor([0], device=self._device, dtype=torch.int)
-
-
 def _mc_input_dist(
     # pyre-ignore [2]
     self,
@@ -307,5 +224,36 @@ def _mc_input_dist(
     )
 
 
-BaseShardedManagedCollisionEmbeddingCollection.__init__ = _mc_init
 BaseShardedManagedCollisionEmbeddingCollection.input_dist = _mc_input_dist
+
+
+def DistributedModelParallel(
+    module: nn.Module,
+    env: Optional[ShardingEnv] = None,
+    device: Optional[torch.device] = None,
+    plan: Optional[ShardingPlan] = None,
+    sharders: Optional[List[ModuleSharder[torch.nn.Module]]] = None,
+    init_data_parallel: bool = True,
+    init_parameters: bool = True,
+    data_parallel_wrapper: Optional[DataParallelWrapper] = None,
+) -> _DistributedModelParallel:
+    """Entry point to model parallelism.
+
+    we custom ddp to make input_dist of ShardModel uninitialized.
+    mc-ebc now make _has_uninitialized_input_dist = True in init.
+    TODO: use torchrec DistributedModelParallel when torchrec fix it.
+    """
+    model = _DistributedModelParallel(
+        module,
+        env,
+        device,
+        plan,
+        sharders,
+        init_data_parallel,
+        init_parameters,
+        data_parallel_wrapper,
+    )
+    for _, m in model.named_modules():
+        if hasattr(m, "_has_uninitialized_input_dist"):
+            m._has_uninitialized_input_dist = True
+    return model
