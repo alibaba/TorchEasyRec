@@ -191,8 +191,8 @@ def _mc_input_dist(
         if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
             if self._embedding_module._has_mean_pooling_callback:
                 self._embedding_module._init_mean_pooling_callback(
-                    # pyre-ignore [16]
                     features.keys(),
+                    # pyre-ignore [16]
                     ctx.inverse_indices,
                 )
         self._embedding_module._has_uninitialized_input_dist = False
