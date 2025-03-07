@@ -111,7 +111,6 @@ class RocketLaunching(RankModel):
         if self.training:
             booster_net = self.booster_mlp(share_net)
             if self.hidden_layer_feature_output:
-                # pyre-ignore [29]
                 booster_out = self.booster_linear(booster_net["hidden_layer_end"])
             else:
                 booster_out = self.booster_linear(booster_net)
@@ -179,7 +178,7 @@ class RocketLaunching(RankModel):
 
     def _distillation_loss(
         self, predictions: Dict[str, torch.Tensor], loss_weight: Optional[torch.Tensor]
-    ):
+    ) -> Dict[str, torch.Tensor]:
         losses = {}
         # compute booster feature and light feature similarity loss
         if self._model_config.feature_based_distillation:
