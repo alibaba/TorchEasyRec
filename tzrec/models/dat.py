@@ -136,10 +136,14 @@ class DAT(MatchModel):
             self._model_config.item_tower.augment_input
         ]
 
-        user_features = self.feature_group_select([user_group])
-        user_augment_features = self.feature_group_select([user_augment_group])
-        item_features = self.feature_group_select([item_group])
-        item_augment_features = self.feature_group_select([item_augment_group])
+        user_features = self.get_features_in_feature_groups([user_group])
+        user_augment_features = self.get_features_in_feature_groups(
+            [user_augment_group]
+        )
+        item_features = self.get_features_in_feature_groups([item_group])
+        item_augment_features = self.get_features_in_feature_groups(
+            [item_augment_group]
+        )
 
         self.user_tower = DATTower(
             self._model_config.user_tower,

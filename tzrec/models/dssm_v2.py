@@ -99,8 +99,8 @@ class DSSMV2(MatchModel):
         user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
 
-        user_features = self.feature_group_select([user_group])
-        item_features = self.feature_group_select([item_group])
+        user_features = self.get_features_in_feature_groups([user_group])
+        item_features = self.get_features_in_feature_groups([item_group])
 
         self.user_tower = DSSMTower(
             self._model_config.user_tower,

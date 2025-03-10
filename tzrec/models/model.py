@@ -165,19 +165,19 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         loss = losses[loss_name]
         self._metric_modules[loss_name].update(loss, loss.new_tensor(label.size(0)))
 
-    def feature_group_select(
+    def get_features_in_feature_groups(
         self, feature_groups: List[FeatureGroupConfig]
     ) -> Dict[str, BaseFeature]:
         """Select features order by feature groups."""
         name_to_feature = {x.name: x for x in self._features}
-        groups_features = OrderedDict()
+        grouped_features = OrderedDict()
         for feature_group in feature_groups:
             for x in feature_group.feature_names:
-                groups_features[x] = name_to_feature[x]
+                grouped_features[x] = name_to_feature[x]
             for sequence_group in feature_group.sequence_groups:
                 for x in sequence_group.feature_names:
-                    groups_features[x] = name_to_feature[x]
-        return groups_features
+                    grouped_features[x] = name_to_feature[x]
+        return grouped_features
 
 
 TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]
