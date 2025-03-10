@@ -190,6 +190,21 @@ def _mc_input_dist(
 ) -> Awaitable[Awaitable[KJTList]]:
     if self._embedding_module._has_uninitialized_input_dist:
         if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+            self._features_order = []
+            # disable feature permutation in mc, because we should
+            # permute features in mc-ebc before mean pooling callback.
+            if self._managed_collision_collection._has_uninitialized_input_dists:
+                self._managed_collision_collection._create_input_dists(
+                    input_feature_names=features.keys()
+                )
+                self._managed_collision_collection._has_uninitialized_input_dists = (
+                    False
+                )
+                if self._managed_collision_collection._features_order:
+                    self._features_order = (
+                        self._managed_collision_collection._features_order
+                    )
+                    self._managed_collision_collection._features_order = []
             if self._embedding_module._has_mean_pooling_callback:
                 self._embedding_module._init_mean_pooling_callback(
                     features.keys(),
@@ -199,6 +214,11 @@ def _mc_input_dist(
         self._embedding_module._has_uninitialized_input_dist = False
     if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
         with torch.no_grad():
+            if self._features_order:
+                features = features.permute(
+                    self._features_order,
+                    self._managed_collision_collection._features_order_tensor,
+                )
             if self._embedding_module._has_mean_pooling_callback:
                 ctx.divisor = _create_mean_pooling_divisor(
                     lengths=features.lengths(),
