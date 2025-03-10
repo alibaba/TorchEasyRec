@@ -203,10 +203,9 @@ class MIND(MatchModel):
         item_group = name_to_feature_group[self._model_config.item_tower.input]
         hist_group = name_to_feature_group[self._model_config.user_tower.history_input]
 
-        name_to_feature = {x.name: x for x in features}
-        user_features = [name_to_feature[x] for x in user_group.feature_names]
-        item_features = [name_to_feature[x] for x in item_group.feature_names]
-        hist_features = [name_to_feature[x] for x in hist_group.feature_names]
+        user_features = self.feature_group_select([user_group])
+        item_features = self.feature_group_select([item_group])
+        hist_features = self.feature_group_select([hist_group])
 
         self.user_tower = MINDUserTower(
             self._model_config.user_tower,
@@ -214,8 +213,8 @@ class MIND(MatchModel):
             self._model_config.similarity,
             user_group,
             hist_group,
-            user_features,
-            hist_features,
+            list(user_features.values()),
+            list(hist_features.values()),
             model_config,
         )
         self.item_tower = MINDItemTower(
@@ -223,7 +222,7 @@ class MIND(MatchModel):
             0,
             self._model_config.similarity,
             item_group,
-            item_features,
+            list(item_features.values()),
             model_config,
         )
 

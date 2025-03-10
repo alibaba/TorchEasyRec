@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -137,21 +136,10 @@ class DAT(MatchModel):
             self._model_config.item_tower.augment_input
         ]
 
-        name_to_feature = {x.name: x for x in features}
-        user_features = OrderedDict(
-            [(x, name_to_feature[x]) for x in user_group.feature_names]
-        )
-        user_augment_features = OrderedDict(
-            [(x, name_to_feature[x]) for x in user_augment_group.feature_names]
-        )
-
-        for sequence_group in user_group.sequence_groups:
-            for x in sequence_group.feature_names:
-                user_features[x] = name_to_feature[x]
-        item_features = [name_to_feature[x] for x in item_group.feature_names]
-        item_augment_features = [
-            name_to_feature[x] for x in item_augment_group.feature_names
-        ]
+        user_features = self.feature_group_select([user_group])
+        user_augment_features = self.feature_group_select([user_augment_group])
+        item_features = self.feature_group_select([item_group])
+        item_augment_features = self.feature_group_select([item_augment_group])
 
         self.user_tower = DATTower(
             self._model_config.user_tower,
@@ -167,7 +155,7 @@ class DAT(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             [item_group, item_augment_group],
-            item_features + item_augment_features,
+            list(item_features.values()) + list(item_augment_features.values()),
             model_config,
         )
 
