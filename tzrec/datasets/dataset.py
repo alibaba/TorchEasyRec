@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -25,6 +26,7 @@ from tzrec.datasets.utils import (
     C_SAMPLE_MASK,
     Batch,
     RecordBatchTensor,
+    remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -256,7 +258,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Init input fields info."""
         self._input_fields = []
         for field in self._reader.schema:
-            if any(map(lambda x: x == field.type, AVAILABLE_PA_TYPES)):
+            field_type = remove_nullable(field.type)
+            if any(map(lambda x: x == field_type, AVAILABLE_PA_TYPES)):
                 self._input_fields.append(field)
             else:
                 raise ValueError(
@@ -381,6 +384,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -389,12 +394,16 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
         self._batch_size = batch_size
         self._selected_cols = selected_cols
         self._drop_remainder = drop_remainder
+        self._shuffle = shuffle
+        self._shuffle_buffer_size = shuffle_buffer_size
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
@@ -405,6 +414,7 @@ class BaseReader(metaclass=_reader_meta_cls):
     def _arrow_reader_iter(
         self, reader: Iterator[pa.RecordBatch]
     ) -> Iterator[Dict[str, pa.Array]]:
+        shuffle_buffer = []
         buff_data = None
         while True:
             data = None
@@ -433,10 +443,24 @@ class BaseReader(metaclass=_reader_meta_cls):
                     if isinstance(column, pa.ChunkedArray):
                         column = column.combine_chunks()
                     data_dict[name] = column
+
+                if self._shuffle:
+                    shuffle_buffer.append(data_dict)
+                    if len(shuffle_buffer) < self._shuffle_buffer_size:
+                        continue
+                    else:
+                        idx = random.randrange(len(shuffle_buffer))
+                        data_dict = shuffle_buffer.pop(idx)
+
                 yield data_dict
 
             if data is None and buff_data is None:
                 break
+
+        if len(shuffle_buffer) > 0:
+            random.shuffle(shuffle_buffer)
+            for data_dict in shuffle_buffer:
+                yield data_dict
 
 
 class BaseWriter(metaclass=_writer_meta_cls):

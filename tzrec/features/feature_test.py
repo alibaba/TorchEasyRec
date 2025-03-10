@@ -42,79 +42,92 @@ class FeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [["1;2;3", "", None, "4"], [1, 2, 3, 4], [3, 0, 0, 1], None, None, None],
             [
-                [["1", "2", "3"], [], None, ["4"]],
+                pa.array(["1;2;3", "", None, "4"]),
                 [1, 2, 3, 4],
                 [3, 0, 0, 1],
                 None,
                 None,
                 None,
             ],
-            [[1, 2, None, 4], [1, 2, 4], [1, 1, 0, 1], None, None, None],
             [
-                ["1;2;3", "", None, "4"],
+                pa.array([["1", "2", "3"], [], None, ["4"]]),
+                [1, 2, 3, 4],
+                [3, 0, 0, 1],
+                None,
+                False,
+                None,
+            ],
+            [pa.array([1, 2, None, 4]), [1, 2, 4], [1, 1, 0, 1], None, None, None],
+            [
+                pa.array(["1;2;3", "", None, "4"]),
                 [1, 2, 3, 0, 0, 4],
                 [3, 1, 1, 1],
                 [0],
-                None,
+                False,
                 None,
             ],
             [
-                [["1", "2", "3"], [], None, ["4"]],
+                pa.array([["1", "2", "3"], [], None, ["4"]]),
                 [1, 2, 3, 0, 0, 4],
                 [3, 1, 1, 1],
                 [0],
-                None,
+                False,
                 None,
             ],
-            [[1, 2, None, 4], [1, 2, 0, 4], [1, 1, 1, 1], [0], None, None],
+            [pa.array([1, 2, None, 4]), [1, 2, 0, 4], [1, 1, 1, 1], [0], None, None],
             [
-                ["1;2;3", "", None, "4"],
+                pa.array(["1:0.1;2:0.2;3:0.3", "", None, "4:0.4"]),
                 [1, 2, 3, 4],
                 [3, 0, 0, 1],
                 None,
-                ["0.1;0.2;0.3", "", None, "0.4"],
+                True,
                 [0.1, 0.2, 0.3, 0.4],
             ],
             [
-                [["1", "2", "3"], [], None, ["4"]],
+                pa.array([["1:0.1", "2:0.2", "3:0.3"], [], None, ["4:0.4"]]),
                 [1, 2, 3, 4],
                 [3, 0, 0, 1],
                 None,
-                [[0.1, 0.2, 0.3], [], None, [0.4]],
+                True,
                 [0.1, 0.2, 0.3, 0.4],
             ],
             [
-                [1, 2, None, 4],
+                pa.array(
+                    [{1: 0.1}, {2: 0.2}, None, {4: 0.4}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
                 [1, 2, 4],
                 [1, 1, 0, 1],
                 None,
-                [0.1, 0.2, None, 0.4],
+                True,
                 [0.1, 0.2, 0.4],
             ],
             [
-                ["1;2;3", "", None, "4"],
+                pa.array(["1:0.1;2:0.2;3:0.3", "", None, "4:0.4"]),
                 [1, 2, 3, 0, 0, 4],
                 [3, 1, 1, 1],
                 [0],
-                ["0.1;0.2;0.3", "", None, "0.4"],
+                True,
                 [0.1, 0.2, 0.3, 1.0, 1.0, 0.4],
             ],
             [
-                [["1", "2", "3"], [], None, ["4"]],
+                pa.array([["1:0.1", "2:0.2", "3:0.3"], [], None, ["4:0.4"]]),
                 [1, 2, 3, 0, 0, 4],
                 [3, 1, 1, 1],
                 [0],
-                [[0.1, 0.2, 0.3], [], None, [0.4]],
+                True,
                 [0.1, 0.2, 0.3, 1.0, 1.0, 0.4],
             ],
             [
-                [1, 2, None, 4],
+                pa.array(
+                    [{1: 0.1}, {2: 0.2}, None, {4: 0.4}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
                 [1, 2, 0, 4],
                 [1, 1, 1, 1],
                 [0],
-                [0.1, 0.2, None, 0.4],
+                True,
                 [0.1, 0.2, 1.0, 0.4],
             ],
         ]
@@ -125,17 +138,20 @@ class FeatureTest(unittest.TestCase):
         expected_values,
         expected_lengths,
         default_value,
-        input_weight,
+        is_weighted,
         expected_weights,
     ):
-        feat = pa.array(input_feat)
-        weight = pa.array(input_weight) if input_weight else None
+        feat = input_feat
         tag_data = feature_lib._parse_fg_encoded_sparse_feature_impl(
-            "tag", feat, default_value=default_value, multival_sep=";", weight=weight
+            "tag",
+            feat,
+            default_value=default_value,
+            multival_sep=";",
+            is_weighted=is_weighted,
         )
         np.testing.assert_allclose(tag_data.values, np.array(expected_values))
         np.testing.assert_allclose(tag_data.lengths, np.array(expected_lengths))
-        if expected_weights:
+        if is_weighted:
             np.testing.assert_allclose(tag_data.weights, np.array(expected_weights))
 
     @parameterized.expand(
@@ -308,7 +324,7 @@ class FeatureTest(unittest.TestCase):
         if with_asset_dir:
             self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
             asset_dir = self.test_dir
-            token_file = "token_g_tokenizer.json"
+            token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
         feature_cfgs = self._create_test_feature_cfgs()
         features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
         fg_json = feature_lib.create_fg_json(features, asset_dir=asset_dir)
@@ -445,7 +461,7 @@ class FeatureTest(unittest.TestCase):
         if with_asset_dir:
             self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
             asset_dir = self.test_dir
-            token_file = "token_g_tokenizer.json"
+            token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
 
         again_feature_cfgs = feature_lib.create_feature_configs(
             features, asset_dir=asset_dir
@@ -456,16 +472,6 @@ class FeatureTest(unittest.TestCase):
             feature_cfgs[6].tokenize_feature.asset_dir = asset_dir
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
         self.assertEqual(repr(feature_cfgs), repr(again_feature_cfgs))
-
-    def test_parse_fg_encoded_sparse_feature_impl_weights(self):
-        feat = pa.array(["1;2;3", "", None, "4"])
-        weights = pa.array(["1.0;1.5;2.0", "", None, "3.0"])
-        tag_data = feature_lib._parse_fg_encoded_sparse_feature_impl(
-            "tag", feat, multival_sep=";", weight=weights
-        )
-        np.testing.assert_allclose(tag_data.values, np.array([1, 2, 3, 4]))
-        np.testing.assert_allclose(tag_data.lengths, np.array([3, 0, 0, 1]))
-        np.testing.assert_allclose(tag_data.weights, np.array([1.0, 1.5, 2.0, 3.0]))
 
 
 if __name__ == "__main__":

@@ -25,9 +25,6 @@ from torch import distributed as dist
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.distributed.model_parallel import (
-    DistributedModelParallel,
-)
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
@@ -82,6 +79,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -206,6 +204,10 @@ def _get_dataloader(
         collate_fn=lambda x: x,
         **kwargs,
     )
+    # For PyTorch versions 2.6 and above, we initialize the data iterator before
+    # beginning the training process to avoid potential CUDA-related issues following
+    # model saving.
+    iter(dataloader)
     return dataloader
 
 
@@ -241,6 +243,7 @@ def _evaluate(
     eval_result_filename: Optional[str] = None,
     global_step: Optional[int] = None,
     eval_summary_writer: Optional[SummaryWriter] = None,
+    global_epoch: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -259,8 +262,10 @@ def _evaluate(
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
+    if global_epoch:
+        desc_suffix += f" Epoch-{global_epoch}"
     if global_step:
-        desc_suffix = f" model-{global_step}"
+        desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
     plogger = None
@@ -353,6 +358,12 @@ def _train_and_evaluate(
     epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
+    save_checkpoints_steps, save_checkpoints_epochs = 0, 0
+    if train_config.save_checkpoints_epochs > 0:
+        save_checkpoints_epochs = train_config.save_checkpoints_epochs
+    else:
+        save_checkpoints_steps = train_config.save_checkpoints_steps
+
     plogger = None
     summary_writer = None
     eval_summary_writer = None
@@ -361,6 +372,7 @@ def _train_and_evaluate(
     if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
+    eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
     if train_config.is_profiling:
         if is_rank_zero:
@@ -378,6 +390,7 @@ def _train_and_evaluate(
 
     last_ckpt_step = -1
     i_step = 0
+    i_epoch = 0
     losses = {}
     for i_epoch in epoch_iter:
         pipeline = TrainPipelineSparseDist(
@@ -420,8 +433,9 @@ def _train_and_evaluate(
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
-            if train_config.save_checkpoints_steps > 0 and i_step > 0:
-                if i_step % train_config.save_checkpoints_steps == 0:
+
+            if save_checkpoints_steps > 0 and i_step > 0:
+                if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
                     checkpoint_util.save_model(
                         os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -433,12 +447,34 @@ def _train_and_evaluate(
                             model,
                             eval_dataloader,
                             eval_config,
+                            eval_result_filename=eval_result_filename,
                             global_step=i_step,
                             eval_summary_writer=eval_summary_writer,
+                            global_epoch=i_epoch,
                         )
                         model.train()
             if train_config.is_profiling:
                 prof.step()
+
+        if save_checkpoints_epochs > 0 and i_step > 0:
+            if i_epoch % save_checkpoints_epochs == 0:
+                last_ckpt_step = i_step
+                checkpoint_util.save_model(
+                    os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                    model,
+                    optimizer,
+                )
+                if eval_dataloader is not None:
+                    _evaluate(
+                        model,
+                        eval_dataloader,
+                        eval_config,
+                        eval_result_filename=eval_result_filename,
+                        global_step=i_step,
+                        eval_summary_writer=eval_summary_writer,
+                        global_epoch=i_epoch,
+                    )
+                    model.train()
 
         if use_step and i_step >= train_config.num_steps - 1:
             break
@@ -469,9 +505,10 @@ def _train_and_evaluate(
                 model,
                 eval_dataloader,
                 eval_config,
-                os.path.join(model_dir, eval_result_filename),
+                eval_result_filename=eval_result_filename,
                 global_step=i_step,
                 eval_summary_writer=eval_summary_writer,
+                global_epoch=i_epoch,
             )
             model.train()
 

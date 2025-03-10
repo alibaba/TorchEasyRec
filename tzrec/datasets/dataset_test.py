@@ -61,8 +61,33 @@ class _TestReader(BaseReader):
                     data = np.random.randint(100, size=(self._batch_size,)).astype(
                         np.str_
                     )
+                elif f.type == pa.string():
+                    data = np.random.randint(100, size=(self._batch_size,)).astype(
+                        np.str_
+                    )
+                elif pa.types.is_list(f.type):
+                    if f.type.value_type == pa.string():
+                        data = [
+                            [str(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported list type: {f.type}")
+
+                elif pa.types.is_list(f.type) and pa.types.is_list(f.type.value_type):
+                    if f.type.value_type.value_type == pa.string():
+                        data = [
+                            [
+                                [str(np.random.randint(100)) for _ in range(2)],
+                                [str(np.random.randint(100)) for _ in range(2)],
+                            ]
+                            for _ in range(self._batch_size)
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported nested list type: {f.type}")
                 else:
-                    raise ValueError(f"Unknown input_type {f.input_type}")
+                    raise ValueError(f"Unknown input_type {f.type}")
+
                 input_data[f.name] = pa.array(data)
             yield input_data
 
@@ -97,7 +122,8 @@ class DatasetTest(unittest.TestCase):
         del utils.STATS_DICT
         utils.STATS_DICT = []
 
-    def test_dataset(self):
+    @parameterized.expand([[False], [True]])
+    def test_dataset(self, need_shuffle):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),
             pa.field(name="float_b", type=pa.float64()),
@@ -124,10 +150,12 @@ class DatasetTest(unittest.TestCase):
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
                     fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
+                    shuffle=need_shuffle,
                 ),
                 features=features,
                 input_path="",
                 input_fields=input_fields,
+                mode=Mode.TRAIN,
             ),
             batch_size=None,
             num_workers=2,
@@ -151,7 +179,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -309,7 +337,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -437,7 +465,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(node)
         node.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(63):
-            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:{i*2}\n")
+            node.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:{i * 2}\n")
         node.flush()
 
         def _ancestor(code):
@@ -453,8 +481,8 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(edge)
         edge.write("src_id:int64\tdst_id:int\tweight:float\n")
         for i in range(31, 63):
-            for anc in _ancestor(i):
-                edge.write(f"{i}\t{anc}\t{1.0}\n")
+            for ancestor in _ancestor(i):
+                edge.write(f"{i}\t{ancestor}\t{1.0}\n")
         edge.flush()
 
         def _childern(code):
@@ -544,6 +572,66 @@ class DatasetTest(unittest.TestCase):
             batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (120,)
         )
         self.assertEqual(batch.labels["label"].size(), (40,))
+
+    def test_dataset_with_list_type_not_null(self):
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="str_c", type=pa.string()),
+            pa.field(name="label", type=pa.int32()),
+            pa.field(name="list_str_d", type=pa.list_(pa.string()), nullable=False),
+            pa.field(
+                name="list_list_str_e",
+                type=pa.list_(pa.field("list_str_e", pa.string(), nullable=False)),
+                nullable=False,
+            ),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="list_str_d")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="list_list_str_e")
+            ),
+        ]
+        features = create_features(feature_cfgs)
+
+        dataloader = DataLoader(
+            dataset=_TestDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=4,
+                    dataset_type=data_pb2.DatasetType.OdpsDataset,
+                    fg_encoded=True,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path="",
+                input_fields=input_fields,
+            ),
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+        self.assertIn("list_str_d", batch.dense_features[BASE_DATA_GROUP].keys())
+        self.assertEqual(
+            batch.dense_features[BASE_DATA_GROUP]["list_str_d"].size(), (4, 1)
+        )
+        self.assertIn("list_list_str_e", batch.dense_features[BASE_DATA_GROUP].keys())
+        self.assertEqual(
+            batch.dense_features[BASE_DATA_GROUP]["list_list_str_e"].size(), (4, 1)
+        )
 
 
 if __name__ == "__main__":

@@ -155,10 +155,11 @@ class EmbeddingGroup(nn.Module):
         self._group_name_to_seq_encoder_configs = defaultdict(list)
         self._grouped_features_keys = list()
 
+        seq_group_names = []
         for feature_group in feature_groups:
             group_name = feature_group.group_name
-            self._respect_and_supplement_feature_group(feature_group)
-            self._add_feature_group_sign_for_sequence_groups(feature_group)
+            self._inspect_and_supplement_feature_group(feature_group, seq_group_names)
+            # self._add_feature_group_sign_for_sequence_groups(feature_group)
             features_data_group = defaultdict(list)
             for feature_name in feature_group.feature_names:
                 feature = self._name_to_feature[feature_name]
@@ -241,10 +242,10 @@ class EmbeddingGroup(nn.Module):
         """grouped_features_keys."""
         return self._grouped_features_keys
 
-    def _respect_and_supplement_feature_group(
-        self, feature_group: FeatureGroupConfig
+    def _inspect_and_supplement_feature_group(
+        self, feature_group: FeatureGroupConfig, seq_group_names: List[str]
     ) -> None:
-        """Respect feature group sequence_groups and sequence_encoders."""
+        """Inspect feature group sequence_groups and sequence_encoders."""
         group_name = feature_group.group_name
         sequence_groups = list(feature_group.sequence_groups)
         sequence_encoders = list(feature_group.sequence_encoders)
@@ -272,6 +273,14 @@ class EmbeddingGroup(nn.Module):
                 "group_name"
             ):
                 sequence_groups[0].group_name = group_name
+
+            for sequence_group in sequence_groups:
+                if sequence_group.group_name in seq_group_names:
+                    raise ValueError(
+                        f"has repeat sequences groups_name: {sequence_group.group_name}"
+                    )
+                else:
+                    seq_group_names.append(sequence_group.group_name)
 
             group_has_encoder = {
                 sequence_group.group_name: False for sequence_group in sequence_groups
@@ -304,23 +313,6 @@ class EmbeddingGroup(nn.Module):
                     f"{group_name} group group_type is not DEEP, "
                     f"sequence_groups and sequence_encoders must configured in DEEP"
                 )
-
-    def _add_feature_group_sign_for_sequence_groups(
-        self, feature_group: FeatureGroupConfig
-    ) -> None:
-        """Assign sequence_groups and sequence_encoder relation group name."""
-        group_name = feature_group.group_name
-        sequence_groups = list(feature_group.sequence_groups)
-        sequence_encoders = list(feature_group.sequence_encoders)
-        if len(sequence_groups) > 0:
-            for sequence_group in sequence_groups:
-                sequence_group.group_name = (
-                    group_name + "___" + sequence_group.group_name
-                )
-            for sequence_encoder in sequence_encoders:
-                seq_type = sequence_encoder.WhichOneof("seq_module")
-                seq_config = getattr(sequence_encoder, seq_type)
-                seq_config.input = group_name + "___" + seq_config.input
 
     def group_names(self) -> List[str]:
         """Feature group names."""
@@ -415,9 +407,9 @@ class EmbeddingGroup(nn.Module):
 
             if emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
-            if emb_impl.has_sparse:
+            if emb_impl.has_sparse or emb_impl.has_mc_sparse:
                 sparse_feat_kjt = batch.sparse_features[key]
-            if emb_impl.has_sparse_user:
+            if emb_impl.has_sparse_user or emb_impl.has_mc_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
 
             result_dicts.append(
@@ -438,11 +430,11 @@ class EmbeddingGroup(nn.Module):
 
             if seq_emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
-            if seq_emb_impl.has_sparse:
+            if seq_emb_impl.has_sparse or seq_emb_impl.has_mc_sparse:
                 sparse_feat_kjt = batch.sparse_features[key]
             if seq_emb_impl.has_mulval_seq:
                 sequence_mulval_length_kjt = batch.sequence_mulval_lengths[key]
-            if seq_emb_impl.has_sparse_user:
+            if seq_emb_impl.has_sparse_user or seq_emb_impl.has_mc_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
             if seq_emb_impl.has_mulval_seq_user:
                 sequence_mulval_length_kjt_user = batch.sequence_mulval_lengths[
@@ -1123,6 +1115,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                         query_t = torch.segment_reduce(
                             query_jt.values(), pooling, lengths=query_jt.lengths()
                         )
+                        if pooling == "mean":
+                            query_t = torch.nan_to_num(query_t, nan=0.0)
                     if is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
                 else:
@@ -1156,14 +1150,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 jt = (
                     sparse_jt_dict[name] if is_sparse else sequence_dense_features[name]
                 )
-                if value_dim != 1:
+                if is_sparse and value_dim != 1:
                     length_jt = seq_mulval_length_jt_dict[raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
+                    jt_values = torch.segment_reduce(
+                        jt.values(), pooling, lengths=length_jt.values()
+                    )
+                    if pooling == "mean":
+                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
                     jt = JaggedTensor(
-                        values=torch.segment_reduce(
-                            jt.values(), pooling, lengths=length_jt.values()
-                        ),
+                        values=jt_values,
                         lengths=length_jt.lengths(),
                     )
                 if i == 0:

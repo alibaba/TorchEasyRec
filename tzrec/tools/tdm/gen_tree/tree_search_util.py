@@ -227,7 +227,7 @@ class TreeSearch(object):
                 for travel in self.travel_list:
                     # do not include edge from leaf to root
                     for i in range(self.max_level - 1):
-                        f.write(f"{travel[0]}\t{travel[i+1]}\t{1.0}\n")
+                        f.write(f"{travel[0]}\t{travel[i + 1]}\t{1.0}\n")
 
     def save_predict_edge(self) -> None:
         """Save edge info for prediction."""

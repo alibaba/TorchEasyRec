@@ -28,17 +28,27 @@ from tzrec.utils.test_util import TestGraphType, create_test_module
 
 class DINEncoderTest(unittest.TestCase):
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, False, False],
+            [TestGraphType.FX_TRACE, False, False],
+            [TestGraphType.JIT_SCRIPT, False, False],
+            [TestGraphType.NORMAL, True, False],
+            [TestGraphType.FX_TRACE, True, False],
+            [TestGraphType.JIT_SCRIPT, True, False],
+            [TestGraphType.NORMAL, False, True],
+            [TestGraphType.FX_TRACE, False, True],
+            [TestGraphType.JIT_SCRIPT, False, True],
+        ]
     )
-    def test_din_encoder(self, graph_type) -> None:
+    def test_din_encoder(self, graph_type, use_bn, use_dice) -> None:
         din = DINEncoder(
             query_dim=16,
             sequence_dim=16,
             input="click_seq",
             attn_mlp=dict(
                 hidden_units=[8, 4, 2],
-                activation="nn.ReLU",
-                use_bn=False,
+                activation="Dice" if use_dice else "nn.ReLU",
+                use_bn=use_bn,
                 dropout_ratio=0.9,
             ),
         )

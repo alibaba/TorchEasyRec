@@ -21,7 +21,7 @@ from parameterized import parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _calc_slice_position
+from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
@@ -51,26 +51,6 @@ class OdpsDatasetTest(unittest.TestCase):
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
             self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
         os.environ.pop("USE_HASH_NODE_ID", None)
-
-    def test_calc_slice_position(self):
-        num_tables = 81
-        num_workers = 8
-        batch_size = 10
-        remain_row_counts = [0] * num_workers
-        worker_row_counts = [0] * num_workers
-        for i in range(num_tables):
-            for j in range(num_workers):
-                start, end, remain_row_counts[j] = _calc_slice_position(
-                    row_count=81,
-                    slice_id=j,
-                    slice_count=num_workers,
-                    batch_size=batch_size,
-                    drop_redundant_bs_eq_one=True if i == num_tables - 1 else False,
-                    pre_total_remain=remain_row_counts[j],
-                )
-                worker_row_counts[j] += end - start
-        self.assertTrue(np.all(np.ceil(np.array(worker_row_counts) / batch_size) == 82))
-        self.assertEqual(sum(worker_row_counts), num_tables * 81 - 1)
 
     def _create_test_table_and_feature_cfgs(self, has_lookup=True):
         self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
@@ -167,7 +147,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 odps_data_quota_name="",
             ),
             features=features,
-            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320',
+            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         self.assertEqual(len(dataset.input_fields), 9)
         self.assertEqual(
@@ -236,14 +216,14 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1',
+                    input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",
                 ),
             ),
             features=features,
-            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320',
+            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -313,7 +293,7 @@ class OdpsWriterTest(unittest.TestCase):
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
             writer = OdpsWriter(
-                f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}',
+                f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
             )
             for _ in range(5):

@@ -70,3 +70,13 @@ message DAT {
     // loss weight for amm_u
     required float amm_u_weight = 8 [default = 0.5];
 }
+
+
+
+message MIND {
+    required MINDUserTower user_tower = 1;
+    required Tower item_tower = 2;
+    optional float simi_pow = 3 [default=10];
+    optional Similarity similarity = 4 [default=COSINE];
+    optional bool in_batch_negative = 5 [default = false];
+}

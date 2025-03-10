@@ -331,7 +331,7 @@ class ConvertConfig(object):
             features = sequence_fg["features"]
             seq_feature_to_fg = {}
             for feature in features:
-                seq_feature_to_fg[f'{seq_name}__{feature["feature_name"]}'] = feature
+                seq_feature_to_fg[f"{seq_name}__{feature['feature_name']}"] = feature
             for cfg in sub_cfgs:
                 sub_feature_cfg = tzrec_feature_pb2.SeqFeatureConfig()
                 feature_name = (

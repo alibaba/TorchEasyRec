@@ -84,7 +84,7 @@ class OdpsDatasetV1Test(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f'odps://{self.odps_config["project_name"]}/tables/test_odps_dataset_{self.test_suffix}',
+            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}",
         )
         self.assertEqual(len(dataset.input_fields), 5)
         dataloader = DataLoader(
