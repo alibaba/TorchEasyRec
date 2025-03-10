@@ -19,7 +19,10 @@ from torchmetrics import Metric
 from torchmetrics.functional.classification.auroc import _binary_auroc_compute
 
 
-def custom_reduce_fx(data_list: List[torch.Tensor]) -> Tuple[torch.Tensor]:
+# pyre-ignore [6]
+def custom_reduce_fx(
+    data_list: List[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Custom reduce func for distributed training. Distribute data to different GPUs.
 
     Args:
@@ -37,18 +40,10 @@ def custom_reduce_fx(data_list: List[torch.Tensor]) -> Tuple[torch.Tensor]:
     key_reduce = []
     for data in data_list:
         for i in range(world_size):
-            key_mask = (
-                data["grouping_key"][i] % world_size == local_rank
-            )  # pyre-ignore [6]
-            pred_selected = torch.masked_select(
-                data["preds"][i], key_mask
-            )  # pyre-ignore [6]
-            target_selected = torch.masked_select(
-                data["target"][i], key_mask
-            )  # pyre-ignore [6]
-            key_selected = torch.masked_select(
-                data["grouping_key"][i], key_mask
-            )  # pyre-ignore [6]
+            key_mask = data["grouping_key"][i] % world_size == local_rank
+            pred_selected = torch.masked_select(data["preds"][i], key_mask)
+            target_selected = torch.masked_select(data["target"][i], key_mask)
+            key_selected = torch.masked_select(data["grouping_key"][i], key_mask)
 
             pred_reduce.append(pred_selected)
             target_reduce.append(target_selected)
@@ -79,23 +74,18 @@ class GroupedAUC(Metric):
             {"preds": preds, "target": target, "grouping_key": grouping_key}
         )
 
+    # pyre-ignore [29]
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
         if not dist.is_initialized():
-            preds = torch.cat(
-                [data["preds"] for data in self.eval_data]
-            )  # pyre-ignore [29]
-            target = torch.cat(
-                [data["target"] for data in self.eval_data]
-            )  # pyre-ignore [29]
-            grouping_key = torch.cat(
-                [data["grouping_key"] for data in self.eval_data]
-            )  # pyre-ignore [29]
+            preds = torch.cat([data["preds"] for data in self.eval_data])
+            target = torch.cat([data["target"] for data in self.eval_data])
+            grouping_key = torch.cat([data["grouping_key"] for data in self.eval_data])
         else:
             preds, target, grouping_key = (
-                self.eval_data[0],  # pyre-ignore [29]
-                self.eval_data[1],  # pyre-ignore [29]
-                self.eval_data[2],  # pyre-ignore [29]
+                self.eval_data[0],
+                self.eval_data[1],
+                self.eval_data[2],
             )
 
         sorted_grouping_key, indices = torch.sort(grouping_key)
