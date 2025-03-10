@@ -114,7 +114,7 @@ class HSTUMatch(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             user_group,
-            list(user_features.values()),
+            user_features,
             model_config,
         )
 
@@ -123,7 +123,7 @@ class HSTUMatch(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             item_group,
-            list(item_features.values()),
+            item_features,
             model_config,
         )
 

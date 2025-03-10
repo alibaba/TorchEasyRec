@@ -150,7 +150,7 @@ class DAT(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             [user_group, user_augment_group],
-            list(user_features.values()) + list(user_augment_features.values()),
+            user_features + user_augment_features,
             model_config,
         )
 
@@ -159,7 +159,7 @@ class DAT(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             [item_group, item_augment_group],
-            list(item_features.values()) + list(item_augment_features.values()),
+            item_features + item_augment_features,
             model_config,
         )
 

@@ -167,7 +167,7 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
 
     def get_features_in_feature_groups(
         self, feature_groups: List[FeatureGroupConfig]
-    ) -> Dict[str, BaseFeature]:
+    ) -> List[BaseFeature]:
         """Select features order by feature groups."""
         name_to_feature = {x.name: x for x in self._features}
         grouped_features = OrderedDict()
@@ -177,7 +177,7 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
             for sequence_group in feature_group.sequence_groups:
                 for x in sequence_group.feature_names:
                     grouped_features[x] = name_to_feature[x]
-        return grouped_features
+        return list(grouped_features.values())
 
 
 TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]

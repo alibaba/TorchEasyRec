@@ -108,7 +108,7 @@ class DSSMV2(MatchModel):
             self._model_config.similarity,
             user_group,
             self.embedding_group.group_dims(self._model_config.user_tower.input),
-            list(user_features.values()),
+            user_features,
         )
 
         self.item_tower = DSSMTower(
@@ -117,7 +117,7 @@ class DSSMV2(MatchModel):
             self._model_config.similarity,
             item_group,
             self.embedding_group.group_dims(self._model_config.item_tower.input),
-            list(item_features.values()),
+            item_features,
         )
 
     def predict(self, batch: Batch) -> Dict[str, Tensor]:

@@ -213,8 +213,8 @@ class MIND(MatchModel):
             self._model_config.similarity,
             user_group,
             hist_group,
-            list(user_features.values()),
-            list(hist_features.values()),
+            user_features,
+            hist_features,
             model_config,
         )
         self.item_tower = MINDItemTower(
@@ -222,7 +222,7 @@ class MIND(MatchModel):
             0,
             self._model_config.similarity,
             item_group,
-            list(item_features.values()),
+            item_features,
             model_config,
         )
 
