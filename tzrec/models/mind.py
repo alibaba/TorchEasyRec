@@ -203,10 +203,9 @@ class MIND(MatchModel):
         item_group = name_to_feature_group[self._model_config.item_tower.input]
         hist_group = name_to_feature_group[self._model_config.user_tower.history_input]
 
-        name_to_feature = {x.name: x for x in features}
-        user_features = [name_to_feature[x] for x in user_group.feature_names]
-        item_features = [name_to_feature[x] for x in item_group.feature_names]
-        hist_features = [name_to_feature[x] for x in hist_group.feature_names]
+        user_features = self.get_features_in_feature_groups([user_group])
+        item_features = self.get_features_in_feature_groups([item_group])
+        hist_features = self.get_features_in_feature_groups([hist_group])
 
         self.user_tower = MINDUserTower(
             self._model_config.user_tower,
