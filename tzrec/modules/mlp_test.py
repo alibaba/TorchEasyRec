@@ -50,6 +50,32 @@ class MLPTest(unittest.TestCase):
             [TestGraphType.JIT_SCRIPT, [0.9]],
         ]
     )
+    def test_mlp_output_hidden(self, graph_type, dropout_ratio) -> None:
+        mlp = MLP(
+            in_features=16,
+            hidden_units=[8, 4, 2],
+            activation="nn.ReLU",
+            use_bn=True,
+            dropout_ratio=dropout_ratio,
+            hidden_layer_feature_output=True,
+        )
+        mlp = create_test_module(mlp, graph_type)
+        input = torch.randn(4, 16)
+        result = mlp(input)
+        self.assertEqual(result["hidden_layer0"].size(), (4, 8))
+        self.assertEqual(result["hidden_layer1"].size(), (4, 4))
+        self.assertEqual(result["hidden_layer2"].size(), (4, 2))
+        self.assertEqual(result["hidden_layer_end"].size(), (4, 2))
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, [0.9]],
+            [TestGraphType.NORMAL, 0.9],
+            [TestGraphType.NORMAL, [0.9, 0.8, 0.7]],
+            [TestGraphType.FX_TRACE, [0.9]],
+            [TestGraphType.JIT_SCRIPT, [0.9]],
+        ]
+    )
     def test_mlp_seq(self, graph_type, dropout_ratio) -> None:
         mlp = MLP(
             in_features=16,
