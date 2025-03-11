@@ -289,6 +289,7 @@ def _evaluate(
             plogger.log(i_step)
 
     metric_result = _model.compute_metric()
+
     if is_rank_zero:
         metric_str = " ".join([f"{k}:{v:0.6f}" for k, v in metric_result.items()])
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
