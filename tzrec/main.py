@@ -25,9 +25,6 @@ from torch import distributed as dist
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.distributed.model_parallel import (
-    DistributedModelParallel,
-)
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
@@ -82,6 +79,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -291,6 +289,7 @@ def _evaluate(
             plogger.log(i_step)
 
     metric_result = _model.compute_metric()
+
     if is_rank_zero:
         metric_str = " ".join([f"{k}:{v:0.6f}" for k, v in metric_result.items()])
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")

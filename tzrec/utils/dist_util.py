@@ -13,11 +13,32 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import distributed as dist
+from torch import nn
 from torch.autograd.profiler import record_function
 from torchrec.distributed import embeddingbag
+from torchrec.distributed.embedding_types import (
+    KJTList,
+)
+from torchrec.distributed.embeddingbag import (
+    ShardedEmbeddingBagCollection,
+)
+from torchrec.distributed.mc_embedding_modules import (
+    BaseShardedManagedCollisionEmbeddingCollection,
+    ShrdCtx,
+)
+from torchrec.distributed.model_parallel import DataParallelWrapper
+from torchrec.distributed.model_parallel import (
+    DistributedModelParallel as _DistributedModelParallel,
+)
+from torchrec.distributed.types import (
+    Awaitable,
+    ModuleSharder,
+    ShardingEnv,
+    ShardingPlan,
+)
 from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import PoolingType
-from torchrec.sparse.jagged_tensor import _to_offsets
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, _to_offsets
 
 
 def broadcast_string(s: str, src: int = 0) -> str:
@@ -158,3 +179,102 @@ def _create_mean_pooling_divisor(
 
 # pyre-ignore [9]
 embeddingbag._create_mean_pooling_divisor = _create_mean_pooling_divisor
+
+
+# fix missing create_mean_pooling_callback of mc-ebc input_dist
+def _mc_input_dist(
+    # pyre-ignore [2]
+    self,
+    ctx: ShrdCtx,
+    features: KeyedJaggedTensor,
+) -> Awaitable[Awaitable[KJTList]]:
+    if self._embedding_module._has_uninitialized_input_dist:
+        if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+            self._features_order = []
+            # disable feature permutation in mc, because we should
+            # permute features in mc-ebc before mean pooling callback.
+            if self._managed_collision_collection._has_uninitialized_input_dists:
+                self._managed_collision_collection._create_input_dists(
+                    input_feature_names=features.keys()
+                )
+                self._managed_collision_collection._has_uninitialized_input_dists = (
+                    False
+                )
+                if self._managed_collision_collection._features_order:
+                    self._features_order = (
+                        self._managed_collision_collection._features_order
+                    )
+                    self._managed_collision_collection._features_order = []
+            if self._embedding_module._has_mean_pooling_callback:
+                self._embedding_module._init_mean_pooling_callback(
+                    features.keys(),
+                    # pyre-ignore [16]
+                    ctx.inverse_indices,
+                )
+        self._embedding_module._has_uninitialized_input_dist = False
+    if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+        with torch.no_grad():
+            if self._features_order:
+                features = features.permute(
+                    self._features_order,
+                    self._managed_collision_collection._features_order_tensor,
+                )
+            if self._embedding_module._has_mean_pooling_callback:
+                ctx.divisor = _create_mean_pooling_divisor(
+                    lengths=features.lengths(),
+                    stride=features.stride(),
+                    keys=features.keys(),
+                    offsets=features.offsets(),
+                    pooling_type_to_rs_features=self._embedding_module._pooling_type_to_rs_features,
+                    stride_per_key=features.stride_per_key(),
+                    dim_per_key=self._embedding_module._dim_per_key,
+                    embedding_names=self._embedding_module._embedding_names,
+                    embedding_dims=self._embedding_module._embedding_dims,
+                    # pyre-ignore [16]
+                    variable_batch_per_feature=ctx.variable_batch_per_feature,
+                    kjt_inverse_order=self._embedding_module._kjt_inverse_order,
+                    kjt_key_indices=self._embedding_module._kjt_key_indices,
+                    kt_key_ordering=self._embedding_module._kt_key_ordering,
+                    inverse_indices=ctx.inverse_indices,
+                    weights=features.weights_or_none(),
+                )
+    # TODO: resolve incompatibility with different contexts
+    return self._managed_collision_collection.input_dist(
+        ctx,
+        features,
+    )
+
+
+BaseShardedManagedCollisionEmbeddingCollection.input_dist = _mc_input_dist
+
+
+def DistributedModelParallel(
+    module: nn.Module,
+    env: Optional[ShardingEnv] = None,
+    device: Optional[torch.device] = None,
+    plan: Optional[ShardingPlan] = None,
+    sharders: Optional[List[ModuleSharder[torch.nn.Module]]] = None,
+    init_data_parallel: bool = True,
+    init_parameters: bool = True,
+    data_parallel_wrapper: Optional[DataParallelWrapper] = None,
+) -> _DistributedModelParallel:
+    """Entry point to model parallelism.
+
+    we custom ddp to make input_dist of ShardModel uninitialized.
+    mc-ebc now make _has_uninitialized_input_dist = True in init.
+    TODO: use torchrec DistributedModelParallel when torchrec fix it.
+    """
+    model = _DistributedModelParallel(
+        module,
+        env,
+        device,
+        plan,
+        sharders,
+        init_data_parallel,
+        init_parameters,
+        data_parallel_wrapper,
+    )
+    for _, m in model.named_modules():
+        if hasattr(m, "_has_uninitialized_input_dist"):
+            m._has_uninitialized_input_dist = True
+    return model

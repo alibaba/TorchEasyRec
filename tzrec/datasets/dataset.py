@@ -26,6 +26,7 @@ from tzrec.datasets.utils import (
     C_SAMPLE_MASK,
     Batch,
     RecordBatchTensor,
+    remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -257,7 +258,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Init input fields info."""
         self._input_fields = []
         for field in self._reader.schema:
-            if any(map(lambda x: x == field.type, AVAILABLE_PA_TYPES)):
+            field_type = remove_nullable(field.type)
+            if any(map(lambda x: x == field_type, AVAILABLE_PA_TYPES)):
                 self._input_fields.append(field)
             else:
                 raise ValueError(

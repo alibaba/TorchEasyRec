@@ -12,6 +12,7 @@
 
 import os
 import random
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -42,9 +43,13 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.utils import calc_slice_position, remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+from tzrec.utils.logging_util import logger
+
+ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
@@ -83,6 +88,7 @@ TYPE_TABLE_TO_PA = {
 def _type_pa_to_table(pa_type: pa.DataType) -> str:
     """PyArrow type to MaxCompute Table type."""
     mc_type = None
+    pa_type = remove_nullable(pa_type)
     for k, v in TYPE_TABLE_TO_PA.items():
         # list<element: int64> and list<item: int64> is equal
         if v == pa_type:
@@ -177,65 +183,6 @@ def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str
     return str_list[2], str_list[4], table_partitions
 
 
-def _calc_slice_position(
-    row_count: int,
-    slice_id: int,
-    slice_count: int,
-    batch_size: int,
-    drop_redundant_bs_eq_one: bool,
-    pre_total_remain: int = 0,
-) -> Tuple[int, int, int]:
-    """Calc table read position according to the slice information.
-
-    Args:
-        row_count (int): table total row count.
-        slice_id (int): worker id.
-        slice_count (int): total worker number.
-        batch_size (int): batch_size.
-        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
-        pre_total_remain (int): remaining total count in pre-table is
-            insufficient to meet the batch_size requirement for each worker.
-
-    Return:
-        start (int): start row position in table.
-        end (int): start row position in table.
-        total_remain (int): remaining total count in curr-table is
-            insufficient to meet the batch_size requirement for each worker.
-    """
-    pre_remain_size = int(pre_total_remain / slice_count)
-    pre_remain_split_point = pre_total_remain % slice_count
-
-    size = int((row_count + pre_total_remain) / slice_count)
-    split_point = (row_count + pre_total_remain) % slice_count
-    if slice_id < split_point:
-        start = slice_id * (size + 1)
-        end = start + (size + 1)
-    else:
-        start = split_point * (size + 1) + (slice_id - split_point) * size
-        end = start + size
-
-    real_start = (
-        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
-    )
-    real_end = (
-        end
-        - pre_remain_size * (slice_id + 1)
-        - min(pre_remain_split_point, slice_id + 1)
-    )
-    # when (end - start) % bz = 1 on some workers and
-    # (end - start) % bz = 0 on other workers, train_eval will hang
-    if (
-        drop_redundant_bs_eq_one
-        and split_point != 0
-        and (end - start) % batch_size == 1
-        and size % batch_size == 0
-    ):
-        real_end = real_end - 1
-        split_point = 0
-    return real_start, real_end, (size % batch_size) * slice_count + split_point
-
-
 def _read_rows_arrow_with_retry(
     client: StorageApiArrowClient,
     read_req: ReadRowsRequest,
@@ -272,7 +219,7 @@ def _reader_iter(
                 time.sleep(1)
                 continue
             break
-        start, end, remain_row_count = _calc_slice_position(
+        start, end, remain_row_count = calc_slice_position(
             # pyre-ignore [6]
             scan_resp.record_count,
             worker_id,
@@ -297,6 +244,7 @@ def _reader_iter(
         while True:
             try:
                 read_data = reader.read()
+                retry_cnt = 0
             except urllib3.exceptions.HTTPError as e:
                 if retry_cnt >= max_retry_count:
                     raise e
@@ -315,6 +263,17 @@ def _reader_iter(
                 retry_cnt = 0
                 offset += len(read_data)
             yield read_data
+
+
+def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
+            for session_id, client in sess_id_to_cli.items():
+                logger.info(f"refresh session: {session_id}")
+                client.get_read_session(SessionRequest(session_id, refresh=True))
+            start_time = time.time()
+        time.sleep(5)
 
 
 class OdpsDataset(BaseDataset):
@@ -435,6 +394,7 @@ class OdpsReader(BaseReader):
 
     def _init_session(self) -> None:
         """Init table scan session."""
+        sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             session_ids = []
             _, table_name, partitions = _parse_table_path(input_path)
@@ -452,13 +412,23 @@ class OdpsReader(BaseReader):
                     )
                     scan_resp = client.create_read_session(scan_req)
                     session_ids.append(scan_resp.session_id)
+                    sess_id_to_cli[scan_resp.session_id] = client
                 else:
                     session_ids.append(None)
+
             if dist.is_initialized():
                 dist.broadcast_object_list(session_ids)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
+        # refresh session
+        if int(os.environ.get("RANK", 0)) == 0:
+            t = threading.Thread(
+                target=_refresh_sessions_daemon,
+                args=(sess_id_to_cli,),
+                daemon=True,
+            )
+            t.start()
 
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
