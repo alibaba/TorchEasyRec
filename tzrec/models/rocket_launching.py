@@ -44,7 +44,7 @@ class RocketLaunching(RankModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        self.hidden_layer_feature_output = self._model_config.feature_based_distillation
+        self.return_hidden_layer_feature = self._model_config.feature_based_distillation
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
         feature_in = self.embedding_group.group_total_dim(self.group_name)
@@ -56,7 +56,7 @@ class RocketLaunching(RankModel):
 
         self.booster_mlp = MLP(
             self.share_mlp.output_dim() if self.share_mlp else feature_in,
-            hidden_layer_feature_output=self.hidden_layer_feature_output,
+            return_hidden_layer_feature=self.return_hidden_layer_feature,
             **config_to_kwargs(self._model_config.booster_mlp),
         )
         self.booster_linear = torch.nn.Linear(
@@ -65,7 +65,7 @@ class RocketLaunching(RankModel):
 
         self.light_mlp = MLP(
             self.share_mlp.output_dim() if self.share_mlp else feature_in,
-            hidden_layer_feature_output=self.hidden_layer_feature_output,
+            return_hidden_layer_feature=self.return_hidden_layer_feature,
             **config_to_kwargs(self._model_config.light_mlp),
         )
         self.light_linear = torch.nn.Linear(
@@ -101,7 +101,7 @@ class RocketLaunching(RankModel):
         else:
             share_net = net
         light_net = self.light_mlp(share_net.detach())
-        if self.hidden_layer_feature_output:
+        if self.return_hidden_layer_feature:
             light_out = self.light_linear(light_net["hidden_layer_end"])
         else:
             light_out = self.light_linear(light_net)
@@ -110,7 +110,7 @@ class RocketLaunching(RankModel):
 
         if self.training:
             booster_net = self.booster_mlp(share_net)
-            if self.hidden_layer_feature_output:
+            if self.return_hidden_layer_feature:
                 booster_out = self.booster_linear(booster_net["hidden_layer_end"])
             else:
                 booster_out = self.booster_linear(booster_net)

@@ -85,7 +85,7 @@ class MLP(nn.Module):
         use_bn (bool): use batch_norm or not.
         dropout_ratio (float|list, optional): dropout ratio of each layer.
         dim (int): input dims.
-        hidden_layer_feature_output (bool): output hidden layer or not.
+        return_hidden_layer_feature (bool): output hidden layer or not.
     """
 
     def __init__(
@@ -96,13 +96,13 @@ class MLP(nn.Module):
         use_bn: bool = False,
         dropout_ratio: Optional[Union[List[float], float]] = None,
         dim: int = 2,
-        hidden_layer_feature_output: bool = False,
+        return_hidden_layer_feature: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_units = hidden_units
         self.activation = activation
         self.use_bn = use_bn
-        self.hidden_layer_feature_output = hidden_layer_feature_output
+        self.return_hidden_layer_feature = return_hidden_layer_feature
 
         if dropout_ratio is None:
             dropout_ratio = [0.0] * len(hidden_units)
@@ -149,12 +149,12 @@ class MLP(nn.Module):
         hidden_feature_dict = {}
         for i, tmp_mlp in enumerate(self.mlp):
             net = tmp_mlp(net)
-            if self.hidden_layer_feature_output:
+            if self.return_hidden_layer_feature:
                 hidden_feature_dict["hidden_layer" + str(i)] = net
                 if i + 1 == len(self.mlp):
                     hidden_feature_dict["hidden_layer_end"] = net
 
-        if self.hidden_layer_feature_output:
+        if self.return_hidden_layer_feature:
             return hidden_feature_dict
         else:
             return net

@@ -57,7 +57,7 @@ class MLPTest(unittest.TestCase):
             activation="nn.ReLU",
             use_bn=True,
             dropout_ratio=dropout_ratio,
-            hidden_layer_feature_output=True,
+            return_hidden_layer_feature=True,
         )
         mlp = create_test_module(mlp, graph_type)
         input = torch.randn(4, 16)

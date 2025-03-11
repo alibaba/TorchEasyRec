@@ -9,7 +9,6 @@ message RocketLaunching {
     optional MLP share_mlp = 1;
     required MLP booster_mlp =2;
     required MLP light_mlp = 3;
-    optional float l2_regularization = 4 [default = 1e-4];
     optional bool feature_based_distillation = 5 [default = false];
     // COSINE = 0; EUCLID = 1;
     optional Similarity feature_distillation_function = 6 [default=COSINE];
