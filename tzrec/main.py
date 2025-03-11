@@ -30,7 +30,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.inference.state_dict_transform import (
-    state_dict_gather,
     state_dict_to_device,
 )
 from torchrec.optim.apply_optimizer_in_backward import (
@@ -83,6 +82,7 @@ from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
+from tzrec.utils.state_dict_util import state_dict_gather
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -769,10 +769,18 @@ def _script_model(
         logger.info("gather states to cpu model...")
 
     state_dict_gather(state_dict, model.state_dict())
-
     dist.barrier()
 
     if is_rank_zero:
+        # for mc modules, we should update and sort mch buffers
+        validate_log_flag = True
+        for _, m in model.named_modules():
+            if hasattr(m, "validate_state"):
+                if validate_log_flag:
+                    logger.info("validate states...")
+                    validate_log_flag = False
+                m.validate_state()
+
         batch = next(iter(dataloader))
 
         if is_cuda_export():
