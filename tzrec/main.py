@@ -82,7 +82,7 @@ from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.state_dict_util import state_dict_gather
+from tzrec.utils.state_dict_util import state_dict_gather, validate_state
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -772,14 +772,8 @@ def _script_model(
     dist.barrier()
 
     if is_rank_zero:
-        # for mc modules, we should update and sort mch buffers
-        validate_log_flag = True
-        for _, m in model.named_modules():
-            if hasattr(m, "validate_state"):
-                if validate_log_flag:
-                    logger.info("validate states...")
-                    validate_log_flag = False
-                m.validate_state()
+        # for mc modules, we should validate and sort mch buffers
+        validate_state(model)
 
         batch = next(iter(dataloader))
 
