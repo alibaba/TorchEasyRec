@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -100,14 +99,8 @@ class DSSMV2(MatchModel):
         user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
 
-        name_to_feature = {x.name: x for x in features}
-        user_features = OrderedDict(
-            [(x, name_to_feature[x]) for x in user_group.feature_names]
-        )
-        for sequence_group in user_group.sequence_groups:
-            for x in sequence_group.feature_names:
-                user_features[x] = name_to_feature[x]
-        item_features = [name_to_feature[x] for x in item_group.feature_names]
+        user_features = self.get_features_in_feature_groups([user_group])
+        item_features = self.get_features_in_feature_groups([item_group])
 
         self.user_tower = DSSMTower(
             self._model_config.user_tower,
@@ -115,7 +108,7 @@ class DSSMV2(MatchModel):
             self._model_config.similarity,
             user_group,
             self.embedding_group.group_dims(self._model_config.user_tower.input),
-            list(user_features.values()),
+            user_features,
         )
 
         self.item_tower = DSSMTower(
