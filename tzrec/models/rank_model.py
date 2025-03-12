@@ -142,12 +142,14 @@ class RankModel(BaseModel):
             raise NotImplementedError
         return predictions
 
-    def _output_to_prediction(self, output: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _output_to_prediction(
+        self, output: torch.Tensor, suffix: str = ""
+    ) -> Dict[str, torch.Tensor]:
         predictions = {}
         for loss_cfg in self._base_model_config.losses:
             predictions.update(
                 self._output_to_prediction_impl(
-                    output, loss_cfg, num_class=self._num_class
+                    output, loss_cfg, num_class=self._num_class, suffix=suffix
                 )
             )
         return predictions

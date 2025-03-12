@@ -3,11 +3,8 @@ package tzrec.protos;
 
 import "tzrec/protos/module.proto";
 import "tzrec/protos/tower.proto";
+import "tzrec/protos/simi.proto";
 
-enum Similarity {
-  COSINE = 0;
-  INNER_PRODUCT = 1;
-}
 
 message DSSM {
     required Tower user_tower = 1;

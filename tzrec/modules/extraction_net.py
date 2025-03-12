@@ -24,8 +24,8 @@ class ExtractionNet(nn.Module):
         in_extraction_networks (list): every task expert input dims.
         in_shared_expert (int): shared expert input dims.
         network_name: ExtractionNet name, not important.
-        share_num: number of experts per task.
-        expert_num_per_task: number of experts for share.
+        share_num: number of experts for share.
+        expert_num_per_task: number of experts per task.
         share_expert_net: mlp network config of experts share.
         task_expert_net: mlp network config of experts per task.
         final_flag: whether to is last extractionNet or not.
