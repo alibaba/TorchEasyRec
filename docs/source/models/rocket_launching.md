@@ -45,7 +45,7 @@ model_config: {
     feature_based_distillation: true
     feature_distillation_function: COSINE
   }
-  num_class: 1
+  num_class: 2
 }
 ```
 
