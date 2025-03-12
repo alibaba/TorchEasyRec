@@ -45,8 +45,7 @@ model_config: {
     feature_based_distillation: true
     feature_distillation_function: COSINE
   }
-  embedding_regularization:5e-6
-  num_class: 2
+  num_class: 1
 }
 ```
 
