@@ -159,6 +159,7 @@ def export_acc_config() -> Dict[str, str]:
     return acc_config
 
 
+# fix fp32 quantize
 def _quantize_state_dict(
     module: nn.Module,
     table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]],
@@ -237,4 +238,5 @@ def _quantize_state_dict(
     return device
 
 
+# pyre-ignore [9]
 embedding_modules.quantize_state_dict = _quantize_state_dict
