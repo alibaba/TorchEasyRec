@@ -155,7 +155,7 @@ class DataParser:
         if is_input_tile():
             flag = False
             for k, v in input_data.items():
-                if self._fg_mode == FgMode.FG_NONE:
+                if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
                     if k in self.user_feats:
                         input_data[k] = v.take([0])
                 else:
@@ -267,7 +267,6 @@ class DataParser:
         }
         fg_output, status = self._fg_handler.process_arrow(input_data)
         assert status.ok(), status.message()
-
         for feature in self._features:
             feat_name = feature.name
             feat_data = fg_output[feat_name]
