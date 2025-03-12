@@ -83,7 +83,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                enable_aot=True,
+                env_str="ENABLE_AOT=1",
             )
         input_tile_dir = os.path.join(self.test_dir, "input_tile")
         input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
