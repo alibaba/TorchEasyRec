@@ -915,8 +915,7 @@ def test_export(
     pipeline_config_path: str,
     test_dir: str,
     asset_files: str = "",
-    enable_aot=False,
-    enable_trt=False,
+    env_str: str = "",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
@@ -927,10 +926,8 @@ def test_export(
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {test_dir}/export "
     )
-    if enable_aot:
-        cmd_str = "ENABLE_AOT=1 " + cmd_str
-    if enable_trt:
-        cmd_str = "ENABLE_TRT=1 " + cmd_str
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     if asset_files:
         cmd_str += f"--asset_files {asset_files}"
 

@@ -48,6 +48,7 @@ from tzrec.acc.utils import (
     is_quant,
     is_trt,
     is_trt_predict,
+    quant_dtype,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
@@ -783,7 +784,8 @@ def _script_model(
 
         if is_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=torch.qint8, inplace=True)
+            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            logger.info("finish quantize embeddings...")
 
         model.eval()
 

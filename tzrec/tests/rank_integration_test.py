@@ -83,23 +83,21 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                enable_aot=True,
+                env_str="ENABLE_AOT=1",
             )
         input_tile_dir = os.path.join(self.test_dir, "input_tile")
         input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
         if self.success:
-            os.environ["INPUT_TILE"] = "2"
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir,
-                enable_aot=True,
+                env_str="INPUT_TILE=2 ENABLE_AOT=1",
             )
         if self.success:
-            os.environ["INPUT_TILE"] = "3"
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir_emb,
-                enable_aot=True,
+                env_str="INPUT_TILE=3 ENABLE_AOT=1",
             )
         self.assertTrue(self.success)
 
@@ -193,6 +191,37 @@ class RankIntegrationTest(unittest.TestCase):
                     result_cpu[k].to(device), v, rtol=5e-3, atol=1e-5
                 )
 
+    def _test_rank_with_fg_quant(self, pipeline_config_path):
+        self.success = utils.test_train_eval(
+            pipeline_config_path,
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2"]:
+            test_dir = os.path.join(self.test_dir, f"quant_{quant_emb.lower()}")
+            if self.success:
+                self.success = utils.test_export(
+                    os.path.join(self.test_dir, "pipeline.config"),
+                    test_dir,
+                    env_str=f"QUANT_EMB={quant_emb}",
+                )
+            if self.success:
+                self.success = utils.test_predict(
+                    scripted_model_path=os.path.join(test_dir, "export"),
+                    predict_input_path=os.path.join(
+                        self.test_dir, r"eval_data/\*.parquet"
+                    ),
+                    predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                    reserved_columns="user_id,item_id",
+                    output_columns="",
+                    test_dir=self.test_dir,
+                )
+            self.assertTrue(self.success)
+            self.assertTrue(
+                os.path.exists(os.path.join(test_dir, "export/scripted_model.pt"))
+            )
+
     def _test_rank_with_fg_input_tile(
         self,
         pipeline_config_path,
@@ -236,24 +265,22 @@ class RankIntegrationTest(unittest.TestCase):
 
         # export no-quant and no-input-tile
         if self.success:
-            os.environ["QUANT_EMB"] = "0"
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), no_quant_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                no_quant_dir,
+                env_str="QUANT_EMB=0",
             )
 
         # export quant and input-tile
         if self.success:
-            os.environ["QUANT_EMB"] = "1"
-            os.environ["INPUT_TILE"] = "2"
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), input_tile_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir,
+                env_str="QUANT_EMB=1 INPUT_TILE=2",
             )
 
         # predict quant and input-tile
         if self.success:
-            # we should not set INPUT_TILE env when predict
-            os.environ.pop("QUANT_EMB", None)
-            os.environ.pop("INPUT_TILE", None)
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir, "export"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
@@ -271,17 +298,14 @@ class RankIntegrationTest(unittest.TestCase):
 
         # export quant and input-tile emb
         if self.success:
-            os.environ["QUANT_EMB"] = "1"
-            os.environ["INPUT_TILE"] = "3"
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), input_tile_dir_emb
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir_emb,
+                env_str="QUANT_EMB=1 INPUT_TILE=3",
             )
 
         # predict quant and input-tile emb
         if self.success:
-            # we should not set INPUT_TILE env when predict
-            os.environ.pop("QUANT_EMB", None)
-            os.environ.pop("INPUT_TILE", None)
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
@@ -470,17 +494,14 @@ class RankIntegrationTest(unittest.TestCase):
 
         # quant and and trt
         if self.success:
-            os.environ["ENABLE_TRT"] = "1"
-            os.environ["DEBUG_TRT"] = "1"
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), trt_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                trt_dir,
+                env_str="ENABLE_TRT=1 DEBUG_TRT=1",
             )
 
         # predict quant and trt
         if self.success:
-            # we should not set INPUT_TILE env when predict
-            os.environ.pop("QUANT_EMB", None)
-            os.environ.pop("INPUT_TILE", None)
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(trt_dir, "export"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
@@ -498,16 +519,12 @@ class RankIntegrationTest(unittest.TestCase):
 
         # quant and input-tile and trt
         if self.success:
-            os.environ["ENABLE_TRT"] = "1"
-            os.environ["DEBUG_TRT"] = "1"
-            os.environ["INPUT_TILE"] = "2"
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), input_tile_trt_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_trt_dir,
+                env_str="ENABLE_TRT=1 DEBUG_TRT=1 INPUT_TILE=2",
             )
         if self.success:
-            # we should not set INPUT_TILE env when predict
-            os.environ.pop("QUANT_EMB", None)
-            os.environ.pop("INPUT_TILE", None)
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_trt_dir, "export"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
@@ -529,16 +546,12 @@ class RankIntegrationTest(unittest.TestCase):
 
         # quant and input-tile emb and trt
         if self.success:
-            os.environ["ENABLE_TRT"] = "1"
-            os.environ["DEBUG_TRT"] = "1"
-            os.environ["INPUT_TILE"] = "3"
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), input_tile_emb_trt_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_emb_trt_dir,
+                env_str="ENABLE_TRT=1 DEBUG_TRT=1 INPUT_TILE=3",
             )
         if self.success:
-            # we should not set INPUT_TILE env when predict
-            os.environ.pop("QUANT_EMB", None)
-            os.environ.pop("INPUT_TILE", None)
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_emb_trt_dir, "export"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
@@ -683,6 +696,11 @@ class RankIntegrationTest(unittest.TestCase):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
             comp_cpu_gpu_pred_result=True,
+        )
+
+    def test_multi_tower_din_with_fg_export_quant(self):
+        self._test_rank_with_fg_quant(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         )
 
     def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
