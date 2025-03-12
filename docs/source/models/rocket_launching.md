@@ -46,6 +46,12 @@ model_config: {
     feature_distillation_function: COSINE
   }
   num_class: 2
+  metrics {
+      auc {}
+  }
+  losses {
+      softmax_cross_entropy {}
+  }
 }
 ```
 
