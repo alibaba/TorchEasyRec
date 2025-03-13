@@ -201,8 +201,8 @@ def _get_dataloader(
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=None,
-        pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
-        collate_fn=lambda x: x,
+        # pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
+        # collate_fn=lambda x: x,
         **kwargs,
     )
     return dataloader
@@ -338,6 +338,8 @@ def _train_and_evaluate(
     ckpt_path: Optional[str] = None,
     eval_result_filename: str = "train_eval_result.txt",
 ) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0

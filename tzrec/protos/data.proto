@@ -106,6 +106,12 @@ message DataConfig {
     // sample weights
     repeated string sample_weight_fields = 19;
 
+    // hstu enable
+    optional bool enable_hstu = 21 [default = false];
+
+    // delimiter for string sequence
+    optional string seq_str_delim = 22 [default = ','];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;

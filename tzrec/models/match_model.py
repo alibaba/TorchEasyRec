@@ -181,18 +181,28 @@ class MatchModel(BaseModel):
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,
         neg_for_each_sample: bool = False,
+        is_hstu: bool = False,
     ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
         else:
-            batch_size = user_emb.size(0)
-            pos_item_emb = item_emb[:batch_size]
-            neg_item_emb = item_emb[batch_size:]
-            pos_ui_sim = torch.sum(
-                torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
-            )
-            neg_ui_sim = None
+            if is_hstu:
+                batch_size = user_emb.size(0)
+                pos_item_emb = item_emb[:, 0]
+                neg_item_emb = item_emb[:, 1:].reshape(-1, item_emb.shape[-1])
+                pos_ui_sim = torch.sum(
+                    torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+                )
+                neg_ui_sim = None
+            else:
+                batch_size = user_emb.size(0)
+                pos_item_emb = item_emb[:batch_size]
+                neg_item_emb = item_emb[batch_size:]
+                pos_ui_sim = torch.sum(
+                    torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+                )
+                neg_ui_sim = None
             if not neg_for_each_sample:
                 neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             else:
@@ -375,7 +385,5 @@ class TowerWoEGWrapper(nn.Module):
         """
         grouped_features = self.embedding_group(batch)
         return {
-            f"{self._tower_name}_emb": getattr(self, self._tower_name)(
-                grouped_features[self._group_name]
-            )
+            f"{self._tower_name}_emb": getattr(self, self._tower_name)(grouped_features)
         }

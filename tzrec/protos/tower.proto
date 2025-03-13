@@ -12,11 +12,16 @@ message Tower {
     required MLP mlp = 2;
 };
 
-message HSTUMatchTower {
+message HSTUMatchUserTower {
     // input feature group name
     required string input = 1;
-    // mlp config
+    // encoder config
     required HSTUEncoder hstu_encoder = 2;
+}
+
+message HSTUMatchItemTower {
+    // input feature group name
+    required string input = 1;
 }
 
 

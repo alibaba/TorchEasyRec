@@ -23,8 +23,8 @@ message DSSM {
 }
 
 message HSTUMatch {
-    required HSTUMatchTower user_tower = 1;
-    required Tower item_tower = 2;
+    required HSTUMatchUserTower user_tower = 1;
+    required HSTUMatchItemTower item_tower = 2;
     // user and item tower output dimension
     required int32 output_dim = 3;
     // similarity method
