@@ -540,7 +540,7 @@ class SequenceRawFeatureTest(unittest.TestCase):
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_sequence_sequence_raw_feature_dense(
+    def test_sequence_raw_feature_dense(
         self,
         input_feat,
         default_value,
@@ -588,7 +588,7 @@ class SequenceRawFeatureTest(unittest.TestCase):
             ],
         ]
     )
-    def test_simple_sequence_sequence_raw_feature_dense(
+    def test_simple_sequence_raw_feature_dense(
         self,
         input_feat,
         default_value,
@@ -644,7 +644,7 @@ class SequenceRawFeatureTest(unittest.TestCase):
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_sequence_sequence_raw_feature_with_boundaries(
+    def test_sequence_raw_feature_with_boundaries(
         self,
         input_feat,
         default_value,
@@ -689,6 +689,40 @@ class SequenceRawFeatureTest(unittest.TestCase):
         )
 
     # TODO(hongsheng.jhs): add normalizer tests.
+
+
+class SequenceCustomFeatureTest(unittest.TestCase):
+    def test_sequence_expr_feature_dense(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            custom_feature=feature_pb2.CustomFeature(
+                feature_name="custom_feat",
+                expression=["user:cur_time", "user:clk_time_seq"],
+                operator_name="SeqExpr",
+                operator_lib_file="pyfg/lib/libseq_expr.so",
+            )
+        )
+        seq_feat = sequence_feature_lib.SequenceCustomFeature(
+            seq_feat_cfg,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 1)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(
+            seq_feat.inputs, ["click_50_seq__cur_time", "click_50_seq__clk_time_seq"]
+        )
+        self.assertEqual(seq_feat.emb_config, None)
+
+        input_data = {
+            "click_50_seq__cur_time": pa.array(["10"]),
+            "click_50_seq__clk_time_seq": pa.array(["2;3", "4"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([8, 7, 6]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
 
 
 if __name__ == "__main__":
