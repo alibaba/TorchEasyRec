@@ -746,14 +746,14 @@ def create_features(
         if force_base_data_group:
             feature.data_group = BASE_DATA_GROUP
         try:
-            side_inputs = feature.side_inputs()
+            side_inputs = feature.side_inputs
             for k, _ in side_inputs:
                 if k == "feature":
                     has_dag = True
                     break
-        except Exception:
+        except Exception as e:
+            logger.warn(f"feature side inputs get exception:{e}")
             pass
-
     if has_dag:
         fg_json = create_fg_json(features)
         # pyre-ignore [16]
