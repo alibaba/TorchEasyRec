@@ -107,9 +107,12 @@ class IdFeature(BaseFeature):
                 self._inputs = [v for _, v in self.side_inputs]
         return self._inputs
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        return [tuple(self.config.expression.split(":"))]
+        if self.config.HasField("expression"):
+            return [tuple(self.config.expression.split(":"))]
+        else:
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
