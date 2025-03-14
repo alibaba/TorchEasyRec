@@ -67,8 +67,8 @@ class OverlapFeature(RawFeature):
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self.config.HasField("query") and self.config.HasField("key"):
-            return [tuple(x.split(":")) for x in [self.config.query, self.config.key]]
+        if self.config.HasField("query") and self.config.HasField("title"):
+            return [tuple(x.split(":")) for x in [self.config.query, self.config.title]]
         else:
             return None
 
