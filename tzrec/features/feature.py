@@ -201,6 +201,12 @@ def _parse_fg_encoded_dense_feature_impl(
     return DenseData(name, feat_values)
 
 
+class InvalidFgInputError(Exception):
+    """Invalid Feature side inputs exception."""
+
+    pass
+
+
 class BaseFeature(object, metaclass=_meta_cls):
     """Base feature class.
 
@@ -491,15 +497,21 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Input field names with side."""
         if self._side_inputs is None:
             side_inputs = self._build_side_inputs()
-            for x in side_inputs:
-                assert len(x) == 2 and x[0] in ["user", "item", "context", "feature"], (
-                    f"{self.__class__.__name__}[{self.name}] must have valid fg "
-                    f"input names, e.g., item:cat_a, but got {x}."
+            if not side_inputs:
+                raise InvalidFgInputError(
+                    f"{self.__class__.__name__}[{self.name}] must have no fg "
+                    f"input names, should set, e.g., item:cat_a."
                 )
+            for x in side_inputs:
+                if not (len(x) == 2 and x[0] in ["user", "item", "context", "feature"]):
+                    raise InvalidFgInputError(
+                        f"{self.__class__.__name__}[{self.name}] must have valid fg "
+                        f"input names, e.g., item:cat_a, but got {x}."
+                    )
             self._side_inputs = side_inputs
         return self._side_inputs
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
         return NotImplemented
 
@@ -751,9 +763,9 @@ def create_features(
                 if k == "feature":
                     has_dag = True
                     break
-        except Exception as e:
-            logger.warn(f"feature side inputs get exception:{e}")
+        except InvalidFgInputError:
             pass
+
     if has_dag:
         fg_json = create_fg_json(features)
         # pyre-ignore [16]

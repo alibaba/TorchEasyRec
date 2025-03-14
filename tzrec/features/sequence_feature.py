@@ -228,13 +228,16 @@ class SequenceIdFeature(IdFeature):
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self._is_grouped_seq:
-            side, name = self.config.expression.split(":")
-            return [(side, f"{self.sequence_name}__{name}")]
+        if self.config.HasField("expression"):
+            if self._is_grouped_seq:
+                side, name = self.config.expression.split(":")
+                return [(side, f"{self.sequence_name}__{name}")]
+            else:
+                return [tuple(self.config.expression.split(":"))]
         else:
-            return [tuple(self.config.expression.split(":"))]
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -407,11 +410,14 @@ class SequenceRawFeature(RawFeature):
 
     def _build_side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
-        if self._is_grouped_seq:
-            side, name = self.config.expression.split(":")
-            return [(side, f"{self.sequence_name}__{name}")]
+        if self.config.HasField("expression"):
+            if self._is_grouped_seq:
+                side, name = self.config.expression.split(":")
+                return [(side, f"{self.sequence_name}__{name}")]
+            else:
+                return [tuple(self.config.expression.split(":"))]
         else:
-            return [tuple(self.config.expression.split(":"))]
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.

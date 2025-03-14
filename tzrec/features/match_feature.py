@@ -116,13 +116,20 @@ class MatchFeature(BaseFeature):
     def _dense_emb_type(self) -> Optional[str]:
         return self.config.WhichOneof("dense_emb")
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        return [
-            tuple(x.split(":"))
-            for x in [self.config.nested_map, self.config.pkey, self.config.skey]
-            if x != "ALL"
-        ]
+        if (
+            self.config.HasField("nested_map")
+            and self.config.HasField("pkey")
+            and self.config.HasField("skey")
+        ):
+            return [
+                tuple(x.split(":"))
+                for x in [self.config.nested_map, self.config.pkey, self.config.skey]
+                if x != "ALL"
+            ]
+        else:
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
