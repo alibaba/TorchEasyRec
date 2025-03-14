@@ -499,8 +499,8 @@ class BaseFeature(object, metaclass=_meta_cls):
             side_inputs = self._build_side_inputs()
             if not side_inputs:
                 raise InvalidFgInputError(
-                    f"{self.__class__.__name__}[{self.name}] must have no fg "
-                    f"input names, should set, e.g., item:cat_a."
+                    f"{self.__class__.__name__}[{self.name}] must have fg "
+                    f"input names, e.g., item:cat_a."
                 )
             for x in side_inputs:
                 if not (len(x) == 2 and x[0] in ["user", "item", "context", "feature"]):
