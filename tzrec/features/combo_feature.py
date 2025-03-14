@@ -104,7 +104,7 @@ class ComboFeature(IdFeature):
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self.config.HasField("expression"):
+        if len(self.config.expression) > 0:
             return [tuple(x.split(":")) for x in self.config.expression]
         else:
             return None

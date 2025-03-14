@@ -67,7 +67,7 @@ class ExprFeature(RawFeature):
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self.config.HasField("variables"):
+        if len(self.config.variables) > 0:
             return [tuple(x.split(":")) for x in self.config.variables]
         else:
             return None
