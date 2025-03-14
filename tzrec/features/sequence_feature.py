@@ -408,7 +408,7 @@ class SequenceRawFeature(RawFeature):
         # TODO: support dense embedding for sequence raw feature.
         return None
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
         if self.config.HasField("expression"):
             if self._is_grouped_seq:
