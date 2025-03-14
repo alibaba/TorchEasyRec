@@ -245,7 +245,7 @@ def _reader_iter(
             try:
                 read_data = reader.read()
                 retry_cnt = 0
-            except urllib3.exceptions.HTTPError as e:
+            except (urllib3.exceptions.HTTPError, pa.lib.ArrowInvalid) as e:
                 if retry_cnt >= max_retry_count:
                     raise e
                 retry_cnt += 1
