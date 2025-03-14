@@ -614,13 +614,16 @@ class SequenceCustomFeature(CustomFeature):
                     **self._fg_encoded_kwargs,
                 )
         elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feat = input_data[self.inputs[0]]
-            if pa.types.is_list(input_feat.type):
-                input_feat = input_feat.fill_null([])
-            input_feat = input_feat.tolist()
+            input_feats = []
+            for name in self.inputs:
+                x = input_data[name]
+                if pa.types.is_list(x.type):
+                    x = x.fill_null([])
+                x = x.tolist()
+                input_feats.append(x)
             if self._fg_op.is_sparse:
                 values, key_lengths, seq_lengths = (
-                    self._fg_op.to_bucketized_jagged_tensor(input_feat)
+                    self._fg_op.to_bucketized_jagged_tensor(input_feats)
                 )
                 parsed_feat = SequenceSparseData(
                     name=self.name,
@@ -629,7 +632,7 @@ class SequenceCustomFeature(CustomFeature):
                     seq_lengths=seq_lengths,
                 )
             else:
-                values, lengths = self._fg_op.to_jagged_tensor(input_feat)
+                values, lengths = self._fg_op.to_jagged_tensor(input_feats)
                 parsed_feat = SequenceDenseData(
                     name=self.name,
                     values=values,
@@ -671,6 +674,7 @@ class SequenceCustomFeature(CustomFeature):
             self.config.default_value = "0"
 
         fg_cfg = super().fg_json()[0]
+        fg_cfg["feature_name"] = self.config.feature_name
         fg_cfg["is_sequence"] = True
         print(fg_cfg)
 
