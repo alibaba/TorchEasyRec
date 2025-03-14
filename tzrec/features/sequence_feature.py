@@ -672,5 +672,6 @@ class SequenceCustomFeature(CustomFeature):
 
         fg_cfg = super().fg_json()[0]
         fg_cfg["is_sequence"] = True
+        print(fg_cfg)
 
         return [fg_cfg]

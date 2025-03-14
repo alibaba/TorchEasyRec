@@ -471,6 +471,39 @@ feature_configs: {
 - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
 - 其余配置同IdFeature
 
+## CustomFeature: 自定义特征
+
+自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
+
+```
+feature_configs: {
+    custom_feature {
+        feature_name: "edit_distance"
+        operator_name: "EditDistance"
+        operator_lib_file: "pyfg/lib/libedit_distance.so"
+        expression: ["user:query", "item:title"]
+    }
+}
+```
+
+- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
+
+- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+
+- expression: 特征FG所依赖组合字段的来源
+
+- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
+
+  |                   | 描述                   |
+  | ----------------- | ---------------------- |
+  | TEXT_LOWER2UPPER  | 小写转换成大写         |
+  | TEXT_UPPER2LOWER  | 大写转换成小写         |
+  | TEXT_SBC2DBC      | 全角到半角             |
+  | TEXT_CHT2CHS      | 繁体到简体             |
+  | TEXT_FILTER       | 去除特殊符号           |
+  | TEXT_SPLITCHRS    | 中文拆成单字(空格分隔) |
+  | TEXT_REMOVE_SPACE | 去除空格               |
+
 ## SequenceRawFeature：数值型序列特征
 
 数值型序列特征，支持string类型为`price1;price2;price3`， 其中`;`为序列分隔符；支持ARRAY<float>为`[price1,price2,price3]`或者ARRAY\<ARRAY<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）

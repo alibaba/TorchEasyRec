@@ -14,6 +14,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
+from google.protobuf import struct_pb2
 from parameterized import parameterized
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
@@ -699,6 +700,13 @@ class SequenceCustomFeatureTest(unittest.TestCase):
                 expression=["user:cur_time", "user:clk_time_seq"],
                 operator_name="SeqExpr",
                 operator_lib_file="pyfg/lib/libseq_expr.so",
+                operator_params=struct_pb2.Struct(
+                    fields={
+                        "formula": struct_pb2.Value(
+                            string_value="custom_feat__cur_time-custom_feat__clk_time_seq"
+                        )
+                    }
+                ),
             )
         )
         seq_feat = sequence_feature_lib.SequenceCustomFeature(
