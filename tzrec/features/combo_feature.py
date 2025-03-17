@@ -102,9 +102,12 @@ class ComboFeature(IdFeature):
             )
         return parsed_feat
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        return [tuple(x.split(":")) for x in self.config.expression]
+        if len(self.config.expression) > 0:
+            return [tuple(x.split(":")) for x in self.config.expression]
+        else:
+            return None
 
     def fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config."""
