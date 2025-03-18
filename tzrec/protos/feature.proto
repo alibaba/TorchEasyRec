@@ -81,11 +81,19 @@ message IdFeature {
     optional bool use_mask =  15;
     // zero collision hash
     optional ZeroCollisionHash zch = 16;
+    // id vocabulary file path
+    optional string vocab_file = 17;
+    // vocab file relative directory
+    optional string asset_dir = 18;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
 
     // TODO: constrains
 }
@@ -164,11 +172,19 @@ message ComboFeature {
     optional bool use_mask =  14;
     // zero collision hash
     optional ZeroCollisionHash zch = 15;
+    // id vocabulary file path
+    optional string vocab_file = 16;
+    // vocab file relative directory
+    optional string asset_dir = 17;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
 
     // TODO: constrains
 }
@@ -219,16 +235,23 @@ message LookupFeature {
     optional uint32 value_dim = 19;
     // numeric lookup value separator
     optional string value_separator = 20 [default = ","];
-
     // mask value in training progress
-    optional bool use_mask =  25;
+    optional bool use_mask =  21;
     // zero collision hash
-    optional ZeroCollisionHash zch = 26;
+    optional ZeroCollisionHash zch = 22;
+    // id vocabulary file path
+    optional string vocab_file = 23;
+    // vocab file relative directory
+    optional string asset_dir = 24;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
 
     oneof dense_emb {
         // autodis embedding
@@ -290,14 +313,22 @@ message MatchFeature {
     // match value dimensions
     optional uint32 value_dim = 20;
     // mask value in training progress
-    optional bool use_mask =  25;
+    optional bool use_mask =  21;
     // zero collision hash
-    optional ZeroCollisionHash zch = 26;
+    optional ZeroCollisionHash zch = 22;
+    // id vocabulary file path
+    optional string vocab_file = 23;
+    // vocab file relative directory
+    optional string asset_dir = 24;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
 
     oneof dense_emb {
         // autodis embedding
@@ -480,14 +511,23 @@ message SequenceIdFeature {
     // id value dimensions, now only support value_dim = 1
     optional uint32 value_dim = 15 [default = 1];
     // mask value in training progress
-    optional bool use_mask =  20;
+    optional bool use_mask =  16;
     // zero collision hash
-    optional ZeroCollisionHash zch = 21;
+    optional ZeroCollisionHash zch = 17;
+    // id vocabulary file path
+    optional string vocab_file = 18;
+    // vocab file relative directory
+    optional string asset_dir = 19;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
+
     // TODO: constrains
 }
 

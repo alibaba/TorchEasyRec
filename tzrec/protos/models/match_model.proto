@@ -3,11 +3,8 @@ package tzrec.protos;
 
 import "tzrec/protos/module.proto";
 import "tzrec/protos/tower.proto";
+import "tzrec/protos/simi.proto";
 
-enum Similarity {
-  COSINE = 0;
-  INNER_PRODUCT = 1;
-}
 
 message DSSM {
     required Tower user_tower = 1;
@@ -68,4 +65,14 @@ message DAT {
     required float amm_i_weight = 7 [default = 0.5];
     // loss weight for amm_u
     required float amm_u_weight = 8 [default = 0.5];
+}
+
+
+
+message MIND {
+    required MINDUserTower user_tower = 1;
+    required Tower item_tower = 2;
+    optional float simi_pow = 3 [default=10];
+    optional Similarity similarity = 4 [default=COSINE];
+    optional bool in_batch_negative = 5 [default = false];
 }

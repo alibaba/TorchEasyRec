@@ -66,7 +66,7 @@ class SequenceSparseData(ParsedData):
     """Internal data structure for sequence sparse feature."""
 
     values: npt.NDArray
-    lengths: npt.NDArray
+    key_lengths: npt.NDArray
     seq_lengths: npt.NDArray
 
 
@@ -109,10 +109,27 @@ class RecordBatchTensor:
 class Batch(Pipelineable):
     """Input Batch."""
 
-    # key of dense_features is group name
+    # key of dense_features is data group name
     dense_features: Dict[str, KeyedTensor] = field(default_factory=dict)
-    # key of sparse_features is group name
+    # key of sparse_features is data group name
     sparse_features: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
+    # key of sequence_mulval_lengths is data group name
+    #
+    # for multi-value sequence, we flatten it, then store values & accumate lengths
+    # into sparse_features, store key_lengths & seq_lengths into sequence_mulval_lengths
+    #
+    # e.g.
+    # for the sequence `click_seq`: [[[3, 4], [5]], [6, [7, 8]]]
+    # we can denote it in jagged formular with:
+    #   values: [3, 4, 5, 6, 7, 8]
+    #   key_lengths: [2, 1, 1, 2]
+    #   seq_lengths: [2, 2]
+    # then:
+    #   sparse_features[dg]['click_seq'].values() = [3, 4, 5, 6, 7, 8]  # values
+    #   sparse_features[dg]['click_seq'].lengths() = [3, 3]  # accumate lengths
+    #   sequence_mulval_lengths[dg]['click_seq'].values() = [2, 1, 1, 2]  # key_lengths
+    #   sequence_mulval_lengths[dg]['click_seq'].lengths() = [2, 2]  # seq_lengths
+    sequence_mulval_lengths: Dict[str, KeyedJaggedTensor] = field(default_factory=dict)
     # key of sequence_dense_features is feature name
     sequence_dense_features: Dict[str, JaggedTensor] = field(default_factory=dict)
     # key of labels is label name
@@ -135,6 +152,10 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sparse_features.items()
             },
+            sequence_mulval_lengths={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.sequence_mulval_lengths.items()
+            },
             sequence_dense_features={
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sequence_dense_features.items()
@@ -156,6 +177,8 @@ class Batch(Pipelineable):
         for v in self.dense_features.values():
             v.record_stream(stream)
         for v in self.sparse_features.values():
+            v.record_stream(stream)
+        for v in self.sequence_mulval_lengths.values():
             v.record_stream(stream)
         for v in self.sequence_dense_features.values():
             v.record_stream(stream)
@@ -191,6 +214,9 @@ class Batch(Pipelineable):
             sparse_features={
                 k: v.pin_memory() for k, v in self.sparse_features.items()
             },
+            sequence_mulval_lengths={
+                k: v.pin_memory() for k, v in self.sequence_mulval_lengths.items()
+            },
             sequence_dense_features=sequence_dense_features,
             labels={k: v.pin_memory() for k, v in self.labels.items()},
             reserves=self.reserves,
@@ -219,6 +245,16 @@ class Batch(Pipelineable):
                 tensor_dict[f"{k}.lengths"] = v.lengths()
                 if v.weights_or_none() is not None:
                     tensor_dict[f"{k}.weights"] = v.weights()
+        for x in self.sequence_mulval_lengths.values():
+            if sparse_dtype:
+                x = KeyedJaggedTensor(
+                    keys=x.keys(),
+                    values=x.values().to(sparse_dtype),
+                    lengths=x.lengths().to(sparse_dtype),
+                )
+            for k, v in x.to_dict().items():
+                tensor_dict[f"{k}.key_lengths"] = v.values()
+                tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.sequence_dense_features.items():
             tensor_dict[f"{k}.values"] = v.values()
             tensor_dict[f"{k}.lengths"] = v.lengths()
@@ -353,3 +389,78 @@ def process_hstu_neg_sample(
     return pc.binary_join_element_wise(
         input_data[seq_attr], sampled_joined, seq_str_delim
     )
+
+
+def calc_slice_position(
+    row_count: int,
+    slice_id: int,
+    slice_count: int,
+    batch_size: int,
+    drop_redundant_bs_eq_one: bool,
+    pre_total_remain: int = 0,
+) -> Tuple[int, int, int]:
+    """Calc table read position according to the slice information.
+
+    Args:
+        row_count (int): table total row count.
+        slice_id (int): worker id.
+        slice_count (int): total worker number.
+        batch_size (int): batch_size.
+        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
+            equal one to prevent train_eval hung.
+        pre_total_remain (int): remaining total count in pre-table is
+            insufficient to meet the batch_size requirement for each worker.
+
+    Return:
+        start (int): start row position in table.
+        end (int): start row position in table.
+        total_remain (int): remaining total count in curr-table is
+            insufficient to meet the batch_size requirement for each worker.
+    """
+    pre_remain_size = int(pre_total_remain / slice_count)
+    pre_remain_split_point = pre_total_remain % slice_count
+
+    size = int((row_count + pre_total_remain) / slice_count)
+    split_point = (row_count + pre_total_remain) % slice_count
+    if slice_id < split_point:
+        start = slice_id * (size + 1)
+        end = start + (size + 1)
+    else:
+        start = split_point * (size + 1) + (slice_id - split_point) * size
+        end = start + size
+
+    real_start = (
+        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
+    )
+    real_end = (
+        end
+        - pre_remain_size * (slice_id + 1)
+        - min(pre_remain_split_point, slice_id + 1)
+    )
+    # when (end - start) % bz = 1 on some workers and
+    # (end - start) % bz = 0 on other workers, train_eval will hang
+    if (
+        drop_redundant_bs_eq_one
+        and split_point != 0
+        and (end - start) % batch_size == 1
+        and size % batch_size == 0
+    ):
+        real_end = real_end - 1
+        split_point = 0
+    return real_start, real_end, (size % batch_size) * slice_count + split_point
+
+
+def remove_nullable(field_type: pa.DataType) -> pa.DataType:
+    """Recursive removal of the null=False property from lists and nested lists."""
+    if pa.types.is_list(field_type):
+        # Get element fields
+        value_field = field_type.value_field
+        # Change the nullable to True
+        normalized_value_field = value_field.with_nullable(True)
+        # Recursive processing of element types
+        normalized_value_type = remove_nullable(normalized_value_field.type)
+        # Construct a new list type
+        return pa.list_(normalized_value_type)
+
+    else:
+        return field_type

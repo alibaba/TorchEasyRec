@@ -9,7 +9,7 @@ jobs:
   ci-test:
     runs-on: tzrec-cpu-runner
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.6-cpu
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.7-cpu
       options: --ipc host
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}

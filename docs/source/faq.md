@@ -111,7 +111,7 @@ pyarrow.lib.ArrowInvalid: Expected to read 538970747 metadata bytes, but only re
 
 **原因：** 这是因为链接mc的session过期失效了，目前session过期时间为1天
 
-**解决方法：** 使用离线FG + 训练 或 多机多卡加速训练，压缩训练时间在1天内
+**解决方法：** 升级torcheasyrec版本>=0.7.5
 
 ______________________________________________________________________
 
@@ -169,3 +169,27 @@ EmbeddingBoundsCheck (VBE false): (at least one) Out of bounds access for batch:
 **原因：** 第2个embedding table只有3行embedding（num_rows: 3)，但是传入的id是3（idx: 3），越界了
 
 **解决方法：** 只通过报错日志很难直接确定第2个embedding table是关联哪一个特征。需设置环境变量`LOG_LEVEL=INFO`或`LOG_LEVEL=DEBUG`重新执行训练命令，可以看到训练日志中包含如下内容`[TBE=xxx] Contents: ['id_3_emb', 'lookup_2_emb', 'lookup_3_emb', ...`，就可以得知`lookup_3`这个特征的输入值存在问题需要进一步检查输入数据。
+
+______________________________________________________________________
+
+**Q12: CUDA initialization error**
+
+**报错信息：**
+
+```
+>>> torch.cuda.is_available()
+/opt/conda/lib/python3.11/site-packages/torch/cuda/__init__.py:129: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 804: forward compatibility was attempted on non supported HW (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:109.)
+  return torch._C._cuda_getDeviceCount() > 0
+False
+```
+
+**原因：** 部分显卡（如：RTX系列的）与torcheasyrec cuda镜像中的cuda-compat library不兼容
+
+**解决方法：** 在运行命令前增加环境变量LD_LIBRARY_PATH=，例如
+
+```bash
+LD_LIBRARY_PATH= torchrun --master_addr=localhost --master_port=32555 \
+    --nnodes=1 --nproc-per-node=2 --node_rank=0 \
+    -m tzrec.train_eval \
+    --pipeline_config_path multi_tower_din_taobao_local.config
+```

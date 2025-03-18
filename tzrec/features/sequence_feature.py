@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import os
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -212,6 +211,14 @@ class SequenceIdFeature(IdFeature):
             return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        else:
+            return 1
+
+    @property
     def is_sequence(self) -> bool:
         """Feature is sequence or not."""
         return True
@@ -221,13 +228,16 @@ class SequenceIdFeature(IdFeature):
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self._is_grouped_seq:
-            side, name = self.config.expression.split(":")
-            return [(side, f"{self.sequence_name}__{name}")]
+        if self.config.HasField("expression"):
+            if self._is_grouped_seq:
+                side, name = self.config.expression.split(":")
+                return [(side, f"{self.sequence_name}__{name}")]
+            else:
+                return [tuple(self.config.expression.split(":"))]
         else:
-            return [tuple(self.config.expression.split(":"))]
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -257,7 +267,7 @@ class SequenceIdFeature(IdFeature):
             parsed_feat = SequenceSparseData(
                 name=self.name,
                 values=values,
-                lengths=key_lengths,
+                key_lengths=key_lengths,
                 seq_lengths=seq_lengths,
             )
         else:
@@ -314,20 +324,16 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets
-        elif len(self.config.vocab_list) > 0:
-            fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
-                self.config.vocab_list
-            )
-            fg_cfg["default_bucketize_value"] = 1
+        elif len(self.vocab_list) > 0:
+            fg_cfg["vocab_list"] = self.vocab_list
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         elif len(self.config.vocab_dict) > 0:
-            vocab_dict = OrderedDict(self.config.vocab_dict.items())
-            vocab_dict[self.config.default_value] = 0
-            fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["vocab_dict"] = self.vocab_dict
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("value_dim"):
-            assert (
-                self.config.value_dim == 1
-            ), f"SequenceIdFeature {self.name} not support multi-value now."
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 1
@@ -402,13 +408,16 @@ class SequenceRawFeature(RawFeature):
         # TODO: support dense embedding for sequence raw feature.
         return None
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self._is_grouped_seq:
-            side, name = self.config.expression.split(":")
-            return [(side, f"{self.sequence_name}__{name}")]
+        if self.config.HasField("expression"):
+            if self._is_grouped_seq:
+                side, name = self.config.expression.split(":")
+                return [(side, f"{self.sequence_name}__{name}")]
+            else:
+                return [tuple(self.config.expression.split(":"))]
         else:
-            return [tuple(self.config.expression.split(":"))]
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -446,7 +455,9 @@ class SequenceRawFeature(RawFeature):
                 parsed_feat = SequenceSparseData(
                     name=self.name,
                     values=values,
-                    lengths=np.array([self._fg_op.value_dimension()] * sum(lengths)),
+                    key_lengths=np.array(
+                        [self._fg_op.value_dimension()] * sum(lengths)
+                    ),
                     seq_lengths=lengths,
                 )
             else:

@@ -155,10 +155,11 @@ class EmbeddingGroup(nn.Module):
         self._group_name_to_seq_encoder_configs = defaultdict(list)
         self._grouped_features_keys = list()
 
+        seq_group_names = []
         for feature_group in feature_groups:
             group_name = feature_group.group_name
-            self._respect_and_supplement_feature_group(feature_group)
-            self._add_feature_group_sign_for_sequence_groups(feature_group)
+            self._inspect_and_supplement_feature_group(feature_group, seq_group_names)
+            # self._add_feature_group_sign_for_sequence_groups(feature_group)
             features_data_group = defaultdict(list)
             for feature_name in feature_group.feature_names:
                 feature = self._name_to_feature[feature_name]
@@ -241,10 +242,10 @@ class EmbeddingGroup(nn.Module):
         """grouped_features_keys."""
         return self._grouped_features_keys
 
-    def _respect_and_supplement_feature_group(
-        self, feature_group: FeatureGroupConfig
+    def _inspect_and_supplement_feature_group(
+        self, feature_group: FeatureGroupConfig, seq_group_names: List[str]
     ) -> None:
-        """Respect feature group sequence_groups and sequence_encoders."""
+        """Inspect feature group sequence_groups and sequence_encoders."""
         group_name = feature_group.group_name
         sequence_groups = list(feature_group.sequence_groups)
         sequence_encoders = list(feature_group.sequence_encoders)
@@ -272,6 +273,14 @@ class EmbeddingGroup(nn.Module):
                 "group_name"
             ):
                 sequence_groups[0].group_name = group_name
+
+            for sequence_group in sequence_groups:
+                if sequence_group.group_name in seq_group_names:
+                    raise ValueError(
+                        f"has repeat sequences groups_name: {sequence_group.group_name}"
+                    )
+                else:
+                    seq_group_names.append(sequence_group.group_name)
 
             group_has_encoder = {
                 sequence_group.group_name: False for sequence_group in sequence_groups
@@ -304,23 +313,6 @@ class EmbeddingGroup(nn.Module):
                     f"{group_name} group group_type is not DEEP, "
                     f"sequence_groups and sequence_encoders must configured in DEEP"
                 )
-
-    def _add_feature_group_sign_for_sequence_groups(
-        self, feature_group: FeatureGroupConfig
-    ) -> None:
-        """Assign sequence_groups and sequence_encoder relation group name."""
-        group_name = feature_group.group_name
-        sequence_groups = list(feature_group.sequence_groups)
-        sequence_encoders = list(feature_group.sequence_encoders)
-        if len(sequence_groups) > 0:
-            for sequence_group in sequence_groups:
-                sequence_group.group_name = (
-                    group_name + "___" + sequence_group.group_name
-                )
-            for sequence_encoder in sequence_encoders:
-                seq_type = sequence_encoder.WhichOneof("seq_module")
-                seq_config = getattr(sequence_encoder, seq_type)
-                seq_config.input = group_name + "___" + seq_config.input
 
     def group_names(self) -> List[str]:
         """Feature group names."""
@@ -393,18 +385,17 @@ class EmbeddingGroup(nn.Module):
         """
         result_dicts = []
 
-        need_input_tile_emb = is_input_tile_emb()
         need_input_tile = is_input_tile()
 
         if need_input_tile:
             emb_keys = list(self.emb_impls.keys())
             seq_emb_keys = list(self.seq_emb_impls.keys())
             unique_keys = list(set(emb_keys + seq_emb_keys))
-            # tile user dense feat & combine item dense feat
+            # tile user dense feat & combine item dense feat, when has user dense feat
             for key in unique_keys:
                 user_kt = batch.dense_features.get(key + "_user", None)
-                item_kt = batch.dense_features.get(key + "_item", None)
-                if user_kt is not None or item_kt is not None:
+                if user_kt is not None:
+                    item_kt = batch.dense_features.get(key, None)
                     batch.dense_features[key] = _tile_and_combine_dense_kt(
                         user_kt, item_kt, batch.tile_size
                     )
@@ -416,12 +407,9 @@ class EmbeddingGroup(nn.Module):
 
             if emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
-            if emb_impl.has_sparse:
-                if need_input_tile_emb:
-                    sparse_feat_kjt = batch.sparse_features[key + "_item"]
-                else:
-                    sparse_feat_kjt = batch.sparse_features[key]
-            if emb_impl.has_sparse_user:
+            if emb_impl.has_sparse or emb_impl.has_mc_sparse:
+                sparse_feat_kjt = batch.sparse_features[key]
+            if emb_impl.has_sparse_user or emb_impl.has_mc_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
             if emb_impl.has_dense or emb_impl.has_sparse:
                 result_dicts.append(
@@ -437,23 +425,30 @@ class EmbeddingGroup(nn.Module):
             sparse_feat_kjt = None
             sparse_feat_kjt_user = None
             dense_feat_kt = None
+            sequence_mulval_length_kjt = None
+            sequence_mulval_length_kjt_user = None
 
             if seq_emb_impl.has_dense:
                 dense_feat_kt = batch.dense_features[key]
-            if seq_emb_impl.has_sparse:
-                if need_input_tile_emb:
-                    sparse_feat_kjt = batch.sparse_features[key + "_item"]
-                else:
-                    sparse_feat_kjt = batch.sparse_features[key]
-            if seq_emb_impl.has_sparse_user:
+            if seq_emb_impl.has_sparse or seq_emb_impl.has_mc_sparse:
+                sparse_feat_kjt = batch.sparse_features[key]
+            if seq_emb_impl.has_mulval_seq:
+                sequence_mulval_length_kjt = batch.sequence_mulval_lengths[key]
+            if seq_emb_impl.has_sparse_user or seq_emb_impl.has_mc_sparse_user:
                 sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
+            if seq_emb_impl.has_mulval_seq_user:
+                sequence_mulval_length_kjt_user = batch.sequence_mulval_lengths[
+                    key + "_user"
+                ]
 
             result_dicts.append(
                 seq_emb_impl(
                     sparse_feat_kjt,
                     dense_feat_kt,
                     batch.sequence_dense_features,
+                    sequence_mulval_length_kjt,
                     sparse_feat_kjt_user,
+                    sequence_mulval_length_kjt_user,
                     batch.tile_size,
                 )
             )
@@ -838,6 +833,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         self.has_mc_sparse = False
         self.has_dense = False
         self.has_sequence_dense = False
+        self.has_mulval_seq = False
 
         # for sparse input-tile-emb
         dim_to_emb_configs_user = defaultdict(OrderedDict)
@@ -845,6 +841,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dim_to_mc_modules_user = defaultdict(OrderedDict)
         self.has_sparse_user = False
         self.has_mc_sparse_user = False
+        self.has_mulval_seq_user = False
 
         self._group_to_shared_query = OrderedDict()
         self._group_to_shared_sequence = OrderedDict()
@@ -910,6 +907,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             self.has_mc_sparse_user = True
                         else:
                             self.has_sparse_user = True
+                        if feature.is_sequence and feature.value_dim != 1:
+                            self.has_mulval_seq_user = True
                     else:
                         emb_configs = (
                             dim_to_mc_emb_configs[embedding_dim]
@@ -929,6 +928,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             self.has_mc_sparse = True
                         else:
                             self.has_sparse = True
+                        if feature.is_sequence and feature.value_dim != 1:
+                            self.has_mulval_seq = True
 
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_config.name
@@ -942,12 +943,28 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 is_user_feat = feature.is_user_feat if need_input_tile else False
                 if feature.is_sequence:
                     shared_sequence.append(
-                        (shared_name, feature.is_sparse, is_user_feat)
+                        (
+                            shared_name,
+                            name,
+                            feature.is_sparse,
+                            feature.pooling_type.value.lower(),
+                            feature.value_dim,
+                            is_user_feat,
+                        )
                     )
                     sequence_dim += output_dim
                     sequence_dims.append(output_dim)
                 else:
-                    shared_query.append((shared_name, feature.is_sparse, is_user_feat))
+                    shared_query.append(
+                        (
+                            shared_name,
+                            name,
+                            feature.is_sparse,
+                            feature.pooling_type.value.lower(),
+                            feature.value_dim,
+                            is_user_feat,
+                        )
+                    )
                     query_dim += output_dim
                     query_dims.append(output_dim)
 
@@ -963,6 +980,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self.ec_list.append(
                 EmbeddingCollection(list(emb_configs.values()), device=device)
             )
+
         self.mc_ec_list = nn.ModuleList()
         for k, emb_configs in dim_to_mc_emb_configs.items():
             self.mc_ec_list.append(
@@ -1017,7 +1035,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sparse_feature: KeyedJaggedTensor,
         dense_feature: KeyedTensor,
         sequence_dense_features: Dict[str, JaggedTensor],
+        sequence_mulval_lengths: KeyedJaggedTensor,
         sparse_feature_user: KeyedJaggedTensor,
+        sequence_mulval_lengths_user: KeyedJaggedTensor,
         tile_size: int = -1,
     ) -> Dict[str, torch.Tensor]:
         """Forward the module.
@@ -1026,8 +1046,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             sparse_feature (KeyedJaggedTensor): sparse id feature.
             dense_feature (dense_feature): dense feature.
             sequence_dense_features (Dict[str, JaggedTensor]): dense sequence feature.
+            sequence_mulval_lengths (KeyedJaggedTensor): key_lengths and seq_lengths for
+                multi-value sparse sequence features, kjt.values is key_lengths,
+                kjt.lengths is seq_lengths.
             sparse_feature_user (KeyedJaggedTensor): user-side sparse feature
                 with batch_size=1, when use INPUT_TILE=3.
+            sequence_mulval_lengths_user (KeyedJaggedTensor):key_lengths and seq_lengths
+                of user-side multi-value sparse sequence features, with batch_size=1,
+                when use INPUT_TILE=3.
             tile_size: size for user-side feature input tile.
 
         Returns:
@@ -1035,6 +1061,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         """
         # TODO (hongsheng.jhs): deal with tag sequence feature.
         sparse_jt_dict_list = []
+        seq_mulval_length_jt_dict_list = []
         dense_t_dict = {}
 
         need_input_tile = is_input_tile()
@@ -1047,6 +1074,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for ec in self.mc_ec_list:
                 sparse_jt_dict_list.append(ec(sparse_feature)[0])
 
+        if self.has_mulval_seq:
+            seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
+
         # do user-side embedding input-tile
         if self.has_sparse_user:
             for ec in self.ec_list_user:
@@ -1057,7 +1087,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for ec in self.mc_ec_list_user:
                 sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
+        # do user-side embedding input-tile
+        if self.has_mulval_seq_user:
+            seq_mulval_length_jt_dict_list.append(
+                sequence_mulval_lengths_user.to_dict()
+            )
+
         sparse_jt_dict = _merge_list_of_jt_dict(sparse_jt_dict_list)
+        seq_mulval_length_jt_dict = _merge_list_of_jt_dict(
+            seq_mulval_length_jt_dict_list
+        )
 
         if self.has_dense:
             dense_t_dict = dense_feature.to_dict()
@@ -1065,10 +1104,19 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         results = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
-            for name, is_sparse, is_user in v:
+            for name, _, is_sparse, pooling, value_dim, is_user in v:
                 if is_sparse:
-                    # TODO(hongsheng.jhs): support multi-value id feature
-                    query_t = sparse_jt_dict[name].to_padded_dense(1).squeeze(1)
+                    query_jt = sparse_jt_dict[name]
+                    if value_dim == 1:
+                        # for single-value id feature
+                        query_t = sparse_jt_dict[name].to_padded_dense(1).squeeze(1)
+                    else:
+                        # for multi-value id feature
+                        query_t = torch.segment_reduce(
+                            query_jt.values(), pooling, lengths=query_jt.lengths()
+                        )
+                        if pooling == "mean":
+                            query_t = torch.nan_to_num(query_t, nan=0.0)
                     if is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
                 else:
@@ -1076,11 +1124,19 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 query_t_list.append(query_t)
             if len(query_t_list) > 0:
                 results[f"{group_name}.query"] = torch.cat(query_t_list, dim=1)
+
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
 
             group_sequence_length = 1
-            for i, (name, is_sparse, is_user) in enumerate(v):
+            for i, (
+                name,
+                raw_name,
+                is_sparse,
+                pooling,
+                value_dim,
+                is_user,
+            ) in enumerate(v):
                 # when is_user is True
                 #   sequence_sparse_features
                 #       when input_tile_emb need to tile(tile_size,1):
@@ -1094,15 +1150,30 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 jt = (
                     sparse_jt_dict[name] if is_sparse else sequence_dense_features[name]
                 )
+                if is_sparse and value_dim != 1:
+                    length_jt = seq_mulval_length_jt_dict[raw_name]
+                    # length_jt.values is sequence key_lengths
+                    # length_jt.lengths is sequence seq_lengths
+                    jt_values = torch.segment_reduce(
+                        jt.values(), pooling, lengths=length_jt.values()
+                    )
+                    if pooling == "mean":
+                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
+                    jt = JaggedTensor(
+                        values=jt_values,
+                        lengths=length_jt.lengths(),
+                    )
                 if i == 0:
                     sequence_length = jt.lengths()
                     group_sequence_length = _int_item(torch.max(sequence_length))
+
                     if need_tile:
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
                             tile_size
                         )
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
+
                 jt = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:

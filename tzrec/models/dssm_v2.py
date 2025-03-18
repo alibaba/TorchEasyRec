@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -22,8 +21,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
-from tzrec.protos import model_pb2, tower_pb2
-from tzrec.protos.models import match_model_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -44,7 +42,7 @@ class DSSMTower(MatchTowerWoEG):
         self,
         tower_config: tower_pb2.Tower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         feature_group_dims: List[int],
         features: List[BaseFeature],
@@ -67,7 +65,7 @@ class DSSMTower(MatchTowerWoEG):
         output = self.mlp(feature)
         if self._output_dim > 0:
             output = self.output(output)
-        if self._similarity == match_model_pb2.Similarity.COSINE:
+        if self._similarity == simi_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
         return output
 
@@ -100,14 +98,8 @@ class DSSMV2(MatchModel):
         user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
 
-        name_to_feature = {x.name: x for x in features}
-        user_features = OrderedDict(
-            [(x, name_to_feature[x]) for x in user_group.feature_names]
-        )
-        for sequence_group in user_group.sequence_groups:
-            for x in sequence_group.feature_names:
-                user_features[x] = name_to_feature[x]
-        item_features = [name_to_feature[x] for x in item_group.feature_names]
+        user_features = self.get_features_in_feature_groups([user_group])
+        item_features = self.get_features_in_feature_groups([item_group])
 
         self.user_tower = DSSMTower(
             self._model_config.user_tower,
@@ -115,7 +107,7 @@ class DSSMV2(MatchModel):
             self._model_config.similarity,
             user_group,
             self.embedding_group.group_dims(self._model_config.user_tower.input),
-            list(user_features.values()),
+            user_features,
         )
 
         self.item_tower = DSSMTower(

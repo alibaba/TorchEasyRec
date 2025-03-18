@@ -97,7 +97,7 @@ model_config {
         - input: 输入feature_group名
         - hidden_units: mlp每一层的channel数目，即神经元的数目
     - output_dim: user/item输出embedding维度
-    - similarity: 向量相似度函数，包括\[COSINE, INNER_PRODUCT\]，默认INNER_PRODUCT
+    - similarity: 向量相似度函数，包括[COSINE, INNER_PRODUCT]，默认INNER_PRODUCT
   - dssm_v2: 参数同dssm
     - dssm_v2可以支持user与item塔 跨塔share embedding，但训练速度相对dssm_v1稍慢
     - 注意如果使用dssm_v2，data_config.force_base_data_group需要设置为true
@@ -113,7 +113,7 @@ model_config {
 - negative_sampler：加权随机负采样，会排除Mini-Batch内的Item Id
   - input_path: 负采样Item表, Schema为: id:int64 | weight:float | attrs:string，其中attr默认为":"分隔符拼接的Item特征
   - num_sample: 训练worker的负采样数
-  - num_eval_sampler: 评估worker的负采样数
+  - num_eval_sample: 评估worker的负采样数
   - attr_fields: Item特征名，顺序与Item的attr中特征的拼接顺序保持一致
   - item_id_field: item_id列名
 - negative_sampler_v2：加权随机负采样，会跟排除Mini-Batch内的User有边的Item Id

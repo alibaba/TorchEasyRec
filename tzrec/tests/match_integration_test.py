@@ -160,7 +160,10 @@ class MatchIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(
             os.path.exists(
-                os.path.join(self.test_dir, "fg_output/item_title_tokenizer.json")
+                os.path.join(
+                    self.test_dir,
+                    "fg_output/tokenizer_b2faab7921bbfb593973632993ca4c85.json",
+                )
             )
         )
 
@@ -270,6 +273,44 @@ class MatchIntegrationTest(unittest.TestCase):
                 predict_output_path=os.path.join(self.test_dir, "predict_result"),
                 reserved_columns="item_id",
                 output_columns="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
+
+    def test_mind_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/mind_mock.config", self.test_dir, item_id="item_id"
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/item"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="item_id",
+                output_columns="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/user"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "user_predict_result"),
+                reserved_columns="user_id,click_50_seq__item_id_1,click_50_seq__item_id_2",
+                output_columns="user_tower_emb",
                 test_dir=self.test_dir,
             )
         self.assertTrue(self.success)

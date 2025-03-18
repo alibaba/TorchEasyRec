@@ -109,8 +109,13 @@ message DataConfig {
     // hstu enable
     optional bool enable_hstu = 21 [default = false];
 
-    // delimiter for string sequence
-    optional string seq_str_delim = 22 [default = ','];
+    // whether to shuffle data
+    optional bool shuffle = 22 [default = false];
+
+    // shufffle buffer for better performance, even shuffle buffer is set,
+    // it is suggested to do full data shuffle before training
+    // especially when the performance of models is not good.
+    optional uint32 shuffle_buffer_size  = 23 [default = 32];
 
     // negative sampler
     oneof sampler {

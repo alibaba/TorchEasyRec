@@ -10,8 +10,6 @@
 # limitations under the License.
 
 import copy
-import os
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
@@ -30,7 +28,6 @@ from tzrec.features.feature import (
     _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
-from tzrec.utils.logging_util import logger
 
 
 class MatchFeature(BaseFeature):
@@ -69,8 +66,6 @@ class MatchFeature(BaseFeature):
         """Fg value dimension of the feature."""
         if self.config.HasField("value_dim"):
             return self.config.value_dim
-        elif self._is_sparse:
-            return 0
         else:
             return 1
 
@@ -87,10 +82,12 @@ class MatchFeature(BaseFeature):
         """Feature is sparse or dense."""
         if self._is_sparse is None:
             self._is_sparse = (
-                self.config.HasField("hash_bucket_size")
+                self.config.HasField("zch")
+                or self.config.HasField("hash_bucket_size")
                 or self.config.HasField("num_buckets")
                 or len(self.config.vocab_list) > 0
                 or len(self.config.vocab_dict) > 0
+                or len(self.config.vocab_file) > 0
                 or len(self.config.boundaries) > 0
             )
         return self._is_sparse
@@ -104,17 +101,13 @@ class MatchFeature(BaseFeature):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             num_embeddings = self.config.num_buckets
-        elif len(self.config.vocab_list) > 0:
-            num_embeddings = len(self.config.vocab_list) + 2
-        elif len(self.config.vocab_dict) > 0:
-            is_rank_zero = os.environ.get("RANK", "0") == "0"
-            if min(list(self.config.vocab_dict.values())) <= 1 and is_rank_zero:
-                logger.warn(
-                    "min index of vocab_dict in "
-                    f"{self.__class__.__name__}[{self.name}] should "
-                    "start from 2. index0 is default_value, index1 is <OOV>."
-                )
-            num_embeddings = max(list(self.config.vocab_dict.values())) + 1
+        elif len(self.vocab_list) > 0:
+            num_embeddings = len(self.vocab_list) + 1
+        elif len(self.vocab_dict) > 0:
+            num_embeddings = max(list(self.vocab_dict.values())) + 1
+        elif len(self.vocab_file) > 0:
+            self.init_fg()
+            num_embeddings = self._fg_op.vocab_list_size()
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
@@ -123,13 +116,20 @@ class MatchFeature(BaseFeature):
     def _dense_emb_type(self) -> Optional[str]:
         return self.config.WhichOneof("dense_emb")
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        return [
-            tuple(x.split(":"))
-            for x in [self.config.nested_map, self.config.pkey, self.config.skey]
-            if x != "ALL"
-        ]
+        if (
+            self.config.HasField("nested_map")
+            and self.config.HasField("pkey")
+            and self.config.HasField("skey")
+        ):
+            return [
+                tuple(x.split(":"))
+                for x in [self.config.nested_map, self.config.pkey, self.config.skey]
+                if x != "ALL"
+            ]
+        else:
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -209,24 +209,32 @@ class MatchFeature(BaseFeature):
             # TODO: value_type -> int64
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
-        elif len(self.config.vocab_list) > 0:
-            fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
-                self.config.vocab_list
-            )
-            fg_cfg["default_bucketize_value"] = 1
+        elif len(self.vocab_list) > 0:
+            fg_cfg["vocab_list"] = self.vocab_list
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
-        elif len(self.config.vocab_dict) > 0:
-            vocab_dict = OrderedDict(self.config.vocab_dict.items())
-            vocab_dict[self.config.default_value] = 0
-            fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+        elif len(self.vocab_dict) > 0:
+            fg_cfg["vocab_dict"] = self.vocab_dict
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+            fg_cfg["value_type"] = "string"
+            fg_cfg["needDiscrete"] = True
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
         elif len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
 
         if fg_cfg["needDiscrete"]:
-            fg_cfg["value_dim"] = self.config.value_dim
+            fg_cfg["value_dim"] = self.value_dim
         #     del fg_cfg["combiner"]
         return [fg_cfg]
+
+    def assets(self) -> Dict[str, str]:
+        """Asset file paths."""
+        assets = {}
+        if len(self.vocab_file) > 0:
+            assets["vocab_file"] = self.vocab_file
+        return assets

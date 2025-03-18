@@ -26,28 +26,41 @@ ENV PATH /opt/conda/bin:$PATH
 
 ARG DEVICE
 RUN case ${DEVICE} in \
-        "cu121") pip install torch==2.5.0 fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cu121 && \
-                 pip uninstall -y nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
-                 sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python3.11/site-packages/torch-2.5.0+cu121.dist-info/METADATA && \
-                 pip install torchmetrics==1.0.3 torch_tensorrt==2.5.0 && \
-                 pip install torchrec==1.0.0 --index-url https://download.pytorch.org/whl/cu121 ;; \
-        * )      pip install torch==2.5.0 fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cpu && \
+        "cu124") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+                 dpkg -i cuda-keyring_1.1-1_all.deb && \
+                 apt-get update && \
+                 apt-get install cuda-compat-12-4 && \
+                 rm -rf /var/lib/apt/lists/* ;; \
+    esac
+RUN case ${DEVICE} in \
+        "cu124") pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124 && \
+                 pip install torchmetrics==1.0.3 torch_tensorrt==2.6.0 --extra-index-url https://download.pytorch.org/whl/cu124 && \
+                 pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cu124 ;; \
+        * )      pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cpu && \
                  pip install torchmetrics==1.0.3 && \
-                 pip install torchrec==1.0.0 --index-url https://download.pytorch.org/whl/cpu ;; \
+                 pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cpu ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
 
 ENV NVIDIA_VISIBLE_DEVICES all
 ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
+ARG LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 
-ADD requirements.txt /root/requirements.txt
 ADD requirements /root/requirements
-RUN cd /root && pip install -r requirements.txt && rm requirements.txt
+RUN cd /root && \
+    pip install -r requirements/runtime.txt && \
+    pip install -r requirements/test.txt && \
+    pip install -r requirements/docs.txt && \
+    case ${DEVICE} in \
+        "cu124") pip install -r requirements/gpu.txt ;; \
+    esac && \
+    rm -rf requirements && \
+    /opt/conda/bin/conda clean -ya
 
 RUN mkdir -p /home/pai/bin && \
     wget -O /home/pai/bin/prepare_dlc_environment https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pai/prepare_dlc_environment.sh && \
     chmod +x /home/pai/bin/prepare_dlc_environment && \
     apt-get update && apt-get install -y --no-install-recommends openssh-server && rm -rf /var/lib/apt/lists/* && service ssh start
 ENV PATH $PATH:/home/pai/bin
+ENV SHELL=/bin/bash

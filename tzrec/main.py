@@ -25,15 +25,11 @@ from torch import distributed as dist
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.distributed.model_parallel import (
-    DistributedModelParallel,
-)
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.inference.state_dict_transform import (
-    state_dict_gather,
     state_dict_to_device,
 )
 from torchrec.optim.apply_optimizer_in_backward import (
@@ -47,10 +43,12 @@ from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     export_acc_config,
     is_aot,
+    is_cuda_export,
     is_input_tile_emb,
     is_quant,
     is_trt,
     is_trt_predict,
+    quant_dtype,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
@@ -69,7 +67,7 @@ from tzrec.models.match_model import (
     TowerWoEGWrapper,
     TowerWrapper,
 )
-from tzrec.models.model import BaseModel, ExportWrapperAOT, ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.optim import optimizer_builder
@@ -81,9 +79,11 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
+from tzrec.utils.state_dict_util import state_dict_gather, validate_state
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -205,6 +205,10 @@ def _get_dataloader(
         collate_fn=lambda x: x,
         **kwargs,
     )
+    # For PyTorch versions 2.6 and above, we initialize the data iterator before
+    # beginning the training process to avoid potential CUDA-related issues following
+    # model saving.
+    iter(dataloader)
     return dataloader
 
 
@@ -240,6 +244,7 @@ def _evaluate(
     eval_result_filename: Optional[str] = None,
     global_step: Optional[int] = None,
     eval_summary_writer: Optional[SummaryWriter] = None,
+    global_epoch: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -258,8 +263,10 @@ def _evaluate(
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
+    if global_epoch:
+        desc_suffix += f" Epoch-{global_epoch}"
     if global_step:
-        desc_suffix = f" model-{global_step}"
+        desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
     plogger = None
@@ -283,6 +290,7 @@ def _evaluate(
             plogger.log(i_step)
 
     metric_result = _model.compute_metric()
+
     if is_rank_zero:
         metric_str = " ".join([f"{k}:{v:0.6f}" for k, v in metric_result.items()])
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
@@ -352,6 +360,12 @@ def _train_and_evaluate(
     epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
+    save_checkpoints_steps, save_checkpoints_epochs = 0, 0
+    if train_config.save_checkpoints_epochs > 0:
+        save_checkpoints_epochs = train_config.save_checkpoints_epochs
+    else:
+        save_checkpoints_steps = train_config.save_checkpoints_steps
+
     plogger = None
     summary_writer = None
     eval_summary_writer = None
@@ -360,6 +374,7 @@ def _train_and_evaluate(
     if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
+    eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
     if train_config.is_profiling:
         if is_rank_zero:
@@ -377,6 +392,7 @@ def _train_and_evaluate(
 
     last_ckpt_step = -1
     i_step = 0
+    i_epoch = 0
     losses = {}
     for i_epoch in epoch_iter:
         pipeline = TrainPipelineSparseDist(
@@ -419,8 +435,9 @@ def _train_and_evaluate(
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
-            if train_config.save_checkpoints_steps > 0 and i_step > 0:
-                if i_step % train_config.save_checkpoints_steps == 0:
+
+            if save_checkpoints_steps > 0 and i_step > 0:
+                if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
                     checkpoint_util.save_model(
                         os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -432,12 +449,34 @@ def _train_and_evaluate(
                             model,
                             eval_dataloader,
                             eval_config,
+                            eval_result_filename=eval_result_filename,
                             global_step=i_step,
                             eval_summary_writer=eval_summary_writer,
+                            global_epoch=i_epoch,
                         )
                         model.train()
             if train_config.is_profiling:
                 prof.step()
+
+        if save_checkpoints_epochs > 0 and i_step > 0:
+            if i_epoch % save_checkpoints_epochs == 0:
+                last_ckpt_step = i_step
+                checkpoint_util.save_model(
+                    os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                    model,
+                    optimizer,
+                )
+                if eval_dataloader is not None:
+                    _evaluate(
+                        model,
+                        eval_dataloader,
+                        eval_config,
+                        eval_result_filename=eval_result_filename,
+                        global_step=i_step,
+                        eval_summary_writer=eval_summary_writer,
+                        global_epoch=i_epoch,
+                    )
+                    model.train()
 
         if use_step and i_step >= train_config.num_steps - 1:
             break
@@ -468,9 +507,10 @@ def _train_and_evaluate(
                 model,
                 eval_dataloader,
                 eval_config,
-                os.path.join(model_dir, eval_result_filename),
+                eval_result_filename=eval_result_filename,
                 global_step=i_step,
                 eval_summary_writer=eval_summary_writer,
+                global_epoch=i_epoch,
             )
             model.train()
 
@@ -727,26 +767,25 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        if is_trt_convert:
-            model = model.to_empty(device="cuda:0")
-            logger.info("gather states to cuda model...")
-        else:
-            model = model.to_empty(device="cpu")
-            logger.info("gather states to cpu model...")
+        model = model.to_empty(device="cpu")
+        logger.info("gather states to cpu model...")
 
     state_dict_gather(state_dict, model.state_dict())
-
     dist.barrier()
 
     if is_rank_zero:
+        # for mc modules, we should validate and sort mch buffers
+        validate_state(model)
+
         batch = next(iter(dataloader))
 
-        if is_aot():
+        if is_cuda_export():
             model = model.cuda()
 
         if is_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=torch.qint8, inplace=True)
+            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            logger.info("finish quantize embeddings...")
 
         model.eval()
 
@@ -755,8 +794,8 @@ def _script_model(
             result = model(data_cuda, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-
             export_model_trt(model, data_cuda, save_dir)
+
         elif is_aot():
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data_cuda)
@@ -876,30 +915,22 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    if is_trt_convert:
-        checkpoint_pg = dist.new_group(backend="nccl")
-        if is_rank_zero:
-            logger.info("copy sharded state_dict to cuda...")
-        device_state_dict = state_dict_to_device(
-            model.state_dict(), pg=checkpoint_pg, device=torch.device(device)
-        )
-    else:
-        checkpoint_pg = dist.new_group(backend="gloo")
-        if is_rank_zero:
-            logger.info("copy sharded state_dict to cpu...")
-        device_state_dict = state_dict_to_device(
-            model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-        )
+    checkpoint_pg = dist.new_group(backend="gloo")
+    if is_rank_zero:
+        logger.info("copy sharded state_dict to cpu...")
+    cpu_state_dict = state_dict_to_device(
+        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
+    )
 
-    device_model = _create_model(
+    cpu_model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
     )
 
-    InferWrapper = ExportWrapperAOT if is_aot() else ScriptWrapper
-    if isinstance(device_model, MatchModel):
-        for name, module in device_model.named_children():
+    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    if isinstance(cpu_model, MatchModel):
+        for name, module in cpu_model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -909,28 +940,28 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    device_state_dict,
+                    cpu_state_dict,
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(device_model, TDM):
-        for name, module in device_model.named_children():
+    elif isinstance(cpu_model, TDM):
+        for name, module in cpu_model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    device_state_dict,
+                    cpu_state_dict,
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            InferWrapper(device_model),
-            device_state_dict,
+            InferWrapper(cpu_model),
+            cpu_state_dict,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -939,8 +970,8 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            InferWrapper(device_model),
-            device_state_dict,
+            InferWrapper(cpu_model),
+            cpu_state_dict,
             dataloader,
             export_dir,
         )
@@ -1018,8 +1049,6 @@ def predict(
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
     data_config: DataConfig = pipeline_config.data_config
-    data_config.ClearField("label_fields")
-    data_config.ClearField("sample_weight_fields")
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)

@@ -17,12 +17,10 @@ message ExtractionNetwork {
     // number of experts per task
     required uint32 expert_num_per_task = 2;
     // number of experts for share
-    // For the last extraction_network, no need to configure this
     optional uint32 share_num = 3;
     // mlp network of experts per task
     required MLP task_expert_net = 4;
     // mlp network of experts for share
-    // For the last extraction_network, no need to configure this
     optional MLP share_expert_net = 5;
 }
 
@@ -31,4 +29,24 @@ message  VariationalDropout{
     optional float regularization_lambda = 1 [default = 0.01];
     // variational_dropout dimension
     optional bool embedding_wise_variational_dropout = 2 [default = false];
+}
+
+
+message B2ICapsule{
+    // max number of high capsules Default: 5
+    optional uint32 max_k = 1 [default = 5];
+    // max behaviour sequence length
+    required uint32 max_seq_len = 2;
+    // high capsule embedding vector dimension
+    required uint32 high_dim = 3;
+    // dynamic routing iterations, Default: 3
+    optional uint32 num_iters = 4 [default = 3];
+    // routing logits scale Default: 20
+    optional float routing_logits_scale = 5 [default = 20];
+    // routing logits initial stddev Default: 1
+    optional float routing_logits_stddev = 6 [default = 1];
+    // squash power Default: 1
+    optional float squash_pow = 7 [default = 1];
+    // whether to use constant capsule number, Default: false
+    optional bool const_caps_num = 8 [default = false];
 }

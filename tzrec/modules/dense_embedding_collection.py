@@ -105,6 +105,7 @@ class AutoDisEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.keep_prob = keep_prob
         self.temperature = temperature
+        self.num_channels = num_channels
 
         self.meta_emb = nn.Parameter(
             torch.randn(num_dense_feature, num_channels, embedding_dim, device=device)
@@ -123,6 +124,15 @@ class AutoDisEmbedding(nn.Module):
         )
         self.leaky_relu = nn.LeakyReLU()
         self.softmax = nn.Softmax(dim=-1)
+        self.reset_parameters()
+
+    def reset_parameters(
+        self,
+    ) -> None:
+        """Reset the parameters."""
+        nn.init.normal_(self.meta_emb, 0, 1.0)
+        nn.init.normal_(self.proj_w, 0, sqrt(2 / (1 + self.num_channels)))
+        nn.init.normal_(self.proj_m, 0, sqrt(1 / self.num_channels))
 
     def forward(self, dense_input: Tensor) -> Tensor:
         """Forward the module.

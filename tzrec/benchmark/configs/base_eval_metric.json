@@ -104,6 +104,17 @@
     },
     "run_cnt": 5
   },
+  "tzrec/benchmark/configs/taobao/dssm_taobao.config": {
+    "label": {
+      "recall@1": 0.240,
+      "recall@5": 0.427
+    },
+    "threshold": {
+      "recall@1": 0.02,
+      "recall@5": 0.02
+    },
+    "run_cnt": 5
+  },
   "tzrec/benchmark/configs/criteo/deepfm.config": {
     "label": {
       "auc": 0.784

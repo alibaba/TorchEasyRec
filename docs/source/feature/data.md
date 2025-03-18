@@ -29,21 +29,7 @@ sample_weight_fields: 'col_name'
 
   - **前置条件**:
     - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
-    - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/perform-access-control-based-on-tenant-level-roles#section-mt7-tmu-f49)文档，编写如下Policy，精细授予用户Quota的使用权限
-    ```
-    {
-        "Version": "1",
-        "Statement": [
-            {
-                "Action": "odps:Usage",
-                "Effect": "Allow",
-                "Resource": [
-                    "acs:odps:*:regions/*/quotas/pay-as-you-go"
-                ]
-            }
-        ]
-    }
-    ```
+    - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
   - input_path: 按如下格式设置
     - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
     - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
@@ -151,21 +137,33 @@ sample_weight_fields: 'col_name'
 - 该模式训练速度最佳，但需提前对数据提前进行FG编码，目前仅提供MaxCompute方式，步骤如下：
   - 在DLC/DSW/Local环境中生成fg json配置，上传至DataWorks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
     ```shell
+    cat <<EOF>> odps_conf
+    access_id=${ACCESS_ID}
+    access_key=${ACCESS_KEY}
+    end_point=http://service.${region}.maxcompute.aliyun-inc.com/api
+    EOF
+
+    ODPS_CONFIG_FILE_PATH=odps_conf \
     python -m tzrec.tools.create_fg_json \
         --pipeline_config_path ${PIPELINE_CONFIG_PATH} \
         --fg_output_dir fg_output \
-        --reserves ${COLS_YOU_WANT_RESERVE}
+        --reserves ${COLS_YOU_WANT_RESERVE} \
+        --fg_resource_name ${FG_RESOURCE_NAME} \
+        --odps_project_name ${PROJECT_NAME}
     ```
     - --pipeline_config_path: 模型配置文件。
     - --fg_output_dir: fg json的输出文件夹。
     - --reserves: 需要透传到输出表的列，列名用逗号分隔。一般需要保留Label列，也可以保留request_id，user_id，item_id列，注意：如果模型的feature_config中有user_id，item_id作为特征，feature_name需避免与样本中的user_id，item_id列名冲突。
+    - --fg_resource_name: 可选，fg json在MaxCompute中的资源名，默认为fg.json
+    - --odps_project_name: 可选，将fg json文件上传到MaxCompute项目名，该参数必须配合参数fg_resource_name和环境变量ODPS_CONFIG_FILE_PATH一起使用
+    - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg039-0.3.9-cp37-cp37m-linux_x86_64.whl
+    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg048-0.4.8-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg039 import offline_pyfg
+    from pyfg048 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",
@@ -222,6 +220,14 @@ sample_weight_fields: 'col_name'
 
 - 每个`proc`上的读数据并发度，`nproc-per-node * num_workers`建议小于单机CPU核数
 - 如果`num_workers==0`，数据进程和训练进程将会在一个进程中，便于调试
+
+### shuffle
+
+- 是否训练时打散数据，默认为false
+
+### shuffle_buffer_size
+
+- 最多缓存多少个batch用于打散数据，默认为32
 
 ### fg_encoded_multival_sep
 

@@ -12,9 +12,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
+from torch import Tensor, nn
+from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
+from torchrec.quant import embedding_modules
 
 
 def is_input_tile() -> bool:
@@ -53,6 +56,11 @@ def is_trt() -> bool:
     return False
 
 
+def is_cuda_export() -> bool:
+    """Judge is trt/aot or not."""
+    return is_trt() or is_aot()
+
+
 def is_trt_predict(model_path: str) -> bool:
     """Judge is trt or not in predict."""
     with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
@@ -80,6 +88,28 @@ def is_quant() -> bool:
     if is_quant and is_quant[0] == "0":
         return False
     return True
+
+
+def quant_dtype() -> torch.dtype:
+    """Get embedding quant dtype."""
+    str_to_dtype = {
+        "FP32": torch.float,
+        "FP16": torch.half,
+        "INT8": torch.qint8,
+        "INT4": torch.quint4x2,
+        "INT2": torch.quint2x4,
+    }
+    quant_dtype_str = os.environ.get("QUANT_EMB", "INT8")
+    if quant_dtype_str == "1":
+        # for compatible
+        quant_dtype_str = "INT8"
+    if quant_dtype_str not in str_to_dtype:
+        raise ValueError(
+            f"Unknown QUANT_EMB: {quant_dtype_str},"
+            f"available types: {list(str_to_dtype.keys())}"
+        )
+    else:
+        return str_to_dtype[quant_dtype_str]
 
 
 def write_mapping_file_for_input_tile(
@@ -124,4 +154,89 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
+    if "ENABLE_AOT" in os.environ:
+        acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
     return acc_config
+
+
+# fix fp32 quantize
+def _quantize_state_dict(
+    module: nn.Module,
+    table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]],
+    table_name_to_data_type: Dict[str, DataType],
+    table_name_to_num_embeddings_post_pruning: Optional[Dict[str, int]] = None,
+) -> torch.device:
+    device = torch.device("cpu")
+    if not table_name_to_num_embeddings_post_pruning:
+        table_name_to_num_embeddings_post_pruning = {}
+
+    for key, tensor in module.state_dict().items():
+        # Extract table name from state dict key.
+        # e.g. ebc.embedding_bags.t1.weight
+        splits = key.split(".")
+        assert splits[-1] == "weight"
+        table_name = splits[-2]
+        data_type = table_name_to_data_type[table_name]
+        num_rows = tensor.shape[0]
+
+        if table_name in table_name_to_num_embeddings_post_pruning:
+            num_rows = table_name_to_num_embeddings_post_pruning[table_name]
+
+        device = tensor.device
+        num_bits = DATA_TYPE_NUM_BITS[data_type]
+
+        if tensor.is_meta:
+            quant_weight = torch.empty(
+                (num_rows, (tensor.shape[1] * num_bits) // 8),
+                device="meta",
+                dtype=torch.uint8,
+            )
+            if (
+                data_type == DataType.INT8
+                or data_type == DataType.INT4
+                or data_type == DataType.INT2
+            ):
+                scale_shift = torch.empty(
+                    (num_rows, 4),
+                    device="meta",
+                    dtype=torch.uint8,
+                )
+            else:
+                scale_shift = None
+        else:
+            if num_rows != tensor.shape[0]:
+                tensor = tensor[:num_rows, :]
+            if tensor.dtype == torch.float or tensor.dtype == torch.float16:
+                if data_type == DataType.FP16:
+                    if tensor.dtype == torch.float:
+                        tensor = tensor.half()
+                    quant_res = tensor.view(torch.uint8)
+                elif data_type == DataType.FP32:
+                    if tensor.dtype == torch.float16:
+                        tensor = tensor.float()
+                    quant_res = tensor.view(torch.uint8)
+                else:
+                    quant_res = (
+                        torch.ops.fbgemm.FloatOrHalfToFusedNBitRowwiseQuantizedSBHalf(
+                            tensor, num_bits
+                        )
+                    )
+            else:
+                raise Exception("Unsupported dtype: {tensor.dtype}")
+            if (
+                data_type == DataType.INT8
+                or data_type == DataType.INT4
+                or data_type == DataType.INT2
+            ):
+                quant_weight, scale_shift = (
+                    quant_res[:, :-4],
+                    quant_res[:, -4:],
+                )
+            else:
+                quant_weight, scale_shift = quant_res, None
+        table_name_to_quantized_weights[table_name] = (quant_weight, scale_shift)
+    return device
+
+
+# pyre-ignore [9]
+embedding_modules.quantize_state_dict = _quantize_state_dict

@@ -78,7 +78,7 @@ class DINEncoder(SequenceEncoder):
         self._sequence_dim = sequence_dim
         if self._query_dim > self._sequence_dim:
             raise ValueError("query_dim > sequence_dim not supported yet.")
-        self.mlp = MLP(in_features=sequence_dim * 4, **attn_mlp)
+        self.mlp = MLP(in_features=sequence_dim * 4, dim=3, **attn_mlp)
         self.linear = nn.Linear(self.mlp.hidden_units[-1], 1)
         self._query_name = f"{input}.query"
         self._sequence_name = f"{input}.sequence"
@@ -227,7 +227,7 @@ class MultiWindowDINEncoder(SequenceEncoder):
             "cumsum_windows_len", torch.tensor(np.cumsum([0] + list(windows_len)[:-1]))
         )
         self._sum_windows_len = sum(windows_len)
-        self.mlp = MLP(in_features=sequence_dim * 3, **attn_mlp)
+        self.mlp = MLP(in_features=sequence_dim * 3, dim=3, **attn_mlp)
         self.linear = nn.Linear(self.mlp.hidden_units[-1], 1)
         self.active = nn.PReLU()
         self._query_name = f"{input}.query"
