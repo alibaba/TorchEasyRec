@@ -128,7 +128,7 @@ class AutoDisEmbedding(nn.Module):
 
     def reset_parameters(
         self,
-    ):
+    ) -> None:
         """Reset the parameters."""
         nn.init.normal_(self.meta_emb, 0, 1.0)
         nn.init.normal_(self.proj_w, 0, sqrt(2 / (1 + self.num_channels)))
