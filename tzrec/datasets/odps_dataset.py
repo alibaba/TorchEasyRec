@@ -87,7 +87,7 @@ TYPE_TABLE_TO_PA = {
 
 
 def _get_compression_type(compression_name: str) -> Compression:
-    type_names = [x.names for x in Compression]
+    type_names = [x.name for x in Compression]
     if compression_name in type_names:
         return Compression[compression_name]
     else:
