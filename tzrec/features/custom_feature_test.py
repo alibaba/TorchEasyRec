@@ -14,6 +14,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
+from google.protobuf import struct_pb2
 
 from tzrec.features import custom_feature as custom_feature_lib
 from tzrec.features.feature import FgMode
@@ -28,6 +29,9 @@ class CustomFeatureTest(unittest.TestCase):
                 operator_name="EditDistance",
                 operator_lib_file="pyfg/lib/libedit_distance.so",
                 expression=["user:query", "item:title"],
+                operator_params=struct_pb2.Struct(
+                    fields={"encoding": struct_pb2.Value(string_value="utf-8")}
+                ),
             )
         )
         custom_feat = custom_feature_lib.CustomFeature(
@@ -43,7 +47,37 @@ class CustomFeatureTest(unittest.TestCase):
         }
         parsed_feat = custom_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([3]))
+        np.testing.assert_allclose(parsed_feat.values, np.array([[3]]))
+
+    def test_edit_distance_with_boundary(self):
+        custom_feat_cfg = feature_pb2.FeatureConfig(
+            custom_feature=feature_pb2.CustomFeature(
+                feature_name="custom_feat",
+                operator_name="EditDistance",
+                operator_lib_file="pyfg/lib/libedit_distance.so",
+                expression=["user:query", "item:title"],
+                operator_params=struct_pb2.Struct(
+                    fields={"encoding": struct_pb2.Value(string_value="utf-8")}
+                ),
+                boundaries=[0, 5, 10],
+                embedding_dim=16,
+            )
+        )
+        custom_feat = custom_feature_lib.CustomFeature(
+            custom_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(custom_feat.output_dim, 16)
+        self.assertEqual(custom_feat.is_sparse, True)
+        self.assertEqual(custom_feat.inputs, ["query", "title"])
+
+        input_data = {
+            "query": pa.array(["裙子"]),
+            "title": pa.array(["连衣裙"]),
+        }
+        parsed_feat = custom_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "custom_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([1]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1]))
 
 
 if __name__ == "__main__":

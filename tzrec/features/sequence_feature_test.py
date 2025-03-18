@@ -768,6 +768,52 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [6]]))
         self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
 
+    def test_sequence_expr_feature_sparse(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            custom_feature=feature_pb2.CustomFeature(
+                feature_name="custom_feat",
+                expression=["user:ulng", "user:ulat", "item:ilng", "item:ilat"],
+                operator_name="SeqExpr",
+                operator_lib_file="pyfg/lib/libseq_expr.so",
+                operator_params=struct_pb2.Struct(
+                    fields={
+                        "formula": struct_pb2.Value(string_value="spherical_distance")
+                    }
+                ),
+                boundaries=[0, 5, 10],
+                embedding_dim=16,
+            )
+        )
+        seq_feat = sequence_feature_lib.SequenceCustomFeature(
+            seq_feat_cfg,
+            sequence_name="click_50_seq",
+            sequence_delim="|",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(
+            seq_feat.inputs,
+            [
+                "click_50_seq__ulng",
+                "click_50_seq__ulat",
+                "click_50_seq__ilng",
+                "click_50_seq__ilat",
+            ],
+        )
+
+        input_data = {
+            "click_50_seq__ulng": pa.array(["1|2", "5"]),
+            "click_50_seq__ulat": pa.array(["3|4", "6"]),
+            "click_50_seq__ilng": pa.array(["9", "10"]),
+            "click_50_seq__ilat": pa.array(["11", "12"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [6]]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
+
 
 if __name__ == "__main__":
     unittest.main()

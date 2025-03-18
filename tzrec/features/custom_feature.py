@@ -148,10 +148,10 @@ class CustomFeature(BaseFeature):
                     x = x.fill_null({})
                 input_feats.append(x.tolist())
             if self.is_sparse:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(*input_feats)
+                values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
                 parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
             else:
-                values = self._fg_op.transform(*input_feats)
+                values = self._fg_op.transform(input_feats)
                 parsed_feat = DenseData(name=self.name, values=values)
         else:
             raise ValueError(
