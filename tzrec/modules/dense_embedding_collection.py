@@ -171,7 +171,7 @@ class MLPEmbedding(nn.Module):
         self.num_dense_feature = num_dense_feature
         self.embedding_dim = embedding_dim
         self.proj_w = nn.Parameter(
-            torch.randn(num_dense_feature, embedding_dim, device=device)
+            torch.randn(num_dense_feature, embedding_dim)
             * sqrt(2 / (1 + embedding_dim))  # glorot normal initialization
         )
 
