@@ -587,6 +587,10 @@ class SequenceCustomFeature(CustomFeature):
                 side_inputs.append(tuple(expression.split(":")))
         return side_inputs
 
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        return None
+
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
 
@@ -676,6 +680,8 @@ class SequenceCustomFeature(CustomFeature):
         fg_cfg = super().fg_json()[0]
         fg_cfg["feature_name"] = self.config.feature_name
         fg_cfg["is_sequence"] = True
-        print(fg_cfg)
+        if not self._is_grouped_seq:
+            fg_cfg["sequence_delim"] = self.config.sequence_delim
+            fg_cfg["sequence_length"] = self.config.sequence_length
 
         return [fg_cfg]

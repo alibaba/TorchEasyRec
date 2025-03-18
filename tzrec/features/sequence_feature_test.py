@@ -703,7 +703,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
                 operator_params=struct_pb2.Struct(
                     fields={
                         "formula": struct_pb2.Value(
-                            string_value="custom_feat__cur_time-custom_feat__clk_time_seq"
+                            string_value="click_50_seq__cur_time-click_50_seq__clk_time_seq"
                         )
                     }
                 ),
@@ -712,7 +712,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         seq_feat = sequence_feature_lib.SequenceCustomFeature(
             seq_feat_cfg,
             sequence_name="click_50_seq",
-            sequence_delim=";",
+            sequence_delim="|",
             sequence_length=50,
             fg_mode=FgMode.FG_NORMAL,
         )
@@ -725,11 +725,47 @@ class SequenceCustomFeatureTest(unittest.TestCase):
 
         input_data = {
             "click_50_seq__cur_time": pa.array(["10"]),
-            "click_50_seq__clk_time_seq": pa.array(["2;3", "4"]),
+            "click_50_seq__clk_time_seq": pa.array(["2|3", "4"]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([8, 7, 6]))
+        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [6]]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
+
+    def test_simple_sequence_expr_feature_dense(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_custom_feature=feature_pb2.SequenceCustomFeature(
+                feature_name="custom_feat",
+                sequence_delim="|",
+                sequence_length=50,
+                expression=["user:cur_time", "user:clk_time_seq"],
+                operator_name="SeqExpr",
+                operator_lib_file="pyfg/lib/libseq_expr.so",
+                operator_params=struct_pb2.Struct(
+                    fields={
+                        "formula": struct_pb2.Value(
+                            string_value="cur_time-clk_time_seq"
+                        )
+                    }
+                ),
+            )
+        )
+        seq_feat = sequence_feature_lib.SequenceCustomFeature(
+            seq_feat_cfg,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 1)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(seq_feat.inputs, ["cur_time", "clk_time_seq"])
+        self.assertEqual(seq_feat.emb_config, None)
+
+        input_data = {
+            "cur_time": pa.array(["10"]),
+            "clk_time_seq": pa.array(["2|3", "4"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "custom_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [6]]))
         self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
 
 
