@@ -28,6 +28,7 @@ from odps.accounts import (
 )
 from odps.apis.storage_api import (
     ArrowReader,
+    Compression,
     ReadRowsRequest,
     SessionRequest,
     SessionStatus,
@@ -83,6 +84,16 @@ TYPE_TABLE_TO_PA = {
     "MAP<INT,STRING>": pa.map_(pa.int32(), pa.string()),
     "MAP<INT,INT>": pa.map_(pa.int32(), pa.int32()),
 }
+
+
+def _get_compression_type(compression_name: str) -> Compression:
+    type_names = [x.names for x in Compression]
+    if compression_name in type_names:
+        return Compression[compression_name]
+    else:
+        raise ValueError(
+            f"Unknown compression type: {compression_name}, available {type_names}"
+        )
 
 
 def _type_pa_to_table(pa_type: pa.DataType) -> str:
@@ -209,6 +220,7 @@ def _reader_iter(
     num_workers: int,
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
+    compression: Compression,
 ) -> Iterator[pa.RecordBatch]:
     num_sess = len(sess_reqs)
     remain_row_count = 0
@@ -238,6 +250,7 @@ def _reader_iter(
             row_index=start,
             row_count=end - start,
             max_batch_rows=min(batch_size, 20000),
+            compression=compression,
         )
         reader = _read_rows_arrow_with_retry(client, read_req)
         max_retry_count = 5
@@ -255,6 +268,7 @@ def _reader_iter(
                     row_index=start + offset,
                     row_count=end - start - offset,
                     max_batch_rows=min(batch_size, 20000),
+                    compression=compression,
                 )
                 reader = _read_rows_arrow_with_retry(client, read_req)
                 continue
@@ -307,6 +321,7 @@ class OdpsDataset(BaseDataset):
             is_orderby_partition=self._data_config.is_orderby_partition,
             quota_name=self._data_config.odps_data_quota_name,
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
+            compression=self._data_config.odps_data_compression,
         )
         self._init_input_fields()
 
@@ -325,6 +340,7 @@ class OdpsReader(BaseReader):
         quota_name (str): storage api quota name.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
+        compression (str):  storage api data compression name.
     """
 
     def __init__(
@@ -338,6 +354,7 @@ class OdpsReader(BaseReader):
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
+        compression: str = "LZ4_FRAME",
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -350,6 +367,7 @@ class OdpsReader(BaseReader):
         )
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
+        self._compression = _get_compression_type(compression)
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
@@ -445,6 +463,7 @@ class OdpsReader(BaseReader):
             num_workers,
             self._batch_size,
             self._drop_redundant_bs_eq_one,
+            self._compression,
         )
         yield from self._arrow_reader_iter(iterator)
 
