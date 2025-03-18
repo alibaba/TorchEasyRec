@@ -95,7 +95,7 @@ message DataConfig {
     optional string odps_data_quota_name = 15 [default = "pay-as-you-go"];
 
     // maxcompute storage api data compression type, LZ4_FRAME | ZSTD | UNCOMPRESSED
-    optional string odps_data_compression = 16 [default = "LZ4_FRAME"]
+    optional string odps_data_compression = 16 [default = "LZ4_FRAME"];
 
     // mask probability for samples in training progress
     optional float sample_mask_prob = 16 [default = 0.0];
