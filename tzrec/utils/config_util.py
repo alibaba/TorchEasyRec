@@ -298,16 +298,19 @@ def edit_config(pipeline_config: Message, edit_config_json: Dict[str, Any]) -> M
     return pipeline_config
 
 
+# pyre-ignore [3]
 def _format_struct_value(value: struct_pb2.Struct) -> Any:
+    # pyre-ignore [16]
     if isinstance(value, struct_pb2.ListValue):
         return map(_format_struct_value, value)
+    # pyre-ignore [16]
     elif isinstance(value, struct_pb2.Struct):
         return struct_to_dict(value)
     else:
         return value
 
 
-def struct_to_dict(struct) -> Dict[str, Any]:
+def struct_to_dict(struct: struct_pb2.Struct) -> Dict[str, Any]:
     """Convert protobuf struct to dict."""
     kwargs = {}
     for key, value in struct.items():

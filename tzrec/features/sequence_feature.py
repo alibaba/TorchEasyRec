@@ -581,17 +581,20 @@ class SequenceCustomFeature(CustomFeature):
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        side_inputs = []
-        if self._is_grouped_seq:
-            for expression in self.config.expression:
-                side, name = expression.split(":")
-                side_inputs.append((side, f"{self.sequence_name}__{name}"))
+        if self.config.HasField("expression"):
+            side_inputs = []
+            if self._is_grouped_seq:
+                for expression in self.config.expression:
+                    side, name = expression.split(":")
+                    side_inputs.append((side, f"{self.sequence_name}__{name}"))
+            else:
+                for expression in self.config.expression:
+                    side_inputs.append(tuple(expression.split(":")))
+            return side_inputs
         else:
-            for expression in self.config.expression:
-                side_inputs.append(tuple(expression.split(":")))
-        return side_inputs
+            return None
 
     @property
     def _dense_emb_type(self) -> Optional[str]:
