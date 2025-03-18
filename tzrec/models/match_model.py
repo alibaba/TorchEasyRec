@@ -176,42 +176,18 @@ class MatchModel(BaseModel):
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
 
-    def sim(
-        self,
-        user_emb: torch.Tensor,
-        item_emb: torch.Tensor,
-        neg_for_each_sample: bool = False,
-        is_hstu: bool = False,
-    ) -> torch.Tensor:
+    def sim(self, user_emb: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
         else:
-            if is_hstu:
-                batch_size = user_emb.size(0)
-                pos_item_emb = item_emb[:, 0]
-                neg_item_emb = item_emb[:, 1:].reshape(-1, item_emb.shape[-1])
-                pos_ui_sim = torch.sum(
-                    torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
-                )
-                neg_ui_sim = None
-            else:
-                batch_size = user_emb.size(0)
-                pos_item_emb = item_emb[:batch_size]
-                neg_item_emb = item_emb[batch_size:]
-                pos_ui_sim = torch.sum(
-                    torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
-                )
-                neg_ui_sim = None
-            if not neg_for_each_sample:
-                neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
-            else:
-                # Calculate similarity for each user with corresponding negative items
-                num_neg_per_user = neg_item_emb.size(0) // batch_size
-                neg_size = batch_size * num_neg_per_user
-                neg_item_emb = neg_item_emb[:neg_size]
-                neg_item_emb = neg_item_emb.view(batch_size, num_neg_per_user, -1)
-                neg_ui_sim = torch.sum(user_emb.unsqueeze(1) * neg_item_emb, dim=-1)
+            batch_size = user_emb.size(0)
+            pos_item_emb = item_emb[:batch_size]
+            neg_item_emb = item_emb[batch_size:]
+            pos_ui_sim = torch.sum(
+                torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+            )
+            neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
 
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:

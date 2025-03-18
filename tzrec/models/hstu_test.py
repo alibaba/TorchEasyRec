@@ -15,7 +15,7 @@ import torch
 from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.hstu import HSTUMatch
 from tzrec.protos import (
@@ -44,7 +44,7 @@ class HSTUTest(unittest.TestCase):
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
                     feature_name="item_id",
-                    embedding_dim=16,
+                    embedding_dim=48,
                     num_buckets=1000,
                     embedding_name="item_id",
                 )
@@ -61,7 +61,7 @@ class HSTUTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             hstu_match=match_model_pb2.HSTUMatch(
-                user_tower=tower_pb2.HSTUMatchUserTower(
+                hstu_tower=tower_pb2.HSTUMatchTower(
                     input="sequence",
                     hstu_encoder=seq_encoder_pb2.HSTUEncoder(
                         sequence_dim=48,
@@ -76,7 +76,6 @@ class HSTUTest(unittest.TestCase):
                         max_output_len=0,
                     ),
                 ),
-                output_dim=64,
                 temperature=0.05,
             ),
             losses=[
@@ -93,16 +92,17 @@ class HSTUTest(unittest.TestCase):
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["historical_ids"],
             values=torch.tensor([1, 2, 3, 4, 5, 2, 7, 8, 9, 4, 11, 5, 13, 14, 15]),
-            # sequence length is 2, 3, \
-            # 2 (neg_seq, first is pos), 2 (neg_seq, first is pos)...
+            # sequence length is
+            # 2, 3, 2 (neg_seq, first is pos), 2 (neg_seq, first is pos)...
             lengths=torch.tensor([2, 3, 2, 2, 2, 2, 2]),
         )
 
         batch = Batch(
             sparse_features={
+                NEG_DATA_GROUP: sparse_feature,
                 BASE_DATA_GROUP: sparse_feature,
             },
-            labels={"label": torch.tensor([1, 1])},
+            labels={"clk": torch.tensor([1, 1])},
         )
 
         predictions = hstu(batch)

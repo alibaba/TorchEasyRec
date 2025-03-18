@@ -14,7 +14,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 from torch import distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -26,6 +25,8 @@ from tzrec.datasets.utils import (
     C_SAMPLE_MASK,
     Batch,
     RecordBatchTensor,
+    process_hstu_neg_sample,
+    process_hstu_seq_data,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -171,7 +172,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._mode = mode
         self._debug_level = debug_level
         self._enable_hstu = data_config.enable_hstu
-        self._seq_str_delim = data_config.seq_str_delim
 
         self._data_parser = DataParser(
             features=features,
@@ -240,7 +240,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 multival_sep=self._fg_encoded_multival_sep
                 if self._fg_mode == data_pb2.FgMode.FG_NONE
                 else chr(29),
-                seq_str_delim=self._seq_str_delim,
             )
             self._sampler.init_cluster(num_client_per_rank, client_id_bias, cluster)
             if cluster is None:
@@ -323,48 +322,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 )
             elif self._enable_hstu:
                 seq_attr = self._sampler._item_id_field
-                if pa.types.is_string(input_data[seq_attr].type):
-                    input_data_k_split = pc.split_pattern(
-                        input_data[seq_attr], self._seq_str_delim
-                    )
-                    # Only keep the target item for previous sequence
-                    # example: [1,2,3,4,5] -> [2,3,4,5] (target item list)
-                    input_data_k_split_slice = pc.list_flatten(
-                        pc.list_slice(input_data_k_split, start=1)
-                    )
-                    pre_seq = pc.list_flatten(input_data_k_split).to_numpy(
-                        zero_copy_only=False
-                    )
-                    # Replace the last item with '-1'
-                    pre_seq[input_data_k_split.offsets.to_numpy()[1:] - 1] = "-1"
-                    mask = pre_seq != "-1"
-                    # Only keep the training sequence, example: [1,2,3,4,5] -> [1,2,3,4]
-                    pre_seq_filter = pre_seq[mask]
-                    pre_seq_filter_offsets = pa.array(
-                        np.concatenate(
-                            [
-                                np.array([0]),
-                                input_data_k_split.offsets[1:].to_numpy(
-                                    zero_copy_only=False
-                                )
-                                - np.arange(
-                                    1,
-                                    len(
-                                        input_data_k_split.offsets[1:].to_numpy(
-                                            zero_copy_only=False
-                                        )
-                                    )
-                                    + 1,
-                                ),
-                            ]
-                        )
-                    )
-                    pre_seq_filter_reshaped = pa.ListArray.from_arrays(
-                        pre_seq_filter_offsets, pre_seq_filter
-                    )
-                    pre_seq_filter_reshaped_joined = pc.binary_join(
-                        pre_seq_filter_reshaped, self._seq_str_delim
-                    )
+
+                (
+                    input_data_k_split,
+                    input_data_k_split_slice,
+                    pre_seq_filter_reshaped_joined,
+                ) = process_hstu_seq_data(
+                    input_data=input_data,
+                    seq_attr=seq_attr,
+                    seq_str_delim=self._sampler.item_id_delim,
+                )
                 if self._mode == Mode.TRAIN:
                     # Training using all possible target items
                     input_data[seq_attr] = input_data_k_split_slice
@@ -374,31 +341,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         pa.array(input_data_k_split.offsets.to_numpy()[1:] - 1)
                     )
                 sampled = self._sampler.get(input_data)
+                # To keep consistent with other process, use two functions
                 for k, v in sampled.items():
                     if k in input_data:
-                        # Reshape sampled v into chunks
-                        v_str = v.cast(pa.string())
-                        neg_sample_num = self._sampler._num_sample
-                        filtered_v_offsets = pa.array(
-                            np.concatenate(
-                                [
-                                    np.array([0]),
-                                    np.arange(
-                                        neg_sample_num, len(v_str) + 1, neg_sample_num
-                                    ),
-                                ]
-                            )
-                        )
-                        filtered_v_palist = pa.ListArray.from_arrays(
-                            filtered_v_offsets, v_str
-                        )
-                        sampled_joined = pc.binary_join(
-                            filtered_v_palist, self._seq_str_delim
-                        )
-
-                        # Combine training sequence and target items
-                        combined = pc.binary_join_element_wise(
-                            input_data[seq_attr], sampled_joined, self._seq_str_delim
+                        combined = process_hstu_neg_sample(
+                            input_data,
+                            v,
+                            self._sampler._num_sample,
+                            self._sampler.item_id_delim,
+                            seq_attr,
                         )
                         # Combine here to make embddings of both user sequence
                         # and target item are the same

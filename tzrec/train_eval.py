@@ -54,8 +54,6 @@ if __name__ == "__main__":
     )
     args, extra_args = parser.parse_known_args()
 
-    # import random
-    # random.seed(42)
     train_and_evaluate(
         args.pipeline_config_path,
         args.train_input_path,

@@ -67,17 +67,16 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         seq_config_dict["sequence_dim"] = sequence_dim
         self.seq_encoder = HSTUEncoder(**seq_config_dict)
 
-    def forward(self, grouped_features: Dict, is_train: bool = False) -> torch.Tensor:
+    def forward(self, grouped_features: Dict) -> torch.Tensor:
         """Forward the tower.
 
         Args:
             grouped_features: Dictionary containing grouped feature tensors
-            is_train: Boolean flag indicating whether the model is in training mode
 
         Returns:
             torch.Tensor: The output tensor from the tower
         """
-        output = self.seq_encoder(grouped_features, is_train=is_train)
+        output = self.seq_encoder(grouped_features, is_train=self.training)
 
         return output
 
@@ -105,17 +104,15 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         super().__init__(tower_config, output_dim, similarity, feature_group, features)
         self.tower_config = tower_config
 
-    def forward(self, grouped_features: Dict, is_train: bool = False) -> torch.Tensor:
+    def forward(self, grouped_features: Dict) -> torch.Tensor:
         """Forward the tower.
 
         Args:
             grouped_features: Dictionary containing grouped feature tensors
-            is_train: Boolean flag indicating whether the model is in training mode
 
         Returns:
             torch.Tensor: The output tensor from the tower
         """
-        # print(grouped_features.keys(), self._group_name)
         output = grouped_features[f"{self._group_name}.sequence"]
         output = F.normalize(output, p=2.0, dim=1, eps=1e-6)
 
@@ -145,7 +142,7 @@ class HSTUMatch(MatchModel):
         )
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
 
-        user_group = name_to_feature_group[self._model_config.user_tower.input]
+        user_group = name_to_feature_group[self._model_config.hstu_tower.input]
 
         name_to_feature = {x.name: x for x in features}
         user_features = OrderedDict(
@@ -156,26 +153,26 @@ class HSTUMatch(MatchModel):
                 user_features[x] = name_to_feature[x]
 
         self.user_tower = HSTUMatchUserTower(
-            self._model_config.user_tower,
+            self._model_config.hstu_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
             user_group,
             self.embedding_group.group_dims(
-                self._model_config.user_tower.input + ".sequence"
+                self._model_config.hstu_tower.input + ".sequence"
             ),
             list(user_features.values()),
             model_config,
         )
 
         self.item_tower = HSTUMatchItemTower(
-            self._model_config.user_tower,
+            self._model_config.hstu_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
             user_group,
             list(user_features.values()),
         )
 
-        self.seq_tower_input = self._model_config.user_tower.input
+        self.seq_tower_input = self._model_config.hstu_tower.input
 
     def predict(self, batch: Batch) -> Dict[str, Tensor]:
         """Forward the model.
@@ -186,13 +183,10 @@ class HSTUMatch(MatchModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        batch_sparse_features = batch.sparse_features["__BASE__"]
-        nonzero_indices = torch.where(
-            batch_sparse_features.lengths()[1:] != batch_sparse_features.lengths()[:-1]
-        )[0]
-        default_value = torch.tensor([-1]).to(nonzero_indices.device)
-        batch_size = torch.cat([nonzero_indices, default_value]).max() + 1
-        neg_sample_size = batch_sparse_features.lengths()[-1] - 1
+        batch_sparse_features = batch.sparse_features["__NEG__"]
+        # Get batch_size and neg_sample_size from batch_sparse_features
+        batch_size = batch.labels["clk"].shape[0]
+        neg_sample_size = batch_sparse_features.lengths()[batch_size] - 1
         grouped_features = self.embedding_group(batch)
 
         item_group_features = {
@@ -200,7 +194,7 @@ class HSTUMatch(MatchModel):
                 self.seq_tower_input + ".sequence"
             ][batch_size:, : neg_sample_size + 1],
         }
-        item_tower_emb = self.item_tower(item_group_features, is_train=self.training)
+        item_tower_emb = self.item_tower(item_group_features)
         user_group_features = {
             self.seq_tower_input + ".sequence": grouped_features[
                 self.seq_tower_input + ".sequence"
@@ -209,11 +203,36 @@ class HSTUMatch(MatchModel):
                 self.seq_tower_input + ".sequence_length"
             ][:batch_size],
         }
-        user_tower_emb = self.user_tower(user_group_features, is_train=self.training)
+        user_tower_emb = self.user_tower(user_group_features)
         ui_sim = (
-            self.sim(
-                user_tower_emb, item_tower_emb, neg_for_each_sample=True, is_hstu=True
-            )
+            self.sim(user_tower_emb, item_tower_emb, neg_for_each_sample=True)
             / self._model_config.temperature
         )
         return {"similarity": ui_sim}
+
+    def sim(
+        self,
+        user_emb: torch.Tensor,
+        item_emb: torch.Tensor,
+        neg_for_each_sample: bool = False,
+    ) -> torch.Tensor:
+        """Override the sim method in MatchModel to calculate similarity."""
+        if self._in_batch_negative:
+            return torch.mm(user_emb, item_emb.T)
+        else:
+            batch_size = user_emb.size(0)
+            pos_item_emb = item_emb[:, 0]
+            neg_item_emb = item_emb[:, 1:].reshape(-1, item_emb.shape[-1])
+            pos_ui_sim = torch.sum(
+                torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+            )
+            neg_ui_sim = None
+            if not neg_for_each_sample:
+                neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+            else:
+                num_neg_per_user = neg_item_emb.size(0) // batch_size
+                neg_size = batch_size * num_neg_per_user
+                neg_item_emb = neg_item_emb[:neg_size]
+                neg_item_emb = neg_item_emb.view(batch_size, num_neg_per_user, -1)
+                neg_ui_sim = torch.sum(user_emb.unsqueeze(1) * neg_item_emb, dim=-1)
+            return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
