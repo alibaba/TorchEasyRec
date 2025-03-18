@@ -15,7 +15,7 @@ message Tower {
 message HSTUMatchTower {
     // input feature group name
     required string input = 1;
-    // encoder config
+    // hstu_encoder config
     required HSTUEncoder hstu_encoder = 2;
 }
 

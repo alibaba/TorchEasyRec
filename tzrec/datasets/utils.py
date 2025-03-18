@@ -271,7 +271,7 @@ def process_hstu_seq_data(
     input_data: Dict[str, pa.Array],
     seq_attr: str,
     seq_str_delim: str,
-) -> Tuple[pa.Array, pa.Array, pa.Array]:
+) -> Tuple[pa.ListArray, pa.StringArray, pa.StringArray]:
     """Process sequence data for HSTU match model.
 
     Args:
@@ -281,9 +281,10 @@ def process_hstu_seq_data(
 
     Returns:
         Tuple containing:
-        - input_data_k_split: Original sequence items
-        - input_data_k_split_slice: Target items for autoregressive training
-        - pre_seq_filter_reshaped_joined: Training sequence for autoregressive training
+        - input_data_k_split: pa.ListArray, Original sequence items
+        - input_data_k_split_slice: pa.Array, Target items for autoregressive training
+        - pre_seq_filter_reshaped_joined: pa.StringArray,
+        Training sequence for autoregressive training
     """
     # default sequence data is string
     if pa.types.is_string(input_data[seq_attr].type):
@@ -349,18 +350,18 @@ def process_hstu_neg_sample(
     neg_sample_num: int,
     seq_str_delim: str,
     seq_attr: str,
-):
+) -> pa.StringArray:
     """Process negative samples for HSTU match model.
 
     Args:
-        input_data: Dictionary containing input arrays
-        v: pa.Array,
-        neg_sample_num: int,
-        seq_str_delim: str,
-        seq_attr: str,
+        input_data: Dict[str, pa.Array], Dictionary containing input arrays
+        v: pa.Array, negative samples.
+        neg_sample_num: int, number of negative samples.
+        seq_str_delim: str, delimiter for sequence string.
+        seq_attr: str, attribute name of sequence.
 
     Returns:
-        pa.Array: Processed negative samples
+        pa.StringArray: Processed negative samples
     """
     # The goal is to make neg samples concat to the training sequence
     # Example:
@@ -381,10 +382,10 @@ def process_hstu_neg_sample(
     # Example:[4,5,6,7,8,9] -> [[4,5], [6,7], [8,9]]
     filtered_v_palist = pa.ListArray.from_arrays(filtered_v_offsets, v_str)
     # Using string for join, as not found operation for ListArray achieving this
-    # Example: [[4,5], [6,7], [8,9]] -> [["4;5"], ["6;7"], ["8;9"]]
+    # Example: [[4,5], [6,7], [8,9]] -> ["4;5", "6;7", "8;9"]
     sampled_joined = pc.binary_join(filtered_v_palist, seq_str_delim)
     # Combine training sequence and target items
-    # Example: ["1;2;3"] + [["4;5"], ["6;7"], ["8;9"]]
+    # Example: ["1;2;3"] + ["4;5", "6;7", "8;9"]
     # -> ["1;4;5", "2;6;7", "3;8;9"]
     return pc.binary_join_element_wise(
         input_data[seq_attr], sampled_joined, seq_str_delim

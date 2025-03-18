@@ -16,13 +16,12 @@ import torch
 import torch.nn.functional as F
 from torch._tensor import Tensor
 
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import NEG_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.sequence import HSTUEncoder
-from tzrec.protos import model_pb2, tower_pb2
-from tzrec.protos.models import match_model_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils import config_util
 
 
@@ -53,7 +52,7 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         self,
         tower_config: tower_pb2.Tower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         feature_group_dims: List[int],
         features: List[BaseFeature],
@@ -67,7 +66,7 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         seq_config_dict["sequence_dim"] = sequence_dim
         self.seq_encoder = HSTUEncoder(**seq_config_dict)
 
-    def forward(self, grouped_features: Dict) -> torch.Tensor:
+    def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the tower.
 
         Args:
@@ -97,14 +96,14 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         self,
         tower_config: tower_pb2.Tower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
     ) -> None:
         super().__init__(tower_config, output_dim, similarity, feature_group, features)
         self.tower_config = tower_config
 
-    def forward(self, grouped_features: Dict) -> torch.Tensor:
+    def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the tower.
 
         Args:
@@ -183,9 +182,9 @@ class HSTUMatch(MatchModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        batch_sparse_features = batch.sparse_features["__NEG__"]
+        batch_sparse_features = batch.sparse_features[NEG_DATA_GROUP]
         # Get batch_size and neg_sample_size from batch_sparse_features
-        batch_size = batch.labels["clk"].shape[0]
+        batch_size = batch.labels[self._label_name].shape[0]
         neg_sample_size = batch_sparse_features.lengths()[batch_size] - 1
         grouped_features = self.embedding_group(batch)
 

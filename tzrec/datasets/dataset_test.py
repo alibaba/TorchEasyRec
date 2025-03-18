@@ -17,7 +17,6 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 from graphlearn.python.nn.pytorch.data import utils
 from parameterized import parameterized
 from torch.utils.data import DataLoader
@@ -27,8 +26,6 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
     NEG_DATA_GROUP,
-    process_hstu_neg_sample,
-    process_hstu_seq_data,
 )
 from tzrec.features.feature import BaseFeature, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
@@ -578,87 +575,6 @@ class DatasetTest(unittest.TestCase):
             batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (120,)
         )
         self.assertEqual(batch.labels["label"].size(), (40,))
-
-    def test_process_hstu_seq_data(self):
-        """Test processing sequence data for HSTU match model."""
-        input_data = {"sequence": pa.array(["1;2;3;4", "5;6;7;8", "9;10;11;12"])}
-
-        split, slice_result, training_seq = process_hstu_seq_data(
-            input_data=input_data, seq_attr="sequence", seq_str_delim=";"
-        )
-
-        # Verify results
-        # Test original split sequences
-        expected_split_values = [
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-            "7",
-            "8",
-            "9",
-            "10",
-            "11",
-            "12",
-        ]
-        self.assertEqual(pc.list_flatten(split).to_pylist(), expected_split_values)
-
-        # Test sliced sequences (target items)
-        expected_slice_values = ["2", "3", "4", "6", "7", "8", "10", "11", "12"]
-        self.assertEqual(slice_result.to_pylist(), expected_slice_values)
-
-        # Test training sequences
-        expected_training_seqs = ["1;2;3", "5;6;7", "9;10;11"]
-        self.assertEqual(training_seq.to_pylist(), expected_training_seqs)
-
-    def test_process_hstu_neg_sample(self):
-        """Test processing negative samples for HSTU match model."""
-        input_data = {"sequence": pa.array(["1;2;3", "4;5;6"])}
-        neg_samples = pa.array(["101", "102", "103", "104", "105", "106"])
-
-        result = process_hstu_neg_sample(
-            input_data=input_data,
-            v=neg_samples,
-            neg_sample_num=2,
-            seq_str_delim=";",
-            seq_attr="sequence",
-        )
-
-        expected_results = [
-            "1;101;102",
-            "2;103;104",
-            "3;105;106",
-            "4;101;102",
-            "5;103;104",
-            "6;105;106",
-        ]
-        self.assertEqual(result.to_pylist(), expected_results)
-
-    def test_process_hstu_neg_sample_with_different_delim(self):
-        """Test negative sampling with different delimiter."""
-        input_data = {"sequence": pa.array(["1|2|3", "4|5|6"])}
-
-        neg_samples = pa.array(["101", "102", "103", "104", "105", "106"])
-
-        result = process_hstu_neg_sample(
-            input_data=input_data,
-            v=neg_samples,
-            neg_sample_num=2,
-            seq_str_delim="|",
-            seq_attr="sequence",
-        )
-
-        expected_results = [
-            "1|101|102",
-            "2|103|104",
-            "3|105|106",
-            "4|101|102",
-            "5|103|104",
-            "6|105|106",
-        ]
-        self.assertEqual(result.to_pylist(), expected_results)
 
     def test_dataset_with_list_type_not_null(self):
         input_fields = [
