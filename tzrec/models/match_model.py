@@ -142,7 +142,10 @@ class MatchTowerWoEG(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        tower_config: Union[
+            tower_pb2.Tower,
+            tower_pb2.HSTUMatchTower,
+        ],
         output_dim: int,
         similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,

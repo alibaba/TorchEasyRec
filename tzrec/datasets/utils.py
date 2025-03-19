@@ -271,7 +271,7 @@ def process_hstu_seq_data(
     input_data: Dict[str, pa.Array],
     seq_attr: str,
     seq_str_delim: str,
-) -> Tuple[pa.ListArray, pa.StringArray, pa.StringArray]:
+) -> Tuple[pa.Array, pa.Array, pa.Array]:
     """Process sequence data for HSTU match model.
 
     Args:
@@ -281,9 +281,9 @@ def process_hstu_seq_data(
 
     Returns:
         Tuple containing:
-        - input_data_k_split: pa.ListArray, Original sequence items
+        - input_data_k_split: pa.Array, Original sequence items
         - input_data_k_split_slice: pa.Array, Target items for autoregressive training
-        - pre_seq_filter_reshaped_joined: pa.StringArray,
+        - pre_seq_filter_reshaped_joined: pa.Array,
         Training sequence for autoregressive training
     """
     # default sequence data is string
@@ -350,7 +350,7 @@ def process_hstu_neg_sample(
     neg_sample_num: int,
     seq_str_delim: str,
     seq_attr: str,
-) -> pa.StringArray:
+) -> pa.Array:
     """Process negative samples for HSTU match model.
 
     Args:
@@ -361,7 +361,7 @@ def process_hstu_neg_sample(
         seq_attr: str, attribute name of sequence.
 
     Returns:
-        pa.StringArray: Processed negative samples
+        pa.Array: Processed negative samples
     """
     # The goal is to make neg samples concat to the training sequence
     # Example:

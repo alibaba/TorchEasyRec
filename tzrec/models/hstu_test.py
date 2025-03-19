@@ -102,7 +102,7 @@ class HSTUTest(unittest.TestCase):
                 NEG_DATA_GROUP: sparse_feature,
                 BASE_DATA_GROUP: sparse_feature,
             },
-            labels={"clk": torch.tensor([1, 1])},
+            labels={"label": torch.tensor([1, 1])},
         )
 
         predictions = hstu(batch)
