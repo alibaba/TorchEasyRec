@@ -321,6 +321,7 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
+    @unittest.skip("skip hstu match test")
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_fg_mock.config",

@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -75,7 +74,7 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         Returns:
             torch.Tensor: The output tensor from the tower
         """
-        output = self.seq_encoder(grouped_features, is_train=self.training)
+        output = self.seq_encoder(grouped_features)
 
         return output
 
@@ -136,18 +135,15 @@ class HSTUMatch(MatchModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        self.embedding_group = EmbeddingGroup(
-            [features[0]], list([model_config.feature_groups[0]])
-        )
+        assert len(model_config.feature_groups) == 1
+        self.embedding_group = EmbeddingGroup(features, model_config.feature_groups)
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
 
-        user_group = name_to_feature_group[self._model_config.hstu_tower.input]
+        feature_group = name_to_feature_group[self._model_config.hstu_tower.input]
 
         name_to_feature = {x.name: x for x in features}
-        user_features = OrderedDict(
-            [(x, name_to_feature[x]) for x in user_group.feature_names]
-        )
-        for sequence_group in user_group.sequence_groups:
+        user_features = self.get_features_in_feature_groups([feature_group])
+        for sequence_group in feature_group.sequence_groups:
             for x in sequence_group.feature_names:
                 user_features[x] = name_to_feature[x]
 
@@ -155,11 +151,11 @@ class HSTUMatch(MatchModel):
             self._model_config.hstu_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
+            feature_group,
             self.embedding_group.group_dims(
                 self._model_config.hstu_tower.input + ".sequence"
             ),
-            list(user_features.values()),
+            user_features,
             model_config,
         )
 
@@ -167,8 +163,8 @@ class HSTUMatch(MatchModel):
             self._model_config.hstu_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
-            list(user_features.values()),
+            feature_group,
+            user_features,
         )
 
         self.seq_tower_input = self._model_config.hstu_tower.input

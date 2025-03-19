@@ -369,9 +369,7 @@ class HSTUEncoder(SequenceEncoder):
         """Output dimension of the module."""
         return self._sequence_dim
 
-    def forward(
-        self, sequence_embedded: Dict[str, torch.Tensor], is_train: bool = False
-    ) -> torch.Tensor:
+    def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the module."""
         sequence = sequence_embedded[self._sequence_name]  # B, N, E
         sequence_length = sequence_embedded[self._sequence_length_name]  # N
@@ -407,12 +405,6 @@ class HSTUEncoder(SequenceEncoder):
             cache=None,
             return_cache_states=False,
         )
-        # output_embeddings = torch.ops.fbgemm.jagged_to_padded_dense(
-        #     values=jagged_x,
-        #     offsets=[sequence_offsets],
-        #     max_lengths=[invalid_attn_mask.size(1)],
-        #     padding_value=0.0,
-        # )
         # post processing: L2 Normalization
         output_embeddings = jagged_x
         output_embeddings = output_embeddings[..., : self._sequence_dim]
@@ -420,7 +412,7 @@ class HSTUEncoder(SequenceEncoder):
             torch.linalg.norm(output_embeddings, ord=None, dim=-1, keepdim=True),
             min=1e-6,
         )
-        if not is_train:
+        if not self.training:
             output_embeddings = self.get_current_embeddings(
                 sequence_length, output_embeddings
             )
@@ -487,10 +479,7 @@ class HSTUEncoder(SequenceEncoder):
             (B, D,) x float, where [i, :] == encoded_embeddings[i, lengths[i] - 1, :]
         """
         offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-        indices = offsets[:-1] + lengths - 1
-        # B, N, D = encoded_embeddings.size()
-        # flattened_offsets = (lengths - 1) + _arange(B, device=lengths.device) * N
-        # return encoded_embeddings.reshape(-1, D)[flattened_offsets, :].reshape(B, D)
+        indices = offsets[1:] - 1
         return encoded_embeddings[indices]
 
 
