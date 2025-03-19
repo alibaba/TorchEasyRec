@@ -136,16 +136,14 @@ class HSTUMatch(MatchModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         assert len(model_config.feature_groups) == 1
-        self.embedding_group = EmbeddingGroup(features, model_config.feature_groups)
-        name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
+        self.embedding_group = EmbeddingGroup(
+            features, list(model_config.feature_groups)
+        )
 
+        name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
         feature_group = name_to_feature_group[self._model_config.hstu_tower.input]
 
-        name_to_feature = {x.name: x for x in features}
-        user_features = self.get_features_in_feature_groups([feature_group])
-        for sequence_group in feature_group.sequence_groups:
-            for x in sequence_group.feature_names:
-                user_features[x] = name_to_feature[x]
+        used_features = self.get_features_in_feature_groups([feature_group])
 
         self.user_tower = HSTUMatchUserTower(
             self._model_config.hstu_tower,
@@ -155,7 +153,7 @@ class HSTUMatch(MatchModel):
             self.embedding_group.group_dims(
                 self._model_config.hstu_tower.input + ".sequence"
             ),
-            user_features,
+            used_features,
             model_config,
         )
 
@@ -164,7 +162,7 @@ class HSTUMatch(MatchModel):
             self._model_config.output_dim,
             self._model_config.similarity,
             feature_group,
-            user_features,
+            used_features,
         )
 
         self.seq_tower_input = self._model_config.hstu_tower.input
