@@ -20,16 +20,15 @@ message DSSM {
 }
 
 message HSTUMatch {
-    required Tower user_tower = 1;
-    required Tower item_tower = 2;
+    required HSTUMatchTower hstu_tower = 1;
     // user and item tower output dimension
-    required int32 output_dim = 3;
+    required int32 output_dim = 2;
     // similarity method
-    optional Similarity similarity = 4 [default=INNER_PRODUCT];
+    optional Similarity similarity = 3 [default=INNER_PRODUCT];
     // similarity scaling factor
-    optional float temperature = 5 [default = 1.0];
+    optional float temperature = 4 [default = 1.0];
     // use in batch items as negative items.
-    optional bool in_batch_negative = 6 [default = false];
+    optional bool in_batch_negative = 5 [default = false];
 }
 
 message DSSMV2 {

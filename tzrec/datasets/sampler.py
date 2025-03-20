@@ -377,6 +377,7 @@ class NegativeSampler(BaseSampler):
         )
         self._item_id_field = config.item_id_field
         self._sampler = None
+        self.item_id_delim = config.item_id_delim
 
     def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""

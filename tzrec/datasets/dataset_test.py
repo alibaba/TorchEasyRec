@@ -23,7 +23,10 @@ from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
-from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP
+from tzrec.datasets.utils import (
+    BASE_DATA_GROUP,
+    NEG_DATA_GROUP,
+)
 from tzrec.features.feature import BaseFeature, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 
