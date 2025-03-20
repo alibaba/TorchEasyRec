@@ -51,7 +51,7 @@ message HSTUEncoder {
     // linear dimension
     optional int32 linear_dim = 5 [default = 64];
     // maximum sequence length
-    optional int32 max_seq_length = 6;
+    optional int32 max_seq_length = 6 [default = 0];
     // dropout rate for positional embeddings
     optional float pos_dropout_rate = 7 [default = 0.2];
     // dropout rate for linear layers
