@@ -28,12 +28,17 @@ sample_weight_fields: 'col_name'
 - OdpsDataset: 输入数据为MaxCompute表
 
   - **前置条件**:
+
     - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
     - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
+
   - input_path: 按如下格式设置
+
     - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
     - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
+
   - 运行训练/评估/导出/预测等命令时
+
     - **本地环境**：
       - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
       ```bash
@@ -59,7 +64,10 @@ sample_weight_fields: 'col_name'
       -m tzrec.train_eval \
       --pipeline_config_path ${PIPELINE_CONFIG}
       ```
+
   - 如果是预付费Quota，可通过`odps_data_quota_name`传入购买的Quota名
+
+  - 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
 
 - ParquetDataset: 输入数据为parquet格式
 
