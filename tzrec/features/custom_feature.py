@@ -9,9 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
+import pyfg
+from google.protobuf.json_format import MessageToDict
 
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
@@ -27,7 +30,6 @@ from tzrec.features.feature import (
     _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
-from tzrec.utils.config_util import struct_to_dict
 
 
 class CustomFeature(BaseFeature):
@@ -174,7 +176,7 @@ class CustomFeature(BaseFeature):
             "value_type": "float",
         }
         if self.config.HasField("operator_params"):
-            fg_cfg.update(struct_to_dict(self.config.operator_params))
+            fg_cfg.update(MessageToDict(self.config.operator_params))
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("normalizer"):
@@ -206,8 +208,27 @@ class CustomFeature(BaseFeature):
         fg_cfg["value_dim"] = self.value_dim
         return [fg_cfg]
 
+    @property
+    def operator_lib_file(self) -> str:
+        """Operator library file path."""
+        if self.config.HasField("operator_lib_file"):
+            operator_lib_file = self.config.operator_lib_file
+            if operator_lib_file.startswith("pyfg/lib/"):
+                # official lib
+                pyfg_dir, _ = os.path.split(pyfg.__file__)
+                operator_lib_file = os.path.join(
+                    pyfg_dir, operator_lib_file.replace("pyfg/lib/", "lib/")
+                )
+            if self.config.HasField("asset_dir"):
+                operator_lib_file = os.path.join(
+                    self.config.asset_dir, operator_lib_file
+                )
+            return operator_lib_file
+        else:
+            return ""
+
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
         assets = {}
-        assets["operator_lib_file"] = self.config.operator_lib_file
+        assets["operator_lib_file"] = self.operator_lib_file
         return assets

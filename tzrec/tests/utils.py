@@ -25,13 +25,18 @@ from tzrec.acc.utils import is_trt_predict
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
+from tzrec.features.custom_feature import CustomFeature
 from tzrec.features.expr_feature import ExprFeature
 from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.features.id_feature import IdFeature
 from tzrec.features.lookup_feature import LookupFeature
 from tzrec.features.match_feature import MatchFeature
 from tzrec.features.raw_feature import RawFeature
-from tzrec.features.sequence_feature import SequenceIdFeature, SequenceRawFeature
+from tzrec.features.sequence_feature import (
+    SequenceCustomFeature,
+    SequenceIdFeature,
+    SequenceRawFeature,
+)
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -260,18 +265,37 @@ class SeqMockInput(MockInput):
         self, num_rows: int, item_t: pa.Table
     ) -> Dict[str, pa.Array]:
         """Create mock data."""
+        item_t_side_infos = []
+        other_side_infos = []
+        for side_info in self.side_infos:
+            if side_info in item_t.column_names:
+                item_t_side_infos.append(side_info)
+            else:
+                other_side_infos.append(side_info)
+
         # generate random sequence id
         row_number = []
+        sequence_lengths = []
         for i in range(num_rows):
-            row_number.extend([i] * random.randint(1, self.sequence_length))
+            sequence_length = random.randint(1, self.sequence_length)
+            sequence_lengths.append(sequence_length)
+            row_number.extend([i] * sequence_length)
         row_number = pa.array(row_number)
         id_data = pa.array(
             _create_random_id_data(len(row_number), self.num_ids, self.vocab_list)
         )
-        tmp_t = pa.Table.from_arrays([row_number, id_data], names=["rn", self.item_id])
+        other_id_datas = OrderedDict()
+        for side_info in other_side_infos:
+            other_id_datas[side_info] = pa.array(
+                _create_random_id_data(len(row_number), 10)
+            )
+        tmp_t = pa.Table.from_arrays(
+            [row_number, id_data] + list(other_id_datas.values()),
+            names=["rn", self.item_id] + list(other_id_datas.keys()),
+        )
 
         # join item side info
-        selected_item_t = item_t.select(list(set([self.item_id] + self.side_infos)))
+        selected_item_t = item_t.select(list(set([self.item_id] + item_t_side_infos)))
         join_t = tmp_t.join(selected_item_t, keys=self.item_id)
 
         # group by sequence item_id and concat
@@ -290,6 +314,7 @@ class SeqMockInput(MockInput):
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
                 data[f"{self.name}__{name}"] = arr
+
         return data
 
 
@@ -683,33 +708,52 @@ def build_mock_input_with_fg(
                 num_ids=feature.num_embeddings,
                 multival_sep=" ",
             )
+        elif type(feature) is CustomFeature:
+            if feature.config.operator_name != "EditDistance":
+                raise ValueError(
+                    "Mock CustomFeature with operator_name"
+                    f"[{feature.config.operator_name}] is not supported."
+                )
+            for side, input_name in feature.side_inputs:
+                inputs[side][input_name] = IdMockInput(
+                    input_name,
+                    is_multi=True,
+                    num_ids=10,
+                    multival_sep="",
+                )
 
     for feature in features:
-        if type(feature) in [SequenceIdFeature, SequenceRawFeature]:
-            side, name = feature.side_inputs[0]
-            if feature.is_grouped_sequence:
-                side_info = name.replace(f"{feature.sequence_name}__", "")
-                if feature.sequence_name in inputs["user"]:
-                    inputs["user"][feature.sequence_name].side_infos.append(side_info)
+        if type(feature) in [
+            SequenceIdFeature,
+            SequenceRawFeature,
+            SequenceCustomFeature,
+        ]:
+            for side, input_name in feature.side_inputs:
+                if feature.is_grouped_sequence:
+                    sub_name = input_name.replace(f"{feature.sequence_name}__", "")
+                    if feature.sequence_name not in inputs["user"]:
+                        inputs["user"][feature.sequence_name] = SeqMockInput(
+                            name=feature.sequence_name,
+                            side_infos=[],
+                            item_id=item_id,
+                            num_ids=inputs["item"][item_id].num_ids,
+                            vocab_list=inputs["item"][item_id].vocab_list,
+                            sequence_length=feature.sequence_length,
+                            sequence_delim=feature.sequence_delim,
+                        )
+                    inputs["user"][feature.sequence_name].side_infos.append(sub_name)
+                    if sub_name in inputs["item"]:
+                        if isinstance(inputs[side][sub_name], IdMockInput):
+                            inputs[side][sub_name].is_multi = False
                 else:
-                    inputs["user"][feature.sequence_name] = SeqMockInput(
-                        name=feature.sequence_name,
-                        side_infos=[side_info],
-                        item_id=item_id,
-                        num_ids=inputs["item"][item_id].num_ids,
-                        vocab_list=inputs["item"][item_id].vocab_list,
-                        sequence_length=feature.sequence_length,
-                        sequence_delim=feature.sequence_delim,
+                    inputs[side][input_name] = IdMockInput(
+                        input_name,
+                        is_multi=True,
+                        num_ids=10
+                        if isinstance(feature, SequenceCustomFeature)
+                        else feature.num_embeddings,
+                        multival_sep=feature.sequence_delim,
                     )
-                if isinstance(inputs[side][side_info], IdMockInput):
-                    inputs[side][side_info].is_multi = False
-            else:
-                inputs[side][name] = IdMockInput(
-                    name,
-                    is_multi=True,
-                    num_ids=feature.num_embeddings,
-                    multival_sep=feature.sequence_delim,
-                )
     return inputs["user"], inputs["item"]
 
 

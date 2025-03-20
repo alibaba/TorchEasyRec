@@ -772,7 +772,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             custom_feature=feature_pb2.CustomFeature(
                 feature_name="custom_feat",
-                expression=["user:ulng", "user:ulat", "item:ilng", "item:ilat"],
+                expression=["item:ilng", "item:ilat", "user:ulng", "user:ulat"],
                 operator_name="SeqExpr",
                 operator_lib_file="pyfg/lib/libseq_expr.so",
                 operator_params=struct_pb2.Struct(
@@ -780,7 +780,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
                         "formula": struct_pb2.Value(string_value="spherical_distance")
                     }
                 ),
-                boundaries=[0, 5, 10],
+                boundaries=[0, 150, 1500],
                 embedding_dim=16,
             )
         )
@@ -796,22 +796,22 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         self.assertEqual(
             seq_feat.inputs,
             [
-                "click_50_seq__ulng",
-                "click_50_seq__ulat",
                 "click_50_seq__ilng",
                 "click_50_seq__ilat",
+                "click_50_seq__ulng",
+                "click_50_seq__ulat",
             ],
         )
 
         input_data = {
-            "click_50_seq__ulng": pa.array(["1|2", "5"]),
-            "click_50_seq__ulat": pa.array(["3|4", "6"]),
-            "click_50_seq__ilng": pa.array(["9", "10"]),
-            "click_50_seq__ilat": pa.array(["11", "12"]),
+            "click_50_seq__ilng": pa.array(["113.728|116.4074", "121.4737"]),
+            "click_50_seq__ilat": pa.array(["23.002|39.9042", "31.2304"]),
+            "click_50_seq__ulng": pa.array(["113.1057", "116.4074"]),
+            "click_50_seq__ulat": pa.array(["22.5614", "39.9042"]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [6]]))
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2]))
         self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
 
 

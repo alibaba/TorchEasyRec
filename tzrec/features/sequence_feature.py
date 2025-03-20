@@ -583,7 +583,7 @@ class SequenceCustomFeature(CustomFeature):
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self.config.HasField("expression"):
+        if len(self.config.expression) > 0:
             side_inputs = []
             if self._is_grouped_seq:
                 for expression in self.config.expression:
