@@ -130,7 +130,10 @@ class HSTUEncoderTest(unittest.TestCase):
             "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
         }
         result = hstu(embedded)
-        self.assertEqual(result.size(), (4, 16))
+        if hstu.training:
+            self.assertEqual(result.size(), (14, 16))
+        else:
+            self.assertEqual(result.size(), (4, 16))
 
 
 class SimpleAttentionTest(unittest.TestCase):
