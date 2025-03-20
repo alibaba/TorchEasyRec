@@ -14,7 +14,7 @@ import re
 from typing import Any, Dict, List, Type
 
 import numpy as np
-from google.protobuf import json_format, struct_pb2, text_format
+from google.protobuf import json_format, text_format
 from google.protobuf.message import Message
 
 from tzrec.protos import data_pb2, pipeline_pb2
@@ -296,23 +296,3 @@ def edit_config(pipeline_config: Message, edit_config_json: Dict[str, Any]) -> M
                     text_format.Parse(param_val, tmp_val)
 
     return pipeline_config
-
-
-# pyre-ignore [3]
-def _format_struct_value(value: struct_pb2.Struct) -> Any:
-    # pyre-ignore [16]
-    if isinstance(value, struct_pb2.ListValue):
-        return map(_format_struct_value, value)
-    # pyre-ignore [16]
-    elif isinstance(value, struct_pb2.Struct):
-        return struct_to_dict(value)
-    else:
-        return value
-
-
-def struct_to_dict(struct: struct_pb2.Struct) -> Dict[str, Any]:
-    """Convert protobuf struct to dict."""
-    kwargs = {}
-    for key, value in struct.items():
-        kwargs[str(key)] = _format_struct_value(value)
-    return kwargs
