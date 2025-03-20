@@ -170,7 +170,7 @@ class CustomFeature(BaseFeature):
             "feature_type": "custom_feature",
             "feature_name": self.name,
             "operator_name": self.config.operator_name,
-            "operator_lib_file": self.config.operator_lib_file,
+            "operator_lib_file": self.operator_lib_file,
             "is_op_thread_safe": self.config.is_op_thread_safe,
             "expression": list(self.config.expression),
             "value_type": "float",

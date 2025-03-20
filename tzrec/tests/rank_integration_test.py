@@ -212,10 +212,10 @@ class RankIntegrationTest(unittest.TestCase):
                     predict_input_path=os.path.join(
                         self.test_dir, r"eval_data/\*.parquet"
                     ),
-                    predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                    predict_output_path=os.path.join(test_dir, "predict_result"),
                     reserved_columns="user_id,item_id",
                     output_columns="",
-                    test_dir=self.test_dir,
+                    test_dir=test_dir,
                 )
             self.assertTrue(self.success)
             self.assertTrue(
