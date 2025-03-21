@@ -71,7 +71,7 @@ class InteractionArch(nn.Module):
     def output_dim(self) -> int:
         """Output dimension of the module."""
         dim = 0
-        for i in range(1, self.F):
+        for i in range(1, self.feature_num):
             dim += i
         return dim
 
