@@ -15,7 +15,7 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.interaction import InputSENet
+from tzrec.modules.interaction import InputSENet, InteractionArch
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -29,6 +29,20 @@ class InputSENetTest(unittest.TestCase):
         input = torch.randn(4, 36)
         result = se(input)
         self.assertEqual(result.size(), (4, 36))
+
+
+class InteractionArchTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_interaction_arch(self, graph_type) -> None:
+        ia = InteractionArch(feature_num=4)
+        self.assertEqual(ia.output_dim(), 6)
+        ia = create_test_module(ia, graph_type)
+        dense_features = torch.randn([10, 8])
+        sparse_features = torch.randn([10, 3, 8])
+        result = ia(dense_features, sparse_features)
+        self.assertEqual(result.size(), (10, 6))
 
 
 if __name__ == "__main__":
