@@ -760,13 +760,13 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         self.assertEqual(seq_feat.emb_config, None)
 
         input_data = {
-            "cur_time": pa.array(["10"]),
-            "clk_time_seq": pa.array(["2|3", "4"]),
+            "cur_time": pa.array(["10", None, None]),
+            "clk_time_seq": pa.array(["2|3", "4", None]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [6]]))
-        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
+        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [-4], [0]]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 1])))
 
     def test_sequence_expr_feature_sparse(self):
         seq_feat_cfg = feature_pb2.FeatureConfig(
@@ -804,15 +804,15 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         )
 
         input_data = {
-            "click_50_seq__ilng": pa.array(["113.728|116.4074", "121.4737"]),
-            "click_50_seq__ilat": pa.array(["23.002|39.9042", "31.2304"]),
-            "click_50_seq__ulng": pa.array(["113.1057", "116.4074"]),
-            "click_50_seq__ulat": pa.array(["22.5614", "39.9042"]),
+            "click_50_seq__ilng": pa.array(["113.728|116.4074", "121.4737", None]),
+            "click_50_seq__ilat": pa.array(["23.002|39.9042", "31.2304", None]),
+            "click_50_seq__ulng": pa.array(["113.1057", "116.4074", None]),
+            "click_50_seq__ulat": pa.array(["22.5614", "39.9042", None]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2]))
-        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1])))
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2, 3]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 1])))
 
 
 if __name__ == "__main__":

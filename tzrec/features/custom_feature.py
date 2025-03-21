@@ -169,6 +169,7 @@ class CustomFeature(BaseFeature):
         fg_cfg = {
             "feature_type": "custom_feature",
             "feature_name": self.name,
+            "default_value": self.config.default_value,
             "operator_name": self.config.operator_name,
             "operator_lib_file": self.operator_lib_file,
             "is_op_thread_safe": self.config.is_op_thread_safe,
