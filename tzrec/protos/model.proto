@@ -35,11 +35,10 @@ message ModelConfig {
     repeated FeatureGroupConfig feature_groups = 1;
 
     oneof model {
-	    // DLRM dlrm = 100;
+	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
-        DLRM dlrm = 104;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
