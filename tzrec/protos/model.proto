@@ -39,6 +39,7 @@ message ModelConfig {
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
+        DLRM dlrm = 104;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;

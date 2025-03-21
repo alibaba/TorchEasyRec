@@ -50,3 +50,50 @@ class InputSENet(nn.Module):
         xx = self.excitation(xx)
         x = x * torch.repeat_interleave(xx, repeats=length_per_key, dim=1)
         return x
+
+
+class InteractionArch(nn.Module):
+    """Feature interaction module.
+
+    Args:
+        feature_num (int): feature_num
+    """
+
+    def __init__(self, feature_num: int) -> None:
+        super().__init__()
+        self.feature_num: int = feature_num
+        self.register_buffer(
+            "triu_indices",
+            torch.triu_indices(self.feature_num, self.feature_num, offset=1),
+            persistent=False,
+        )
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        dim = 0
+        for i in range(1, self.F):
+            dim += i
+        return dim
+
+    def forward(
+        self, dense_features: torch.Tensor, sparse_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            dense_features (torch.Tensor): an input tensor of size B X D.
+            sparse_features (torch.Tensor): an input tensor of size B X N X D.
+        """
+        if self.feature_num <= 0:
+            return dense_features
+
+        combined_values = torch.cat(
+            (dense_features.unsqueeze(1), sparse_features), dim=1
+        )  # B X (N+1) X D
+
+        interactions = torch.bmm(
+            combined_values, torch.transpose(combined_values, 1, 2)
+        )  # B X (N+1) X (N+1)
+        interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
+
+        return interactions_flat
