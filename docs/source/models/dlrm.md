@@ -76,23 +76,22 @@ model_config: {
 - feature_groups: 特征组
 
   - 包含两个feature_group: dense 和sparse group, **group name不能变**
-
   - wide_deep: dlrm模型使用的都是Deep features, 所以都设置成DEEP
 
 - dlrm: dlrm模型相关的参数
 
-  - bot_mlp: dense mlp的参数配置
+  - dense_mlp: dense mlp的参数配置
 
     - hidden_units: dnn每一层的channel数目，即神经元的数目,输入dense features,最后一层channel数必须等于sparce feature得维度
 
-  - top_mlp: 输出(logits)之前的mlp, 输入为dense features, sparse features and interact features.
-
-    - hidden_units: dnn每一层的channel数目，即神经元的数目
-
   - arch_with_sparse:
 
-    - 默认是true, sparse features也会和dense features以及interact features concat起来, 然后进入top_mlp.
-    - if false, 即仅将dense features和interact features concat起来，输入bot_dnn.
+    - 默认是true, sparse features也会和dense features以及interact features concat起来, 然后进入final_mlp.
+    - if false, 即仅将dense features和interact features concat起来，输入final_mlp.
+
+  - final: 输出(logits)之前的mlp, 输入为dense features, sparse features and interact features.
+
+    - hidden_units: dnn每一层的channel数目，即神经元的数目
 
 ### 示例Config
 

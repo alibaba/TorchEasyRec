@@ -50,7 +50,9 @@ class DLRM(RankModel):
         for feature_name in dense_feature_dims.keys():
             if "seq_encoder" in feature_name:
                 raise Exception("dense group not have sequence features.")
-        self.bot_mlp = MLP(dense_dim, **config_to_kwargs(self._model_config.bot_mlp))
+        self.dense_mlp = MLP(
+            dense_dim, **config_to_kwargs(self._model_config.dense_mlp)
+        )
 
         assert self.embedding_group.has_group("sparse"), "sparse group is not specified"
         sparse_feature_dims = self.embedding_group.group_feature_dims("sparse")
@@ -60,21 +62,26 @@ class DLRM(RankModel):
             self.per_sparse_dim = dim
             if "seq_encoder" in feature_name:
                 raise Exception("sparse group not have sequence features.")
+
         self.sparse_num = len(sparse_feature_dims)
         sparse_dims = set(sparse_feature_dims.values())
         if len(sparse_dims) > 1:
             raise Exception(
                 f"sparse group feature dims must be the same, but we find {sparse_dims}"
             )
+        if self.per_sparse_dim != self.dense_mlp.output_dim():
+            raise Exception(
+                "dense mlp last hidden_unit must be the same sparse feature dim"
+            )
+
         self.interaction = InteractionArch(self.sparse_num + 1)
 
-        feature_dim = self.bot_mlp.output_dim() + self.interaction.output_dim()
+        feature_dim = self.dense_mlp.output_dim() + self.interaction.output_dim()
         if self._model_config.arch_with_sparse:
             feature_dim += sparse_dim
 
-        self.top_mlp = MLP(feature_dim, **config_to_kwargs(self._model_config.top_mlp))
-
-        self.output_mlp = nn.Linear(self.top_mlp.output_dim(), self._num_class)
+        self.final_mlp = MLP(feature_dim, **config_to_kwargs(self._model_config.final))
+        self.output_mlp = nn.Linear(self.final_mlp.output_dim(), self._num_class)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
@@ -89,7 +96,7 @@ class DLRM(RankModel):
 
         # dense
         dense_group_feat = grouped_features["dense"]
-        dense_feat = self.bot_mlp(dense_group_feat)
+        dense_feat = self.dense_mlp(dense_group_feat)
 
         # sparse
         sparse_group_feat = grouped_features["sparse"]
@@ -100,12 +107,12 @@ class DLRM(RankModel):
         # interaction
         interaction_feat = self.interaction(dense_feat, sparse_feat)
 
-        # top mlp
+        # final mlp
         all_feat = torch.cat([interaction_feat, dense_feat], dim=-1)
         if self._model_config.arch_with_sparse:
             all_feat = torch.cat([all_feat, sparse_group_feat], dim=-1)
-        top_feat = self.top_mlp(all_feat)
+        y_final = self.final_mlp(all_feat)
 
         # output
-        y = self.output_mlp(top_feat)
+        y = self.output_mlp(y_final)
         return self._output_to_prediction(y)
