@@ -9,10 +9,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import abc
+from typing import Any, Optional
 
 import torch
 from torch import nn
+
+from tzrec.ops import Kernel
+
+
+class BaseModule(nn.Module, abc.ABC):
+    def __init__(
+        self,
+        is_inference: bool = False,
+        kernel: Optional[Kernel] = None,
+    ) -> None:
+        super().__init__()
+        self._is_inference = is_inference
+        self._kernel = kernel
+
+    def kernel(self) -> Kernel:
+        kernel = self._kernel
+        if kernel is not None:
+            return kernel
+        else:
+            return Kernel.TRITON
+
+    def recursive_setattr(self, name: str, value: Any) -> None:
+        for _, module in self.named_modules():
+            if hasattr(module, name):
+                setattr(module, name, value)
+
+    def set_is_inference(self, is_inference: bool) -> None:
+        self._is_inference = is_inference
+        self.recursive_setattr("_is_inference", is_inference)
+
+    def set_kernel(self, kernel: Kernel) -> None:
+        self._kernel = kernel
+        self.recursive_setattr("_kernel", kernel)
+
+    @property
+    def is_inference(self) -> bool:
+        return self._is_inference
+
+    @property
+    def is_eval(self) -> bool:
+        return (not self._is_inference) and (not self.training)
+
+    @property
+    def is_train(self) -> bool:
+        return (not self._is_inference) and self.training
 
 
 class Transpose(nn.Module):
@@ -66,3 +112,10 @@ def div_no_nan(
         posinf=0.0,
         neginf=0.0,
     )
+
+
+@torch.fx.wrap
+def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    """Unwrap optional tensor for trace."""
+    assert optional is not None, "Expected optional to be non-None Tensor"
+    return optional

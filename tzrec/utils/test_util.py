@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from enum import Enum
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,26 @@ from torch.fx import GraphModule
 
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
+
+nv_gpu_unavailable: Tuple[bool, str] = (
+    not torch.cuda.is_available() or torch.cuda.device_count() == 0,
+    "CUDA is not available or no GPUs detected",
+)
+nv_gpu_available: bool = not nv_gpu_unavailable[0]
+
+
+amd_gpu_unavailable: Tuple[bool, str] = (
+    not torch.version.hip,
+    "AMD HIP not available or no GPUs detected",
+)
+amd_gpu_available: bool = not amd_gpu_unavailable[0]
+
+gpu_unavailable: Tuple[bool, str] = (
+    not nv_gpu_available and not amd_gpu_available,
+    "CUDA/HIP is not available or no GPUs detected",
+)
+
+gpu_available: bool = not gpu_unavailable[0]
 
 
 class TestGraphType(Enum):
@@ -117,3 +137,35 @@ def dfs_are_close(df1: pd.DataFrame, df2: pd.DataFrame, abs_tol: float) -> bool:
     result = np.all(abs_diff <= abs_tol)
     # pyre-ignore [7]
     return result
+
+
+def generate_sparse_seq_len(
+    size: int,
+    max_seq_len: int,
+    sparsity: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate sequence lengths with sparsity."""
+    if sparsity == 0.0:
+        return torch.zeros(size=(size,), device=device, dtype=torch.int)
+    elif sparsity == 1.0:
+        return torch.ones(size=(size,), device=device, dtype=torch.int) * max_seq_len
+    elif sparsity >= 0.5:
+        min_seq_len: int = int((2 * sparsity - 1.0) * max_seq_len)
+        return torch.randint(
+            low=min_seq_len,
+            high=max_seq_len,
+            size=(size,),
+            device=device,
+            dtype=torch.int,
+        )
+    else:
+        min_seq_len: int = 0
+        max_seq_len: int = int(2 * sparsity * max_seq_len)
+        return torch.randint(
+            low=min_seq_len,
+            high=max_seq_len,
+            size=(size,),
+            device=device,
+            dtype=torch.int,
+        )
