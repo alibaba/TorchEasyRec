@@ -23,13 +23,13 @@ from tzrec.ops.pytorch.pt_jagged_tensors import (
     pytorch_concat_2D_jagged,
     pytorch_hstu_concat_l2_embeddings,
     pytorch_hstu_split_l2_embeddings,
+    pytorch_jagged_dense_bmm_broadcast_add,
     pytorch_split_2D_jagged,
-    pytorch_jagged_dense_bmm_broadcast_add
 )
 from tzrec.ops.triton.triton_jagged_tensors import (
     triton_concat_2D_jagged,
-    triton_split_2D_jagged,
     triton_jagged_dense_bmm_broadcast_add,
+    triton_split_2D_jagged,
 )
 
 torch.fx.wrap("triton_concat_2D_jagged")

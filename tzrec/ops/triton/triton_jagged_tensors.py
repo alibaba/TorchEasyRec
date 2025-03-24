@@ -14,14 +14,14 @@
 # thanks to their public work.
 
 
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-
-from tzrec.ops.utils import switch_to_contiguous_if_needed, autotune_max_seq_len
 from triton.runtime.autotuner import autotune as triton_autotune
+
+from tzrec.ops.utils import autotune_max_seq_len, switch_to_contiguous_if_needed
 
 
 def _get_bmm_configs() -> List[triton.Config]:
@@ -43,6 +43,7 @@ def _get_bmm_configs() -> List[triton.Config]:
                             )
                         )
     return configs
+
 
 @triton.jit
 def _concat_2D_jagged(
@@ -184,13 +185,12 @@ def jagged_dense_bmm_broadcast_add_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Computing bmm Out = Jagged x Dense + Bias
+    """Computing bmm Out = Jagged x Dense + Bias.
 
     M is the jagged dimension
-    Jagged has shape (sum_B(M_i), K), Dense has shape (B, K, N), Bias has shape (B, N), 
+    Jagged has shape (sum_B(M_i), K), Dense has shape (B, K, N), Bias has shape (B, N),
     and Out has shape (sum_B(M_i), N)
     """
-
     off_n = tl.program_id(0)
     off_m = tl.program_id(1)
     off_b = tl.program_id(2)
@@ -242,6 +242,7 @@ def jagged_dense_bmm_broadcast_add_kernel(
     out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :]
     tl.store(out_ptrs, out, mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N))
 
+
 @triton_autotune(
     configs=_get_bmm_configs(),
     key=["M", "N", "AUTOTUNE_MAX_SEQ_LEN"],
@@ -269,13 +270,12 @@ def _jagged_jagged_bmm_reduce_sum(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Computing bmm Out = Jagged x Jagged
+    """Computing bmm Out = Jagged x Jagged.
 
     K is the jagged dimension
-    JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), 
+    JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N),
     and Out has shape (B, M, N)
     """
-
     off_b = tl.program_id(0)
     off_m = tl.program_id(1)
     off_n = tl.program_id(2)
@@ -551,8 +551,6 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         )
 
         return None, d_jagged_in, None, None, None, None, None
-    
-
 
 
 class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
