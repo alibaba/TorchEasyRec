@@ -112,3 +112,6 @@ class LayerNormTest(unittest.TestCase):
             ref_db,
             opt_db,
         )
+
+if __name__ == "__main__":
+    unittest.main()

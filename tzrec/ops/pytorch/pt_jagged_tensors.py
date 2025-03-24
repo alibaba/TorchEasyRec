@@ -219,3 +219,27 @@ def pytorch_hstu_concat_l2_embeddings(
         ),
     )
     return padded_x.flatten(0, 1)[mask.view(-1), :]
+
+
+def pytorch_jagged_dense_bmm_broadcast_add(
+    max_seq_len: int,
+    seq_offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    dense: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    dtype = jagged.dtype
+    jagged = jagged.to(torch.float32)
+    dense = dense.to(torch.float32)
+    padded_jagged = torch.ops.fbgemm.jagged_to_padded_dense(
+        values=jagged,
+        offsets=[seq_offsets],
+        max_lengths=[max_seq_len],
+        padding_value=0.0,
+    )
+    bmm_out = torch.bmm(padded_jagged, dense)
+    jagged_out = torch.ops.fbgemm.dense_to_jagged(
+        bmm_out + bias.unsqueeze(1), [seq_offsets], total_L=jagged.shape[0]
+    )[0]
+    jagged_out = jagged_out.to(dtype)
+    return jagged_out

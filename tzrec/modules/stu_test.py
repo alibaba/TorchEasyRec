@@ -110,9 +110,9 @@ class StuTest(unittest.TestCase):
             stu_list=stu_layers,
             is_inference=False,
         ).to(device)
-        stu.recursive_setattr("_hammer_kernel", Kernel.PYTORCH)
+        stu.recursive_setattr("_kernel", Kernel.PYTORCH)
         stu_triton = copy.deepcopy(stu)
-        stu_triton.recursive_setattr("_hammer_kernel", Kernel.TRITON)
+        stu_triton.recursive_setattr("_kernel", Kernel.TRITON)
 
         if empty_inputs:
             x_lengths = torch.zeros(batch_size, dtype=torch.int32, device=device)
@@ -376,7 +376,7 @@ class StuTest(unittest.TestCase):
             stu_list=stu_layers,
             is_inference=True,
         ).to(device)
-        stu.recursive_setattr("_hammer_kernel", Kernel.TRITON)
+        stu.recursive_setattr("_kernel", Kernel.TRITON)
         stu.eval()
 
         x_lengths = torch.randint(
@@ -444,3 +444,7 @@ class StuTest(unittest.TestCase):
         )
 
         torch.testing.assert_close(ref_delta_y, delta_y)
+
+
+if __name__ == "__main__":
+    unittest.main()

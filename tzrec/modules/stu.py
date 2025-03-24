@@ -310,7 +310,7 @@ class STULayer(STU):
                 recompute_normed_x_in_backward=self._recompute_normed_x,
                 sort_by_length=self._sort_by_length,
                 prefill=kv_caching_lengths is not None,
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
             )
 
         self.update_kv_cache(
@@ -337,7 +337,7 @@ class STULayer(STU):
                 linear_dim=self._hidden_dim,
                 concat_ux=True,
                 training=self.training,
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
                 recompute_y_in_backward=self._recompute_y,
             )
 
@@ -359,7 +359,7 @@ class STULayer(STU):
                 hidden_dim=self._hidden_dim,
                 uvqk_weight=self._uvqk_weight.to(delta_x.dtype),
                 uvqk_bias=self._uvqk_beta.to(delta_x.dtype),
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
             )
         k, v, max_seq_len, seq_offsets = self.construct_full_kv(
             delta_k=delta_k.flatten(1, 2),
@@ -386,7 +386,7 @@ class STULayer(STU):
                 num_targets=num_targets if self._target_aware else None,
                 max_attn_len=self._max_attn_len,
                 contextual_seq_len=self._contextual_seq_len,
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
             ).view(-1, self._hidden_dim * self._num_heads)
         with record_function("## stu_compute_output ##"):
             return hstu_compute_output(
@@ -403,7 +403,7 @@ class STULayer(STU):
                 linear_dim=self._hidden_dim,
                 concat_ux=True,
                 training=self.training,
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
                 recompute_y_in_backward=self._recompute_y,
             )
 

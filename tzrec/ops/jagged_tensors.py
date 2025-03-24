@@ -19,21 +19,17 @@ import torch
 from torch.fx._symbolic_trace import is_fx_tracing
 
 from tzrec.ops import Kernel
-from tzrec.ops.pytorch.pt_jagged import (
-    pytorch_jagged_dense_bmm_broadcast_add,
-)
 from tzrec.ops.pytorch.pt_jagged_tensors import (
     pytorch_concat_2D_jagged,
     pytorch_hstu_concat_l2_embeddings,
     pytorch_hstu_split_l2_embeddings,
     pytorch_split_2D_jagged,
-)
-from tzrec.ops.triton.triton_jagged import (
-    triton_jagged_dense_bmm_broadcast_add,
+    pytorch_jagged_dense_bmm_broadcast_add
 )
 from tzrec.ops.triton.triton_jagged_tensors import (
     triton_concat_2D_jagged,
     triton_split_2D_jagged,
+    triton_jagged_dense_bmm_broadcast_add,
 )
 
 torch.fx.wrap("triton_concat_2D_jagged")
