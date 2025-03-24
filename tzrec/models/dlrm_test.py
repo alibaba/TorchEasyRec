@@ -66,8 +66,8 @@ class DLRMTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             dlrm=rank_model_pb2.DLRM(
-                top_mlp=module_pb2.MLP(hidden_units=[8, 4]),
-                bot_mlp=module_pb2.MLP(hidden_units=[2, 8]),
+                dense_mlp=module_pb2.MLP(hidden_units=[2, 8]),
+                final=module_pb2.MLP(hidden_units=[8, 4]),
                 arch_with_sparse=arch_with_sparse,
             ),
             losses=[
