@@ -35,6 +35,7 @@ class BaseModule(nn.Module, abc.ABC):
         else:
             return Kernel.TRITON
 
+    # pyre-ignore [2]
     def recursive_setattr(self, name: str, value: Any) -> None:
         for _, module in self.named_modules():
             if hasattr(module, name):
