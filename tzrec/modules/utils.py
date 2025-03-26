@@ -120,3 +120,11 @@ def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
     """Unwrap optional tensor for trace."""
     assert optional is not None, "Expected optional to be non-None Tensor"
     return optional
+
+
+def init_linear_xavier_weights_zero_bias(m: torch.nn.Module) -> None:
+    """Init nn.Linear module with Xavier weights and zero bias."""
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)

@@ -55,3 +55,34 @@ message PLE {
     // task tower
     repeated TaskTower task_towers = 2;
 }
+
+
+message DlrmHSTU {
+    optional string uih_post_id_feature_name = 11;
+
+    optional string uih_action_time_feature_name = 12;
+
+    optional string uih_weight_feature_name = 13;
+
+
+    optional uint32 hstu_num_heads = 1 [default = 4];
+
+    optional uint32 hstu_attn_linear_dim = 2 [default = 128];
+
+    optional uint32 hstu_attn_qk_dim = 3 [default = 128];
+
+    optional uint32 hstu_attn_num_layers = 4 [default = 3];
+
+    optional float hstu_input_dropout_ratio = 5 [default = 0.2];
+
+    optional float hstu_linear_dropout_rate = 6 [default = 0.2];
+
+    optional uint32 hstu_transducer_embedding_dim = 7 [default = 512];
+
+    optional bool hstu_group_norm = 8 [default = false];
+    //
+    optional bool enable_postprocessor = 9 [default = true];
+
+    optional bool use_layer_norm_postprocessor = 10 [default = false];
+
+}

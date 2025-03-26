@@ -45,6 +45,7 @@ message ModelConfig {
         DBMTL dbmtl = 202;
         PLE ple = 203;
         DC2VR dc2vr = 204;
+        DlrmHSTU dlrm_hstu = 205;
 
         DSSM dssm = 301;
         DSSMV2 dssm_v2 = 302;
