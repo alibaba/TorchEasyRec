@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 from torch import nn
@@ -64,9 +64,9 @@ def _merge_list_of_tensor_dict(
 
 
 @torch.fx.wrap
-def _merge_list_of_tensor_dict_dict(
-    list_of_tensor_dict_dict: List[Dict[str, Dict[str, torch.Tensor]]],
-) -> Dict[str, Dict[str, torch.Tensor]]:
+def _merge_list_of_dict_of_jt_odict(
+    list_of_tensor_dict_dict: List[Dict[str, OrderedDict[str, JaggedTensor]]],
+) -> Dict[str, OrderedDict[str, torch.Tensor]]:
     result = {}
     for tensor_d_d in list_of_tensor_dict_dict:
         result.update(tensor_d_d)
@@ -918,7 +918,7 @@ class SequenceEmbeddingGroup(nn.Module):
     def forward(
         self,
         batch: Batch,
-    ) -> Dict[str, Dict[str, JaggedTensor]]:
+    ) -> Dict[str, OrderedDict[str, JaggedTensor]]:
         """Forward the module.
 
         Args:
@@ -952,8 +952,20 @@ class SequenceEmbeddingGroup(nn.Module):
                 )
             )
 
-        result = _merge_list_of_tensor_dict_dict(result_dicts)
+        result = _merge_list_of_dict_of_jt_odict(result_dicts)
         return result
+
+
+class _SequenceEmbeddingInfo(NamedTuple):
+    """One Embedding info in SequenceGroup."""
+
+    name: str
+    raw_name: str
+    is_sparse: bool
+    pooling_type: str
+    value_dim: int
+    is_user: bool
+    is_sequence: bool
 
 
 class SequenceEmbeddingGroupImpl(nn.Module):
@@ -998,6 +1010,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
         self._group_to_shared_query = OrderedDict()
         self._group_to_shared_sequence = OrderedDict()
+        self._group_to_shared_feature = OrderedDict()
         self._group_total_dim = dict()
         self._group_output_dims = dict()
 
@@ -1024,10 +1037,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             sequence_dim = 0
             query_dims = []
             sequence_dims = []
+            output_dims = []
             group_name = feature_group.group_name
             feature_names = list(feature_group.feature_names)
             shared_query = []
             shared_sequence = []
+            shared_feature = []
 
             for name in feature_names:
                 shared_name = name
@@ -1094,39 +1109,34 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                         self.has_dense = True
 
                 is_user_feat = feature.is_user_feat if need_input_tile else False
+                shared_info = _SequenceEmbeddingInfo(
+                    name=shared_name,
+                    raw_name=name,
+                    is_sparse=feature.is_sparse,
+                    pooling_type=feature.pooling_type.value.lower(),
+                    value_dim=feature.value_dim,
+                    is_user_feat=is_user_feat,
+                    is_sequence=feature.is_sequence,
+                )
                 if feature.is_sequence:
-                    shared_sequence.append(
-                        (
-                            shared_name,
-                            name,
-                            feature.is_sparse,
-                            feature.pooling_type.value.lower(),
-                            feature.value_dim,
-                            is_user_feat,
-                        )
-                    )
+                    shared_sequence.append(shared_info)
                     sequence_dim += output_dim
                     sequence_dims.append(output_dim)
                 else:
-                    shared_query.append(
-                        (
-                            shared_name,
-                            name,
-                            feature.is_sparse,
-                            feature.pooling_type.value.lower(),
-                            feature.value_dim,
-                            is_user_feat,
-                        )
-                    )
+                    shared_query.append(shared_info)
                     query_dim += output_dim
                     query_dims.append(output_dim)
+                shared_feature.append(shared_info)
+                output_dims.append(output_dim)
 
             self._group_to_shared_query[group_name] = shared_query
             self._group_to_shared_sequence[group_name] = shared_sequence
+            self._group_to_shared_feature[group_name] = shared_feature
             self._group_total_dim[f"{group_name}.query"] = query_dim
             self._group_total_dim[f"{group_name}.sequence"] = sequence_dim
             self._group_output_dims[f"{group_name}.query"] = query_dims
             self._group_output_dims[f"{group_name}.sequence"] = sequence_dims
+            self._group_output_dims[group_name] = output_dims
 
         self.ec_list = nn.ModuleList()
         for _, emb_configs in dim_to_emb_configs.items():
@@ -1163,13 +1173,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
     def group_dims(self, group_name: str) -> List[int]:
         """Output dimension of each feature in a feature group."""
-        if "." in group_name:
-            return self._group_output_dims[group_name]
-        else:
-            return (
-                self._group_output_dims[f"{group_name}.query"]
-                + self._group_output_dims[f"{group_name}.sequence"]
-            )
+        return self._group_output_dims[group_name]
 
     def group_total_dim(self, group_name: str) -> int:
         """Total output dimension of a feature group."""
@@ -1188,12 +1192,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
     def has_group(self, group_name: str) -> bool:
         """Check the feature group exist or not."""
         true_name = group_name.split(".")[0] if "." in group_name else group_name
-        query_name = true_name + ".query"
-        sequnce_name = true_name + ".sequence"
-        return (
-            query_name in self._group_output_dims.keys()
-            and sequnce_name in self._group_output_dims.keys()
-        )
+        return true_name in self._group_output_dims.keys()
 
     def _forward_impl(
         self,
@@ -1245,34 +1244,29 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
         seq_jt_dict = {}
         for _, v in self._group_to_shared_sequence.items():
-            for (
-                name,
-                raw_name,
-                is_sparse,
-                pooling,
-                value_dim,
-                _,
-            ) in v:
-                if name in seq_jt_dict:
+            for info in v:
+                if info.name in seq_jt_dict:
                     continue
                 jt = (
-                    sparse_jt_dict[name] if is_sparse else sequence_dense_features[name]
+                    sparse_jt_dict[info.name]
+                    if info.is_sparse
+                    else sequence_dense_features[info.name]
                 )
-                if is_sparse and value_dim != 1:
-                    length_jt = seq_mulval_length_jt_dict[raw_name]
+                if info.is_sparse and info.value_dim != 1:
+                    length_jt = seq_mulval_length_jt_dict[info.raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
                     key_lengths = length_jt.values()
-                    if pooling == "mean":
+                    if info.pooling == "mean":
                         key_lengths = key_lengths.clamp(min=1)
                     jt_values = torch.segment_reduce(
-                        jt.values(), pooling, lengths=key_lengths
+                        jt.values(), info.pooling, lengths=key_lengths
                     )
                     jt = JaggedTensor(
                         values=jt_values,
                         lengths=length_jt.lengths(),
                     )
-                seq_jt_dict[name] = jt
+                seq_jt_dict[info.name] = jt
 
         jt_dict = _merge_list_of_jt_dict([sparse_jt_dict, seq_jt_dict])
 
@@ -1322,23 +1316,23 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         results = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
-            for name, _, is_sparse, pooling, value_dim, is_user in v:
-                if is_sparse:
-                    query_jt = jt_dict[name]
-                    if value_dim == 1:
+            for info in v:
+                if info.is_sparse:
+                    query_jt = jt_dict[info.name]
+                    if info.value_dim == 1:
                         # for single-value id feature
-                        query_t = jt_dict[name].to_padded_dense(1).squeeze(1)
+                        query_t = jt_dict[info.name].to_padded_dense(1).squeeze(1)
                     else:
                         # for multi-value id feature
                         query_t = torch.segment_reduce(
-                            query_jt.values(), pooling, lengths=query_jt.lengths()
+                            query_jt.values(), info.pooling, lengths=query_jt.lengths()
                         )
-                        if pooling == "mean":
+                        if info.pooling == "mean":
                             query_t = torch.nan_to_num(query_t, nan=0.0)
-                    if is_user and need_input_tile_emb:
+                    if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
                 else:
-                    query_t = dense_t_dict[name]
+                    query_t = dense_t_dict[info.name]
                 query_t_list.append(query_t)
             if len(query_t_list) > 0:
                 results[f"{group_name}.query"] = torch.cat(query_t_list, dim=1)
@@ -1347,25 +1341,18 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             seq_t_list = []
 
             group_sequence_length = 1
-            for i, (
-                name,
-                _,
-                is_sparse,
-                _,
-                _,
-                is_user,
-            ) in enumerate(v):
+            for i, info in enumerate(v):
                 # when is_user is True
                 #   sequence_sparse_features
                 #       when input_tile_emb need to tile(tile_size,1):
                 #   sequence_dense_features always need to tile
                 need_tile = False
-                if is_user:
-                    if is_sparse:
+                if info.is_user:
+                    if info.is_sparse:
                         need_tile = need_input_tile_emb
                     else:
                         need_tile = need_input_tile
-                jt = jt_dict[name]
+                jt = jt_dict[info.name]
                 if i == 0:
                     sequence_length = jt.lengths()
                     group_sequence_length = _int_item(torch.max(sequence_length))
@@ -1394,7 +1381,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_feature: KeyedTensor,
         sequence_dense_features: KeyedTensor,
         sequence_mulval_lengths: KeyedTensor,
-    ) -> Dict[str, Dict[str, JaggedTensor]]:
+    ) -> Dict[str, OrderedDict[str, JaggedTensor]]:
         """Forward the module.
 
         Args:
@@ -1419,21 +1406,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         )
 
         results = {}
-        for group_name, v in self._group_to_shared_query.items():
-            group_result = {}
-            for name, _, is_sparse, _, _, _ in v:
-                if is_sparse:
-                    jt = jt_dict[name]
+        for group_name, v in self._group_to_shared_feature.items():
+            group_result = OrderedDict()
+            for info in v:
+                if info.is_sparse:
+                    jt = jt_dict[info.name]
                 else:
-                    jt = _dense_to_jt(dense_t_dict[name])
-                group_result[name] = jt
-            results[group_name] = group_result
-
-        for group_name, v in self._group_to_shared_sequence.items():
-            group_result = results.get(group_name, {})
-            for vv in v:
-                name = vv[0]
-                group_result[name] = jt_dict[name]
+                    jt = _dense_to_jt(dense_t_dict[info.name])
+                group_result[info.name] = jt
             results[group_name] = group_result
 
         return results

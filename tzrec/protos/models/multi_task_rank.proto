@@ -58,12 +58,27 @@ message PLE {
 
 
 message DlrmHSTU {
-    optional string uih_post_id_feature_name = 11;
+    required string uih_id_feature_name = 11;
 
-    optional string uih_action_time_feature_name = 12;
+    required string uih_action_time_feature_name = 12;
 
-    optional string uih_weight_feature_name = 13;
+    required string uih_action_weight_feature_name = 13;
 
+    required string uih_watchtime_feature_name = 17;
+
+    required string candidates_id_feature_name = 14;
+
+    required string candidates_query_time_feature_name = 18;
+
+    required string candidates_action_weight_feature_name = 19;
+
+    required string candidates_watchtime_feature_name = 20;
+
+    map<string, uint32> contextual_feature_to_max_length = 15;
+
+    map<string, uint32> contextual_feature_to_min_uih_length = 16;
+
+    map<string, uint32> action_weights = 21;
 
     optional uint32 hstu_num_heads = 1 [default = 4];
 
@@ -84,5 +99,8 @@ message DlrmHSTU {
     optional bool enable_postprocessor = 9 [default = true];
 
     optional bool use_layer_norm_postprocessor = 10 [default = false];
+
+    // multi task tower config
+    required FusionTaskTower fusion_task_tower = 22;
 
 }

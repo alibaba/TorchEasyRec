@@ -112,6 +112,28 @@ message InterventionTaskTower {
 };
 
 
+message FusionSubTaskConfig {
+    // task name for the task
+    required string task_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // bitmask for get actual label for binary classification task
+    optional uint64 task_bitmask = 3;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // TODO: support multi-class classification loss
+    // optional uint32 num_class = 5 [default = 1];
+}
+
+
+message FusionTaskTower {
+    // task tower mlp
+    optional MLP mlp = 1;
+    // sub task configs
+    repeated FusionSubTaskConfig task_configs = 2;
+}
+
+
 message MultiWindowDINTower {
     // time windows len
     repeated uint32 windows_len = 1;

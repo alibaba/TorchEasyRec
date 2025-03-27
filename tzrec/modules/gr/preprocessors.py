@@ -247,7 +247,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 max_len_right=output_max_seq_len,
                 offsets_left=None,
                 offsets_right=output_seq_offsets,
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
                 values_left=torch.zeros(
@@ -260,7 +260,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 max_len_right=output_max_seq_len,
                 offsets_left=None,
                 offsets_right=output_seq_offsets,
-                kernel=self.hammer_kernel(),
+                kernel=self.kernel(),
             ).squeeze(-1)
             output_max_seq_len = output_max_seq_len + self._max_contextual_seq_len
             output_seq_lengths = output_seq_lengths + self._max_contextual_seq_len

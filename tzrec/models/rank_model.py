@@ -187,14 +187,13 @@ class RankModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_weight: Optional[torch.Tensor],
         loss_cfg: LossConfig,
         num_class: int = 1,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
         losses = {}
-        label = batch.labels[label_name]
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
@@ -237,7 +236,7 @@ class RankModel(BaseModel):
                 self._loss_impl(
                     predictions,
                     batch,
-                    self._label_name,
+                    batch.labels[self._label_name],
                     loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
@@ -265,11 +264,11 @@ class RankModel(BaseModel):
                 task="multiclass", num_class=num_class, **metric_kwargs
             )
         elif metric_type == "mean_absolute_error":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.MeanAbsoluteError()
         elif metric_type == "mean_squared_error":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.MeanSquaredError()
         elif metric_type == "accuracy":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.Accuracy()
         elif metric_type == "grouped_auc":
             assert num_class <= 2, (
                 f"num_class must less than 2 when metric type is {metric_type}"
@@ -289,13 +288,11 @@ class RankModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         metric_cfg: MetricConfig,
         num_class: int = 1,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
-
         metric_type = metric_cfg.WhichOneof("metric")
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
         metric_name = metric_type + suffix
@@ -349,10 +346,12 @@ class RankModel(BaseModel):
             self._update_metric_impl(
                 predictions,
                 batch,
-                self._label_name,
+                batch.labels[self._label_name],
                 metric_cfg,
                 num_class=self._num_class,
             )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
-                self._update_loss_metric_impl(losses, batch, self._label_name, loss_cfg)
+                self._update_loss_metric_impl(
+                    losses, batch, batch.labels[self._label_name], loss_cfg
+                )
