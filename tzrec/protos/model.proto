@@ -35,7 +35,7 @@ message ModelConfig {
     repeated FeatureGroupConfig feature_groups = 1;
 
     oneof model {
-	    // DLRM dlrm = 100;
+	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
