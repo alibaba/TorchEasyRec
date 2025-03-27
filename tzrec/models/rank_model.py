@@ -262,14 +262,18 @@ class RankModel(BaseModel):
             )
         elif metric_type == "multiclass_auc":
             self._metric_modules[metric_name] = torchmetrics.AUROC(
-                task="multiclass", num_class=num_class, **metric_kwargs
+                task="multiclass", num_classes=num_class, **metric_kwargs
             )
         elif metric_type == "mean_absolute_error":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.MeanAbsoluteError()
         elif metric_type == "mean_squared_error":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.MeanSquaredError()
         elif metric_type == "accuracy":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.Accuracy(
+                task="multiclass" if num_class > 1 else "binary",
+                num_classes=num_class,
+                **metric_kwargs,
+            )
         elif metric_type == "grouped_auc":
             assert num_class <= 2, (
                 f"num_class must less than 2 when metric type is {metric_type}"
@@ -315,9 +319,14 @@ class RankModel(BaseModel):
             pred = predictions["probs" + suffix]
             self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "mean_absolute_error":
-            pass
+            pred = predictions["y" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "mean_squared_error":
-            pass
+            pred = predictions["y" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
+        elif metric_type == "accuracy":
+            pred = predictions["probs" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "grouped_auc":
             pred = (
                 predictions["probs" + suffix]

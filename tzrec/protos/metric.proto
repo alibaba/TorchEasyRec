@@ -23,6 +23,10 @@ message MeanSquaredError {
 }
 
 message Accuracy {
+    // probs threshold
+    optional float threshold = 1 [default = 0.5];
+    // top k accuracy when num_class > 1
+    optional uint32 top_k = 2 [default = 1];
 }
 
 message GroupedAUC {
