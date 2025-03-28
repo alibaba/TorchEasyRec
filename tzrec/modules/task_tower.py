@@ -22,9 +22,9 @@ class TaskTower(nn.Module):
     """General task tower Module.
 
     Args:
-        tower_feature_in (in): task tower input dims.
-        num_class: num_class for multi-class classification loss
-        mlp:  mlp network config.
+        tower_feature_in (int): task tower input dims.
+        num_class (int): num_class for multi-class classification loss.
+        mlp (dict):  mlp network config.
     """
 
     def __init__(
