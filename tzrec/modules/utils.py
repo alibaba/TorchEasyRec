@@ -9,10 +9,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import abc
+from typing import Any, Optional
 
 import torch
 from torch import nn
+
+from tzrec.ops import Kernel
+
+
+class BaseModule(nn.Module, abc.ABC):
+    """TorchEasyRec Base Module.
+
+    Args:
+        is_inference (bool): is inference or not.
+        kernel (Optional[Kernel]): module kernel type.
+    """
+
+    def __init__(
+        self,
+        is_inference: bool = False,
+        kernel: Optional[Kernel] = None,
+    ) -> None:
+        super().__init__()
+        self._is_inference = is_inference
+        self._kernel = kernel
+
+    def kernel(self) -> Kernel:
+        """Get kernel type."""
+        kernel = self._kernel
+        if kernel is not None:
+            return kernel
+        else:
+            return Kernel.TRITON
+
+    # pyre-ignore [2]
+    def recursive_setattr(self, name: str, value: Any) -> None:
+        """Recursive set sub module attrs."""
+        for _, module in self.named_modules():
+            if hasattr(module, name):
+                setattr(module, name, value)
+
+    def set_is_inference(self, is_inference: bool) -> None:
+        """Set module in inference or not."""
+        self._is_inference = is_inference
+        self.recursive_setattr("_is_inference", is_inference)
+
+    def set_kernel(self, kernel: Kernel) -> None:
+        """Set module kernel type."""
+        self._kernel = kernel
+        self.recursive_setattr("_kernel", kernel)
+
+    @property
+    def is_inference(self) -> bool:
+        """Get module is inference or not."""
+        return self._is_inference
+
+    @property
+    def is_eval(self) -> bool:
+        """Get module is eval or not."""
+        return (not self._is_inference) and (not self.training)
+
+    @property
+    def is_train(self) -> bool:
+        """Get module is train or not."""
+        return (not self._is_inference) and self.training
 
 
 class Transpose(nn.Module):
@@ -66,3 +127,11 @@ def div_no_nan(
         posinf=0.0,
         neginf=0.0,
     )
+
+
+def init_linear_xavier_weights_zero_bias(m: torch.nn.Module) -> None:
+    """Init nn.Linear module with Xavier weights and zero bias."""
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)

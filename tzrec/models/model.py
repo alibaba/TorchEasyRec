@@ -26,6 +26,7 @@ from torchrec.modules.embedding_modules import (
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils.load_class import get_register_class_meta
@@ -34,7 +35,7 @@ _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
 
 
-class BaseModel(nn.Module, metaclass=_meta_cls):
+class BaseModel(BaseModule, metaclass=_meta_cls):
     """TorchEasyRec base model.
 
     Args:
