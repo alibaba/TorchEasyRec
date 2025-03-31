@@ -41,6 +41,9 @@ from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
 from tzrec.utils.fx_util import fx_int_item
 
+EMPTY_KJT = KeyedJaggedTensor.empty()
+
+
 torch.fx.wrap(fx_int_item)
 
 

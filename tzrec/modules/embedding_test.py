@@ -23,6 +23,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.modules.embedding import (
+    EMPTY_KJT,
     EmbeddingGroup,
     EmbeddingGroupImpl,
     SequenceEmbeddingGroupImpl,
@@ -159,9 +160,6 @@ def _create_test_sequence_features(has_zch=False, has_mulval=False, pooling_type
     ]
     features = create_features(feature_cfgs)
     return features
-
-
-EMPTY_KJT = KeyedJaggedTensor.empty()
 
 
 class _EGScriptWrapper(nn.Module):
