@@ -36,6 +36,15 @@ def _update_tensor_dict(
     tensor_dict[key] = new_tensor
 
 
+def _is_classification_loss(loss_cfg: LossConfig) -> bool:
+    loss_type = loss_cfg.WhichOneof("loss")
+    return loss_type in [
+        "binary_cross_entropy",
+        "softmax_cross_entropy",
+        "jrc_loss",
+    ]
+
+
 class RankModel(BaseModel):
     """Base model for ranking.
 

@@ -18,6 +18,16 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tzrec.modules.utils import BaseModule
+from tzrec.ops.utils import fx_arange
+from tzrec.utils.fx_util import fx_int_item
+
+torch.fx.wrap(fx_arange)
+torch.fx.wrap(fx_int_item)
+
+
+@torch.fx.wrap
+def _fx_mask_assign(x: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) -> None:
+    x[mask] = value
 
 
 class ActionEncoder(BaseModule):
@@ -97,16 +107,18 @@ class ActionEncoder(BaseModule):
             max_lengths=[max_seq_len],
             padding_value=0.0,
         )
-        mask = torch.arange(max_seq_len, device=seq_offsets.device).view(1, max_seq_len)
+        mask = fx_arange(max_seq_len, device=seq_offsets.device).view(1, max_seq_len)
         mask = torch.logical_and(
             mask >= (seq_lengths - num_targets).unsqueeze(1),
             mask < seq_lengths.unsqueeze(1),
         )
-        padded_action_embeddings[mask] = self._target_action_embedding_table.view(
-            1, -1
-        ).tile(
-            int(torch.sum(num_targets).item()),
-            1,
+        _fx_mask_assign(
+            padded_action_embeddings,
+            mask,
+            self._target_action_embedding_table.view(1, -1).tile(
+                fx_int_item(torch.sum(num_targets)),
+                1,
+            ),
         )
         action_embeddings = torch.ops.fbgemm.dense_to_jagged(
             dense=padded_action_embeddings,

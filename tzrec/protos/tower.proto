@@ -126,7 +126,7 @@ message FusionSubTaskConfig {
 }
 
 
-message FusionTaskTower {
+message FusionMTLTower {
     // task tower mlp
     optional MLP mlp = 1;
     // sub task configs

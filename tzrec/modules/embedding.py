@@ -39,6 +39,9 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
+from tzrec.utils.fx_util import fx_int_item
+
+torch.fx.wrap(fx_int_item)
 
 
 @torch.fx.wrap
@@ -65,10 +68,10 @@ def _merge_list_of_tensor_dict(
 
 @torch.fx.wrap
 def _merge_list_of_dict_of_jt_odict(
-    list_of_tensor_dict_dict: List[Dict[str, OrderedDict[str, JaggedTensor]]],
-) -> Dict[str, OrderedDict[str, torch.Tensor]]:
-    result = {}
-    for tensor_d_d in list_of_tensor_dict_dict:
+    list_of_dict_of_jt_odict: List[Dict[str, Dict[str, JaggedTensor]]],
+) -> Dict[str, Dict[str, JaggedTensor]]:
+    result: Dict[str, Dict[str, JaggedTensor]] = {}
+    for tensor_d_d in list_of_dict_of_jt_odict:
         result.update(tensor_d_d)
     return result
 
@@ -135,11 +138,6 @@ def _cast_away_jt_dict_optional(
 ) -> Dict[str, JaggedTensor]:
     assert arg is not None
     return arg
-
-
-@torch.fx.wrap
-def _int_item(x: torch.Tensor) -> int:
-    return int(x.item())
 
 
 class EmbeddingGroup(nn.Module):
@@ -918,6 +916,67 @@ class SequenceEmbeddingGroup(nn.Module):
     def forward(
         self,
         batch: Batch,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward the module.
+
+        Args:
+            batch (Batch): a instance of Batch with features.
+
+        Returns:
+            group_features (dict): dict of feature_group to embedded tensor.
+        """
+        result_dicts = []
+
+        need_input_tile = is_input_tile()
+
+        if need_input_tile:
+            unique_keys = list(self.seq_emb_impls.keys())
+            # tile user dense feat & combine item dense feat, when has user dense feat
+            for key in unique_keys:
+                user_kt = batch.dense_features.get(key + "_user", None)
+                if user_kt is not None:
+                    item_kt = batch.dense_features.get(key, None)
+                    batch.dense_features[key] = _tile_and_combine_dense_kt(
+                        user_kt, item_kt, batch.tile_size
+                    )
+
+        for key, seq_emb_impl in self.seq_emb_impls.items():
+            sparse_feat_kjt = None
+            sparse_feat_kjt_user = None
+            dense_feat_kt = None
+            sequence_mulval_length_kjt = None
+            sequence_mulval_length_kjt_user = None
+
+            if seq_emb_impl.has_dense:
+                dense_feat_kt = batch.dense_features[key]
+            if seq_emb_impl.has_sparse or seq_emb_impl.has_mc_sparse:
+                sparse_feat_kjt = batch.sparse_features[key]
+            if seq_emb_impl.has_mulval_seq:
+                sequence_mulval_length_kjt = batch.sequence_mulval_lengths[key]
+            if seq_emb_impl.has_sparse_user or seq_emb_impl.has_mc_sparse_user:
+                sparse_feat_kjt_user = batch.sparse_features[key + "_user"]
+            if seq_emb_impl.has_mulval_seq_user:
+                sequence_mulval_length_kjt_user = batch.sequence_mulval_lengths[
+                    key + "_user"
+                ]
+
+            result_dicts.append(
+                seq_emb_impl(
+                    sparse_feat_kjt,
+                    dense_feat_kt,
+                    batch.sequence_dense_features,
+                    sequence_mulval_length_kjt,
+                    sparse_feat_kjt_user,
+                    sequence_mulval_length_kjt_user,
+                    batch.tile_size,
+                )
+            )
+
+        return _merge_list_of_tensor_dict(result_dicts)
+
+    def jagged_forward(
+        self,
+        batch: Batch,
     ) -> Dict[str, OrderedDict[str, JaggedTensor]]:
         """Forward the module.
 
@@ -944,7 +1003,7 @@ class SequenceEmbeddingGroup(nn.Module):
                 sequence_mulval_length_kjt = batch.sequence_mulval_lengths[key]
 
             result_dicts.append(
-                seq_emb_impl(
+                seq_emb_impl.jagged_forward(
                     sparse_feat_kjt,
                     dense_feat_kt,
                     batch.sequence_dense_features,
@@ -962,7 +1021,7 @@ class _SequenceEmbeddingInfo(NamedTuple):
     name: str
     raw_name: str
     is_sparse: bool
-    pooling_type: str
+    pooling: str
     value_dim: int
     is_user: bool
     is_sequence: bool
@@ -1113,9 +1172,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     name=shared_name,
                     raw_name=name,
                     is_sparse=feature.is_sparse,
-                    pooling_type=feature.pooling_type.value.lower(),
+                    pooling=feature.pooling_type.value.lower(),
                     value_dim=feature.value_dim,
-                    is_user_feat=is_user_feat,
+                    is_user=is_user_feat,
                     is_sequence=feature.is_sequence,
                 )
                 if feature.is_sequence:
@@ -1355,7 +1414,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 jt = jt_dict[info.name]
                 if i == 0:
                     sequence_length = jt.lengths()
-                    group_sequence_length = _int_item(torch.max(sequence_length))
+                    group_sequence_length = fx_int_item(torch.max(sequence_length))
 
                     if need_tile:
                         results[f"{group_name}.sequence_length"] = sequence_length.tile(
@@ -1403,6 +1462,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             dense_feature,
             sequence_dense_features,
             sequence_mulval_lengths,
+            None,
+            None,
         )
 
         results = {}

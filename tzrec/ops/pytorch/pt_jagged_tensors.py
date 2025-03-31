@@ -20,6 +20,8 @@ import torch
 
 from tzrec.ops.utils import fx_arange
 
+torch.fx.wrap(fx_arange)
+
 
 def _concat_2D_jagged_jagged(
     values_left: torch.Tensor,

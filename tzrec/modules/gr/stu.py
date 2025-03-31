@@ -72,7 +72,7 @@ class STULayerConfig:
     contextual_seq_len: int = 0
 
 
-@torch.fx.wrap
+# @torch.fx.wrap
 def _update_kv_cache(
     max_seq_len: int,
     seq_offsets: torch.Tensor,

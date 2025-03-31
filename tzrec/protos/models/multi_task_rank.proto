@@ -78,8 +78,6 @@ message DlrmHSTU {
 
     map<string, uint32> contextual_feature_to_min_uih_length = 16;
 
-    map<string, uint32> action_weights = 21;
-
     optional uint32 hstu_num_heads = 1 [default = 4];
 
     optional uint32 hstu_attn_linear_dim = 2 [default = 128];
@@ -101,6 +99,8 @@ message DlrmHSTU {
     optional bool use_layer_norm_postprocessor = 10 [default = false];
 
     // multi task tower config
-    required FusionTaskTower fusion_task_tower = 22;
+    required FusionMTLTower fusion_mtl_tower = 22;
+
+    required uint32 max_seq_len = 23;
 
 }

@@ -19,7 +19,7 @@ from torchrec import JaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.rank_model import RankModel
+from tzrec.models.rank_model import RankModel, _is_classification_loss
 from tzrec.modules.embedding import SequenceEmbeddingGroup
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
 from tzrec.modules.gr.positional_encoder import HSTUPositionalEncoder
@@ -30,6 +30,7 @@ from tzrec.modules.gr.postprocessors import (
 from tzrec.modules.gr.preprocessors import ContextualPreprocessor
 from tzrec.modules.gr.stu import STU, STULayer, STULayerConfig, STUStack
 from tzrec.modules.norm import LayerNorm, SwishLayerNorm
+from tzrec.modules.task_tower import FusionMTLTower
 from tzrec.modules.utils import (
     init_linear_xavier_weights_zero_bias,
 )
@@ -38,8 +39,26 @@ from tzrec.ops.jagged_tensors import concat_2D_jagged
 from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
+from tzrec.protos.tower_pb2 import FusionSubTaskConfig
+from tzrec.utils.config_util import config_to_kwargs
 
-torch.fx.wrap("len")
+
+@torch.fx.wrap
+def _fx_odict_jt_vcat(odict_jt: Dict[str, JaggedTensor]) -> torch.Tensor:
+    return torch.cat([t.values() for t in odict_jt.values()], dim=-1)
+
+
+@torch.fx.wrap
+def _fx_construct_payload(
+    payload_features: Dict[str, torch.Tensor],
+    contextual_seq_embeddings: Dict[str, JaggedTensor],
+) -> Dict[str, torch.Tensor]:
+    results: Dict[str, torch.Tensor] = {}
+    for k, v in contextual_seq_embeddings.items():
+        results[k] = v.values()
+        results[k + "_offsets"] = v.offsets()
+    results.update(payload_features)
+    return results
 
 
 @torch.fx.wrap
@@ -84,7 +103,7 @@ class DlrmHSTU(RankModel):
         )
         assert isinstance(self._model_config, multi_task_rank_pb2.DlrmHSTU)
 
-        set_static_max_seq_lens([self._hstu_configs.max_seq_len])
+        set_static_max_seq_lens([self._model_config.max_seq_len])
 
         self.embedding_group = SequenceEmbeddingGroup(
             self._features, list(self._base_model_config.feature_groups)
@@ -96,7 +115,7 @@ class DlrmHSTU(RankModel):
         }
         hstu_embedding_table_dim = name_to_feature[
             self._model_config.uih_id_feature_name
-        ]
+        ]._embedding_dim
 
         self._merge_uih_candidate_feature_mapping = list(
             zip(
@@ -108,20 +127,27 @@ class DlrmHSTU(RankModel):
             (
                 self._model_config.uih_action_time_feature_name,
                 self._model_config.candidates_query_time_feature_name,
+                False,
             ),
             (
                 self._model_config.uih_action_weight_feature_name,
                 self._model_config.candidates_action_weight_feature_name,
+                True,
             ),
             (
                 self._model_config.uih_watchtime_feature_name,
                 self._model_config.candidates_watchtime_feature_name,
+                False,
             ),
         ]
 
-        self._task_configs = self._model_config.fusion_task_tower.task_configs
+        self._task_configs = self._model_config.fusion_mtl_tower.task_configs
 
         # preprocessor setup
+        action_weights = []
+        for task_cfg in self._task_configs:
+            if task_cfg.HasField("task_bitmask"):
+                action_weights.append(task_cfg.task_bitmask)
         preprocessor = ContextualPreprocessor(
             input_embedding_dim=hstu_embedding_table_dim,
             output_embedding_dim=self._model_config.hstu_transducer_embedding_dim,
@@ -129,7 +155,7 @@ class DlrmHSTU(RankModel):
             contextual_feature_to_min_uih_length=self._model_config.contextual_feature_to_min_uih_length,
             action_embedding_dim=8,
             action_feature_name=self._model_config.uih_action_weight_feature_name,
-            action_weights=self._model_config.action_weights,
+            action_weights=action_weights,
         )
 
         # positional encoder
@@ -197,8 +223,7 @@ class DlrmHSTU(RankModel):
         # item embeddings
         self._item_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
-                in_features=hstu_embedding_table_dim
-                * len(self._hstu_configs.item_embedding_feature_names),
+                in_features=self.embedding_group.group_total_dim("candidate"),
                 out_features=512,
             ),
             SwishLayerNorm(512),
@@ -209,19 +234,10 @@ class DlrmHSTU(RankModel):
             LayerNorm(self._model_config.hstu_transducer_embedding_dim),
         ).apply(init_linear_xavier_weights_zero_bias)
 
-    def _construct_payload(
-        self,
-        payload_features: Dict[str, torch.Tensor],
-        contextual_seq_embeddings: OrderedDict[str, JaggedTensor],
-    ) -> Dict[str, torch.Tensor]:
-        contextual_payload_features = {}
-        for k, v in contextual_seq_embeddings.items():
-            contextual_payload_features[k] = v.values()
-            contextual_payload_features[k + "_offsets"] = v.offsets()
-        return {
-            **payload_features,
-            **contextual_payload_features,
-        }
+        self._multitask_module = FusionMTLTower(
+            tower_feature_in=self._model_config.hstu_transducer_embedding_dim,
+            **config_to_kwargs(self._model_config.fusion_mtl_tower),
+        ).apply(init_linear_xavier_weights_zero_bias)
 
     def _user_forward(
         self,
@@ -244,7 +260,7 @@ class DlrmHSTU(RankModel):
             ].values(),
             seq_lengths=source_lengths,
             seq_timestamps=source_timestamps,
-            seq_payloads=self._construct_payload(
+            seq_payloads=_fx_construct_payload(
                 payload_features=payload_features,
                 contextual_seq_embeddings=contextual_seq_embeddings,
             ),
@@ -257,8 +273,8 @@ class DlrmHSTU(RankModel):
         self,
         candidate_seq_embeddings: OrderedDict[str, JaggedTensor],
     ) -> torch.Tensor:  # [L, D]
-        all_embeddings = [x.values() for x in candidate_seq_embeddings.values()]
-        item_embeddings = self._item_embedding_mlp(torch.cat(all_embeddings, dim=-1))
+        all_embeddings = _fx_odict_jt_vcat(candidate_seq_embeddings)
+        item_embeddings = self._item_embedding_mlp(all_embeddings)
         return item_embeddings
 
     def preprocess(
@@ -273,19 +289,19 @@ class DlrmHSTU(RankModel):
         torch.Tensor,
     ]:
         """Do embedding lookup and prepare payload features."""
-        grouped_features = self.embedding_group(batch)
+        grouped_features = self.embedding_group.jagged_forward(batch)
 
-        features = {
-            **batch.sparse_features[BASE_DATA_GROUP].to_dict(),
-            **batch.sequence_dense_features,
-        }
+        sparse_features = batch.sparse_features[BASE_DATA_GROUP].to_dict()
+        sequence_dense_features = batch.sequence_dense_features
 
         num_candidates = _fx_mark_length_features(
-            features[self._model_config.candidates_id_feature_name].lengths()
+            sparse_features[self._model_config.candidates_id_feature_name].lengths()
         )
         max_num_candidates = _fx_infer_max_len(num_candidates)
 
-        uih_seq_lengths = features[self._model_config.uih_id_feature_name].lengths()
+        uih_seq_lengths = sparse_features[
+            self._model_config.uih_id_feature_name
+        ].lengths()
         max_uih_len = _fx_infer_max_len(uih_seq_lengths)
 
         # prepare payload features
@@ -293,8 +309,13 @@ class DlrmHSTU(RankModel):
         for (
             uih_feature_name,
             candidate_feature_name,
+            is_sparse,
         ) in self._merge_uih_candidate_payload_mapping:
-            values_left = features[uih_feature_name].values()
+            if is_sparse:
+                values_left = sparse_features[uih_feature_name].values().unsqueeze(-1)
+            else:
+                values_left = sequence_dense_features[uih_feature_name].values()
+
             if self._is_inference and (
                 candidate_feature_name
                 == self._model_config.candidates_action_weight_feature_name
@@ -304,22 +325,27 @@ class DlrmHSTU(RankModel):
                 total_candidates = torch.sum(num_candidates).item()
                 values_right = torch.zeros(
                     total_candidates,  # pyre-ignore
-                    dtype=torch.int64,
+                    dtype=values_left.dtype,
                     device=values_left.device,
                 )
+            elif is_sparse:
+                values_right = (
+                    sparse_features[candidate_feature_name].values().unsqueeze(-1)
+                )
             else:
-                values_right = features[candidate_feature_name].values()
+                values_right = sequence_dense_features[candidate_feature_name].values()
+
             merged_values = concat_2D_jagged(
                 max_len_left=max_uih_len,
                 offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
                     uih_seq_lengths
                 ),
-                values_left=values_left.unsqueeze(-1),
+                values_left=values_left,
                 max_len_right=max_num_candidates,
                 offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
                     num_candidates
                 ),
-                values_right=values_right.unsqueeze(-1),
+                values_right=values_right,
                 kernel=Kernel.PYTORCH if self._is_inference else self.kernel(),
             ).squeeze(-1)
             payload_features[uih_feature_name] = merged_values
@@ -345,7 +371,7 @@ class DlrmHSTU(RankModel):
         uih_seq_lengths: torch.Tensor,
         max_num_candidates: int,
         num_candidates: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         """Forward User and Item network."""
         # merge uih and candidates embeddings
         uid_seq_embeddings = OrderedDict()
@@ -355,7 +381,7 @@ class DlrmHSTU(RankModel):
         ) in self._merge_uih_candidate_feature_mapping:
             uid_seq_embeddings[uih_feature_name] = JaggedTensor(
                 lengths=uih_seq_lengths + num_candidates,
-                embedding=concat_2D_jagged(
+                values=concat_2D_jagged(
                     max_len_left=max_uih_len,
                     offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
                         uih_seq_lengths
@@ -384,11 +410,24 @@ class DlrmHSTU(RankModel):
                 grouped_features["contextual"],
                 num_candidates=num_candidates,
             )
+        with record_function("## multitask_module ##"):
+            mt_preds = self._multitask_module(
+                candidates_user_embeddings, candidates_item_embeddings
+            )
 
-        return (
-            candidates_user_embeddings,
-            candidates_item_embeddings,
-        )
+        predictions = {}
+        for task_cfg in self._task_configs:
+            task_name = task_cfg.task_name
+            for loss_cfg in task_cfg.losses:
+                predictions.update(
+                    self._output_to_prediction_impl(
+                        mt_preds[task_name],
+                        loss_cfg,
+                        suffix=f"_{task_name}",
+                    )
+                )
+
+        return predictions
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
@@ -401,7 +440,7 @@ class DlrmHSTU(RankModel):
         """
         with record_function("## preprocess ##"):
             (
-                seq_embeddings,
+                grouped_features,
                 payload_features,
                 max_uih_len,
                 uih_seq_lengths,
@@ -411,13 +450,26 @@ class DlrmHSTU(RankModel):
 
         with record_function("## main_forward ##"):
             return self.main_forward(
-                seq_embeddings=seq_embeddings,
+                grouped_features=grouped_features,
                 payload_features=payload_features,
                 max_uih_len=max_uih_len,
                 uih_seq_lengths=uih_seq_lengths,
                 max_num_candidates=max_num_candidates,
                 num_candidates=num_candidates,
             )
+
+    def _get_label(batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
+        label_name = task_cfg.label_name
+        is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
+        if is_sparse_label:
+            label = batch.sparse_features[BASE_DATA_GROUP][label_name]
+        else:
+            label = batch.dense_features[BASE_DATA_GROUP][label_name]
+        if task_cfg.HasField("task_bitmask"):
+            label = (torch.bitwise_and(label, task_cfg.task_bitmask) > 0).to(
+                label.dtype
+            )
+        return label
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
@@ -426,17 +478,14 @@ class DlrmHSTU(RankModel):
         losses = {}
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label_name = task_cfg.label_name
-
-            if task_cfg.HasField("task_bitmask"):
-                _ = batch.sparse_features[BASE_DATA_GROUP][label_name]
+            label = self._get_label(batch, task_cfg)
 
             for loss_cfg in task_cfg.losses:
                 losses.update(
                     self._loss_impl(
                         predictions,
                         batch,
-                        batch.labels[label_name],
+                        label,
                         None,
                         loss_cfg,
                         suffix=f"_{task_name}",
@@ -472,12 +521,13 @@ class DlrmHSTU(RankModel):
         """
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label_name = task_cfg.label_name
+            label = self._get_label(batch, task_cfg)
+
             for metric_cfg in task_cfg.metrics:
                 self._update_metric_impl(
                     predictions,
                     batch,
-                    label_name,
+                    label,
                     metric_cfg,
                     suffix=f"_{task_name}",
                 )
@@ -486,7 +536,7 @@ class DlrmHSTU(RankModel):
                     self._update_loss_metric_impl(
                         losses,
                         batch,
-                        label_name,
+                        label,
                         loss_cfg,
                         suffix=f"_{task_name}",
                     )

@@ -58,6 +58,7 @@ def create_test_module(
         module = symbolic_trace(module)
     elif graph_type == TestGraphType.JIT_SCRIPT:
         module = symbolic_trace(module)
+        print(module.code)
         module = torch.jit.script(module)
     return module
 
