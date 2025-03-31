@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -1244,7 +1244,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sequence_mulval_lengths: KeyedJaggedTensor,
         sparse_feature_user: KeyedJaggedTensor,
         sequence_mulval_lengths_user: KeyedJaggedTensor,
-    ):
+    ) -> Tuple[Dict[str, JaggedTensor], Dict[str, torch.Tensor]]:
         sparse_jt_dict_list = []
         seq_mulval_length_jt_dict_list = []
         dense_t_dict = {}
@@ -1419,10 +1419,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
     def jagged_forward(
         self,
-        sparse_feature: KeyedTensor,
+        sparse_feature: KeyedJaggedTensor,
         dense_feature: KeyedTensor,
-        sequence_dense_features: KeyedTensor,
-        sequence_mulval_lengths: KeyedTensor,
+        sequence_dense_features: Dict[str, JaggedTensor],
+        sequence_mulval_lengths: KeyedJaggedTensor,
     ) -> Dict[str, OrderedDict[str, JaggedTensor]]:
         """Forward the module.
 
@@ -1445,8 +1445,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             dense_feature,
             sequence_dense_features,
             sequence_mulval_lengths,
-            None,
-            None,
+            EMPTY_KJT,
+            EMPTY_KJT,
         )
 
         results = {}
