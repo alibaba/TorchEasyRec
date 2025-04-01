@@ -13,7 +13,7 @@
 import os
 import unittest
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, List, Optional, Union
 
 import torch
 from parameterized import parameterized
@@ -21,7 +21,7 @@ from torch import nn
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
-from tzrec.features.feature import create_features
+from tzrec.features.feature import BaseFeature, create_features
 from tzrec.modules.embedding import (
     EMPTY_KJT,
     EmbeddingGroup,
@@ -29,6 +29,7 @@ from tzrec.modules.embedding import (
     SequenceEmbeddingGroupImpl,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
+from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -447,7 +448,31 @@ class EmbeddingGroupTest(unittest.TestCase):
                 group_type=model_pb2.FeatureGroupType.SEQUENCE,
             ),
         ]
-        embedding_group = SequenceEmbeddingGroupImpl(
+
+        class SequenceEmbeddingGroupImplJaggedForward(SequenceEmbeddingGroupImpl):
+            def __init__(
+                self,
+                features: List[BaseFeature],
+                feature_groups: List[Union[FeatureGroupConfig, SeqGroupConfig]],
+                device: Optional[torch.device] = None,
+            ):
+                super().__init__(features, feature_groups, device)
+
+            def forward(
+                self,
+                sparse_feature: KeyedJaggedTensor,
+                dense_feature: KeyedTensor,
+                sequence_dense_features: Dict[str, JaggedTensor],
+                sequence_mulval_lengths: KeyedJaggedTensor,
+            ) -> Dict[str, Dict[str, JaggedTensor]]:
+                return self.jagged_forward(
+                    sparse_feature,
+                    dense_feature,
+                    sequence_dense_features,
+                    sequence_mulval_lengths,
+                )
+
+        embedding_group = SequenceEmbeddingGroupImplJaggedForward(
             features, feature_groups, device=torch.device("cpu")
         )
         self.assertEqual(embedding_group.group_dims("click"), [16, 8, 1, 16, 8, 1])
@@ -480,7 +505,7 @@ class EmbeddingGroupTest(unittest.TestCase):
             values=torch.tensor([[x] for x in range(10)], dtype=torch.float32),
             lengths=torch.tensor([3, 3, 2, 2]),
         ).to_dict()
-        result = embedding_group.jagged_forward(
+        result = embedding_group(
             sparse_feature,
             dense_feature,
             sequence_dense_feature,
