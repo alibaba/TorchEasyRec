@@ -155,11 +155,10 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         self,
         losses: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_cfg: LossConfig,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
         loss = losses[loss_name]
