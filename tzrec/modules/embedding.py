@@ -1453,7 +1453,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         for group_name, v in self._group_to_shared_feature.items():
             group_result = OrderedDict()
             for info in v:
-                if info.is_sparse:
+                if info.is_sparse or info.is_sequence:
                     jt = jt_dict[info.name]
                 else:
                     jt = _dense_to_jt(dense_t_dict[info.name])

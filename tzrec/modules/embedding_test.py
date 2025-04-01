@@ -421,6 +421,86 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            [TestGraphType.JIT_SCRIPT],
+        ]
+    )
+    def test_sequence_embedding_group_impl_jagged_forward(self, graph_type) -> None:
+        features = _create_test_sequence_features()
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="click",
+                feature_names=[
+                    "cat_a",
+                    "cat_b",
+                    "int_a",
+                    "click_seq__cat_a",
+                    "click_seq__cat_b",
+                    "click_seq__int_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="buy",
+                feature_names=["cat_a", "int_a", "buy_seq__cat_a", "buy_seq__int_a"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        embedding_group = SequenceEmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertEqual(embedding_group.group_dims("click"), [16, 8, 1, 16, 8, 1])
+        self.assertEqual(embedding_group.group_dims("buy"), [16, 1, 16, 1])
+        self.assertEqual(embedding_group.group_total_dim("click"), 50)
+        self.assertEqual(embedding_group.group_total_dim("buy"), 34)
+
+        embedding_group = create_test_module(embedding_group, graph_type)
+
+        values = torch.tensor(list(range(24)))
+        lengths = torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2])
+        sequence_mulval_lengths = EMPTY_KJT
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=[
+                "cat_a",
+                "cat_b",
+                "click_seq__cat_a",
+                "click_seq__cat_b",
+                "buy_seq__cat_a",
+                "buy_seq__cat_b",
+            ],
+            values=values,
+            lengths=lengths,
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        sequence_dense_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__int_a", "buy_seq__int_a"],
+            values=torch.tensor([[x] for x in range(10)], dtype=torch.float32),
+            lengths=torch.tensor([3, 3, 2, 2]),
+        ).to_dict()
+        result = embedding_group.jagged_forward(
+            sparse_feature,
+            dense_feature,
+            sequence_dense_feature,
+            sequence_mulval_lengths,
+        )
+        self.assertEqual(len(result["click"]), 6)
+        self.assertEqual(len(result["buy"]), 4)
+        self.assertEqual(result["click"]["cat_a"].values().size(), (2, 16))
+        self.assertEqual(result["click"]["cat_b"].values().size(), (2, 8))
+        self.assertEqual(result["click"]["int_a"].values().size(), (2, 1))
+        self.assertEqual(result["click"]["click_seq__cat_a"].values().size(), (6, 16))
+        self.assertEqual(result["click"]["click_seq__cat_b"].values().size(), (6, 8))
+        self.assertEqual(result["click"]["click_seq__int_a"].values().size(), (6, 1))
+        self.assertEqual(result["buy"]["cat_a"].values().size(), (2, 16))
+        self.assertEqual(result["buy"]["int_a"].values().size(), (2, 1))
+        self.assertEqual(result["buy"]["buy_seq__cat_a"].values().size(), (4, 16))
+        self.assertEqual(result["buy"]["buy_seq__int_a"].values().size(), (4, 1))
+
+    @parameterized.expand(
+        [
             [TestGraphType.NORMAL, False],
             [TestGraphType.FX_TRACE, False],
             [TestGraphType.JIT_SCRIPT, False],
