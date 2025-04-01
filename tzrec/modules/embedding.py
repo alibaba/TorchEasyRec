@@ -1245,9 +1245,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sparse_feature_user: KeyedJaggedTensor,
         sequence_mulval_lengths_user: KeyedJaggedTensor,
     ) -> Tuple[Dict[str, JaggedTensor], Dict[str, torch.Tensor]]:
-        sparse_jt_dict_list = []
-        seq_mulval_length_jt_dict_list = []
-        dense_t_dict = {}
+        sparse_jt_dict_list: List[Dict[str, JaggedTensor]] = []
+        seq_mulval_length_jt_dict_list: List[Dict[str, JaggedTensor]] = []
+        dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
             for ec in self.ec_list:
@@ -1260,17 +1260,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
-        # do user-side embedding input-tile
         if self.has_sparse_user:
             for ec in self.ec_list_user:
                 sparse_jt_dict_list.append(ec(sparse_feature_user))
 
-        # do user-side embedding input-tile
         if self.has_mc_sparse_user:
             for ec in self.mc_ec_list_user:
                 sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
-        # do user-side embedding input-tile
         if self.has_mulval_seq_user:
             seq_mulval_length_jt_dict_list.append(
                 sequence_mulval_lengths_user.to_dict()
@@ -1284,7 +1281,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         if self.has_dense:
             dense_t_dict = dense_feature.to_dict()
 
-        seq_jt_dict = {}
+        seq_jt_dict: Dict[str, JaggedTensor] = {}
         for _, v in self._group_to_shared_sequence.items():
             for info in v:
                 if info.name in seq_jt_dict:
@@ -1309,7 +1306,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     )
                 seq_jt_dict[info.name] = jt
 
-        jt_dict = _merge_list_of_jt_dict([sparse_jt_dict, seq_jt_dict])
+        if len(seq_jt_dict) > 0:
+            jt_dict = _merge_list_of_jt_dict([sparse_jt_dict, seq_jt_dict])
+        else:
+            jt_dict = sparse_jt_dict
 
         return jt_dict, dense_t_dict
 
