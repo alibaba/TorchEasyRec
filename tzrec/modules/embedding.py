@@ -1298,12 +1298,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     length_jt = seq_mulval_length_jt_dict[info.raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
-                    key_lengths = length_jt.values()
-                    if info.pooling == "mean":
-                        key_lengths = key_lengths.clamp(min=1)
                     jt_values = torch.segment_reduce(
-                        jt.values(), info.pooling, lengths=key_lengths
+                        jt.values(), info.pooling, lengths=length_jt.values()
                     )
+                    if info.pooling == "mean":
+                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
                     jt = JaggedTensor(
                         values=jt_values,
                         lengths=length_jt.lengths(),
