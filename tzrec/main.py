@@ -70,11 +70,13 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
+from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
@@ -233,7 +235,12 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
-    model = model_cls(model_config, features, labels, sample_weights=sample_weights)
+    model: BaseModel = model_cls(
+        model_config, features, labels, sample_weights=sample_weights
+    )
+
+    kernel = Kernel[KernelProto.Name(model_config.kernel)]
+    model.set_kernel(kernel)
     return model
 
 
@@ -927,6 +934,7 @@ def export(
         features,
         list(data_config.label_fields),
     )
+    cpu_model.set_is_inference(True)
 
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     if isinstance(cpu_model, MatchModel):
