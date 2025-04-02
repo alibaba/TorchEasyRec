@@ -28,11 +28,9 @@ from tzrec.modules.mlp import MLP
 from tzrec.protos.seq_encoder_pb2 import SeqEncoderConfig
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.fx_util import fx_arange
 
-
-@torch.fx.wrap
-def _arange(end: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(end, device=device)
+torch.fx.wrap(fx_arange)
 
 
 _SEQ_ENCODER_CLASS_MAP = {}
@@ -94,7 +92,7 @@ class DINEncoder(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         max_seq_length = sequence.size(1)
-        sequence_mask = _arange(
+        sequence_mask = fx_arange(
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
 
@@ -142,7 +140,7 @@ class SimpleAttention(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         max_seq_length = sequence.size(1)
-        sequence_mask = _arange(max_seq_length, sequence_length.device).unsqueeze(
+        sequence_mask = fx_arange(max_seq_length, sequence_length.device).unsqueeze(
             0
         ) < sequence_length.unsqueeze(1)
 
@@ -244,7 +242,7 @@ class MultiWindowDINEncoder(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         max_seq_length = sequence.size(1)
-        sequence_mask = _arange(
+        sequence_mask = fx_arange(
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
 
@@ -378,13 +376,13 @@ class HSTUEncoder(SequenceEncoder):
 
         # Add positional embeddings and apply dropout
         positions = (
-            _arange(sequence.size(1), device=sequence.device)
+            fx_arange(sequence.size(1), device=sequence.device)
             .unsqueeze(0)
             .expand(sequence.size(0), -1)
         )
         sequence = sequence * (self._sequence_dim**0.5) + self.position_embed(positions)
         sequence = F.dropout(sequence, p=self.dropout_rate, training=self.training)
-        sequence_mask = _arange(
+        sequence_mask = fx_arange(
             sequence.size(1), device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
         sequence = sequence * sequence_mask.unsqueeze(-1).to(float_dtype)

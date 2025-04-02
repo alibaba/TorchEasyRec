@@ -52,6 +52,18 @@ def symbolic_trace(
     return _symbolic_trace(root, concrete_args, _leaf_modules)
 
 
+@torch.fx.wrap
+def fx_arange(len: int, device: torch.device) -> torch.Tensor:
+    """Fx trace wrapper for arange"""
+    return torch.arange(len, device=device)
+
+@torch.fx.wrap
+def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    """Unwrap optional tensor for trace."""
+    assert optional is not None, "Expected optional to be non-None Tensor"
+    return optional
+
+
 # We remove `inputs_to_device` to allow `IntNBitTableBatchedEmbeddingBagsCodegen`
 # temporarily to run on both CPU and GPU after applying `symbolic_trace`. Additionally,
 # we also can uncomment the following code to ensure it functions correctly, this may
