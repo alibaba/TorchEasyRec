@@ -222,12 +222,11 @@ class MatchModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_cfg: LossConfig,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
         losses = {}
-        label = batch.labels[label_name]
         sample_weight = (
             batch.sample_weights[self._sample_weight]
             if self._sample_weight
@@ -261,7 +260,9 @@ class MatchModel(BaseModel):
         losses = {}
         for loss_cfg in self._base_model_config.losses:
             losses.update(
-                self._loss_impl(predictions, batch, self._label_name, loss_cfg)
+                self._loss_impl(
+                    predictions, batch, batch.labels[self._label_name], loss_cfg
+                )
             )
         losses.update(self._loss_collection)
         return losses
@@ -288,12 +289,10 @@ class MatchModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         metric_cfg: MetricConfig,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
-
         metric_type = metric_cfg.WhichOneof("metric")
         metric_name = metric_type + suffix
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
@@ -323,10 +322,14 @@ class MatchModel(BaseModel):
             losses (dict, optional): a dict of loss.
         """
         for metric_cfg in self._base_model_config.metrics:
-            self._update_metric_impl(predictions, batch, self._label_name, metric_cfg)
+            self._update_metric_impl(
+                predictions, batch, batch.labels[self._label_name], metric_cfg
+            )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
-                self._update_loss_metric_impl(losses, batch, self._label_name, loss_cfg)
+                self._update_loss_metric_impl(
+                    losses, batch, batch.labels[self._label_name], loss_cfg
+                )
 
 
 class TowerWrapper(nn.Module):
