@@ -1,1 +1,2 @@
 torch-tensorrt==2.6.0
+triton==3.2.0
