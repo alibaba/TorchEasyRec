@@ -16,9 +16,13 @@
 from typing import List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
-from triton.runtime.autotuner import autotune as triton_autotune
+
+try:
+    import triton
+    import triton.language as tl
+    from triton.runtime.autotuner import autotune as triton_autotune
+except Exception:
+    pass
 
 from tzrec.ops.triton.triton_addmm import triton_addmm_fwd
 from tzrec.ops.utils import (

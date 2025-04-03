@@ -18,12 +18,12 @@ from typing import List, Tuple
 
 import torch
 
-# @manual=//triton:triton
-import triton
-
-# @manual=//triton:triton
-import triton.language as tl
-from triton.runtime.autotuner import autotune as triton_autotune
+try:
+    import triton
+    import triton.language as tl
+    from triton.runtime.autotuner import autotune as triton_autotune
+except Exception:
+    pass
 
 ENABLE_FULL_TURNING_SPACE = False
 

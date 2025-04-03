@@ -189,8 +189,9 @@ def get_test_dtypes(dtypes: List[torch.dtype]) -> List[torch.dtype]:
     results = []
     for dtype in dtypes:
         if dtype == torch.bfloat16:
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8:
-                results.append(dtype)
+            if torch.cuda.is_available():
+                if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8:
+                    results.append(dtype)
         else:
             results.append(dtype)
     return results

@@ -68,7 +68,7 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
-    @unittest.skipIf(*unittest_gpu_unavailable)
+    @unittest.skipIf(*gpu_unavailable)
     def test_aot_export(self):
         pipeline_config_path = "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         self.success = utils.test_train_eval(
