@@ -27,8 +27,8 @@ from tzrec.modules.hstu import (
 from tzrec.modules.mlp import MLP
 from tzrec.protos.seq_encoder_pb2 import SeqEncoderConfig
 from tzrec.utils import config_util
-from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.fx_util import fx_arange
+from tzrec.utils.load_class import get_register_class_meta
 
 torch.fx.wrap(fx_arange)
 

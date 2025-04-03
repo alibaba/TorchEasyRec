@@ -21,7 +21,12 @@ from tzrec.ops import (
     Kernel,
 )
 from tzrec.ops.jagged_tensors import split_2D_jagged
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable, hypothesis_settings as settings, get_test_dtypes
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 def test_attn(
@@ -250,9 +255,7 @@ class HSTUAttentionTest(unittest.TestCase):
         hidden_dim=st.sampled_from([16, 32, 64, 128]),
         causal=st.sampled_from([True]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
     )
@@ -313,9 +316,7 @@ class HSTUAttentionTest(unittest.TestCase):
         attn_dim=st.sampled_from([16, 32, 64, 128]),
         hidden_dim=st.sampled_from([16, 32, 64, 128]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([False, True]),
         contextual_seq_len=st.sampled_from([0, 10]),
     )
@@ -344,9 +345,7 @@ class HSTUAttentionTest(unittest.TestCase):
         attn_dim=st.sampled_from([16, 32, 64]),
         hidden_dim=st.sampled_from([16, 32, 64]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([False, True]),
         contextual_seq_len=st.sampled_from([0, 10]),
     )

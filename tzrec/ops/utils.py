@@ -39,9 +39,9 @@ def prev_power_of_2(x: int) -> int:
         return out // 2 if out > x else out
 
 
-
 STATIC_MAX_SEQ_LENS: List[int] = []
 USE_RUNTIME_MAX_SEQ_LEN: bool = False
+
 
 def set_static_max_seq_lens(max_seq_lens: List[int]) -> None:
     global STATIC_MAX_SEQ_LENS

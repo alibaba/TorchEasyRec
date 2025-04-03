@@ -21,7 +21,8 @@ from tzrec.ops.layer_norm import (
     layer_norm,
     swish_layer_norm,
 )
-from tzrec.utils.test_util import gpu_unavailable, hypothesis_settings as settings, get_test_dtypes
+from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class LayerNormTest(unittest.TestCase):
@@ -31,9 +32,7 @@ class LayerNormTest(unittest.TestCase):
         N=st.sampled_from([4200000]),
         D=st.sampled_from([512]),
         is_swish=st.sampled_from([False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float16])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
         deadline=None,
@@ -56,9 +55,7 @@ class LayerNormTest(unittest.TestCase):
         N=st.integers(min_value=0, max_value=10000),
         D=st.integers(min_value=32, max_value=512),
         is_swish=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         deadline=None,

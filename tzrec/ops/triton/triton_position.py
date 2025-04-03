@@ -29,6 +29,7 @@ from tzrec.ops.utils import (
 
 torch.fx.wrap(prev_power_of_2)
 
+
 def _add_position_embeddings_configs() -> List[triton.Config]:
     configs = []
     for BLOCK_N in [16, 32, 64]:

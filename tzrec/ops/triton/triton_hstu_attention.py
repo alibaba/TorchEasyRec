@@ -1,3 +1,14 @@
+# Copyright (c) 2025, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +30,8 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from triton.runtime.autotuner import autotune as triton_autotune
+
 from tzrec.ops.utils import (
     autotune_max_seq_len,
     prev_power_of_2,
@@ -39,6 +50,7 @@ except ImportError:
 
 
 torch.fx.wrap(prev_power_of_2)
+
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     configs = []
@@ -800,7 +812,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
     dqk_trans = tl.where(invalid_mask_trans, dqk_trans, 0)
     dqk_trans = dqk_trans.to(k.dtype)
 
-    # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
+    # Note: the factor `alpha` is delayed until the end of the function to reduce the cost  # NOQA
     dk += tl.dot(dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32)
     if ATOMIC_ADD:
         lock_id = start_m // BLOCK_M
@@ -1027,7 +1039,7 @@ def _get_bw_configs() -> List[triton.Config]:
                                             {
                                                 "BLOCK_M": BLOCK_M,
                                                 "BLOCK_N": BLOCK_N,
-                                                "matrix_instr_nonkdim": matrix_instr_nonkdim,
+                                                "matrix_instr_nonkdim": matrix_instr_nonkdim,  # NOQA
                                                 "waves_per_eu": waves_per_eu,
                                                 "SEQUENCE_PARALLEL": sp,
                                                 "UNROLL": 1,

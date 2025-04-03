@@ -34,9 +34,7 @@ def pytorch_add_position_embeddings(
 ) -> torch.Tensor:
     jagged = jagged * scale
     B = high_inds.size(0)
-    col_indices = fx_arange(max_seq_len, device=high_inds.device).expand(
-        B, max_seq_len
-    )
+    col_indices = fx_arange(max_seq_len, device=high_inds.device).expand(B, max_seq_len)
     col_indices = torch.clamp(col_indices, max=high_inds.view(-1, 1))
     dense_values = torch.index_select(dense, 0, col_indices.reshape(-1)).view(
         B, max_seq_len, -1

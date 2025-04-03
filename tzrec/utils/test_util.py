@@ -9,20 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
-from typing import Dict, List, Union, Tuple
-
 import os
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
 import torch
+from hypothesis import settings as _settings
+from hypothesis.utils.conventions import not_set as _not_set
 from torch import nn
 from torch.fx import GraphModule
 
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
-from hypothesis._settings import settings as _settings, not_set as _not_set , is_in_ci as _is_in_ci
-
 
 nv_gpu_unavailable: Tuple[bool, str] = (
     not torch.cuda.is_available() or torch.cuda.device_count() == 0,
@@ -102,11 +102,20 @@ def parameterized_name_func(func, num, p) -> str:
 
 class hypothesis_settings(_settings):
     """Hypothesis settings for TorchEasyRec."""
-    def __init__(self, parent = None, *, max_examples: int = _not_set, **kwargs):
-        if _is_in_ci():
+
+    # pyre-ignore[9]
+    def __init__(
+        self,
+        parent: Optional[_settings] = None,
+        *,
+        max_examples: int = _not_set,
+        **kwargs: Any,
+    ) -> None:
+        if eval(os.environ.get("CI", "False")):
             if max_examples != _not_set:
                 max_examples = max(1, max_examples // 5)
         super().__init__(parent, max_examples=max_examples, **kwargs)
+
 
 def dicts_are_equal(
     dict1: Dict[str, torch.Tensor], dict2: Dict[str, torch.Tensor]
@@ -173,7 +182,7 @@ def generate_sparse_seq_len(
             device=device,
             dtype=torch.int,
         )
-    
+
 
 def get_test_dtypes(dtypes: List[torch.dtype]) -> List[torch.dtype]:
     """Get valid test dtypes."""

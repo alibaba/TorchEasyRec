@@ -54,8 +54,9 @@ def symbolic_trace(
 
 @torch.fx.wrap
 def fx_arange(len: int, device: torch.device) -> torch.Tensor:
-    """Fx trace wrapper for arange"""
+    """Fx trace wrapper for arange."""
     return torch.arange(len, device=device)
+
 
 @torch.fx.wrap
 def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:

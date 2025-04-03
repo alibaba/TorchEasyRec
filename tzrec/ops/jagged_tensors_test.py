@@ -17,7 +17,12 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable, hypothesis_settings as settings, get_test_dtypes
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class JaggedTensorsTest(unittest.TestCase):
@@ -30,9 +35,7 @@ class JaggedTensorsTest(unittest.TestCase):
         D=st.integers(10, 30),
         is_dense_a=st.sampled_from([True, False]),
         is_dense_b=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -150,9 +153,7 @@ class JaggedTensorsTest(unittest.TestCase):
         D=st.integers(10, 30),
         is_dense_a=st.sampled_from([True, False]),
         is_dense_b=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -178,9 +179,7 @@ class JaggedTensorsTest(unittest.TestCase):
         D=st.sampled_from([256]),
         is_dense_a=st.sampled_from([True, False]),
         is_dense_b=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -306,9 +305,7 @@ class JaggedTensorsTest(unittest.TestCase):
         contextual_seq_len=st.sampled_from([0, 10]),
         max_targets=st.sampled_from([10, 20]),
         D=st.integers(10, 30),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -398,9 +395,7 @@ class JaggedTensorsTest(unittest.TestCase):
         contextual_seq_len=st.sampled_from([3]),
         max_targets=st.sampled_from([2]),
         D=st.integers(10, 10),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.bfloat16, torch.float32])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,

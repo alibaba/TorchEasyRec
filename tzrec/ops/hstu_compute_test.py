@@ -36,7 +36,12 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable, hypothesis_settings as settings, get_test_dtypes
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class HSTUComputeTest(unittest.TestCase):
@@ -51,9 +56,7 @@ class HSTUComputeTest(unittest.TestCase):
         num_heads=st.sampled_from([4]),
         training=st.just(False),
         recompute_y_in_backward=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            get_test_dtypes([torch.float32, torch.bfloat16])
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.float32, torch.bfloat16])),
     )
     @settings(
         deadline=None,

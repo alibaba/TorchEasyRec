@@ -18,7 +18,8 @@ from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
 from tzrec.ops.mm import addmm
-from tzrec.utils.test_util import gpu_unavailable, hypothesis_settings as settings, get_test_dtypes
+from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class MMlTest(unittest.TestCase):

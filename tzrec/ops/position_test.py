@@ -16,7 +16,12 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable, hypothesis_settings as settings, get_test_dtypes
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class PositionEmbeddingsTest(unittest.TestCase):
@@ -150,7 +155,9 @@ class PositionEmbeddingsTest(unittest.TestCase):
         D=st.integers(20, 200),
         max_targets=st.sampled_from([10, 20]),
         time_bucket_fn=st.sampled_from(["log"]),
-        dtype=st.sampled_from(get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])),
+        dtype=st.sampled_from(
+            get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])
+        ),
     )
     @settings(
         verbosity=Verbosity.verbose,
