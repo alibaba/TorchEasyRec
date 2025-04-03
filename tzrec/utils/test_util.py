@@ -103,11 +103,11 @@ def parameterized_name_func(func, num, p) -> str:
 class hypothesis_settings(_settings):
     """Hypothesis settings for TorchEasyRec."""
 
-    # pyre-ignore[9]
     def __init__(
         self,
         parent: Optional[_settings] = None,
         *,
+        # pyre-ignore[9]
         max_examples: int = _not_set,
         **kwargs: Any,
     ) -> None:
