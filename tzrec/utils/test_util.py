@@ -37,6 +37,10 @@ gpu_unavailable: Tuple[bool, str] = (
     "CUDA/HIP is not available or no GPUs detected",
 )
 
+_settings.register_profile(
+    "default", _settings(_settings.get_profile("default"), print_blob=True)
+)
+
 
 class TestGraphType(Enum):
     """Graph Type for Tests."""
@@ -111,7 +115,7 @@ class hypothesis_settings(_settings):
         max_examples: int = _not_set,
         **kwargs: Any,
     ) -> None:
-        if bool(os.environ.get("CI", "False")):
+        if os.environ.get("CI", "false").lower() == "true":
             if max_examples != _not_set:
                 max_examples = max(1, max_examples // 5)
         super().__init__(parent, max_examples=max_examples, **kwargs)

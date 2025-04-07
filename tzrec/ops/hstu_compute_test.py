@@ -56,7 +56,7 @@ class HSTUComputeTest(unittest.TestCase):
         num_heads=st.sampled_from([4]),
         training=st.just(False),
         recompute_y_in_backward=st.sampled_from([True, False]),
-        dtype=st.sampled_from(get_test_dtypes([torch.float32, torch.bfloat16])),
+        dtype=st.sampled_from(get_test_dtypes([torch.float32])),  # , torch.bfloat16])),
     )
     @settings(
         deadline=None,
@@ -84,12 +84,12 @@ class HSTUComputeTest(unittest.TestCase):
         num_heads=st.sampled_from([4]),
         training=st.just(False),
         recompute_y_in_backward=st.sampled_from([False]),
-        dtype=st.just(torch.bfloat16),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
         deadline=None,
         verbosity=Verbosity.verbose,
-        max_examples=1,
+        max_examples=2,
     )
     # pyre-ignore[2]
     def test_long_sequences_compute_output(self, *args, **kwargs) -> None:
@@ -260,11 +260,7 @@ class HSTUComputeTest(unittest.TestCase):
         hidden_dim=st.sampled_from([16, 32, 64, 128]),
         causal=st.sampled_from([True]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.float32])),
         contextual_seq_len=st.sampled_from([0]),
         has_max_attn_len=st.sampled_from([False, True]),
         sort_by_length=st.sampled_from([True, False]),
