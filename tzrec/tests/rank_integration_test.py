@@ -691,7 +691,7 @@ class RankIntegrationTest(unittest.TestCase):
             comp_cpu_gpu_pred_result=True,
         )
 
-    @unittest.skipIf(gpu_unavailable)
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_zch_with_fg_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
@@ -708,7 +708,7 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         )
 
-    @unittest.skipIf(gpu_unavailable)
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
@@ -742,14 +742,14 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
 
-    @unittest.skipIf(nv_gpu_unavailable)
+    @unittest.skipIf(*nv_gpu_unavailable)
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(nv_gpu_unavailable)
+    @unittest.skipIf(*nv_gpu_unavailable)
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",

@@ -111,7 +111,7 @@ class hypothesis_settings(_settings):
         max_examples: int = _not_set,
         **kwargs: Any,
     ) -> None:
-        if eval(os.environ.get("CI", "False")):
+        if bool(os.environ.get("CI", "False")):
             if max_examples != _not_set:
                 max_examples = max(1, max_examples // 5)
         super().__init__(parent, max_examples=max_examples, **kwargs)
