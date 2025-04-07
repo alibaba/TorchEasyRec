@@ -53,6 +53,19 @@ def symbolic_trace(
 
 
 @torch.fx.wrap
+def fx_arange(len: int, device: torch.device) -> torch.Tensor:
+    """Fx trace wrapper for arange."""
+    return torch.arange(len, device=device)
+
+
+@torch.fx.wrap
+def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    """Unwrap optional tensor for trace."""
+    assert optional is not None, "Expected optional to be non-None Tensor"
+    return optional
+
+
+@torch.fx.wrap
 def fx_int_item(x: torch.Tensor) -> int:
     """Fx trace wrapper for `int(x.item())`."""
     return int(x.item())

@@ -950,7 +950,7 @@ def load_config_for_test(
 
 
 def _standalone():
-    if bool(os.environ.get("CI", "False")):
+    if os.environ.get("CI", "false").lower() == "true":
         # When using GitHub Actions, a container network is created by GitHub, and
         # the host network cannot be utilized. This can lead to the error:
         # [c10d] The hostname of the client socket cannot be retrieved, error code: -3.
