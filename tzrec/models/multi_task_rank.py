@@ -122,7 +122,7 @@ class MultiTaskRank(RankModel):
                     self._loss_impl(
                         predictions,
                         batch,
-                        label_name,
+                        batch.labels[label_name],
                         loss_weight,
                         loss_cfg,
                         num_class=task_tower_cfg.num_class,
@@ -165,7 +165,7 @@ class MultiTaskRank(RankModel):
                 self._update_metric_impl(
                     predictions,
                     batch,
-                    label_name,
+                    batch.labels[label_name],
                     metric_cfg,
                     num_class=task_tower_cfg.num_class,
                     suffix=f"_{tower_name}",
@@ -175,7 +175,7 @@ class MultiTaskRank(RankModel):
                     self._update_loss_metric_impl(
                         losses,
                         batch,
-                        label_name,
+                        batch.labels[label_name],
                         loss_cfg,
                         suffix=f"_{tower_name}",
                     )

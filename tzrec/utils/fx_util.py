@@ -65,6 +65,12 @@ def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
     return optional
 
 
+@torch.fx.wrap
+def fx_int_item(x: torch.Tensor) -> int:
+    """Fx trace wrapper for `int(x.item())`."""
+    return int(x.item())
+
+
 # We remove `inputs_to_device` to allow `IntNBitTableBatchedEmbeddingBagsCodegen`
 # temporarily to run on both CPU and GPU after applying `symbolic_trace`. Additionally,
 # we also can uncomment the following code to ensure it functions correctly, this may
