@@ -17,13 +17,9 @@
 from typing import List, Tuple
 
 import torch
-
-try:
-    import triton
-    import triton.language as tl
-    from triton.runtime.autotuner import autotune as triton_autotune
-except Exception:
-    pass
+import triton
+import triton.language as tl
+from triton.runtime.autotuner import autotune as triton_autotune
 
 ENABLE_FULL_TURNING_SPACE = False
 

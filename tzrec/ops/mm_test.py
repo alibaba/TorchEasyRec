@@ -17,7 +17,6 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.ops.mm import addmm
 from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
 from tzrec.utils.test_util import hypothesis_settings as settings
 
@@ -67,6 +66,8 @@ class MMlTest(unittest.TestCase):
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
     ) -> None:
+        from tzrec.ops.mm import addmm
+
         # to enable more deterministic results.
         torch.manual_seed(0)
 

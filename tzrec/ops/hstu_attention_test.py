@@ -20,7 +20,6 @@ from hypothesis import strategies as st
 from tzrec.ops import (
     Kernel,
 )
-from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.test_util import (
     generate_sparse_seq_len,
     get_test_dtypes,
@@ -371,6 +370,7 @@ class HSTUAttentionTest(unittest.TestCase):
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
         from tzrec.ops.hstu_attention import delta_hstu_mha, hstu_mha
+        from tzrec.ops.jagged_tensors import split_2D_jagged
 
         alpha = 1.0 / (attn_dim**0.5)
         lengths = torch.randint(

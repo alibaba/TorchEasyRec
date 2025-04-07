@@ -17,10 +17,6 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.ops.layer_norm import (
-    layer_norm,
-    swish_layer_norm,
-)
 from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
 from tzrec.utils.test_util import hypothesis_settings as settings
 
@@ -81,6 +77,11 @@ class LayerNormTest(unittest.TestCase):
         real_kernel: Kernel,
         skip_comparisons: bool = False,
     ) -> None:
+        from tzrec.ops.layer_norm import (
+            layer_norm,
+            swish_layer_norm,
+        )
+
         N = N // 4 * 4
         x = (
             torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
