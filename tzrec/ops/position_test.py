@@ -188,7 +188,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
         max_contextual_seq_len=st.sampled_from([10]),
         interleave_targets=st.sampled_from([False]),
         batch_size=st.sampled_from([130]),
-        D=st.sampled_from([512]),
+        D=st.sampled_from([192]),
         max_targets=st.sampled_from([10]),
         time_bucket_fn=st.sampled_from(["log"]),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
