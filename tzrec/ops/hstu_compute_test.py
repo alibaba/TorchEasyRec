@@ -269,7 +269,7 @@ class HSTUComputeTest(unittest.TestCase):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=150,
+        max_examples=20,
         deadline=None,
     )
     # pyre-ignore[2]

@@ -297,6 +297,7 @@ class JaggedTensorsTest(unittest.TestCase):
             torch.testing.assert_close(ref_d_a, real_d_a)
             torch.testing.assert_close(ref_d_b, real_d_b)
 
+    @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
         batch_size=st.integers(2, 8),
@@ -387,6 +388,7 @@ class JaggedTensorsTest(unittest.TestCase):
         real_d_x = x.grad.clone()
         torch.testing.assert_close(ref_d_x, real_d_x)
 
+    @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
         batch_size=st.integers(1, 1),
