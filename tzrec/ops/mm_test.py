@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import unittest
 from typing import Optional
 
@@ -22,6 +23,11 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class MMlTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(

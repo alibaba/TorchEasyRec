@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import gc
 import unittest
 
 import torch
@@ -22,6 +23,11 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class LayerNormTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
