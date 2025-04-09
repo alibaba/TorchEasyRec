@@ -114,8 +114,10 @@ class CapsuleLayer(nn.Module):
         Return:
             [batch_size, max_k, high_dim]
         """
-        routing_logits_tmp = torch.zeros_like(inputs)[:, :, :1] + self.zeros_placehoder
-        routing_logits = torch.rand_like(routing_logits_tmp, device=inputs.device)
+        routing_logits_tmp = torch.zeros_like(inputs)[
+            :, :, :1
+        ] + self.zeros_placehoder.to(inputs.device)
+        routing_logits = torch.rand_like(routing_logits_tmp)
 
         routing_logits = (
             routing_logits * self._routing_logits_stddev + self._routing_logits_scale
