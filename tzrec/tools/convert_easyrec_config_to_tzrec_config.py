@@ -180,7 +180,6 @@ class ConvertConfig(object):
         pipeline_config.data_config.dataset_type = DatasetType.OdpsDataset
         pipeline_config.data_config.label_fields.extend(label_fields)
         pipeline_config.data_config.num_workers = 8
-        pipeline_config.data_config.odps_data_quota_name = ""
         return pipeline_config
 
     def _create_feature_config(self, pipeline_config):

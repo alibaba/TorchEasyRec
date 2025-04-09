@@ -120,7 +120,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表。配置文件的data_config.dataset_type需设置为OdpsDataset。
 
 ```bash
-ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.train_eval \
