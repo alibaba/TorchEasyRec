@@ -46,7 +46,7 @@ sample_weight_fields: 'col_name'
       project_name=${PROJECT_NAME}
       access_id=${ACCESS_ID}
       access_key=${ACCESS_KEY}
-      end_point=http://service.{region}.maxcompute.aliyun-inc.com/api
+      end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
       EOF
 
       ODPS_CONFIG_FILE_PATH=odps_conf \
@@ -58,14 +58,14 @@ sample_weight_fields: 'col_name'
     - **PAI-DLC/PAI-DSW环境**：
       - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
       ```bash
-      ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+      ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
       torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
       --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
       -m tzrec.train_eval \
       --pipeline_config_path ${PIPELINE_CONFIG}
       ```
 
-  - 如果是预付费Quota，可通过`odps_data_quota_name`传入购买的Quota名
+  - 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
 
   - 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
 
@@ -148,7 +148,7 @@ sample_weight_fields: 'col_name'
     cat <<EOF>> odps_conf
     access_id=${ACCESS_ID}
     access_key=${ACCESS_KEY}
-    end_point=http://service.${region}.maxcompute.aliyun-inc.com/api
+    end_point=http://service.${region}-vpc.maxcompute.aliyun-inc.com/api
     EOF
 
     ODPS_CONFIG_FILE_PATH=odps_conf \
