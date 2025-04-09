@@ -27,6 +27,8 @@ from tzrec.ops.utils import (
     switch_to_contiguous_if_needed,
 )
 
+torch.fx.wrap(prev_power_of_2)
+
 
 def _add_position_embeddings_configs() -> List[triton.Config]:
     configs = []

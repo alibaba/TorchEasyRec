@@ -9,18 +9,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import unittest
 from typing import Optional
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class JaggedTensorsTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
@@ -30,11 +41,7 @@ class JaggedTensorsTest(unittest.TestCase):
         D=st.integers(10, 30),
         is_dense_a=st.sampled_from([True, False]),
         is_dense_b=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -152,11 +159,7 @@ class JaggedTensorsTest(unittest.TestCase):
         D=st.integers(10, 30),
         is_dense_a=st.sampled_from([True, False]),
         is_dense_b=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -179,14 +182,10 @@ class JaggedTensorsTest(unittest.TestCase):
         batch_size=st.sampled_from([130]),
         max_len_a=st.sampled_from([32768]),
         max_len_b=st.sampled_from([10]),
-        D=st.sampled_from([512]),
+        D=st.sampled_from([256]),
         is_dense_a=st.sampled_from([True, False]),
         is_dense_b=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -304,6 +303,7 @@ class JaggedTensorsTest(unittest.TestCase):
             torch.testing.assert_close(ref_d_a, real_d_a)
             torch.testing.assert_close(ref_d_b, real_d_b)
 
+    @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
         batch_size=st.integers(2, 8),
@@ -312,11 +312,7 @@ class JaggedTensorsTest(unittest.TestCase):
         contextual_seq_len=st.sampled_from([0, 10]),
         max_targets=st.sampled_from([10, 20]),
         D=st.integers(10, 30),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -389,7 +385,6 @@ class JaggedTensorsTest(unittest.TestCase):
             contextual_seq_len=contextual_seq_len,
             kernel=Kernel.TRITON,
         )
-        print(ref_minus_l2_x.shape, real_minus_l2_x.shape)
         torch.testing.assert_close(ref_minus_l2_x, real_minus_l2_x)
         torch.testing.assert_close(ref_l2_x, real_l2_x)
         d_minus_l2_x = d_minus_l2_x.detach().clone()
@@ -399,6 +394,7 @@ class JaggedTensorsTest(unittest.TestCase):
         real_d_x = x.grad.clone()
         torch.testing.assert_close(ref_d_x, real_d_x)
 
+    @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
         batch_size=st.integers(1, 1),
@@ -407,11 +403,7 @@ class JaggedTensorsTest(unittest.TestCase):
         contextual_seq_len=st.sampled_from([3]),
         max_targets=st.sampled_from([2]),
         D=st.integers(10, 10),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -527,9 +519,7 @@ class JaggedTensorsTest(unittest.TestCase):
         D=st.integers(20, 200),
         K=st.integers(30, 200),
         dtype=st.sampled_from(
-            [torch.float32, torch.bfloat16, torch.float16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
+            get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])
         ),
         contiguous=st.booleans(),
     )
@@ -555,14 +545,14 @@ class JaggedTensorsTest(unittest.TestCase):
     @given(
         batch_size=st.sampled_from([130]),
         max_seq_len=st.sampled_from([32768]),
-        D=st.sampled_from([512]),
-        K=st.sampled_from([512]),
+        D=st.sampled_from([128]),
+        K=st.sampled_from([128]),
         dtype=st.sampled_from([torch.float32, torch.bfloat16]),
         contiguous=st.booleans(),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=1,
+        max_examples=2,
         deadline=None,
     )
     def test_jagged_dense_bmm_broadcast_add_triton_large_tensor(

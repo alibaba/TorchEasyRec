@@ -22,7 +22,7 @@ from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
 from tzrec.utils import config_util
-from tzrec.utils.test_util import dfs_are_close
+from tzrec.utils.test_util import dfs_are_close, gpu_unavailable, nv_gpu_unavailable
 
 
 class RankIntegrationTest(unittest.TestCase):
@@ -68,7 +68,7 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    @unittest.skipIf(*gpu_unavailable)
     def test_aot_export(self):
         pipeline_config_path = "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         self.success = utils.test_train_eval(
@@ -691,7 +691,7 @@ class RankIntegrationTest(unittest.TestCase):
             comp_cpu_gpu_pred_result=True,
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_zch_with_fg_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
@@ -708,7 +708,7 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
@@ -742,14 +742,14 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    @unittest.skipIf(*nv_gpu_unavailable)
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "cuda not found")
+    @unittest.skipIf(*nv_gpu_unavailable)
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",

@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -41,6 +41,9 @@ from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
 from tzrec.utils.fx_util import fx_int_item
 
+EMPTY_KJT = KeyedJaggedTensor.empty()
+
+
 torch.fx.wrap(fx_int_item)
 
 
@@ -67,7 +70,7 @@ def _merge_list_of_tensor_dict(
 
 
 @torch.fx.wrap
-def _merge_list_of_dict_of_jt_odict(
+def _merge_list_of_dict_of_jt_dict(
     list_of_dict_of_jt_odict: List[Dict[str, Dict[str, JaggedTensor]]],
 ) -> Dict[str, Dict[str, JaggedTensor]]:
     result: Dict[str, Dict[str, JaggedTensor]] = {}
@@ -121,23 +124,15 @@ def _dense_to_jt(t: torch.Tensor) -> JaggedTensor:
 
 
 @torch.fx.wrap
-def _cast_away_kjt_optional(arg: Optional[KeyedJaggedTensor]) -> KeyedJaggedTensor:
-    assert arg is not None
-    return arg
-
-
-@torch.fx.wrap
-def _cast_away_kt_optional(arg: Optional[KeyedTensor]) -> KeyedTensor:
-    assert arg is not None
-    return arg
-
-
-@torch.fx.wrap
-def _cast_away_jt_dict_optional(
-    arg: Optional[Dict[str, JaggedTensor]],
-) -> Dict[str, JaggedTensor]:
-    assert arg is not None
-    return arg
+def _dense_to_jt(t: torch.Tensor) -> JaggedTensor:
+    return JaggedTensor(
+        values=t,
+        lengths=torch.ones(
+            t.shape[0],
+            dtype=torch.int64,
+            device=t.device,
+        ),
+    )
 
 
 class EmbeddingGroup(nn.Module):
@@ -1011,7 +1006,7 @@ class SequenceEmbeddingGroup(nn.Module):
                 )
             )
 
-        result = _merge_list_of_dict_of_jt_odict(result_dicts)
+        result = _merge_list_of_dict_of_jt_dict(result_dicts)
         return result
 
 
@@ -1261,10 +1256,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sequence_mulval_lengths: KeyedJaggedTensor,
         sparse_feature_user: KeyedJaggedTensor,
         sequence_mulval_lengths_user: KeyedJaggedTensor,
-    ):
-        sparse_jt_dict_list = []
-        seq_mulval_length_jt_dict_list = []
-        dense_t_dict = {}
+    ) -> Tuple[Dict[str, JaggedTensor], Dict[str, torch.Tensor]]:
+        sparse_jt_dict_list: List[Dict[str, JaggedTensor]] = []
+        seq_mulval_length_jt_dict_list: List[Dict[str, JaggedTensor]] = []
+        dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
             for ec in self.ec_list:
@@ -1277,17 +1272,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
-        # do user-side embedding input-tile
         if self.has_sparse_user:
             for ec in self.ec_list_user:
                 sparse_jt_dict_list.append(ec(sparse_feature_user))
 
-        # do user-side embedding input-tile
         if self.has_mc_sparse_user:
             for ec in self.mc_ec_list_user:
                 sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
-        # do user-side embedding input-tile
         if self.has_mulval_seq_user:
             seq_mulval_length_jt_dict_list.append(
                 sequence_mulval_lengths_user.to_dict()
@@ -1301,7 +1293,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         if self.has_dense:
             dense_t_dict = dense_feature.to_dict()
 
-        seq_jt_dict = {}
+        seq_jt_dict: Dict[str, JaggedTensor] = {}
         for _, v in self._group_to_shared_sequence.items():
             for info in v:
                 if info.name in seq_jt_dict:
@@ -1315,19 +1307,21 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     length_jt = seq_mulval_length_jt_dict[info.raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
-                    key_lengths = length_jt.values()
-                    if info.pooling == "mean":
-                        key_lengths = key_lengths.clamp(min=1)
                     jt_values = torch.segment_reduce(
-                        jt.values(), info.pooling, lengths=key_lengths
+                        jt.values(), info.pooling, lengths=length_jt.values()
                     )
+                    if info.pooling == "mean":
+                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
                     jt = JaggedTensor(
                         values=jt_values,
                         lengths=length_jt.lengths(),
                     )
                 seq_jt_dict[info.name] = jt
 
-        jt_dict = _merge_list_of_jt_dict([sparse_jt_dict, seq_jt_dict])
+        if len(seq_jt_dict) > 0:
+            jt_dict = _merge_list_of_jt_dict([sparse_jt_dict, seq_jt_dict])
+        else:
+            jt_dict = sparse_jt_dict
 
         return jt_dict, dense_t_dict
 
@@ -1436,10 +1430,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
     def jagged_forward(
         self,
-        sparse_feature: KeyedTensor,
+        sparse_feature: KeyedJaggedTensor,
         dense_feature: KeyedTensor,
-        sequence_dense_features: KeyedTensor,
-        sequence_mulval_lengths: KeyedTensor,
+        sequence_dense_features: Dict[str, JaggedTensor],
+        sequence_mulval_lengths: KeyedJaggedTensor,
     ) -> Dict[str, OrderedDict[str, JaggedTensor]]:
         """Forward the module.
 
@@ -1462,15 +1456,15 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             dense_feature,
             sequence_dense_features,
             sequence_mulval_lengths,
-            None,
-            None,
+            EMPTY_KJT,
+            EMPTY_KJT,
         )
 
         results = {}
         for group_name, v in self._group_to_shared_feature.items():
             group_result = OrderedDict()
             for info in v:
-                if info.is_sparse:
+                if info.is_sparse or info.is_sequence:
                     jt = jt_dict[info.name]
                 else:
                     jt = _dense_to_jt(dense_t_dict[info.name])

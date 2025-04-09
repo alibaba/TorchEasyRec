@@ -9,19 +9,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import unittest
 from typing import Optional
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.ops.mm import addmm
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class MMlTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
@@ -30,9 +36,7 @@ class MMlTest(unittest.TestCase):
         K=st.integers(min_value=100, max_value=300),
         broadcast=st.booleans(),
         dtype=st.sampled_from(
-            [torch.float32, torch.bfloat16, torch.float16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
+            get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])
         ),
     )
     @settings(
@@ -68,6 +72,8 @@ class MMlTest(unittest.TestCase):
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
     ) -> None:
+        from tzrec.ops.mm import addmm
+
         # to enable more deterministic results.
         torch.manual_seed(0)
 

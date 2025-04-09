@@ -10,37 +10,36 @@
 # limitations under the License.
 
 
+import gc
 import unittest
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.ops.layer_norm import (
-    layer_norm,
-    swish_layer_norm,
-)
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class LayerNormTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
         N=st.sampled_from([4200000]),
         D=st.sampled_from([512]),
         is_swish=st.sampled_from([False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
         deadline=None,
         verbosity=Verbosity.verbose,
-        max_examples=1,
+        max_examples=2,
     )
     # pyre-ignore[2]
     def test_large_tensors(self, *args, **kwargs) -> None:
@@ -58,11 +57,7 @@ class LayerNormTest(unittest.TestCase):
         N=st.integers(min_value=0, max_value=10000),
         D=st.integers(min_value=32, max_value=512),
         is_swish=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         deadline=None,
@@ -88,6 +83,11 @@ class LayerNormTest(unittest.TestCase):
         real_kernel: Kernel,
         skip_comparisons: bool = False,
     ) -> None:
+        from tzrec.ops.layer_norm import (
+            layer_norm,
+            swish_layer_norm,
+        )
+
         N = N // 4 * 4
         x = (
             torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))

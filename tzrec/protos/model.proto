@@ -30,6 +30,12 @@ message FeatureGroupConfig {
     repeated SeqEncoderConfig sequence_encoders = 5;
 }
 
+enum Kernel {
+    TRITON = 0;
+    PYTORCH = 1;
+    CUDA = 2;
+}
+
 message ModelConfig {
 
     repeated FeatureGroupConfig feature_groups = 1;
@@ -67,4 +73,6 @@ message ModelConfig {
     repeated MetricConfig metrics = 4;
 
     optional VariationalDropout variational_dropout = 11;
+
+    optional Kernel kernel = 12 [default = PYTORCH];
 }

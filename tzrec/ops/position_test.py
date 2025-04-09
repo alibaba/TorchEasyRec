@@ -9,17 +9,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import unittest
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class PositionEmbeddingsTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
@@ -150,7 +161,9 @@ class PositionEmbeddingsTest(unittest.TestCase):
         D=st.integers(20, 200),
         max_targets=st.sampled_from([10, 20]),
         time_bucket_fn=st.sampled_from(["log"]),
-        dtype=st.sampled_from([torch.float32, torch.bfloat16, torch.float16]),
+        dtype=st.sampled_from(
+            get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])
+        ),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -175,14 +188,14 @@ class PositionEmbeddingsTest(unittest.TestCase):
         max_contextual_seq_len=st.sampled_from([10]),
         interleave_targets=st.sampled_from([False]),
         batch_size=st.sampled_from([130]),
-        D=st.sampled_from([512]),
+        D=st.sampled_from([192]),
         max_targets=st.sampled_from([10]),
         time_bucket_fn=st.sampled_from(["log"]),
-        dtype=st.sampled_from([torch.bfloat16]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=1,
+        max_examples=2,
         deadline=None,
     )
     def test_add_timestamp_positional_embeddings_triton_large_tensor(

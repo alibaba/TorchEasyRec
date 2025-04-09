@@ -19,6 +19,13 @@ from tzrec.ops import Kernel
 
 
 class BaseModule(nn.Module, abc.ABC):
+    """TorchEasyRec Base Module.
+
+    Args:
+        is_inference (bool): is inference or not.
+        kernel (Optional[Kernel]): module kernel type.
+    """
+
     def __init__(
         self,
         is_inference: bool = False,
@@ -29,6 +36,7 @@ class BaseModule(nn.Module, abc.ABC):
         self._kernel = kernel
 
     def kernel(self) -> Kernel:
+        """Get kernel type."""
         kernel = self._kernel
         if kernel is not None:
             return kernel
@@ -37,28 +45,34 @@ class BaseModule(nn.Module, abc.ABC):
 
     # pyre-ignore [2]
     def recursive_setattr(self, name: str, value: Any) -> None:
+        """Recursive set sub module attrs."""
         for _, module in self.named_modules():
             if hasattr(module, name):
                 setattr(module, name, value)
 
     def set_is_inference(self, is_inference: bool) -> None:
+        """Set module in inference or not."""
         self._is_inference = is_inference
         self.recursive_setattr("_is_inference", is_inference)
 
     def set_kernel(self, kernel: Kernel) -> None:
+        """Set module kernel type."""
         self._kernel = kernel
         self.recursive_setattr("_kernel", kernel)
 
     @property
     def is_inference(self) -> bool:
+        """Get module is inference or not."""
         return self._is_inference
 
     @property
     def is_eval(self) -> bool:
+        """Get module is eval or not."""
         return (not self._is_inference) and (not self.training)
 
     @property
     def is_train(self) -> bool:
+        """Get module is train or not."""
         return (not self._is_inference) and self.training
 
 
@@ -113,13 +127,6 @@ def div_no_nan(
         posinf=0.0,
         neginf=0.0,
     )
-
-
-@torch.fx.wrap
-def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
-    """Unwrap optional tensor for trace."""
-    assert optional is not None, "Expected optional to be non-None Tensor"
-    return optional
 
 
 def init_linear_xavier_weights_zero_bias(m: torch.nn.Module) -> None:

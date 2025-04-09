@@ -18,12 +18,10 @@ from typing import Optional
 
 import torch
 
-from tzrec.modules.utils import fx_unwrap_optional_tensor
+from tzrec.utils.fx_util import fx_arange, fx_unwrap_optional_tensor
 
-
-@torch.fx.wrap
-def torch_arange(end: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(end, device=device)
+torch.fx.wrap(fx_arange)
+torch.fx.wrap(fx_unwrap_optional_tensor)
 
 
 def pytorch_add_position_embeddings(
@@ -36,9 +34,7 @@ def pytorch_add_position_embeddings(
 ) -> torch.Tensor:
     jagged = jagged * scale
     B = high_inds.size(0)
-    col_indices = torch_arange(max_seq_len, device=high_inds.device).expand(
-        B, max_seq_len
-    )
+    col_indices = fx_arange(max_seq_len, device=high_inds.device).expand(B, max_seq_len)
     col_indices = torch.clamp(col_indices, max=high_inds.view(-1, 1))
     dense_values = torch.index_select(dense, 0, col_indices.reshape(-1)).view(
         B, max_seq_len, -1

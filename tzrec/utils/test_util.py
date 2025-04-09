@@ -9,12 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from enum import Enum
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
+from hypothesis import settings as _settings
+from hypothesis.utils.conventions import not_set as _not_set
 from torch import nn
 from torch.fx import GraphModule
 
@@ -25,21 +28,18 @@ nv_gpu_unavailable: Tuple[bool, str] = (
     not torch.cuda.is_available() or torch.cuda.device_count() == 0,
     "CUDA is not available or no GPUs detected",
 )
-nv_gpu_available: bool = not nv_gpu_unavailable[0]
-
-
 amd_gpu_unavailable: Tuple[bool, str] = (
     not torch.version.hip,
     "AMD HIP not available or no GPUs detected",
 )
-amd_gpu_available: bool = not amd_gpu_unavailable[0]
-
 gpu_unavailable: Tuple[bool, str] = (
-    not nv_gpu_available and not amd_gpu_available,
+    nv_gpu_unavailable[0] and amd_gpu_unavailable[0],
     "CUDA/HIP is not available or no GPUs detected",
 )
 
-gpu_available: bool = not gpu_unavailable[0]
+_settings.register_profile(
+    "default", _settings(_settings.get_profile("default"), print_blob=True)
+)
 
 
 class TestGraphType(Enum):
@@ -103,6 +103,23 @@ def parameterized_name_func(func, num, p) -> str:
     base_name = func.__name__
     name_suffix = "_%s" % (num,)
     return base_name + name_suffix
+
+
+class hypothesis_settings(_settings):
+    """Hypothesis settings for TorchEasyRec."""
+
+    def __init__(
+        self,
+        parent: Optional[_settings] = None,
+        *,
+        # pyre-ignore[9]
+        max_examples: int = _not_set,
+        **kwargs: Any,
+    ) -> None:
+        if os.environ.get("CI", "false").lower() == "true":
+            if max_examples != _not_set:
+                max_examples = max(1, max_examples // 5)
+        super().__init__(parent, max_examples=max_examples, **kwargs)
 
 
 def dicts_are_equal(
@@ -170,3 +187,16 @@ def generate_sparse_seq_len(
             device=device,
             dtype=torch.int,
         )
+
+
+def get_test_dtypes(dtypes: List[torch.dtype]) -> List[torch.dtype]:
+    """Get valid test dtypes."""
+    results = []
+    for dtype in dtypes:
+        if dtype == torch.bfloat16:
+            if torch.cuda.is_available():
+                if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8:
+                    results.append(dtype)
+        else:
+            results.append(dtype)
+    return results

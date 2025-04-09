@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from tzrec.ops.utils import fx_arange
+from tzrec.utils.fx_util import fx_arange
 
 torch.fx.wrap(fx_arange)
 

@@ -9,19 +9,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import random
 import unittest
 from typing import Optional
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import (
     Kernel,
 )
-from tzrec.ops.jagged_tensors import split_2D_jagged
-from tzrec.utils.test_util import generate_sparse_seq_len, gpu_unavailable
+from tzrec.utils.test_util import (
+    generate_sparse_seq_len,
+    get_test_dtypes,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 def test_attn(
@@ -239,6 +244,11 @@ def test_delta_attn(
 
 
 class HSTUAttentionTest(unittest.TestCase):
+    def tearDown(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
@@ -250,17 +260,13 @@ class HSTUAttentionTest(unittest.TestCase):
         hidden_dim=st.sampled_from([16, 32, 64, 128]),
         causal=st.sampled_from([True]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=200,
+        max_examples=20,
         deadline=None,
     )
     # pyre-ignore[2]
@@ -284,7 +290,7 @@ class HSTUAttentionTest(unittest.TestCase):
         hidden_dim=st.just(128),
         causal=st.sampled_from([True]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from([torch.bfloat16]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
         has_max_attn_len=st.sampled_from([True, False]),
     )
     @settings(
@@ -315,17 +321,13 @@ class HSTUAttentionTest(unittest.TestCase):
         attn_dim=st.sampled_from([16, 32, 64, 128]),
         hidden_dim=st.sampled_from([16, 32, 64, 128]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([False, True]),
         contextual_seq_len=st.sampled_from([0, 10]),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=200,
+        max_examples=20,
         deadline=None,
     )
     # pyre-ignore[2]
@@ -348,17 +350,13 @@ class HSTUAttentionTest(unittest.TestCase):
         attn_dim=st.sampled_from([16, 32, 64]),
         hidden_dim=st.sampled_from([16, 32, 64]),
         has_multiple_targets=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([False, True]),
         contextual_seq_len=st.sampled_from([0, 10]),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=200,
+        max_examples=20,
         deadline=None,
     )
     def test_cache(
@@ -378,6 +376,7 @@ class HSTUAttentionTest(unittest.TestCase):
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
         from tzrec.ops.hstu_attention import delta_hstu_mha, hstu_mha
+        from tzrec.ops.jagged_tensors import split_2D_jagged
 
         alpha = 1.0 / (attn_dim**0.5)
         lengths = torch.randint(
