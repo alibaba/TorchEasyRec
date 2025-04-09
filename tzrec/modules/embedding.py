@@ -123,18 +123,6 @@ def _dense_to_jt(t: torch.Tensor) -> JaggedTensor:
     )
 
 
-@torch.fx.wrap
-def _dense_to_jt(t: torch.Tensor) -> JaggedTensor:
-    return JaggedTensor(
-        values=t,
-        lengths=torch.ones(
-            t.shape[0],
-            dtype=torch.int64,
-            device=t.device,
-        ),
-    )
-
-
 class EmbeddingGroup(nn.Module):
     """Applies embedding lookup transformation for feature group.
 
