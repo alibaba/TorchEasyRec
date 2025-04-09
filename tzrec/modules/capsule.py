@@ -78,6 +78,8 @@ class CapsuleLayer(nn.Module):
             torch.randn(self._low_dim, self._high_dim)
         )  # [ld, hd]
 
+        self.zeros_placehoder = torch.zeros((1, self._max_k))
+
     def squash(self, inputs: torch.Tensor) -> torch.Tensor:
         """Squash inputs over the last dimension.
 
@@ -112,14 +114,8 @@ class CapsuleLayer(nn.Module):
         Return:
             [batch_size, max_k, high_dim]
         """
-        routing_logits = torch.concat(
-            [
-                torch.randn_like(inputs, dtype=torch.float32),
-                torch.randn_like(inputs, dtype=torch.float32),
-            ],
-            dim=-1,
-        )
-        routing_logits = routing_logits[:, :, : self._max_k].to(inputs.device)
+        routing_logits_tmp = torch.zeros_like(inputs)[:, :, :1] + self.zeros_placehoder
+        routing_logits = torch.rand_like(routing_logits_tmp, device=inputs.device)
 
         routing_logits = (
             routing_logits * self._routing_logits_stddev + self._routing_logits_scale
