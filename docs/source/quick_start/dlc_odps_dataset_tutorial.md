@@ -53,7 +53,7 @@ cd /mnt/data
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config
 # 安装tzrec并启动训练
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
-ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.train_eval \
@@ -76,7 +76,7 @@ odps://{project}/tables/{table_name}/{partition}，多表按逗号分隔
 完成模型训练后，进行模型评估：
 
 ```bash
-ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.eval \
@@ -93,7 +93,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 导出训练好的模型：
 
 ```bash
-ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.export \
@@ -110,7 +110,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 使用导出的模型进行预测：
 
 ```bash
-ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.predict \

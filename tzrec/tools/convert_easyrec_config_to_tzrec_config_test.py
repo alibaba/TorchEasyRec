@@ -458,7 +458,6 @@ DATA_CONFIG = """data_config {
   label_fields: "is_click_cover"
   label_fields: "is_click_video"
   num_workers: 8
-  odps_data_quota_name: ""
 }
 """
 
