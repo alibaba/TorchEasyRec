@@ -73,7 +73,7 @@ sample_weight_fields: 'col_name'
 
   - input_path: 按如下格式设置
     - `${PATH_TO_DATA_DIR}/*.parquet`
-  - 注意: 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等
+  - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
 - CsvDataset: 输入数据为csv格式
 
@@ -81,7 +81,7 @@ sample_weight_fields: 'col_name'
     - `${PATH_TO_DATA_DIR}/*.csv`
   - 需设置`delimiter`来指名列分隔符，默认为`,`
   - 注意:
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量基本相等
+    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
     - 暂不支持没有header的csv文件
     - csv格式数据读性能有瓶颈
 
