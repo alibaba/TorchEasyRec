@@ -189,7 +189,11 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
     @parameterized.expand([["bigint"], ["string"]])
-    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
     def test_odps_dataset_with_sampler(self, id_type):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
