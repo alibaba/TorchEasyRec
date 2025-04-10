@@ -21,7 +21,7 @@ from parameterized import parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter
+from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
@@ -30,26 +30,21 @@ from tzrec.utils.misc_util import get_free_port, random_name
 
 class OdpsDatasetTest(unittest.TestCase):
     def setUp(self):
-        self.odps_config = {}
         self.o = None
+        self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
                     values = line.split("=", 1)
-                    if len(values) == 2:
-                        self.odps_config[values[0]] = values[1].strip()
-            self.o = ODPS(
-                access_id=self.odps_config["access_id"],
-                secret_access_key=self.odps_config["access_key"],
-                project=self.odps_config["project_name"],
-                endpoint=self.odps_config["end_point"],
-            )
+                    if len(values) == 2 and values[0] == "project_name":
+                        self.test_project = values[1].strip()
         self.test_suffix = random_name()
 
     def tearDown(self):
         if self.o is not None:
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
             self.o.delete_table(f"test_odps_sampler_{self.test_suffix}", if_exists=True)
+        self.o = None
         os.environ.pop("USE_HASH_NODE_ID", None)
 
     def _create_test_table_and_feature_cfgs(self, has_lookup=True):
@@ -132,8 +127,18 @@ class OdpsDatasetTest(unittest.TestCase):
         return feature_cfgs
 
     @parameterized.expand([[False], [True]])
-    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
     def test_odps_dataset(self, is_orderby_partition):
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+        )
         feature_cfgs = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
@@ -147,7 +152,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 odps_data_quota_name="",
             ),
             features=features,
-            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         self.assertEqual(len(dataset.input_fields), 9)
         self.assertEqual(
@@ -184,8 +189,18 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
     @parameterized.expand([["bigint"], ["string"]])
-    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
     def test_odps_dataset_with_sampler(self, id_type):
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+        )
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         feature_cfgs = self._create_test_table_and_feature_cfgs(has_lookup=False)
@@ -216,14 +231,14 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
+                    input_path=f"odps://{self.test_project}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",
                 ),
             ),
             features=features,
-            input_path=f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -259,33 +274,38 @@ class OdpsDatasetTest(unittest.TestCase):
 
 class OdpsWriterTest(unittest.TestCase):
     def setUp(self):
-        self.odps_config = {}
         self.o = None
+        self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
                     values = line.split("=", 1)
-                    if len(values) == 2:
-                        self.odps_config[values[0]] = values[1].strip()
-            self.o = ODPS(
-                access_id=self.odps_config["access_id"],
-                secret_access_key=self.odps_config["access_key"],
-                project=self.odps_config["project_name"],
-                endpoint=self.odps_config["end_point"],
-            )
-
+                    if len(values) == 2 and values[0] == "project_name":
+                        self.test_project = values[1].strip()
         self.test_suffix = random_name()
 
     def tearDown(self):
         if self.o is not None:
             self.o.delete_table(f"test_odps_dataset_{self.test_suffix}", if_exists=True)
+        self.o = None
 
     @parameterized.expand(
         [[""], ["/dt=20240401"]],
         name_func=test_util.parameterized_name_func,
     )
-    @unittest.skipIf("ODPS_CONFIG_FILE_PATH" not in os.environ, "odps config not found")
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
     def test_odps_writer(self, partition_spec):
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+        )
+
         def _writer_worker(rank, world_size, port):
             os.environ["RANK"] = str(rank)
             os.environ["WORLD_SIZE"] = str(world_size)
@@ -293,7 +313,7 @@ class OdpsWriterTest(unittest.TestCase):
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
             writer = OdpsWriter(
-                f"odps://{self.odps_config['project_name']}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
+                f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
             )
             for _ in range(5):
