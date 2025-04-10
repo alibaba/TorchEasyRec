@@ -26,4 +26,7 @@ jobs:
         run: |
           echo "ODPS_ENDPOINT: $ODPS_ENDPOINT"
           cd run_${{ github.run_id }}
-          bash scripts/ci/ci_test_cpu.sh
+          pip install -r requirements/runtime.txt
+          pip install -r requirements/test.txt
+          bash scripts/gen_proto.sh
+          PYTHONPATH=. python tzrec/datasets/odps_dataset_test.py
