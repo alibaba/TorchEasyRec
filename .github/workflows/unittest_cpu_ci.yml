@@ -19,6 +19,10 @@ jobs:
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
         id: run_unittest_ci
+        env: # Or as an environment variable
+          ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
+          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
           bash scripts/ci/ci_test_cpu.sh
