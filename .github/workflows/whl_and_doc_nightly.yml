@@ -17,11 +17,13 @@ jobs:
         uses: actions/checkout@v2
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          path: run_${{ github.run_id }}
       - name: BuildWheel
         id: run_build_wheel
         env:
             ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
         run: |
+          cd run_${{ github.run_id }}
           git config --global --add safe.directory /__w/TorchEasyRec/TorchEasyRec
           wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/ossutil -o /usr/local/bin/ossutil
           chmod +x /usr/local/bin/ossutil

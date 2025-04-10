@@ -15,9 +15,11 @@ jobs:
         uses: actions/checkout@v2
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          path: run_${{ github.run_id }}
       - name: RunPyTypingCI
         id: run_pytyping_ci
         run: |
+          cd run_${{ github.run_id }}
           pip install -r requirements.txt
           bash scripts/gen_proto.sh
           python scripts/pyre_check.py
