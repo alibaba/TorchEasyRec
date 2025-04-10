@@ -23,6 +23,8 @@ jobs:
             ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
         run: |
           git config --global --add safe.directory /__w/TorchEasyRec/TorchEasyRec
+          wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/ossutil
+          chmod +x ossutil
           bash scripts/build_wheel.sh nightly-oss
       - name: BuildDoc
         id: run_build_doc
