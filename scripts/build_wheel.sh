@@ -5,6 +5,7 @@ release_type=$1
 if [[ "${release_type}" == *"nightly"* ]]; then
   git_rev=$(git rev-parse --short HEAD)
   date=$(date +"%Y%m%d")
+  echo "git_rev: ${git_rev}"
   export NIGHTLY_VERSION="${date}.${git_rev}"
 fi
 

@@ -1,4 +1,4 @@
-name: PyTyping CI
+name: Wheel And Doc Nightly
 
 on:
   pull_request:
