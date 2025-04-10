@@ -1,6 +1,8 @@
 name: PyTyping CI
 
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
   schedule:
     - cron:  '0 16 * * *'
   workflow_dispatch:
