@@ -29,4 +29,4 @@ jobs:
           cd run_${{ github.run_id }}
           pip install -r requirements.txt
           bash scripts/gen_proto.sh
-          PYTHONPATH=. MKL_THREADING_LAYER=GNU python tzrec/benchmark/benchmark.py
+          PYTHONPATH=. PYTHONUNBUFFERED=1 MKL_THREADING_LAYER=GNU python tzrec/benchmark/benchmark.py

@@ -244,7 +244,7 @@ def test_delta_attn(
 
 
 class HSTUAttentionTest(unittest.TestCase):
-    def tearDown(self):
+    def teardown_example(self, example):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
