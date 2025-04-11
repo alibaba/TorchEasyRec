@@ -26,7 +26,7 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class PositionEmbeddingsTest(unittest.TestCase):
-    def tearDown(self):
+    def teardown_example(self, example):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
