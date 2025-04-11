@@ -15,6 +15,7 @@ import os
 import time
 from typing import Any, Dict, List, Tuple
 
+from tzrec.tests.utils import _standalone
 from tzrec.utils import config_util, misc_util
 
 TEXT_RESET = "\033[0m"
@@ -123,7 +124,7 @@ def _benchmark_train_eval(
 ) -> bool:
     """Run train_eval for benchmark."""
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         "--nnodes=1 --nproc-per-node=2 "
         f"--log_dir {log_path} -r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {run_config_path}"
