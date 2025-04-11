@@ -2,14 +2,14 @@ name: Benchmark
 
 on:
   schedule:
-    - cron:  '0 17 * * 0,3'
+    - cron:  '0 17 * * 2,6'
   pull_request:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 jobs:
   ci-test:
-    runs-on: tzrec-runner
+    runs-on: tzrec-bench-runner
     container:
       image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.7
       options: --gpus all --ipc host
