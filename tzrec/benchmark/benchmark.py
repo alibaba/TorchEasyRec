@@ -55,27 +55,26 @@ def print_balance(*args, **kwargs):
     print(f"{TEXT_BOLD_YELLOW}[BALANCE]{TEXT_RESET}", *args, **kwargs)
 
 
-def _get_odps_config() -> Dict[str, str]:
-    """Get ODPS config."""
-    odps_config = {}
+def _get_benchmark_project() -> str:
+    """Get ODPS project for benchmark."""
+    project = os.environ.get("CI_ODPS_PROJECT_NAME", "")
     if "ODPS_CONFIG_FILE_PATH" in os.environ:
         with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
             for line in f.readlines():
                 values = line.split("=", 1)
-                if len(values) == 2:
-                    odps_config[values[0]] = values[1].strip()
-    return odps_config
+                if len(values) == 2 and values[0] == "project_name":
+                    project = values[1].strip()
+    return project
 
 
 def _modify_pipline_config(
     pipeline_config_path: str,
     model_path: str,
     run_config_path: str,
-    odps_config: Dict[str, str],
 ) -> None:
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     pipeline_config.model_dir = model_path
-    project = odps_config["project_name"]
+    project = _get_benchmark_project()
     train_input_path = pipeline_config.train_input_path.format(PROJECT=project)
     pipeline_config.train_input_path = train_input_path
     eval_input_path = pipeline_config.eval_input_path.format(PROJECT=project)
@@ -247,7 +246,6 @@ def main(
     base_metric_path: str = "tzrec/benchmark/configs/base_eval_metric.json",
 ) -> None:
     """Run benchmarks."""
-    odps_config = _get_odps_config()
     train_config_paths = _get_config_paths(pipeline_config_paths)
     f = open(base_metric_path)
     base_eval_metrics = json.load(f)
@@ -274,9 +272,7 @@ def main(
             new_config_path = os.path.join(configs_path, file_path + ".config")
             model_path = os.path.join(models_path, file_path)
             log_path = os.path.join(logs_path, file_path)
-            _modify_pipline_config(
-                old_config_path, model_path, new_config_path, odps_config
-            )
+            _modify_pipline_config(old_config_path, model_path, new_config_path)
             success = _benchmark_train_eval(new_config_path, log_path)
             if success:
                 train_metric = _get_train_metrics(model_path)
