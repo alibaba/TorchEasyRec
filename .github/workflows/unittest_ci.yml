@@ -21,4 +21,4 @@ jobs:
         id: run_unittest_ci
         run: |
           cd run_${{ github.run_id }}
-          bash scripts/ci/ci_test.sh
+          CI_HYPOTHESIS=true bash scripts/ci/ci_test.sh

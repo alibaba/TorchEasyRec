@@ -25,4 +25,4 @@ jobs:
           ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
-          bash scripts/ci/ci_test_cpu.sh
+          CI_HYPOTHESIS=true bash scripts/ci/ci_test_cpu.sh

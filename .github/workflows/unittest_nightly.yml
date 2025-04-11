@@ -27,4 +27,4 @@ jobs:
           ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
-          CI=false bash scripts/ci/ci_test.sh
+          bash scripts/ci/ci_test.sh
