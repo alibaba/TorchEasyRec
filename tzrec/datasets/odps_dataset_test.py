@@ -12,6 +12,7 @@
 
 import multiprocessing as mp
 import os
+import time
 import unittest
 
 import numpy as np
@@ -335,6 +336,7 @@ class OdpsWriterTest(unittest.TestCase):
             )
             p.start()
             procs.append(p)
+            time.sleep(1)  # prevent get credential failed
         for i, p in enumerate(procs):
             p.join()
             if p.exitcode != 0:

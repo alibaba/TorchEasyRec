@@ -32,7 +32,7 @@ class HSTUComputeTest(unittest.TestCase):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print(example, torch.cuda.memory_summary())
+            torch.cuda.memory_summary()  # prevent oom
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
