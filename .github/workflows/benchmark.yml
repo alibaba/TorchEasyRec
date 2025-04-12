@@ -3,8 +3,6 @@ name: Benchmark
 on:
   schedule:
     - cron:  '0 17 * * 2,6'
-  pull_request:
-    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 jobs:
