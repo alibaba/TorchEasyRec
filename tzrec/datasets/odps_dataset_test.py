@@ -313,6 +313,7 @@ class OdpsWriterTest(unittest.TestCase):
             os.environ["MASTER_ADDR"] = "127.0.0.1"
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
+            time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
@@ -336,7 +337,6 @@ class OdpsWriterTest(unittest.TestCase):
             )
             p.start()
             procs.append(p)
-            time.sleep(1)  # prevent get credential failed
         for i, p in enumerate(procs):
             p.join()
             if p.exitcode != 0:
