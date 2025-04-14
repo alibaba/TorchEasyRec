@@ -36,11 +36,11 @@ bash scripts/gen_proto.sh
 python setup.py sdist bdist_wheel
 
 if [[ "${release_type}" == *"nightly-oss"* ]]; then
-  OSSUTIL="ossutil -e oss-accelerate.aliyuncs.com "
+  OSS_UTIL="ossutil -e oss-accelerate.aliyuncs.com "
   if [[ -n "${ALIBABA_CLOUD_ECS_METADATA}" ]]; then
-    OSS_UTIL="${OSSUTIL} --mode EcsRamRole --ecs-role-name ${ALIBABA_CLOUD_ECS_METADATA} "
+    OSS_UTIL="${OSS_UTIL} --mode EcsRamRole --ecs-role-name ${ALIBABA_CLOUD_ECS_METADATA} "
   fi
-  whls=`${OSSUTIL} ls oss://tzrec/release/nightly/ -s | grep ".whl"`
+  whls=`${OSS_UTIL} ls oss://tzrec/release/nightly/ -s | grep ".whl"`
 
   # check whl exist
   oss_exist=0
