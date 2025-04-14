@@ -3,8 +3,6 @@ name: Unit Test Nightly
 on:
   schedule:
     - cron:  '0 16 * * *'
-  pull_request:
-    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 jobs:
