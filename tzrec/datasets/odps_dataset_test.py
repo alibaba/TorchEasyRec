@@ -12,6 +12,7 @@
 
 import multiprocessing as mp
 import os
+import time
 import unittest
 
 import numpy as np
@@ -312,6 +313,7 @@ class OdpsWriterTest(unittest.TestCase):
             os.environ["MASTER_ADDR"] = "127.0.0.1"
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
+            time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",

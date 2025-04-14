@@ -113,12 +113,21 @@ class hypothesis_settings(_settings):
         *,
         # pyre-ignore[9]
         max_examples: int = _not_set,
+        # pyre-ignore[9]
+        derandomize: bool = _not_set,
         **kwargs: Any,
     ) -> None:
-        if os.environ.get("CI", "false").lower() == "true":
+        if os.environ.get("CI_HYPOTHESIS", "false").lower() == "true":
             if max_examples != _not_set:
                 max_examples = max(1, max_examples // 5)
-        super().__init__(parent, max_examples=max_examples, **kwargs)
+            if derandomize == _not_set:
+                derandomize = True
+        else:
+            if derandomize == _not_set:
+                derandomize = False
+        super().__init__(
+            parent, max_examples=max_examples, derandomize=derandomize, **kwargs
+        )
 
 
 def dicts_are_equal(
