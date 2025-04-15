@@ -53,7 +53,7 @@ class _TestRegressionModel(RankModel):
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         dense_feat_kt = batch.dense_features[BASE_DATA_GROUP]
-        y = dense_feat_kt.values().squeeze(1)
+        y = dense_feat_kt.values()
         return self._output_to_prediction(y)
 
 
