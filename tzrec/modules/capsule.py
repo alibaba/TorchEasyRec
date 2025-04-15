@@ -40,6 +40,11 @@ def sequence_mask(lengths: torch.Tensor, max_len: Optional[int] = None) -> torch
     return mask
 
 
+@torch.fx.wrap
+def _init_routing_logits(x: torch.Tensor, k: int) -> torch.Tensor:
+    return torch.randn(x.size()[:-1] + torch.Size([k]), device=x.device, dtype=x.dtype)
+
+
 class CapsuleLayer(nn.Module):
     """Capsule layer.
 
@@ -78,8 +83,6 @@ class CapsuleLayer(nn.Module):
             torch.randn(self._low_dim, self._high_dim)
         )  # [ld, hd]
 
-        self.zeros_placehoder = torch.zeros((1, self._max_k))
-
     def squash(self, inputs: torch.Tensor) -> torch.Tensor:
         """Squash inputs over the last dimension.
 
@@ -91,8 +94,12 @@ class CapsuleLayer(nn.Module):
         """
         input_norm = torch.linalg.norm(inputs, dim=-1, keepdim=True)
         input_norm_eps = torch.max(input_norm, torch.tensor(1e-7))
-        scale_factor = torch.square(input_norm_eps) / (
-            (1 + torch.square(input_norm_eps)) * input_norm_eps
+        scale_factor = (
+            torch.pow(
+                torch.square(input_norm_eps) / (1 + torch.square(input_norm_eps)),
+                self._squash_pow,
+            )
+            / input_norm_eps
         )
         return scale_factor * inputs
 
@@ -114,26 +121,22 @@ class CapsuleLayer(nn.Module):
         Return:
             [batch_size, max_k, high_dim]
         """
-        routing_logits_tmp = torch.zeros_like(inputs)[
-            :, :, :1
-        ] + self.zeros_placehoder.to(inputs.device)
-        routing_logits = torch.rand_like(routing_logits_tmp)
+        routing_logits = _init_routing_logits(inputs, self._max_k)
 
-        routing_logits = (
-            routing_logits * self._routing_logits_stddev + self._routing_logits_scale
-        )
+        routing_logits = routing_logits * self._routing_logits_stddev
 
         capsule_mask = capsule_mask.unsqueeze(1)  # [bs, 1, max_k]
         capsule_mask_thresh = (capsule_mask.float() * 2 - 1) * 1e32
 
         low_capsule_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
+        low_capsule_vec = torch.nn.functional.normalize(low_capsule_vec, p=2.0, dim=-1)
 
         assert num_iters > 0, "num_iters should be greater than 0"
         high_capsule_vec = torch.Tensor([0])
         for _ in range(num_iters):
             routing_logits = torch.minimum(routing_logits, capsule_mask_thresh)
             routing_logits = torch.nn.functional.softmax(
-                routing_logits, dim=1
+                routing_logits, dim=2
             )  # [b, s, k]
             routing_logits = routing_logits * seq_mask.unsqueeze(2).float()
 
@@ -141,8 +144,13 @@ class CapsuleLayer(nn.Module):
                 "bsk, bsh -> bkh", routing_logits, low_capsule_vec
             )
             high_capsule_vec = self.squash(high_capsule_vec)
-            routing_logits = routing_logits + torch.einsum(
-                "bkh, bsh -> bsk", high_capsule_vec, low_capsule_vec
+            high_capsule_vec = torch.nn.functional.normalize(
+                high_capsule_vec, p=2.0, dim=-1
+            )
+            routing_logits = (
+                routing_logits
+                + torch.einsum("bkh, bsh -> bsk", high_capsule_vec, low_capsule_vec)
+                * self._routing_logits_scale
             )
         return high_capsule_vec
 
@@ -190,4 +198,5 @@ class CapsuleLayer(nn.Module):
         user_interests = self.dynamic_routing(
             inputs, seq_mask, capsule_mask, self._num_iters
         )
+        user_interests = user_interests * capsule_mask.unsqueeze(-1).float()
         return user_interests

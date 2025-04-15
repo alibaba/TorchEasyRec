@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 from torch._tensor import Tensor
+from torch.linalg import norm
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -121,6 +122,7 @@ class MINDUserTower(MatchTower):
 
         if self._similarity == simi_pb2.Similarity.COSINE:
             user_interests = F.normalize(user_interests, p=2.0, dim=-1)
+
         return user_interests
 
 
@@ -242,12 +244,17 @@ class MIND(MatchModel):
         batch_size = user_interests.size(0)
         pos_item_emb = item_emb[:batch_size]
 
+        interest_mask = norm(user_interests, dim=-1) != 0.0
+
         simi_pow = self._model_config.simi_pow
         interest_weight = torch.einsum("bkd, bd->bk", user_interests, pos_item_emb)
+
+        threshold = (interest_mask.float() * 2 - 1) * 1e32
+        interest_weight = torch.minimum(interest_weight, threshold)
+
         interest_weight = interest_weight.unsqueeze(-1)
-        interest_weight = torch.nn.functional.softmax(
-            torch.pow(interest_weight, simi_pow), dim=1
-        )
+        interest_weight = interest_weight * simi_pow
+        interest_weight = torch.nn.functional.softmax(interest_weight, dim=1)
 
         user_emb = torch.sum(torch.multiply(interest_weight, user_interests), dim=1)
         return user_emb
@@ -263,6 +270,7 @@ class MIND(MatchModel):
 
         """
         user_interests = self.user_tower(batch)
+
         item_emb = self.item_tower(batch)
 
         user_emb = self.label_aware_attention(user_interests, item_emb)
