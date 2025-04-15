@@ -130,7 +130,7 @@ class DBMTLTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
         self.assertEqual(predictions["probs_is_buy"].size(), (2,))
-        self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
+        self.assertEqual(predictions["y_cost_price"].size(), (2,))
 
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
@@ -329,7 +329,7 @@ class DBMTLTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
         self.assertEqual(predictions["probs_is_buy"].size(), (2,))
-        self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
+        self.assertEqual(predictions["y_cost_price"].size(), (2,))
 
 
 if __name__ == "__main__":
