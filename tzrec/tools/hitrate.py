@@ -64,9 +64,8 @@ def batch_hitrate(
             )
             continue
         for interest_id in range(max_num_interests):
-            if num_interests:
-                if interest_id > num_interests[idx]:
-                    continue
+            if num_interests and interest_id >= num_interests[idx]:
+                break
             hit_id_set |= set(recall_id[interest_id]) & gt_item
         hit_count = float(len(hit_id_set))
         hitrates.append(hit_count / gt_items_size)
