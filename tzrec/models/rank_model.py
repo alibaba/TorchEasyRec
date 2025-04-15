@@ -137,6 +137,7 @@ class RankModel(BaseModel):
             predictions["probs" + suffix] = probs
             predictions["probs1" + suffix] = probs[:, 1]
         elif loss_type == "l2_loss":
+            output = torch.squeeze(output, dim=1)
             predictions["y" + suffix] = output
         else:
             raise NotImplementedError
