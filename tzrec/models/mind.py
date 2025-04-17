@@ -274,5 +274,5 @@ class MIND(MatchModel):
         item_emb = self.item_tower(batch)
 
         user_emb = self.label_aware_attention(user_interests, item_emb)
-        ui_sim = self.sim(user_emb, item_emb)
+        ui_sim = self.sim(user_emb, item_emb) / self._model_config.temperature
         return {"similarity": ui_sim}
