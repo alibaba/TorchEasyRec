@@ -120,6 +120,12 @@ if __name__ == "__main__":
         "--top_k", type=int, default=200, help="use top k search result."
     )
     parser.add_argument(
+        "--topk_across_interests",
+        type=bool,
+        default=False,
+        help="select topk candidates across all interests.",
+    )
+    parser.add_argument(
         "--ivf_nlist", type=int, default=1000, help="nlist of IVFFlat index."
     )
     parser.add_argument(
@@ -261,12 +267,65 @@ if __name__ == "__main__":
         recall_distances, recall_ids = faiss_util.search_faiss_index(
             index, index_id_map, user_emb, args.top_k
         )
-        recall_distances = recall_distances.reshape(
-            [-1, args.num_interests, recall_distances.shape[-1]]
-        )
-        recall_ids = recall_ids.reshape(
-            [-1, args.num_interests, recall_distances.shape[-1]]
-        )
+
+        # pick topk candidates across all interests
+        if args.topk_across_interests:
+            recall_distances_flat = recall_distances.reshape(
+                [-1, args.num_interests * recall_distances.shape[-1]]
+            )
+            recall_ids_flat = recall_ids.reshape(
+                [-1, args.num_interests * recall_ids.shape[-1]]
+            )
+
+            sort_idx = np.argsort(recall_distances_flat, axis=-1)[:, ::-1]
+            recall_distances_flat_sorted = recall_distances_flat[
+                np.arange(recall_distances_flat.shape[0])[:, np.newaxis], sort_idx
+            ]
+            recall_ids_flat_sorted = recall_ids_flat[
+                np.arange(recall_ids_flat.shape[0])[:, np.newaxis], sort_idx
+            ]
+
+            # get unique candidates
+            recall_distances_flat_sorted_pad = np.concatenate(
+                [
+                    recall_distances_flat_sorted,
+                    np.zeros((recall_distances_flat_sorted.shape[0], 1)),
+                ],
+                axis=-1,
+            )
+            # compute diff value between consecutive distances
+            recall_distances_diff = (
+                recall_distances_flat_sorted_pad[:, 0:-1]
+                - recall_distances_flat_sorted_pad[:, 1:]
+            )
+            # zero diff positions are dulipcated values
+            recall_distances_unique = np.where(
+                recall_distances_diff == 0, -1, recall_distances_flat_sorted
+            )
+            # sort again to get the unique candidates, duplicated values are -1,
+            # so they are moved to the end
+            sort_idx_new = np.argsort(recall_distances_unique, axis=-1)[:, ::-1]
+
+            recall_distances = recall_distances_flat_sorted[
+                np.arange(recall_distances_flat_sorted.shape[0])[:, np.newaxis],
+                sort_idx_new[:, 0 : args.top_k],
+            ]
+            recall_ids = recall_ids_flat_sorted[
+                np.arange(recall_ids_flat_sorted.shape[0])[:, np.newaxis],
+                sort_idx_new[:, 0 : args.top_k],
+            ]
+
+            recall_distances = recall_distances.reshape(
+                [-1, 1, recall_distances.shape[-1]]
+            )
+            recall_ids = recall_ids.reshape([-1, 1, recall_distances.shape[-1]])
+        else:  # pick topk candidates for each interest
+            recall_distances = recall_distances.reshape(
+                [-1, args.num_interests, recall_distances.shape[-1]]
+            )
+            recall_ids = recall_ids.reshape(
+                [-1, args.num_interests, recall_distances.shape[-1]]
+            )
 
         num_interests_per_req = None
         if args.num_interests_field:
@@ -276,7 +335,7 @@ if __name__ == "__main__":
             request_id.tolist(),
             recall_ids,
             gt_items.tolist(),
-            args.num_interests,
+            args.num_interests if not args.topk_across_interests else 1,
             num_interests_per_req.tolist() if num_interests_per_req else None,
         )
 
