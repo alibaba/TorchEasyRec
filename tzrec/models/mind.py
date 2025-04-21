@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torch._tensor import Tensor
 from torch.linalg import norm
 
@@ -91,6 +92,8 @@ class MINDUserTower(MatchTower):
             dim=3,
             **config_to_kwargs(tower_config.concat_mlp),
         )
+        if self._output_dim > 0:
+            self.output = nn.Linear(self._concat_mlp.output_dim(), output_dim)
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower.
@@ -119,6 +122,9 @@ class MINDUserTower(MatchTower):
         user_feature_tile = torch.tile(user_feature, [1, high_capsules.shape[1], 1])
         user_interests = torch.cat([user_feature_tile, high_capsules], dim=-1)
         user_interests = self._concat_mlp(user_interests)
+
+        if self._output_dim > 0:
+            user_interests = self.output(user_interests)
 
         if self._similarity == simi_pb2.Similarity.COSINE:
             user_interests = F.normalize(user_interests, p=2.0, dim=-1)
@@ -160,6 +166,8 @@ class MINDItemTower(MatchTower):
         self.init_input()
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
+        if self._output_dim > 0:
+            self.output = nn.Linear(self.mlp.output_dim(), output_dim)
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower.
@@ -173,6 +181,9 @@ class MINDItemTower(MatchTower):
         """
         grouped_features = self.build_input(batch)
         item_emb = self.mlp(grouped_features[self._group_name])
+
+        if self._output_dim > 0:
+            item_emb = self.output(item_emb)
 
         if self._similarity == simi_pb2.Similarity.COSINE:
             item_emb = F.normalize(item_emb, p=2.0, dim=1)
@@ -210,7 +221,7 @@ class MIND(MatchModel):
 
         self.user_tower = MINDUserTower(
             self._model_config.user_tower,
-            0,
+            self._model_config.output_dim,
             self._model_config.similarity,
             user_group,
             hist_group,
@@ -220,7 +231,7 @@ class MIND(MatchModel):
         )
         self.item_tower = MINDItemTower(
             self._model_config.item_tower,
-            0,
+            self._model_config.output_dim,
             self._model_config.similarity,
             item_group,
             item_features,
