@@ -177,7 +177,7 @@ class CapsuleLayer(nn.Module):
 
         seq_mask = sequence_mask(seq_len, self._max_seq_len)
         seq_mask = seq_mask.to(device)
-
+        inputs = inputs * seq_mask.unsqueeze(-1).float()
         if self._const_caps_num:
             n_high_capsules = (
                 torch.zeros_like(seq_len, dtype=torch.float32) + self._max_k

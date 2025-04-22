@@ -66,20 +66,42 @@ class MINDUserTower(MatchTower):
         self.init_input()
 
         user_feature_in = self.embedding_group.group_total_dim(self._group_name)
-        self.user_mlp = MLP(user_feature_in, **config_to_kwargs(tower_config.user_mlp))
+        self.user_mlp = MLP(
+            in_features=user_feature_in,
+            hidden_units=tower_config.user_mlp.hidden_units[0:-1],
+            activation=tower_config.user_mlp.activation,
+            use_bn=tower_config.user_mlp.use_bn,
+            dropout_ratio=tower_config.user_mlp.dropout_ratio[0],
+        )
+        self.user_mlp_out = nn.Linear(
+            self.user_mlp.output_dim(), tower_config.user_mlp.hidden_units[-1]
+        )
 
         hist_feature_dim = self.embedding_group.group_total_dim(
             self._hist_group_name + ".sequence"
         )
 
-        if tower_config.hist_seq_mlp:
+        if (
+            tower_config.hist_seq_mlp
+            and len(tower_config.hist_seq_mlp.hidden_units) > 0
+        ):
             self._hist_seq_mlp = MLP(
                 in_features=hist_feature_dim,
                 dim=3,
-                **config_to_kwargs(tower_config.hist_seq_mlp),
+                hidden_units=tower_config.hist_seq_mlp.hidden_units[0:-1],
+                activation=tower_config.hist_seq_mlp.activation,
+                use_bn=tower_config.hist_seq_mlp.use_bn,
+                dropout_ratio=tower_config.hist_seq_mlp.dropout_ratio[0],
+            )
+            self._hist_seq_mlp_out = nn.Linear(
+                self._hist_seq_mlp.output_dim(),
+                tower_config.hist_seq_mlp.hidden_units[-1],
+                bias=False,
             )
             capsule_input_dim = tower_config.hist_seq_mlp.hidden_units[-1]
+
         else:
+            self._hist_seq_mlp = None
             capsule_input_dim = hist_feature_dim
 
         self._capsule_layer = CapsuleLayer(
@@ -93,7 +115,9 @@ class MINDUserTower(MatchTower):
             **config_to_kwargs(tower_config.concat_mlp),
         )
         if self._output_dim > 0:
-            self.output = nn.Linear(self._concat_mlp.output_dim(), output_dim)
+            self.output = nn.Linear(
+                self._concat_mlp.output_dim(), output_dim, bias=False
+            )
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower.
@@ -108,10 +132,12 @@ class MINDUserTower(MatchTower):
         grp_hist_seq = user_feature_dict[self._hist_group_name + ".sequence"]
         grp_hist_len = user_feature_dict[self._hist_group_name + ".sequence_length"]
 
-        user_feature = self.user_mlp(user_feature_dict[self._group_name])
+        user_feature = self.user_mlp_out(
+            self.user_mlp(user_feature_dict[self._group_name])
+        )
 
         if self._hist_seq_mlp:
-            hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
+            hist_seq_feas = self._hist_seq_mlp_out(self._hist_seq_mlp(grp_hist_seq))
         else:
             hist_seq_feas = grp_hist_seq
 
@@ -285,5 +311,8 @@ class MIND(MatchModel):
         item_emb = self.item_tower(batch)
 
         user_emb = self.label_aware_attention(user_interests, item_emb)
+        if self._model_config.similarity == simi_pb2.Similarity.COSINE:
+            user_emb = F.normalize(user_emb, p=2.0, dim=1)
+
         ui_sim = self.sim(user_emb, item_emb) / self._model_config.temperature
         return {"similarity": ui_sim}
