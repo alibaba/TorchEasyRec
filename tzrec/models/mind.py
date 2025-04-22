@@ -142,12 +142,15 @@ class MINDUserTower(MatchTower):
             hist_seq_feas = grp_hist_seq
 
         high_capsules = self._capsule_layer(hist_seq_feas, grp_hist_len)
+        high_capsules_mask = norm(high_capsules, dim=-1) != 0.0
 
         # concatenate user feature and high_capsules
         user_feature = torch.unsqueeze(user_feature, dim=1)
         user_feature_tile = torch.tile(user_feature, [1, high_capsules.shape[1], 1])
         user_interests = torch.cat([user_feature_tile, high_capsules], dim=-1)
+        user_interests = user_interests * high_capsules_mask.unsqueeze(-1).float()
         user_interests = self._concat_mlp(user_interests)
+        user_interests = user_interests * high_capsules_mask.unsqueeze(-1).float()
 
         if self._output_dim > 0:
             user_interests = self.output(user_interests)
