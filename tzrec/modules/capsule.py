@@ -128,12 +128,16 @@ class CapsuleLayer(nn.Module):
         capsule_mask = capsule_mask.unsqueeze(1)  # [bs, 1, max_k]
         capsule_mask_thresh = (capsule_mask.float() * 2 - 1) * 1e32
 
-        low_capsule_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
-        low_capsule_vec = torch.nn.functional.normalize(low_capsule_vec, p=2.0, dim=-1)
+        low_capsule_vec = torch.einsum(
+            "bsl, lh -> bsh", inputs, self.bilinear_matrix
+        ).detach()
+        low_capsule_vec_norm = torch.nn.functional.normalize(
+            low_capsule_vec, p=2.0, dim=-1
+        )
 
         assert num_iters > 0, "num_iters should be greater than 0"
         high_capsule_vec = torch.Tensor([0])
-        for _ in range(num_iters):
+        for iter in range(num_iters):
             routing_logits = torch.minimum(routing_logits, capsule_mask_thresh)
             routing_logits = torch.nn.functional.softmax(
                 routing_logits, dim=2
@@ -143,13 +147,14 @@ class CapsuleLayer(nn.Module):
             high_capsule_vec = torch.einsum(
                 "bsk, bsh -> bkh", routing_logits, low_capsule_vec
             )
-            high_capsule_vec = self.squash(high_capsule_vec)
+            if iter + 1 == num_iters:
+                high_capsule_vec = self.squash(high_capsule_vec)
             high_capsule_vec = torch.nn.functional.normalize(
                 high_capsule_vec, p=2.0, dim=-1
             )
             routing_logits = (
-                routing_logits
-                + torch.einsum("bkh, bsh -> bsk", high_capsule_vec, low_capsule_vec)
+                # routing_logits +
+                torch.einsum("bkh, bsh -> bsk", high_capsule_vec, low_capsule_vec_norm)
                 * self._routing_logits_scale
             )
         return high_capsule_vec
