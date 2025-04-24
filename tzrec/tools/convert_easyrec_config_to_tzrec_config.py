@@ -686,8 +686,8 @@ class ConvertConfig(object):
             tz_model_config_ob = rank_model_pb2.DeepFM()
             deep = self._easyrec_dnn_2_tzrec_mlp(easyrec_model_config.dnn)
             final = self._easyrec_dnn_2_tzrec_mlp(easyrec_model_config.final_dnn)
-            tz_model_config_ob.deep = deep
-            tz_model_config_ob.final = final
+            tz_model_config_ob.deep.CopyFrom(deep)
+            tz_model_config_ob.final.CopyFrom(final)
             if easyrec_model_config.HasField("wide_output_dim"):
                 tz_model_config_ob.wide_embedding_dim = (
                     easyrec_model_config.wide_output_dim
