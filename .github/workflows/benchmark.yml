@@ -1,0 +1,30 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron:  '0 17 * * 2,6'
+  workflow_dispatch:
+
+jobs:
+  ci-test:
+    runs-on: tzrec-bench-runner
+    container:
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.7
+      options: --gpus all --ipc host
+    steps:
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: run_${{ github.run_id }}
+      - name: RunBenchmark
+        id: run_benchmark
+        env:
+          ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
+          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
+        run: |
+          cd run_${{ github.run_id }}
+          pip install -r requirements.txt
+          bash scripts/gen_proto.sh
+          PYTHONPATH=. PYTHONUNBUFFERED=1 MKL_THREADING_LAYER=GNU python tzrec/benchmark/benchmark.py

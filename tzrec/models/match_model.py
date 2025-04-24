@@ -21,11 +21,10 @@ from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
-from tzrec.protos import model_pb2, tower_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -67,7 +66,7 @@ class MatchTower(nn.Module):
             tower_pb2.MINDItemTower,
         ],
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
@@ -143,9 +142,12 @@ class MatchTowerWoEG(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        tower_config: Union[
+            tower_pb2.Tower,
+            tower_pb2.HSTUMatchTower,
+        ],
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
     ) -> None:
@@ -185,12 +187,7 @@ class MatchModel(BaseModel):
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
 
-    def sim(
-        self,
-        user_emb: torch.Tensor,
-        item_emb: torch.Tensor,
-        neg_for_each_sample: bool = False,
-    ) -> torch.Tensor:
+    def sim(self, user_emb: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
@@ -201,16 +198,7 @@ class MatchModel(BaseModel):
             pos_ui_sim = torch.sum(
                 torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
             )
-            neg_ui_sim = None
-            if not neg_for_each_sample:
-                neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
-            else:
-                # Calculate similarity for each user with corresponding negative items
-                num_neg_per_user = neg_item_emb.size(0) // batch_size
-                neg_size = batch_size * num_neg_per_user
-                neg_item_emb = neg_item_emb[:neg_size]
-                neg_item_emb = neg_item_emb.view(batch_size, num_neg_per_user, -1)
-                neg_ui_sim = torch.sum(user_emb.unsqueeze(1) * neg_item_emb, dim=-1)
+            neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
 
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:
@@ -234,12 +222,11 @@ class MatchModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_cfg: LossConfig,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
         losses = {}
-        label = batch.labels[label_name]
         sample_weight = (
             batch.sample_weights[self._sample_weight]
             if self._sample_weight
@@ -273,7 +260,9 @@ class MatchModel(BaseModel):
         losses = {}
         for loss_cfg in self._base_model_config.losses:
             losses.update(
-                self._loss_impl(predictions, batch, self._label_name, loss_cfg)
+                self._loss_impl(
+                    predictions, batch, batch.labels[self._label_name], loss_cfg
+                )
             )
         losses.update(self._loss_collection)
         return losses
@@ -300,12 +289,10 @@ class MatchModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         metric_cfg: MetricConfig,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
-
         metric_type = metric_cfg.WhichOneof("metric")
         metric_name = metric_type + suffix
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
@@ -335,10 +322,14 @@ class MatchModel(BaseModel):
             losses (dict, optional): a dict of loss.
         """
         for metric_cfg in self._base_model_config.metrics:
-            self._update_metric_impl(predictions, batch, self._label_name, metric_cfg)
+            self._update_metric_impl(
+                predictions, batch, batch.labels[self._label_name], metric_cfg
+            )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
-                self._update_loss_metric_impl(losses, batch, self._label_name, loss_cfg)
+                self._update_loss_metric_impl(
+                    losses, batch, batch.labels[self._label_name], loss_cfg
+                )
 
 
 class TowerWrapper(nn.Module):

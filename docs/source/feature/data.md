@@ -28,12 +28,17 @@ sample_weight_fields: 'col_name'
 - OdpsDataset: 输入数据为MaxCompute表
 
   - **前置条件**:
+
     - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
     - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
+
   - input_path: 按如下格式设置
+
     - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
     - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
+
   - 运行训练/评估/导出/预测等命令时
+
     - **本地环境**：
       - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
       ```bash
@@ -41,7 +46,7 @@ sample_weight_fields: 'col_name'
       project_name=${PROJECT_NAME}
       access_id=${ACCESS_ID}
       access_key=${ACCESS_KEY}
-      end_point=http://service.{region}.maxcompute.aliyun-inc.com/api
+      end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
       EOF
 
       ODPS_CONFIG_FILE_PATH=odps_conf \
@@ -53,19 +58,22 @@ sample_weight_fields: 'col_name'
     - **PAI-DLC/PAI-DSW环境**：
       - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
       ```bash
-      ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+      ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
       torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
       --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
       -m tzrec.train_eval \
       --pipeline_config_path ${PIPELINE_CONFIG}
       ```
-  - 如果是预付费Quota，可通过`odps_data_quota_name`传入购买的Quota名
+
+  - 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
+
+  - 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
 
 - ParquetDataset: 输入数据为parquet格式
 
   - input_path: 按如下格式设置
     - `${PATH_TO_DATA_DIR}/*.parquet`
-  - 注意: 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等
+  - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
 - CsvDataset: 输入数据为csv格式
 
@@ -73,7 +81,7 @@ sample_weight_fields: 'col_name'
     - `${PATH_TO_DATA_DIR}/*.csv`
   - 需设置`delimiter`来指名列分隔符，默认为`,`
   - 注意:
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量基本相等
+    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
     - 暂不支持没有header的csv文件
     - csv格式数据读性能有瓶颈
 
@@ -140,7 +148,7 @@ sample_weight_fields: 'col_name'
     cat <<EOF>> odps_conf
     access_id=${ACCESS_ID}
     access_key=${ACCESS_KEY}
-    end_point=http://service.${region}.maxcompute.aliyun-inc.com/api
+    end_point=http://service.${region}-vpc.maxcompute.aliyun-inc.com/api
     EOF
 
     ODPS_CONFIG_FILE_PATH=odps_conf \
@@ -159,11 +167,11 @@ sample_weight_fields: 'col_name'
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg048-0.4.8-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
+    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg059-0.5.9-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg048 import offline_pyfg
+    from pyfg059 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",

@@ -1,6 +1,7 @@
 syntax = "proto2";
 package tzrec.protos;
 
+import "google/protobuf/struct.proto";
 
 // LFU: evict_score = access_cnt
 message LFU_EvictionPolicy {
@@ -479,6 +480,77 @@ message TokenizeFeature {
     // TODO: constrains
 }
 
+message CustomFeature {
+    // feature name.
+    required string feature_name = 1;
+    // custom operator name.
+    required string operator_name = 2;
+    // custom operator lib file name.
+    required string operator_lib_file = 3;
+    // operator custom params.
+    optional google.protobuf.Struct operator_params = 4;
+    // custom operator is thread safe or not.
+    optional bool is_op_thread_safe = 5 [default = false];
+    // feature input, e.g. user:os
+    repeated string expression = 6;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 7;
+    // embedding dimension
+    optional uint32 embedding_dim = 8;
+    // boundaries for bucktize numeric value
+    repeated float boundaries = 9;
+    // number of hash size for sparse value
+    optional uint64 hash_bucket_size = 10;
+    // number of id enumerators for sparse value
+    optional uint64 num_buckets = 11;
+    // id vocabulary list for sparse value
+    repeated string vocab_list = 12;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 13;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 14 [default = "sum"];
+    // fg default value
+    optional string default_value = 15 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 16 [default = "\x1d"];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 17;
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 18;
+    // value dimensions
+    optional uint32 value_dim = 19;
+    // mask value in training progress
+    optional bool use_mask = 20;
+    // zero collision hash
+    optional ZeroCollisionHash zch = 21;
+    // id vocabulary file path
+    optional string vocab_file = 22;
+    // vocab file relative directory
+    optional string asset_dir = 23;
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
+
+    // TODO: constrains
+}
+
 message SequenceIdFeature {
     // feature name, e.g. item_cat_seq
     required string feature_name = 1;
@@ -572,6 +644,75 @@ message SequenceRawFeature {
     // TODO: constrains
 }
 
+
+message SequenceCustomFeature {
+    // feature name.
+    required string feature_name = 1;
+    // custom operator name.
+    required string operator_name = 2;
+    // custom operator lib file name.
+    required string operator_lib_file = 3;
+    // operator custom params.
+    optional google.protobuf.Struct operator_params = 4;
+    // custom operator is thread safe or not.
+    optional bool is_op_thread_safe = 5 [default = false];
+    // feature input, e.g. user:os
+    repeated string expression = 6;
+    // max sequence length, only take effect in fg
+    required uint32 sequence_length = 7;
+    // sequence delimiter
+    required string sequence_delim = 8 [default = ";"];
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 9;
+    // embedding dimension
+    optional uint32 embedding_dim = 10;
+    // boundaries for bucktize numeric value
+    repeated float boundaries = 11;
+    // number of hash size for sparse value
+    optional uint64 hash_bucket_size = 12;
+    // number of id enumerators for sparse value
+    optional uint64 num_buckets = 13;
+    // id vocabulary list for sparse value
+    repeated string vocab_list = 14;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 15;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 16 [default = "sum"];
+    // fg default value
+    optional string default_value = 17 [default = "0"];
+    // fg multi-value separator
+    optional string separator = 18 [default = "\x1d"];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 19;
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 20;
+    // value dimensions
+    optional uint32 value_dim = 21;
+    // mask value in training progress
+    optional bool use_mask = 22;
+    // zero collision hash
+    optional ZeroCollisionHash zch = 23;
+    // id vocabulary file path
+    optional string vocab_file = 24;
+    // vocab file relative directory
+    optional string asset_dir = 25;
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
+
+    // TODO: constrains
+}
+
 message SequenceFeature {
     // sequence name
     required string sequence_name = 1;
@@ -599,6 +740,8 @@ message FeatureConfig {
         TokenizeFeature tokenize_feature = 9;
         SequenceIdFeature sequence_id_feature = 10;
         SequenceRawFeature sequence_raw_feature = 11;
+        CustomFeature custom_feature = 12;
+        SequenceCustomFeature sequence_custom_feature = 13;
     }
 }
 
@@ -607,5 +750,6 @@ message SeqFeatureConfig {
     oneof feature {
         IdFeature id_feature = 1;
         RawFeature raw_feature = 2;
+        CustomFeature custom_feature = 3;
     }
 }

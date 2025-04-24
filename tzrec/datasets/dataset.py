@@ -26,6 +26,9 @@ from tzrec.datasets.utils import (
     C_SAMPLE_MASK,
     Batch,
     RecordBatchTensor,
+    process_hstu_neg_sample,
+    process_hstu_seq_data,
+    remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -170,6 +173,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._reserved_columns = reserved_columns or []
         self._mode = mode
         self._debug_level = debug_level
+        self._enable_hstu = data_config.enable_hstu
 
         self._data_parser = DataParser(
             features=features,
@@ -257,7 +261,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Init input fields info."""
         self._input_fields = []
         for field in self._reader.schema:
-            if any(map(lambda x: x == field.type, AVAILABLE_PA_TYPES)):
+            field_type = remove_nullable(field.type)
+            if any(map(lambda x: x == field_type, AVAILABLE_PA_TYPES)):
                 self._input_fields.append(field)
             else:
                 raise ValueError(
@@ -323,6 +328,44 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
+            elif self._enable_hstu:
+                seq_attr = self._sampler._item_id_field
+
+                (
+                    input_data_k_split,
+                    input_data_k_split_slice,
+                    pre_seq_filter_reshaped_joined,
+                ) = process_hstu_seq_data(
+                    input_data=input_data,
+                    seq_attr=seq_attr,
+                    seq_str_delim=self._sampler.item_id_delim,
+                )
+                if self._mode == Mode.TRAIN:
+                    # Training using all possible target items
+                    input_data[seq_attr] = input_data_k_split_slice
+                elif self._mode == Mode.EVAL:
+                    # Evaluation using the last item for previous sequence
+                    input_data[seq_attr] = input_data_k_split.values.take(
+                        pa.array(input_data_k_split.offsets.to_numpy()[1:] - 1)
+                    )
+                sampled = self._sampler.get(input_data)
+                # To keep consistent with other process, use two functions
+                for k, v in sampled.items():
+                    if k in input_data:
+                        combined = process_hstu_neg_sample(
+                            input_data,
+                            v,
+                            self._sampler._num_sample,
+                            self._sampler.item_id_delim,
+                            seq_attr,
+                        )
+                        # Combine here to make embddings of both user sequence
+                        # and target item are the same
+                        input_data[k] = pa.concat_arrays(
+                            [pre_seq_filter_reshaped_joined, combined]
+                        )
+                    else:
+                        input_data[k] = v
             else:
                 sampled = self._sampler.get(input_data)
                 for k, v in sampled.items():

@@ -111,7 +111,7 @@ pyarrow.lib.ArrowInvalid: Expected to read 538970747 metadata bytes, but only re
 
 **原因：** 这是因为链接mc的session过期失效了，目前session过期时间为1天
 
-**解决方法：** 使用离线FG + 训练 或 多机多卡加速训练，压缩训练时间在1天内
+**解决方法：** 升级torcheasyrec版本>=0.7.5
 
 ______________________________________________________________________
 

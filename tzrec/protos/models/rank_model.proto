@@ -26,3 +26,11 @@ message MultiTowerDINTRT {
     repeated DINTower din_towers = 2;
     required MLP final = 3;
 }
+
+
+message DLRM {
+  required MLP dense_mlp = 1;
+  // whether to include sparse features after interaction
+  optional bool arch_with_sparse = 2 [default=true];
+  required MLP final = 3;
+}

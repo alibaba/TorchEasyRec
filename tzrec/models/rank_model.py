@@ -137,17 +137,20 @@ class RankModel(BaseModel):
             predictions["probs" + suffix] = probs
             predictions["probs1" + suffix] = probs[:, 1]
         elif loss_type == "l2_loss":
+            output = torch.squeeze(output, dim=1)
             predictions["y" + suffix] = output
         else:
             raise NotImplementedError
         return predictions
 
-    def _output_to_prediction(self, output: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _output_to_prediction(
+        self, output: torch.Tensor, suffix: str = ""
+    ) -> Dict[str, torch.Tensor]:
         predictions = {}
         for loss_cfg in self._base_model_config.losses:
             predictions.update(
                 self._output_to_prediction_impl(
-                    output, loss_cfg, num_class=self._num_class
+                    output, loss_cfg, num_class=self._num_class, suffix=suffix
                 )
             )
         return predictions
@@ -185,14 +188,13 @@ class RankModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_weight: Optional[torch.Tensor],
         loss_cfg: LossConfig,
         num_class: int = 1,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
         losses = {}
-        label = batch.labels[label_name]
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
@@ -235,7 +237,7 @@ class RankModel(BaseModel):
                 self._loss_impl(
                     predictions,
                     batch,
-                    self._label_name,
+                    batch.labels[self._label_name],
                     loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
@@ -260,14 +262,18 @@ class RankModel(BaseModel):
             )
         elif metric_type == "multiclass_auc":
             self._metric_modules[metric_name] = torchmetrics.AUROC(
-                task="multiclass", num_class=num_class, **metric_kwargs
+                task="multiclass", num_classes=num_class, **metric_kwargs
             )
         elif metric_type == "mean_absolute_error":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.MeanAbsoluteError()
         elif metric_type == "mean_squared_error":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.MeanSquaredError()
         elif metric_type == "accuracy":
-            pass
+            self._metric_modules[metric_name] = torchmetrics.Accuracy(
+                task="multiclass" if num_class > 1 else "binary",
+                num_classes=num_class,
+                **metric_kwargs,
+            )
         elif metric_type == "grouped_auc":
             assert num_class <= 2, (
                 f"num_class must less than 2 when metric type is {metric_type}"
@@ -287,13 +293,11 @@ class RankModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         metric_cfg: MetricConfig,
         num_class: int = 1,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
-
         metric_type = metric_cfg.WhichOneof("metric")
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
         metric_name = metric_type + suffix
@@ -313,9 +317,14 @@ class RankModel(BaseModel):
             pred = predictions["probs" + suffix]
             self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "mean_absolute_error":
-            pass
+            pred = predictions["y" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "mean_squared_error":
-            pass
+            pred = predictions["y" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
+        elif metric_type == "accuracy":
+            pred = predictions["probs" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "grouped_auc":
             pred = (
                 predictions["probs" + suffix]
@@ -347,10 +356,12 @@ class RankModel(BaseModel):
             self._update_metric_impl(
                 predictions,
                 batch,
-                self._label_name,
+                batch.labels[self._label_name],
                 metric_cfg,
                 num_class=self._num_class,
             )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
-                self._update_loss_metric_impl(losses, batch, self._label_name, loss_cfg)
+                self._update_loss_metric_impl(
+                    losses, batch, batch.labels[self._label_name], loss_cfg
+                )

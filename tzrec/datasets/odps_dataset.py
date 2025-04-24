@@ -12,6 +12,7 @@
 
 import os
 import random
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -27,6 +28,7 @@ from odps.accounts import (
 )
 from odps.apis.storage_api import (
     ArrowReader,
+    Compression,
     ReadRowsRequest,
     SessionRequest,
     SessionStatus,
@@ -42,10 +44,13 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import calc_slice_position
+from tzrec.datasets.utils import calc_slice_position, remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+from tzrec.utils.logging_util import logger
+
+ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
@@ -81,9 +86,20 @@ TYPE_TABLE_TO_PA = {
 }
 
 
+def _get_compression_type(compression_name: str) -> Compression:
+    type_names = [x.name for x in Compression]
+    if compression_name in type_names:
+        return Compression[compression_name]
+    else:
+        raise ValueError(
+            f"Unknown compression type: {compression_name}, available {type_names}"
+        )
+
+
 def _type_pa_to_table(pa_type: pa.DataType) -> str:
     """PyArrow type to MaxCompute Table type."""
     mc_type = None
+    pa_type = remove_nullable(pa_type)
     for k, v in TYPE_TABLE_TO_PA.items():
         # list<element: int64> and list<item: int64> is equal
         if v == pa_type:
@@ -131,6 +147,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
         or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
         or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+        or "ALIBABA_CLOUD_ECS_METADATA" in os.environ
     ):
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
@@ -204,6 +221,7 @@ def _reader_iter(
     num_workers: int,
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
+    compression: Compression,
 ) -> Iterator[pa.RecordBatch]:
     num_sess = len(sess_reqs)
     remain_row_count = 0
@@ -233,13 +251,16 @@ def _reader_iter(
             row_index=start,
             row_count=end - start,
             max_batch_rows=min(batch_size, 20000),
+            compression=compression,
         )
         reader = _read_rows_arrow_with_retry(client, read_req)
         max_retry_count = 5
         while True:
             try:
                 read_data = reader.read()
-            except urllib3.exceptions.HTTPError as e:
+                retry_cnt = 0
+            # pyre-ignore [66]
+            except (urllib3.exceptions.HTTPError, pa.lib.ArrowInvalid) as e:
                 if retry_cnt >= max_retry_count:
                     raise e
                 retry_cnt += 1
@@ -248,6 +269,7 @@ def _reader_iter(
                     row_index=start + offset,
                     row_count=end - start - offset,
                     max_batch_rows=min(batch_size, 20000),
+                    compression=compression,
                 )
                 reader = _read_rows_arrow_with_retry(client, read_req)
                 continue
@@ -257,6 +279,17 @@ def _reader_iter(
                 retry_cnt = 0
                 offset += len(read_data)
             yield read_data
+
+
+def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
+            for session_id, client in sess_id_to_cli.items():
+                logger.info(f"refresh session: {session_id}")
+                client.get_read_session(SessionRequest(session_id, refresh=True))
+            start_time = time.time()
+        time.sleep(5)
 
 
 class OdpsDataset(BaseDataset):
@@ -289,6 +322,7 @@ class OdpsDataset(BaseDataset):
             is_orderby_partition=self._data_config.is_orderby_partition,
             quota_name=self._data_config.odps_data_quota_name,
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
+            compression=self._data_config.odps_data_compression,
         )
         self._init_input_fields()
 
@@ -307,6 +341,7 @@ class OdpsReader(BaseReader):
         quota_name (str): storage api quota name.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
+        compression (str):  storage api data compression name.
     """
 
     def __init__(
@@ -320,6 +355,7 @@ class OdpsReader(BaseReader):
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
+        compression: str = "LZ4_FRAME",
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -332,6 +368,7 @@ class OdpsReader(BaseReader):
         )
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
+        self._compression = _get_compression_type(compression)
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
@@ -377,6 +414,7 @@ class OdpsReader(BaseReader):
 
     def _init_session(self) -> None:
         """Init table scan session."""
+        sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             session_ids = []
             _, table_name, partitions = _parse_table_path(input_path)
@@ -394,13 +432,23 @@ class OdpsReader(BaseReader):
                     )
                     scan_resp = client.create_read_session(scan_req)
                     session_ids.append(scan_resp.session_id)
+                    sess_id_to_cli[scan_resp.session_id] = client
                 else:
                     session_ids.append(None)
+
             if dist.is_initialized():
                 dist.broadcast_object_list(session_ids)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
+        # refresh session
+        if int(os.environ.get("RANK", 0)) == 0:
+            t = threading.Thread(
+                target=_refresh_sessions_daemon,
+                args=(sess_id_to_cli,),
+                daemon=True,
+            )
+            t.start()
 
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
@@ -416,6 +464,7 @@ class OdpsReader(BaseReader):
             num_workers,
             self._batch_size,
             self._drop_redundant_bs_eq_one,
+            self._compression,
         )
         yield from self._arrow_reader_iter(iterator)
 

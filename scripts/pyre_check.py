@@ -27,6 +27,7 @@ IGNORE_PATTERNS = [
     "Annotation `pa.Scalar` is not defined as a type",
     "Annotation `parquet.FileMetaData` is not defined as a type",
     "Annotation `faiss.Index` is not defined as a type.",
+    "Annotation `struct_pb2.Struct` is not defined as a type.",
     "Undefined attribute [16]: Module `pyarrow` has no attribute",
     "Undefined attribute [16]: Module `pyarrow.compute` has no attribute",
     "Undefined attribute [16]: Module `pyarrow.csv` has no attribute",

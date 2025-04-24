@@ -4,6 +4,7 @@ package tzrec.protos;
 import "tzrec/protos/models/rank_model.proto";
 import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
+import "tzrec/protos/models/general_rank_model.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
@@ -29,12 +30,18 @@ message FeatureGroupConfig {
     repeated SeqEncoderConfig sequence_encoders = 5;
 }
 
+enum Kernel {
+    TRITON = 0;
+    PYTORCH = 1;
+    CUDA = 2;
+}
+
 message ModelConfig {
 
     repeated FeatureGroupConfig feature_groups = 1;
 
     oneof model {
-	    // DLRM dlrm = 100;
+	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
@@ -54,6 +61,8 @@ message ModelConfig {
         TDM tdm = 400;
 
         MultiTowerDINTRT multi_tower_din_trt =500;
+
+        RocketLaunching rocket_launching = 600;
     }
 
     optional uint32 num_class = 2 [default = 1];
@@ -63,4 +72,6 @@ message ModelConfig {
     repeated MetricConfig metrics = 4;
 
     optional VariationalDropout variational_dropout = 11;
+
+    optional Kernel kernel = 12 [default = PYTORCH];
 }

@@ -448,6 +448,43 @@ feature_configs: {
   | TEXT_SPLITCHRS    | 中文拆成单字(空格分隔) |
   | TEXT_REMOVE_SPACE | 去除空格               |
 
+## CustomFeature: 自定义特征
+
+自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
+
+```
+feature_configs: {
+    custom_feature {
+        feature_name: "edit_distance"
+        operator_name: "EditDistance"
+        operator_lib_file: "pyfg/lib/libedit_distance.so"
+        expression: ["user:query", "item:title"]
+        operator_params {
+            fields {
+                key: "encoding"
+                value {
+                    string_value: "utf-8"
+                }
+            }
+        }
+    }
+}
+```
+
+- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
+
+- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+
+- expression: 特征FG所依赖组合字段的来源
+
+- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
+
+| 算子名称     | 算子功能 | 算子动态库                   | 算子参数                                                                         |
+| ------------ | -------- | ---------------------------- | -------------------------------------------------------------------------------- |
+| EditDistance | 编辑距离 | pyfg/lib/libedit_distance.so | • encoding: 输入文本的编码，可选：utf-8, latin，默认值为latin                    |
+| RegexReplace | 正则替换 | pyfg/lib/libregex_replace.so | • regex_patten: 正则表达式，匹配的文本片段将会被替换 <br>• replacement: 替换文本 |
+|              |          |                              |                                                                                  |
+
 ## SequenceIdFeature：类别型序列特征
 
 类别型序列特征，支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；支持ARRAY<string>或ARRAY<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）
@@ -491,6 +528,57 @@ feature_configs: {
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 - 其余配置同RawFeature
 
+## SequenceCustomFeature: 自定义序列特征
+
+自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
+
+```
+feature_configs: {
+    sequence_custom_feature {
+        feature_name: "seq_expr_1"
+        operator_name: "SeqExpr"
+        operator_lib_file: "pyfg/lib/libseq_expr.so"
+        expression: ["user:cur_time", "item:clk_time_seq"]
+        operator_params {
+            fields {
+                key: "formula"
+                value {
+                    string_value: "cur_time-clk_time_seq"
+                }
+            }
+        }
+    }
+}
+feature_configs: {
+    sequence_custom_feature {
+        feature_name: "seq_expr_2"
+        operator_name: "SeqExpr"
+        operator_lib_file: "pyfg/lib/libseq_expr.so"
+        expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+        operator_params {
+            fields {
+                key: "formula"
+                value {
+                    string_value: "spherical_distance"
+                }
+            }
+        }
+    }
+}
+```
+
+- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
+
+- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+
+- expression: 特征FG所依赖组合字段的来源
+
+- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
+
+| 算子名称 | 算子功能   | 算子动态库              | 算子参数                                                                                                                                                 |
+| -------- | ---------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SeqExpr  | 序列表达式 | pyfg/lib/libseq_expr.so | • formula: 表达式。如果值为spherical_distance， 计算两个经纬度坐标的距离，参数为[lng1_seq, lat1_seq, lng2, lat2]，前两个参数是序列，后两个参数是标量值。 |
+
 ## SequenceFeature：分组序列特征
 
 分组序列特征的子序列格式一般为`XX;XX;XX`，如用户点击的Item的序列特征为`item_id1;item_id2;item_id3`，其中`;`为序列分隔符，也支持ARRAY类型，同SequenceIdFeature和SequenceRawFeature。
@@ -528,6 +616,18 @@ feature_configs: {
                 expression: "user:ts"
             }
         }
+        features {
+            custom_feature {
+                feature_name: "seq_expr"
+                operator_name: "SeqExpr"
+                operator_lib_file: "pyfg/lib/libseq_expr.so"
+                expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+                operator_params {
+                    key: "formula"
+                    string_value: "spherical_distance"
+                }
+            }
+        }
     }
 }
 ```
@@ -536,7 +636,7 @@ feature_configs: {
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列特征分隔符
 - **sequence_pk**: 序列特征主键，一般为ItemId列表，主要用于线上模型服务，线上模型服务会使用该ItemId列表从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。而行为属性相关子序列（如行为时间序列`ts1;ts2;ts3`）跟用户相关，则仍需从请求从传递。
-- **features**: 序列特征子特征，配置同IdFeature和RawFeature
+- **features**: 序列特征子特征，配置同IdFeature和RawFeature和SequenceCustomFeature
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
   - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。在输入样本数据中列名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，`expression`为`item:iid`，输入样本数据中列名应为`click_seq__iid`。在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
   - 其中当类型为IdFeature时

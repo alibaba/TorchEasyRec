@@ -25,13 +25,18 @@ from tzrec.acc.utils import is_trt_predict
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
+from tzrec.features.custom_feature import CustomFeature
 from tzrec.features.expr_feature import ExprFeature
 from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.features.id_feature import IdFeature
 from tzrec.features.lookup_feature import LookupFeature
 from tzrec.features.match_feature import MatchFeature
 from tzrec.features.raw_feature import RawFeature
-from tzrec.features.sequence_feature import SequenceIdFeature, SequenceRawFeature
+from tzrec.features.sequence_feature import (
+    SequenceCustomFeature,
+    SequenceIdFeature,
+    SequenceRawFeature,
+)
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -119,6 +124,36 @@ class IdMockInput(MockInput):
             )
             random.shuffle(data)
         return pa.array(data)
+
+
+class HSTUIdMockInput(MockInput):
+    """Mock sparse id input data class."""
+
+    def __init__(
+        self,
+        name: str,
+        is_multi: bool = False,
+        num_ids: Optional[int] = None,
+        vocab_list: Optional[List[str]] = None,
+        multival_sep: str = chr(3),
+    ) -> None:
+        super().__init__(name)
+        self.is_multi = is_multi
+        self.num_ids = num_ids
+        self.vocab_list = vocab_list
+        self.multival_sep = multival_sep
+
+    def create_data(self, num_rows: int, has_null: bool = True) -> pa.Array:
+        """Create mock data."""
+        # string
+        # num_multi_rows = random.randint(num_rows // 3, 2 * num_rows // 3)
+        num_multi_id = 3
+        data_multi = _create_random_id_data(
+            (num_rows, num_multi_id), self.num_ids, self.vocab_list
+        ).astype(str)
+        data_multi = list(map(lambda x: self.multival_sep.join(x), data_multi))
+        random.shuffle(data_multi)
+        return pa.array(data_multi)
 
 
 class SeqIdMockInput(MockInput):
@@ -260,18 +295,37 @@ class SeqMockInput(MockInput):
         self, num_rows: int, item_t: pa.Table
     ) -> Dict[str, pa.Array]:
         """Create mock data."""
+        item_t_side_infos = []
+        other_side_infos = []
+        for side_info in self.side_infos:
+            if side_info in item_t.column_names:
+                item_t_side_infos.append(side_info)
+            else:
+                other_side_infos.append(side_info)
+
         # generate random sequence id
         row_number = []
+        sequence_lengths = []
         for i in range(num_rows):
-            row_number.extend([i] * random.randint(1, self.sequence_length))
+            sequence_length = random.randint(1, self.sequence_length)
+            sequence_lengths.append(sequence_length)
+            row_number.extend([i] * sequence_length)
         row_number = pa.array(row_number)
         id_data = pa.array(
             _create_random_id_data(len(row_number), self.num_ids, self.vocab_list)
         )
-        tmp_t = pa.Table.from_arrays([row_number, id_data], names=["rn", self.item_id])
+        other_id_datas = OrderedDict()
+        for side_info in other_side_infos:
+            other_id_datas[side_info] = pa.array(
+                _create_random_id_data(len(row_number), 10)
+            )
+        tmp_t = pa.Table.from_arrays(
+            [row_number, id_data] + list(other_id_datas.values()),
+            names=["rn", self.item_id] + list(other_id_datas.keys()),
+        )
 
         # join item side info
-        selected_item_t = item_t.select(list(set([self.item_id] + self.side_infos)))
+        selected_item_t = item_t.select(list(set([self.item_id] + item_t_side_infos)))
         join_t = tmp_t.join(selected_item_t, keys=self.item_id)
 
         # group by sequence item_id and concat
@@ -290,6 +344,7 @@ class SeqMockInput(MockInput):
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
                 data[f"{self.name}__{name}"] = arr
+
         return data
 
 
@@ -599,7 +654,10 @@ def _get_vocab_list(feature: BaseFeature) -> Optional[List[str]]:
 
 
 def build_mock_input_with_fg(
-    features: List[BaseFeature], user_id: str = "", item_id: str = ""
+    features: List[BaseFeature],
+    user_id: str = "",
+    item_id: str = "",
+    is_hstu: bool = False,
 ) -> Dict[str, MockInput]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
@@ -683,33 +741,61 @@ def build_mock_input_with_fg(
                 num_ids=feature.num_embeddings,
                 multival_sep=" ",
             )
+        elif type(feature) is CustomFeature:
+            if feature.config.operator_name != "EditDistance":
+                raise ValueError(
+                    "Mock CustomFeature with operator_name"
+                    f"[{feature.config.operator_name}] is not supported."
+                )
+            for side, input_name in feature.side_inputs:
+                inputs[side][input_name] = IdMockInput(
+                    input_name,
+                    is_multi=True,
+                    num_ids=10,
+                    multival_sep="",
+                )
 
     for feature in features:
-        if type(feature) in [SequenceIdFeature, SequenceRawFeature]:
-            side, name = feature.side_inputs[0]
-            if feature.is_grouped_sequence:
-                side_info = name.replace(f"{feature.sequence_name}__", "")
-                if feature.sequence_name in inputs["user"]:
-                    inputs["user"][feature.sequence_name].side_infos.append(side_info)
+        if type(feature) in [
+            SequenceIdFeature,
+            SequenceRawFeature,
+            SequenceCustomFeature,
+        ]:
+            for side, input_name in feature.side_inputs:
+                if feature.is_grouped_sequence:
+                    sub_name = input_name.replace(f"{feature.sequence_name}__", "")
+                    if feature.sequence_name not in inputs["user"]:
+                        inputs["user"][feature.sequence_name] = SeqMockInput(
+                            name=feature.sequence_name,
+                            side_infos=[],
+                            item_id=item_id,
+                            num_ids=inputs["item"][item_id].num_ids,
+                            vocab_list=inputs["item"][item_id].vocab_list,
+                            sequence_length=feature.sequence_length,
+                            sequence_delim=feature.sequence_delim,
+                        )
+                    inputs["user"][feature.sequence_name].side_infos.append(sub_name)
+                    if sub_name in inputs["item"]:
+                        if isinstance(inputs[side][sub_name], IdMockInput):
+                            inputs[side][sub_name].is_multi = False
                 else:
-                    inputs["user"][feature.sequence_name] = SeqMockInput(
-                        name=feature.sequence_name,
-                        side_infos=[side_info],
-                        item_id=item_id,
-                        num_ids=inputs["item"][item_id].num_ids,
-                        vocab_list=inputs["item"][item_id].vocab_list,
-                        sequence_length=feature.sequence_length,
-                        sequence_delim=feature.sequence_delim,
-                    )
-                if isinstance(inputs[side][side_info], IdMockInput):
-                    inputs[side][side_info].is_multi = False
-            else:
-                inputs[side][name] = IdMockInput(
-                    name,
-                    is_multi=True,
-                    num_ids=feature.num_embeddings,
-                    multival_sep=feature.sequence_delim,
-                )
+                    if is_hstu:
+                        # hstu require number of sequence item is over 2
+                        inputs[side][input_name] = HSTUIdMockInput(
+                            input_name,
+                            is_multi=True,
+                            num_ids=feature.num_embeddings,
+                            multival_sep=feature.sequence_delim,
+                        )
+                    else:
+                        inputs[side][input_name] = IdMockInput(
+                            input_name,
+                            is_multi=True,
+                            num_ids=10
+                            if isinstance(feature, SequenceCustomFeature)
+                            else feature.num_embeddings,
+                            multival_sep=feature.sequence_delim,
+                        )
     return inputs["user"], inputs["item"]
 
 
@@ -719,6 +805,7 @@ def load_config_for_test(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
+    is_hstu: bool = False,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
@@ -749,7 +836,9 @@ def load_config_for_test(
             num_parts=num_parts,
         )
     else:
-        user_inputs, item_inputs = build_mock_input_with_fg(features, user_id, item_id)
+        user_inputs, item_inputs = build_mock_input_with_fg(
+            features, user_id, item_id, is_hstu
+        )
         _, item_t = create_mock_data(
             os.path.join(test_dir, "item_data"),
             item_inputs,
@@ -843,7 +932,9 @@ def load_config_for_test(
                 os.path.join(test_dir, "item_gl"),
                 item_inputs,
                 item_id,
-                neg_fields=list(sampler_config.attr_fields),
+                # hstu only uses item_id as negative sample, \
+                # as sampler_config.attr_fields is sequence
+                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
@@ -859,7 +950,7 @@ def load_config_for_test(
 
 
 def _standalone():
-    if bool(os.environ.get("CI", "False")):
+    if os.environ.get("CI", "false").lower() == "true":
         # When using GitHub Actions, a container network is created by GitHub, and
         # the host network cannot be utilized. This can lead to the error:
         # [c10d] The hostname of the client socket cannot be retrieved, error code: -3.
@@ -875,10 +966,11 @@ def test_train_eval(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
+    is_hstu: bool = False,
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
-        pipeline_config_path, test_dir, user_id, item_id, cate_id
+        pipeline_config_path, test_dir, user_id, item_id, cate_id, is_hstu
     )
 
     test_config_path = os.path.join(test_dir, "pipeline.config")
@@ -915,8 +1007,7 @@ def test_export(
     pipeline_config_path: str,
     test_dir: str,
     asset_files: str = "",
-    enable_aot=False,
-    enable_trt=False,
+    env_str: str = "",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
@@ -927,10 +1018,8 @@ def test_export(
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {test_dir}/export "
     )
-    if enable_aot:
-        cmd_str = "ENABLE_AOT=1 " + cmd_str
-    if enable_trt:
-        cmd_str = "ENABLE_TRT=1 " + cmd_str
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     if asset_files:
         cmd_str += f"--asset_files {asset_files}"
 

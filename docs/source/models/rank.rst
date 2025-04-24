@@ -6,4 +6,6 @@
 
    multi_tower
    deepfm
+   dlrm
    din
+   rocket_launching

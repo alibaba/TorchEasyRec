@@ -10,6 +10,7 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
+from collections import OrderedDict
 from itertools import chain
 from queue import Queue
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -25,15 +26,16 @@ from torchrec.modules.embedding_modules import (
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
-from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils.load_class import get_register_class_meta
 
 _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
 
 
-class BaseModel(nn.Module, metaclass=_meta_cls):
+class BaseModel(BaseModule, metaclass=_meta_cls):
     """TorchEasyRec base model.
 
     Args:
@@ -154,15 +156,28 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         self,
         losses: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_cfg: LossConfig,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
         loss = losses[loss_name]
         self._metric_modules[loss_name].update(loss, loss.new_tensor(label.size(0)))
+
+    def get_features_in_feature_groups(
+        self, feature_groups: List[FeatureGroupConfig]
+    ) -> List[BaseFeature]:
+        """Select features order by feature groups."""
+        name_to_feature = {x.name: x for x in self._features}
+        grouped_features = OrderedDict()
+        for feature_group in feature_groups:
+            for x in feature_group.feature_names:
+                grouped_features[x] = name_to_feature[x]
+            for sequence_group in feature_group.sequence_groups:
+                for x in sequence_group.feature_names:
+                    grouped_features[x] = name_to_feature[x]
+        return list(grouped_features.values())
 
 
 TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]

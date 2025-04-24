@@ -27,12 +27,10 @@ from tzrec.modules.hstu import (
 from tzrec.modules.mlp import MLP
 from tzrec.protos.seq_encoder_pb2 import SeqEncoderConfig
 from tzrec.utils import config_util
+from tzrec.utils.fx_util import fx_arange
 from tzrec.utils.load_class import get_register_class_meta
 
-
-@torch.fx.wrap
-def _arange(end: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(end, device=device)
+torch.fx.wrap(fx_arange)
 
 
 _SEQ_ENCODER_CLASS_MAP = {}
@@ -94,7 +92,7 @@ class DINEncoder(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         max_seq_length = sequence.size(1)
-        sequence_mask = _arange(
+        sequence_mask = fx_arange(
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
 
@@ -142,7 +140,7 @@ class SimpleAttention(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         max_seq_length = sequence.size(1)
-        sequence_mask = _arange(max_seq_length, sequence_length.device).unsqueeze(
+        sequence_mask = fx_arange(max_seq_length, sequence_length.device).unsqueeze(
             0
         ) < sequence_length.unsqueeze(1)
 
@@ -244,7 +242,7 @@ class MultiWindowDINEncoder(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         max_seq_length = sequence.size(1)
-        sequence_mask = _arange(
+        sequence_mask = fx_arange(
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
 
@@ -276,33 +274,6 @@ class MultiWindowDINEncoder(SequenceEncoder):
         return torch.cat([result, query.unsqueeze(1)], dim=1).reshape(
             result.shape[0], -1
         )  # [B, (L+1)*C]
-
-
-def create_seq_encoder(
-    seq_encoder_config: SeqEncoderConfig, group_total_dim: Dict[str, int]
-) -> SequenceEncoder:
-    """Build seq encoder model..
-
-    Args:
-        seq_encoder_config:  a SeqEncoderConfig.group_total_dim.
-        group_total_dim: a dict contain all seq group dim info.
-
-    Return:
-        model: a SequenceEncoder cls.
-    """
-    model_cls_name = config_util.which_msg(seq_encoder_config, "seq_module")
-    # pyre-ignore [16]
-    model_cls = SequenceEncoder.create_class(model_cls_name)
-    seq_type = seq_encoder_config.WhichOneof("seq_module")
-    seq_type_config = getattr(seq_encoder_config, seq_type)
-    input_name = seq_type_config.input
-    query_dim = group_total_dim[f"{input_name}.query"]
-    sequence_dim = group_total_dim[f"{input_name}.sequence"]
-    seq_config_dict = config_util.config_to_kwargs(seq_type_config)
-    seq_config_dict["sequence_dim"] = sequence_dim
-    seq_config_dict["query_dim"] = query_dim
-    seq_encoder = model_cls(**seq_config_dict)
-    return seq_encoder
 
 
 class HSTUEncoder(SequenceEncoder):
@@ -344,7 +315,7 @@ class HSTUEncoder(SequenceEncoder):
         self._sequence_length_name = f"{input}.sequence_length"
         max_output_len = max_output_len + 1  # for target
         self.position_embed = nn.Embedding(
-            self._max_seq_length + max_output_len, self._sequence_dim, padding_idx=0
+            self._max_seq_length + max_output_len, self._sequence_dim
         )
         self.dropout_rate = pos_dropout_rate
         self.enable_relative_attention_bias = True
@@ -405,13 +376,13 @@ class HSTUEncoder(SequenceEncoder):
 
         # Add positional embeddings and apply dropout
         positions = (
-            _arange(sequence.size(1), device=sequence.device)
+            fx_arange(sequence.size(1), device=sequence.device)
             .unsqueeze(0)
             .expand(sequence.size(0), -1)
         )
         sequence = sequence * (self._sequence_dim**0.5) + self.position_embed(positions)
         sequence = F.dropout(sequence, p=self.dropout_rate, training=self.training)
-        sequence_mask = _arange(
+        sequence_mask = fx_arange(
             sequence.size(1), device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
         sequence = sequence * sequence_mask.unsqueeze(-1).to(float_dtype)
@@ -432,21 +403,17 @@ class HSTUEncoder(SequenceEncoder):
             cache=None,
             return_cache_states=False,
         )
-        output_embeddings = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=jagged_x,
-            offsets=[sequence_offsets],
-            max_lengths=[invalid_attn_mask.size(1)],
-            padding_value=0.0,
-        )
         # post processing: L2 Normalization
+        output_embeddings = jagged_x
         output_embeddings = output_embeddings[..., : self._sequence_dim]
         output_embeddings = output_embeddings / torch.clamp(
             torch.linalg.norm(output_embeddings, ord=None, dim=-1, keepdim=True),
             min=1e-6,
         )
-        output_embeddings = self.get_current_embeddings(
-            sequence_length, output_embeddings
-        )
+        if not self.training:
+            output_embeddings = self.get_current_embeddings(
+                sequence_length, output_embeddings
+            )
         return output_embeddings
 
     def jagged_forward(
@@ -509,6 +476,33 @@ class HSTUEncoder(SequenceEncoder):
         Returns:
             (B, D,) x float, where [i, :] == encoded_embeddings[i, lengths[i] - 1, :]
         """
-        B, N, D = encoded_embeddings.size()
-        flattened_offsets = (lengths - 1) + _arange(B, device=lengths.device) * N
-        return encoded_embeddings.reshape(-1, D)[flattened_offsets, :].reshape(B, D)
+        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        indices = offsets[1:] - 1
+        return encoded_embeddings[indices]
+
+
+def create_seq_encoder(
+    seq_encoder_config: SeqEncoderConfig, group_total_dim: Dict[str, int]
+) -> SequenceEncoder:
+    """Build seq encoder model..
+
+    Args:
+        seq_encoder_config:  a SeqEncoderConfig.group_total_dim.
+        group_total_dim: a dict contain all seq group dim info.
+
+    Return:
+        model: a SequenceEncoder cls.
+    """
+    model_cls_name = config_util.which_msg(seq_encoder_config, "seq_module")
+    # pyre-ignore [16]
+    model_cls = SequenceEncoder.create_class(model_cls_name)
+    seq_type = seq_encoder_config.WhichOneof("seq_module")
+    seq_type_config = getattr(seq_encoder_config, seq_type)
+    input_name = seq_type_config.input
+    query_dim = group_total_dim[f"{input_name}.query"]
+    sequence_dim = group_total_dim[f"{input_name}.sequence"]
+    seq_config_dict = config_util.config_to_kwargs(seq_type_config)
+    seq_config_dict["sequence_dim"] = sequence_dim
+    seq_config_dict["query_dim"] = query_dim
+    seq_encoder = model_cls(**seq_config_dict)
+    return seq_encoder

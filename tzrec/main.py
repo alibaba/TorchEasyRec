@@ -25,15 +25,11 @@ from torch import distributed as dist
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.distributed.model_parallel import (
-    DistributedModelParallel,
-)
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.inference.state_dict_transform import (
-    state_dict_gather,
     state_dict_to_device,
 )
 from torchrec.optim.apply_optimizer_in_backward import (
@@ -52,6 +48,7 @@ from tzrec.acc.utils import (
     is_quant,
     is_trt,
     is_trt_predict,
+    quant_dtype,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
@@ -73,18 +70,22 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
+from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
+from tzrec.utils.state_dict_util import state_dict_gather, validate_state
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -234,7 +235,12 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
-    model = model_cls(model_config, features, labels, sample_weights=sample_weights)
+    model: BaseModel = model_cls(
+        model_config, features, labels, sample_weights=sample_weights
+    )
+
+    kernel = Kernel[KernelProto.Name(model_config.kernel)]
+    model.set_kernel(kernel)
     return model
 
 
@@ -291,6 +297,7 @@ def _evaluate(
             plogger.log(i_step)
 
     metric_result = _model.compute_metric()
+
     if is_rank_zero:
         metric_str = " ".join([f"{k}:{v:0.6f}" for k, v in metric_result.items()])
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
@@ -771,10 +778,12 @@ def _script_model(
         logger.info("gather states to cpu model...")
 
     state_dict_gather(state_dict, model.state_dict())
-
     dist.barrier()
 
     if is_rank_zero:
+        # for mc modules, we should validate and sort mch buffers
+        validate_state(model)
+
         batch = next(iter(dataloader))
 
         if is_cuda_export():
@@ -782,7 +791,8 @@ def _script_model(
 
         if is_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=torch.qint8, inplace=True)
+            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            logger.info("finish quantize embeddings...")
 
         model.eval()
 
@@ -924,6 +934,7 @@ def export(
         features,
         list(data_config.label_fields),
     )
+    cpu_model.set_is_inference(True)
 
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     if isinstance(cpu_model, MatchModel):
