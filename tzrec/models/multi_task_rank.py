@@ -97,6 +97,7 @@ class MultiTaskRank(RankModel):
                 if task_tower_cfg.sample_weight_name:
                     sample_weight = task_tower_cfg.sample_weight_name
                     loss_weight = batch.sample_weights[sample_weight]
+                    loss_weight = div_no_nan(loss_weight, torch.mean(loss_weight))
                 else:
                     loss_weight = torch.Tensor([1.0]).to(
                         batch.labels[label_name].device
@@ -112,8 +113,6 @@ class MultiTaskRank(RankModel):
                         task_tower_cfg.in_task_space_weight * in_task_space
                         + task_tower_cfg.out_task_space_weight * (1 - in_task_space)
                     )
-
-                loss_weight = div_no_nan(loss_weight, torch.mean(loss_weight))
             else:
                 loss_weight = None
 
