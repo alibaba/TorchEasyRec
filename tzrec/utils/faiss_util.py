@@ -107,6 +107,9 @@ def build_faiss_index(
         index.hnsw.efConstruction = hnsw_efConstruction
     else:
         raise ValueError(f"Unknown index_type: {index_type}")
+    if faiss.get_num_gpus() > 0:
+        res = faiss.StandardGpuResources()
+        index = faiss.index_cpu_to_gpu(res, int(os.environ.get("LOCAL_RANK", 0)), index)
 
     embeddings = np.concatenate(embeddings)
     if index_type.startswith("IVFFlat"):
@@ -115,6 +118,7 @@ def build_faiss_index(
     index.add(embeddings)
     if is_local_rank_zero:
         logger.info("Build embeddings finished.")
+
     return index, np.array(index_id_map, dtype=str)
 
 

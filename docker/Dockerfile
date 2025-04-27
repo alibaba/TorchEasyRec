@@ -48,14 +48,14 @@ ARG LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 
 ADD requirements /root/requirements
+ADD requirements-cpu.txt /root/requirements-cpu.txt
+ADD requirements-gpu.txt /root/requirements-gpu.txt
 RUN cd /root && \
-    pip install -r requirements/runtime.txt && \
-    pip install -r requirements/test.txt && \
-    pip install -r requirements/docs.txt && \
     case ${DEVICE} in \
-        "cu124") pip install -r requirements/gpu.txt ;; \
+        "cu124") pip install -r requirements-gpu.txt ;; \
+        * )      pip install -r requirements-cpu.txt ;; \
     esac && \
-    rm -rf requirements && \
+    rm -rf requirements requirements-cpu.txt requirements-gpu.txt && \
     /opt/conda/bin/conda clean -ya
 
 RUN mkdir -p /home/pai/bin && \
