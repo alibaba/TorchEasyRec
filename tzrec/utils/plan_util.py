@@ -168,6 +168,8 @@ class DynamicProgrammingProposer(Proposer):
             fqn = sharding_option.fqn
             if fqn not in self._sharding_options_by_fqn:
                 self._sharding_options_by_fqn[fqn] = []
+            if sharding_option.sharding_type != "row_wise":
+                continue
             self._sharding_options_by_fqn[fqn].append(sharding_option)
 
     def _reset(self) -> None:

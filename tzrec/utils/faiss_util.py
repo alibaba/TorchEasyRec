@@ -137,6 +137,9 @@ def write_faiss_index(
             for mapping continuous ids to origin id.
         output_dir (str): index output dir.
     """
+    if hasattr(index, "getResources"):  # gpu index
+        # pyre-ignore [16]
+        index = faiss.index_gpu_to_cpu(index)
     # pyre-ignore [16]
     faiss.write_index(index, os.path.join(output_dir, "faiss_index"))
     with open(os.path.join(output_dir, "id_mapping"), "w") as f:
