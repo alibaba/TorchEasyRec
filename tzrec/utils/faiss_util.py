@@ -107,8 +107,12 @@ def build_faiss_index(
         index.hnsw.efConstruction = hnsw_efConstruction
     else:
         raise ValueError(f"Unknown index_type: {index_type}")
+
+    # pyre-ignore [16]
     if faiss.get_num_gpus() > 0:
+        # pyre-ignore [16]
         res = faiss.StandardGpuResources()
+        # pyre-ignore [16]
         index = faiss.index_cpu_to_gpu(res, int(os.environ.get("LOCAL_RANK", 0)), index)
 
     embeddings = np.concatenate(embeddings)
