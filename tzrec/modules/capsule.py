@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
@@ -164,7 +164,9 @@ class CapsuleLayer(nn.Module):
 
         return high_capsule_vec
 
-    def forward(self, inputs: torch.Tensor, seq_len: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, inputs: torch.Tensor, seq_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward method.
 
         Args:
@@ -209,4 +211,4 @@ class CapsuleLayer(nn.Module):
             inputs, seq_mask, capsule_mask, self._num_iters
         )
         user_interests = user_interests * capsule_mask.unsqueeze(-1).float()
-        return user_interests
+        return user_interests, capsule_mask

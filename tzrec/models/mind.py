@@ -9,13 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch._tensor import Tensor
-from torch.linalg import norm
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -141,7 +140,9 @@ class MINDUserTower(MatchTower):
                 self._concat_mlp.output_dim(), output_dim, bias=False
             )
 
-    def forward(self, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, batch: Batch
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward the tower.
 
         Args:
@@ -169,8 +170,9 @@ class MINDUserTower(MatchTower):
         else:
             hist_seq_feas = grp_hist_seq
 
-        high_capsules = self._capsule_layer(hist_seq_feas, grp_hist_len)
-        high_capsules_mask = norm(high_capsules, dim=-1) != 0.0
+        high_capsules, high_capsules_mask = self._capsule_layer(
+            hist_seq_feas, grp_hist_len
+        )
 
         # concatenate user feature and high_capsules
         user_feature = torch.unsqueeze(user_feature, dim=1)
@@ -186,7 +188,10 @@ class MINDUserTower(MatchTower):
         if self._similarity == simi_pb2.Similarity.COSINE:
             user_interests = F.normalize(user_interests, p=2.0, dim=-1)
 
-        return user_interests
+        if self.is_inference:
+            return user_interests
+        else:
+            return user_interests, high_capsules_mask
 
 
 class MINDItemTower(MatchTower):
@@ -299,20 +304,20 @@ class MIND(MatchModel):
         self,
         user_interests: torch.Tensor,
         item_emb: torch.Tensor,
+        interest_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Compute label-aware attention for user interests.
 
         Args:
             user_interests (Tensor): user interests.
             item_emb (Tensor): item embedding.
+            interest_mask (Tensor): interest mask.
 
         Returns:
             user_emb (Tensor): user embedding.
         """
         batch_size = user_interests.size(0)
         pos_item_emb = item_emb[:batch_size]
-
-        interest_mask = norm(user_interests, dim=-1) != 0.0
 
         simi_pow = self._model_config.simi_pow
         interest_weight = torch.einsum("bkd, bd->bk", user_interests, pos_item_emb)
@@ -337,13 +342,15 @@ class MIND(MatchModel):
             simi (dict): a dict of predicted result.
 
         """
-        user_interests = self.user_tower(batch)
-
+        if self.is_inference:
+            user_interests = self.user_tower(batch)
+        else:
+            user_interests, interest_mask = self.user_tower(batch)
         item_emb = self.item_tower(batch)
 
-        user_emb = self.label_aware_attention(user_interests, item_emb)
-        if self._model_config.similarity == simi_pb2.Similarity.COSINE:
-            user_emb = F.normalize(user_emb, p=2.0, dim=1)
+        user_emb = self.label_aware_attention(user_interests, item_emb, interest_mask)
+        # if self._model_config.similarity == simi_pb2.Similarity.COSINE:
+        #     user_emb = F.normalize(user_emb, p=2.0, dim=1)
 
         ui_sim = self.sim(user_emb, item_emb) / self._model_config.temperature
         return {"similarity": ui_sim}
