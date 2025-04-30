@@ -66,16 +66,23 @@ class MINDUserTower(MatchTower):
         self.init_input()
 
         user_feature_in = self.embedding_group.group_total_dim(self._group_name)
-        self.user_mlp = MLP(
-            in_features=user_feature_in,
-            hidden_units=tower_config.user_mlp.hidden_units[0:-1],
-            activation=tower_config.user_mlp.activation,
-            use_bn=tower_config.user_mlp.use_bn,
-            dropout_ratio=tower_config.user_mlp.dropout_ratio[0],
-        )
-        self.user_mlp_out = nn.Linear(
-            self.user_mlp.output_dim(), tower_config.user_mlp.hidden_units[-1]
-        )
+        if len(tower_config.user_mlp.hidden_units) > 1:
+            self.user_mlp = MLP(
+                in_features=user_feature_in,
+                hidden_units=tower_config.user_mlp.hidden_units[0:-1],
+                activation=tower_config.user_mlp.activation,
+                use_bn=tower_config.user_mlp.use_bn,
+                dropout_ratio=tower_config.user_mlp.dropout_ratio[0],
+            )
+            self.user_mlp_out = nn.Linear(
+                self.user_mlp.output_dim(), tower_config.user_mlp.hidden_units[-1]
+            )
+
+        else:
+            self.user_mlp = nn.Linear(
+                self.user_mlp.user_feature_in, tower_config.user_mlp.hidden_units[-1]
+            )
+            self.user_mlp_out = None
 
         hist_feature_dim = self.embedding_group.group_total_dim(
             self._hist_group_name + ".sequence"
@@ -83,7 +90,7 @@ class MINDUserTower(MatchTower):
 
         if (
             tower_config.hist_seq_mlp
-            and len(tower_config.hist_seq_mlp.hidden_units) > 0
+            and len(tower_config.hist_seq_mlp.hidden_units) > 1
         ):
             self._hist_seq_mlp = MLP(
                 in_features=hist_feature_dim,
@@ -91,6 +98,7 @@ class MINDUserTower(MatchTower):
                 hidden_units=tower_config.hist_seq_mlp.hidden_units[0:-1],
                 activation=tower_config.hist_seq_mlp.activation,
                 use_bn=tower_config.hist_seq_mlp.use_bn,
+                bias=False,
                 dropout_ratio=tower_config.hist_seq_mlp.dropout_ratio[0],
             )
             self._hist_seq_mlp_out = nn.Linear(
@@ -99,7 +107,17 @@ class MINDUserTower(MatchTower):
                 bias=False,
             )
             capsule_input_dim = tower_config.hist_seq_mlp.hidden_units[-1]
-
+        elif (
+            tower_config.hist_seq_mlp
+            and len(tower_config.hist_seq_mlp.hidden_units) > 0
+        ):
+            self._hist_seq_mlp = nn.Linear(
+                hist_feature_dim,
+                tower_config.hist_seq_mlp.hidden_units[-1],
+                bias=False,
+            )
+            self._hist_seq_mlp_out = None
+            capsule_input_dim = tower_config.hist_seq_mlp.hidden_units[-1]
         else:
             self._hist_seq_mlp = None
             capsule_input_dim = hist_feature_dim
@@ -132,12 +150,18 @@ class MINDUserTower(MatchTower):
         grp_hist_seq = user_feature_dict[self._hist_group_name + ".sequence"]
         grp_hist_len = user_feature_dict[self._hist_group_name + ".sequence_length"]
 
-        user_feature = self.user_mlp_out(
-            self.user_mlp(user_feature_dict[self._group_name])
-        )
+        if self.user_mlp_out:
+            user_feature = self.user_mlp_out(
+                self.user_mlp(user_feature_dict[self._group_name])
+            )
+        else:
+            user_feature = self.user_mlp(user_feature_dict[self._group_name])
 
         if self._hist_seq_mlp:
-            hist_seq_feas = self._hist_seq_mlp_out(self._hist_seq_mlp(grp_hist_seq))
+            if self._hist_seq_mlp_out:
+                hist_seq_feas = self._hist_seq_mlp_out(self._hist_seq_mlp(grp_hist_seq))
+            else:
+                hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
         else:
             hist_seq_feas = grp_hist_seq
 
