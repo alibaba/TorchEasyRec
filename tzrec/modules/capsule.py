@@ -42,7 +42,11 @@ def sequence_mask(lengths: torch.Tensor, max_len: Optional[int] = None) -> torch
 
 @torch.fx.wrap
 def _init_routing_logits(x: torch.Tensor, k: int) -> torch.Tensor:
-    return torch.randn(x.size()[:-1] + torch.Size([k]), device=x.device, dtype=x.dtype)
+    return torch.randn(
+        x.size()[:-1] + torch.Size([k]),  # pyre-ignore [58]
+        device=x.device,
+        dtype=x.dtype,
+    )
 
 
 class CapsuleLayer(nn.Module):

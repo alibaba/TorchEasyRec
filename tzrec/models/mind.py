@@ -72,7 +72,9 @@ class MINDUserTower(MatchTower):
                 hidden_units=tower_config.user_mlp.hidden_units[0:-1],
                 activation=tower_config.user_mlp.activation,
                 use_bn=tower_config.user_mlp.use_bn,
-                dropout_ratio=tower_config.user_mlp.dropout_ratio[0],
+                dropout_ratio=tower_config.user_mlp.dropout_ratio[0]
+                if tower_config.user_mlp.dropout_ratio
+                else None,
             )
             self.user_mlp_out = nn.Linear(
                 self.user_mlp.output_dim(), tower_config.user_mlp.hidden_units[-1]
@@ -99,7 +101,9 @@ class MINDUserTower(MatchTower):
                 activation=tower_config.hist_seq_mlp.activation,
                 use_bn=tower_config.hist_seq_mlp.use_bn,
                 bias=False,
-                dropout_ratio=tower_config.hist_seq_mlp.dropout_ratio[0],
+                dropout_ratio=tower_config.hist_seq_mlp.dropout_ratio[0]
+                if tower_config.hist_seq_mlp.dropout_ratio
+                else None,
             )
             self._hist_seq_mlp_out = nn.Linear(
                 self._hist_seq_mlp.output_dim(),
