@@ -26,10 +26,11 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 class PositionEmbeddingsTest(unittest.TestCase):
-    def tearDown(self):
+    def teardown_example(self, example):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.memory_summary()  # prevent oom
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
@@ -188,7 +189,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
         max_contextual_seq_len=st.sampled_from([10]),
         interleave_targets=st.sampled_from([False]),
         batch_size=st.sampled_from([130]),
-        D=st.sampled_from([192]),
+        D=st.sampled_from([128]),
         max_targets=st.sampled_from([10]),
         time_bucket_fn=st.sampled_from(["log"]),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),

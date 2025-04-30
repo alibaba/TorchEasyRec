@@ -1,8 +1,8 @@
-name: Unit Test CI
+name: Unit Test Nightly
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize]
+  schedule:
+    - cron:  '0 16 * * *'
   workflow_dispatch:
 
 jobs:
@@ -17,9 +17,13 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: run_${{ github.run_id }}
-      - name: RunUnitTestCI
-        id: run_unittest_ci
+      - name: RunUnitTestNightly
+        id: run_unittest_nightly
+        env:
+          ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
+          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
           pip uninstall faiss-cpu -y
-          CI_HYPOTHESIS=true bash scripts/ci/ci_test.sh
+          bash scripts/ci/ci_test.sh

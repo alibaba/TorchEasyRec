@@ -5,6 +5,7 @@ DOCKER_TAG=0.7
 
 rm -rf docker/requirements
 cp -r requirements/ docker/requirements
+cp -r requirements/ docker/requirements
 cd docker
 
 for DEVICE in cu124 cpu

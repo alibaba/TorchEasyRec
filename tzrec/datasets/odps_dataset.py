@@ -147,6 +147,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
         or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
         or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+        or "ALIBABA_CLOUD_ECS_METADATA" in os.environ
     ):
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
