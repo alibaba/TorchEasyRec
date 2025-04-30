@@ -240,6 +240,9 @@ if __name__ == "__main__":
             quota_name=args.odps_data_quota_name,
         )
 
+    if args.topk_across_interests:
+        print("args.topk_across_interests is True")
+
     # calculate hitrate
     total_count = 0
     total_hits = 0.0
@@ -277,7 +280,12 @@ if __name__ == "__main__":
                 [-1, args.num_interests * recall_ids.shape[-1]]
             )
 
-            sort_idx = np.argsort(recall_distances_flat, axis=-1)[:, ::-1]
+            sort_idx = np.argsort(recall_distances_flat, axis=-1)
+            if args.index_type.endswith(
+                "IP"
+            ):  # inner product should be sorted in descending order
+                sort_idx = sort_idx[:, ::-1]
+
             recall_distances_flat_sorted = recall_distances_flat[
                 np.arange(recall_distances_flat.shape[0])[:, np.newaxis], sort_idx
             ]
@@ -298,13 +306,21 @@ if __name__ == "__main__":
                 recall_distances_flat_sorted_pad[:, 0:-1]
                 - recall_distances_flat_sorted_pad[:, 1:]
             )
-            # zero diff positions are dulipcated values
+
+            if args.index_type.endswith("IP"):
+                pad_value = -1
+            else:
+                pad_value = 1
+
+            # zero diff positions are dulipcated values, so we pad them with a pad value
             recall_distances_unique = np.where(
-                recall_distances_diff == 0, -1, recall_distances_flat_sorted
+                recall_distances_diff == 0, pad_value, recall_distances_flat_sorted
             )
-            # sort again to get the unique candidates, duplicated values are -1,
-            # so they are moved to the end
-            sort_idx_new = np.argsort(recall_distances_unique, axis=-1)[:, ::-1]
+            # sort again to get the unique candidates, duplicated values are -1(IP)
+            # or 1(L2), so they are moved to the end
+            sort_idx_new = np.argsort(recall_distances_unique, axis=-1)
+            if args.index_type.endswith("IP"):
+                sort_idx_new = sort_idx_new[:, ::-1]
 
             recall_distances = recall_distances_flat_sorted[
                 np.arange(recall_distances_flat_sorted.shape[0])[:, np.newaxis],
