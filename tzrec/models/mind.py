@@ -348,7 +348,11 @@ class MIND(MatchModel):
             user_interests, interest_mask = self.user_tower(batch)
         item_emb = self.item_tower(batch)
 
-        user_emb = self.label_aware_attention(user_interests, item_emb, interest_mask)
+        user_emb = self.label_aware_attention(
+            user_interests,
+            item_emb,
+            interest_mask,  # pyre-ignore [61]
+        )
         # if self._model_config.similarity == simi_pb2.Similarity.COSINE:
         #     user_emb = F.normalize(user_emb, p=2.0, dim=1)
 
