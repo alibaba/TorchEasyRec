@@ -1,4 +1,3 @@
 -r requirements/runtime.txt
 -r requirements/test.txt
 -r requirements/docs.txt
--r requirements/gpu.txt

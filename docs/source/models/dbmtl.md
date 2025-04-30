@@ -73,9 +73,12 @@ model_config {
     - mlp: TaskTower的MLP参数配置
     - relation_tower_names: 上游关联Tower名
     - relation_mlp: 关联Tower融合的MLP参数配置
+    - weight: 任务权重名
+    - sample_weight_name: 样本权重列名
     - losses: 任务损失函数配置
     - metrics: 任务评估指标配置
     - task_space_indicator_label: 标识当前任务空间的目标名称，配合in_task_space_weight、out_task_space_weight使用。例如，对于cvr任务，可以设置task_space_indicator_label=clk，in_task_space_weight=1，out_task_space_weight=0，来使得cvr任务塔只在点击空间计算loss。
+      - 注: in_task_space_weight和out_task_space_weight不影响loss权重的绝对值，权重会在batch维度被归一化。例如：in_task_space_weight=10,out_task_space_weight=1跟in_task_space_weight=1,out_task_space_weight=0.1是等价的。如需要提升这个task的loss权重的绝对值，需设置weight参数
     - in_task_space_weight: 对于task_space_indicator_label>0的样本会乘以该权重
     - out_task_space_weight: 对于task_space_indicator_label\<=0的样本会乘以该权重
 
