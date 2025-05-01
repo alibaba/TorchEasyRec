@@ -19,6 +19,7 @@ import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import torch
+from numpy.linalg import norm
 from torch import distributed as dist
 
 from tzrec.datasets.dataset import create_reader, create_writer
@@ -271,6 +272,35 @@ if __name__ == "__main__":
             index, index_id_map, user_emb, args.top_k
         )
 
+        # In case of all-zero query vector, the corresponding knn results
+        # should be removed.
+        if args.index_type.endswith("IP"):
+            recall_distances = np.minimum(
+                recall_distances,
+                np.tile(
+                    (
+                        (norm(user_emb, axis=-1, keepdims=True) != 0.0).astype("float")
+                        * 2
+                        - 1
+                    )
+                    * 1e32,
+                    (1, args.top_k),
+                ),
+            )
+        else:  # L2 distance
+            recall_distances = np.maximum(
+                recall_distances,
+                np.tile(
+                    (
+                        (norm(user_emb, axis=-1, keepdims=True) == 0.0).astype("float")
+                        * 2
+                        - 1
+                    )
+                    * 1e32,
+                    (1, args.top_k),
+                ),
+            )
+
         # pick topk candidates across all interests
         if args.topk_across_interests:
             recall_distances_flat = recall_distances.reshape(
@@ -308,16 +338,16 @@ if __name__ == "__main__":
             )
 
             if args.index_type.endswith("IP"):
-                pad_value = -1
+                pad_value = -1e32
             else:
-                pad_value = 1
+                pad_value = 1e32
 
             # zero diff positions are dulipcated values, so we pad them with a pad value
             recall_distances_unique = np.where(
                 recall_distances_diff == 0, pad_value, recall_distances_flat_sorted
             )
-            # sort again to get the unique candidates, duplicated values are -1(IP)
-            # or 1(L2), so they are moved to the end
+            # sort again to get the unique candidates, duplicated values are -1e32(IP)
+            # or 1e32(L2), so they are moved to the end
             sort_idx_new = np.argsort(recall_distances_unique, axis=-1)
             if args.index_type.endswith("IP"):
                 sort_idx_new = sort_idx_new[:, ::-1]
