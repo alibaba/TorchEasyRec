@@ -10,6 +10,8 @@ message MLP {
     optional string activation = 3 [default = 'nn.ReLU'];
     // use batch normalization
     optional bool use_bn = 4 [default = false];
+    // use bias
+    optional bool bias = 5 [default = true];
 }
 
 message ExtractionNetwork {
