@@ -590,11 +590,11 @@ class ConvertConfig(object):
         task_expert_net = self._easyrec_dnn_2_tzrec_mlp(
             easyrec_extraction_network.task_expert_net
         )
-        tzrec_extraction_network.task_expert_net = task_expert_net
+        tzrec_extraction_network.task_expert_net.CopyFrom(task_expert_net)
         share_expert_net = self._easyrec_dnn_2_tzrec_mlp(
             easyrec_extraction_network.share_expert_net
         )
-        tzrec_extraction_network.share_expert_net = share_expert_net
+        tzrec_extraction_network.share_expert_net.CopyFrom(share_expert_net)
         return tzrec_extraction_network
 
     def _convert_model_feature_group(self, easyrec_feature_groups):
@@ -662,8 +662,8 @@ class ConvertConfig(object):
         elif model_class == "MMoE":
             tz_model_config_ob = multi_task_rank_pb2.MMoE()
             expert_mlp = self._easyrec_dnn_2_tzrec_mlp(easyrec_model_config.expert_dnn)
-            tz_model_config_ob.expert_mlp = expert_mlp
-            tz_model_config_ob.gate_mlp = expert_mlp
+            tz_model_config_ob.expert_mlp.CopyFrom(expert_mlp)
+            tz_model_config_ob.gate_mlp.CopyFrom(expert_mlp)
             tz_model_config_ob.num_expert = easyrec_model_config.num_expert
             for task_tower in easyrec_model_config.task_towers:
                 tz_task_tower = self._easyrec_task_tower_2_tzrec_task_tower(task_tower)
@@ -699,18 +699,18 @@ class ConvertConfig(object):
                 tz_tower = self._easyrec_tower_2_tzrec_tower(tower)
                 tz_model_config_ob.towers.append(tz_tower)
             final = self._easyrec_dnn_2_tzrec_mlp(easyrec_model_config.final_dnn)
-            tz_model_config_ob.final = final
+            tz_model_config_ob.final.CopyFrom(final)
             tz_model_config.multi_tower.CopyFrom(tz_model_config_ob)
         elif model_class == "DSSM":
             tz_model_config_ob = match_model_pb2.DSSM()
             user_tower = self._easyrec_dssm_tower_2_tzrec_tower(
                 easyrec_model_config.user_tower
             )
-            tz_model_config_ob.user_tower = user_tower
+            tz_model_config_ob.user_tower.CopyFrom(user_tower)
             item_tower = self._easyrec_dssm_tower_2_tzrec_tower(
                 easyrec_model_config.item_tower
             )
-            tz_model_config_ob.item_tower = item_tower
+            tz_model_config_ob.item_tower.CopyFrom(item_tower)
             tz_model_config_ob.output_dim = 32
             if easyrec_model_config.HasField("temperature"):
                 tz_model_config_ob.temperature = easyrec_model_config.temperature
