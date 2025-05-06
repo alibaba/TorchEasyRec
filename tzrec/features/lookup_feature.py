@@ -229,7 +229,7 @@ class LookupFeature(BaseFeature):
                 fg_cfg["needDiscrete"] = True
             elif self.config.HasField("num_buckets"):
                 fg_cfg["num_buckets"] = self.config.num_buckets
-                fg_cfg["value_type"] = "int64"
+                fg_cfg["value_type"] = "string"
                 fg_cfg["needDiscrete"] = False
                 fg_cfg["combiner"] = ""
             elif len(self.vocab_list) > 0:
@@ -254,6 +254,8 @@ class LookupFeature(BaseFeature):
                 fg_cfg["combiner"] = ""
             if fg_cfg["combiner"] == "":
                 fg_cfg["value_dim"] = self.value_dim
+            if self.config.HasField("fg_value_type"):
+                fg_cfg["value_type"] = self.config.fg_value_type
 
         fg_cfgs = [fg_cfg]
         if raw_fg_cfg is not None:
