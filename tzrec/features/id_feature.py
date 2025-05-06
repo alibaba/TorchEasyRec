@@ -185,6 +185,8 @@ class IdFeature(BaseFeature):
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 0
+        if self.config.HasField("fg_value_type"):
+            fg_cfg["value_type"] = self.config.fg_value_type
         return [fg_cfg]
 
     def assets(self) -> Dict[str, str]:
