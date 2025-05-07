@@ -71,31 +71,6 @@ def create_test_model(
     return create_test_module(model, graph_type)
 
 
-def init_parameters(module: nn.Module, device: torch.device) -> None:
-    """Init param for model with meta device type."""
-
-    @torch.no_grad()
-    def init_parameters(module: nn.Module) -> None:
-        # Allocate parameters and buffers if over 'meta' device.
-        has_meta_param = False
-        for name, param in module._parameters.items():
-            if isinstance(param, torch.Tensor) and param.device.type == "meta":
-                module._parameters[name] = nn.Parameter(
-                    torch.empty_like(param, device=device),
-                    requires_grad=param.requires_grad,
-                )
-                has_meta_param = True
-        for name, buffer in module._buffers.items():
-            if isinstance(buffer, torch.Tensor) and buffer.device.type == "meta":
-                module._buffers[name] = torch.zeros_like(buffer, device=device)
-
-        # Init parameters if at least one parameter is over 'meta' device.
-        if has_meta_param and hasattr(module, "reset_parameters"):
-            module.reset_parameters()
-
-    module.apply(init_parameters)
-
-
 # pyre-ignore [2]
 def parameterized_name_func(func, num, p) -> str:
     """Name func for parameterized."""

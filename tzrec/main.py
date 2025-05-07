@@ -29,9 +29,6 @@ from torch.utils.tensorboard import SummaryWriter
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
 from torchrec.inference.modules import quantize_embeddings
-from torchrec.inference.state_dict_transform import (
-    state_dict_to_device,
-)
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
@@ -85,7 +82,7 @@ from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.state_dict_util import state_dict_gather, validate_state
+from tzrec.utils.state_dict_util import init_parameters, validate_state
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -765,7 +762,6 @@ def evaluate(
 def _script_model(
     pipeline_config: EasyRecConfig,
     model: nn.Module,
-    state_dict: Dict[str, Any],
     dataloader: DataLoader,
     save_dir: str,
 ) -> None:
@@ -774,13 +770,7 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        model = model.to_empty(device="cpu")
-        logger.info("gather states to cpu model...")
 
-    state_dict_gather(state_dict, model.state_dict())
-    dist.barrier()
-
-    if is_rank_zero:
         # for mc modules, we should validate and sort mch buffers
         validate_state(model)
 
@@ -851,11 +841,17 @@ def export(
             model specified by model_dir in pipeline_config_path.
         asset_files (str, optional): more files will be copied to export_dir.
     """
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    if not is_rank_zero:
+        logger.warning("Only first rank will be used for export now.")
+        return
+    else:
+        os.environ["WORLD_SIZE"] = 1
+
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    device, _ = init_process_group()
-    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    dist.init_process_group("gloo")
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
@@ -887,19 +883,10 @@ def export(
         features,
         list(data_config.label_fields),
     )
-    model = ScriptWrapper(model)
-
-    planner = create_planner(
-        device=device,
-        batch_size=data_config.batch_size,
-    )
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
-    if is_rank_zero:
-        logger.info(str(plan))
-
-    model = DistributedModelParallel(module=model, device=device, plan=plan)
+    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    model = InferWrapper(model)
+    model.set_is_inference(True)
+    init_parameters(model, "cpu")
 
     if not checkpoint_path:
         checkpoint_path, _ = checkpoint_util.latest_checkpoint(
@@ -922,23 +909,8 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    checkpoint_pg = dist.new_group(backend="gloo")
-    if is_rank_zero:
-        logger.info("copy sharded state_dict to cpu...")
-    cpu_state_dict = state_dict_to_device(
-        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-    )
-
-    cpu_model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-    )
-    cpu_model.set_is_inference(True)
-
-    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
-    if isinstance(cpu_model, MatchModel):
-        for name, module in cpu_model.named_children():
+    if isinstance(model.model, MatchModel):
+        for name, module in model.model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -948,28 +920,25 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    cpu_state_dict,
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(cpu_model, TDM):
-        for name, module in cpu_model.named_children():
+    elif isinstance(model.model, TDM):
+        for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    cpu_state_dict,
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            InferWrapper(cpu_model),
-            cpu_state_dict,
+            model,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -978,8 +947,7 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            InferWrapper(cpu_model),
-            cpu_state_dict,
+            model,
             dataloader,
             export_dir,
         )
