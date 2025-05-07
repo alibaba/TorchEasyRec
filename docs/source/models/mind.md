@@ -249,7 +249,7 @@ torchrun --master_addr=localhost --master_port=32771 \
 - request_id_field: user_gt_input表中的request id列名
 - num_interests: 用户最大兴趣个数
 - top_k: 召回top k个item
-- topk_across_interests: 当该参数为true时， 在所有的兴趣中， 共召回top k个item；当该参数为false时， 在每个兴趣中， 召回top k个item。默认为false。
+- topk_across_interests: 当给出该参数时(该参数无需赋值)，在所有的兴趣中，共召回top k个item；当不给出该参数时，则在每个兴趣中， 各召回top k个item。
 
 ## 参考论文
 
