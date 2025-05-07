@@ -677,7 +677,7 @@ class ConvertConfig(object):
                         extraction_network
                     )
                 )
-                tz_model_config.extraction_networks.append(tz_extraction_network)
+                tz_model_config.ple.extraction_networks.append(tz_extraction_network)
             for task_tower in easyrec_model_config.task_towers:
                 tz_task_tower = self._easyrec_task_tower_2_tzrec_task_tower(task_tower)
                 tz_model_config_ob.task_towers.append(tz_task_tower)
@@ -712,7 +712,7 @@ class ConvertConfig(object):
             )
             tz_model_config_ob.item_tower.CopyFrom(item_tower)
             tz_model_config_ob.output_dim = 32
-            if easyrec_model_config.HasField("temperature"):
+            if hasattr(easyrec_model_config, 'temperature') and easyrec_model_config.HasField("temperature"):
                 tz_model_config_ob.temperature = easyrec_model_config.temperature
             tz_model_config.dssm.CopyFrom(tz_model_config_ob)
         else:
