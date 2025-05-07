@@ -432,217 +432,12 @@ export_config {
 }
 """
 
-EASYREC_CONFIG_SIMPLEMULTITASK = """train_config {
-  optimizer_config {
-    use_moving_average: false
-    adam_asyncw_optimizer {
-      weight_decay: 1e-6
-      learning_rate {
-        constant_learning_rate {
-          learning_rate: 0.001
-        }
-      }
-    }
-  }
-  sync_replicas: false
-  save_summary_steps: 1000
-  log_step_count_steps: 100
-  save_checkpoints_steps: 1000000
-  keep_checkpoint_max: 1
-}
-data_config {
-  batch_size: 4096
-  label_fields: "is_click_cover"
-  label_fields: "is_click_video"
-  shuffle: false
-  num_epochs: 3
-  input_type: OdpsRTPInput
-  separator: ""
-  selected_cols: "is_click_cover,is_click_video,features"
-  input_fields {
-    input_name: "is_click_cover"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "is_click_video"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "user_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_blue_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "host_price_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_video_sequence"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_exposure_cnt_7d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "click_100_seq__item_id"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "click_100_seq__ts"
-    input_type: STRING
-    default_val: ""
-  }
-  pai_worker_queue: true
-}
-feature_configs {
-  input_names: "user_id"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 1000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "item_id"
-  feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_blue_level"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "host_price_level"
-  feature_type: IdFeature
-  embedding_dim: 8
-  hash_bucket_size: 180
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_video_sequence"
-  feature_type: SequenceFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ","
-  combiner: "mean"
-  sub_feature_type: IdFeature
-}
-
-feature_configs {
-  input_names: "item__kv_user_blue_level_exposure_cnt_7d"
-  feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 47.00000001
-  boundaries: 285.00000001
-  boundaries: 672.00000001
-  boundaries: 1186.00000001
-  boundaries: 1853.00000001
-  boundaries: 2716.00000001
-  boundaries: 3861.00000001
-  boundaries: 5459.00000001
-  boundaries: 7817.00000001
-  boundaries: 11722.0
-  boundaries: 19513.0
-  boundaries: 43334.0
-  separator: ""
-}
-feature_configs {
-  feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "user_blue_level"
-  feature_type: LookupFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 1.00000001
-  boundaries: 2.00000001
-  boundaries: 5.00000001
-  boundaries: 8.00000001
-  boundaries: 13.00000001
-  boundaries: 19.00000001
-  boundaries: 28.00000001
-  boundaries: 42.00000001
-  boundaries: 67.00000001
-  boundaries: 123.00000001
-  boundaries: 298.00000001
-  separator: ""
-}
-feature_configs {
-  feature_name: "combo_user_blue_level_x_host_price_level"
-  input_names: "user_blue_level"
-  input_names: "host_price_level"
-  feature_type: ComboFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-}
-feature_configs {
-  input_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-  feature_type: RawFeature
-  separator: ""
-}
-feature_configs {
-  input_names: "click_100_seq__item_id"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-}
-feature_configs {
-  input_names: "click_100_seq__ts"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 3.00000001
-  boundaries: 25.00000001
-  boundaries: 70.00000001
-}
-
-model_config {
+EASYREC_CONFIG_SIMPLEMULTITASK = """model_config {
   model_class: "SimpleMultiTask"
   feature_groups {
     group_name: "all"
     feature_names: "user_id"
-	feature_names: "item_id"
+    feature_names: "item_id"
     feature_names: "user_blue_level"
     feature_names: "host_price_level"
     feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
@@ -693,212 +488,7 @@ export_config {
 }
 """
 
-EASYREC_CONFIG_MMOE = """train_config {
-  optimizer_config {
-    use_moving_average: false
-    adam_asyncw_optimizer {
-      weight_decay: 1e-6
-      learning_rate {
-        constant_learning_rate {
-          learning_rate: 0.001
-        }
-      }
-    }
-  }
-  sync_replicas: false
-  save_summary_steps: 1000
-  log_step_count_steps: 100
-  save_checkpoints_steps: 1000000
-  keep_checkpoint_max: 1
-}
-data_config {
-  batch_size: 4096
-  label_fields: "is_click_cover"
-  label_fields: "is_click_video"
-  shuffle: false
-  num_epochs: 3
-  input_type: OdpsRTPInput
-  separator: ""
-  selected_cols: "is_click_cover,is_click_video,features"
-  input_fields {
-    input_name: "is_click_cover"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "is_click_video"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "user_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_blue_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "host_price_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_video_sequence"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_exposure_cnt_7d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "click_100_seq__item_id"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "click_100_seq__ts"
-    input_type: STRING
-    default_val: ""
-  }
-  pai_worker_queue: true
-}
-feature_configs {
-  input_names: "user_id"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 1000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "item_id"
-  feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_blue_level"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "host_price_level"
-  feature_type: IdFeature
-  embedding_dim: 8
-  hash_bucket_size: 180
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_video_sequence"
-  feature_type: SequenceFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ","
-  combiner: "mean"
-  sub_feature_type: IdFeature
-}
-
-feature_configs {
-  input_names: "item__kv_user_blue_level_exposure_cnt_7d"
-  feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 47.00000001
-  boundaries: 285.00000001
-  boundaries: 672.00000001
-  boundaries: 1186.00000001
-  boundaries: 1853.00000001
-  boundaries: 2716.00000001
-  boundaries: 3861.00000001
-  boundaries: 5459.00000001
-  boundaries: 7817.00000001
-  boundaries: 11722.0
-  boundaries: 19513.0
-  boundaries: 43334.0
-  separator: ""
-}
-feature_configs {
-  feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "user_blue_level"
-  feature_type: LookupFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 1.00000001
-  boundaries: 2.00000001
-  boundaries: 5.00000001
-  boundaries: 8.00000001
-  boundaries: 13.00000001
-  boundaries: 19.00000001
-  boundaries: 28.00000001
-  boundaries: 42.00000001
-  boundaries: 67.00000001
-  boundaries: 123.00000001
-  boundaries: 298.00000001
-  separator: ""
-}
-feature_configs {
-  feature_name: "combo_user_blue_level_x_host_price_level"
-  input_names: "user_blue_level"
-  input_names: "host_price_level"
-  feature_type: ComboFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-}
-feature_configs {
-  input_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-  feature_type: RawFeature
-  separator: ""
-}
-feature_configs {
-  input_names: "click_100_seq__item_id"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-}
-feature_configs {
-  input_names: "click_100_seq__ts"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 3.00000001
-  boundaries: 25.00000001
-  boundaries: 70.00000001
-}
-
-model_config {
+EASYREC_CONFIG_MMOE = """model_config {
   model_class: "MMoE"
   feature_groups {
     group_name: "all"
@@ -958,212 +548,7 @@ export_config {
 }
 """
 
-EASYREC_CONFIG_PLE = """train_config {
-  optimizer_config {
-    use_moving_average: false
-    adam_asyncw_optimizer {
-      weight_decay: 1e-6
-      learning_rate {
-        constant_learning_rate {
-          learning_rate: 0.001
-        }
-      }
-    }
-  }
-  sync_replicas: false
-  save_summary_steps: 1000
-  log_step_count_steps: 100
-  save_checkpoints_steps: 1000000
-  keep_checkpoint_max: 1
-}
-data_config {
-  batch_size: 4096
-  label_fields: "is_click_cover"
-  label_fields: "is_click_video"
-  shuffle: false
-  num_epochs: 3
-  input_type: OdpsRTPInput
-  separator: ""
-  selected_cols: "is_click_cover,is_click_video,features"
-  input_fields {
-    input_name: "is_click_cover"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "is_click_video"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "user_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_blue_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "host_price_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_video_sequence"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_exposure_cnt_7d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "click_100_seq__item_id"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "click_100_seq__ts"
-    input_type: STRING
-    default_val: ""
-  }
-  pai_worker_queue: true
-}
-feature_configs {
-  input_names: "user_id"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 1000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "item_id"
-  feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_blue_level"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "host_price_level"
-  feature_type: IdFeature
-  embedding_dim: 8
-  hash_bucket_size: 180
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_video_sequence"
-  feature_type: SequenceFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ","
-  combiner: "mean"
-  sub_feature_type: IdFeature
-}
-
-feature_configs {
-  input_names: "item__kv_user_blue_level_exposure_cnt_7d"
-  feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 47.00000001
-  boundaries: 285.00000001
-  boundaries: 672.00000001
-  boundaries: 1186.00000001
-  boundaries: 1853.00000001
-  boundaries: 2716.00000001
-  boundaries: 3861.00000001
-  boundaries: 5459.00000001
-  boundaries: 7817.00000001
-  boundaries: 11722.0
-  boundaries: 19513.0
-  boundaries: 43334.0
-  separator: ""
-}
-feature_configs {
-  feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "user_blue_level"
-  feature_type: LookupFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 1.00000001
-  boundaries: 2.00000001
-  boundaries: 5.00000001
-  boundaries: 8.00000001
-  boundaries: 13.00000001
-  boundaries: 19.00000001
-  boundaries: 28.00000001
-  boundaries: 42.00000001
-  boundaries: 67.00000001
-  boundaries: 123.00000001
-  boundaries: 298.00000001
-  separator: ""
-}
-feature_configs {
-  feature_name: "combo_user_blue_level_x_host_price_level"
-  input_names: "user_blue_level"
-  input_names: "host_price_level"
-  feature_type: ComboFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-}
-feature_configs {
-  input_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-  feature_type: RawFeature
-  separator: ""
-}
-feature_configs {
-  input_names: "click_100_seq__item_id"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-}
-feature_configs {
-  input_names: "click_100_seq__ts"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 3.00000001
-  boundaries: 25.00000001
-  boundaries: 70.00000001
-}
-
-model_config {
+EASYREC_CONFIG_PLE = """model_config {
   model_class: "PLE"
   feature_groups {
     group_name: "all"
@@ -1255,212 +640,7 @@ export_config {
 }
 """
 
-EASYREC_CONFIG_DEEPFM = """train_config {
-  optimizer_config {
-    use_moving_average: false
-    adam_asyncw_optimizer {
-      weight_decay: 1e-6
-      learning_rate {
-        constant_learning_rate {
-          learning_rate: 0.001
-        }
-      }
-    }
-  }
-  sync_replicas: false
-  save_summary_steps: 1000
-  log_step_count_steps: 100
-  save_checkpoints_steps: 1000000
-  keep_checkpoint_max: 1
-}
-data_config {
-  batch_size: 4096
-  label_fields: "is_click_cover"
-  label_fields: "is_click_video"
-  shuffle: false
-  num_epochs: 3
-  input_type: OdpsRTPInput
-  separator: ""
-  selected_cols: "is_click_cover,is_click_video,features"
-  input_fields {
-    input_name: "is_click_cover"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "is_click_video"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "user_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_blue_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "host_price_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_video_sequence"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_exposure_cnt_7d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "click_100_seq__item_id"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "click_100_seq__ts"
-    input_type: STRING
-    default_val: ""
-  }
-  pai_worker_queue: true
-}
-feature_configs {
-  input_names: "user_id"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 1000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "item_id"
-  feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_blue_level"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "host_price_level"
-  feature_type: IdFeature
-  embedding_dim: 8
-  hash_bucket_size: 180
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_video_sequence"
-  feature_type: SequenceFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ","
-  combiner: "mean"
-  sub_feature_type: IdFeature
-}
-
-feature_configs {
-  input_names: "item__kv_user_blue_level_exposure_cnt_7d"
-  feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 47.00000001
-  boundaries: 285.00000001
-  boundaries: 672.00000001
-  boundaries: 1186.00000001
-  boundaries: 1853.00000001
-  boundaries: 2716.00000001
-  boundaries: 3861.00000001
-  boundaries: 5459.00000001
-  boundaries: 7817.00000001
-  boundaries: 11722.0
-  boundaries: 19513.0
-  boundaries: 43334.0
-  separator: ""
-}
-feature_configs {
-  feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "user_blue_level"
-  feature_type: LookupFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 1.00000001
-  boundaries: 2.00000001
-  boundaries: 5.00000001
-  boundaries: 8.00000001
-  boundaries: 13.00000001
-  boundaries: 19.00000001
-  boundaries: 28.00000001
-  boundaries: 42.00000001
-  boundaries: 67.00000001
-  boundaries: 123.00000001
-  boundaries: 298.00000001
-  separator: ""
-}
-feature_configs {
-  feature_name: "combo_user_blue_level_x_host_price_level"
-  input_names: "user_blue_level"
-  input_names: "host_price_level"
-  feature_type: ComboFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-}
-feature_configs {
-  input_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-  feature_type: RawFeature
-  separator: ""
-}
-feature_configs {
-  input_names: "click_100_seq__item_id"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-}
-feature_configs {
-  input_names: "click_100_seq__ts"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 3.00000001
-  boundaries: 25.00000001
-  boundaries: 70.00000001
-}
-
-model_config {
+EASYREC_CONFIG_DEEPFM = """model_config {
   model_class: "DeepFM"
   feature_groups {
     group_name: "wide"
@@ -1543,212 +723,7 @@ export_config {
 }
 """
 
-EASYREC_CONFIG_MULTITOWER = """train_config {
-  optimizer_config {
-    use_moving_average: false
-    adam_asyncw_optimizer {
-      weight_decay: 1e-6
-      learning_rate {
-        constant_learning_rate {
-          learning_rate: 0.001
-        }
-      }
-    }
-  }
-  sync_replicas: false
-  save_summary_steps: 1000
-  log_step_count_steps: 100
-  save_checkpoints_steps: 1000000
-  keep_checkpoint_max: 1
-}
-data_config {
-  batch_size: 4096
-  label_fields: "is_click_cover"
-  label_fields: "is_click_video"
-  shuffle: false
-  num_epochs: 3
-  input_type: OdpsRTPInput
-  separator: ""
-  selected_cols: "is_click_cover,is_click_video,features"
-  input_fields {
-    input_name: "is_click_cover"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "is_click_video"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "user_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_blue_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "host_price_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_video_sequence"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_exposure_cnt_7d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "click_100_seq__item_id"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "click_100_seq__ts"
-    input_type: STRING
-    default_val: ""
-  }
-  pai_worker_queue: true
-}
-feature_configs {
-  input_names: "user_id"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 1000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "item_id"
-  feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_blue_level"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "host_price_level"
-  feature_type: IdFeature
-  embedding_dim: 8
-  hash_bucket_size: 180
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_video_sequence"
-  feature_type: SequenceFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ","
-  combiner: "mean"
-  sub_feature_type: IdFeature
-}
-
-feature_configs {
-  input_names: "item__kv_user_blue_level_exposure_cnt_7d"
-  feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 47.00000001
-  boundaries: 285.00000001
-  boundaries: 672.00000001
-  boundaries: 1186.00000001
-  boundaries: 1853.00000001
-  boundaries: 2716.00000001
-  boundaries: 3861.00000001
-  boundaries: 5459.00000001
-  boundaries: 7817.00000001
-  boundaries: 11722.0
-  boundaries: 19513.0
-  boundaries: 43334.0
-  separator: ""
-}
-feature_configs {
-  feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "user_blue_level"
-  feature_type: LookupFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 1.00000001
-  boundaries: 2.00000001
-  boundaries: 5.00000001
-  boundaries: 8.00000001
-  boundaries: 13.00000001
-  boundaries: 19.00000001
-  boundaries: 28.00000001
-  boundaries: 42.00000001
-  boundaries: 67.00000001
-  boundaries: 123.00000001
-  boundaries: 298.00000001
-  separator: ""
-}
-feature_configs {
-  feature_name: "combo_user_blue_level_x_host_price_level"
-  input_names: "user_blue_level"
-  input_names: "host_price_level"
-  feature_type: ComboFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-}
-feature_configs {
-  input_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-  feature_type: RawFeature
-  separator: ""
-}
-feature_configs {
-  input_names: "click_100_seq__item_id"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-}
-feature_configs {
-  input_names: "click_100_seq__ts"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 3.00000001
-  boundaries: 25.00000001
-  boundaries: 70.00000001
-}
-
-model_config {
+EASYREC_CONFIG_MULTITOWER = """model_config {
   model_class: "MultiTower"
   feature_groups {
     group_name: "all"
@@ -1811,212 +786,7 @@ export_config {
 }
 """
 
-EASYREC_CONFIG_DSSM = """train_config {
-  optimizer_config {
-    use_moving_average: false
-    adam_asyncw_optimizer {
-      weight_decay: 1e-6
-      learning_rate {
-        constant_learning_rate {
-          learning_rate: 0.001
-        }
-      }
-    }
-  }
-  sync_replicas: false
-  save_summary_steps: 1000
-  log_step_count_steps: 100
-  save_checkpoints_steps: 1000000
-  keep_checkpoint_max: 1
-}
-data_config {
-  batch_size: 4096
-  label_fields: "is_click_cover"
-  label_fields: "is_click_video"
-  shuffle: false
-  num_epochs: 3
-  input_type: OdpsRTPInput
-  separator: ""
-  selected_cols: "is_click_cover,is_click_video,features"
-  input_fields {
-    input_name: "is_click_cover"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "is_click_video"
-    input_type: INT32
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "user_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item_id"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_blue_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "host_price_level"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "user_video_sequence"
-    input_type: STRING
-    default_val: "-1024"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_exposure_cnt_7d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-    input_type: DOUBLE
-    default_val: "0"
-  }
-  input_fields {
-    input_name: "click_100_seq__item_id"
-    input_type: STRING
-    default_val: ""
-  }
-  input_fields {
-    input_name: "click_100_seq__ts"
-    input_type: STRING
-    default_val: ""
-  }
-  pai_worker_queue: true
-}
-feature_configs {
-  input_names: "user_id"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 1000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "item_id"
-  feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_blue_level"
-  feature_type: IdFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "host_price_level"
-  feature_type: IdFeature
-  embedding_dim: 8
-  hash_bucket_size: 180
-  separator: ""
-  combiner: "mean"
-}
-feature_configs {
-  input_names: "user_video_sequence"
-  feature_type: SequenceFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-  separator: ","
-  combiner: "mean"
-  sub_feature_type: IdFeature
-}
-
-feature_configs {
-  input_names: "item__kv_user_blue_level_exposure_cnt_7d"
-  feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 47.00000001
-  boundaries: 285.00000001
-  boundaries: 672.00000001
-  boundaries: 1186.00000001
-  boundaries: 1853.00000001
-  boundaries: 2716.00000001
-  boundaries: 3861.00000001
-  boundaries: 5459.00000001
-  boundaries: 7817.00000001
-  boundaries: 11722.0
-  boundaries: 19513.0
-  boundaries: 43334.0
-  separator: ""
-}
-feature_configs {
-  feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "item__kv_user_blue_level_click_focus_cnt_7d"
-  input_names: "user_blue_level"
-  feature_type: LookupFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 1.00000001
-  boundaries: 2.00000001
-  boundaries: 5.00000001
-  boundaries: 8.00000001
-  boundaries: 13.00000001
-  boundaries: 19.00000001
-  boundaries: 28.00000001
-  boundaries: 42.00000001
-  boundaries: 67.00000001
-  boundaries: 123.00000001
-  boundaries: 298.00000001
-  separator: ""
-}
-feature_configs {
-  feature_name: "combo_user_blue_level_x_host_price_level"
-  input_names: "user_blue_level"
-  input_names: "host_price_level"
-  feature_type: ComboFeature
-  embedding_dim: 4
-  hash_bucket_size: 140
-}
-feature_configs {
-  input_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
-  feature_type: RawFeature
-  separator: ""
-}
-feature_configs {
-  input_names: "click_100_seq__item_id"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: IdFeature
-  embedding_dim: 24
-  hash_bucket_size: 1500000
-}
-feature_configs {
-  input_names: "click_100_seq__ts"
-  feature_type: SequenceFeature
-  separator: ";"
-  combiner: "mean"
-  sub_feature_type: RawFeature
-  embedding_dim: 4
-  boundaries: 1e-08
-  boundaries: 3.00000001
-  boundaries: 25.00000001
-  boundaries: 70.00000001
-}
-
-model_config {
+EASYREC_CONFIG_DSSM = """model_config {
   model_class: "DSSM"
   feature_groups {
     group_name: "user"
@@ -2646,7 +1416,7 @@ MODEL_CONFIG_PLE = """model_config {
 }
 """
 
-MODEL_CONFIG_DeepFM = """model_config {
+MODEL_CONFIG_DEEPFM = """model_config {
   feature_groups {
     group_name: "wide"
     feature_names: "user_id"
@@ -2884,42 +1654,9 @@ class ConvertConfigTest(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_convert_", dir="./tmp")
         self.fg_path = os.path.join(self.test_dir, "fg.json")
         self.easyrec_path = os.path.join(self.test_dir, "easyrec.config")
-        self.easyrec_SimpleMultiTask_path = os.path.join(
-            self.test_dir, "easyrec_SimpleMultiTask.config"
-        )
-        self.easyrec_MMoE_path = os.path.join(self.test_dir, "easyrec_MMoE.config")
-        self.easyrec_PLE_path = os.path.join(self.test_dir, "easyrec_PLE.config")
-        self.easyrec_DeepFM_path = os.path.join(self.test_dir, "easyrec_DeepFM.config")
-        self.easyrec_MultiTower_path = os.path.join(
-            self.test_dir, "easyrec_MultiTower.config"
-        )
-        self.easyrec_DSSM_path = os.path.join(self.test_dir, "easyrec_DSSM.config")
         self.tzrec_path = os.path.join(self.test_dir, "tzrec.config")
-        self.tzrec_SimpleMultiTask_path = os.path.join(
-            self.test_dir, "tzrec_SimpleMultiTask.config"
-        )
-        self.tzrec_MMoE_path = os.path.join(self.test_dir, "tzrec_MMoE.config")
-        self.tzrec_PLE_path = os.path.join(self.test_dir, "tzrec_PLE.config")
-        self.tzrec_DeepFM_path = os.path.join(self.test_dir, "tzrec_DeepFM.config")
-        self.tzrec_MultiTower_path = os.path.join(
-            self.test_dir, "tzrec_MultiTower.config"
-        )
-        self.tzrec_DSSM_path = os.path.join(self.test_dir, "tzrec_DSSM.config")
         with open(self.easyrec_path, "w", encoding="utf-8") as f:
             f.write(EASYREC_CONFIG)
-        with open(self.easyrec_SimpleMultiTask_path, "w", encoding="utf-8") as f:
-            f.write(EASYREC_CONFIG_SIMPLEMULTITASK)
-        with open(self.easyrec_MMoE_path, "w", encoding="utf-8") as f:
-            f.write(EASYREC_CONFIG_MMOE)
-        with open(self.easyrec_PLE_path, "w", encoding="utf-8") as f:
-            f.write(EASYREC_CONFIG_PLE)
-        with open(self.easyrec_DeepFM_path, "w", encoding="utf-8") as f:
-            f.write(EASYREC_CONFIG_DEEPFM)
-        with open(self.easyrec_MultiTower_path, "w", encoding="utf-8") as f:
-            f.write(EASYREC_CONFIG_MULTITOWER)
-        with open(self.easyrec_DSSM_path, "w", encoding="utf-8") as f:
-            f.write(EASYREC_CONFIG_DSSM)
-
         f = open(self.fg_path, "w", encoding="utf-8")
         json.dump(FG_JSON, f)
         f.close()
@@ -2964,9 +1701,17 @@ class ConvertConfigTest(unittest.TestCase):
         self.assertEqual(config_text, MODEL_CONFIG)
 
     def test_create_model_config_simplemultitask(self):
+        self.easyrec_simplemultitask_path = os.path.join(
+            self.test_dir, "easyrec_simplemultitask.config"
+        )
+        self.tzrec_simplemultitask_path = os.path.join(
+            self.test_dir, "tzrec_simplemultitask.config"
+        )
+        with open(self.easyrec_simplemultitask_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_SIMPLEMULTITASK)
         convert_simplemultitask = ConvertConfig(
-            self.easyrec_SimpleMultiTask_path,
-            self.tzrec_SimpleMultiTask_path,
+            self.easyrec_simplemultitask_path,
+            self.tzrec_simplemultitask_path,
             self.fg_path,
         )
         config = tzrec_pipeline_pb2.EasyRecConfig()
@@ -2975,8 +1720,12 @@ class ConvertConfigTest(unittest.TestCase):
         self.assertEqual(config_text, MODEL_CONFIG_SIMPLEMULTITASK)
 
     def test_create_model_config_mmoe(self):
+        self.easyrec_mmoe_path = os.path.join(self.test_dir, "easyrec_mmoe.config")
+        self.tzrec_mmoe_path = os.path.join(self.test_dir, "tzrec_mmoe.config")
+        with open(self.easyrec_mmoe_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_MMOE)
         convert_mmoe = ConvertConfig(
-            self.easyrec_MMoE_path, self.tzrec_MMoE_path, self.fg_path
+            self.easyrec_mmoe_path, self.tzrec_mmoe_path, self.fg_path
         )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_mmoe._create_model_config(config)
@@ -2984,8 +1733,12 @@ class ConvertConfigTest(unittest.TestCase):
         self.assertEqual(config_text, MODEL_CONFIG_MMOE)
 
     def test_create_model_config_ple(self):
+        self.easyrec_ple_path = os.path.join(self.test_dir, "easyrec_ple.config")
+        self.tzrec_ple_path = os.path.join(self.test_dir, "tzrec_ple.config")
+        with open(self.easyrec_ple_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_PLE)
         convert_ple = ConvertConfig(
-            self.easyrec_PLE_path, self.tzrec_PLE_path, self.fg_path
+            self.easyrec_ple_path, self.tzrec_ple_path, self.fg_path
         )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_ple._create_model_config(config)
@@ -2993,17 +1746,29 @@ class ConvertConfigTest(unittest.TestCase):
         self.assertEqual(config_text, MODEL_CONFIG_PLE)
 
     def test_create_model_config_deepfm(self):
+        self.easyrec_deepfm_path = os.path.join(self.test_dir, "easyrec_deepfm.config")
+        self.tzrec_deepfm_path = os.path.join(self.test_dir, "tzrec_deepfm.config")
+        with open(self.easyrec_deepfm_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_DEEPFM)
         convert_deepfm = ConvertConfig(
-            self.easyrec_DeepFM_path, self.tzrec_DeepFM_path, self.fg_path
+            self.easyrec_deepfm_path, self.tzrec_deepfm_path, self.fg_path
         )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_deepfm._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
-        self.assertEqual(config_text, MODEL_CONFIG_DeepFM)
+        self.assertEqual(config_text, MODEL_CONFIG_DEEPFM)
 
     def test_create_model_config_multitower(self):
+        self.easyrec_multitower_path = os.path.join(
+            self.test_dir, "easyrec_multitower.config"
+        )
+        self.tzrec_multitower_path = os.path.join(
+            self.test_dir, "tzrec_multitower.config"
+        )
+        with open(self.easyrec_multitower_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_MULTITOWER)
         convert_multitower = ConvertConfig(
-            self.easyrec_MultiTower_path, self.tzrec_MultiTower_path, self.fg_path
+            self.easyrec_multitower_path, self.tzrec_multitower_path, self.fg_path
         )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_multitower._create_model_config(config)
@@ -3011,8 +1776,12 @@ class ConvertConfigTest(unittest.TestCase):
         self.assertEqual(config_text, MODEL_CONFIG_MULTITOWER)
 
     def test_create_model_config_dssm(self):
+        self.easyrec_dssm_path = os.path.join(self.test_dir, "easyrec_dssm.config")
+        self.tzrec_dssm_path = os.path.join(self.test_dir, "tzrec_dssm.config")
+        with open(self.easyrec_dssm_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_DSSM)
         convert_dssm = ConvertConfig(
-            self.easyrec_DSSM_path, self.tzrec_DSSM_path, self.fg_path
+            self.easyrec_dssm_path, self.tzrec_dssm_path, self.fg_path
         )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_dssm._create_model_config(config)
