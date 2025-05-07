@@ -13,7 +13,7 @@ feature_configs {
         sequence_delim: "|"
         expression: "user:click_50_seq__adgroup_id"
         embedding_dim: 16
-        hash_bucket_size: 846812
+        num_buckets: 846812
     }
 }
 feature_configs {
@@ -23,7 +23,7 @@ feature_configs {
         sequence_delim: "|"
         expression: "user:click_50_seq__cate_id"
         embedding_dim: 8
-        hash_bucket_size: 12961
+        num_buckets: 12961
     }
 }
 
@@ -34,7 +34,7 @@ feature_configs {
         sequence_delim: "|"
         expression: "user:click_50_seq__brand"
         embedding_dim: 8
-        hash_bucket_size: 461498
+        num_buckets: 461498
     }
 }
 
