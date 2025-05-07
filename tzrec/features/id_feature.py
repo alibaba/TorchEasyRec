@@ -166,34 +166,27 @@ class IdFeature(BaseFeature):
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("zch"):
             fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
-            fg_cfg["value_type"] = "string"
         elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
-            fg_cfg["value_type"] = "string"
         elif len(self.vocab_list) > 0:
             fg_cfg["vocab_list"] = self.vocab_list
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
-            fg_cfg["value_type"] = "string"
         elif len(self.vocab_dict) > 0:
             fg_cfg["vocab_dict"] = self.vocab_dict
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
-            fg_cfg["value_type"] = "string"
         elif len(self.vocab_file) > 0:
             fg_cfg["vocab_file"] = self.vocab_file
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
-            fg_cfg["value_type"] = "string"
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets
-            if self.config.default_value:
-                fg_cfg["value_type"] = "int64"
-            else:
-                fg_cfg["value_type"] = "string"
         if self.config.weighted:
             fg_cfg["weighted"] = True
         if self.config.HasField("value_dim"):
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 0
+        if self.config.HasField("fg_value_type"):
+            fg_cfg["value_type"] = self.config.fg_value_type
         return [fg_cfg]
 
     def assets(self) -> Dict[str, str]:
