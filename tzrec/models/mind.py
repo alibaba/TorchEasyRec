@@ -9,10 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torch._tensor import Tensor
 
 from tzrec.datasets.utils import Batch
@@ -64,20 +65,64 @@ class MINDUserTower(MatchTower):
         self.init_input()
 
         user_feature_in = self.embedding_group.group_total_dim(self._group_name)
-        self.user_mlp = MLP(user_feature_in, **config_to_kwargs(tower_config.user_mlp))
+        if len(tower_config.user_mlp.hidden_units) > 1:
+            self.user_mlp = MLP(
+                in_features=user_feature_in,
+                hidden_units=tower_config.user_mlp.hidden_units[0:-1],
+                activation=tower_config.user_mlp.activation,
+                use_bn=tower_config.user_mlp.use_bn,
+                dropout_ratio=tower_config.user_mlp.dropout_ratio[0]
+                if tower_config.user_mlp.dropout_ratio
+                else None,
+            )
+            self.user_mlp_out = nn.Linear(
+                self.user_mlp.output_dim(), tower_config.user_mlp.hidden_units[-1]
+            )
+
+        else:
+            self.user_mlp = nn.Linear(
+                self.user_mlp.user_feature_in, tower_config.user_mlp.hidden_units[-1]
+            )
+            self.user_mlp_out = None
 
         hist_feature_dim = self.embedding_group.group_total_dim(
             self._hist_group_name + ".sequence"
         )
 
-        if tower_config.hist_seq_mlp:
+        if (
+            tower_config.hist_seq_mlp
+            and len(tower_config.hist_seq_mlp.hidden_units) > 1
+        ):
             self._hist_seq_mlp = MLP(
                 in_features=hist_feature_dim,
                 dim=3,
-                **config_to_kwargs(tower_config.hist_seq_mlp),
+                hidden_units=tower_config.hist_seq_mlp.hidden_units[0:-1],
+                activation=tower_config.hist_seq_mlp.activation,
+                use_bn=tower_config.hist_seq_mlp.use_bn,
+                bias=False,
+                dropout_ratio=tower_config.hist_seq_mlp.dropout_ratio[0]
+                if tower_config.hist_seq_mlp.dropout_ratio
+                else None,
+            )
+            self._hist_seq_mlp_out = nn.Linear(
+                self._hist_seq_mlp.output_dim(),
+                tower_config.hist_seq_mlp.hidden_units[-1],
+                bias=False,
             )
             capsule_input_dim = tower_config.hist_seq_mlp.hidden_units[-1]
+        elif (
+            tower_config.hist_seq_mlp
+            and len(tower_config.hist_seq_mlp.hidden_units) > 0
+        ):
+            self._hist_seq_mlp = nn.Linear(
+                hist_feature_dim,
+                tower_config.hist_seq_mlp.hidden_units[-1],
+                bias=False,
+            )
+            self._hist_seq_mlp_out = None
+            capsule_input_dim = tower_config.hist_seq_mlp.hidden_units[-1]
         else:
+            self._hist_seq_mlp = None
             capsule_input_dim = hist_feature_dim
 
         self._capsule_layer = CapsuleLayer(
@@ -90,8 +135,14 @@ class MINDUserTower(MatchTower):
             dim=3,
             **config_to_kwargs(tower_config.concat_mlp),
         )
+        if self._output_dim > 0:
+            self.output = nn.Linear(
+                self._concat_mlp.output_dim(), output_dim, bias=False
+            )
 
-    def forward(self, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, batch: Batch
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward the tower.
 
         Args:
@@ -104,24 +155,43 @@ class MINDUserTower(MatchTower):
         grp_hist_seq = user_feature_dict[self._hist_group_name + ".sequence"]
         grp_hist_len = user_feature_dict[self._hist_group_name + ".sequence_length"]
 
-        user_feature = self.user_mlp(user_feature_dict[self._group_name])
+        if self.user_mlp_out:
+            user_feature = self.user_mlp_out(
+                self.user_mlp(user_feature_dict[self._group_name])
+            )
+        else:
+            user_feature = self.user_mlp(user_feature_dict[self._group_name])
 
         if self._hist_seq_mlp:
-            hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
+            if self._hist_seq_mlp_out:
+                hist_seq_feas = self._hist_seq_mlp_out(self._hist_seq_mlp(grp_hist_seq))
+            else:
+                hist_seq_feas = self._hist_seq_mlp(grp_hist_seq)
         else:
             hist_seq_feas = grp_hist_seq
 
-        high_capsules = self._capsule_layer(hist_seq_feas, grp_hist_len)
+        high_capsules, high_capsules_mask = self._capsule_layer(
+            hist_seq_feas, grp_hist_len
+        )
 
         # concatenate user feature and high_capsules
         user_feature = torch.unsqueeze(user_feature, dim=1)
         user_feature_tile = torch.tile(user_feature, [1, high_capsules.shape[1], 1])
         user_interests = torch.cat([user_feature_tile, high_capsules], dim=-1)
+        user_interests = user_interests * high_capsules_mask.unsqueeze(-1).float()
         user_interests = self._concat_mlp(user_interests)
+        user_interests = user_interests * high_capsules_mask.unsqueeze(-1).float()
+
+        if self._output_dim > 0:
+            user_interests = self.output(user_interests)
 
         if self._similarity == simi_pb2.Similarity.COSINE:
             user_interests = F.normalize(user_interests, p=2.0, dim=-1)
-        return user_interests
+
+        if self.is_inference:
+            return user_interests
+        else:
+            return user_interests, high_capsules_mask
 
 
 class MINDItemTower(MatchTower):
@@ -158,6 +228,8 @@ class MINDItemTower(MatchTower):
         self.init_input()
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
+        if self._output_dim > 0:
+            self.output = nn.Linear(self.mlp.output_dim(), output_dim)
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Forward the tower.
@@ -171,6 +243,9 @@ class MINDItemTower(MatchTower):
         """
         grouped_features = self.build_input(batch)
         item_emb = self.mlp(grouped_features[self._group_name])
+
+        if self._output_dim > 0:
+            item_emb = self.output(item_emb)
 
         if self._similarity == simi_pb2.Similarity.COSINE:
             item_emb = F.normalize(item_emb, p=2.0, dim=1)
@@ -208,7 +283,7 @@ class MIND(MatchModel):
 
         self.user_tower = MINDUserTower(
             self._model_config.user_tower,
-            0,
+            self._model_config.output_dim,
             self._model_config.similarity,
             user_group,
             hist_group,
@@ -218,7 +293,7 @@ class MIND(MatchModel):
         )
         self.item_tower = MINDItemTower(
             self._model_config.item_tower,
-            0,
+            self._model_config.output_dim,
             self._model_config.similarity,
             item_group,
             item_features,
@@ -229,12 +304,14 @@ class MIND(MatchModel):
         self,
         user_interests: torch.Tensor,
         item_emb: torch.Tensor,
+        interest_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Compute label-aware attention for user interests.
 
         Args:
             user_interests (Tensor): user interests.
             item_emb (Tensor): item embedding.
+            interest_mask (Tensor): interest mask.
 
         Returns:
             user_emb (Tensor): user embedding.
@@ -244,10 +321,13 @@ class MIND(MatchModel):
 
         simi_pow = self._model_config.simi_pow
         interest_weight = torch.einsum("bkd, bd->bk", user_interests, pos_item_emb)
+
+        threshold = (interest_mask.float() * 2 - 1) * 1e32
+        interest_weight = torch.minimum(interest_weight, threshold)
+
         interest_weight = interest_weight.unsqueeze(-1)
-        interest_weight = torch.nn.functional.softmax(
-            torch.pow(interest_weight, simi_pow), dim=1
-        )
+        interest_weight = interest_weight * simi_pow
+        interest_weight = torch.nn.functional.softmax(interest_weight, dim=1)
 
         user_emb = torch.sum(torch.multiply(interest_weight, user_interests), dim=1)
         return user_emb
@@ -262,9 +342,19 @@ class MIND(MatchModel):
             simi (dict): a dict of predicted result.
 
         """
-        user_interests = self.user_tower(batch)
+        if self.is_inference:
+            user_interests = self.user_tower(batch)
+        else:
+            user_interests, interest_mask = self.user_tower(batch)
         item_emb = self.item_tower(batch)
 
-        user_emb = self.label_aware_attention(user_interests, item_emb)
-        ui_sim = self.sim(user_emb, item_emb)
+        user_emb = self.label_aware_attention(
+            user_interests,
+            item_emb,
+            interest_mask,  # pyre-ignore [61]
+        )
+        # if self._model_config.similarity == simi_pb2.Similarity.COSINE:
+        #     user_emb = F.normalize(user_emb, p=2.0, dim=1)
+
+        ui_sim = self.sim(user_emb, item_emb) / self._model_config.temperature
         return {"similarity": ui_sim}

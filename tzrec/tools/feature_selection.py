@@ -266,15 +266,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--visualize",
-        type=bool,
+        action="store_true",
         default=False,
         help="visualization feature selection result or not",
     )
     parser.add_argument(
         "--clear_variational_dropout",
-        type=bool,
-        default=True,
-        help="visualization feature selection result or not",
+        action="store_true",
+        default=False,
+        help="clear variational dropout config or not",
     )
     args, extra_args = parser.parse_known_args()
     fs = VariationalDropoutFS(

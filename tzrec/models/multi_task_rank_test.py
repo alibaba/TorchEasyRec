@@ -50,13 +50,17 @@ class _TestMultiTaskRankModel(MultiTaskRank):
 class MultiTaskRankTest(unittest.TestCase):
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, True],
-            [TestGraphType.FX_TRACE, True],
-            [TestGraphType.NORMAL, False],
-            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.NORMAL, 1.0, True],
+            [TestGraphType.FX_TRACE, 1.0, True],
+            [TestGraphType.NORMAL, 1.0, False],
+            [TestGraphType.FX_TRACE, 1.0, False],
+            [TestGraphType.NORMAL, 2.0, True],
+            [TestGraphType.FX_TRACE, 2.0, True],
+            [TestGraphType.NORMAL, 2.0, False],
+            [TestGraphType.FX_TRACE, 2.0, False],
         ]
     )
-    def test_multi_task_rank_model(self, graph_type, task_space):
+    def test_multi_task_rank_model(self, graph_type, t2_loss_weight, task_space):
         model_config = model_pb2.ModelConfig(
             simple_multi_task=multi_task_rank_pb2.SimpleMultiTask(
                 task_towers=[
@@ -73,6 +77,7 @@ class MultiTaskRankTest(unittest.TestCase):
                     TaskTower(
                         tower_name="t2",
                         label_name="label2",
+                        weight=t2_loss_weight,
                         losses=[
                             loss_pb2.LossConfig(
                                 binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
@@ -111,16 +116,16 @@ class MultiTaskRankTest(unittest.TestCase):
             metric_result = model.model.compute_metric()
 
         if task_space:
-            expected_total_loss = torch.tensor(2.2173)
+            expected_total_loss = torch.tensor(0.6762 + 1.5410 * t2_loss_weight)
             expected_losses = {
                 "binary_cross_entropy_t1": torch.tensor(0.6762),
-                "binary_cross_entropy_t2": torch.tensor(1.5410),
+                "binary_cross_entropy_t2": torch.tensor(1.5410 * t2_loss_weight),
             }
         else:
-            expected_total_loss = torch.tensor(1.5784)
+            expected_total_loss = torch.tensor(0.6762 + 0.9021 * t2_loss_weight)
             expected_losses = {
                 "binary_cross_entropy_t1": torch.tensor(0.6762),
-                "binary_cross_entropy_t2": torch.tensor(0.9021),
+                "binary_cross_entropy_t2": torch.tensor(0.9021 * t2_loss_weight),
             }
         expected_logits = {
             "logits_t1": torch.tensor([0.2000, 0.3000]),

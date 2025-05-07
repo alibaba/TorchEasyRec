@@ -25,4 +25,5 @@ jobs:
           ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
+          pip uninstall faiss-cpu -y
           bash scripts/ci/ci_test.sh
