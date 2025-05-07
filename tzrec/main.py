@@ -846,7 +846,11 @@ def export(
         logger.warning("Only first rank will be used for export now.")
         return
     else:
-        os.environ["WORLD_SIZE"] = 1
+        if os.environ.get("WORLD_SIZE") != "1":
+            logger.warning(
+                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
+            )
+            os.environ["WORLD_SIZE"] = "1"
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
@@ -886,7 +890,7 @@ def export(
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     model = InferWrapper(model)
     model.set_is_inference(True)
-    init_parameters(model, "cpu")
+    init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
         checkpoint_path, _ = checkpoint_util.latest_checkpoint(
