@@ -67,6 +67,7 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
@@ -761,7 +762,8 @@ def evaluate(
 
 def _script_model(
     pipeline_config: EasyRecConfig,
-    model: nn.Module,
+    model: BaseModule,
+    state_dict: Optional[Dict[str, Any]],
     dataloader: DataLoader,
     save_dir: str,
 ) -> None:
@@ -770,6 +772,10 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
+        model.set_is_inference(True)
+        if state_dict is not None:
+            model.to_empty(device="cpu")
+            model.load_state_dict(state_dict, strict=False)
 
         # for mc modules, we should validate and sort mch buffers
         validate_state(model)
@@ -889,7 +895,6 @@ def export(
     )
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     model = InferWrapper(model)
-    model.set_is_inference(True)
     init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
@@ -924,6 +929,7 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
+                    model.state_dict(),
                     dataloader,
                     tower_export_dir,
                 )
@@ -936,6 +942,7 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
+                    model.state_dict(),
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
@@ -943,6 +950,7 @@ def export(
         _script_model(
             ori_pipeline_config,
             model,
+            None,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -952,6 +960,7 @@ def export(
         _script_model(
             ori_pipeline_config,
             model,
+            None,
             dataloader,
             export_dir,
         )
