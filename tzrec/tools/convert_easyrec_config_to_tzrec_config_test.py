@@ -2875,6 +2875,7 @@ MODEL_CONFIG_DSSM = """model_config {
 }
 """
 
+
 class ConvertConfigTest(unittest.TestCase):
     def setUp(self):
         self.success = False
@@ -2883,18 +2884,26 @@ class ConvertConfigTest(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_convert_", dir="./tmp")
         self.fg_path = os.path.join(self.test_dir, "fg.json")
         self.easyrec_path = os.path.join(self.test_dir, "easyrec.config")
-        self.easyrec_SimpleMultiTask_path = os.path.join(self.test_dir, "easyrec_SimpleMultiTask.config")
+        self.easyrec_SimpleMultiTask_path = os.path.join(
+            self.test_dir, "easyrec_SimpleMultiTask.config"
+        )
         self.easyrec_MMoE_path = os.path.join(self.test_dir, "easyrec_MMoE.config")
         self.easyrec_PLE_path = os.path.join(self.test_dir, "easyrec_PLE.config")
         self.easyrec_DeepFM_path = os.path.join(self.test_dir, "easyrec_DeepFM.config")
-        self.easyrec_MultiTower_path = os.path.join(self.test_dir, "easyrec_MultiTower.config")
+        self.easyrec_MultiTower_path = os.path.join(
+            self.test_dir, "easyrec_MultiTower.config"
+        )
         self.easyrec_DSSM_path = os.path.join(self.test_dir, "easyrec_DSSM.config")
         self.tzrec_path = os.path.join(self.test_dir, "tzrec.config")
-        self.tzrec_SimpleMultiTask_path = os.path.join(self.test_dir, "tzrec_SimpleMultiTask.config")
+        self.tzrec_SimpleMultiTask_path = os.path.join(
+            self.test_dir, "tzrec_SimpleMultiTask.config"
+        )
         self.tzrec_MMoE_path = os.path.join(self.test_dir, "tzrec_MMoE.config")
         self.tzrec_PLE_path = os.path.join(self.test_dir, "tzrec_PLE.config")
         self.tzrec_DeepFM_path = os.path.join(self.test_dir, "tzrec_DeepFM.config")
-        self.tzrec_MultiTower_path = os.path.join(self.test_dir, "tzrec_MultiTower.config")
+        self.tzrec_MultiTower_path = os.path.join(
+            self.test_dir, "tzrec_MultiTower.config"
+        )
         self.tzrec_DSSM_path = os.path.join(self.test_dir, "tzrec_DSSM.config")
         with open(self.easyrec_path, "w", encoding="utf-8") as f:
             f.write(EASYREC_CONFIG)
@@ -2953,43 +2962,58 @@ class ConvertConfigTest(unittest.TestCase):
         config = convert._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG)
+
     def test_create_model_config_simplemultitask(self):
-        convert_simplemultitask = ConvertConfig(self.easyrec_SimpleMultiTask_path, self.tzrec_SimpleMultiTask_path, self.fg_path)
+        convert_simplemultitask = ConvertConfig(
+            self.easyrec_SimpleMultiTask_path,
+            self.tzrec_SimpleMultiTask_path,
+            self.fg_path,
+        )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_simplemultitask._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG_SIMPLEMULTITASK)
 
     def test_create_model_config_mmoe(self):
-        convert_mmoe = ConvertConfig(self.easyrec_MMoE_path, self.tzrec_MMoE_path, self.fg_path)
+        convert_mmoe = ConvertConfig(
+            self.easyrec_MMoE_path, self.tzrec_MMoE_path, self.fg_path
+        )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_mmoe._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG_MMOE)
 
     def test_create_model_config_ple(self):
-        convert_ple = ConvertConfig(self.easyrec_PLE_path, self.tzrec_PLE_path, self.fg_path)
+        convert_ple = ConvertConfig(
+            self.easyrec_PLE_path, self.tzrec_PLE_path, self.fg_path
+        )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_ple._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG_PLE)
 
     def test_create_model_config_deepfm(self):
-        convert_deepfm = ConvertConfig(self.easyrec_DeepFM_path, self.tzrec_DeepFM_path, self.fg_path)
+        convert_deepfm = ConvertConfig(
+            self.easyrec_DeepFM_path, self.tzrec_DeepFM_path, self.fg_path
+        )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_deepfm._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG_DeepFM)
 
     def test_create_model_config_multitower(self):
-        convert_multitower = ConvertConfig(self.easyrec_MultiTower_path, self.tzrec_MultiTower_path, self.fg_path)
+        convert_multitower = ConvertConfig(
+            self.easyrec_MultiTower_path, self.tzrec_MultiTower_path, self.fg_path
+        )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_multitower._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG_MULTITOWER)
 
     def test_create_model_config_dssm(self):
-        convert_dssm = ConvertConfig(self.easyrec_DSSM_path, self.tzrec_DSSM_path, self.fg_path)
+        convert_dssm = ConvertConfig(
+            self.easyrec_DSSM_path, self.tzrec_DSSM_path, self.fg_path
+        )
         config = tzrec_pipeline_pb2.EasyRecConfig()
         config = convert_dssm._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)

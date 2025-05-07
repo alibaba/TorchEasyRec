@@ -712,7 +712,9 @@ class ConvertConfig(object):
             )
             tz_model_config_ob.item_tower.CopyFrom(item_tower)
             tz_model_config_ob.output_dim = 32
-            if hasattr(easyrec_model_config, 'temperature') and easyrec_model_config.HasField("temperature"):
+            if hasattr(
+                easyrec_model_config, "temperature"
+            ) and easyrec_model_config.HasField("temperature"):
                 tz_model_config_ob.temperature = easyrec_model_config.temperature
             tz_model_config.dssm.CopyFrom(tz_model_config_ob)
         else:
