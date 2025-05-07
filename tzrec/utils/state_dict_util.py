@@ -24,7 +24,6 @@ def validate_state(model: nn.Module) -> None:
             if validate_log_flag:
                 logger.info("validate states...")
                 validate_log_flag = False
-            m.validate_state()
             if isinstance(m, MCHManagedCollisionModule):
                 # fix output_segments_tensor is a meta tensor.
                 output_segments = [
@@ -36,6 +35,7 @@ def validate_state(model: nn.Module) -> None:
                     dtype=torch.int64,
                     device=m._current_iter_tensor.device,
                 )
+            m.validate_state()
 
 
 def init_parameters(module: nn.Module, device: torch.device) -> None:
