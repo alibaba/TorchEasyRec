@@ -20,6 +20,7 @@ def fix_mch_state(model: nn.Module) -> None:
         # fix output_segments_tensor is a meta tensor.
         if (
             isinstance(m, MCHManagedCollisionModule)
+            # pyre-ignore [16]
             and m._buffers["_output_segments_tensor"].is_meta
         ):
             output_segments = [
