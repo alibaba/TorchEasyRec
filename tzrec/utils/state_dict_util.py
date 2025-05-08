@@ -13,29 +13,24 @@ import torch
 from torch import nn
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
-from tzrec.utils.logging_util import logger
 
-
-def validate_state(model: nn.Module) -> None:
-    """For mc modules, we should update and sort mch buffers."""
-    validate_log_flag = True
+def fix_mch_state(model: nn.Module) -> None:
+    """Fix output_segments_tensor of mc modules may be a meta tensor."""
     for _, m in model.named_modules():
-        if hasattr(m, "validate_state"):
-            if validate_log_flag:
-                logger.info("validate states...")
-                validate_log_flag = False
-            m.validate_state()
-            if isinstance(m, MCHManagedCollisionModule):
-                # fix output_segments_tensor is a meta tensor.
-                output_segments = [
-                    m._output_global_offset,
-                    m._output_global_offset + m._zch_size,
-                ]
-                m._buffers["_output_segments_tensor"] = torch.tensor(
-                    output_segments + [-1] * (1025 - len(output_segments)),
-                    dtype=torch.int64,
-                    device=m._current_iter_tensor.device,
-                )
+        # fix output_segments_tensor is a meta tensor.
+        if (
+            isinstance(m, MCHManagedCollisionModule)
+            and m._buffers["_output_segments_tensor"].is_meta
+        ):
+            output_segments = [
+                m._output_global_offset,
+                m._output_global_offset + m._zch_size,
+            ]
+            m._buffers["_output_segments_tensor"] = torch.tensor(
+                output_segments + [-1] * (1025 - len(output_segments)),
+                dtype=torch.int64,
+                device=m._current_iter_tensor.device,
+            )
 
 
 def init_parameters(module: nn.Module, device: torch.device) -> None:

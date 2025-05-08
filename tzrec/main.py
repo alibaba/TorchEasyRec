@@ -83,7 +83,7 @@ from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -777,10 +777,8 @@ def _script_model(
             model.to_empty(device="cpu")
             model.load_state_dict(state_dict, strict=False)
 
-        # for mc modules, we should validate and sort mch buffers
-        # but we do not gather state dict now, validate_state already
-        # in post_load_state_dict hook
-        # validate_state(model)
+        # for mc modules, fix output_segments_tensor is a meta tensor.
+        fix_mch_state(model)
 
         batch = next(iter(dataloader))
 
