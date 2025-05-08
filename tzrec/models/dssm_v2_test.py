@@ -20,7 +20,8 @@ from tzrec.features.feature import create_features
 from tzrec.models.dssm_v2 import DSSMV2
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class DSSMV2Test(unittest.TestCase):

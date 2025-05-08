@@ -9,61 +9,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Union
-
 import torch
-from torch import distributed as dist
 from torch import nn
-from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
-from tzrec.utils.logging_util import logger
 
-
-def state_dict_gather(
-    src: Dict[str, Union[torch.Tensor, ShardedTensor]],
-    dst: Dict[str, torch.Tensor],
-) -> None:
-    """Gathers the values of the src state_dict into the dst state_dict.
-
-    Gathers the values of the src state_dict of the keys present in the dst state_dict.
-    Can handle ShardedTensors in the src state_dict.
-
-    Args:
-        src (Dict[str, Union[torch.Tensor, ShardedTensor]]): source's state_dict for
-            this rank.
-        dst (Dict[str, torch.Tensor]): destination's state_dict
-    """
-    for key, dst_tensor in dst.items():
-        src_tensor = src[key]
-        if isinstance(src_tensor, ShardedTensor):
-            src_tensor.gather(
-                out=dst_tensor if (dist.get_rank() == 0) else None,
-                dtype=dst_tensor.dtype,
-            )
-        elif isinstance(src_tensor, torch.Tensor):
-            dst_tensor.copy_(src_tensor)
-        else:
-            raise ValueError(f"Unsupported tensor {key} type {type(src_tensor)}")
-
-
-def validate_state(model: nn.Module) -> None:
-    """For mc modules, we should update and sort mch buffers."""
-    validate_log_flag = True
+def fix_mch_state(model: nn.Module) -> None:
+    """Fix output_segments_tensor of mc modules may be a meta tensor."""
     for _, m in model.named_modules():
-        if hasattr(m, "validate_state"):
-            if validate_log_flag:
-                logger.info("validate states...")
-                validate_log_flag = False
-            m.validate_state()
-            if isinstance(m, MCHManagedCollisionModule):
-                # fix output_segments_tensor is a meta tensor.
-                output_segments = [
-                    m._output_global_offset,
-                    m._output_global_offset + m._zch_size,
-                ]
-                m._buffers["_output_segments_tensor"] = torch.tensor(
-                    output_segments + [-1] * (1025 - len(output_segments)),
-                    dtype=torch.int64,
-                    device=m._current_iter_tensor.device,
+        # fix output_segments_tensor is a meta tensor.
+        if (
+            isinstance(m, MCHManagedCollisionModule)
+            # pyre-ignore [16]
+            and m._buffers["_output_segments_tensor"].is_meta
+        ):
+            output_segments = [
+                m._output_global_offset,
+                m._output_global_offset + m._zch_size,
+            ]
+            m._buffers["_output_segments_tensor"] = torch.tensor(
+                output_segments + [-1] * (1025 - len(output_segments)),
+                dtype=torch.int64,
+                device=m._current_iter_tensor.device,
+            )
+
+
+def init_parameters(module: nn.Module, device: torch.device) -> None:
+    """Init param for model with meta device type."""
+
+    @torch.no_grad()
+    def init_parameters(module: nn.Module) -> None:
+        # Allocate parameters and buffers if over 'meta' device.
+        has_meta_param = False
+        for name, param in module._parameters.items():
+            if isinstance(param, torch.Tensor) and param.device.type == "meta":
+                module._parameters[name] = nn.Parameter(
+                    torch.empty_like(param, device=device),
+                    requires_grad=param.requires_grad,
                 )
+                has_meta_param = True
+        for name, buffer in module._buffers.items():
+            if isinstance(buffer, torch.Tensor) and buffer.device.type == "meta":
+                module._buffers[name] = torch.zeros_like(buffer, device=device)
+
+        # Init parameters if at least one parameter is over 'meta' device.
+        if has_meta_param and hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+
+    module.apply(init_parameters)
