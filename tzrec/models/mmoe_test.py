@@ -27,7 +27,8 @@ from tzrec.protos import (
     tower_pb2,
 )
 from tzrec.protos.models import multi_task_rank_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class MMoETest(unittest.TestCase):
