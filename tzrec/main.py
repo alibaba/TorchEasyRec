@@ -13,6 +13,7 @@ import copy
 import itertools
 import json
 import os
+import pickle
 import shutil
 from collections import OrderedDict
 from queue import Queue
@@ -581,6 +582,29 @@ def train_and_evaluate(
             gl_cluster=gl_cluster,
         )
 
+    # Get Restore Ckpt Path
+    ckpt_path = None
+    skip_steps = -1
+    if pipeline_config.train_config.fine_tune_checkpoint:
+        ckpt_path, _ = checkpoint_util.latest_checkpoint(
+            pipeline_config.train_config.fine_tune_checkpoint
+        )
+    if os.path.exists(pipeline_config.model_dir):
+        # TODO(hongsheng.jhs): save and restore dataloader state.
+        latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
+            pipeline_config.model_dir
+        )
+        if latest_ckpt_path:
+            if continue_train:
+                ckpt_path = latest_ckpt_path
+            else:
+                raise RuntimeError(
+                    f"model_dir[{pipeline_config.model_dir}] already exists "
+                    "and not empty(if you want to continue train on current "
+                    "model_dir please delete dir model_dir or specify "
+                    "--continue_train)"
+                )
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
@@ -596,6 +620,14 @@ def train_and_evaluate(
     apply_optimizer_in_backward(
         sparse_optim_cls, model.model.sparse_parameters(), sparse_optim_kwargs
     )
+
+    ckpt_plan = None
+    if ckpt_path is not None:
+        ckpt_plan_path = os.path.join(ckpt_path, "plan")
+        if os.path.exists(ckpt_plan_path):
+            with open(ckpt_plan_path, "rb") as f:
+                ckpt_plan = pickle.load(f)  # NOQA
+        # constrain =
 
     planner = create_planner(
         device=device,
@@ -629,28 +661,6 @@ def train_and_evaluate(
     dense_lr = optimizer_builder.create_scheduler(
         dense_optimizer, pipeline_config.train_config.dense_optimizer
     )
-
-    ckpt_path = None
-    skip_steps = -1
-    if pipeline_config.train_config.fine_tune_checkpoint:
-        ckpt_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.train_config.fine_tune_checkpoint
-        )
-    if os.path.exists(pipeline_config.model_dir):
-        # TODO(hongsheng.jhs): save and restore dataloader state.
-        latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
-        if latest_ckpt_path:
-            if continue_train:
-                ckpt_path = latest_ckpt_path
-            else:
-                raise RuntimeError(
-                    f"model_dir[{pipeline_config.model_dir}] already exists "
-                    "and not empty(if you want to continue train on current "
-                    "model_dir please delete dir model_dir or specify "
-                    "--continue_train)"
-                )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
     # model_dir first, other slow rank find model_dir already exists and
