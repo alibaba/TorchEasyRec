@@ -25,27 +25,32 @@ from tzrec.utils.config_util import config_to_kwargs
 class MaskBlock(nn.Module):
     """MaskBlock module."""
 
-    def __init__(self, input_dim, mask_input_dim, aggregation_dim, output_dim):
+    def __init__(
+        self, input_dim, mask_input_dim, reduction_ratio, aggregation_dim, output_dim
+    ):
         super(MaskBlock, self).__init__()
-        self.aggregation_dim = aggregation_dim
         self.output_dim = output_dim
         self.ln_emb = nn.LayerNorm(input_dim)
 
+        if aggregation_dim:
+            self.aggregation_dim = aggregation_dim
+        if reduction_ratio:
+            self.aggregation_dim = int(mask_input_dim * reduction_ratio)
         self.aggregation_layer = nn.Linear(mask_input_dim, aggregation_dim)
         self.projection_layer = nn.Linear(aggregation_dim, input_dim)
         self.hidden_layer = nn.Linear(input_dim, output_dim)
 
         self.ln_output = nn.LayerNorm(output_dim)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+        self.relu_mask = nn.ReLU()
+        self.relu_out = nn.ReLU()
 
     def forward(self, input_1, input_2):
         """Forward pass of MaskBlock."""
         ln_emb = self.ln_emb(input_1)
-        weights = self.sigmoid(self.projection_layer(self.aggregation_layer(input_2)))
+        weights = self.projection_layer(self.relu_mask(self.aggregation_layer(input_2)))
         masked_emb = ln_emb * weights
         output = self.ln_output(self.hidden_layer(masked_emb))
-        output = self.relu(output)
+        output = self.relu_out(output)
 
         return output
 
@@ -75,21 +80,21 @@ class MaskNet(RankModel):
 
         masknet_config = model_config.mask_net
         self.use_parallel = masknet_config.use_parallel
-
         if self.use_parallel:
             self.mask_blocks = nn.ModuleList(
                 [
                     MaskBlock(
                         feature_dim,
                         feature_dim,
-                        masknet_config.mask_block_aggregation_dim,
-                        masknet_config.mask_block_output_dim,
+                        masknet_config.mask_block.reduction_ratio,
+                        masknet_config.mask_block.mask_block_aggregation_dim,
+                        masknet_config.mask_block.mask_block_output_dim,
                     )
                     for _ in range(masknet_config.n_mask_blocks)
                 ]
             )
             self.top_mlp = MLP(
-                in_features=masknet_config.mask_block_output_dim
+                in_features=masknet_config.mask_block.mask_block_output_dim
                 * masknet_config.n_mask_blocks,
                 **config_to_kwargs(masknet_config.top_mlp),
             )
@@ -99,8 +104,9 @@ class MaskNet(RankModel):
                     MaskBlock(
                         feature_dim,
                         feature_dim,
-                        masknet_config.mask_block_aggregation_dim,
-                        masknet_config.mask_block_output_dim,
+                        masknet_config.mask_block.reduction_ratio,
+                        masknet_config.mask_block.mask_block_aggregation_dim,
+                        masknet_config.mask_block.mask_block_output_dim,
                     )
                 ]
             )
@@ -109,12 +115,13 @@ class MaskNet(RankModel):
                     MaskBlock(
                         masknet_config.mask_block_output_dim,
                         feature_dim,
-                        masknet_config.mask_block_aggregation_dim,
-                        masknet_config.mask_block_output_dim,
+                        masknet_config.mask_block.reduction_ratio,
+                        masknet_config.mask_block.mask_block_aggregation_dim,
+                        masknet_config.mask_block.mask_block_output_dim,
                     )
                 )
             self.top_mlp = MLP(
-                in_features=masknet_config.mask_block_output_dim,
+                in_features=masknet_config.mask_block.mask_block_output_dim,
                 **config_to_kwargs(masknet_config.top_mlp),
             )
 

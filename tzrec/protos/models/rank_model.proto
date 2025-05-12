@@ -37,10 +37,12 @@ message DLRM {
 
 
 message MaskNet {
+    // number of mask blocks
     required uint32 n_mask_blocks = 1;
-    required uint32 mask_block_aggregation_dim = 2;
-    //required uint32 mask_block_projection_dim = 3;
-    required uint32 mask_block_output_dim = 3;
-    required MLP top_mlp = 4;
+    // mask block
+    required MaskBlock mask_block = 2;
+    required MLP top_mlp = 3;
+    // use parallel or serial mask blocks
     optional bool use_parallel = 5 [default=true];
+
 }
