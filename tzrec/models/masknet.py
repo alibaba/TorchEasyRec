@@ -23,34 +23,48 @@ from tzrec.utils.config_util import config_to_kwargs
 
 
 class MaskBlock(nn.Module):
-    """MaskBlock module."""
+    """MaskBlock module.
+
+    Args:
+        input_dim (int): Input dimension, either feature embedding dim(parallel mode)
+            or hidden state dim(serial mode).
+        mask_input_dim (int): Mask input dimension, is always the feature embedding dim
+            for both para and serial modes.
+        reduction_ratio (float): Reduction ratio, aggregation_dim / mask_input_dim.
+        aggregation_dim (int): Aggregation layer dim, mask_input_dim*reduction_ratio.
+        hidden_dim (int): Hidden layer dimension for feedforward network.
+    """
 
     def __init__(
-        self, input_dim, mask_input_dim, reduction_ratio, aggregation_dim, output_dim
+        self, input_dim, mask_input_dim, reduction_ratio, aggregation_dim, hidden_dim
     ):
         super(MaskBlock, self).__init__()
-        self.output_dim = output_dim
         self.ln_emb = nn.LayerNorm(input_dim)
 
         if aggregation_dim:
             self.aggregation_dim = aggregation_dim
         if reduction_ratio:
             self.aggregation_dim = int(mask_input_dim * reduction_ratio)
-        self.aggregation_layer = nn.Linear(mask_input_dim, aggregation_dim)
-        self.projection_layer = nn.Linear(aggregation_dim, input_dim)
-        self.hidden_layer = nn.Linear(input_dim, output_dim)
 
-        self.ln_output = nn.LayerNorm(output_dim)
-        self.relu_mask = nn.ReLU()
-        self.relu_out = nn.ReLU()
+        self.mask_generator = nn.Sequential(
+            nn.Linear(mask_input_dim, aggregation_dim),
+            nn.ReLU(),
+            nn.Linear(aggregation_dim, input_dim),
+        )
 
-    def forward(self, input_1, input_2):
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+
+    def forward(self, input, mask_input):
         """Forward pass of MaskBlock."""
-        ln_emb = self.ln_emb(input_1)
-        weights = self.projection_layer(self.relu_mask(self.aggregation_layer(input_2)))
-        masked_emb = ln_emb * weights
-        output = self.ln_output(self.hidden_layer(masked_emb))
-        output = self.relu_out(output)
+        ln_emb = self.ln_emb(input)
+        weights = self.mask_generator(mask_input)
+        weighted_emb = ln_emb * weights
+        output = self.ffn(weighted_emb)
 
         return output
 
@@ -80,48 +94,27 @@ class MaskNet(RankModel):
 
         masknet_config = model_config.mask_net
         self.use_parallel = masknet_config.use_parallel
+
+        self.mask_blocks = nn.ModuleList(
+            [
+                MaskBlock(
+                    feature_dim,
+                    feature_dim,
+                    masknet_config.mask_block.reduction_ratio,
+                    masknet_config.mask_block.aggregation_dim,
+                    masknet_config.mask_block.hidden_dim,
+                )
+                for _ in range(masknet_config.n_mask_blocks)
+            ]
+        )
         if self.use_parallel:
-            self.mask_blocks = nn.ModuleList(
-                [
-                    MaskBlock(
-                        feature_dim,
-                        feature_dim,
-                        masknet_config.mask_block.reduction_ratio,
-                        masknet_config.mask_block.mask_block_aggregation_dim,
-                        masknet_config.mask_block.mask_block_output_dim,
-                    )
-                    for _ in range(masknet_config.n_mask_blocks)
-                ]
-            )
             self.top_mlp = MLP(
-                in_features=masknet_config.mask_block.mask_block_output_dim
-                * masknet_config.n_mask_blocks,
+                in_features=feature_dim * masknet_config.n_mask_blocks,
                 **config_to_kwargs(masknet_config.top_mlp),
             )
         else:
-            self.mask_blocks = nn.ModuleList(
-                [
-                    MaskBlock(
-                        feature_dim,
-                        feature_dim,
-                        masknet_config.mask_block.reduction_ratio,
-                        masknet_config.mask_block.mask_block_aggregation_dim,
-                        masknet_config.mask_block.mask_block_output_dim,
-                    )
-                ]
-            )
-            for _ in range(1, masknet_config.n_mask_blocks):
-                self.mask_blocks.append(
-                    MaskBlock(
-                        masknet_config.mask_block_output_dim,
-                        feature_dim,
-                        masknet_config.mask_block.reduction_ratio,
-                        masknet_config.mask_block.mask_block_aggregation_dim,
-                        masknet_config.mask_block.mask_block_output_dim,
-                    )
-                )
             self.top_mlp = MLP(
-                in_features=masknet_config.mask_block.mask_block_output_dim,
+                in_features=feature_dim,
                 **config_to_kwargs(masknet_config.top_mlp),
             )
 
@@ -130,7 +123,7 @@ class MaskNet(RankModel):
         )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Forward."""
+        """Forward method."""
         feature_dict = self.build_input(batch)
         features = feature_dict[self.group_name]
 

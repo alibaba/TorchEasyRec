@@ -43,6 +43,6 @@ message MaskNet {
     required MaskBlock mask_block = 2;
     required MLP top_mlp = 3;
     // use parallel or serial mask blocks
-    optional bool use_parallel = 5 [default=true];
+    optional bool use_parallel = 4 [default=true];
 
 }

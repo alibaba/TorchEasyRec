@@ -58,7 +58,7 @@ message MaskBlock{
     // the ratio between aggregation dim and masked input dim
     optional float reduction_ratio = 1 [default=1.0];
     // the dim of aggregation layer
-    optional uint32 mask_block_aggregation_dim = 2;
-    // the dim of output layer
-    required uint32 mask_block_output_dim = 3;
+    optional uint32 aggregation_dim = 2;
+    // the dim of hidden ffn layer
+    required uint32 hidden_dim = 3;
 }
