@@ -51,11 +51,18 @@ class MaskBlock(nn.Module):
         if reduction_ratio:
             self.aggregation_dim = int(mask_input_dim * reduction_ratio)
 
-        self.mask_generator = nn.Sequential(
-            nn.Linear(mask_input_dim, aggregation_dim),
-            nn.ReLU(),
-            nn.Linear(aggregation_dim, input_dim),
+        assert self.aggregation_dim > 0, (
+            "aggregation_dim must be > 0, check your aggregation_dim or "
         )
+        "redudction_ratio settings."
+
+        self.mask_generator = nn.Sequential(
+            nn.Linear(mask_input_dim, self.aggregation_dim),
+            nn.ReLU(),
+            nn.Linear(self.aggregation_dim, input_dim),
+        )
+
+        assert hidden_dim > 0, "hidden_dim must be > 0."
 
         self.ffn = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
