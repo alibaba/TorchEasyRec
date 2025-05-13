@@ -36,8 +36,13 @@ class MaskBlock(nn.Module):
     """
 
     def __init__(
-        self, input_dim, mask_input_dim, reduction_ratio, aggregation_dim, hidden_dim
-    ):
+        self,
+        input_dim: int,
+        mask_input_dim: int,
+        reduction_ratio: float,
+        aggregation_dim: int,
+        hidden_dim: int,
+    ) -> None:
         super(MaskBlock, self).__init__()
         self.ln_emb = nn.LayerNorm(input_dim)
 
@@ -71,7 +76,7 @@ class MaskBlock(nn.Module):
             nn.Linear(hidden_dim, input_dim),
         )
 
-    def forward(self, input, mask_input):
+    def forward(self, input: torch.Tensor, mask_input: torch.Tensor) -> torch.Tensor:
         """Forward pass of MaskBlock."""
         ln_emb = self.ln_emb(input)
         weights = self.mask_generator(mask_input)
