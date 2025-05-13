@@ -41,6 +41,11 @@ class MaskBlock(nn.Module):
         super(MaskBlock, self).__init__()
         self.ln_emb = nn.LayerNorm(input_dim)
 
+        if not aggregation_dim and not reduction_ratio:
+            raise ValueError(
+                "Either aggregation_dim or reduction_ratio must be provided."
+            )
+
         if aggregation_dim:
             self.aggregation_dim = aggregation_dim
         if reduction_ratio:
