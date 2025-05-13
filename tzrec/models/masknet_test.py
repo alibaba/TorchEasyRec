@@ -56,8 +56,11 @@ class MaskNetTest(unittest.TestCase):
             feature_groups=feature_groups,
             mask_net=rank_model_pb2.MaskNet(
                 n_mask_blocks=3,
-                mask_block_aggregation_dim=64,
-                mask_block_output_dim=32,
+                mask_block=module_pb2.MaskBlock(
+                    reduction_ratio=2,
+                    aggregation_dim=32,
+                    hidden_dim=16,
+                ),
                 use_parallel=True,
                 top_mlp=module_pb2.MLP(hidden_units=[8, 4]),
             ),
