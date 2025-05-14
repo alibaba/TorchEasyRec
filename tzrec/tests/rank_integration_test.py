@@ -124,7 +124,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_train_eval(
                 "tzrec/tests/configs/multi_tower_din_mock.config",
                 os.path.join(self.test_dir, "2"),
-                f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1')}",
+                f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}",
             )
         self.assertTrue(self.success)
 

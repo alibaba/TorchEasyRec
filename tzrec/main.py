@@ -634,6 +634,11 @@ def train_and_evaluate(
         ckpt_path, _ = checkpoint_util.latest_checkpoint(
             pipeline_config.train_config.fine_tune_checkpoint
         )
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            raise RuntimeError(
+                "fine_tune_checkpoint"
+                "[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
+            )
     if os.path.exists(pipeline_config.model_dir):
         # TODO(hongsheng.jhs): save and restore dataloader state.
         latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
