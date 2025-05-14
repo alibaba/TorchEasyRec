@@ -55,14 +55,16 @@ class MaskNetTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             mask_net=rank_model_pb2.MaskNet(
-                n_mask_blocks=3,
-                mask_block=module_pb2.MaskBlock(
-                    reduction_ratio=2,
-                    aggregation_dim=32,
-                    hidden_dim=16,
-                ),
-                use_parallel=True,
-                top_mlp=module_pb2.MLP(hidden_units=[8, 4]),
+                module_pb2.MaskNetModule(
+                    n_mask_blocks=3,
+                    mask_block=module_pb2.MaskBlock(
+                        reduction_ratio=2,
+                        aggregation_dim=32,
+                        hidden_dim=16,
+                    ),
+                    use_parallel=True,
+                    top_mlp=module_pb2.MLP(hidden_units=[8, 4]),
+                )
             ),
             losses=[
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())

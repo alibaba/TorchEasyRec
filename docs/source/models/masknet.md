@@ -9,15 +9,16 @@
 
 ```
     mask_net {
-        n_mask_blocks: 3
-        mask_block {
-            reduction_ratio: 3
-            hidden_dim: 512
-        }
-        use_parallel: true
-        top_mlp {
-            hidden_units: [256, 128, 64]
-
+        mask_net_module {
+            n_mask_blocks: 8
+            mask_block {
+                reduction_ratio: 3
+                hidden_dim: 256
+            }
+            use_parallel: true
+            top_mlp {
+                hidden_units: [256, 128, 64]
+            }
         }
     }
 ```
