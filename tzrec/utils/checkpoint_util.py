@@ -154,6 +154,8 @@ def restore_model(
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
         logger.info(f"Restoring checkpoint from {checkpoint_dir}...")
+    if not os.path.exists(checkpoint_dir):
+        raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
     if os.path.exists(model_ckpt_path):
