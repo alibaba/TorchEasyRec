@@ -17,73 +17,8 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.mlp import MLP
+from tzrec.modules.masknet_module import MaskNetModule
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.utils.config_util import config_to_kwargs
-
-
-class MaskBlock(nn.Module):
-    """MaskBlock module.
-
-    Args:
-        input_dim (int): Input dimension, either feature embedding dim(parallel mode)
-            or hidden state dim(serial mode).
-        mask_input_dim (int): Mask input dimension, is always the feature embedding dim
-            for both para and serial modes.
-        reduction_ratio (float): Reduction ratio, aggregation_dim / mask_input_dim.
-        aggregation_dim (int): Aggregation layer dim, mask_input_dim*reduction_ratio.
-        hidden_dim (int): Hidden layer dimension for feedforward network.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        mask_input_dim: int,
-        reduction_ratio: float,
-        aggregation_dim: int,
-        hidden_dim: int,
-    ) -> None:
-        super(MaskBlock, self).__init__()
-        self.ln_emb = nn.LayerNorm(input_dim)
-
-        if not aggregation_dim and not reduction_ratio:
-            raise ValueError(
-                "Either aggregation_dim or reduction_ratio must be provided."
-            )
-
-        if aggregation_dim:
-            self.aggregation_dim = aggregation_dim
-        if reduction_ratio:
-            self.aggregation_dim = int(mask_input_dim * reduction_ratio)
-
-        assert self.aggregation_dim > 0, (
-            "aggregation_dim must be > 0, check your aggregation_dim or "
-        )
-        "redudction_ratio settings."
-
-        self.mask_generator = nn.Sequential(
-            nn.Linear(mask_input_dim, self.aggregation_dim),
-            nn.ReLU(),
-            nn.Linear(self.aggregation_dim, input_dim),
-        )
-
-        assert hidden_dim > 0, "hidden_dim must be > 0."
-
-        self.ffn = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
-        )
-
-    def forward(self, input: torch.Tensor, mask_input: torch.Tensor) -> torch.Tensor:
-        """Forward pass of MaskBlock."""
-        ln_emb = self.ln_emb(input)
-        weights = self.mask_generator(mask_input)
-        weighted_emb = ln_emb * weights
-        output = self.ffn(weighted_emb)
-
-        return output
 
 
 class MaskNet(RankModel):
@@ -109,32 +44,9 @@ class MaskNet(RankModel):
         self.group_name = self.embedding_group.group_names()[0]
         feature_dim = self.embedding_group.group_total_dim(self.group_name)
 
-        masknet_config = model_config.mask_net
-        self.use_parallel = masknet_config.use_parallel
+        masknet_config = model_config.mask_net.mask_net_module
 
-        self.mask_blocks = nn.ModuleList(
-            [
-                MaskBlock(
-                    feature_dim,
-                    feature_dim,
-                    masknet_config.mask_block.reduction_ratio,
-                    masknet_config.mask_block.aggregation_dim,
-                    masknet_config.mask_block.hidden_dim,
-                )
-                for _ in range(masknet_config.n_mask_blocks)
-            ]
-        )
-        if self.use_parallel:
-            self.top_mlp = MLP(
-                in_features=feature_dim * masknet_config.n_mask_blocks,
-                **config_to_kwargs(masknet_config.top_mlp),
-            )
-        else:
-            self.top_mlp = MLP(
-                in_features=feature_dim,
-                **config_to_kwargs(masknet_config.top_mlp),
-            )
-
+        self.mask_net_layer = MaskNetModule(masknet_config, feature_dim)
         self.output_linear = nn.Linear(
             masknet_config.top_mlp.hidden_units[-1], self._num_class, bias=False
         )
@@ -144,18 +56,7 @@ class MaskNet(RankModel):
         feature_dict = self.build_input(batch)
         features = feature_dict[self.group_name]
 
-        if self.use_parallel:  # parallel mask blocks
-            hidden = torch.concat(
-                [
-                    self.mask_blocks[i](features, features)
-                    for i in range(len(self.mask_blocks))
-                ],
-                dim=-1,
-            )
-        else:  # serial mask blocks
-            hidden = self.mask_blocks[0](features, features)
-            for i in range(1, len(self.mask_blocks)):
-                hidden = self.mask_blocks[i](hidden, features)
+        hidden = self.mask_net_layer(features)
 
-        output = self.output_linear(self.top_mlp(hidden))
+        output = self.output_linear(hidden)
         return self._output_to_prediction(output)
