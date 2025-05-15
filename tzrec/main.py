@@ -23,6 +23,7 @@ import pyarrow as pa
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -312,6 +313,7 @@ def _evaluate(
 def _log_train(
     step: int,
     losses: Dict[str, torch.Tensor],
+    params: Dict[str, torch.Tensor],
     param_groups: List[Dict[str, Any]],
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
@@ -336,6 +338,20 @@ def _log_train(
         summary_writer.add_scalar("loss/total", total_loss, step)
         for i, g in enumerate(param_groups):
             summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
+        for name, param in params.items():
+            if isinstance(param, ShardedTensor):
+                # for sharded tensor, we only log the current local shard
+                local_shard = param.local_shards()[0]
+                # metadata.placement looks like 'rank:0/cuda:0'
+                rank = str(local_shard.metadata.placement).split("/")[0]
+                summary_writer.add_histogram(
+                    tag=f"{name}/{rank}", values=local_shard.tensor, global_step=step
+                )
+            else:
+                summary_writer.add_histogram(tag=name, values=param, global_step=step)
+                summary_writer.add_histogram(
+                    tag=f"{name}/grad", values=param.grad, global_step=step
+                )
 
 
 def _train_and_evaluate(
@@ -428,6 +444,7 @@ def _train_and_evaluate(
                     _log_train(
                         i_step,
                         losses,
+                        params=optimizer.params,
                         param_groups=optimizer.param_groups,
                         plogger=plogger,
                         summary_writer=summary_writer,
@@ -493,6 +510,7 @@ def _train_and_evaluate(
     _log_train(
         i_step,
         losses,
+        params=optimizer.params,
         param_groups=optimizer.param_groups,
         plogger=plogger,
         summary_writer=summary_writer,
