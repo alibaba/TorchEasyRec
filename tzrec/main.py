@@ -315,8 +315,8 @@ def _log_train(
     losses: Dict[str, torch.Tensor],
     params: Dict[str, torch.Tensor],
     param_groups: List[Dict[str, Any]],
+    tb_summaries: List[str],
     plogger: Optional[ProgressLogger] = None,
-    tb_summaries: Optional[List[str]] = None,
     summary_writer: Optional[SummaryWriter] = None,
 ) -> None:
     """Logging current training step."""
@@ -419,24 +419,24 @@ def _train_and_evaluate(
     plogger = None
     summary_writer = None
     eval_summary_writer = None
-    tb_summaries = set(["loss", "learning_rate"])
+    tb_summaries_set = set(["loss", "learning_rate"])
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
     if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
         if not train_config.tensorboard_summaries:
-            tb_summaries = list(tb_summaries)
+            tb_summaries = list(tb_summaries_set)
         else:
             for summary in train_config.tensorboard_summaries:
                 if summary in TENSORBOARD_SUMMARIES:
-                    tb_summaries.add(summary)
+                    tb_summaries_set.add(summary)
                 else:
                     raise ValueError(
                         "tensorboard_summaries should be one of [%s], you provided %s."
                         % (", ".join(TENSORBOARD_SUMMARIES), summary)
                     )
-            tb_summaries = list(tb_summaries)
+            tb_summaries = list(tb_summaries_set)
 
     eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
@@ -484,13 +484,14 @@ def _train_and_evaluate(
                 losses, _, _ = pipeline.progress(train_iterator)
 
                 if i_step % train_config.log_step_count_steps == 0:
+                    # pyre-ignore [16]
                     _log_train(
                         i_step,
                         losses,
                         params=optimizer.params,
                         param_groups=optimizer.param_groups,
-                        plogger=plogger,
                         tb_summaries=tb_summaries,
+                        plogger=plogger,
                         summary_writer=summary_writer,
                     )
 
@@ -550,14 +551,14 @@ def _train_and_evaluate(
         for lr in lr_scheduler:
             if lr.by_epoch:
                 lr.step()
-
+    # pyre-ignore [16]
     _log_train(
         i_step,
         losses,
         params=optimizer.params,
         param_groups=optimizer.param_groups,
-        plogger=plogger,
         tb_summaries=tb_summaries,
+        plogger=plogger,
         summary_writer=summary_writer,
     )
     if summary_writer is not None:
