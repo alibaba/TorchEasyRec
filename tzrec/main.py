@@ -419,6 +419,7 @@ def _train_and_evaluate(
     plogger = None
     summary_writer = None
     eval_summary_writer = None
+    tb_summaries = None
     tb_summaries_set = set(["loss", "learning_rate"])
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
@@ -484,11 +485,10 @@ def _train_and_evaluate(
                 losses, _, _ = pipeline.progress(train_iterator)
 
                 if i_step % train_config.log_step_count_steps == 0:
-                    # pyre-ignore [16]
                     _log_train(
                         i_step,
                         losses,
-                        params=optimizer.params,
+                        params=optimizer.params,  # pyre-ignore [16]
                         param_groups=optimizer.param_groups,
                         tb_summaries=tb_summaries,
                         plogger=plogger,
@@ -551,11 +551,11 @@ def _train_and_evaluate(
         for lr in lr_scheduler:
             if lr.by_epoch:
                 lr.step()
-    # pyre-ignore [16]
+
     _log_train(
         i_step,
         losses,
-        params=optimizer.params,
+        params=optimizer.params,  # pyre-ignore [16]
         param_groups=optimizer.param_groups,
         tb_summaries=tb_summaries,
         plogger=plogger,
