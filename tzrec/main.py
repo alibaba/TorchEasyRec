@@ -444,7 +444,7 @@ def _train_and_evaluate(
                     _log_train(
                         i_step,
                         losses,
-                        params=optimizer.params,
+                        params=optimizer.params,  # pyre-ignore [16]
                         param_groups=optimizer.param_groups,
                         plogger=plogger,
                         summary_writer=summary_writer,
@@ -510,7 +510,7 @@ def _train_and_evaluate(
     _log_train(
         i_step,
         losses,
-        params=optimizer.params,
+        params=optimizer.params,  # pyre-ignore [16]
         param_groups=optimizer.param_groups,
         plogger=plogger,
         summary_writer=summary_writer,
