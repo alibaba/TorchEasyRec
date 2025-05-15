@@ -49,7 +49,7 @@ from tzrec.acc.utils import (
     quant_dtype,
     write_mapping_file_for_input_tile,
 )
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
+from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
@@ -316,6 +316,7 @@ def _log_train(
     params: Dict[str, torch.Tensor],
     param_groups: List[Dict[str, Any]],
     plogger: Optional[ProgressLogger] = None,
+    tb_summaries: Optional[List[str]] = None,
     summary_writer: Optional[SummaryWriter] = None,
 ) -> None:
     """Logging current training step."""
@@ -333,25 +334,53 @@ def _log_train(
         )
     if summary_writer is not None:
         total_loss = sum(losses.values())
-        for k, v in losses.items():
-            summary_writer.add_scalar(f"loss/{k}", v, step)
-        summary_writer.add_scalar("loss/total", total_loss, step)
-        for i, g in enumerate(param_groups):
-            summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
-        for name, param in params.items():
-            if isinstance(param, ShardedTensor):
-                # for sharded tensor, we only log the current local shard
-                local_shard = param.local_shards()[0]
-                # metadata.placement looks like 'rank:0/cuda:0'
-                rank = str(local_shard.metadata.placement).split("/")[0]
-                summary_writer.add_histogram(
-                    tag=f"{name}/{rank}", values=local_shard.tensor, global_step=step
-                )
-            else:
-                summary_writer.add_histogram(tag=name, values=param, global_step=step)
-                summary_writer.add_histogram(
-                    tag=f"{name}/grad", values=param.grad, global_step=step
-                )
+        if "loss" in tb_summaries:
+            for k, v in losses.items():
+                summary_writer.add_scalar(f"loss/{k}", v, step)
+            summary_writer.add_scalar("loss/total", total_loss, step)
+        if "learning_rate" in tb_summaries:
+            for i, g in enumerate(param_groups):
+                summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
+
+        if "global_gradient_norm" in tb_summaries:
+            global_grad_norm = torch.nn.utils.get_total_norm(
+                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
+            )
+            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+
+        if (
+            "gradient_norm" in tb_summaries
+            or "gradient" in tb_summaries
+            or "parameter" in tb_summaries
+        ):
+            for name, param in params.items():
+                if isinstance(param, ShardedTensor):
+                    if "parameter" in tb_summaries:
+                        # for sharded tensor, we only log the current local shard
+                        local_shard = param.local_shards()[0]
+                        # metadata.placement looks like 'rank:0/cuda:0'
+                        rank = str(local_shard.metadata.placement).split("/")[0]
+                        summary_writer.add_histogram(
+                            tag=f"{name}/{rank}",
+                            values=local_shard.tensor,
+                            global_step=step,
+                        )
+                else:
+                    if "parameter" in tb_summaries:
+                        summary_writer.add_histogram(
+                            tag=name, values=param, global_step=step
+                        )
+                    if "gradient" in tb_summaries:
+                        summary_writer.add_histogram(
+                            tag=f"{name}/gradient", values=param.grad, global_step=step
+                        )
+                    if "gradient_norm" in tb_summaries:
+                        grad_norm = torch.norm(param.grad)
+                        summary_writer.add_scalar(
+                            tag=f"{name}/gradient_norm",
+                            scalar_value=grad_norm,
+                            global_step=step,
+                        )
 
 
 def _train_and_evaluate(
@@ -390,11 +419,25 @@ def _train_and_evaluate(
     plogger = None
     summary_writer = None
     eval_summary_writer = None
+    tb_summaries = set(["loss", "learning_rate"])
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
     if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
+        if not train_config.tensorboard_summaries:
+            tb_summaries = list(tb_summaries)
+        else:
+            for summary in train_config.tensorboard_summaries:
+                if summary in TENSORBOARD_SUMMARIES:
+                    tb_summaries.add(summary)
+                else:
+                    raise ValueError(
+                        "tensorboard_summaries should be one of [%s], you provided %s."
+                        % (", ".join(TENSORBOARD_SUMMARIES), summary)
+                    )
+            tb_summaries = list(tb_summaries)
+
     eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
     if train_config.is_profiling:
@@ -444,9 +487,10 @@ def _train_and_evaluate(
                     _log_train(
                         i_step,
                         losses,
-                        params=optimizer.params,  # pyre-ignore [16]
+                        params=optimizer.params,
                         param_groups=optimizer.param_groups,
                         plogger=plogger,
+                        tb_summaries=tb_summaries,
                         summary_writer=summary_writer,
                     )
 
@@ -510,9 +554,10 @@ def _train_and_evaluate(
     _log_train(
         i_step,
         losses,
-        params=optimizer.params,  # pyre-ignore [16]
+        params=optimizer.params,
         param_groups=optimizer.param_groups,
         plogger=plogger,
+        tb_summaries=tb_summaries,
         summary_writer=summary_writer,
     )
     if summary_writer is not None:

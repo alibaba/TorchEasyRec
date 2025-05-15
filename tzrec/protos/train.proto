@@ -26,5 +26,9 @@ message TrainConfig {
     optional bool use_tensorboard = 10 [default = true];
     // epoch interval for saving checkpoint
     optional uint32 save_checkpoints_epochs = 11;
+    // the summaries to be saved in tensorboard, activated only when use_tensorboard=true,
+    // possible values are: "loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"
+    // default values are ["loss", "learning_rate"]
+    repeated string tensorboard_summaries = 12;
     // TBD: qcomm config
 }
