@@ -315,7 +315,7 @@ def _log_train(
     losses: Dict[str, torch.Tensor],
     params: Dict[str, torch.Tensor],
     param_groups: List[Dict[str, Any]],
-    tb_summaries: List[str],
+    tb_summaries: Optional[List[str]],
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
 ) -> None:
@@ -488,7 +488,7 @@ def _train_and_evaluate(
                     _log_train(
                         i_step,
                         losses,
-                        params=optimizer.params,  # pyre-ignore [16]
+                        params=optimizer.params,  # pyre-ignore
                         param_groups=optimizer.param_groups,
                         tb_summaries=tb_summaries,
                         plogger=plogger,
@@ -555,7 +555,7 @@ def _train_and_evaluate(
     _log_train(
         i_step,
         losses,
-        params=optimizer.params,  # pyre-ignore [16]
+        params=optimizer.params,  # pyre-ignore
         param_groups=optimizer.param_groups,
         tb_summaries=tb_summaries,
         plogger=plogger,
