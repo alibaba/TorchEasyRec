@@ -97,16 +97,6 @@ class IdFeature(BaseFeature):
             )
         return num_embeddings
 
-    @property
-    def inputs(self) -> List[str]:
-        """Input field names."""
-        if not self._inputs:
-            if self.fg_mode == FgMode.FG_NONE:
-                self._inputs = [self.name]
-            else:
-                self._inputs = [v for _, v in self.side_inputs]
-        return self._inputs
-
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
         if self.config.HasField("expression"):
