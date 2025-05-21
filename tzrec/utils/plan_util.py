@@ -94,8 +94,9 @@ def create_planner(
     )
 
     # the optimizer state key names differ when using data_parallel for
-    # embedding sharding compared to when using row_wise
-    # https://github.com/pytorch/torchrec/issues/2394
+    # embedding sharding compared to when using row_wise and table_wise
+    # https://github.com/pytorch/torchrec/issues/2394. So that, we
+    # add constraints for params with data_parallel plan in ckpt.
     fqn_constraints = {}
     if os.path.exists(ckpt_plan_path):
         with open(ckpt_plan_path, "rb") as f:
