@@ -95,13 +95,13 @@ if __name__ == "__main__":
     if args.remove_bucketizer:
         fg_json = copy.copy(fg_json)
         for feature in fg_json["features"]:
-            feature.pop("hash_bucket_size")
-            feature.pop("vocab_dict")
-            feature.pop("vocab_list")
-            feature.pop("boundaries")
-            feature.pop("num_buckets")
+            feature.pop("hash_bucket_size", None)
+            feature.pop("vocab_dict", None)
+            feature.pop("vocab_list", None)
+            feature.pop("boundaries", None)
+            feature.pop("num_buckets", None)
             if feature["feature_type"] != "tokenize_feature":
-                feature.pop("vocab_file")
+                feature.pop("vocab_file", None)
 
     if args.reserves is not None:
         reserves = []

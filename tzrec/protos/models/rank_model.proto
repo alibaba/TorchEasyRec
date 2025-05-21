@@ -34,3 +34,8 @@ message DLRM {
   optional bool arch_with_sparse = 2 [default=true];
   required MLP final = 3;
 }
+
+
+message MaskNet {
+    required MaskNetModule mask_net_module = 1;
+}

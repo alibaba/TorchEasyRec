@@ -38,8 +38,9 @@ class CapsuleTest(unittest.TestCase):
         cap_test = create_test_module(cap, graph_type)
         input = torch.randn(4, 64, 8)
         seq_len = torch.arange(4) + 32
-        result = cap_test(input, seq_len)
+        result, mask = cap_test(input, seq_len)
         self.assertEqual(result.size(), (4, 5, 8))
+        self.assertEqual(mask.size(), (4, 5))
 
 
 if __name__ == "__main__":

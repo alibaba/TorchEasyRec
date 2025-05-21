@@ -88,6 +88,7 @@ LR策略可以支持按epoch更新或者按step更新
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录下记录trace文件
 - use_tensorboard: 是否使用tensorboard，默认为true
+- tensorboard_summaries: 设置需要在tensorboard中展示的数据， 只在use_tensorboard为true时生效。 可选值为["loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"], 默认值是["loss", "learning_rate"]。 在训练数据量大， 训练时长较长时， 酌情开启"parameter"、 "gradient"、"gradient_norm", 避免出现性能问题。
 
 ## 训练性能优化
 

@@ -95,6 +95,9 @@ message IdFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // value_type after fg before bucketize, you can specify it for better performance.
+    // e.g. fg_value_type = int64 when use num_buckets
+    optional string fg_value_type = 32;
 
     // TODO: constrains
 }
@@ -253,6 +256,9 @@ message LookupFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // value_type after fg before bucketize, you can specify it for better performance.
+    // e.g. fg_value_type = int64 when use num_buckets
+    optional string fg_value_type = 32;
 
     oneof dense_emb {
         // autodis embedding
@@ -330,6 +336,9 @@ message MatchFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // value_type after fg before bucketize, you can specify it for better performance.
+    // e.g. fg_value_type = int64 when use num_buckets
+    optional string fg_value_type = 32;
 
     oneof dense_emb {
         // autodis embedding

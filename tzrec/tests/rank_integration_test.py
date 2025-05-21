@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 import unittest
 
@@ -34,9 +33,9 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
+        # if self.success:
+        #     if os.path.exists(self.test_dir):
+        #         shutil.rmtree(self.test_dir)
         os.environ.pop("QUANT_EMB", None)
         os.environ.pop("INPUT_TILE", None)
         os.environ.pop("ENABLE_TRT", None)
@@ -124,7 +123,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_train_eval(
                 "tzrec/tests/configs/multi_tower_din_mock.config",
                 os.path.join(self.test_dir, "2"),
-                f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1')}",
+                f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}",
             )
         self.assertTrue(self.success)
 

@@ -9,3 +9,4 @@
    dlrm
    din
    rocket_launching
+   masknet

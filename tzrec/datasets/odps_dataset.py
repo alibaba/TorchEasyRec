@@ -509,29 +509,23 @@ class OdpsWriter(BaseWriter):
         self._client = None
         self._sess_req = None
         self._writer = None
-        if self._o.exist_table(self._table_name):
-            if int(os.environ.get("RANK", 0)) == 0:
-                self._create_partition()
-            else:
-                self._wait_init_table()
-            self._init_writer()
-            self._lazy_inited = True
 
     def _create_table(self, output_dict: OrderedDict[str, pa.Array]) -> None:
         """Create output table."""
-        schemas = []
-        for k, v in output_dict.items():
-            schemas.append(f"{k} {_type_pa_to_table(v.type)}")
-        schema = ",".join(schemas)
-        if self._partition_spec:
-            pt_schemas = []
-            for pt_spec in self._partition_spec.split("/"):
-                pt_name = pt_spec.split("=")[0]
-                pt_schemas.append(f"{pt_name} STRING")
-            schema = (schema, ",".join(pt_schemas))
-        self._o.create_table(
-            self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
-        )
+        if not self._o.exist_table(self._table_name):
+            schemas = []
+            for k, v in output_dict.items():
+                schemas.append(f"{k} {_type_pa_to_table(v.type)}")
+            schema = ",".join(schemas)
+            if self._partition_spec:
+                pt_schemas = []
+                for pt_spec in self._partition_spec.split("/"):
+                    pt_name = pt_spec.split("=")[0]
+                    pt_schemas.append(f"{pt_name} STRING")
+                schema = (schema, ",".join(pt_schemas))
+            self._o.create_table(
+                self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
+            )
 
     def _create_partition(self) -> None:
         """Create output partition."""

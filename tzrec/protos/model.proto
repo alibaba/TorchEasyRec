@@ -45,6 +45,7 @@ message ModelConfig {
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
+        MaskNet mask_net = 104;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
