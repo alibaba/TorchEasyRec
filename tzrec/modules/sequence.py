@@ -95,11 +95,9 @@ class DINEncoder(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         if self._max_seq_length > 0:
-            max_seq_length = min(self._max_seq_length, sequence.size(1))
-            sequence_length = torch.clamp_max(sequence_length, max_seq_length)
-            sequence = sequence[:, :max_seq_length, :]
-        else:
-            max_seq_length = sequence.size(1)
+            sequence_length = torch.clamp_max(sequence_length, self._max_seq_length)
+            sequence = sequence[:, : self._max_seq_length, :]
+        max_seq_length = sequence.size(1)
         sequence_mask = fx_arange(
             max_seq_length, device=sequence_length.device
         ).unsqueeze(0) < sequence_length.unsqueeze(1)
@@ -150,11 +148,9 @@ class SimpleAttention(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         if self._max_seq_length > 0:
-            max_seq_length = min(self._max_seq_length, sequence.size(1))
-            sequence_length = torch.clamp_max(sequence_length, max_seq_length)
-            sequence = sequence[:, :max_seq_length, :]
-        else:
-            max_seq_length = sequence.size(1)
+            sequence_length = torch.clamp_max(sequence_length, self._max_seq_length)
+            sequence = sequence[:, : self._max_seq_length, :]
+        max_seq_length = sequence.size(1)
         sequence_mask = fx_arange(max_seq_length, sequence_length.device).unsqueeze(
             0
         ) < sequence_length.unsqueeze(1)
