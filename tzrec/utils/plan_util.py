@@ -52,6 +52,8 @@ from torchrec.distributed.types import (
     ModuleSharder,
 )
 
+from tzrec.utils.logging_util import logger
+
 
 def _bytes_to_float_bin(num_bytes: Union[float, int], bin_size: float) -> float:
     return float(num_bytes) / bin_size
@@ -64,6 +66,7 @@ def create_planner(
 ) -> EmbeddingShardingPlanner:
     """Create EmbeddingShardingPlanner."""
     local_world_size = get_local_size()
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
     # build topo
     topo_kwargs = {}
@@ -98,16 +101,20 @@ def create_planner(
     # https://github.com/pytorch/torchrec/issues/2394. So that, we
     # add constraints for params with data_parallel plan in ckpt.
     fqn_constraints = {}
-    if ckpt_plan_path is not None:
-        if os.path.exists(ckpt_plan_path):
-            with open(ckpt_plan_path, "r") as f:
-                ckpt_plan = json.load(f)
-                for module_path, module_plan in ckpt_plan.items():
-                    for param_name, param_sharding in module_plan.items():
-                        if param_sharding["sharding_type"] == "data_parallel":
-                            fqn_constraints[f"{module_path}.{param_name}"] = (
-                                ParameterConstraints(sharding_types=["data_parallel"])
+    if ckpt_plan_path is not None and os.path.exists(ckpt_plan_path):
+        with open(ckpt_plan_path, "r") as f:
+            ckpt_plan = json.load(f)
+            for module_path, module_plan in ckpt_plan.items():
+                for param_name, param_sharding in module_plan.items():
+                    if param_sharding["sharding_type"] == "data_parallel":
+                        fqn = f"{module_path}.{param_name}"
+                        if is_rank_zero:
+                            logger.info(
+                                "add ParameterConstraints[sharding_types=['data_parallel'] for param[{fqn}] from checkpoint plan."  # NOQA
                             )
+                        fqn_constraints[fqn] = ParameterConstraints(
+                            sharding_types=["data_parallel"]
+                        )
 
     # build planner
     planner = EmbeddingShardingPlanner(
