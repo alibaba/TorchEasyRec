@@ -9,8 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
-import pickle
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union
 
@@ -100,13 +100,13 @@ def create_planner(
     fqn_constraints = {}
     if ckpt_plan_path is not None:
         if os.path.exists(ckpt_plan_path):
-            with open(ckpt_plan_path, "rb") as f:
-                ckpt_plan = pickle.load(f)  # NOQA
-                for k, mplan in ckpt_plan.plan.items():
-                    for name, sharding in mplan.items():
-                        if sharding.sharding_type == "data_parallel":
-                            fqn_constraints[f"{k}.{name}"] = ParameterConstraints(
-                                sharding_types=[sharding.sharding_type]
+            with open(ckpt_plan_path, "r") as f:
+                ckpt_plan = json.load(f)
+                for module_path, module_plan in ckpt_plan.items():
+                    for param_name, param_sharding in module_plan.items():
+                        if param_sharding["sharding_type"] == "data_parallel":
+                            fqn_constraints[f"{module_path}.{param_name}"] = (
+                                ParameterConstraints(sharding_types=["data_parallel"])
                             )
 
     # build planner
