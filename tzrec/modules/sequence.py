@@ -61,6 +61,7 @@ class DINEncoder(SequenceEncoder):
         query_dim (int): query tensor channel dimension.
         input(str): input feature group name.
         attn_mlp (dict): target attention MLP module parameters.
+        max_seq_length (int): maximum sequence length.
     """
 
     def __init__(
@@ -69,6 +70,7 @@ class DINEncoder(SequenceEncoder):
         query_dim: int,
         input: str,
         attn_mlp: Dict[str, Any],
+        max_seq_length: int = 0,
         **kwargs: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__(input)
@@ -81,6 +83,7 @@ class DINEncoder(SequenceEncoder):
         self._query_name = f"{input}.query"
         self._sequence_name = f"{input}.sequence"
         self._sequence_length_name = f"{input}.sequence_length"
+        self._max_seq_length = max_seq_length
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
@@ -91,6 +94,9 @@ class DINEncoder(SequenceEncoder):
         query = sequence_embedded[self._query_name]
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
+        if self._max_seq_length > 0:
+            sequence_length = torch.clamp_max(sequence_length, self._max_seq_length)
+            sequence = sequence[:, : self._max_seq_length, :]
         max_seq_length = sequence.size(1)
         sequence_mask = fx_arange(
             max_seq_length, device=sequence_length.device
@@ -121,6 +127,7 @@ class SimpleAttention(SequenceEncoder):
         sequence_dim: int,
         query_dim: int,
         input: str,
+        max_seq_length: int = 0,
         **kwargs: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__(input)
@@ -129,6 +136,7 @@ class SimpleAttention(SequenceEncoder):
         self._query_name = f"{input}.query"
         self._sequence_name = f"{input}.sequence"
         self._sequence_length_name = f"{input}.sequence_length"
+        self._max_seq_length = max_seq_length
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
@@ -139,6 +147,9 @@ class SimpleAttention(SequenceEncoder):
         query = sequence_embedded[self._query_name]
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
+        if self._max_seq_length > 0:
+            sequence_length = torch.clamp_max(sequence_length, self._max_seq_length)
+            sequence = sequence[:, : self._max_seq_length, :]
         max_seq_length = sequence.size(1)
         sequence_mask = fx_arange(max_seq_length, sequence_length.device).unsqueeze(
             0
@@ -165,6 +176,7 @@ class PoolingEncoder(SequenceEncoder):
         sequence_dim: int,
         input: str,
         pooling_type: str = "mean",
+        max_seq_length: int = 0,
         **kwargs: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__(input)
@@ -176,6 +188,7 @@ class PoolingEncoder(SequenceEncoder):
         ], "only sum|mean pooling type supported now."
         self._sequence_name = f"{input}.sequence"
         self._sequence_length_name = f"{input}.sequence_length"
+        self._max_seq_length = max_seq_length
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
@@ -184,12 +197,14 @@ class PoolingEncoder(SequenceEncoder):
     def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the module."""
         sequence = sequence_embedded[self._sequence_name]
+        if self._max_seq_length > 0:
+            sequence = sequence[:, : self._max_seq_length, :]
         feature = torch.sum(sequence, dim=1)
         if self._pooling_type == "mean":
             sequence_length = sequence_embedded[self._sequence_length_name]
-            sequence_length = torch.max(
-                sequence_length, torch.ones_like(sequence_length)
-            )
+            if self._max_seq_length > 0:
+                sequence_length = torch.clamp_max(sequence_length, self._max_seq_length)
+            sequence_length = torch.clamp_min(sequence_length, 1)
             feature = feature / sequence_length.unsqueeze(1)
         return feature
 
