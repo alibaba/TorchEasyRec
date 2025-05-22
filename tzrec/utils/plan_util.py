@@ -98,15 +98,16 @@ def create_planner(
     # https://github.com/pytorch/torchrec/issues/2394. So that, we
     # add constraints for params with data_parallel plan in ckpt.
     fqn_constraints = {}
-    if os.path.exists(ckpt_plan_path):
-        with open(ckpt_plan_path, "rb") as f:
-            ckpt_plan = pickle.load(f)  # NOQA
-            for k, mplan in ckpt_plan.plan.items():
-                for name, sharding in mplan.items():
-                    if sharding.sharding_type == "data_parallel":
-                        fqn_constraints[f"{k}.{name}"] = ParameterConstraints(
-                            sharding_types=[sharding.sharding_type]
-                        )
+    if ckpt_plan_path is not None:
+        if os.path.exists(ckpt_plan_path):
+            with open(ckpt_plan_path, "rb") as f:
+                ckpt_plan = pickle.load(f)  # NOQA
+                for k, mplan in ckpt_plan.plan.items():
+                    for name, sharding in mplan.items():
+                        if sharding.sharding_type == "data_parallel":
+                            fqn_constraints[f"{k}.{name}"] = ParameterConstraints(
+                                sharding_types=[sharding.sharding_type]
+                            )
 
     # build planner
     planner = EmbeddingShardingPlanner(
