@@ -95,7 +95,7 @@ class DINEncoder(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         if self._max_seq_length > 0:
-            max_seq_length = self._max_seq_length
+            max_seq_length = min(self._max_seq_length, sequence.size(1))
             sequence_length = torch.clamp_max(sequence_length, max_seq_length)
             sequence = sequence[:, :max_seq_length, :]
         else:
@@ -150,7 +150,7 @@ class SimpleAttention(SequenceEncoder):
         sequence = sequence_embedded[self._sequence_name]
         sequence_length = sequence_embedded[self._sequence_length_name]
         if self._max_seq_length > 0:
-            max_seq_length = self._max_seq_length
+            max_seq_length = min(self._max_seq_length, sequence.size(1))
             sequence_length = torch.clamp_max(sequence_length, max_seq_length)
             sequence = sequence[:, :max_seq_length, :]
         else:
@@ -208,9 +208,7 @@ class PoolingEncoder(SequenceEncoder):
             sequence_length = sequence_embedded[self._sequence_length_name]
             if self._max_seq_length > 0:
                 sequence_length = torch.clamp_max(sequence_length, self._max_seq_length)
-            sequence_length = torch.max(
-                sequence_length, torch.ones_like(sequence_length)
-            )
+            sequence_length = torch.clamp_min(sequence_length, 1)
             feature = feature / sequence_length.unsqueeze(1)
         return feature
 
