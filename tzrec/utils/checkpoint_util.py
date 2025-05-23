@@ -212,7 +212,7 @@ def save_model(
                         "ranks": param_sharding.ranks,
                     }
             with open(os.path.join(checkpoint_dir, "plan"), "w") as f:
-                json.dump(model._plan, f)
+                json.dump(plan, f)
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:

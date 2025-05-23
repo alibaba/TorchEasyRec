@@ -110,7 +110,7 @@ def create_planner(
                         fqn = f"{module_path}.{param_name}"
                         if is_rank_zero:
                             logger.info(
-                                "add ParameterConstraints[sharding_types=['data_parallel'] for param[{fqn}] from checkpoint plan."  # NOQA
+                                f"add ParameterConstraints[sharding_types=['data_parallel'] for param[{fqn}] from checkpoint plan."  # NOQA
                             )
                         fqn_constraints[fqn] = ParameterConstraints(
                             sharding_types=["data_parallel"]
