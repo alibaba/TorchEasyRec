@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import glob
+import json
 import os
 from dataclasses import replace
 from typing import List, Optional, Tuple
@@ -198,6 +199,20 @@ def save_model(
             optimizer.state_dict(),
             checkpoint_id=os.path.join(checkpoint_dir, "optimizer"),
         )
+    # save model plan
+    if hasattr(model, "_plan") and model._plan is not None:
+        if int(os.environ.get("RANK", 0)) == 0:
+            plan = {}
+            for module_path, module_plan in model._plan.plan.items():
+                plan[module_path] = {}
+                for param_name, param_sharding in module_plan.items():
+                    plan[module_path][param_name] = {
+                        "sharding_type": param_sharding.sharding_type,
+                        "compute_kernel": param_sharding.compute_kernel,
+                        "ranks": param_sharding.ranks,
+                    }
+            with open(os.path.join(checkpoint_dir, "plan"), "w") as f:
+                json.dump(plan, f)
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:
