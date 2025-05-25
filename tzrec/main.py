@@ -397,6 +397,9 @@ def _train_and_evaluate(
     eval_result_filename: str = "train_eval_result.txt",
 ) -> None:
     """Train and evaluate the model."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.train()
@@ -765,6 +768,9 @@ def evaluate(
             pipeline_config, could be a path or a list of paths
         eval_result_filename (str): evaluation result metrics save path.
     """
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
 
     device, _ = init_process_group()
