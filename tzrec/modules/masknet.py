@@ -59,7 +59,7 @@ class MaskBlock(nn.Module):
         self.mask_generator = nn.Sequential(
             nn.Linear(mask_input_dim, self.aggregation_dim),
             nn.ReLU(),
-            nn.Linear(self.d, input_dim),
+            nn.Linear(self.aggregation_dim, input_dim),
         )
 
         assert hidden_dim > 0, "hidden_dim must be > 0."
