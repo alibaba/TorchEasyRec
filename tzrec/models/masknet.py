@@ -17,8 +17,9 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.masknet_module import MaskNetModule
+from tzrec.modules.masknet import MaskNetModule
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.config_util import config_to_kwargs
 
 
 class MaskNet(RankModel):
@@ -44,9 +45,11 @@ class MaskNet(RankModel):
         self.group_name = self.embedding_group.group_names()[0]
         feature_dim = self.embedding_group.group_total_dim(self.group_name)
 
-        masknet_config = model_config.mask_net.mask_net_module
+        masknet_config = self._model_config.mask_net_module
 
-        self.mask_net_layer = MaskNetModule(masknet_config, feature_dim)
+        self.mask_net_layer = MaskNetModule(
+            feature_dim, **config_to_kwargs(masknet_config)
+        )
         self.output_linear = nn.Linear(
             masknet_config.top_mlp.hidden_units[-1], self._num_class, bias=False
         )

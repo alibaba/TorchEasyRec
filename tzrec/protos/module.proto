@@ -69,7 +69,7 @@ message MaskNetModule {
     // mask block
     required MaskBlock mask_block = 2;
     // mlp layer on top of mask blocks
-    required MLP top_mlp = 3;
+    optional MLP top_mlp = 3;
     // use parallel or serial mask blocks
     optional bool use_parallel = 4 [default=true];
 

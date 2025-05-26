@@ -9,14 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
 
 from tzrec.modules.mlp import MLP
-from tzrec.protos.module_pb2 import MaskNetModule as MaskNetModuleConfig
-from tzrec.utils.config_util import config_to_kwargs
 
 
 class MaskBlock(nn.Module):
@@ -27,21 +25,20 @@ class MaskBlock(nn.Module):
             or hidden state dim(serial mode).
         mask_input_dim (int): Mask input dimension, is always the feature embedding dim
             for both para and serial modes.
+        hidden_dim (int): Hidden layer dimension for feedforward network.
         reduction_ratio (float): Reduction ratio, aggregation_dim / mask_input_dim.
         aggregation_dim (int): Aggregation layer dim, mask_input_dim*reduction_ratio.
-        hidden_dim (int): Hidden layer dimension for feedforward network.
     """
 
     def __init__(
         self,
         input_dim: int,
         mask_input_dim: int,
-        reduction_ratio: float,
-        aggregation_dim: int,
         hidden_dim: int,
+        reduction_ratio: float = 1.0,
+        aggregation_dim: int = 0,
     ) -> None:
         super(MaskBlock, self).__init__()
-        self.ln_emb = nn.LayerNorm(input_dim)
 
         if not aggregation_dim and not reduction_ratio:
             raise ValueError(
@@ -51,7 +48,7 @@ class MaskBlock(nn.Module):
         if aggregation_dim:
             self.aggregation_dim = aggregation_dim
         if reduction_ratio:
-            self.aggregation_dim = int(mask_input_dim * reduction_ratio)
+            self.aggregation_dim = int(input_dim * reduction_ratio)
 
         assert self.aggregation_dim > 0, (
             "aggregation_dim must be > 0, check your aggregation_dim or "
@@ -65,19 +62,24 @@ class MaskBlock(nn.Module):
         )
 
         assert hidden_dim > 0, "hidden_dim must be > 0."
+        self._hidden_dim = hidden_dim
 
         self.ffn = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
         )
 
-    def forward(self, input: torch.Tensor, mask_input: torch.Tensor) -> torch.Tensor:
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._hidden_dim
+
+    def forward(
+        self, feature_input: torch.Tensor, mask_input: torch.Tensor
+    ) -> torch.Tensor:
         """Forward pass of MaskBlock."""
-        ln_emb = self.ln_emb(input)
         weights = self.mask_generator(mask_input)
-        weighted_emb = ln_emb * weights
+        weighted_emb = feature_input * weights
         output = self.ffn(weighted_emb)
 
         return output
@@ -87,56 +89,73 @@ class MaskNetModule(nn.Module):
     """Masknet module.
 
     Args:
-        model_config (ModelConfig): an instance of ModelConfig.
         feature_dim (int): input feature dim.
+        n_mask_blocks (int): number of mask blocks
+        mask_block (dict): MaskBlock module parameters.
+        top_mlp (dict): top MLP module parameters.
+        use_parallel (bool): use parallel or serial mask blocks
     """
 
     def __init__(
         self,
-        module_config: MaskNetModuleConfig,
         feature_dim: int,
+        n_mask_blocks: int,
+        mask_block: Dict[str, Any],
+        top_mlp: Optional[Dict[str, Any]],
+        use_parallel: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        self.ln_emb = nn.LayerNorm(feature_dim)
 
-        self.use_parallel = module_config.use_parallel
+        self.use_parallel = use_parallel
 
-        self.mask_blocks = nn.ModuleList(
-            [
-                MaskBlock(
-                    feature_dim,
-                    feature_dim,
-                    module_config.mask_block.reduction_ratio,
-                    module_config.mask_block.aggregation_dim,
-                    module_config.mask_block.hidden_dim,
-                )
-                for _ in range(module_config.n_mask_blocks)
-            ]
-        )
         if self.use_parallel:
-            self.top_mlp = MLP(
-                in_features=feature_dim * module_config.n_mask_blocks,
-                **config_to_kwargs(module_config.top_mlp),
+            self.mask_blocks = nn.ModuleList(
+                [
+                    MaskBlock(feature_dim, feature_dim, **mask_block)
+                    for _ in range(n_mask_blocks)
+                ]
             )
+            self._output_dim = self.mask_blocks[0].output_dim() * n_mask_blocks
         else:
+            self.mask_blocks = nn.ModuleList()
+            self._output_dim = feature_dim
+            for i in range(n_mask_blocks):
+                self.mask_blocks.append(
+                    MaskBlock(self._output_dim, feature_dim, **mask_block)
+                )
+                self._output_dim = self.mask_blocks[i].output_dim()
+
+        self.top_mlp = None
+        if top_mlp:
             self.top_mlp = MLP(
-                in_features=feature_dim,
-                **config_to_kwargs(module_config.top_mlp),
+                in_features=self._output_dim,
+                **top_mlp,
             )
+            self._output_dim = self.top_mlp.output_dim()
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._output_dim
 
     def forward(self, feature_emb: torch.Tensor) -> torch.Tensor:
         """Forward method."""
+        ln_emb = self.ln_emb(feature_emb)
         if self.use_parallel:  # parallel mask blocks
             hidden = torch.concat(
                 [
-                    self.mask_blocks[i](feature_emb, feature_emb)
+                    self.mask_blocks[i](ln_emb, feature_emb)
                     for i in range(len(self.mask_blocks))
                 ],
                 dim=-1,
             )
         else:  # serial mask blocks
-            hidden = self.mask_blocks[0](feature_emb, feature_emb)
+            hidden = self.mask_blocks[0](ln_emb, feature_emb)
             for i in range(1, len(self.mask_blocks)):
                 hidden = self.mask_blocks[i](hidden, feature_emb)
 
-        return self.top_mlp(hidden)
+        if self.top_mlp is not None:
+            hidden = self.top_mlp(hidden)
+
+        return hidden
