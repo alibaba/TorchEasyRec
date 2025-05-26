@@ -34,7 +34,7 @@ class MaskNetModuleTest(unittest.TestCase):
         masknet_module = MaskNetModule(
             feature_dim=16,
             n_mask_blocks=3,
-            mask_block=dict(reduction_ratio=0.5, hidden_dim=16),
+            mask_block=dict(reduction_ratio=2.0, hidden_dim=16),
             top_mlp=dict(
                 hidden_units=[8, 4, 2],
                 activation="nn.ReLU",
