@@ -121,11 +121,11 @@ class MaskNetModule(nn.Module):
         else:
             self.mask_blocks = nn.ModuleList()
             self._output_dim = feature_dim
-            for _ in range(n_mask_blocks):
+            for i in range(n_mask_blocks):
                 self.mask_blocks.append(
                     MaskBlock(self._output_dim, feature_dim, **mask_block)
                 )
-                self._output_dim = self.mask_blocks[0].output_dim()
+                self._output_dim = self.mask_blocks[i].output_dim()
 
         self.top_mlp = None
         if top_mlp:
