@@ -39,6 +39,7 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
+    allow_tf32,
     export_acc_config,
     is_aot,
     is_cuda_export,
@@ -619,9 +620,10 @@ def train_and_evaluate(
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
 
-    device, _ = init_process_group()
+    device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    allow_tf32(pipeline_config.train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -692,6 +694,7 @@ def train_and_evaluate(
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
         ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
+        global_constraints_cfg=pipeline_config.train_config.global_embedding_constraints,
     )
 
     plan = planner.collective_plan(
@@ -767,9 +770,10 @@ def evaluate(
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
 
-    device, _ = init_process_group()
+    device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    allow_tf32(pipeline_config.train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -795,6 +799,7 @@ def evaluate(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
+        global_constraints_cfg=pipeline_config.train_config.global_embedding_constraints,
     )
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD

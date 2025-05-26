@@ -101,7 +101,7 @@ class MaskNetModule(nn.Module):
         feature_dim: int,
         n_mask_blocks: int,
         mask_block: Dict[str, Any],
-        top_mlp: Optional[Dict[str, Any]],
+        top_mlp: Optional[Dict[str, Any]] = None,
         use_parallel: bool = True,
         **kwargs: Any,
     ) -> None:
