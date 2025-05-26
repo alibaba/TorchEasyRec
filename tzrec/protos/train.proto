@@ -2,6 +2,7 @@ syntax = "proto2";
 package tzrec.protos;
 
 import "tzrec/protos/optimizer.proto";
+import "tzrec/protos/feature.proto";
 
 message TrainConfig {
     // embedding part optimizer
@@ -34,5 +35,7 @@ message TrainConfig {
     optional bool cudnn_allow_tf32 = 13 [default = true];
     // where to use torch.backends.cuda.matmul.allow_tf32
     optional bool cuda_matmul_allow_tf32 = 14 [default = false];
+    // global embedding param constraints
+    optional ParameterConstraints global_embedding_constraints = 15;
     // TBD: qcomm config
 }

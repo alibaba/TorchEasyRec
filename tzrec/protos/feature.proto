@@ -3,6 +3,15 @@ package tzrec.protos;
 
 import "google/protobuf/struct.proto";
 
+message ParameterConstraints {
+    // embedding sharding type constraints
+    // data_parallel | table_wise | column_wise | row_wise | table_row_wise | table_column_wise | grid_shard
+    repeated string sharding_types = 1;
+    // embedding compute kernel constraints
+    // dense | fused | fused_uvm | fused_uvm_caching | key_value
+    repeated string compute_kernels = 2;
+}
+
 // LFU: evict_score = access_cnt
 message LFU_EvictionPolicy {
 }

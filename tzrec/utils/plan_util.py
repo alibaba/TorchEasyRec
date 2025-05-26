@@ -12,7 +12,7 @@
 import json
 import os
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -21,19 +21,22 @@ from torch import nn
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.enumerators import (
-    EmbeddingEnumerator as _EmbeddingEnumerator,
-)
-from torchrec.distributed.planner.enumerators import (
+    GUARDED_COMPUTE_KERNELS,
+    EmbeddingComputeKernel,
     EmbeddingTower,
     EmbeddingTowerCollection,
     ParameterConstraints,
     Shard,
     ShardEstimator,
+    ShardingType,
     _extract_constraints_for_param,
     _get_tower_index,
     calculate_shard_sizes_and_offsets,
     get_partition_by_type,
     sharder_name,
+)
+from torchrec.distributed.planner.enumerators import (
+    EmbeddingEnumerator as _EmbeddingEnumerator,
 )
 from torchrec.distributed.planner.proposers import UniformProposer
 from torchrec.distributed.planner.storage_reservations import (
@@ -52,6 +55,7 @@ from torchrec.distributed.types import (
     ModuleSharder,
 )
 
+from tzrec.protos import feature_pb2
 from tzrec.utils.logging_util import logger
 
 
@@ -63,6 +67,7 @@ def create_planner(
     device: torch.device,
     batch_size: int,
     ckpt_plan_path: Optional[str] = None,
+    global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
 ) -> EmbeddingShardingPlanner:
     """Create EmbeddingShardingPlanner."""
     local_world_size = get_local_size()
@@ -110,18 +115,32 @@ def create_planner(
                         fqn = f"{module_path}.{param_name}"
                         if is_rank_zero:
                             logger.info(
-                                f"add ParameterConstraints[sharding_types=['data_parallel'] for param[{fqn}] from checkpoint plan."  # NOQA
+                                f"add ParameterConstraints[sharding_types=['data_parallel']] for param[{fqn}] from checkpoint plan."  # NOQA
                             )
                         fqn_constraints[fqn] = ParameterConstraints(
                             sharding_types=["data_parallel"]
                         )
+
+    global_constraints = None
+    if global_constraints_cfg is not None:
+        global_constraints = ParameterConstraints(
+            sharding_types=list(global_constraints_cfg.sharding_types)
+            if len(global_constraints_cfg.sharding_types) > 0
+            else None,
+            compute_kernels=list(global_constraints_cfg.compute_kernels)
+            if len(global_constraints_cfg.compute_kernels) > 0
+            else None,
+        )
 
     # build planner
     planner = EmbeddingShardingPlanner(
         topology=topology,
         batch_size=batch_size,
         enumerator=EmbeddingEnumerator(
-            topology=topology, batch_size=batch_size, fqn_constraints=fqn_constraints
+            topology=topology,
+            batch_size=batch_size,
+            fqn_constraints=fqn_constraints,
+            global_constraints=global_constraints,
         ),
         storage_reservation=storage_reservation,
         proposer=[DynamicProgrammingProposer(), UniformProposer()],
@@ -214,8 +233,6 @@ class DynamicProgrammingProposer(Proposer):
             fqn = sharding_option.fqn
             if fqn not in self._sharding_options_by_fqn:
                 self._sharding_options_by_fqn[fqn] = []
-            if sharding_option.sharding_type == "data_parallel":
-                continue
             self._sharding_options_by_fqn[fqn].append(sharding_option)
 
     def _reset(self) -> None:
@@ -354,6 +371,8 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             the exact name_children enumeration order
         fqn_constraints (Optional[Dict[str, ParameterConstraints]]): dict of parameter
             fqns to provided ParameterConstraints.
+        global_constraints (Optional[ParameterConstraints]): all parameters provided
+            ParameterConstraints.
     """
 
     def __init__(
@@ -364,11 +383,24 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         estimator: Optional[Union[ShardEstimator, List[ShardEstimator]]] = None,
         use_exact_enumerate_order: Optional[bool] = False,
         fqn_constraints: Optional[Dict[str, ParameterConstraints]] = None,
+        global_constraints: Optional[ParameterConstraints] = None,
     ) -> None:
         super().__init__(
             topology, batch_size, constraints, estimator, use_exact_enumerate_order
         )
         self._fqn_constraints = fqn_constraints
+        self._global_constraints = global_constraints
+
+    def _get_constraints(
+        self, child_path: str, name: str
+    ) -> Tuple[Optional[Dict[str, ParameterConstraints]], str]:
+        if self._fqn_constraints is not None:
+            constraint_key = child_path + "." + name
+            if constraint_key in self._fqn_constraints:
+                return self._fqn_constraints, constraint_key
+        if self._global_constraints is not None:
+            return {"__GLOBAL__": self._global_constraints}, "__GLOBAL__"
+        return self._constraints, name
 
     def enumerate(
         self,
@@ -415,12 +447,6 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             is_pooled = ShardingOption.module_pooled(child_module, child_path)
 
             for name, param in sharder.shardable_parameters(child_module).items():
-                if self._fqn_constraints is not None:
-                    constraints = self._fqn_constraints
-                    constraint_key = child_path + "." + name
-                else:
-                    constraints = self._constraints
-                    constraint_key = name
                 (
                     input_lengths,
                     col_wise_shard_dim,
@@ -432,7 +458,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                     output_dtype,
                     device_group,
                     key_value_params,
-                ) = _extract_constraints_for_param(constraints, constraint_key)
+                ) = _extract_constraints_for_param(self._constraints, name)
 
                 # skip for other device groups
                 if device_group and device_group != self._compute_device:
@@ -441,12 +467,13 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                 sharding_options_per_table: List[ShardingOption] = []
 
                 for sharding_type in self._filter_sharding_types(
-                    name, sharder.sharding_types(self._compute_device)
+                    name, sharder.sharding_types(self._compute_device), child_path
                 ):
                     for compute_kernel in self._filter_compute_kernels(
                         name,
                         sharder.compute_kernels(sharding_type, self._compute_device),
                         sharding_type,
+                        child_path,
                     ):
                         (
                             shard_sizes,
@@ -505,3 +532,78 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         self.populate_estimates(sharding_options)
 
         return sharding_options
+
+    def _filter_sharding_types(
+        self, name: str, allowed_sharding_types: List[str], child_path: str
+    ) -> List[str]:
+        _constraints, key = self._get_constraints(child_path, name)
+        # GRID_SHARD is only supported if specified by user in parameter constraints
+        if not _constraints or not _constraints.get(key):
+            return [
+                t for t in allowed_sharding_types if t != ShardingType.GRID_SHARD.value
+            ]
+        constraints: ParameterConstraints = _constraints[key]
+        if not constraints.sharding_types:
+            return [
+                t for t in allowed_sharding_types if t != ShardingType.GRID_SHARD.value
+            ]
+        constrained_sharding_types: List[str] = constraints.sharding_types
+
+        filtered_sharding_types = list(
+            set(constrained_sharding_types) & set(allowed_sharding_types)
+        )
+        if not filtered_sharding_types:
+            logger.warn(
+                "No available sharding types after applying user provided "
+                f"constraints for {key}. Constrained sharding types: "
+                f"{constrained_sharding_types}, allowed sharding types: "
+                f"{allowed_sharding_types}, filtered sharding types: "
+                f"{filtered_sharding_types}. Please check if the constrained "
+                "sharding types are too restrictive, if the sharder allows the "
+                "sharding types, or if non-strings are passed in."
+            )
+        return filtered_sharding_types
+
+    def _filter_compute_kernels(
+        self,
+        name: str,
+        allowed_compute_kernels: List[str],
+        sharding_type: str,
+        child_path: str,
+    ) -> List[str]:
+        _constraints, key = self._get_constraints(child_path, name)
+        # setup constrained_compute_kernels
+        if _constraints and _constraints.get(key) and _constraints[key].compute_kernels:
+            # pyre-ignore
+            constrained_compute_kernels: List[str] = _constraints[key].compute_kernels
+        else:
+            constrained_compute_kernels: List[str] = [
+                compute_kernel.value
+                for compute_kernel in EmbeddingComputeKernel
+                if compute_kernel not in GUARDED_COMPUTE_KERNELS
+            ]
+
+        # setup filtered_compute_kernels
+        filtered_compute_kernels = list(
+            set(constrained_compute_kernels) & set(allowed_compute_kernels)
+        )
+
+        # special rules
+        if EmbeddingComputeKernel.DENSE.value in filtered_compute_kernels:
+            if (
+                EmbeddingComputeKernel.FUSED.value in filtered_compute_kernels
+            ):  # always false for data_parallel
+                filtered_compute_kernels.remove(EmbeddingComputeKernel.DENSE.value)
+
+        if not filtered_compute_kernels:
+            logger.warn(
+                "No available compute kernels after applying user provided "
+                f"constraints for {key}. Constrained compute kernels: "
+                f"{constrained_compute_kernels}, allowed compute kernels: "
+                f"{allowed_compute_kernels}, filtered compute kernels: "
+                f"{filtered_compute_kernels}, sharding type: {sharding_type}. "
+                "Please check if the constrained "
+                "compute kernels are too restrictive, if the sharder allows the "
+                "compute kernels, or if non-strings are passed in."
+            )
+        return filtered_compute_kernels

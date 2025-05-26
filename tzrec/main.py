@@ -694,6 +694,7 @@ def train_and_evaluate(
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
         ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
+        global_constraints_cfg=pipeline_config.train_config.global_embedding_constraints,
     )
 
     plan = planner.collective_plan(
@@ -798,6 +799,7 @@ def evaluate(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
+        global_constraints_cfg=pipeline_config.train_config.global_embedding_constraints,
     )
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD
