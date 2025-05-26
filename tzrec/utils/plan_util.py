@@ -396,6 +396,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
     ) -> Tuple[Optional[Dict[str, ParameterConstraints]], str]:
         if self._fqn_constraints is not None:
             constraint_key = child_path + "." + name
+            # pyre-ignore [58]
             if constraint_key in self._fqn_constraints:
                 return self._fqn_constraints, constraint_key
         if self._global_constraints is not None:
@@ -533,6 +534,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
 
         return sharding_options
 
+    # pyre-ignore [14]
     def _filter_sharding_types(
         self, name: str, allowed_sharding_types: List[str], child_path: str
     ) -> List[str]:
@@ -564,6 +566,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             )
         return filtered_sharding_types
 
+    # pyre-ignore [14]
     def _filter_compute_kernels(
         self,
         name: str,
