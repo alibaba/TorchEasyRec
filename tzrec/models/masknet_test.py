@@ -17,34 +17,27 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.dlrm import DLRM
+from tzrec.models.masknet import MaskNet
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
-class DLRMTest(unittest.TestCase):
+class MaskNetTest(unittest.TestCase):
     @parameterized.expand(
-        [
-            [TestGraphType.NORMAL, False],
-            [TestGraphType.FX_TRACE, False],
-            [TestGraphType.JIT_SCRIPT, False],
-            [TestGraphType.NORMAL, True],
-            [TestGraphType.FX_TRACE, True],
-            [TestGraphType.JIT_SCRIPT, True],
-        ]
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
-    def test_dlrm(self, graph_type, arch_with_sparse) -> None:
+    def test_masknet(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
-                    feature_name="cat_a", embedding_dim=8, num_buckets=100
+                    feature_name="cat_a", embedding_dim=16, num_buckets=100
                 )
             ),
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
-                    feature_name="cat_b", embedding_dim=8, num_buckets=1000
+                    feature_name="cat_b", embedding_dim=16, num_buckets=1000
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -54,30 +47,34 @@ class DLRMTest(unittest.TestCase):
         features = create_features(feature_cfgs)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
-                group_name="dense",
-                feature_names=["int_a"],
+                group_name="all_features",
+                feature_names=["cat_a", "cat_b", "int_a"],
                 group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="sparse",
-                feature_names=["cat_a", "cat_b"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
+            )
         ]
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            dlrm=rank_model_pb2.DLRM(
-                dense_mlp=module_pb2.MLP(hidden_units=[2, 8]),
-                final=module_pb2.MLP(hidden_units=[8, 4]),
-                arch_with_sparse=arch_with_sparse,
+            mask_net=rank_model_pb2.MaskNet(
+                mask_net_module=module_pb2.MaskNetModule(
+                    n_mask_blocks=3,
+                    mask_block=module_pb2.MaskBlock(
+                        reduction_ratio=2,
+                        aggregation_dim=32,
+                        hidden_dim=16,
+                    ),
+                    use_parallel=True,
+                    top_mlp=module_pb2.MLP(hidden_units=[8, 4]),
+                )
             ),
             losses=[
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
             ],
         )
-        dlrm = DLRM(model_config=model_config, features=features, labels=["label"])
-        init_parameters(dlrm, device=torch.device("cpu"))
-        dlrm = create_test_model(dlrm, graph_type)
+        mask_net = MaskNet(
+            model_config=model_config, features=features, labels=["label"]
+        )
+        init_parameters(mask_net, device=torch.device("cpu"))
+        mask_net = create_test_model(mask_net, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b"],
@@ -94,9 +91,9 @@ class DLRMTest(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = dlrm(batch.to_dict())
+            predictions = mask_net(batch.to_dict())
         else:
-            predictions = dlrm(batch)
+            predictions = mask_net(batch)
         self.assertEqual(predictions["logits"].size(), (2,))
         self.assertEqual(predictions["probs"].size(), (2,))
 

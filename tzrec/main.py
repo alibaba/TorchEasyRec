@@ -23,15 +23,13 @@ import pyarrow as pa
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 # NOQA
 from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
 from torchrec.inference.modules import quantize_embeddings
-from torchrec.inference.state_dict_transform import (
-    state_dict_to_device,
-)
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
@@ -51,7 +49,7 @@ from tzrec.acc.utils import (
     quant_dtype,
     write_mapping_file_for_input_tile,
 )
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
+from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
@@ -70,6 +68,7 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
@@ -85,7 +84,7 @@ from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.state_dict_util import state_dict_gather, validate_state
+from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -314,7 +313,9 @@ def _evaluate(
 def _log_train(
     step: int,
     losses: Dict[str, torch.Tensor],
+    params: Dict[str, torch.Tensor],
     param_groups: List[Dict[str, Any]],
+    tb_summaries: List[str],
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
 ) -> None:
@@ -333,11 +334,53 @@ def _log_train(
         )
     if summary_writer is not None:
         total_loss = sum(losses.values())
-        for k, v in losses.items():
-            summary_writer.add_scalar(f"loss/{k}", v, step)
-        summary_writer.add_scalar("loss/total", total_loss, step)
-        for i, g in enumerate(param_groups):
-            summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
+        if "loss" in tb_summaries:
+            for k, v in losses.items():
+                summary_writer.add_scalar(f"loss/{k}", v, step)
+            summary_writer.add_scalar("loss/total", total_loss, step)
+        if "learning_rate" in tb_summaries:
+            for i, g in enumerate(param_groups):
+                summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
+
+        if "global_gradient_norm" in tb_summaries:
+            global_grad_norm = torch.nn.utils.get_total_norm(
+                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
+            )
+            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+
+        if (
+            "gradient_norm" in tb_summaries
+            or "gradient" in tb_summaries
+            or "parameter" in tb_summaries
+        ):
+            for name, param in params.items():
+                if isinstance(param, ShardedTensor):
+                    if "parameter" in tb_summaries:
+                        # for sharded tensor, we only log the current local shard
+                        local_shard = param.local_shards()[0]
+                        # metadata.placement looks like 'rank:0/cuda:0'
+                        rank = str(local_shard.metadata.placement).split("/")[0]
+                        summary_writer.add_histogram(
+                            tag=f"{name}/{rank}",
+                            values=local_shard.tensor,
+                            global_step=step,
+                        )
+                else:
+                    if "parameter" in tb_summaries:
+                        summary_writer.add_histogram(
+                            tag=name, values=param, global_step=step
+                        )
+                    if "gradient" in tb_summaries:
+                        summary_writer.add_histogram(
+                            tag=f"{name}/gradient", values=param.grad, global_step=step
+                        )
+                    if "gradient_norm" in tb_summaries:
+                        grad_norm = torch.norm(param.grad)
+                        summary_writer.add_scalar(
+                            tag=f"{name}/gradient_norm",
+                            scalar_value=grad_norm,
+                            global_step=step,
+                        )
 
 
 def _train_and_evaluate(
@@ -376,11 +419,26 @@ def _train_and_evaluate(
     plogger = None
     summary_writer = None
     eval_summary_writer = None
+    tb_summaries = list()
+    tb_summaries_set = set(["loss", "learning_rate"])
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
     if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
+        if not train_config.tensorboard_summaries:
+            tb_summaries = list(tb_summaries_set)
+        else:
+            for summary in train_config.tensorboard_summaries:
+                if summary in TENSORBOARD_SUMMARIES:
+                    tb_summaries_set.add(summary)
+                else:
+                    raise ValueError(
+                        "tensorboard_summaries should be one of [%s], you provided %s."
+                        % (", ".join(TENSORBOARD_SUMMARIES), summary)
+                    )
+            tb_summaries = list(tb_summaries_set)
+
     eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
     if train_config.is_profiling:
@@ -430,7 +488,9 @@ def _train_and_evaluate(
                     _log_train(
                         i_step,
                         losses,
+                        params=optimizer.params,  # pyre-ignore
                         param_groups=optimizer.param_groups,
+                        tb_summaries=tb_summaries,
                         plogger=plogger,
                         summary_writer=summary_writer,
                     )
@@ -495,7 +555,9 @@ def _train_and_evaluate(
     _log_train(
         i_step,
         losses,
+        params=optimizer.params,
         param_groups=optimizer.param_groups,
+        tb_summaries=tb_summaries,
         plogger=plogger,
         summary_writer=summary_writer,
     )
@@ -581,6 +643,34 @@ def train_and_evaluate(
             gl_cluster=gl_cluster,
         )
 
+    # Get Restore Ckpt Path
+    ckpt_path = None
+    skip_steps = -1
+    if pipeline_config.train_config.fine_tune_checkpoint:
+        ckpt_path, _ = checkpoint_util.latest_checkpoint(
+            pipeline_config.train_config.fine_tune_checkpoint
+        )
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            raise RuntimeError(
+                "fine_tune_checkpoint"
+                "[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
+            )
+    if os.path.exists(pipeline_config.model_dir):
+        # TODO(hongsheng.jhs): save and restore dataloader state.
+        latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
+            pipeline_config.model_dir
+        )
+        if latest_ckpt_path:
+            if continue_train:
+                ckpt_path = latest_ckpt_path
+            else:
+                raise RuntimeError(
+                    f"model_dir[{pipeline_config.model_dir}] already exists "
+                    "and not empty(if you want to continue train on current "
+                    "model_dir please delete dir model_dir or specify "
+                    "--continue_train)"
+                )
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
@@ -601,6 +691,7 @@ def train_and_evaluate(
         device=device,
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
     )
 
     plan = planner.collective_plan(
@@ -629,28 +720,6 @@ def train_and_evaluate(
     dense_lr = optimizer_builder.create_scheduler(
         dense_optimizer, pipeline_config.train_config.dense_optimizer
     )
-
-    ckpt_path = None
-    skip_steps = -1
-    if pipeline_config.train_config.fine_tune_checkpoint:
-        ckpt_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.train_config.fine_tune_checkpoint
-        )
-    if os.path.exists(pipeline_config.model_dir):
-        # TODO(hongsheng.jhs): save and restore dataloader state.
-        latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
-        if latest_ckpt_path:
-            if continue_train:
-                ckpt_path = latest_ckpt_path
-            else:
-                raise RuntimeError(
-                    f"model_dir[{pipeline_config.model_dir}] already exists "
-                    "and not empty(if you want to continue train on current "
-                    "model_dir please delete dir model_dir or specify "
-                    "--continue_train)"
-                )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
     # model_dir first, other slow rank find model_dir already exists and
@@ -764,8 +833,8 @@ def evaluate(
 
 def _script_model(
     pipeline_config: EasyRecConfig,
-    model: nn.Module,
-    state_dict: Dict[str, Any],
+    model: BaseModule,
+    state_dict: Optional[Dict[str, Any]],
     dataloader: DataLoader,
     save_dir: str,
 ) -> None:
@@ -774,15 +843,13 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        model = model.to_empty(device="cpu")
-        logger.info("gather states to cpu model...")
+        model.set_is_inference(True)
+        if state_dict is not None:
+            model.to_empty(device="cpu")
+            model.load_state_dict(state_dict, strict=False)
 
-    state_dict_gather(state_dict, model.state_dict())
-    dist.barrier()
-
-    if is_rank_zero:
-        # for mc modules, we should validate and sort mch buffers
-        validate_state(model)
+        # for mc modules, fix output_segments_tensor is a meta tensor.
+        fix_mch_state(model)
 
         batch = next(iter(dataloader))
 
@@ -851,11 +918,21 @@ def export(
             model specified by model_dir in pipeline_config_path.
         asset_files (str, optional): more files will be copied to export_dir.
     """
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    if not is_rank_zero:
+        logger.warning("Only first rank will be used for export now.")
+        return
+    else:
+        if os.environ.get("WORLD_SIZE") != "1":
+            logger.warning(
+                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
+            )
+            os.environ["WORLD_SIZE"] = "1"
+
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    device, _ = init_process_group()
-    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    dist.init_process_group("gloo")
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
@@ -887,19 +964,9 @@ def export(
         features,
         list(data_config.label_fields),
     )
-    model = ScriptWrapper(model)
-
-    planner = create_planner(
-        device=device,
-        batch_size=data_config.batch_size,
-    )
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
-    if is_rank_zero:
-        logger.info(str(plan))
-
-    model = DistributedModelParallel(module=model, device=device, plan=plan)
+    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    model = InferWrapper(model)
+    init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
         checkpoint_path, _ = checkpoint_util.latest_checkpoint(
@@ -922,23 +989,8 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    checkpoint_pg = dist.new_group(backend="gloo")
-    if is_rank_zero:
-        logger.info("copy sharded state_dict to cpu...")
-    cpu_state_dict = state_dict_to_device(
-        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-    )
-
-    cpu_model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-    )
-    cpu_model.set_is_inference(True)
-
-    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
-    if isinstance(cpu_model, MatchModel):
-        for name, module in cpu_model.named_children():
+    if isinstance(model.model, MatchModel):
+        for name, module in model.model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -948,28 +1000,28 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    cpu_state_dict,
+                    model.state_dict(),
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(cpu_model, TDM):
-        for name, module in cpu_model.named_children():
+    elif isinstance(model.model, TDM):
+        for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    cpu_state_dict,
+                    model.state_dict(),
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            InferWrapper(cpu_model),
-            cpu_state_dict,
+            model,
+            None,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -978,8 +1030,8 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            InferWrapper(cpu_model),
-            cpu_state_dict,
+            model,
+            None,
             dataloader,
             export_dir,
         )

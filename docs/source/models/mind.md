@@ -13,7 +13,7 @@ feature_configs {
         sequence_delim: "|"
         expression: "user:click_50_seq__adgroup_id"
         embedding_dim: 16
-        hash_bucket_size: 846812
+        num_buckets: 846812
     }
 }
 feature_configs {
@@ -23,7 +23,7 @@ feature_configs {
         sequence_delim: "|"
         expression: "user:click_50_seq__cate_id"
         embedding_dim: 8
-        hash_bucket_size: 12961
+        num_buckets: 12961
     }
 }
 
@@ -34,7 +34,7 @@ feature_configs {
         sequence_delim: "|"
         expression: "user:click_50_seq__brand"
         embedding_dim: 8
-        hash_bucket_size: 461498
+        num_buckets: 461498
     }
 }
 
@@ -249,6 +249,7 @@ torchrun --master_addr=localhost --master_port=32771 \
 - request_id_field: user_gt_input表中的request id列名
 - num_interests: 用户最大兴趣个数
 - top_k: 召回top k个item
+- topk_across_interests: 当给出该参数时(该参数无需赋值)，在所有的兴趣中，共召回top k个item；当不给出该参数时，则在每个兴趣中， 各召回top k个item。
 
 ## 参考论文
 

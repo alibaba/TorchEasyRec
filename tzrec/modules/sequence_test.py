@@ -29,18 +29,21 @@ from tzrec.utils.test_util import TestGraphType, create_test_module
 class DINEncoderTest(unittest.TestCase):
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, False, False],
-            [TestGraphType.FX_TRACE, False, False],
-            [TestGraphType.JIT_SCRIPT, False, False],
-            [TestGraphType.NORMAL, True, False],
-            [TestGraphType.FX_TRACE, True, False],
-            [TestGraphType.JIT_SCRIPT, True, False],
-            [TestGraphType.NORMAL, False, True],
-            [TestGraphType.FX_TRACE, False, True],
-            [TestGraphType.JIT_SCRIPT, False, True],
+            [TestGraphType.NORMAL, False, False, 0],
+            [TestGraphType.FX_TRACE, False, False, 0],
+            [TestGraphType.JIT_SCRIPT, False, False, 0],
+            [TestGraphType.NORMAL, True, False, 0],
+            [TestGraphType.FX_TRACE, True, False, 0],
+            [TestGraphType.JIT_SCRIPT, True, False, 0],
+            [TestGraphType.NORMAL, False, True, 0],
+            [TestGraphType.FX_TRACE, False, True, 0],
+            [TestGraphType.JIT_SCRIPT, False, True, 0],
+            [TestGraphType.NORMAL, False, True, 3],
+            [TestGraphType.FX_TRACE, False, True, 3],
+            [TestGraphType.JIT_SCRIPT, False, True, 3],
         ]
     )
-    def test_din_encoder(self, graph_type, use_bn, use_dice) -> None:
+    def test_din_encoder(self, graph_type, use_bn, use_dice, max_seq_length) -> None:
         din = DINEncoder(
             query_dim=16,
             sequence_dim=16,
@@ -51,14 +54,24 @@ class DINEncoderTest(unittest.TestCase):
                 use_bn=use_bn,
                 dropout_ratio=0.9,
             ),
+            max_seq_length=max_seq_length,
         )
         self.assertEqual(din.output_dim(), 16)
         din = create_test_module(din, graph_type)
-        embedded = {
-            "click_seq.query": torch.randn(4, 16),
-            "click_seq.sequence": torch.randn(4, 10, 16),
-            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
-        }
+        if max_seq_length > 0:
+            embedded = {
+                "click_seq.query": torch.randn(4, 16),
+                "click_seq.sequence": torch.randn(4, max_seq_length, 16),
+                "click_seq.sequence_length": torch.clamp_max(
+                    torch.tensor([2, 3, 4, 5]), max_seq_length
+                ),
+            }
+        else:
+            embedded = {
+                "click_seq.query": torch.randn(4, 16),
+                "click_seq.sequence": torch.randn(4, 10, 16),
+                "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+            }
         result = din(embedded)
         self.assertEqual(result.size(), (4, 16))
 
@@ -138,31 +151,52 @@ class HSTUEncoderTest(unittest.TestCase):
 
 class SimpleAttentionTest(unittest.TestCase):
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, 0],
+            [TestGraphType.FX_TRACE, 0],
+            [TestGraphType.JIT_SCRIPT, 0],
+            [TestGraphType.NORMAL, 3],
+            [TestGraphType.FX_TRACE, 3],
+            [TestGraphType.JIT_SCRIPT, 3],
+        ]
     )
-    def test_simple_attention(self, graph_type) -> None:
-        attn = SimpleAttention(
-            16,
-            16,
-            input="click_seq",
-        )
+    def test_simple_attention(self, graph_type, max_seq_length) -> None:
+        attn = SimpleAttention(16, 16, input="click_seq", max_seq_length=max_seq_length)
         self.assertEqual(attn.output_dim(), 16)
         attn = create_test_module(attn, graph_type)
-        embedded = {
-            "click_seq.query": torch.randn(4, 16),
-            "click_seq.sequence": torch.randn(4, 10, 16),
-            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
-        }
+        if max_seq_length > 0:
+            embedded = {
+                "click_seq.query": torch.randn(4, 16),
+                "click_seq.sequence": torch.randn(4, max_seq_length, 16),
+                "click_seq.sequence_length": torch.clamp_max(
+                    torch.tensor([2, 3, 4, 5]), max_seq_length
+                ),
+            }
+        else:
+            embedded = {
+                "click_seq.query": torch.randn(4, 16),
+                "click_seq.sequence": torch.randn(4, 10, 16),
+                "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+            }
         result = attn(embedded)
         self.assertEqual(result.size(), (4, 16))
 
 
 class PoolingEncoderTest(unittest.TestCase):
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, 0],
+            [TestGraphType.FX_TRACE, 0],
+            [TestGraphType.JIT_SCRIPT, 0],
+            [TestGraphType.NORMAL, 3],
+            [TestGraphType.FX_TRACE, 3],
+            [TestGraphType.JIT_SCRIPT, 3],
+        ]
     )
-    def test_mean_pooling(self, graph_type) -> None:
-        attn = PoolingEncoder(16, input="click_seq", pooling_type="mean")
+    def test_mean_pooling(self, graph_type, max_seq_length) -> None:
+        attn = PoolingEncoder(
+            16, input="click_seq", pooling_type="mean", max_seq_length=max_seq_length
+        )
         self.assertEqual(attn.output_dim(), 16)
         attn = create_test_module(attn, graph_type)
         sequence_length = torch.tensor([2, 3, 4, 5])

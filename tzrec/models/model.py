@@ -184,7 +184,7 @@ TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]
 TRAIN_FWD_TYPE = Tuple[torch.Tensor, TRAIN_OUT_TYPE]
 
 
-class TrainWrapper(nn.Module):
+class TrainWrapper(BaseModule):
     """Model train wrapper for pipeline."""
 
     def __init__(self, module: nn.Module) -> None:
@@ -214,7 +214,7 @@ class TrainWrapper(nn.Module):
         return total_loss, (losses, predictions, batch)
 
 
-class ScriptWrapper(nn.Module):
+class ScriptWrapper(BaseModule):
     """Model inference wrapper for jit.script."""
 
     def __init__(self, module: nn.Module) -> None:

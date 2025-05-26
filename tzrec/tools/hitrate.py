@@ -19,6 +19,7 @@ import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import torch
+from numpy.linalg import norm
 from torch import distributed as dist
 
 from tzrec.datasets.dataset import create_reader, create_writer
@@ -75,6 +76,116 @@ def batch_hitrate(
     return hitrates, hit_ids, hits, gt_count
 
 
+def interest_merge(
+    user_emb: npt.NDArray,
+    recall_distances: npt.NDArray,
+    recall_ids: npt.NDArray,
+    top_k: int,
+    num_interests: int,
+    index_type: str,
+) -> Tuple[npt.NDArray, npt.NDArray]:
+    """Merge the recall results of different interests.
+
+    Args:
+        user_emb (NDArray): user embedding.
+        recall_distances (NDArray): recall distances.
+        recall_ids (NDArray): recall ids.
+        top_k (int): top k candidates.
+        num_interests (int): number of interests.
+        index_type (str): index type.
+
+    Returns:
+        recall_distances (NDArray): merged recall distances.
+        recall_ids(NDArray): merged recall ids.
+    """
+    # In case of all-zero query vector, the corresponding knn results
+    # should be removed since faiss returns random target for all-zero query.
+    if index_type.endswith("IP"):
+        recall_distances = np.minimum(
+            recall_distances,
+            np.tile(
+                (
+                    (norm(user_emb, axis=-1, keepdims=True) != 0.0).astype("float") * 2
+                    - 1
+                )
+                * 1e32,
+                (1, top_k),
+            ),
+        )
+    else:  # L2 distance
+        recall_distances = np.maximum(
+            recall_distances,
+            np.tile(
+                (
+                    (norm(user_emb, axis=-1, keepdims=True) == 0.0).astype("float") * 2
+                    - 1
+                )
+                * 1e32,
+                (1, top_k),
+            ),
+        )
+    recall_distances_flat = recall_distances.reshape(
+        [-1, num_interests * recall_distances.shape[-1]]
+    )
+    recall_ids_flat = recall_ids.reshape(
+        [-1, args.num_interests * recall_ids.shape[-1]]
+    )
+
+    sort_idx = np.argsort(recall_distances_flat, axis=-1)
+    if index_type.endswith("IP"):  # inner product should be sorted in descending order
+        sort_idx = sort_idx[:, ::-1]
+
+    recall_distances_flat_sorted = recall_distances_flat[
+        np.arange(recall_distances_flat.shape[0])[:, np.newaxis], sort_idx
+    ]
+    recall_ids_flat_sorted = recall_ids_flat[
+        np.arange(recall_ids_flat.shape[0])[:, np.newaxis], sort_idx
+    ]
+
+    # get unique candidates
+    recall_distances_flat_sorted_pad = np.concatenate(
+        [
+            recall_distances_flat_sorted,
+            np.zeros((recall_distances_flat_sorted.shape[0], 1)),
+        ],
+        axis=-1,
+    )
+    # compute diff value between consecutive distances
+    recall_distances_diff = (
+        recall_distances_flat_sorted_pad[:, 0:-1]
+        - recall_distances_flat_sorted_pad[:, 1:]
+    )
+
+    if index_type.endswith("IP"):
+        pad_value = -1e32
+    else:
+        pad_value = 1e32
+
+    # zero diff positions are dulipcated values, so we pad them with a pad value
+    recall_distances_unique = np.where(
+        recall_distances_diff == 0, pad_value, recall_distances_flat_sorted
+    )
+    # sort again to get the unique candidates, duplicated values are -1e32(IP)
+    # or 1e32(L2), so they are moved to the end
+    sort_idx_new = np.argsort(recall_distances_unique, axis=-1)
+    if index_type.endswith("IP"):
+        sort_idx_new = sort_idx_new[:, ::-1]
+
+    recall_distances = recall_distances_flat_sorted[
+        np.arange(recall_distances_flat_sorted.shape[0])[:, np.newaxis],
+        sort_idx_new[:, 0:top_k],
+    ]
+    recall_ids = recall_ids_flat_sorted[
+        np.arange(recall_ids_flat_sorted.shape[0])[:, np.newaxis],
+        sort_idx_new[:, 0:top_k],
+    ]
+
+    recall_distances = recall_distances.reshape([-1, 1, recall_distances.shape[-1]])
+    recall_ids = recall_ids.reshape([-1, 1, recall_distances.shape[-1]])
+
+    return recall_distances, recall_ids
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -118,6 +229,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--top_k", type=int, default=200, help="use top k search result."
+    )
+    parser.add_argument(
+        "--topk_across_interests",
+        action="store_true",
+        default=False,
+        help="select topk candidates across all interests.",
     )
     parser.add_argument(
         "--ivf_nlist", type=int, default=1000, help="nlist of IVFFlat index."
@@ -234,6 +351,9 @@ if __name__ == "__main__":
             quota_name=args.odps_data_quota_name,
         )
 
+    if args.topk_across_interests:
+        print("args.topk_across_interests is True")
+
     # calculate hitrate
     total_count = 0
     total_hits = 0.0
@@ -261,12 +381,24 @@ if __name__ == "__main__":
         recall_distances, recall_ids = faiss_util.search_faiss_index(
             index, index_id_map, user_emb, args.top_k
         )
-        recall_distances = recall_distances.reshape(
-            [-1, args.num_interests, recall_distances.shape[-1]]
-        )
-        recall_ids = recall_ids.reshape(
-            [-1, args.num_interests, recall_distances.shape[-1]]
-        )
+
+        # pick topk candidates across all interests
+        if args.topk_across_interests:
+            recall_distances, recall_ids = interest_merge(
+                user_emb,
+                recall_distances,
+                recall_ids,
+                args.top_k,
+                args.num_interests,
+                args.index_type,
+            )
+        else:  # pick topk candidates for each interest
+            recall_distances = recall_distances.reshape(
+                [-1, args.num_interests, recall_distances.shape[-1]]
+            )
+            recall_ids = recall_ids.reshape(
+                [-1, args.num_interests, recall_distances.shape[-1]]
+            )
 
         num_interests_per_req = None
         if args.num_interests_field:
@@ -276,7 +408,7 @@ if __name__ == "__main__":
             request_id.tolist(),
             recall_ids,
             gt_items.tolist(),
-            args.num_interests,
+            args.num_interests if not args.topk_across_interests else 1,
             num_interests_per_req.tolist() if num_interests_per_req else None,
         )
 
