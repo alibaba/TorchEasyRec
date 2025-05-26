@@ -30,9 +30,9 @@ class MaskNetModuleTest(unittest.TestCase):
             [TestGraphType.JIT_SCRIPT, True],
         ]
     )
-    def test_fm(self, graph_type, use_parallel) -> None:
+    def test_masknet(self, graph_type, use_parallel) -> None:
         masknet_module = MaskNetModule(
-            feature_dim=16,
+            feature_dim=24,
             n_mask_blocks=3,
             mask_block=dict(reduction_ratio=2.0, hidden_dim=16),
             top_mlp=dict(
@@ -44,7 +44,7 @@ class MaskNetModuleTest(unittest.TestCase):
             use_parallel=use_parallel,
         )
         masknet_module = create_test_module(masknet_module, graph_type)
-        input = torch.randn(4, 16)
+        input = torch.randn(4, 24)
         result = masknet_module(input)
         self.assertEqual(result.size(), (4, 2))
 
