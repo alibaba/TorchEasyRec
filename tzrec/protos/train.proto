@@ -30,5 +30,9 @@ message TrainConfig {
     // possible values are: "loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"
     // default values are ["loss", "learning_rate"]
     repeated string tensorboard_summaries = 12;
+    // where to use torch.backends.cudnn.allow_tf32
+    optional bool cudnn_allow_tf32 = 13 [default = true];
+    // where to use torch.backends.cuda.matmul.allow_tf32
+    optional bool cuda_matmul_allow_tf32 = 14 [default = false];
     // TBD: qcomm config
 }

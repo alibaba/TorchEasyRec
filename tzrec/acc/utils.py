@@ -19,6 +19,8 @@ from torch import Tensor, nn
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
 from torchrec.quant import embedding_modules
 
+from tzrec.protos.train_pb2 import TrainConfig
+
 
 def is_input_tile() -> bool:
     """Judge is input file or not."""
@@ -157,6 +159,15 @@ def export_acc_config() -> Dict[str, str]:
     if "ENABLE_AOT" in os.environ:
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
     return acc_config
+
+
+def allow_tf32(train_config: TrainConfig, backend: str) -> None:
+    """Set allow_tf32 flag for cudnn and cuda matmul."""
+    if backend == "nccl":
+        if train_config.HasField("cudnn_allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = train_config.cudnn_allow_tf32
+        if train_config.HasField("cuda_matmul_allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = train_config.cuda_matmul_allow_tf32
 
 
 # fix fp32 quantize
