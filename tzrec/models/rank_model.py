@@ -69,7 +69,7 @@ class RankModel(BaseModel):
         self.embedding_group = EmbeddingGroup(
             self._features,
             list(self._base_model_config.feature_groups),
-            wide_embedding_dim=self.wide_embedding_dim
+            wide_embedding_dim=int(self.wide_embedding_dim)
             if hasattr(self, "wide_embedding_dim")
             else None,
         )
