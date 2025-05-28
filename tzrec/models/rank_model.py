@@ -67,7 +67,11 @@ class RankModel(BaseModel):
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(
-            self._features, list(self._base_model_config.feature_groups)
+            self._features,
+            list(self._base_model_config.feature_groups),
+            wide_embedding_dim=self.wide_embedding_dim
+            if hasattr(self, "wide_embedding_dim")
+            else None,
         )
 
         if self._base_model_config.HasField("variational_dropout"):

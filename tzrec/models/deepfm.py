@@ -42,6 +42,7 @@ class DeepFM(RankModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
+        self.wide_embedding_dim = model_config.deepfm.wide_embedding_dim
         self.init_input()
         self.fm = FactorizationMachine()
         if self.embedding_group.has_group("fm"):
