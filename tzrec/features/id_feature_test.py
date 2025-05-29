@@ -203,7 +203,19 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array([3]))
         np.testing.assert_allclose(parsed_feat.lengths, np.array([0, 0, 0, 1]))
 
-    def test_id_feature_with_weighted(self):
+    @parameterized.expand(
+        [
+            [pa.array(["123:0.5", "1391:0.3", None, "12:0.9\035123:0.21", ""])],
+            [
+                pa.array(
+                    [{"123": 0.5}, {"1391": 0.3}, None, {"12": 0.9, "123": 0.21}, {}],
+                    type=pa.map_(pa.string(), pa.float32()),
+                )
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_id_feature_with_weighted(self, inputs):
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="cate",
@@ -216,10 +228,7 @@ class IdFeatureTest(unittest.TestCase):
         id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         self.assertEqual(id_feat.inputs, ["cate"])
 
-        input_data = {
-            "cate": pa.array(["123:0.5", "1391:0.3", None, "12:0.9\035123:0.21", ""])
-        }
-        parsed_feat = id_feat.parse(input_data)
+        parsed_feat = id_feat.parse({"cate": inputs})
         self.assertEqual(parsed_feat.name, "cate")
 
         tag_idx = np.argsort(parsed_feat.values[2:])

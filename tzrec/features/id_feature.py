@@ -125,7 +125,12 @@ class IdFeature(BaseFeature):
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
-            input_feat = input_feat.tolist()
+                input_feat = input_feat.tolist()
+            elif pa.types.is_map(input_feat.type):
+                input_feat = input_feat.fill_null({})
+                input_feat = list(map(dict, input_feat.tolist()))
+            else:
+                input_feat = input_feat.tolist()
             if self._is_weighted:
                 values, lengths, weights = self._fg_op.to_weighted_jagged_tensor(
                     input_feat
