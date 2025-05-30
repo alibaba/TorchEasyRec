@@ -755,30 +755,64 @@ class DataParser:
         feature_rows = defaultdict(dict)
         for f in self._features:
             if f.is_sparse:
-                lengths = input_data[f"{f.name}.lengths"]
-                values = input_data[f"{f.name}.values"].cpu().numpy()
-                cnt = 0
-                # pyre-ignore [16]
-                sep = f.sequence_delim if f.is_sequence else ","
-                for i, ll in enumerate(lengths):
-                    cur_v = values[cnt : cnt + ll]
-                    cnt += ll
-                    feature_rows[i][f.name] = sep.join(cur_v.astype(str))
+                if f.is_sequence:
+                    lengths = input_data[f"{f.name}.lengths"]
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
+                    if f.value_dim != 1:
+                        key_lengths = input_data[f"{f.name}.key_lengths"].cpu().numpy()
+                    else:
+                        key_lengths = np.ones_like(values, dtype=np.int32)
+                    kl_cnt = 0
+                    cnt = 0
+                    for i, ll in enumerate(lengths):
+                        if ll > 0:
+                            cur_kl_cumsum = np.cumsum(key_lengths[kl_cnt : kl_cnt + ll])
+                            cur_kl_sum = cur_kl_cumsum[-1]
+                            cur_v = map(
+                                ",".join,
+                                np.split(
+                                    values[cnt : cnt + cur_kl_sum], cur_kl_cumsum[:-1]
+                                ),
+                            )
+                            kl_cnt += ll
+                            cnt += cur_kl_sum
+                        else:
+                            cur_v = []
+                        # pyre-ignore [16]
+                        feature_rows[i][f.name] = f.sequence_delim.join(cur_v)
+                else:
+                    lengths = input_data[f"{f.name}.lengths"]
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
+                    weights = None
+                    if f.is_weighted:
+                        weights = (
+                            input_data[f"{f.name}.weights"].cpu().numpy().astype(str)
+                        )
+                    cnt = 0
+                    for i, ll in enumerate(lengths):
+                        cur_v = values[cnt : cnt + ll]
+                        if weights is not None:
+                            cur_w = weights[cnt : cnt + ll]
+                            cur_v = sorted(
+                                map(lambda x: f"{x[0]}:{x[1]}", zip(cur_v, cur_w))
+                            )
+                        cnt += ll
+                        feature_rows[i][f.name] = ",".join(cur_v)
             else:
                 if f.is_sequence:
                     lengths = input_data[f"{f.name}.lengths"]
-                    values = input_data[f"{f.name}.values"].cpu().numpy()
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
                     cnt = 0
                     for i, ll in enumerate(lengths):
                         cur_v = values[cnt : cnt + ll]
                         cnt += ll
                         feature_rows[i][f.name] = f.sequence_delim.join(
-                            map(",".join, cur_v.astype(str))
+                            map(",".join, cur_v)
                         )
                 else:
-                    values = input_data[f"{f.name}.values"].cpu().numpy()
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
                     for i, cur_v in enumerate(values):
-                        feature_rows[i][f.name] = ",".join(cur_v.astype(str))
+                        feature_rows[i][f.name] = ",".join(cur_v)
 
         result = []
         for i in range(len(feature_rows)):

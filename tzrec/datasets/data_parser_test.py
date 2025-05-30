@@ -1055,6 +1055,38 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
+    def test_dump_parsed_inputs(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs(
+            tag_b_weighted=True, tag_b_seq=True
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        data_parser = DataParser(features=features, labels=["label"])
+
+        input_data = {
+            "cat_a": pa.array([1, 2, 3]),
+            "tag_b": pa.array(["4:0.1\x1d5:0.2", "", "6:0.3"]),
+            "int_a": pa.array([7, 8, 9], pa.float32()),
+            "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+            "map_a": pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"]),
+            "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
+            "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
+            "click_seq__tag_b": pa.array(["17\x1d18;19;20\x1d21", "22", ""]),
+            "label": pa.array([0, 0, 1], pa.int32()),
+            "__SAMPLE_MASK__": pa.array([True, False, False]),
+        }
+        data = data_parser.parse(input_data=input_data)
+        dump_str = data_parser.dump_parsed_inputs(data)
+        self.assertEqual(
+            dump_str,
+            pa.array(
+                [
+                    "f_cat_a:1 | f_tag_b:4:0.1,5:0.2 | f_int_a:7.0 | f_int_b:27.0,37.0 | f_lookup_a:0.1 | click_seq__f_cat_a:10;11;12 | click_seq__f_int_a:14.0;15.0;16.0 | click_seq__f_tag_b:17,18;19;20,21",  # NOQA
+                    "f_cat_a:2 | f_tag_b: | f_int_a:8.0 | f_int_b:28.0,38.0 | f_lookup_a:0.0 | click_seq__f_cat_a:13 | click_seq__f_int_a:17.0 | click_seq__f_tag_b:22",  # NOQA
+                    "f_cat_a:3 | f_tag_b:6:0.3 | f_int_a:9.0 | f_int_b:29.0,39.0 | f_lookup_a:0.2 | click_seq__f_cat_a:0 | click_seq__f_int_a:0.0 | click_seq__f_tag_b:0",  # NOQA
+                ]
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
