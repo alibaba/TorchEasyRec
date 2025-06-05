@@ -136,7 +136,9 @@ class DSSMV2(MatchModel):
         user_tower_emb = self.user_tower(user_feat)
         item_tower_emb = self.item_tower(item_feat)
 
+        hard_neg_indices = batch.hard_neg_indices
         ui_sim = (
-            self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature
+            self.sim(user_tower_emb, item_tower_emb, hard_neg_indices)
+            / self._model_config.temperature
         )
         return {"similarity": ui_sim}
