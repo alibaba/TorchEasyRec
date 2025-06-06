@@ -88,6 +88,50 @@ class PlanUtilTest(unittest.TestCase):
         for k, v in best_grid_proposal.items():
             self.assertEqual(str(v), str(best_dp_proposal[k]))
 
+    def test_dp_proposer_with_prune(self) -> None:
+        topology = Topology(
+            world_size=2, hbm_cap=(1000**3) * 10 * 2 * 4, compute_device="cuda"
+        )
+        enumerator = EmbeddingEnumerator(topology=topology, batch_size=8196)
+        partitioner = GreedyPerfPartitioner()
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000**i,
+                embedding_dim=10 * i,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(1, 4)
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        search_space = enumerator.enumerate(
+            module=model,
+            sharders=get_default_sharders(),
+        )
+
+        dp_proposer = DynamicProgrammingProposer()
+        dp_proposer.load(search_space)
+        best_dp_perf = float("inf")
+        best_dp_proposal = None
+        num_proposals = 0
+        proposal = dp_proposer.propose()
+        while proposal:
+            num_proposals += 1
+            try:
+                partitioner.partition(proposal, topology)
+                cur_perf = sum([x.total_perf for x in proposal])
+                if cur_perf < best_dp_perf:
+                    best_dp_proposal = {x.fqn: x for x in proposal}
+                    best_dp_perf = cur_perf
+            except PlannerError:
+                pass
+            dp_proposer.feedback(partitionable=True, storage_constraint=topology)
+            proposal = dp_proposer.propose()
+        self.assertEqual(
+            best_dp_proposal["sparse.ebc.table_3"].sharding_type, "row_wise"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

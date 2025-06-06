@@ -212,9 +212,9 @@ class DynamicProgrammingProposer(Proposer):
         # indices of sharding_options
         self._proposal_list: List[List[int]] = []
         self._current_proposal: int = -1
-        self._plan_by_hbm = True
+        self._storage_type = "hbm"
         if not torch.cuda.is_available():
-            self._plan_by_hbm = False
+            self._storage_type = "ddr"
 
     def load(
         self,
@@ -225,10 +225,7 @@ class DynamicProgrammingProposer(Proposer):
         self._reset()
         # order the sharding_option by total_storage.hbm from low to high
         for sharding_option in sorted(
-            search_space,
-            key=lambda x: x.total_storage.hbm
-            if self._plan_by_hbm
-            else x.total_storage.ddr,
+            search_space, key=lambda x: getattr(x.total_storage, self._storage_type)
         ):
             fqn = sharding_option.fqn
             if fqn not in self._sharding_options_by_fqn:
@@ -273,12 +270,12 @@ class DynamicProgrammingProposer(Proposer):
 
             assert storage_constraint is not None
             # are we assuming the table will be evenly sharded on all devices?
-            mem_total = sum(
-                [
-                    x.storage.hbm if self._plan_by_hbm else x.storage.ddr
-                    for x in storage_constraint.devices
-                ]
-            )
+            max_device_mem = 0
+            mem_total = 0
+            for x in storage_constraint.devices:
+                cur_device_mem = getattr(x.storage, self._storage_type)
+                max_device_mem = max(max_device_mem, cur_device_mem)
+                mem_total += cur_device_mem
 
             bin_count = self._mem_bins_per_device * len(storage_constraint.devices)
             bin_size = float(mem_total) / bin_count
@@ -304,10 +301,19 @@ class DynamicProgrammingProposer(Proposer):
                 self._sharding_options_by_fqn.values()
             ):
                 for opt_id, sharding_option in enumerate(sharding_options):
+                    # prune mem of one shard > mem of one device
+                    if (
+                        max(
+                            [
+                                getattr(shard.storage, self._storage_type)
+                                for shard in sharding_option.shards
+                            ]
+                        )
+                        > max_device_mem
+                    ):
+                        continue
                     mem_by_fqn[table_id][opt_id] = _bytes_to_float_bin(
-                        sharding_option.total_storage.hbm
-                        if self._plan_by_hbm
-                        else sharding_option.total_storage.ddr,
+                        getattr(sharding_option.total_storage, self._storage_type),
                         bin_size,
                     )
                     perf_by_fqn[table_id][opt_id] = sharding_option.total_perf
