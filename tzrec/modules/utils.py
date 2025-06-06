@@ -29,7 +29,7 @@ class BaseModule(nn.Module, abc.ABC):
     def __init__(
         self, is_inference: bool = False, kernel: Optional[Kernel] = None, **kwargs: Any
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__()
         self._is_inference = is_inference
         self._kernel = kernel
 

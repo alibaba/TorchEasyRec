@@ -47,8 +47,13 @@ def _update_tensor_2_dict(
 
 @torch.fx.wrap
 def _get_hard_neg_sparse_tensor(
-    indices: torch.Tensor, values: torch.Tensor, shape: List[int]
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    hard_neg_indices: torch.Tensor,
+    user_emb: torch.Tensor,
 ) -> torch.Tensor:
+    batch_size = user_emb.size(0)
+    shape = [batch_size, int(torch.max(hard_neg_indices[:, 1]).item()) + 1]
     return torch.sparse_coo_tensor(
         indices, values, shape, device=indices.device
     ).to_dense()
@@ -242,14 +247,15 @@ class MatchModel(BaseModel):
             _hard_neg_ui_sim = torch.sum(
                 torch.multiply(hard_user_emb, hard_item_emb), dim=-1, keepdim=True
             )  # [n_hard, 1]
-            hard_neg_shape = [batch_size, torch.max(hard_neg_indices[:, 1]).item() + 1]
+
             hard_neg_ui_sim = _get_hard_neg_sparse_tensor(
-                hard_neg_indices.T, _hard_neg_ui_sim.ravel(), hard_neg_shape
+                hard_neg_indices.T, _hard_neg_ui_sim.ravel(), hard_neg_indices, user_emb
             )
             hard_neg_mask = _get_hard_neg_sparse_tensor(
                 hard_neg_indices.T,
                 _get_ones(hard_neg_indices),  # torch.ones(hard_neg_indices.shape[0]),
-                hard_neg_shape,
+                hard_neg_indices,
+                user_emb,
             )
             hard_neg_ui_sim = hard_neg_ui_sim - (1 - hard_neg_mask) * 1e32
             return torch.cat([pos_ui_sim, neg_ui_sim, hard_neg_ui_sim], dim=-1)
