@@ -389,8 +389,8 @@ class DataParser:
         for weight in self._sample_weights:
             sample_weights[weight] = input_data[weight]
 
-        hard_neg_indices = None
-        if "hard_neg_indices" in input_data:
+        hard_neg_indices = torch.tensor([])
+        if hasattr(input_data, "hard_neg_indices"):
             hard_neg_indices = input_data["hard_neg_indices"]
 
         batch = Batch(
@@ -404,6 +404,7 @@ class DataParser:
             tile_size=tile_size,
             hard_neg_indices=hard_neg_indices,
         )
+
         return batch
 
     def _to_dense_features(

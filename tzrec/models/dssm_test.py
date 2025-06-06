@@ -77,7 +77,12 @@ class DSSMTest(unittest.TestCase):
                 )
             ],
         )
-        dssm = DSSM(model_config=model_config, features=features, labels=["label"])
+        dssm = DSSM(
+            model_config=model_config,
+            features=features,
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
         init_parameters(dssm, device=torch.device("cpu"))
         dssm = create_test_model(dssm, graph_type)
 

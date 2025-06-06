@@ -200,6 +200,7 @@ class MatchModel(BaseModel):
         self._loss_collection = {}
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
+        self.sampler_type = kwargs["sampler_type"]
 
     def sim(
         self,
@@ -213,7 +214,7 @@ class MatchModel(BaseModel):
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
 
-        if hard_neg_indices is None:
+        if self.sampler_type in ["negative_sampler", "negative_sampler_v2"]:
             pos_item_emb = item_emb[:batch_size]
             neg_item_emb = item_emb[batch_size:]
             pos_ui_sim = torch.sum(
@@ -221,7 +222,7 @@ class MatchModel(BaseModel):
             )
             neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
-        else:
+        else:  # negative_sampler and hard_negative_sampler_v2
             n_hard = hard_neg_indices.shape[0]
 
             # compute simple sample similarities

@@ -141,7 +141,7 @@ class Batch(Pipelineable):
     # sample_weight
     sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
     # hard_neg_indices
-    hard_neg_indices: torch.Tensor = field(default_factory=None)
+    hard_neg_indices: torch.Tensor = field(default_factory=torch.Tensor)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -174,9 +174,7 @@ class Batch(Pipelineable):
             },
             hard_neg_indices=self.hard_neg_indices.to(
                 device=device, non_blocking=non_blocking
-            )
-            if self.hard_neg_indices is not None
-            else None,
+            ),
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -193,8 +191,8 @@ class Batch(Pipelineable):
             v.record_stream(stream)
         for v in self.sample_weights.values():
             v.record_stream(stream)
-        if self.hard_neg_indices is not None:
-            self.hard_neg_indices.record_stream(stream)
+
+        self.hard_neg_indices.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
         """Copy to pinned memory."""
@@ -231,9 +229,7 @@ class Batch(Pipelineable):
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
-            hard_neg_indices=self.hard_neg_indices.pin_memory()
-            if self.hard_neg_indices is not None
-            else None,
+            hard_neg_indices=self.hard_neg_indices.pin_memory(),
         )
 
     def to_dict(

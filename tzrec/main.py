@@ -679,6 +679,7 @@ def train_and_evaluate(
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=data_config.WhichOneof("sampler"),
     )
     model = TrainWrapper(model)
 
