@@ -272,7 +272,7 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}"] = v
         if self.tile_size > 0:
             tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
-        if self.hard_neg_indices is not None:
+        if self.hard_neg_indices is not None and len(self.hard_neg_indices) > 0:
             tensor_dict["hard_neg_indices"] = self.hard_neg_indices
         return tensor_dict
 

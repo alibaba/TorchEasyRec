@@ -207,7 +207,7 @@ class HSTUMatch(MatchModel):
         self,
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,
-        neg_for_each_sample: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         """Override the sim method in MatchModel to calculate similarity."""
         if self._in_batch_negative:
@@ -220,7 +220,7 @@ class HSTUMatch(MatchModel):
                 torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
             )
             neg_ui_sim = None
-            if not neg_for_each_sample:
+            if not kwargs.get("neg_for_each_sample", False):
                 neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             else:
                 num_neg_per_user = neg_item_emb.size(0) // batch_size

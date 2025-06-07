@@ -40,7 +40,11 @@ class _TestMatchModel(MatchModel):
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         dense_feat_kt = batch.dense_features[BASE_DATA_GROUP]
         dense_neg_kt = batch.dense_features[NEG_DATA_GROUP]
-        simi = self.sim(dense_feat_kt.values(), dense_neg_kt.values())
+        simi = self.sim(
+            dense_feat_kt.values(),
+            dense_neg_kt.values(),
+            hard_neg_indices=torch.tensor([]),
+        )
         return {"similarity": simi}
 
 
