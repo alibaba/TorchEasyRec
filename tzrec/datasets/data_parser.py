@@ -196,6 +196,10 @@ class DataParser:
                     f"sample weight column [{weight_name}] should be float dtype."
                 )
 
+        if "hard_neg_indices" in input_data.keys():
+            output_data["hard_neg_indices"] = torch.tensor(
+                input_data["hard_neg_indices"].tolist(), dtype=torch.int32
+            )
         return output_data
 
     def _parse_feature_normal(
@@ -252,11 +256,6 @@ class DataParser:
                         ((0, max_batch_size - len(feat_data.values)), (0, 0)),
                     )
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-
-        if "hard_neg_indices" in input_data.keys():
-            output_data["hard_neg_indices"] = torch.tensor(
-                input_data["hard_neg_indices"].tolist(), dtype=torch.int32
-            )
 
     def _parse_feature_fg_handler(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
@@ -319,11 +318,6 @@ class DataParser:
                             ((0, max_batch_size - len(dense_values)), (0, 0)),
                         )
                     output_data[f"{feat_name}.values"] = _to_tensor(dense_values)
-
-        if "hard_neg_indices" in input_data.keys():
-            output_data["hard_neg_indices"] = torch.tensor(
-                input_data["hard_neg_indices"].tolist(), dtype=torch.int32
-            )
 
     def to_batch(
         self, input_data: Dict[str, torch.Tensor], force_no_tile: bool = False
@@ -390,7 +384,10 @@ class DataParser:
             sample_weights[weight] = input_data[weight]
 
         hard_neg_indices = torch.tensor([])
-        if hasattr(input_data, "hard_neg_indices"):
+        if (
+            hasattr(input_data, "hard_neg_indices")
+            or "hard_neg_indices" in input_data.keys()
+        ):
             hard_neg_indices = input_data["hard_neg_indices"]
 
         batch = Batch(

@@ -211,7 +211,7 @@ class MatchModel(BaseModel):
         self,
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,
-        hard_neg_indices: Optional[torch.Tensor] = None,
+        hard_neg_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         batch_size = user_emb.size(0)
