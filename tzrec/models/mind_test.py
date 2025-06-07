@@ -11,11 +11,11 @@
 
 import unittest
 
-import pyarrow as pa
 import torch
 from parameterized import parameterized
+from torchrec import KeyedJaggedTensor
 
-from tzrec.datasets.data_parser import DataParser
+from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.mind import MIND
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
@@ -29,6 +29,117 @@ class MINDTest(unittest.TestCase):
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_mind(self, graph_type) -> None:
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_u", embedding_dim=16, num_buckets=100
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_i", embedding_dim=16, num_buckets=1000
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_50_seq",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="cat_i", embedding_dim=16, num_buckets=1000
+                            )
+                        )
+                    ],
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs, neg_fields=["cat_i"])
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="user",
+                feature_names=["cat_u"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="item",
+                feature_names=["cat_i"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="hist",
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                feature_names=["click_50_seq__cat_i"],
+            ),
+        ]
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            mind=match_model_pb2.MIND(
+                user_tower=tower_pb2.MINDUserTower(
+                    input="user",
+                    history_input="hist",
+                    user_mlp=module_pb2.MLP(hidden_units=[12, 6]),
+                    hist_seq_mlp=module_pb2.MLP(hidden_units=[12, 16]),
+                    capsule_config=module_pb2.B2ICapsule(
+                        max_k=2,
+                        max_seq_len=20,
+                        high_dim=4,
+                        num_iters=3,
+                        routing_logits_scale=1.0,
+                        routing_logits_stddev=0.1,
+                        squash_pow=2.0,
+                    ),
+                    concat_mlp=module_pb2.MLP(hidden_units=[16, 8]),
+                ),
+                item_tower=tower_pb2.Tower(
+                    input="item", mlp=module_pb2.MLP(hidden_units=[16, 8])
+                ),
+                simi_pow=10,
+            ),
+            losses=[
+                loss_pb2.LossConfig(
+                    softmax_cross_entropy=loss_pb2.SoftmaxCrossEntropy()
+                )
+            ],
+        )
+        mind = MIND(
+            model_config=model_config,
+            features=features,
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
+        init_parameters(mind, device=torch.device("cpu"))
+        mind = create_test_model(mind, graph_type)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_u", "click_50_seq__cat_i"],
+            values=torch.tensor([1, 3, 4, 5]),
+            lengths=torch.tensor([1, 3]),
+        )
+
+        sparse_neg_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_i"],
+            values=torch.tensor([1, 2, 3]),
+            lengths=torch.tensor([1, 1, 1]),
+        )
+
+        batch = Batch(
+            sparse_features={
+                BASE_DATA_GROUP: sparse_feature,
+                NEG_DATA_GROUP: sparse_neg_feature,
+            },
+            labels={},
+        )
+
+        if graph_type == TestGraphType.JIT_SCRIPT:
+            predictions = mind(batch.to_dict())
+        else:
+            predictions = mind(batch)
+        self.assertEqual(predictions["similarity"].size(), (1, 3))
+
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_mind_hard_neg(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -101,47 +212,43 @@ class MINDTest(unittest.TestCase):
                 )
             ],
         )
-        mind = MIND(model_config=model_config, features=features, labels=["label"])
+        mind = MIND(
+            model_config=model_config,
+            features=features,
+            labels=["label"],
+            sampler_type="hard_negative_sampler",
+        )
         init_parameters(mind, device=torch.device("cpu"))
         mind = create_test_model(mind, graph_type)
 
-        # sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-        #     keys=["cat_u,cat_i,click_50_seq__cat_i"],
-        #     values=torch.tensor([1, 2, 3, 4, 5, 6]),
-        #     lengths=torch.tensor([1, 2, 3]),
-        # )
-
-        # sparse_neg_feature = KeyedJaggedTensor.from_lengths_sync(
-        #     keys=["cat_i"],
-        #     values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
-        #     lengths=torch.tensor([1, 2, 1, 3]),
-        # )
-
-        # batch = Batch(
-        #     sparse_features={
-        #         BASE_DATA_GROUP: sparse_feature,
-        #         NEG_DATA_GROUP: sparse_neg_feature,
-        #     },
-        #     labels={},
-        # )
-
-        data_parser = DataParser(features=features, labels=["label"])
-
-        data = data_parser.parse(
-            input_data={
-                "cat_u": pa.array([1, 2, 3]),
-                "cat_i": pa.array([1, 2, 3, 4, 5, 6]),
-                "click_50_seq__cat_i": pa.array(["11;12;13", "13", ""]),
-                "label": pa.array([1, 1, 1], pa.int32()),
-            }
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_u", "click_50_seq__cat_i"],
+            values=torch.tensor([1, 3, 4, 5]),
+            lengths=torch.tensor([1, 3]),
         )
-        batch = data_parser.to_batch(data)
+
+        sparse_neg_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_i"],
+            values=torch.tensor([1, 2, 3, 4, 5]),
+            lengths=torch.tensor([1, 1, 1, 1, 1]),
+        )
+
+        hard_neg_indices = torch.tensor([[0, 0], [0, 1]])
+
+        batch = Batch(
+            sparse_features={
+                BASE_DATA_GROUP: sparse_feature,
+                NEG_DATA_GROUP: sparse_neg_feature,
+            },
+            labels={},
+            hard_neg_indices=hard_neg_indices,
+        )
 
         if graph_type == TestGraphType.JIT_SCRIPT:
             predictions = mind(batch.to_dict())
         else:
             predictions = mind(batch)
-        self.assertEqual(predictions["similarity"].size(), (3, 4))
+        self.assertEqual(predictions["similarity"].size(), (1, 5))
 
 
 if __name__ == "__main__":

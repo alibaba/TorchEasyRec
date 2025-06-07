@@ -10,7 +10,7 @@
 # limitations under the License.
 
 import unittest
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import torch
 from parameterized import parameterized
@@ -32,8 +32,9 @@ class _TestMatchModel(MatchModel):
         features: List[BaseFeature],
         labels: List[str],
         in_batch_negative: bool = False,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, **kwargs)
         self._in_batch_negative = in_batch_negative
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -68,6 +69,7 @@ class MatchModelTest(unittest.TestCase):
             features=[],
             labels=["label"],
             in_batch_negative=in_batch_neg,
+            sampler_type="negative_sampler",
         )
         model = TrainWrapper(model)
         model = create_test_model(model, graph_type)
