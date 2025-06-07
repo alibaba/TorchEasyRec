@@ -85,7 +85,12 @@ class HSTUTest(unittest.TestCase):
                 )
             ],
         )
-        hstu = HSTUMatch(model_config=model_config, features=features, labels=["label"])
+        hstu = HSTUMatch(
+            model_config=model_config,
+            features=features,
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
         init_parameters(hstu, device=torch.device("cpu"))
         hstu = create_test_model(hstu, graph_type)
 
