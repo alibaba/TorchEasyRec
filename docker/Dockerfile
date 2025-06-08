@@ -26,19 +26,19 @@ ENV PATH /opt/conda/bin:$PATH
 
 ARG DEVICE
 RUN case ${DEVICE} in \
-        "cu124") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+        "cu126") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
                  dpkg -i cuda-keyring_1.1-1_all.deb && \
                  apt-get update && \
-                 apt-get install cuda-compat-12-4 && \
+                 apt-get install cuda-compat-12-6 && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu124") pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124 && \
-                 pip install torchmetrics==1.0.3 torch_tensorrt==2.6.0 --extra-index-url https://download.pytorch.org/whl/cu124 && \
-                 pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cu124 ;; \
-        * )      pip install torch==2.6.0 fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cpu && \
+        "cu126") pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchmetrics==1.0.3 torch_tensorrt==2.7.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchrec==1.2.0 ;; \
+        * )      pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cpu && \
                  pip install torchmetrics==1.0.3 && \
-                 pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cpu ;; \
+                 pip install torchrec==1.2.0 ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
 
@@ -52,7 +52,7 @@ ADD requirements-cpu.txt /root/requirements-cpu.txt
 ADD requirements-gpu.txt /root/requirements-gpu.txt
 RUN cd /root && \
     case ${DEVICE} in \
-        "cu124") pip install -r requirements-gpu.txt ;; \
+        "cu126") pip install -r requirements-gpu.txt ;; \
         * )      pip install -r requirements-cpu.txt ;; \
     esac && \
     rm -rf requirements requirements-cpu.txt requirements-gpu.txt && \
