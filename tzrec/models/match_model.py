@@ -224,7 +224,11 @@ class MatchModel(BaseModel):
             "negative_sampler_v2",
             "hard_negative_sampler",
             "hard_negative_sampler_v2",
-        ], f"wrong sampler type: {self.sampler_type}"
+        ], (
+            f"wrong sampler type: {self.sampler_type}, sampler_type should be one of \
+                negative_sampler, negative_sampler_v2, hard_negative_sampler, \
+                hard_negative_sampler_v2"
+        )
 
         if self.sampler_type in ["negative_sampler", "negative_sampler_v2"]:
             pos_item_emb = item_emb[:batch_size]

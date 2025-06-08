@@ -214,6 +214,18 @@ def _get_dataloader(
     return dataloader
 
 
+def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
+    try:
+        sampler_type = (
+            data_config.WhichOneof("sampler")
+            if data_config.HasField("sampler")
+            else None
+        )
+    except Exception:
+        sampler_type = None
+    return sampler_type
+
+
 def _create_model(
     model_config: ModelConfig,
     features: List[BaseFeature],
@@ -677,14 +689,9 @@ def train_and_evaluate(
                     "model_dir please delete dir model_dir or specify "
                     "--continue_train)"
                 )
-    try:
-        sampler_type = (
-            data_config.WhichOneof("sampler")
-            if data_config.HasField("sampler")
-            else None
-        )
-    except Exception:
-        sampler_type = None
+
+    sampler_type = _get_sampler_type(data_config)
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
@@ -798,14 +805,9 @@ def evaluate(
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
     )
-    try:
-        sampler_type = (
-            data_config.WhichOneof("sampler")
-            if data_config.HasField("sampler")
-            else None
-        )
-    except Exception:
-        sampler_type = None
+
+    sampler_type = _get_sampler_type(data_config)
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
@@ -984,11 +986,13 @@ def export(
         data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
     )
 
+    sampler_type = _get_sampler_type(data_config)
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
+        sampler_type=sampler_type,
     )
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     model = InferWrapper(model)
