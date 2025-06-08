@@ -198,16 +198,16 @@ class HSTUMatch(MatchModel):
         }
         user_tower_emb = self.user_tower(user_group_features)
         ui_sim = (
-            self.sim(user_tower_emb, item_tower_emb, neg_for_each_sample=True)
+            self.simi(user_tower_emb, item_tower_emb, neg_for_each_sample=True)
             / self._model_config.temperature
         )
         return {"similarity": ui_sim}
 
-    def sim(
+    def simi(
         self,
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,
-        **kwargs,
+        neg_for_each_sample: bool = False,
     ) -> torch.Tensor:
         """Override the sim method in MatchModel to calculate similarity."""
         if self._in_batch_negative:
@@ -220,7 +220,7 @@ class HSTUMatch(MatchModel):
                 torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
             )
             neg_ui_sim = None
-            if not kwargs.get("neg_for_each_sample", False):
+            if not neg_for_each_sample:
                 neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             else:
                 num_neg_per_user = neg_item_emb.size(0) // batch_size

@@ -798,13 +798,21 @@ def evaluate(
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
     )
-
+    try:
+        sampler_type = (
+            data_config.WhichOneof("sampler")
+            if data_config.HasField("sampler")
+            else None
+        )
+    except Exception:
+        sampler_type = None
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
     )
     model = TrainWrapper(model)
 
