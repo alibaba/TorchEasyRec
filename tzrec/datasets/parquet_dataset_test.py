@@ -89,6 +89,7 @@ class ParquetDatasetTest(unittest.TestCase):
             self.assertEqual(
                 sorted(data.to_dict().keys()),
                 [
+                    "hard_neg_indices",
                     "id_a.lengths",
                     "id_a.values",
                     "label",
