@@ -383,12 +383,14 @@ class DataParser:
         for weight in self._sample_weights:
             sample_weights[weight] = input_data[weight]
 
+        additional_infos = {}
         hard_neg_indices = torch.tensor([])
         if (
             hasattr(input_data, "hard_neg_indices")
             or "hard_neg_indices" in input_data.keys()
         ):
             hard_neg_indices = input_data["hard_neg_indices"]
+        additional_infos["hard_neg_indices"] = hard_neg_indices
 
         batch = Batch(
             dense_features=dense_features,
@@ -399,7 +401,7 @@ class DataParser:
             sample_weights=sample_weights,
             # pyre-ignore [6]
             tile_size=tile_size,
-            hard_neg_indices=hard_neg_indices,
+            additional_infos=additional_infos,
         )
 
         return batch

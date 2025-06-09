@@ -205,13 +205,13 @@ class MatchModel(BaseModel):
         self._loss_collection = {}
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
-        self.sampler_type = kwargs["sampler_type"]
+        self.sampler_type = kwargs.get("sampler_type", "negative_sampler")
 
     def sim(
         self,
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,
-        hard_neg_indices: torch.Tensor,
+        hard_neg_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         batch_size = user_emb.size(0)

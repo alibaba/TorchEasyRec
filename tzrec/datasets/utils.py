@@ -29,6 +29,8 @@ CROSS_NEG_DATA_GROUP = "__CNEG__"
 C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
+HARD_NEG_INDICES = "hard_neg_indices"
+
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
     FieldType.INT64: pa.int64(),
@@ -140,8 +142,8 @@ class Batch(Pipelineable):
     tile_size: int = field(default=-1)
     # sample_weight
     sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
-    # hard_neg_indices
-    hard_neg_indices: torch.Tensor = field(default_factory=torch.Tensor)
+
+    additional_infos: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -172,9 +174,10 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sample_weights.items()
             },
-            hard_neg_indices=self.hard_neg_indices.to(
-                device=device, non_blocking=non_blocking
-            ),
+            additional_infos={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.additional_infos.items()
+            },
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -191,8 +194,8 @@ class Batch(Pipelineable):
             v.record_stream(stream)
         for v in self.sample_weights.values():
             v.record_stream(stream)
-
-        self.hard_neg_indices.record_stream(stream)
+        for v in self.additional_infos.values():
+            v.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
         """Copy to pinned memory."""
@@ -229,7 +232,9 @@ class Batch(Pipelineable):
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
-            hard_neg_indices=self.hard_neg_indices.pin_memory(),
+            additional_infos={
+                k: v.pin_memory() for k, v in self.additional_infos.items()
+            },
         )
 
     def to_dict(
@@ -272,10 +277,10 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}"] = v
         if self.tile_size > 0:
             tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
-        if self.hard_neg_indices is not None and len(self.hard_neg_indices) > 0:
-            tensor_dict["hard_neg_indices"] = self.hard_neg_indices
-        else:
-            tensor_dict["hard_neg_indices"] = torch.Tensor([])
+
+        for k, v in self.additional_infos.items():
+            tensor_dict[f"{k}"] = v
+
         return tensor_dict
 
 

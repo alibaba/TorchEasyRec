@@ -356,9 +356,10 @@ class MIND(MatchModel):
         # if self._model_config.similarity == simi_pb2.Similarity.COSINE:
         #     user_emb = F.normalize(user_emb, p=2.0, dim=1)
 
-        hard_neg_indices = batch.hard_neg_indices
         ui_sim = (
-            self.sim(user_emb, item_emb, hard_neg_indices)
+            self.sim(
+                user_emb, item_emb, batch.additional_infos.get("hard_neg_indices", None)
+            )
             / self._model_config.temperature
         )
         return {"similarity": ui_sim}

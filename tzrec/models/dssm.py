@@ -143,8 +143,13 @@ class DSSM(MatchModel):
         _update_dict_tensor(
             self._loss_collection, self.item_tower.group_variational_dropout_loss
         )
+
         ui_sim = (
-            self.sim(user_tower_emb, item_tower_emb, batch.hard_neg_indices)
+            self.sim(
+                user_tower_emb,
+                item_tower_emb,
+                batch.additional_infos.get("hard_neg_indices", None),
+            )
             / self._model_config.temperature
         )
         return {"similarity": ui_sim}

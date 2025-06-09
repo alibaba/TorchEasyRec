@@ -15,7 +15,12 @@ import torch
 from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP, Batch
+from tzrec.datasets.utils import (
+    BASE_DATA_GROUP,
+    HARD_NEG_INDICES,
+    NEG_DATA_GROUP,
+    Batch,
+)
 from tzrec.features.feature import create_features
 from tzrec.models.mind import MIND
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
@@ -241,7 +246,7 @@ class MINDTest(unittest.TestCase):
                 NEG_DATA_GROUP: sparse_neg_feature,
             },
             labels={},
-            hard_neg_indices=hard_neg_indices,
+            additional_infos={HARD_NEG_INDICES: hard_neg_indices},
         )
 
         if graph_type == TestGraphType.JIT_SCRIPT:
