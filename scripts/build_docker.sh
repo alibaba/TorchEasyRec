@@ -10,11 +10,7 @@ cd docker
 
 for DEVICE in cu126 cpu
 do
-    case ${DEVICE} in
-        "cu126") LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat ;;
-        * )      LD_LIBRARY_PATH= ;;
-    esac
-    docker build --network host -t ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} --build-arg LD_LIBRARY_PATH=${LD_LIBRARY_PATH} .
+    docker build --network host -t ${REGISTRY}/tzrec-test:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} .
     docker push ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE}
 done
 
