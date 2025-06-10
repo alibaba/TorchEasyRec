@@ -22,6 +22,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.acc.utils import is_cuda_export, is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import (
+    HARD_NEG_INDICES,
     Batch,
     DenseData,
     SequenceDenseData,
@@ -197,7 +198,7 @@ class DataParser:
                 )
 
         if "hard_neg_indices" in input_data.keys():
-            output_data["hard_neg_indices"] = torch.tensor(
+            output_data[HARD_NEG_INDICES] = torch.tensor(
                 input_data["hard_neg_indices"].tolist(), dtype=torch.int32
             )
         return output_data
@@ -384,13 +385,12 @@ class DataParser:
             sample_weights[weight] = input_data[weight]
 
         additional_infos = {}
-        hard_neg_indices = torch.tensor([])
         if (
-            hasattr(input_data, "hard_neg_indices")
-            or "hard_neg_indices" in input_data.keys()
+            hasattr(input_data, HARD_NEG_INDICES)
+            or HARD_NEG_INDICES in input_data.keys()
         ):
-            hard_neg_indices = input_data["hard_neg_indices"]
-        additional_infos["hard_neg_indices"] = hard_neg_indices
+            hard_neg_indices = input_data[HARD_NEG_INDICES]
+            additional_infos[HARD_NEG_INDICES] = hard_neg_indices
 
         batch = Batch(
             dense_features=dense_features,

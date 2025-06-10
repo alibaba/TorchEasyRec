@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch._tensor import Tensor
 
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import HARD_NEG_INDICES, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.capsule import CapsuleLayer
@@ -358,7 +358,7 @@ class MIND(MatchModel):
 
         ui_sim = (
             self.sim(
-                user_emb, item_emb, batch.additional_infos.get("hard_neg_indices", None)
+                user_emb, item_emb, batch.additional_infos.get(HARD_NEG_INDICES, None)
             )
             / self._model_config.temperature
         )
