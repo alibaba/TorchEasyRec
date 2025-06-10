@@ -18,7 +18,7 @@ conda activate tzrec
 pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu126
 pip install fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126
 pip install torchmetrics==1.0.3
-pip install torchrec==1.2.0
+pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cu126
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
 ```
 

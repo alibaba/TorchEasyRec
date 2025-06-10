@@ -35,10 +35,10 @@ RUN case ${DEVICE} in \
 RUN case ${DEVICE} in \
         "cu126") pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126 && \
                  pip install torchmetrics==1.0.3 torch_tensorrt==2.7.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
-                 pip install torchrec==1.2.0 ;; \
+                 pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cu126 ;; \
         * )      pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cpu && \
                  pip install torchmetrics==1.0.3 && \
-                 pip install torchrec==1.2.0 ;; \
+                 pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cpu ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
 
