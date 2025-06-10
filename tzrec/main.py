@@ -986,13 +986,12 @@ def export(
         data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
     )
 
-    sampler_type = _get_sampler_type(data_config)
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
-        sampler_type=sampler_type,
+        sampler_type=None,
     )
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     model = InferWrapper(model)
