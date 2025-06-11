@@ -206,6 +206,9 @@ def export_pm(
     batch = Dim("batch")
     dynamic_shapes = {}
     for key in data:
+        if key == "hard_neg_indices":
+            dynamic_shapes[key] = {}
+            continue
         # .lengths
         if key.endswith(".lengths"):
             # user feats

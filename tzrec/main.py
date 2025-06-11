@@ -214,11 +214,24 @@ def _get_dataloader(
     return dataloader
 
 
+def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
+    try:
+        sampler_type = (
+            data_config.WhichOneof("sampler")
+            if data_config.HasField("sampler")
+            else None
+        )
+    except Exception:
+        sampler_type = None
+    return sampler_type
+
+
 def _create_model(
     model_config: ModelConfig,
     features: List[BaseFeature],
     labels: List[str],
     sample_weights: Optional[List[str]] = None,
+    sampler_type: Optional[str] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -227,7 +240,7 @@ def _create_model(
         features (list): list of features.
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
-
+        sampler_type (str): negative sampler type
     Return:
         model: a EasyRec Model.
     """
@@ -236,7 +249,11 @@ def _create_model(
     model_cls = BaseModel.create_class(model_cls_name)
 
     model: BaseModel = model_cls(
-        model_config, features, labels, sample_weights=sample_weights
+        model_config,
+        features,
+        labels,
+        sample_weights=sample_weights,
+        sampler_type=sampler_type,
     )
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
@@ -673,12 +690,15 @@ def train_and_evaluate(
                     "--continue_train)"
                 )
 
+    sampler_type = _get_sampler_type(data_config)
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
     )
     model = TrainWrapper(model)
 
@@ -786,12 +806,15 @@ def evaluate(
         mode=Mode.EVAL,
     )
 
+    sampler_type = _get_sampler_type(data_config)
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
     )
     model = TrainWrapper(model)
 
@@ -968,6 +991,7 @@ def export(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
+        sampler_type=None,
     )
     InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
     model = InferWrapper(model)

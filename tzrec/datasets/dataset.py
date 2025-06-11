@@ -174,6 +174,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._mode = mode
         self._debug_level = debug_level
         self._enable_hstu = data_config.enable_hstu
+        self.sampler_type = (
+            self._data_config.WhichOneof("sampler")
+            if self._data_config.HasField("sampler")
+            else None
+        )
 
         self._data_parser = DataParser(
             features=features,
@@ -186,6 +191,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             is_training=self._mode == Mode.TRAIN,
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
+            sampler_type=self.sampler_type,
         )
 
         self._input_fields = None
