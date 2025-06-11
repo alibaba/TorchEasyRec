@@ -239,7 +239,7 @@ class MatchModel(BaseModel):
             neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
         else:  # hard_negative_sampler and hard_negative_sampler_v2
-            n_hard = hard_neg_indices.shape[0]  # pyre-ignore [16]
+            n_hard = hard_neg_indices.size(0)  # pyre-ignore [16]
 
             # compute simple sample similarities
             simple_item_emb = item_emb[0:-n_hard]
