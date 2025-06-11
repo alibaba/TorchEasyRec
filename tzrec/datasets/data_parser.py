@@ -390,8 +390,10 @@ class DataParser:
 
         additional_infos = {}
         if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
-            hard_neg_indices = input_data[HARD_NEG_INDICES]
-            additional_infos[HARD_NEG_INDICES] = hard_neg_indices
+            try:
+                additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
+            except Exception:
+                print(f"{HARD_NEG_INDICES} is ignored.")
 
         batch = Batch(
             dense_features=dense_features,
