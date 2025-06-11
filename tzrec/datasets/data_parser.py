@@ -49,6 +49,7 @@ class DataParser:
         fg_threads (int): fg thread number.
         force_base_data_group (bool): force padding data into same
             data group with same batch_size.
+        sampler_type: (str): negative sampler type
     """
 
     def __init__(
@@ -59,6 +60,7 @@ class DataParser:
         is_training: bool = False,
         fg_threads: int = 1,
         force_base_data_group: bool = False,
+        sampler_type: Optional[str] = None,
     ) -> None:
         self._features = features
         self._labels = labels or []
@@ -76,6 +78,8 @@ class DataParser:
         self.sequence_mulval_sparse_keys = defaultdict(list)
         self.sequence_dense_keys = []
         self.has_weight_keys = defaultdict(list)
+
+        self.sampler_type = sampler_type
 
         for feature in self._features:
             if feature.is_sequence:
@@ -385,10 +389,7 @@ class DataParser:
             sample_weights[weight] = input_data[weight]
 
         additional_infos = {}
-        if (
-            hasattr(input_data, HARD_NEG_INDICES)
-            or HARD_NEG_INDICES in input_data.keys()
-        ):
+        if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
             hard_neg_indices = input_data[HARD_NEG_INDICES]
             additional_infos[HARD_NEG_INDICES] = hard_neg_indices
 
