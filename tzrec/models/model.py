@@ -221,7 +221,12 @@ class ScriptWrapper(BaseModule):
         super().__init__()
         self.model = module
         self._features = self.model._features
-        self._data_parser = DataParser(self._features, sampler_type=module.sampler_type)
+        self._data_parser = DataParser(
+            self._features,
+            sampler_type=module.sampler_type
+            if hasattr(module, "sampler_type")
+            else None,
+        )
 
     def get_batch(
         self,
