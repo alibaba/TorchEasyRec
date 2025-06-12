@@ -1,4 +1,4 @@
-alibabacloud_credentials
+alibabacloud_credentials==0.3.6
 anytree
 common_io @ https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/common_io-0.4.1%2Btunnel-py2.py3-none-any.whl
 fbgemm-gpu==1.2.0
