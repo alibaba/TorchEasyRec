@@ -22,6 +22,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.acc.utils import is_cuda_export, is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import (
+    HARD_NEG_INDICES,
     Batch,
     DenseData,
     SequenceDenseData,
@@ -48,6 +49,7 @@ class DataParser:
         fg_threads (int): fg thread number.
         force_base_data_group (bool): force padding data into same
             data group with same batch_size.
+        sampler_type: (str): negative sampler type
     """
 
     def __init__(
@@ -58,6 +60,7 @@ class DataParser:
         is_training: bool = False,
         fg_threads: int = 1,
         force_base_data_group: bool = False,
+        sampler_type: Optional[str] = None,
     ) -> None:
         self._features = features
         self._labels = labels or []
@@ -75,6 +78,8 @@ class DataParser:
         self.sequence_mulval_sparse_keys = defaultdict(list)
         self.sequence_dense_keys = []
         self.has_weight_keys = defaultdict(list)
+
+        self.sampler_type = sampler_type
 
         for feature in self._features:
             if feature.is_sequence:
@@ -196,6 +201,10 @@ class DataParser:
                     f"sample weight column [{weight_name}] should be float dtype."
                 )
 
+        if "hard_neg_indices" in input_data.keys():
+            output_data[HARD_NEG_INDICES] = torch.tensor(
+                input_data["hard_neg_indices"].tolist(), dtype=torch.int32
+            )
         return output_data
 
     def _parse_feature_normal(
@@ -262,10 +271,10 @@ class DataParser:
             else 0
         )
 
-        input_data = {
+        input_data_fg = {
             k: v for k, v in input_data.items() if k in self.feature_input_names
         }
-        fg_output, status = self._fg_handler.process_arrow(input_data)
+        fg_output, status = self._fg_handler.process_arrow(input_data_fg)
         assert status.ok(), status.message()
         for feature in self._features:
             feat_name = feature.name
@@ -379,6 +388,13 @@ class DataParser:
         for weight in self._sample_weights:
             sample_weights[weight] = input_data[weight]
 
+        additional_infos = {}
+        if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
+            try:
+                additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
+            except Exception:
+                print(f"{HARD_NEG_INDICES} is ignored.")
+
         batch = Batch(
             dense_features=dense_features,
             sparse_features=sparse_features,
@@ -388,7 +404,9 @@ class DataParser:
             sample_weights=sample_weights,
             # pyre-ignore [6]
             tile_size=tile_size,
+            additional_infos=additional_infos,
         )
+
         return batch
 
     def _to_dense_features(

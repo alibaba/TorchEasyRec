@@ -45,6 +45,25 @@ def _update_tensor_2_dict(
     tensor_dict[key] = new_tensor
 
 
+@torch.fx.wrap
+def _get_hard_neg_sparse_tensor(
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    hard_neg_indices: torch.Tensor,
+    user_emb: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = user_emb.size(0)
+    shape = [batch_size, int(torch.max(hard_neg_indices[:, 1]).item()) + 1]
+    return torch.sparse_coo_tensor(
+        indices, values, shape, device=indices.device
+    ).to_dense()
+
+
+@torch.fx.wrap
+def _get_ones(indices: torch.Tensor) -> torch.Tensor:
+    return torch.ones(indices.shape[0], device=indices.device)
+
+
 class MatchTower(BaseModule):
     """Base match tower.
 
@@ -186,13 +205,32 @@ class MatchModel(BaseModel):
         self._loss_collection = {}
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
+        self.sampler_type = kwargs.get("sampler_type", "negative_sampler")
 
-    def sim(self, user_emb: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
+    def sim(
+        self,
+        user_emb: torch.Tensor,
+        item_emb: torch.Tensor,
+        hard_neg_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
+        batch_size = user_emb.size(0)
+
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
-        else:
-            batch_size = user_emb.size(0)
+
+        assert self.sampler_type in [
+            "negative_sampler",
+            "negative_sampler_v2",
+            "hard_negative_sampler",
+            "hard_negative_sampler_v2",
+        ], (
+            f"wrong sampler type: {self.sampler_type}, sampler_type should be one of \
+                negative_sampler, negative_sampler_v2, hard_negative_sampler, \
+                hard_negative_sampler_v2"
+        )
+
+        if self.sampler_type in ["negative_sampler", "negative_sampler_v2"]:
             pos_item_emb = item_emb[:batch_size]
             neg_item_emb = item_emb[batch_size:]
             pos_ui_sim = torch.sum(
@@ -200,6 +238,43 @@ class MatchModel(BaseModel):
             )
             neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
+        else:  # hard_negative_sampler and hard_negative_sampler_v2
+            n_hard = hard_neg_indices.size(0)  # pyre-ignore [16]
+
+            # compute simple sample similarities
+            simple_item_emb = item_emb[0:-n_hard]
+            pos_item_emb = simple_item_emb[:batch_size]
+            neg_item_emb = simple_item_emb[batch_size:]
+            pos_ui_sim = torch.sum(
+                torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+            )
+            neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+
+            # compute hard sample similarities
+            hard_item_emb = item_emb[-n_hard:]  # [n_hard, d]
+            hard_user_emb = torch.index_select(
+                user_emb,
+                0,
+                hard_neg_indices[:, 0],  # pyre-ignore [16]
+            )  # [n_hard, d]
+            _hard_neg_ui_sim = torch.sum(
+                torch.multiply(hard_user_emb, hard_item_emb), dim=-1, keepdim=True
+            )  # [n_hard, 1]
+
+            hard_neg_ui_sim = _get_hard_neg_sparse_tensor(
+                hard_neg_indices.T,  # pyre-ignore [16]
+                _hard_neg_ui_sim.ravel(),
+                hard_neg_indices,
+                user_emb,
+            )
+            hard_neg_mask = _get_hard_neg_sparse_tensor(
+                hard_neg_indices.T,
+                _get_ones(hard_neg_indices),  # torch.ones(hard_neg_indices.shape[0]),
+                hard_neg_indices,
+                user_emb,
+            )
+            hard_neg_ui_sim = hard_neg_ui_sim - (1 - hard_neg_mask) * 1e32
+            return torch.cat([pos_ui_sim, neg_ui_sim, hard_neg_ui_sim], dim=-1)
 
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:
         loss_type = loss_cfg.WhichOneof("loss")

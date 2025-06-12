@@ -594,6 +594,39 @@ def create_mock_item_gl_data(
     return data_path
 
 
+def create_mock_hard_negative(
+    edge_path: str,
+    user_path: str,
+    src_data: Dict[str, List],  # {user_id: user_t, item_id: item_t}
+    num_rows: int = 10240,
+) -> Tuple[str]:
+    """Create hard negative mock data."""
+    idx_1 = np.random.choice(
+        np.arange(len(src_data["user_id"])), num_rows, replace=False
+    )
+    idx_2 = np.random.choice(
+        np.arange(len(src_data["item_id"])), num_rows, replace=False
+    )
+    uid = np.array(src_data["user_id"])[idx_1].tolist()
+    iid = np.array(src_data["item_id"])[idx_2].tolist()
+    field_data = [uid, iid]
+    lines = []
+    lines.append("userid:int64\titemid:int64\tweight:float\n")
+    for row in zip(*field_data):
+        lines.append("\t".join([str(row[0]), str(row[1]), "1"]) + "\n")
+    with open(edge_path, "w") as f:
+        f.writelines(lines)
+
+    user_lines = []
+    user_lines.append("id:int64\tweight:float\n")
+    for u in src_data["user_id"]:
+        user_lines.append("\t".join([str(u), "1"]) + "\n")
+    with open(user_path, "w") as f:
+        f.writelines(user_lines)
+
+    return edge_path, user_path
+
+
 def build_mock_input_fg_encoded(
     features: List[BaseFeature], user_id: str = "", item_id: str = ""
 ) -> Dict[str, MockInput]:
@@ -927,7 +960,7 @@ def load_config_for_test(
                 test_dir, "init_tree/predict_edge_table.txt"
             )
 
-        else:
+        elif sampler_type == "negative_sampler":
             item_gl_path = create_mock_item_gl_data(
                 os.path.join(test_dir, "item_gl"),
                 item_inputs,
@@ -938,10 +971,32 @@ def load_config_for_test(
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
-            assert sampler_type == "negative_sampler", (
-                "now only negative_sampler supported."
-            )
+            # assert sampler_type == "negative_sampler", (
+            #     "now only negative_sampler supported."
+            # )
             sampler_config.input_path = item_gl_path
+        elif sampler_type == "hard_negative_sampler":
+            item_gl_path = create_mock_item_gl_data(
+                os.path.join(test_dir, "item_gl"),
+                item_inputs,
+                item_id,
+                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
+                attr_delimiter=sampler_config.attr_delimiter,
+                num_rows=data_config.batch_size * num_parts * 4,
+            )
+
+            hard_neg_edge_path, hard_neg_user_path = create_mock_hard_negative(
+                os.path.join(test_dir, "hard_neg_edge"),
+                os.path.join(test_dir, "hard_neg_user"),
+                {
+                    "user_id": user_t["user_id"].to_pylist(),
+                    "item_id": item_t["item_id"].to_pylist(),
+                },
+                num_rows=data_config.batch_size * 4,
+            )
+            sampler_config.hard_neg_edge_input_path = hard_neg_edge_path
+            sampler_config.user_input_path = hard_neg_user_path
+            sampler_config.item_input_path = item_gl_path
 
     data_config.dataset_type = data_pb2.ParquetDataset
     pipeline_config.model_dir = os.path.join(test_dir, "train")
