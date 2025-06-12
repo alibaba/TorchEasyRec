@@ -8,9 +8,9 @@ cp -r requirements*.txt docker/
 cp -r requirements/ docker/requirements
 cd docker
 
-for DEVICE in cu126 cpu
+for DEVICE in cpu
 do
-    docker build --network host -t ${REGISTRY}/tzrec-test:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} .
+    docker build --network host -t ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} .
     docker push ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE}
 done
 
