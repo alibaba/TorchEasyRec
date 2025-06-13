@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch._tensor import Tensor
 
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import HARD_NEG_INDICES, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.capsule import CapsuleLayer
@@ -356,5 +356,10 @@ class MIND(MatchModel):
         # if self._model_config.similarity == simi_pb2.Similarity.COSINE:
         #     user_emb = F.normalize(user_emb, p=2.0, dim=1)
 
-        ui_sim = self.sim(user_emb, item_emb) / self._model_config.temperature
+        ui_sim = (
+            self.sim(
+                user_emb, item_emb, batch.additional_infos.get(HARD_NEG_INDICES, None)
+            )
+            / self._model_config.temperature
+        )
         return {"similarity": ui_sim}

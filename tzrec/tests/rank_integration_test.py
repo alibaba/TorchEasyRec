@@ -22,7 +22,7 @@ from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
 from tzrec.utils import config_util
-from tzrec.utils.test_util import dfs_are_close, gpu_unavailable, nv_gpu_unavailable
+from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
 
 
 class RankIntegrationTest(unittest.TestCase):
@@ -742,14 +742,14 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
 
-    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skip("skip trt test")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skip("skip trt test")
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",

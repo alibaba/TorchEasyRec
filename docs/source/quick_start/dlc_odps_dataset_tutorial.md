@@ -34,11 +34,11 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:0.7.0-pytorch2.6.0-gpu-py311-cu124-ubuntu22.04`
+**节点镜像** 选择官方镜像`torcheasyrec:0.8.0-pytorch2.7.0-gpu-py311-cu126-ubuntu22.04`
 
 **数据集配置** 选择刚新建的NAS数据集
 
-**资源配置** 选择框架为PyTorch，任务资源我们以选择单机8卡V100为例（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型）
+**资源配置** 选择框架为PyTorch，任务资源我们以选择单机8卡V100为例（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型），**驱动设置选择535+**
 
 **角色信息** 选择**PAI默认角色**
 
