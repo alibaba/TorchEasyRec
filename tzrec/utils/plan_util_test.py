@@ -90,7 +90,9 @@ class PlanUtilTest(unittest.TestCase):
 
     def test_dp_proposer_with_prune(self) -> None:
         topology = Topology(
-            world_size=2, hbm_cap=(1000**3) * 10 * 2 * 4, compute_device="cuda"
+            world_size=2,
+            hbm_cap=(1000**3) * 10 * 2 * 4,
+            compute_device="cuda" if torch.cuda.is_available() else "cpu",
         )
         enumerator = EmbeddingEnumerator(topology=topology, batch_size=8196)
         partitioner = GreedyPerfPartitioner()
@@ -129,7 +131,8 @@ class PlanUtilTest(unittest.TestCase):
             dp_proposer.feedback(partitionable=True, storage_constraint=topology)
             proposal = dp_proposer.propose()
         self.assertEqual(
-            best_dp_proposal["sparse.ebc.table_3"].sharding_type, "row_wise"
+            best_dp_proposal["sparse.ebc.table_3"].sharding_type,
+            "row_wise" if torch.cuda.is_available() else "table_wise",
         )
 
 
