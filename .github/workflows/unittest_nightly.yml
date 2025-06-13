@@ -9,7 +9,7 @@ jobs:
   ci-test:
     runs-on: tzrec-runner
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.7
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.8
       options: --gpus all --ipc host
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
@@ -25,5 +25,4 @@ jobs:
           ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
-          pip uninstall faiss-cpu -y
           bash scripts/ci/ci_test.sh
