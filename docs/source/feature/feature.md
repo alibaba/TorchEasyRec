@@ -350,22 +350,23 @@ feature_configs: {
 备注：上述内置函数支持批量计算和广播机制
 
 - **内置向量函数**:
-  | 函数名 |参数数量| 解释 |
-  |\--------------|---|------------------------------------------------------|
-  | len |1| the length of a vector |
-  | l2_norm |1| l2 normalize of a vector |
-  | squared_norm |1| squared normalize of a vector |
-  | dot |2| dot product of two vectors |
-  | euclid_dist |2| euclidean distance between two vectors |
-  | std_dev |1| standard deviation of a vector, divide n |
-  | pop_std_dev |1| population standard deviation of a vector, divide n-1 |
-  | variance |1| sample variance of a vector, divide n |
-  | pop_variance |1| population variance of a vector, divide n-1 |
-  | reduce_min |1| reduce min of a vector |
-  | reduce_max |1| reduce max of a vector |
-  | reduce_sum |1| reduce sum of a vector |
-  | reduce_mean |1| reduce mean of a vector |
-  | reduce_prod |1| reduce product of a vector |
+
+  | 函数名       | 参数数量 | 解释                                                  |
+  | ------------ | -------- | ----------------------------------------------------- |
+  | len          | 1        | the length of a vector                                |
+  | l2_norm      | 1        | l2 normalize of a vector                              |
+  | squared_norm | 1        | squared normalize of a vector                         |
+  | dot          | 2        | dot product of two vectors                            |
+  | euclid_dist  | 2        | euclidean distance between two vectors                |
+  | std_dev      | 1        | standard deviation of a vector, divide n              |
+  | pop_std_dev  | 1        | population standard deviation of a vector, divide n-1 |
+  | variance     | 1        | sample variance of a vector, divide n                 |
+  | pop_variance | 1        | population variance of a vector, divide n-1           |
+  | reduce_min   | 1        | reduce min of a vector                                |
+  | reduce_max   | 1        | reduce max of a vector                                |
+  | reduce_sum   | 1        | reduce sum of a vector                                |
+  | reduce_mean  | 1        | reduce mean of a vector                               |
+  | reduce_prod  | 1        | reduce product of a vector                            |
 
 备注：当表达式包含上述内置向量函数时，非向量函数参数的其他变量只能是单值类型(scalar)。
 
