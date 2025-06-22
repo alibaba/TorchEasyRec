@@ -188,7 +188,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sample_weights=list(data_config.sample_weight_fields)
             if self._mode != Mode.PREDICT
             else None,
-            is_training=self._mode == Mode.TRAIN,
+            mode=self._mode,
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
             sampler_type=self.sampler_type,
