@@ -51,6 +51,15 @@ class SamplerTest(unittest.TestCase):
         f.flush()
         return f
 
+    def _create_item_gl_data_with_null(self):
+        f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(f)
+        f.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(100):
+            f.write(f"{i}\t{1}\t::我们{i}\n")
+        f.flush()
+        return f
+
     def _create_user_gl_data(self):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
@@ -172,6 +181,41 @@ class SamplerTest(unittest.TestCase):
             raise RuntimeError("worker failed.")
         self.assertEqual(len(res["int_a"]), 8)
         self.assertEqual(len(res["float_b"]), 8)
+        self.assertEqual(len(res["str_c"]), 8)
+
+    def test_negative_sampler_with_null(self):
+        f = self._create_item_gl_data_with_null()
+
+        def _sampler_worker(res):
+            config = sampler_pb2.NegativeSampler(
+                input_path=f.name,
+                num_sample=8,
+                attr_fields=["int_a", "float_b", "str_c"],
+                item_id_field="item_id",
+            )
+            sampler = NegativeSampler(
+                config=config,
+                fields=[
+                    pa.field(name="int_a", type=pa.int64()),
+                    pa.field(name="float_b", type=pa.float64()),
+                    pa.field(name="str_c", type=pa.string()),
+                ],
+                batch_size=4,
+            )
+            assert sampler.estimated_sample_num == 8
+            sampler.init_cluster()
+            sampler.launch_server()
+            sampler.init()
+            res.update(sampler.get({"item_id": pa.array([0, 1, 2, 3])}))
+
+        res = mp.Manager().dict()
+        p = mp.Process(target=_sampler_worker, args=(res,))
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError("worker failed.")
+        self.assertEqual(res["int_a"], pa.array([None] * 8, type=pa.int64()))
+        self.assertEqual(res["float_b"], pa.array([None] * 8, type=pa.float64()))
         self.assertEqual(len(res["str_c"]), 8)
 
     def test_negative_sampler_with_ignore_feature(self):
