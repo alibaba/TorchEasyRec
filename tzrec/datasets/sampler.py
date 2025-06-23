@@ -51,6 +51,32 @@ def string_attrs(self, string_attrs):  # NOQA
 Values.string_attrs = string_attrs
 
 
+def _get_gl_type(field_type: pa.DataType) -> str:
+    type_map = {
+        pa.int32(): "int",
+        pa.int64(): "int",
+        pa.float32(): "float",
+        pa.float64(): "float",
+    }
+    if field_type in type_map:
+        return type_map[field_type]
+    else:
+        return "string"
+
+
+def _get_np_type(field_type: pa.DataType) -> npt.DTypeLike:
+    type_map = {
+        pa.int32(): np.int32,
+        pa.int64(): np.int64,
+        pa.float32(): np.float32,
+        pa.float64(): np.double,
+    }
+    if field_type in type_map:
+        return type_map[field_type]
+    else:
+        return np.str_
+
+
 def _bootstrap(group_size: int, local_rank: int, group_rank: int) -> str:
     def addr_to_tensor(ip: str, port: str) -> torch.Tensor:
         addr_array = [int(i) for i in (ip.split("."))] + [int(port)]
@@ -135,14 +161,14 @@ def _to_arrow_array(
             )
             result = pa.MapArray.from_arrays(offsets, keys, items)
 
-    elif pa.types.is_string(field_type):
-        result = pa.array(x, type=field_type)
-    else:
+    elif x.dtype == np.str_ and not pa.types.is_string(field_type):
         x = pa.array(x, type=pa.string())
         is_empty = pa.compute.equal(x, pa.scalar(""))
         nulls = pa.nulls(len(x))
         x = pa.compute.if_else(is_empty, nulls, x)
         result = x.cast(field_type, safe=False)
+    else:
+        result = pa.array(x, type=field_type)
 
     if isinstance(result, pa.ChunkedArray):
         result = result.combine_chunks()
@@ -168,6 +194,7 @@ class BaseSampler(metaclass=_meta_cls):
         batch_size: int,
         is_training: bool = True,
         multival_sep: str = chr(29),
+        typed_fields: Optional[List[pa.Field]] = None,
     ) -> None:
         self._batch_size = batch_size
         self._multival_sep = multival_sep
@@ -183,21 +210,33 @@ class BaseSampler(metaclass=_meta_cls):
         self._cluster = None
 
         input_fields = {f.name: f for f in fields}
+        input_typed_fields = (
+            {f.name: f for f in typed_fields} if typed_fields else dict()
+        )
         self._attr_names = []
         self._attr_types = []
         self._attr_gl_types = []
+        self._attr_np_types = []
         self._valid_attr_names = []
         self._ignore_attr_names = set()
         for field_name in config.attr_fields:
             if field_name in input_fields:
                 field = input_fields[field_name]
+                self._attr_gl_types.append("string")
+                self._attr_np_types.append(np.str_)
                 self._valid_attr_names.append(field.name)
+            elif field in input_typed_fields:
+                field = input_typed_fields[field_name]
+                self._attr_gl_types.append(_get_gl_type(field.type))
+                self._attr_np_types.append(np.str_)
+                self._valid_attr_names.append(_get_np_type(field.type))
             else:
                 field = pa.field(name=field_name, type=pa.string())
+                self._attr_gl_types.append("string")
+                self._attr_np_types.append(np.str_)
                 self._ignore_attr_names.add(field_name)
             self._attr_names.append(field.name)
             self._attr_types.append(field.type)
-            self._attr_gl_types.append("string")
         if len(self._ignore_attr_names) > 0:
             logger.warning(
                 f"Features {self._ignore_attr_names} in "
@@ -258,16 +297,28 @@ class BaseSampler(metaclass=_meta_cls):
 
     def _parse_nodes(self, nodes: gl.Nodes) -> List[pa.Array]:
         features = []
+        int_idx = 0
+        float_idx = 0
         string_idx = 0
-        for attr_name, attr_type in zip(self._attr_names, self._attr_types):
+        for attr_name, attr_type, attr_gl_type, attr_np_type in zip(
+            self._attr_names, self._attr_types, self._attr_gl_types, self._attr_np_types
+        ):
             if attr_name in self._ignore_attr_names:
                 string_idx += 1
                 continue
-            else:
+            if attr_gl_type == "int":
+                feature = nodes.int_attrs[:, :, int_idx]
+                int_idx += 1
+            elif attr_gl_type == "float":
+                feature = nodes.float_attrs[:, :, float_idx]
+                float_idx += 1
+            elif attr_gl_type == "string":
                 feature = nodes.string_attrs[:, :, string_idx].astype(np.string_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
-            feature = np.reshape(feature, [-1])[: self._num_sample].astype(np.str_)
+            else:
+                raise ValueError("Unknown attr type %s" % attr_gl_type)
+            feature = np.reshape(feature, [-1])[: self._num_sample].astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
         return features
@@ -276,16 +327,28 @@ class BaseSampler(metaclass=_meta_cls):
         self, nodes: gl.Nodes
     ) -> Tuple[List[pa.Array], npt.NDArray]:
         features = []
+        int_idx = 0
+        float_idx = 0
         string_idx = 0
-        for attr_name, attr_type in zip(self._attr_names, self._attr_types):
+        for attr_name, attr_type, attr_gl_type, attr_np_type in zip(
+            self._attr_names, self._attr_types, self._attr_gl_types, self._attr_np_types
+        ):
             if attr_name in self._ignore_attr_names:
                 string_idx += 1
                 continue
-            else:
+            if attr_gl_type == "int":
+                feature = nodes.int_attrs[:, int_idx]
+                int_idx += 1
+            elif attr_gl_type == "float":
+                feature = nodes.float_attrs[:, float_idx]
+                float_idx += 1
+            elif attr_gl_type == "string":
                 feature = nodes.string_attrs[:, string_idx].astype(np.string_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
-            feature = feature.astype(np.str_)
+            else:
+                raise ValueError("Unknown attr type %s" % attr_gl_type)
+            feature = feature.astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
         # pyre-ignore [16]
