@@ -215,7 +215,7 @@ class DataParser:
     ) -> None:
         # when mode = predict, we will not do negative sampling, so that we should not
         # pad parsed features.
-        pad_to_max_bs = Mode != Mode.PREDICT and self._force_base_data_group
+        pad_to_max_bs = self._mode != Mode.PREDICT and self._force_base_data_group
         max_batch_size = (
             max([len(v) for v in input_data.values()]) if pad_to_max_bs else 0
         )
@@ -271,7 +271,7 @@ class DataParser:
     ) -> None:
         # when mode = predict, we will not do negative sampling, so that we should not
         # pad parsed features.
-        pad_to_max_bs = Mode != Mode.PREDICT and self._force_base_data_group
+        pad_to_max_bs = self._mode != Mode.PREDICT and self._force_base_data_group
         max_batch_size = (
             max([len(v) for v in input_data.values()]) if pad_to_max_bs else 0
         )
