@@ -739,8 +739,14 @@ class TDMSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
-        fields = [pa.field("tree_level", pa.int64())] + fields
-        super().__init__(config, fields, batch_size, is_training, multival_sep)
+        super().__init__(
+            config,
+            fields,
+            batch_size,
+            is_training,
+            multival_sep,
+            typed_fields=[pa.field("tree_level", pa.int64())],
+        )
         self._g = (
             gl.Graph()
             .node(
