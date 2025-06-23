@@ -13,7 +13,7 @@
 TorchEasyRec查询Nightly版本
 
 ```bash
-pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
 #### 数据
@@ -51,7 +51,7 @@ tar xf taobao_data_train.tar.gz
 tar xf taobao_data_eval.tar.gz
 cd -
 # 安装tzrec并启动训练
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.train_eval \
@@ -69,7 +69,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 #### 评估
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.eval \
@@ -84,7 +84,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 #### 导出
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.export \
@@ -99,7 +99,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 #### 预测
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.predict \
@@ -135,7 +135,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ```bash
 dlc submit pytorchjob \
     --name=${JOB_NAME} \
-    --command='pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+    --command='pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK -m tzrec.train_eval --pipeline_config_path /mnt/data/multi_tower_din_taobao_dlc.config --train_input_path /mnt/data/data/taobao_data_train/\*.parquet --eval_input_path /mnt/data/taobao_data_eval/\*.parquet --model_dir /mnt/data/multi_tower_din_taobao_dlc' \
     --data_sources=${DATA_SOURCE} \
     --workspace_id=${WORKSPACE_ID} \
