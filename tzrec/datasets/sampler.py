@@ -228,8 +228,8 @@ class BaseSampler(metaclass=_meta_cls):
             elif field_name in input_typed_fields:
                 field = input_typed_fields[field_name]
                 self._attr_gl_types.append(_get_gl_type(field.type))
-                self._attr_np_types.append(np.str_)
-                self._valid_attr_names.append(_get_np_type(field.type))
+                self._attr_np_types.append(_get_np_type(field.type))
+                self._valid_attr_names.append(field.name)
             else:
                 field = pa.field(name=field_name, type=pa.string())
                 self._attr_gl_types.append("string")
