@@ -225,7 +225,7 @@ class BaseSampler(metaclass=_meta_cls):
                 self._attr_gl_types.append("string")
                 self._attr_np_types.append(np.str_)
                 self._valid_attr_names.append(field.name)
-            elif field in input_typed_fields:
+            elif field_name in input_typed_fields:
                 field = input_typed_fields[field_name]
                 self._attr_gl_types.append(_get_gl_type(field.type))
                 self._attr_np_types.append(np.str_)
