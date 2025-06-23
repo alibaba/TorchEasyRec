@@ -161,7 +161,7 @@ def _to_arrow_array(
             )
             result = pa.MapArray.from_arrays(offsets, keys, items)
 
-    elif x.dtype == np.str_ and not pa.types.is_string(field_type):
+    elif np.issubdtype(x.dtype, np.str_) and not pa.types.is_string(field_type):
         x = pa.array(x, type=pa.string())
         is_empty = pa.compute.equal(x, pa.scalar(""))
         nulls = pa.nulls(len(x))
@@ -318,6 +318,7 @@ class BaseSampler(metaclass=_meta_cls):
                 string_idx += 1
             else:
                 raise ValueError("Unknown attr type %s" % attr_gl_type)
+            print(attr_np_type, flush=True)
             feature = np.reshape(feature, [-1])[: self._num_sample].astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
