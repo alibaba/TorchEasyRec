@@ -161,8 +161,15 @@ def _to_arrow_array(
             )
             result = pa.MapArray.from_arrays(offsets, keys, items)
 
+    elif np.issubdtype(x.dtype, np.str_) and not pa.types.is_string(field_type):
+        x = pa.array(x, type=pa.string())
+        is_empty = pa.compute.equal(x, pa.scalar(""))
+        nulls = pa.nulls(len(x))
+        x = pa.compute.if_else(is_empty, nulls, x)
+        result = x.cast(field_type, safe=False)
     else:
         result = pa.array(x, type=field_type)
+
     if isinstance(result, pa.ChunkedArray):
         result = result.combine_chunks()
     return result
@@ -187,6 +194,7 @@ class BaseSampler(metaclass=_meta_cls):
         batch_size: int,
         is_training: bool = True,
         multival_sep: str = chr(29),
+        typed_fields: Optional[List[pa.Field]] = None,
     ) -> None:
         self._batch_size = batch_size
         self._multival_sep = multival_sep
@@ -202,6 +210,9 @@ class BaseSampler(metaclass=_meta_cls):
         self._cluster = None
 
         input_fields = {f.name: f for f in fields}
+        input_typed_fields = (
+            {f.name: f for f in typed_fields} if typed_fields else dict()
+        )
         self._attr_names = []
         self._attr_types = []
         self._attr_gl_types = []
@@ -211,14 +222,21 @@ class BaseSampler(metaclass=_meta_cls):
         for field_name in config.attr_fields:
             if field_name in input_fields:
                 field = input_fields[field_name]
+                self._attr_gl_types.append("string")
+                self._attr_np_types.append(np.str_)
+                self._valid_attr_names.append(field.name)
+            elif field_name in input_typed_fields:
+                field = input_typed_fields[field_name]
+                self._attr_gl_types.append(_get_gl_type(field.type))
+                self._attr_np_types.append(_get_np_type(field.type))
                 self._valid_attr_names.append(field.name)
             else:
                 field = pa.field(name=field_name, type=pa.string())
+                self._attr_gl_types.append("string")
+                self._attr_np_types.append(np.str_)
                 self._ignore_attr_names.add(field_name)
             self._attr_names.append(field.name)
             self._attr_types.append(field.type)
-            self._attr_gl_types.append(_get_gl_type(field.type))
-            self._attr_np_types.append(_get_np_type(field.type))
         if len(self._ignore_attr_names) > 0:
             logger.warning(
                 f"Features {self._ignore_attr_names} in "
@@ -300,6 +318,7 @@ class BaseSampler(metaclass=_meta_cls):
                 string_idx += 1
             else:
                 raise ValueError("Unknown attr type %s" % attr_gl_type)
+            print(attr_np_type, flush=True)
             feature = np.reshape(feature, [-1])[: self._num_sample].astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
@@ -721,8 +740,14 @@ class TDMSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
-        fields = [pa.field("tree_level", pa.int64())] + fields
-        super().__init__(config, fields, batch_size, is_training, multival_sep)
+        super().__init__(
+            config,
+            fields,
+            batch_size,
+            is_training,
+            multival_sep,
+            typed_fields=[pa.field("tree_level", pa.int64())],
+        )
         self._g = (
             gl.Graph()
             .node(
