@@ -548,8 +548,12 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
+            object_list = [session_id]
+        else:
+            object_list = [None]
         if self._pg is not None:
-            session_id = dist.broadcast_object_list([session_id], group=self._pg)[0]
+            dist.broadcast_object_list(object_list, group=self._pg)
+        session_id = object_list[0]
         self._sess_req = SessionRequest(session_id=session_id)
         while True:
             sess_resp = self._client.get_write_session(self._sess_req)
@@ -597,7 +601,10 @@ class OdpsWriter(BaseWriter):
         if self._writer is not None:
             commit_msg, _ = self._writer.finish()
             if self._pg is not None:
-                commit_msgs = [None for _ in range(self._pg.size())]
+                if int(os.environ.get("RANK", 0)) == 0:
+                    commit_msgs = [None for _ in range(self._pg.size())]
+                else:
+                    commit_msgs = None
                 dist.gather_object(commit_msg, commit_msgs, group=self._pg)
             else:
                 commit_msgs = [commit_msg]
