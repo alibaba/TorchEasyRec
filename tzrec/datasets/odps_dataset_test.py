@@ -189,7 +189,7 @@ class OdpsDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
-    @parameterized.expand([["bigint"], ["string"]])
+    @parameterized.expand([["bigint"], ["string"], ["int"]])
     @unittest.skipIf(
         "ODPS_CONFIG_FILE_PATH" not in os.environ
         and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
