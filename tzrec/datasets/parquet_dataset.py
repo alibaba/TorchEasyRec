@@ -26,6 +26,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import calc_slice_position
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
 
@@ -154,7 +155,7 @@ class ParquetReader(BaseReader):
             shuffle,
             shuffle_buffer_size,
         )
-
+        self._pg = dist_util.get_dist_object_pg()
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
         self._ordered_cols = None
@@ -188,7 +189,7 @@ class ParquetReader(BaseReader):
                 _get_metadata, self._input_files[rank::world_size]
             ):
                 parquet_metas_per_rank[k] = v
-        if dist.is_initialized():
+        if self._pg is not None:
             parquet_metas_list = [None] * world_size
             dist.all_gather_object(parquet_metas_list, parquet_metas_per_rank)
             for v in parquet_metas_list:

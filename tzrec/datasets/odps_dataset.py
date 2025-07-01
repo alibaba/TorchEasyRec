@@ -47,6 +47,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import calc_slice_position, remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
 ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
@@ -307,10 +308,6 @@ class OdpsDataset(BaseDataset):
         input_path: str,
         **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert dist.is_initialized(), (
-                "You should initialize distribute group first."
-            )
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
         self._reader = OdpsReader(
@@ -365,6 +362,7 @@ class OdpsReader(BaseReader):
             shuffle,
             shuffle_buffer_size,
         )
+        self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
         self._compression = _get_compression_type(compression)
@@ -435,8 +433,8 @@ class OdpsReader(BaseReader):
                 else:
                     session_ids.append(None)
 
-            if dist.is_initialized():
-                dist.broadcast_object_list(session_ids)
+            if self._pg is not None:
+                dist.broadcast_object_list(session_ids, group=self._pg)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
@@ -481,16 +479,18 @@ class OdpsWriter(BaseWriter):
     Args:
         output_path (str): data output path.
         quota_name (str): storage api quota name.
+        world_size (int, optional): number of ranks, each rank has a writer.
     """
 
     def __init__(
-        self, output_path: str, quota_name: str = "pay-as-you-go", **kwargs: Any
+        self,
+        output_path: str,
+        quota_name: str = "pay-as-you-go",
+        world_size: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert dist.is_initialized(), (
-                "You should initialize distribute group first."
-            )
         super().__init__(output_path)
+        self._pg = dist_util.get_dist_object_pg(world_size)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
@@ -508,11 +508,6 @@ class OdpsWriter(BaseWriter):
         self._client = None
         self._sess_req = None
         self._writer = None
-        self._pg = None
-        if os.environ.get("WORLD_SIZE") is not None:
-            self._pg = dist.new_group(
-                ranks=list(range(int(os.environ.get("WORLD_SIZE")))), backend="gloo"
-            )
 
     def _create_table(self, output_dict: OrderedDict[str, pa.Array]) -> None:
         """Create output table."""
@@ -554,9 +549,7 @@ class OdpsWriter(BaseWriter):
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
         if self._pg is not None:
-            session_id = dist.broadcast_object_list(
-                [session_id], src=0, group=self._pg
-            )[0]
+            session_id = dist.broadcast_object_list([session_id], group=self._pg)[0]
         self._sess_req = SessionRequest(session_id=session_id)
         while True:
             sess_resp = self._client.get_write_session(self._sess_req)
@@ -605,7 +598,7 @@ class OdpsWriter(BaseWriter):
             commit_msg, _ = self._writer.finish()
             if self._pg is not None:
                 commit_msgs = [None for _ in range(self._pg.size())]
-                dist.gather_object(commit_msg, commit_msgs, dst=0, group=self._pg)
+                dist.gather_object(commit_msg, commit_msgs, group=self._pg)
             else:
                 commit_msgs = [commit_msg]
             if int(os.environ.get("RANK", 0)) == 0:

@@ -462,6 +462,7 @@ if __name__ == "__main__":
                 args.total_hitrate_output,
                 writer_type,
                 quota_name=args.odps_data_quota_name,
+                world_size=1,
             )
             hitrate_writer.write({"hitrate": pa.array([total_hitrate])})
             hitrate_writer.close()
