@@ -47,7 +47,6 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import calc_slice_position, remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
-from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
 ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
@@ -509,6 +508,11 @@ class OdpsWriter(BaseWriter):
         self._client = None
         self._sess_req = None
         self._writer = None
+        self._pg = None
+        if os.environ.get("WORLD_SIZE") is not None:
+            self._pg = dist.new_group(
+                ranks=list(range(int(os.environ.get("WORLD_SIZE")))), backend="gloo"
+            )
 
     def _create_table(self, output_dict: OrderedDict[str, pa.Array]) -> None:
         """Create output table."""
@@ -549,8 +553,10 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
-        if dist.is_initialized():
-            session_id = dist_util.broadcast_string(session_id)
+        if self._pg is not None:
+            session_id = dist.broadcast_object_list(
+                [session_id], src=0, group=self._pg
+            )[0]
         self._sess_req = SessionRequest(session_id=session_id)
         while True:
             sess_resp = self._client.get_write_session(self._sess_req)
@@ -597,8 +603,9 @@ class OdpsWriter(BaseWriter):
         """Close and commit data."""
         if self._writer is not None:
             commit_msg, _ = self._writer.finish()
-            if dist.is_initialized():
-                commit_msgs = dist_util.gather_strings(commit_msg)
+            if self._pg is not None:
+                commit_msgs = [None for _ in range(self._pg.size())]
+                dist.gather_object(commit_msg, commit_msgs, dst=0, group=self._pg)
             else:
                 commit_msgs = [commit_msg]
             if int(os.environ.get("RANK", 0)) == 0:
@@ -610,4 +617,9 @@ class OdpsWriter(BaseWriter):
                     raise RuntimeError(
                         f"Fail to commit write session: {self._sess_req.session_id}"
                     )
+        elif self._pg is not None:
+            raise RuntimeError(
+                f"Writer on Rank[{os.environ.get('RANK', 0)}] has no "
+                "data, please check your input data."
+            )
         super().close()
