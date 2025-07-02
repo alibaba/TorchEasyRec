@@ -705,9 +705,12 @@ def train_and_evaluate(
     sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
         pipeline_config.train_config.sparse_optimizer
     )
-    apply_optimizer_in_backward(
-        sparse_optim_cls, model.model.sparse_parameters(), sparse_optim_kwargs
-    )
+    trainable_params, frozen_params = model.model.sparse_parameters()
+    apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
+    if len(frozen_params) > 0:
+        apply_optimizer_in_backward(
+            sparse_optim_cls, frozen_params, dict(sparse_optim_kwargs, **{"lr": 0.0})
+        )
 
     planner = create_planner(
         device=device,

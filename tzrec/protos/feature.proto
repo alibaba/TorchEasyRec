@@ -107,6 +107,8 @@ message IdFeature {
     // value_type after fg before bucketize, you can specify it for better performance.
     // e.g. fg_value_type = int64 when use num_buckets
     optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     // TODO: constrains
 }
@@ -145,6 +147,8 @@ message RawFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     oneof dense_emb {
         // autodis embedding
@@ -198,6 +202,8 @@ message ComboFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     // TODO: constrains
 }
@@ -268,6 +274,8 @@ message LookupFeature {
     // value_type after fg before bucketize, you can specify it for better performance.
     // e.g. fg_value_type = int64 when use num_buckets
     optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     oneof dense_emb {
         // autodis embedding
@@ -348,6 +356,8 @@ message MatchFeature {
     // value_type after fg before bucketize, you can specify it for better performance.
     // e.g. fg_value_type = int64 when use num_buckets
     optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     oneof dense_emb {
         // autodis embedding
@@ -383,6 +393,8 @@ message ExprFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     oneof dense_emb {
         // autodis embedding
@@ -428,6 +440,8 @@ message OverlapFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     oneof dense_emb {
         // autodis embedding
@@ -494,6 +508,8 @@ message TokenizeFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     // TODO: constrains
 }
@@ -558,6 +574,8 @@ message CustomFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     oneof dense_emb {
         // autodis embedding
@@ -617,6 +635,8 @@ message SequenceIdFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     // TODO: constrains
 }
@@ -659,6 +679,8 @@ message SequenceRawFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
     // TODO: constrains
 }
 
@@ -727,6 +749,8 @@ message SequenceCustomFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
 
     // TODO: constrains
 }
