@@ -21,6 +21,7 @@ import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.acc.utils import is_cuda_export, is_input_tile, is_input_tile_emb
+from tzrec.constant import Mode
 from tzrec.datasets.utils import (
     HARD_NEG_INDICES,
     Batch,
@@ -45,7 +46,8 @@ class DataParser:
     Args:
         features (list): a list of features.
         labels (list, optional): a list of label names.
-        is_training (bool): is training or not.
+        sample_weights (list, optional): a list of sample weights.
+        mode (Mode): train or eval or predict.
         fg_threads (int): fg thread number.
         force_base_data_group (bool): force padding data into same
             data group with same batch_size.
@@ -57,7 +59,7 @@ class DataParser:
         features: List[BaseFeature],
         labels: Optional[List[str]] = None,
         sample_weights: Optional[List[str]] = None,
-        is_training: bool = False,
+        mode: Mode = Mode.EVAL,
         fg_threads: int = 1,
         force_base_data_group: bool = False,
         sampler_type: Optional[str] = None,
@@ -65,7 +67,8 @@ class DataParser:
         self._features = features
         self._labels = labels or []
         self._sample_weights = sample_weights or []
-        self._is_training = is_training
+        self._mode = mode
+        self._is_training = mode == Mode.TRAIN
         self._force_base_data_group = force_base_data_group
 
         self._fg_mode = features[0].fg_mode
@@ -201,19 +204,20 @@ class DataParser:
                     f"sample weight column [{weight_name}] should be float dtype."
                 )
 
-        if "hard_neg_indices" in input_data.keys():
+        if HARD_NEG_INDICES in input_data.keys():
             output_data[HARD_NEG_INDICES] = torch.tensor(
-                input_data["hard_neg_indices"].tolist(), dtype=torch.int32
+                input_data[HARD_NEG_INDICES].tolist(), dtype=torch.int32
             )
         return output_data
 
     def _parse_feature_normal(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
     ) -> None:
+        # when mode = predict, we will not do negative sampling, so that we should not
+        # pad parsed features.
+        pad_to_max_bs = self._mode != Mode.PREDICT and self._force_base_data_group
         max_batch_size = (
-            max([len(v) for v in input_data.values()])
-            if self._force_base_data_group
-            else 0
+            max([len(v) for v in input_data.values()]) if pad_to_max_bs else 0
         )
 
         for feature in self._features:
@@ -221,7 +225,7 @@ class DataParser:
 
             if isinstance(feat_data, SequenceSparseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.seq_lengths = np.pad(
                         feat_data.seq_lengths,
                         (0, max_batch_size - len(feat_data.seq_lengths)),
@@ -235,7 +239,7 @@ class DataParser:
                     )
             elif isinstance(feat_data, SequenceDenseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.seq_lengths = np.pad(
                         feat_data.seq_lengths,
                         (0, max_batch_size - len(feat_data.seq_lengths)),
@@ -245,7 +249,7 @@ class DataParser:
                 )
             elif isinstance(feat_data, SparseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.lengths = np.pad(
                         feat_data.lengths, (0, max_batch_size - len(feat_data.lengths))
                     )
@@ -255,7 +259,7 @@ class DataParser:
                         feat_data.weights
                     )
             elif isinstance(feat_data, DenseData):
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.values = np.pad(
                         feat_data.values,
                         ((0, max_batch_size - len(feat_data.values)), (0, 0)),
@@ -265,10 +269,11 @@ class DataParser:
     def _parse_feature_fg_handler(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
     ) -> None:
+        # when mode = predict, we will not do negative sampling, so that we should not
+        # pad parsed features.
+        pad_to_max_bs = self._mode != Mode.PREDICT and self._force_base_data_group
         max_batch_size = (
-            max([len(v) for v in input_data.values()])
-            if self._force_base_data_group
-            else 0
+            max([len(v) for v in input_data.values()]) if pad_to_max_bs else 0
         )
 
         input_data_fg = {
@@ -283,7 +288,7 @@ class DataParser:
                 if feature.is_sparse:
                     output_data[f"{feat_name}.values"] = _to_tensor(feat_data.np_values)
                     feat_lengths = feat_data.np_lengths
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         feat_lengths = np.pad(
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
@@ -297,7 +302,7 @@ class DataParser:
                         feat_data.dense_values
                     )
                     feat_lengths = feat_data.np_lengths
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         feat_lengths = np.pad(
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
@@ -306,7 +311,7 @@ class DataParser:
                 if feature.is_sparse:
                     output_data[f"{feat_name}.values"] = _to_tensor(feat_data.np_values)
                     feat_lengths = feat_data.np_lengths
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         feat_lengths = np.pad(
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
@@ -317,7 +322,7 @@ class DataParser:
                         )
                 else:
                     dense_values = feat_data.dense_values
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         dense_values = np.pad(
                             dense_values,
                             ((0, max_batch_size - len(dense_values)), (0, 0)),
