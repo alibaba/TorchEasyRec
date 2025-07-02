@@ -318,7 +318,6 @@ class BaseSampler(metaclass=_meta_cls):
                 string_idx += 1
             else:
                 raise ValueError("Unknown attr type %s" % attr_gl_type)
-            print(attr_np_type, flush=True)
             feature = np.reshape(feature, [-1])[: self._num_sample].astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
