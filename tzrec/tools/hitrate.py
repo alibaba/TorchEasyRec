@@ -457,11 +457,12 @@ if __name__ == "__main__":
     total_hitrate = (total_hits_t / total_gt_count_t).cpu().item()
     if is_rank_zero:
         logger.info(f"Total hitrate: {total_hitrate}")
-        if args.hitrate_details_output:
+        if args.total_hitrate_output:
             hitrate_writer = create_writer(
                 args.total_hitrate_output,
                 writer_type,
                 quota_name=args.odps_data_quota_name,
+                world_size=1,
             )
             hitrate_writer.write({"hitrate": pa.array([total_hitrate])})
             hitrate_writer.close()

@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import List, Optional
 
 import torch
@@ -38,67 +39,16 @@ from torchrec.distributed.types import (
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
-def broadcast_string(s: str, src: int = 0) -> str:
-    """Broadcasts a string from the source rank to all other ranks."""
-    if dist.get_rank() == src:
-        s_tensor = torch.ByteTensor(bytearray(s, "utf-8"))
-        length = torch.tensor([len(s_tensor)])
-    else:
-        length = torch.tensor([0], dtype=torch.long)
-
-    if dist.get_backend() == dist.Backend.NCCL:
-        length = length.cuda()
-    dist.broadcast(length, src)
-
-    if dist.get_rank() != src:
-        s_tensor = torch.ByteTensor(length.item())
-
-    if dist.get_backend() == dist.Backend.NCCL:
-        s_tensor = s_tensor.cuda()
-    # pyre-ignore [61]
-    dist.broadcast(s_tensor, src)
-
-    s_recv = s_tensor.cpu().numpy().tobytes().decode("utf-8")
-    return s_recv
-
-
-def gather_strings(s: str, dst: int = 0) -> List[str]:
-    """Gather strings from all ranks to the destination rank."""
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    s_tensor = torch.ByteTensor(bytearray(s, "utf-8"))
-
-    max_len = torch.tensor([len(s_tensor)], dtype=torch.long)
-    max_len_list = [torch.tensor([0], dtype=torch.long) for _ in range(world_size)]
-    if dist.get_backend() == dist.Backend.NCCL:
-        max_len = max_len.cuda()
-        max_len_list = [x.cuda() for x in max_len_list]
-    dist.all_gather(max_len_list, max_len)
-
-    # pyre-ignore [6]
-    max_len = max(max_len_list).item()
-    padded_s_tensor = torch.cat(
-        (s_tensor, torch.zeros(max_len - len(s_tensor), dtype=torch.uint8))
-    )
-    if rank == dst:
-        gather_list = [
-            torch.zeros(max_len, dtype=torch.uint8) for _ in range(world_size)
-        ]
-    else:
-        gather_list = []
-    if dist.get_backend() == dist.Backend.NCCL:
-        padded_s_tensor = padded_s_tensor.cuda()
-        gather_list = [x.cuda() for x in gather_list]
-    dist.gather(padded_s_tensor, gather_list, dst)
-
-    gathered_strings = []
-    if rank == dst:
-        for tensor in gather_list:
-            string = tensor.cpu().numpy().tobytes().decode("utf-8").rstrip("\x00")
-            gathered_strings.append(string)
-
-    return gathered_strings
+def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.ProcessGroup]:
+    """New ProcessGroup used for broadcast_object or gather_object."""
+    pg = None
+    world_size = world_size or int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        if dist.is_initialized() and dist.GroupMember.WORLD.size() == world_size:
+            pg = dist.GroupMember.WORLD
+        else:
+            pg = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    return pg
 
 
 # fix missing create_mean_pooling_callback of mc-ebc input_dist
