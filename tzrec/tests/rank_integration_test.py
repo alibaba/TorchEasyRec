@@ -108,6 +108,13 @@ class RankIntegrationTest(unittest.TestCase):
             output_columns="probs",
         )
 
+    def test_multi_tower_din_fg_encoded_train_eval_export_frozen_emb(self):
+        self._test_rank_nofg(
+            "tzrec/tests/configs/multi_tower_din_mock_frozen.config",
+            reserved_columns="clk",
+            output_columns="probs",
+        )
+
     def test_dbmtl_has_sequence_fg_encoded_train_eval_export(self):
         self._test_rank_nofg(
             "tzrec/tests/configs/dbmtl_has_sequence_mock.config",
