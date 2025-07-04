@@ -20,6 +20,8 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **fg_encoded_default_value**: FG编码后的数据的默认值，当fg_encoded=true并且不是用pai-fg编码数据时，可以设置该参数填充空值
 
+- **trainable**: Embedding Variable是否可训练，默认为true
+
 ## IdFeature: 类别型特征
 
 类别型特征，例如手机品牌、item_id、user_id、年龄段、星座等，一般在表里面存储的类型一般是string、bigint、array<string>或array<bigint>。可支持多值Id特征
