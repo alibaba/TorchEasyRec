@@ -39,3 +39,10 @@ message DLRM {
 message MaskNet {
     required MaskNetModule mask_net_module = 1;
 }
+
+
+message DCNv1 {
+    required Cross cross_tower = 1;
+    required MLP deep_tower = 2;
+    required MLP final_dnn = 3;
+}

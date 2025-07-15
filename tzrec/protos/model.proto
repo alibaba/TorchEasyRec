@@ -46,6 +46,7 @@ message ModelConfig {
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
         MaskNet mask_net = 104;
+        DCNv1 dcn_v1 = 105;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
