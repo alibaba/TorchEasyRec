@@ -291,7 +291,7 @@ class OdpsWriterTest(unittest.TestCase):
         self.o = None
 
     @parameterized.expand(
-        [[""], ["/dt=20240401"]],
+        [["", 2, 2], ["/dt=20240401", 2, 2], ["/dt=20240401", 2, 1]],
         name_func=test_util.parameterized_name_func,
     )
     @unittest.skipIf(
@@ -299,7 +299,7 @@ class OdpsWriterTest(unittest.TestCase):
         and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
         "odps config not found",
     )
-    def test_odps_writer(self, partition_spec):
+    def test_odps_writer(self, partition_spec, default_world_size, writer_world_size):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
             account=account,
@@ -307,9 +307,9 @@ class OdpsWriterTest(unittest.TestCase):
             endpoint=odps_endpoint,
         )
 
-        def _writer_worker(rank, world_size, port):
+        def _writer_worker(rank, port):
             os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
+            os.environ["WORLD_SIZE"] = str(default_world_size)
             os.environ["MASTER_ADDR"] = "127.0.0.1"
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
@@ -317,6 +317,7 @@ class OdpsWriterTest(unittest.TestCase):
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
+                world_size=writer_world_size,
             )
             for _ in range(5):
                 writer.write(
@@ -327,13 +328,13 @@ class OdpsWriterTest(unittest.TestCase):
                 )
             writer.close()
 
-        world_size = 2
+        writer_world_size = 2
         port = get_free_port()
         procs = []
-        for rank in range(world_size):
+        for rank in range(writer_world_size):
             p = mp.Process(
                 target=_writer_worker,
-                args=(rank, world_size, port),
+                args=(rank, port),
             )
             p.start()
             procs.append(p)

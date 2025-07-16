@@ -34,7 +34,7 @@ from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
-from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
@@ -705,9 +705,11 @@ def train_and_evaluate(
     sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
         pipeline_config.train_config.sparse_optimizer
     )
-    apply_optimizer_in_backward(
-        sparse_optim_cls, model.model.sparse_parameters(), sparse_optim_kwargs
-    )
+    trainable_params, frozen_params = model.model.sparse_parameters()
+    apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
+    if len(frozen_params) > 0:
+        # SGD and lr=0 for using fused kernel and freezing params
+        apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
 
     planner = create_planner(
         device=device,

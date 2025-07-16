@@ -391,7 +391,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = eval(f"partial({self.config.init_fn})")
-            return EmbeddingBagConfig(
+            emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
@@ -399,6 +399,8 @@ class BaseFeature(object, metaclass=_meta_cls):
                 pooling=self.pooling_type,
                 init_fn=init_fn,
             )
+            emb_bag_config.trainable = self.config.trainable
+            return emb_bag_config
         else:
             return None
 
@@ -410,13 +412,15 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = eval(f"partial({self.config.init_fn})")
-            return EmbeddingConfig(
+            emb_config = EmbeddingConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
                 feature_names=[self.name],
                 init_fn=init_fn,
             )
+            emb_config.trainable = self.config.trainable
+            return emb_config
         else:
             return None
 
