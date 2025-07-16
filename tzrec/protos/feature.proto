@@ -380,6 +380,10 @@ message ExprFeature {
     optional uint32 embedding_dim = 5;
     // boundaries for bucktize numeric expr value
     repeated float boundaries = 6;
+    // fg multi-value separator
+    optional string separator = 7 [default = "\x1d"];
+    // fill value when vector length mismatch, default is NaN.
+    optional float fill_missing = 8;
     // embedding pooling type, available is {sum | mean}
     optional string pooling = 10 [default = "sum"];
     // fg default value
