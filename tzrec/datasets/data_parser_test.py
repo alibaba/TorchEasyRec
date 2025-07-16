@@ -346,7 +346,9 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
-    def _create_test_fg_feature_cfgs(self, tag_b_weighted=False, tag_b_seq=False):
+    def _create_test_fg_feature_cfgs(
+        self, tag_b_weighted=False, tag_b_seq=False, with_const=False
+    ):
         seq_sub_feas = [
             feature_pb2.SeqFeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -414,6 +416,14 @@ class DataParserTest(unittest.TestCase):
                 )
             ),
         ]
+        if with_const:
+            feature_cfgs.append(
+                feature_pb2.FeatureConfig(
+                    lookup_feature=feature_pb2.LookupFeature(
+                        feature_name="f_lookup_b", map="user:map_a", key="const:1"
+                    )
+                ),
+            )
         return feature_cfgs
 
     @parameterized.expand(
@@ -608,6 +618,91 @@ class DataParserTest(unittest.TestCase):
             self.assertTrue(
                 kjt_is_equal(batch.sparse_features["__BASE__"], expected_sparse_feat)
             )
+        expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__f_tag_b"],
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
+        )
+        expected_seq_dense_feat = JaggedTensor(
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
+        )
+
+        torch.testing.assert_close(
+            batch.dense_features["__BASE__"].values(), expected_dense_feat.values()
+        )
+
+        self.assertTrue(
+            kjt_is_equal(
+                batch.sequence_mulval_lengths["__BASE__"],
+                expected_seq_mulval_lengths_user,
+            )
+        )
+        self.assertTrue(
+            jt_is_equal(
+                batch.sequence_dense_features["click_seq__f_int_a"],
+                expected_seq_dense_feat,
+            )
+        )
+        torch.testing.assert_close(batch.labels["label"], expected_label)
+
+    def test_fg_with_const(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs(
+            tag_b_seq=True, with_const=True
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        data_parser = DataParser(features=features, labels=["label"])
+        self.assertEqual(
+            sorted(list(data_parser.feature_input_names)),
+            [
+                "cat_a",
+                "click_seq__cat_a",
+                "click_seq__int_a",
+                "click_seq__tag_b",
+                "int_a",
+                "int_b",
+                "map_a",
+                "tag_b",
+            ],
+        )
+
+        data = data_parser.parse(
+            input_data={
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(["4\x1d5", "", "6"]),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+                "map_a": pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"]),
+                "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
+                "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
+                "click_seq__tag_b": pa.array(["17\x1d18;19;20\x1d21", "22", ""]),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
+            }
+        )
+        batch = data_parser.to_batch(data)
+
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
+        expected_dense_feat = KeyedTensor(
+            keys=["f_int_a", "f_int_b", "f_lookup_a", "f_lookup_b"],
+            length_per_key=[1, 2, 1],
+            values=torch.tensor(
+                [[7, 27, 37, 0.1, 0.1], [8, 28, 38, 0.0, 0.0], [9, 29, 39, 0.2, 0.1]],
+                dtype=torch.float32,
+            ),
+        )
+        expected_sparse_feat = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f_cat_a", "f_tag_b", "click_seq__f_cat_a", "click_seq__f_tag_b"],
+            values=torch.tensor(
+                [1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 0, 17, 18, 19, 20, 21, 22, 0]
+            ),
+            lengths=torch.tensor(
+                [1, 1, 1, 2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32
+            ),
+        )
+        self.assertTrue(
+            kjt_is_equal(batch.sparse_features["__BASE__"], expected_sparse_feat)
+        )
         expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
             keys=["click_seq__f_tag_b"],
             values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),

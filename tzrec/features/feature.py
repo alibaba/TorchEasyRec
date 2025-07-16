@@ -507,7 +507,10 @@ class BaseFeature(object, metaclass=_meta_cls):
                     f"input names, e.g., item:cat_a."
                 )
             for x in side_inputs:
-                if not (len(x) == 2 and x[0] in ["user", "item", "context", "feature"]):
+                if not (
+                    len(x) == 2
+                    and x[0] in ["user", "item", "context", "feature", "const"]
+                ):
                     raise InvalidFgInputError(
                         f"{self.__class__.__name__}[{self.name}] must have valid fg "
                         f"input names, e.g., item:cat_a, but got {x}."
