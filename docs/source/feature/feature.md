@@ -76,7 +76,12 @@ feature_configs {
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 
-  - `input_side`可以取值为`user`/`item`/`context`，用于指导推荐模型服务从哪里获取相关特征，`user`表示这个特征是用户侧特征，从请求中获取，`item`表示是物品侧特征，可以从模型服务内存Cache中获取，`context`表示是需从请求里传递的物品侧特征，如召回名等
+  - `input_side`一共支持五种 \[`user`, `item`, `context`, `feature`, `const`\]
+    - `user`: 用户侧特征输入，线上推理时从请求中传入
+    - `item`: 物品侧特征输入，线上推理时会从实时缓存在内存中的特征表里获取
+    - `context`: 由上下文产生物品侧特征输入，线上推理时从请求中传入，如`recall_name`等
+    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果
+    - `const`: 输入为常量
   - `input_name`为来源字段的实际名称
 
 - **hash_bucket_size**: hash bucket的大小。为减少hash冲突，建议设置
@@ -114,7 +119,7 @@ feature_configs {
 }
 ```
 
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为`user`/`item`/`context`，`input_name`为来源字段的名称
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为\[`user`, `item`, `context`, `feature`, `const`\]，`input_name`为来源字段的名称
 
 - **normalizer**: 指定连续值特征的变换方式，支持4种，默认不变换
 
@@ -310,10 +315,11 @@ feature_configs: {
 
 - **expression**: 表达式本身
 
-- **内置函数**:
+- **内置函数**: 详见[表达式文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/built-in-feature-operator?#1d09c2da3aajb)
 
   | 函数名      | 参数数量 | 解释                                                                    |
   | ----------- | -------- | ----------------------------------------------------------------------- |
+  | rnd         | 0        | Generate a random number between 0 and 1                                |
   | sin         | 1        | sine function                                                           |
   | cos         | 1        | cosine function                                                         |
   | tan         | 1        | tangens function                                                        |
