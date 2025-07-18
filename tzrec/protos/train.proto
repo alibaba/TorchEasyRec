@@ -2,6 +2,7 @@ syntax = "proto2";
 package tzrec.protos;
 
 import "tzrec/protos/optimizer.proto";
+import "tzrec/protos/feature.proto";
 
 message TrainConfig {
     // embedding part optimizer
@@ -26,5 +27,15 @@ message TrainConfig {
     optional bool use_tensorboard = 10 [default = true];
     // epoch interval for saving checkpoint
     optional uint32 save_checkpoints_epochs = 11;
+    // the summaries to be saved in tensorboard, activated only when use_tensorboard=true,
+    // possible values are: "loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"
+    // default values are ["loss", "learning_rate"]
+    repeated string tensorboard_summaries = 12;
+    // where to use torch.backends.cudnn.allow_tf32
+    optional bool cudnn_allow_tf32 = 13 [default = true];
+    // where to use torch.backends.cuda.matmul.allow_tf32
+    optional bool cuda_matmul_allow_tf32 = 14 [default = false];
+    // global embedding param constraints
+    optional ParameterConstraints global_embedding_constraints = 15;
     // TBD: qcomm config
 }

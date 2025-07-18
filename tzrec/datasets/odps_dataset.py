@@ -147,6 +147,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
         or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
         or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+        or "ALIBABA_CLOUD_ECS_METADATA" in os.environ
     ):
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
@@ -307,10 +308,6 @@ class OdpsDataset(BaseDataset):
         input_path: str,
         **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert dist.is_initialized(), (
-                "You should initialize distribute group first."
-            )
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
         self._reader = OdpsReader(
@@ -365,6 +362,7 @@ class OdpsReader(BaseReader):
             shuffle,
             shuffle_buffer_size,
         )
+        self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
         self._compression = _get_compression_type(compression)
@@ -435,8 +433,8 @@ class OdpsReader(BaseReader):
                 else:
                     session_ids.append(None)
 
-            if dist.is_initialized():
-                dist.broadcast_object_list(session_ids)
+            if self._pg is not None:
+                dist.broadcast_object_list(session_ids, group=self._pg)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
@@ -481,16 +479,18 @@ class OdpsWriter(BaseWriter):
     Args:
         output_path (str): data output path.
         quota_name (str): storage api quota name.
+        world_size (int, optional): number of ranks, each rank has a writer.
     """
 
     def __init__(
-        self, output_path: str, quota_name: str = "pay-as-you-go", **kwargs: Any
+        self,
+        output_path: str,
+        quota_name: str = "pay-as-you-go",
+        world_size: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert dist.is_initialized(), (
-                "You should initialize distribute group first."
-            )
         super().__init__(output_path)
+        self._pg = dist_util.get_dist_object_pg(world_size)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
@@ -508,29 +508,23 @@ class OdpsWriter(BaseWriter):
         self._client = None
         self._sess_req = None
         self._writer = None
-        if self._o.exist_table(self._table_name):
-            if int(os.environ.get("RANK", 0)) == 0:
-                self._create_partition()
-            else:
-                self._wait_init_table()
-            self._init_writer()
-            self._lazy_inited = True
 
     def _create_table(self, output_dict: OrderedDict[str, pa.Array]) -> None:
         """Create output table."""
-        schemas = []
-        for k, v in output_dict.items():
-            schemas.append(f"{k} {_type_pa_to_table(v.type)}")
-        schema = ",".join(schemas)
-        if self._partition_spec:
-            pt_schemas = []
-            for pt_spec in self._partition_spec.split("/"):
-                pt_name = pt_spec.split("=")[0]
-                pt_schemas.append(f"{pt_name} STRING")
-            schema = (schema, ",".join(pt_schemas))
-        self._o.create_table(
-            self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
-        )
+        if not self._o.exist_table(self._table_name):
+            schemas = []
+            for k, v in output_dict.items():
+                schemas.append(f"{k} {_type_pa_to_table(v.type)}")
+            schema = ",".join(schemas)
+            if self._partition_spec:
+                pt_schemas = []
+                for pt_spec in self._partition_spec.split("/"):
+                    pt_name = pt_spec.split("=")[0]
+                    pt_schemas.append(f"{pt_name} STRING")
+                schema = (schema, ",".join(pt_schemas))
+            self._o.create_table(
+                self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
+            )
 
     def _create_partition(self) -> None:
         """Create output partition."""
@@ -554,8 +548,12 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
-        if dist.is_initialized():
-            session_id = dist_util.broadcast_string(session_id)
+            object_list = [session_id]
+        else:
+            object_list = [None]
+        if self._pg is not None:
+            dist.broadcast_object_list(object_list, group=self._pg)
+        session_id = object_list[0]
         self._sess_req = SessionRequest(session_id=session_id)
         while True:
             sess_resp = self._client.get_write_session(self._sess_req)
@@ -602,8 +600,12 @@ class OdpsWriter(BaseWriter):
         """Close and commit data."""
         if self._writer is not None:
             commit_msg, _ = self._writer.finish()
-            if dist.is_initialized():
-                commit_msgs = dist_util.gather_strings(commit_msg)
+            if self._pg is not None:
+                if int(os.environ.get("RANK", 0)) == 0:
+                    commit_msgs = [None for _ in range(self._pg.size())]
+                else:
+                    commit_msgs = None
+                dist.gather_object(commit_msg, commit_msgs, group=self._pg)
             else:
                 commit_msgs = [commit_msg]
             if int(os.environ.get("RANK", 0)) == 0:
@@ -615,4 +617,9 @@ class OdpsWriter(BaseWriter):
                     raise RuntimeError(
                         f"Fail to commit write session: {self._sess_req.session_id}"
                     )
+        elif self._pg is not None:
+            raise RuntimeError(
+                f"Writer on Rank[{os.environ.get('RANK', 0)}] has no "
+                "data, please check your input data."
+            )
         super().close()

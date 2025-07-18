@@ -26,7 +26,7 @@ model_config {
 
 训练完成后，运行如下脚本查看特征重要性:
 
-```
+```bash
 torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=1 --node_rank=0 \
     -m tzrec.tools.feature_selection \
@@ -34,13 +34,12 @@ torchrun --master_addr=localhost --master_port=32555 \
     --model_dir experiments/taobao/dbmtl_ce \
     --topk 100 \
     --output_dir experiments/taobao/dbmtl_ce/output_dir \
-    --clear_variational_dropout true\
-    --visualize false
+    --clear_variational_dropout
 ```
 
 - --pipeline_config_path: 训练用的配置文件路径
 - --model_dir: 模型训练的目录
 - --topk 100: 在训练配置文件钟保存top_k重要的特征
 - --output_dir: 新的模型配置文件以及重要性分析保存的目录
-- --clear_variational_dropout: 新的模型配置文件中是否删除变分dropout的配置，默认true
-- --visualize: 是否画图展示特征重要性，默认false。如果需要，则需要安装matplotlib
+- --clear_variational_dropout: 新的模型配置文件中是否删除变分dropout的配置
+- --visualize: 是否画图展示特征重要性。如果需要，则需要安装matplotlib

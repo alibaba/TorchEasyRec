@@ -10,6 +10,8 @@ message MLP {
     optional string activation = 3 [default = 'nn.ReLU'];
     // use batch normalization
     optional bool use_bn = 4 [default = false];
+    // use bias
+    optional bool bias = 5 [default = true];
 }
 
 message ExtractionNetwork {
@@ -51,6 +53,27 @@ message B2ICapsule {
     optional bool const_caps_num = 8 [default = false];
 }
 
+
+message MaskBlock{
+    // the ratio between aggregation dim and masked input dim
+    optional float reduction_ratio = 1 [default=1.0];
+    // the dim of aggregation layer
+    optional uint32 aggregation_dim = 2;
+    // the dim of hidden ffn layer
+    required uint32 hidden_dim = 3;
+}
+
+message MaskNetModule {
+    // number of mask blocks
+    required uint32 n_mask_blocks = 1;
+    // mask block
+    required MaskBlock mask_block = 2;
+    // mlp layer on top of mask blocks
+    optional MLP top_mlp = 3;
+    // use parallel or serial mask blocks
+    optional bool use_parallel = 4 [default=true];
+
+}
 
 message GRActionEncoder {
     // action embedding dim
@@ -186,7 +209,6 @@ message GRPositionalEncoder {
     // use timestamp encoding or not.
     optional bool use_time_encoding = 3 [default = false];
 }
-
 
 message HSTU {
     // stu config

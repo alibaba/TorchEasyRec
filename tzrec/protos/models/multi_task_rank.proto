@@ -20,16 +20,16 @@ message MMoE {
 }
 
 message DBMTL {
+    // shared bottom MaskNet module
+    optional MaskNetModule mask_net = 6;
     // shared bottom mlp layer
     optional MLP bottom_mlp = 1;
-
     // mmoe expert mlp layer definition
     optional MLP expert_mlp = 2;
     // mmoe gate module definition
     optional MLP gate_mlp = 3;
     // number of mmoe experts
     optional uint32 num_expert = 4 [default=3];
-
     // bayes task tower
     repeated BayesTaskTower task_towers = 5;
 }

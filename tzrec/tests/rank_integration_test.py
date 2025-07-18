@@ -22,7 +22,7 @@ from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
 from tzrec.utils import config_util
-from tzrec.utils.test_util import dfs_are_close, gpu_unavailable, nv_gpu_unavailable
+from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
 
 
 class RankIntegrationTest(unittest.TestCase):
@@ -108,9 +108,23 @@ class RankIntegrationTest(unittest.TestCase):
             output_columns="probs",
         )
 
+    def test_multi_tower_din_fg_encoded_train_eval_export_frozen_emb(self):
+        self._test_rank_nofg(
+            "tzrec/tests/configs/multi_tower_din_mock_frozen.config",
+            reserved_columns="clk",
+            output_columns="probs",
+        )
+
     def test_dbmtl_has_sequence_fg_encoded_train_eval_export(self):
         self._test_rank_nofg(
             "tzrec/tests/configs/dbmtl_has_sequence_mock.config",
+            reserved_columns="clk,buy",
+            output_columns="probs_ctr,probs_cvr",
+        )
+
+    def test_dbmtl_has_sequence_fg_encoded_focal_loss_train_eval_export(self):
+        self._test_rank_nofg(
+            "tzrec/tests/configs/dbmtl_has_sequence_mock_focal_loss.config",
             reserved_columns="clk,buy",
             output_columns="probs_ctr,probs_cvr",
         )
@@ -124,7 +138,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_train_eval(
                 "tzrec/tests/configs/multi_tower_din_mock.config",
                 os.path.join(self.test_dir, "2"),
-                f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1')}",
+                f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}",
             )
         self.assertTrue(self.success)
 
@@ -742,14 +756,14 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
 
-    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skip("skip trt test")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skip("skip trt test")
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",

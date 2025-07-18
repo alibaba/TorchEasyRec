@@ -12,12 +12,11 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import torch
-from torch import Tensor, nn
-from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
-from torchrec.quant import embedding_modules
+
+from tzrec.protos.train_pb2 import TrainConfig
 
 
 def is_input_tile() -> bool:
@@ -159,84 +158,10 @@ def export_acc_config() -> Dict[str, str]:
     return acc_config
 
 
-# fix fp32 quantize
-def _quantize_state_dict(
-    module: nn.Module,
-    table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]],
-    table_name_to_data_type: Dict[str, DataType],
-    table_name_to_num_embeddings_post_pruning: Optional[Dict[str, int]] = None,
-) -> torch.device:
-    device = torch.device("cpu")
-    if not table_name_to_num_embeddings_post_pruning:
-        table_name_to_num_embeddings_post_pruning = {}
-
-    for key, tensor in module.state_dict().items():
-        # Extract table name from state dict key.
-        # e.g. ebc.embedding_bags.t1.weight
-        splits = key.split(".")
-        assert splits[-1] == "weight"
-        table_name = splits[-2]
-        data_type = table_name_to_data_type[table_name]
-        num_rows = tensor.shape[0]
-
-        if table_name in table_name_to_num_embeddings_post_pruning:
-            num_rows = table_name_to_num_embeddings_post_pruning[table_name]
-
-        device = tensor.device
-        num_bits = DATA_TYPE_NUM_BITS[data_type]
-
-        if tensor.is_meta:
-            quant_weight = torch.empty(
-                (num_rows, (tensor.shape[1] * num_bits) // 8),
-                device="meta",
-                dtype=torch.uint8,
-            )
-            if (
-                data_type == DataType.INT8
-                or data_type == DataType.INT4
-                or data_type == DataType.INT2
-            ):
-                scale_shift = torch.empty(
-                    (num_rows, 4),
-                    device="meta",
-                    dtype=torch.uint8,
-                )
-            else:
-                scale_shift = None
-        else:
-            if num_rows != tensor.shape[0]:
-                tensor = tensor[:num_rows, :]
-            if tensor.dtype == torch.float or tensor.dtype == torch.float16:
-                if data_type == DataType.FP16:
-                    if tensor.dtype == torch.float:
-                        tensor = tensor.half()
-                    quant_res = tensor.view(torch.uint8)
-                elif data_type == DataType.FP32:
-                    if tensor.dtype == torch.float16:
-                        tensor = tensor.float()
-                    quant_res = tensor.view(torch.uint8)
-                else:
-                    quant_res = (
-                        torch.ops.fbgemm.FloatOrHalfToFusedNBitRowwiseQuantizedSBHalf(
-                            tensor, num_bits
-                        )
-                    )
-            else:
-                raise Exception("Unsupported dtype: {tensor.dtype}")
-            if (
-                data_type == DataType.INT8
-                or data_type == DataType.INT4
-                or data_type == DataType.INT2
-            ):
-                quant_weight, scale_shift = (
-                    quant_res[:, :-4],
-                    quant_res[:, -4:],
-                )
-            else:
-                quant_weight, scale_shift = quant_res, None
-        table_name_to_quantized_weights[table_name] = (quant_weight, scale_shift)
-    return device
-
-
-# pyre-ignore [9]
-embedding_modules.quantize_state_dict = _quantize_state_dict
+def allow_tf32(train_config: TrainConfig, backend: str) -> None:
+    """Set allow_tf32 flag for cudnn and cuda matmul."""
+    if backend == "nccl":
+        if train_config.HasField("cudnn_allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = train_config.cudnn_allow_tf32
+        if train_config.HasField("cuda_matmul_allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = train_config.cuda_matmul_allow_tf32

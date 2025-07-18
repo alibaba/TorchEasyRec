@@ -10,6 +10,8 @@ message DINEncoder {
     required string input = 2;
     // mlp config for target attention score
     required MLP attn_mlp = 3;
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
 }
 
 message SimpleAttention {
@@ -17,6 +19,8 @@ message SimpleAttention {
     optional string name = 1;
     // sequence feature name
     required string input = 2;
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
 }
 
 message PoolingEncoder {
@@ -26,6 +30,8 @@ message PoolingEncoder {
     required string input = 2;
     // pooling type, sum or mean
     optional string pooling_type = 3 [default = 'mean'];
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
 }
 
 message MultiWindowDINEncoder {

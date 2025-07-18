@@ -30,6 +30,20 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
         self._by_epoch = by_epoch
         super().__init__(optimizer)
 
+    # pyre-ignore [3]
+    def get_lr(self):
+        """Calculates the learning rate."""
+        lrs = self._get_lr()
+        # when base_lr is equal to 0, we freeze lr to 0
+        # instead of using the scheduler lr
+        return [
+            base_lr if base_lr == 0 else lr for base_lr, lr in zip(self.base_lrs, lrs)
+        ]
+
+    def _get_lr(self) -> List[float]:
+        """Calculates the learning rate."""
+        raise NotImplementedError
+
     @property
     def by_epoch(self) -> bool:
         """Schedule by epoch or not."""
@@ -42,8 +56,7 @@ class ConstantLR(BaseLR):
     def __init__(self, optimizer: Optimizer) -> None:
         super().__init__(optimizer, by_epoch=True)
 
-    # pyre-ignore [3]
-    def get_lr(self):
+    def _get_lr(self) -> List[float]:
         """Calculates the learning rate."""
         return self.base_lrs
 
@@ -81,8 +94,7 @@ class ExponentialDecayLR(BaseLR):
         self._min_learning_rate = min_learning_rate
         super().__init__(optimizer, by_epoch=by_epoch)
 
-    # pyre-ignore [3]
-    def get_lr(self):
+    def _get_lr(self) -> List[float]:
         """Calculates the learning rate."""
         step_count = max(self._step_count - 1, 0)
         if step_count < self._warmup_size:
@@ -130,8 +142,7 @@ class ManualStepLR(BaseLR):
         self._warmup = warmup
         super().__init__(optimizer, by_epoch=by_epoch)
 
-    # pyre-ignore [3]
-    def get_lr(self):
+    def _get_lr(self) -> List[float]:
         """Calculates the learning rate."""
         step_count = max(self._step_count - 1, 0)
         idx = bisect.bisect_left(self._schedule_sizes, step_count)

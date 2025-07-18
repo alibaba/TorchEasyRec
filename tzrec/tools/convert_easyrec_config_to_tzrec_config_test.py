@@ -432,6 +432,421 @@ export_config {
 }
 """
 
+EASYREC_CONFIG_SIMPLEMULTITASK = """model_config {
+  model_class: "SimpleMultiTask"
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: DEEP
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  simple_multi_task {
+    task_towers {
+      tower_name: "is_click_video"
+      label_name: "is_click_video"
+      dnn {
+        hidden_units: [256, 192, 128, 64]
+      }
+      num_class: 1
+      weight: 1.0
+      loss_type: CLASSIFICATION
+      metrics_set: {
+       auc {}
+      }
+    }
+    l2_regularization: 0.0
+  }
+  embedding_regularization: 0.0
+}
+export_config {
+  multi_placeholder: true
+}
+"""
+
+EASYREC_CONFIG_MMOE = """model_config {
+  model_class: "MMoE"
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+	feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: DEEP
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  mmoe {
+    expert_dnn {
+      hidden_units: [256, 192, 128, 64]
+    }
+    num_expert: 4
+    task_towers {
+      tower_name: "is_click_video"
+      label_name: "is_click_video"
+      dnn {
+        hidden_units: [256, 192, 128, 64]
+      }
+      num_class: 1
+      weight: 1.0
+      loss_type: CLASSIFICATION
+      metrics_set: {
+       auc {}
+      }
+    }
+    l2_regularization: 1e-06
+  }
+  embedding_regularization: 5e-05
+}
+export_config {
+  multi_placeholder: true
+}
+"""
+
+EASYREC_CONFIG_PLE = """model_config {
+  model_class: "PLE"
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+	feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: DEEP
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  ple {
+    extraction_networks {
+      network_name: "layer1"
+      expert_num_per_task: 3
+      share_num: 3
+
+      task_expert_net {
+        hidden_units: [128, 64, 32]
+      }
+      share_expert_net {
+        hidden_units: [128, 64, 32]
+      }
+    }
+    extraction_networks {
+      network_name: "layer2"
+      expert_num_per_task: 3
+      share_num: 3
+
+      task_expert_net {
+        hidden_units: [64, 32, 16]
+      }
+      share_expert_net {
+        hidden_units: [64, 32, 16]
+      }
+    }
+    extraction_networks {
+      network_name: "layer3"
+      expert_num_per_task: 3
+      share_num: 3
+
+      task_expert_net {
+        hidden_units: [64, 32, 16]
+      }
+      share_expert_net {
+        hidden_units: [64, 32, 16]
+      }
+    }
+
+    task_towers {
+      tower_name: "is_click_video"
+      label_name: "is_click_video"
+      loss_type: CLASSIFICATION
+      metrics_set: {
+        auc {}
+      }
+      dnn {
+        hidden_units: [128, 64, 32]
+      }
+      weight: 1.0
+    }
+    l2_regularization: 1e-6
+  }
+  embedding_regularization: 5e-6
+}
+export_config {
+  multi_placeholder: true
+}
+"""
+
+EASYREC_CONFIG_DEEPFM = """model_config {
+  model_class: "DeepFM"
+  feature_groups {
+    group_name: "wide"
+    feature_names: "user_id"
+	feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: WIDE
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  feature_groups {
+    group_name: "fm"
+    feature_names: "user_id"
+	feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: DEEP
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  deepfm {
+    wide_output_dim: 16
+
+    dnn {
+      hidden_units: [128, 64, 32]
+    }
+
+    final_dnn {
+      hidden_units: [128, 64]
+    }
+    l2_regularization: 1e-5
+  }
+  embedding_regularization: 1e-7
+}
+export_config {
+  multi_placeholder: true
+}
+"""
+
+EASYREC_CONFIG_MULTITOWER = """model_config {
+  model_class: "MultiTower"
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+	feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: DEEP
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  losses {
+    loss_type: F1_REWEIGHTED_LOSS
+    weight: 1.0
+    f1_reweighted_loss {
+      f1_beta_square: 1.0
+    }
+  }
+  losses {
+    loss_type: PAIR_WISE_LOSS
+    weight: 1.0
+  }
+  multi_tower {
+    towers {
+      input: "all"
+      dnn {
+        hidden_units: [256, 128, 96, 64]
+      }
+    }
+    final_dnn {
+      hidden_units: [128, 96, 64, 32, 16]
+    }
+    l2_regularization: 1e-6
+  }
+  embedding_regularization: 1e-4
+}
+export_config {
+  multi_placeholder: true
+}
+"""
+
+EASYREC_CONFIG_DSSM = """model_config {
+  model_class: "DSSM"
+  feature_groups {
+    group_name: "user"
+    feature_names: "user_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    wide_deep: DEEP
+    sequence_features {
+      group_name: "seq_fea_1"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "user_video_sequence"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+    sequence_features {
+      group_name: "seq_fea_2"
+      seq_att_map {
+        key: "item_id"
+        hist_seq: "click_100_seq__item_id"
+		aux_hist_seq: "click_100_seq__ts"
+      }
+      tf_summary: false
+      allow_key_search: false
+    }
+  }
+  feature_groups {
+    group_name: "item"
+	feature_names: "item_id"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    wide_deep: DEEP
+  }
+  dssm {
+    user_tower {
+      id: "user_id"
+      dnn {
+        hidden_units: [256, 128, 64, 32]
+        # dropout_ratio : [0.1, 0.1, 0.1, 0.1]
+      }
+    }
+    item_tower {
+      id: "item_id"
+      dnn {
+        hidden_units: [256, 128, 64, 32]
+      }
+    }
+    simi_func: INNER_PRODUCT
+    l2_regularization: 1e-6
+  }
+  embedding_regularization: 5e-5
+}
+export_config {
+  multi_placeholder: true
+}
+"""
+
 TRAIN_CONFIG = """train_config {
   sparse_optimizer {
     adam_optimizer {
@@ -458,7 +873,6 @@ DATA_CONFIG = """data_config {
   label_fields: "is_click_cover"
   label_fields: "is_click_video"
   num_workers: 8
-  odps_data_quota_name: ""
 }
 """
 
@@ -805,6 +1219,432 @@ MODEL_CONFIG = """model_config {
 }
 """
 
+MODEL_CONFIG_SIMPLEMULTITASK = """model_config {
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: DEEP
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  simple_multi_task {
+    task_towers {
+      tower_name: "is_click_video"
+      label_name: "is_click_video"
+      metrics {
+        auc {
+        }
+      }
+      num_class: 1
+      mlp {
+        hidden_units: 256
+        hidden_units: 192
+        hidden_units: 128
+        hidden_units: 64
+        use_bn: true
+      }
+    }
+  }
+}
+"""
+
+MODEL_CONFIG_MMOE = """model_config {
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: DEEP
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  mmoe {
+    expert_mlp {
+      hidden_units: 256
+      hidden_units: 192
+      hidden_units: 128
+      hidden_units: 64
+      use_bn: true
+    }
+    gate_mlp {
+      hidden_units: 256
+      hidden_units: 192
+      hidden_units: 128
+      hidden_units: 64
+      use_bn: true
+    }
+    num_expert: 4
+    task_towers {
+      tower_name: "is_click_video"
+      label_name: "is_click_video"
+      metrics {
+        auc {
+        }
+      }
+      num_class: 1
+      mlp {
+        hidden_units: 256
+        hidden_units: 192
+        hidden_units: 128
+        hidden_units: 64
+        use_bn: true
+      }
+    }
+  }
+}
+"""
+
+MODEL_CONFIG_PLE = """model_config {
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: DEEP
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  ple {
+    task_towers {
+      tower_name: "is_click_video"
+      label_name: "is_click_video"
+      metrics {
+        auc {
+        }
+      }
+      num_class: 1
+      mlp {
+        hidden_units: 128
+        hidden_units: 64
+        hidden_units: 32
+        use_bn: true
+      }
+    }
+  }
+}
+"""
+
+MODEL_CONFIG_DEEPFM = """model_config {
+  feature_groups {
+    group_name: "wide"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: WIDE
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  feature_groups {
+    group_name: "fm"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: DEEP
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  deepfm {
+    deep {
+      hidden_units: 128
+      hidden_units: 64
+      hidden_units: 32
+      use_bn: true
+    }
+    final {
+      hidden_units: 128
+      hidden_units: 64
+      use_bn: true
+    }
+    wide_embedding_dim: 16
+  }
+}
+"""
+
+MODEL_CONFIG_MULTITOWER = """model_config {
+  feature_groups {
+    group_name: "all"
+    feature_names: "user_id"
+    feature_names: "item_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: DEEP
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  multi_tower {
+    towers {
+      input: "all"
+      mlp {
+        hidden_units: 256
+        hidden_units: 128
+        hidden_units: 96
+        hidden_units: 64
+        use_bn: true
+      }
+    }
+    final {
+      hidden_units: 128
+      hidden_units: 96
+      hidden_units: 64
+      hidden_units: 32
+      hidden_units: 16
+      use_bn: true
+    }
+  }
+}
+"""
+
+MODEL_CONFIG_DSSM = """model_config {
+  feature_groups {
+    group_name: "user"
+    feature_names: "user_id"
+    feature_names: "user_blue_level"
+    feature_names: "host_price_level"
+    feature_names: "combo_user_blue_level_x_host_price_level"
+    group_type: DEEP
+    sequence_groups {
+      group_name: "seq_fea_1"
+      feature_names: "item_id"
+      feature_names: "user_video_sequence"
+    }
+    sequence_groups {
+      group_name: "seq_fea_2"
+      feature_names: "item_id"
+      feature_names: "click_100_seq__item_id"
+      feature_names: "click_100_seq__ts"
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_1"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+    sequence_encoders {
+      din_encoder {
+        input: "seq_fea_2"
+        attn_mlp {
+          use_bn: true
+        }
+      }
+    }
+  }
+  feature_groups {
+    group_name: "item"
+    feature_names: "item_id"
+    feature_names: "item__kv_user_blue_level_exposure_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_focus_cnt_7d"
+    feature_names: "item__kv_user_blue_level_click_video_div_exposure_cnt_30d"
+    group_type: DEEP
+  }
+  dssm {
+    user_tower {
+      input: "user_id"
+      mlp {
+        hidden_units: 256
+        hidden_units: 128
+        hidden_units: 64
+        hidden_units: 32
+        use_bn: true
+      }
+    }
+    item_tower {
+      input: "item_id"
+      mlp {
+        hidden_units: 256
+        hidden_units: 128
+        hidden_units: 64
+        hidden_units: 32
+        use_bn: true
+      }
+    }
+    output_dim: 32
+  }
+}
+"""
+
 
 class ConvertConfigTest(unittest.TestCase):
     def setUp(self):
@@ -859,6 +1699,94 @@ class ConvertConfigTest(unittest.TestCase):
         config = convert._create_model_config(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, MODEL_CONFIG)
+
+    def test_create_model_config_simplemultitask(self):
+        self.easyrec_simplemultitask_path = os.path.join(
+            self.test_dir, "easyrec_simplemultitask.config"
+        )
+        self.tzrec_simplemultitask_path = os.path.join(
+            self.test_dir, "tzrec_simplemultitask.config"
+        )
+        with open(self.easyrec_simplemultitask_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_SIMPLEMULTITASK)
+        convert_simplemultitask = ConvertConfig(
+            self.easyrec_simplemultitask_path,
+            self.tzrec_simplemultitask_path,
+            self.fg_path,
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert_simplemultitask._create_model_config(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, MODEL_CONFIG_SIMPLEMULTITASK)
+
+    def test_create_model_config_mmoe(self):
+        self.easyrec_mmoe_path = os.path.join(self.test_dir, "easyrec_mmoe.config")
+        self.tzrec_mmoe_path = os.path.join(self.test_dir, "tzrec_mmoe.config")
+        with open(self.easyrec_mmoe_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_MMOE)
+        convert_mmoe = ConvertConfig(
+            self.easyrec_mmoe_path, self.tzrec_mmoe_path, self.fg_path
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert_mmoe._create_model_config(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, MODEL_CONFIG_MMOE)
+
+    def test_create_model_config_ple(self):
+        self.easyrec_ple_path = os.path.join(self.test_dir, "easyrec_ple.config")
+        self.tzrec_ple_path = os.path.join(self.test_dir, "tzrec_ple.config")
+        with open(self.easyrec_ple_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_PLE)
+        convert_ple = ConvertConfig(
+            self.easyrec_ple_path, self.tzrec_ple_path, self.fg_path
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert_ple._create_model_config(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, MODEL_CONFIG_PLE)
+
+    def test_create_model_config_deepfm(self):
+        self.easyrec_deepfm_path = os.path.join(self.test_dir, "easyrec_deepfm.config")
+        self.tzrec_deepfm_path = os.path.join(self.test_dir, "tzrec_deepfm.config")
+        with open(self.easyrec_deepfm_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_DEEPFM)
+        convert_deepfm = ConvertConfig(
+            self.easyrec_deepfm_path, self.tzrec_deepfm_path, self.fg_path
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert_deepfm._create_model_config(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, MODEL_CONFIG_DEEPFM)
+
+    def test_create_model_config_multitower(self):
+        self.easyrec_multitower_path = os.path.join(
+            self.test_dir, "easyrec_multitower.config"
+        )
+        self.tzrec_multitower_path = os.path.join(
+            self.test_dir, "tzrec_multitower.config"
+        )
+        with open(self.easyrec_multitower_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_MULTITOWER)
+        convert_multitower = ConvertConfig(
+            self.easyrec_multitower_path, self.tzrec_multitower_path, self.fg_path
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert_multitower._create_model_config(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, MODEL_CONFIG_MULTITOWER)
+
+    def test_create_model_config_dssm(self):
+        self.easyrec_dssm_path = os.path.join(self.test_dir, "easyrec_dssm.config")
+        self.tzrec_dssm_path = os.path.join(self.test_dir, "tzrec_dssm.config")
+        with open(self.easyrec_dssm_path, "w", encoding="utf-8") as f:
+            f.write(EASYREC_CONFIG_DSSM)
+        convert_dssm = ConvertConfig(
+            self.easyrec_dssm_path, self.tzrec_dssm_path, self.fg_path
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert_dssm._create_model_config(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, MODEL_CONFIG_DSSM)
 
     def _run_env(self):
         return {"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}

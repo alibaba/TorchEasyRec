@@ -7,7 +7,7 @@
 TorchEasyRec查询Nightly版本
 
 ```bash
-pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
 ### 本地Conda安装
@@ -15,11 +15,11 @@ pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-pip install fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124
-pip install torchmetrics==1.0.3
-pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cu124
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu126
+pip install fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126
+pip install torchmetrics==1.0.3 tensordict
+pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cu126
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
 ### Docker镜像启动 (推荐)
@@ -27,14 +27,14 @@ pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyu
 ```bash
 docker run -td --gpus all --shm-size 10gb  --network host mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}
 docker exec -it <CONTAINER_ID> bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
 注：
 
 ```
-GPU版本（CUDA 12.4) 镜像地址：
-  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu124
+GPU版本（CUDA 12.6) 镜像地址：
+  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu126
 CPU版本 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cpu
 ```

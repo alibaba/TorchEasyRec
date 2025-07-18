@@ -17,6 +17,7 @@ from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.models.model import BaseModel
@@ -76,7 +77,11 @@ class RankModel(BaseModel):
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(
-            self._features, list(self._base_model_config.feature_groups)
+            self._features,
+            list(self._base_model_config.feature_groups),
+            wide_embedding_dim=int(self.wide_embedding_dim)
+            if hasattr(self, "wide_embedding_dim")
+            else None,
         )
 
         if self._base_model_config.HasField("variational_dropout"):
@@ -125,7 +130,7 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         predictions = {}
         loss_type = loss_cfg.WhichOneof("loss")
-        if loss_type == "binary_cross_entropy":
+        if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
             assert num_class == 1, f"num_class must be 1 when loss type is {loss_type}"
             output = torch.squeeze(output, dim=1)
             predictions["logits" + suffix] = output
@@ -146,6 +151,7 @@ class RankModel(BaseModel):
             predictions["probs" + suffix] = probs
             predictions["probs1" + suffix] = probs[:, 1]
         elif loss_type == "l2_loss":
+            output = torch.squeeze(output, dim=1)
             predictions["y" + suffix] = output
         else:
             raise NotImplementedError
@@ -174,6 +180,12 @@ class RankModel(BaseModel):
         loss_name = loss_type + suffix
         if loss_type == "binary_cross_entropy":
             self._loss_modules[loss_name] = nn.BCEWithLogitsLoss(reduction=reduction)
+        elif loss_type == "binary_focal_loss":
+            self._loss_modules[loss_name] = BinaryFocalLoss(
+                gamma=loss_cfg.binary_focal_loss.gamma,
+                alpha=loss_cfg.binary_focal_loss.alpha,
+                reduction=reduction,
+            )
         elif loss_type == "softmax_cross_entropy":
             self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
         elif loss_type == "jrc_loss":
@@ -206,7 +218,7 @@ class RankModel(BaseModel):
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        if loss_type == "binary_cross_entropy":
+        if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
             pred = predictions["logits" + suffix]
             label = label.to(torch.float32)
             losses[loss_name] = self._loss_modules[loss_name](pred, label)

@@ -229,6 +229,8 @@ class MatchFeature(BaseFeature):
 
         if fg_cfg["needDiscrete"]:
             fg_cfg["value_dim"] = self.value_dim
+        if self.config.HasField("fg_value_type"):
+            fg_cfg["value_type"] = self.config.fg_value_type
         #     del fg_cfg["combiner"]
         return [fg_cfg]
 

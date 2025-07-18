@@ -75,4 +75,6 @@ message MIND {
     optional float simi_pow = 3 [default=10];
     optional Similarity similarity = 4 [default=COSINE];
     optional bool in_batch_negative = 5 [default = false];
+    optional float temperature = 6 [default = 1.0];
+    required int32 output_dim = 7;
 }

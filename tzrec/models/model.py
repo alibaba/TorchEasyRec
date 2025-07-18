@@ -11,7 +11,6 @@
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from collections import OrderedDict
-from itertools import chain
 from queue import Queue
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -127,21 +126,44 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric.reset()
         return metric_results
 
-    def sparse_parameters(self) -> Iterable[nn.Parameter]:
+    def sparse_parameters(
+        self,
+    ) -> Tuple[Iterable[nn.Parameter], Iterable[nn.Parameter]]:
         """Get an iterator over sparse parameters of the module."""
         q = Queue()
         q.put(self)
-        parameters_list = []
+        trainable_parameters_list = []
+        frozen_parameters_list = []
         while not q.empty():
             m = q.get()
-            if isinstance(m, EmbeddingBagCollectionInterface) or isinstance(
-                m, EmbeddingCollectionInterface
-            ):
-                parameters_list.append(m.parameters())
+            if isinstance(m, EmbeddingBagCollectionInterface):
+                frozen_names = {
+                    f".{t.name}.weight"
+                    for t in m.embedding_bag_configs()
+                    if not t.trainable
+                }
+                for name, param in m.named_parameters():
+                    frozen = any(map(lambda x: name.endswith(x), frozen_names))
+                    if frozen:
+                        frozen_parameters_list.append(param)
+                    else:
+                        trainable_parameters_list.append(param)
+            elif isinstance(m, EmbeddingCollectionInterface):
+                frozen_names = {
+                    f".{t.name}.weight"
+                    for t in m.embedding_configs()
+                    if not t.trainable
+                }
+                for name, param in m.named_parameters():
+                    frozen = any(map(lambda x: name.endswith(x), frozen_names))
+                    if frozen:
+                        frozen_parameters_list.append(param)
+                    else:
+                        trainable_parameters_list.append(param)
             else:
                 for child in m.children():
                     q.put(child)
-        return chain.from_iterable(parameters_list)
+        return trainable_parameters_list, frozen_parameters_list
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model."""
@@ -184,7 +206,7 @@ TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]
 TRAIN_FWD_TYPE = Tuple[torch.Tensor, TRAIN_OUT_TYPE]
 
 
-class TrainWrapper(nn.Module):
+class TrainWrapper(BaseModule):
     """Model train wrapper for pipeline."""
 
     def __init__(self, module: nn.Module) -> None:
@@ -214,14 +236,19 @@ class TrainWrapper(nn.Module):
         return total_loss, (losses, predictions, batch)
 
 
-class ScriptWrapper(nn.Module):
+class ScriptWrapper(BaseModule):
     """Model inference wrapper for jit.script."""
 
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
         self._features = self.model._features
-        self._data_parser = DataParser(self._features)
+        self._data_parser = DataParser(
+            self._features,
+            sampler_type=str(module.sampler_type)
+            if hasattr(module, "sampler_type")
+            else None,
+        )
 
     def get_batch(
         self,

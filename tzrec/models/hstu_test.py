@@ -26,7 +26,8 @@ from tzrec.protos import (
     tower_pb2,
 )
 from tzrec.protos.models import match_model_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class HSTUTest(unittest.TestCase):
@@ -84,7 +85,12 @@ class HSTUTest(unittest.TestCase):
                 )
             ],
         )
-        hstu = HSTUMatch(model_config=model_config, features=features, labels=["label"])
+        hstu = HSTUMatch(
+            model_config=model_config,
+            features=features,
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
         init_parameters(hstu, device=torch.device("cpu"))
         hstu = create_test_model(hstu, graph_type)
 

@@ -24,3 +24,12 @@ class Mode(Enum):
 EASYREC_VERSION = "0.7.5"
 
 PREDICT_QUEUE_TIMEOUT = int(os.environ.get("PREDICT_QUEUE_TIMEOUT") or 600)
+
+TENSORBOARD_SUMMARIES = [
+    "loss",
+    "learning_rate",
+    "parameter",
+    "global_gradient_norm",
+    "gradient_norm",
+    "gradient",
+]

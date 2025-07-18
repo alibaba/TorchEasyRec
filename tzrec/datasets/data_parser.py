@@ -21,7 +21,9 @@ import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.acc.utils import is_cuda_export, is_input_tile, is_input_tile_emb
+from tzrec.constant import Mode
 from tzrec.datasets.utils import (
+    HARD_NEG_INDICES,
     Batch,
     DenseData,
     SequenceDenseData,
@@ -44,10 +46,12 @@ class DataParser:
     Args:
         features (list): a list of features.
         labels (list, optional): a list of label names.
-        is_training (bool): is training or not.
+        sample_weights (list, optional): a list of sample weights.
+        mode (Mode): train or eval or predict.
         fg_threads (int): fg thread number.
         force_base_data_group (bool): force padding data into same
             data group with same batch_size.
+        sampler_type: (str): negative sampler type
     """
 
     def __init__(
@@ -55,14 +59,16 @@ class DataParser:
         features: List[BaseFeature],
         labels: Optional[List[str]] = None,
         sample_weights: Optional[List[str]] = None,
-        is_training: bool = False,
+        mode: Mode = Mode.EVAL,
         fg_threads: int = 1,
         force_base_data_group: bool = False,
+        sampler_type: Optional[str] = None,
     ) -> None:
         self._features = features
         self._labels = labels or []
         self._sample_weights = sample_weights or []
-        self._is_training = is_training
+        self._mode = mode
+        self._is_training = mode == Mode.TRAIN
         self._force_base_data_group = force_base_data_group
 
         self._fg_mode = features[0].fg_mode
@@ -75,6 +81,8 @@ class DataParser:
         self.sequence_mulval_sparse_keys = defaultdict(list)
         self.sequence_dense_keys = []
         self.has_weight_keys = defaultdict(list)
+
+        self.sampler_type = sampler_type
 
         for feature in self._features:
             if feature.is_sequence:
@@ -196,15 +204,20 @@ class DataParser:
                     f"sample weight column [{weight_name}] should be float dtype."
                 )
 
+        if HARD_NEG_INDICES in input_data.keys():
+            output_data[HARD_NEG_INDICES] = torch.tensor(
+                input_data[HARD_NEG_INDICES].tolist(), dtype=torch.int32
+            )
         return output_data
 
     def _parse_feature_normal(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
     ) -> None:
+        # when mode = predict, we will not do negative sampling, so that we should not
+        # pad parsed features.
+        pad_to_max_bs = self._mode != Mode.PREDICT and self._force_base_data_group
         max_batch_size = (
-            max([len(v) for v in input_data.values()])
-            if self._force_base_data_group
-            else 0
+            max([len(v) for v in input_data.values()]) if pad_to_max_bs else 0
         )
 
         for feature in self._features:
@@ -212,7 +225,7 @@ class DataParser:
 
             if isinstance(feat_data, SequenceSparseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.seq_lengths = np.pad(
                         feat_data.seq_lengths,
                         (0, max_batch_size - len(feat_data.seq_lengths)),
@@ -226,7 +239,7 @@ class DataParser:
                     )
             elif isinstance(feat_data, SequenceDenseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.seq_lengths = np.pad(
                         feat_data.seq_lengths,
                         (0, max_batch_size - len(feat_data.seq_lengths)),
@@ -236,7 +249,7 @@ class DataParser:
                 )
             elif isinstance(feat_data, SparseData):
                 output_data[f"{feature.name}.values"] = _to_tensor(feat_data.values)
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.lengths = np.pad(
                         feat_data.lengths, (0, max_batch_size - len(feat_data.lengths))
                     )
@@ -246,7 +259,7 @@ class DataParser:
                         feat_data.weights
                     )
             elif isinstance(feat_data, DenseData):
-                if self._force_base_data_group:
+                if pad_to_max_bs:
                     feat_data.values = np.pad(
                         feat_data.values,
                         ((0, max_batch_size - len(feat_data.values)), (0, 0)),
@@ -256,16 +269,17 @@ class DataParser:
     def _parse_feature_fg_handler(
         self, input_data: Dict[str, pa.Array], output_data: Dict[str, torch.Tensor]
     ) -> None:
+        # when mode = predict, we will not do negative sampling, so that we should not
+        # pad parsed features.
+        pad_to_max_bs = self._mode != Mode.PREDICT and self._force_base_data_group
         max_batch_size = (
-            max([len(v) for v in input_data.values()])
-            if self._force_base_data_group
-            else 0
+            max([len(v) for v in input_data.values()]) if pad_to_max_bs else 0
         )
 
-        input_data = {
+        input_data_fg = {
             k: v for k, v in input_data.items() if k in self.feature_input_names
         }
-        fg_output, status = self._fg_handler.process_arrow(input_data)
+        fg_output, status = self._fg_handler.process_arrow(input_data_fg)
         assert status.ok(), status.message()
         for feature in self._features:
             feat_name = feature.name
@@ -274,7 +288,7 @@ class DataParser:
                 if feature.is_sparse:
                     output_data[f"{feat_name}.values"] = _to_tensor(feat_data.np_values)
                     feat_lengths = feat_data.np_lengths
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         feat_lengths = np.pad(
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
@@ -288,7 +302,7 @@ class DataParser:
                         feat_data.dense_values
                     )
                     feat_lengths = feat_data.np_lengths
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         feat_lengths = np.pad(
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
@@ -297,7 +311,7 @@ class DataParser:
                 if feature.is_sparse:
                     output_data[f"{feat_name}.values"] = _to_tensor(feat_data.np_values)
                     feat_lengths = feat_data.np_lengths
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         feat_lengths = np.pad(
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
@@ -308,7 +322,7 @@ class DataParser:
                         )
                 else:
                     dense_values = feat_data.dense_values
-                    if self._force_base_data_group:
+                    if pad_to_max_bs:
                         dense_values = np.pad(
                             dense_values,
                             ((0, max_batch_size - len(dense_values)), (0, 0)),
@@ -379,6 +393,13 @@ class DataParser:
         for weight in self._sample_weights:
             sample_weights[weight] = input_data[weight]
 
+        additional_infos = {}
+        if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
+            try:
+                additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
+            except Exception:
+                print(f"{HARD_NEG_INDICES} is ignored.")
+
         batch = Batch(
             dense_features=dense_features,
             sparse_features=sparse_features,
@@ -388,7 +409,9 @@ class DataParser:
             sample_weights=sample_weights,
             # pyre-ignore [6]
             tile_size=tile_size,
+            additional_infos=additional_infos,
         )
+
         return batch
 
     def _to_dense_features(
@@ -755,30 +778,64 @@ class DataParser:
         feature_rows = defaultdict(dict)
         for f in self._features:
             if f.is_sparse:
-                lengths = input_data[f"{f.name}.lengths"]
-                values = input_data[f"{f.name}.values"].cpu().numpy()
-                cnt = 0
-                # pyre-ignore [16]
-                sep = f.sequence_delim if f.is_sequence else ","
-                for i, ll in enumerate(lengths):
-                    cur_v = values[cnt : cnt + ll]
-                    cnt += ll
-                    feature_rows[i][f.name] = sep.join(cur_v.astype(str))
+                if f.is_sequence:
+                    lengths = input_data[f"{f.name}.lengths"]
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
+                    if f.value_dim != 1:
+                        key_lengths = input_data[f"{f.name}.key_lengths"].cpu().numpy()
+                    else:
+                        key_lengths = np.ones_like(values, dtype=np.int32)
+                    kl_cnt = 0
+                    cnt = 0
+                    for i, ll in enumerate(lengths):
+                        if ll > 0:
+                            cur_kl_cumsum = np.cumsum(key_lengths[kl_cnt : kl_cnt + ll])
+                            cur_kl_sum = cur_kl_cumsum[-1]
+                            cur_v = map(
+                                ",".join,
+                                np.split(
+                                    values[cnt : cnt + cur_kl_sum], cur_kl_cumsum[:-1]
+                                ),
+                            )
+                            kl_cnt += ll
+                            cnt += cur_kl_sum
+                        else:
+                            cur_v = []
+                        # pyre-ignore [16]
+                        feature_rows[i][f.name] = f.sequence_delim.join(cur_v)
+                else:
+                    lengths = input_data[f"{f.name}.lengths"]
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
+                    weights = None
+                    if f.is_weighted:
+                        weights = (
+                            input_data[f"{f.name}.weights"].cpu().numpy().astype(str)
+                        )
+                    cnt = 0
+                    for i, ll in enumerate(lengths):
+                        cur_v = values[cnt : cnt + ll]
+                        if weights is not None:
+                            cur_w = weights[cnt : cnt + ll]
+                            cur_v = sorted(
+                                map(lambda x: f"{x[0]}:{x[1]}", zip(cur_v, cur_w))
+                            )
+                        cnt += ll
+                        feature_rows[i][f.name] = ",".join(cur_v)
             else:
                 if f.is_sequence:
                     lengths = input_data[f"{f.name}.lengths"]
-                    values = input_data[f"{f.name}.values"].cpu().numpy()
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
                     cnt = 0
                     for i, ll in enumerate(lengths):
                         cur_v = values[cnt : cnt + ll]
                         cnt += ll
                         feature_rows[i][f.name] = f.sequence_delim.join(
-                            map(",".join, cur_v.astype(str))
+                            map(",".join, cur_v)
                         )
                 else:
-                    values = input_data[f"{f.name}.values"].cpu().numpy()
+                    values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
                     for i, cur_v in enumerate(values):
-                        feature_rows[i][f.name] = ",".join(cur_v.astype(str))
+                        feature_rows[i][f.name] = ",".join(cur_v)
 
         result = []
         for i in range(len(feature_rows)):

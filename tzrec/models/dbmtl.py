@@ -17,6 +17,7 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.multi_task_rank import MultiTaskRank
+from tzrec.modules.masknet import MaskNetModule
 from tzrec.modules.mlp import MLP
 from tzrec.modules.mmoe import MMoE as MMoEModule
 from tzrec.protos.model_pb2 import ModelConfig
@@ -52,6 +53,13 @@ class DBMTL(MultiTaskRank):
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
         feature_in = self.embedding_group.group_total_dim(self.group_name)
+
+        self.mask_net = None
+        if self._model_config.HasField("mask_net"):
+            self.mask_net = MaskNetModule(
+                feature_in, **config_to_kwargs(self._model_config.mask_net)
+            )
+            feature_in = self.mask_net.output_dim()
 
         self.bottom_mlp = None
         if self._model_config.HasField("bottom_mlp"):
@@ -126,6 +134,8 @@ class DBMTL(MultiTaskRank):
         grouped_features = self.build_input(batch)
 
         net = grouped_features[self.group_name]
+        if self.mask_net is not None:
+            net = self.mask_net(net)
         if self.bottom_mlp is not None:
             net = self.bottom_mlp(net)
 

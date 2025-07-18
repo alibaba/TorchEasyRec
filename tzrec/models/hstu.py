@@ -198,12 +198,12 @@ class HSTUMatch(MatchModel):
         }
         user_tower_emb = self.user_tower(user_group_features)
         ui_sim = (
-            self.sim(user_tower_emb, item_tower_emb, neg_for_each_sample=True)
+            self.simi(user_tower_emb, item_tower_emb, neg_for_each_sample=True)
             / self._model_config.temperature
         )
         return {"similarity": ui_sim}
 
-    def sim(
+    def simi(
         self,
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,

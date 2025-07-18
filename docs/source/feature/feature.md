@@ -20,6 +20,8 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **fg_encoded_default_value**: FG编码后的数据的默认值，当fg_encoded=true并且不是用pai-fg编码数据时，可以设置该参数填充空值
 
+- **trainable**: Embedding Variable是否可训练，默认为true
+
 ## IdFeature: 类别型特征
 
 类别型特征，例如手机品牌、item_id、user_id、年龄段、星座等，一般在表里面存储的类型一般是string、bigint、array<string>或array<bigint>。可支持多值Id特征
@@ -74,7 +76,12 @@ feature_configs {
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 
-  - `input_side`可以取值为`user`/`item`/`context`，用于指导推荐模型服务从哪里获取相关特征，`user`表示这个特征是用户侧特征，从请求中获取，`item`表示是物品侧特征，可以从模型服务内存Cache中获取，`context`表示是需从请求里传递的物品侧特征，如召回名等
+  - `input_side`一共支持五种 \[`user`, `item`, `context`, `feature`, `const`\]
+    - `user`: 用户侧特征输入，线上推理时从请求中传入
+    - `item`: 物品侧特征输入，线上推理时会从实时缓存在内存中的特征表里获取
+    - `context`: 由上下文产生物品侧特征输入，线上推理时从请求中传入，如`recall_name`等
+    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果
+    - `const`: 输入为常量
   - `input_name`为来源字段的实际名称
 
 - **hash_bucket_size**: hash bucket的大小。为减少hash冲突，建议设置
@@ -112,7 +119,7 @@ feature_configs {
 }
 ```
 
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为`user`/`item`/`context`，`input_name`为来源字段的名称
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为\[`user`, `item`, `context`, `feature`, `const`\]，`input_name`为来源字段的名称
 
 - **normalizer**: 指定连续值特征的变换方式，支持4种，默认不变换
 
@@ -308,39 +315,68 @@ feature_configs: {
 
 - **expression**: 表达式本身
 
-- **内置函数**:
+- **内置函数**: 详见[表达式文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/built-in-feature-operator?#1d09c2da3aajb)
 
-  | 函数名      | 参数数量 | 解释                                   |
-  | ----------- | -------- | -------------------------------------- |
-  | sin         | 1        | sine function                          |
-  | cos         | 1        | cosine function                        |
-  | tan         | 1        | tangens function                       |
-  | asin        | 1        | arcus sine function                    |
-  | acos        | 1        | arcus cosine function                  |
-  | atan        | 1        | arcus tangens function                 |
-  | sinh        | 1        | hyperbolic sine function               |
-  | cosh        | 1        | hyperbolic cosine                      |
-  | tanh        | 1        | hyperbolic tangens function            |
-  | asinh       | 1        | hyperbolic arcus sine function         |
-  | acosh       | 1        | hyperbolic arcus tangens function      |
-  | atanh       | 1        | hyperbolic arcur tangens function      |
-  | log2        | 1        | logarithm to the base 2                |
-  | log10       | 1        | logarithm to the base 10               |
-  | log         | 1        | logarithm to base e (2.71828...)       |
-  | ln          | 1        | logarithm to base e (2.71828...)       |
-  | exp         | 1        | e raised to the power of x             |
-  | sqrt        | 1        | square root of a value                 |
-  | sign        | 1        | sign function -1 if x\<0; 1 if x>0     |
-  | rint        | 1        | round to nearest integer               |
-  | abs         | 1        | absolute value                         |
-  | sigmoid     | 1        | sigmoid function                       |
-  | l2_norm     | 1        | l2 normalize of a vector               |
-  | dot         | 2        | dot product of two vectors             |
-  | euclid_dist | 2        | euclidean distance between two vectors |
-  | min         | var.     | min of all arguments                   |
-  | max         | var.     | max of all arguments                   |
-  | sum         | var.     | sum of all arguments                   |
-  | avg         | var.     | mean value of all arguments            |
+  | 函数名      | 参数数量 | 解释                                                                    |
+  | ----------- | -------- | ----------------------------------------------------------------------- |
+  | rnd         | 0        | Generate a random number between 0 and 1                                |
+  | sin         | 1        | sine function                                                           |
+  | cos         | 1        | cosine function                                                         |
+  | tan         | 1        | tangens function                                                        |
+  | asin        | 1        | arcus sine function                                                     |
+  | acos        | 1        | arcus cosine function                                                   |
+  | atan        | 1        | arcus tangens function                                                  |
+  | sinh        | 1        | hyperbolic sine function                                                |
+  | cosh        | 1        | hyperbolic cosine                                                       |
+  | tanh        | 1        | hyperbolic tangens function                                             |
+  | asinh       | 1        | hyperbolic arcus sine function                                          |
+  | acosh       | 1        | hyperbolic arcus tangens function                                       |
+  | atanh       | 1        | hyperbolic arcur tangens function                                       |
+  | log2        | 1        | logarithm to the base 2                                                 |
+  | log10       | 1        | logarithm to the base 10                                                |
+  | log         | 1        | logarithm to base e (2.71828...)                                        |
+  | ln          | 1        | logarithm to base e (2.71828...)                                        |
+  | exp         | 1        | e raised to the power of x                                              |
+  | sqrt        | 1        | square root of a value                                                  |
+  | sign        | 1        | sign function -1 if x\<0; 1 if x>0                                      |
+  | abs         | 1        | absolute value                                                          |
+  | rint        | 1        | round to nearest integer                                                |
+  | floor       | 1        | 向下取整                                                                |
+  | ceil        | 1        | 向上取整                                                                |
+  | trunc       | 1        | 截断取整（直接去掉小数部分）                                            |
+  | round       | 1        | 四舍五入，总是使用"远离零"的舍入方式（round half away from zero）       |
+  | roundp      | 2        | 自定义精度取整函数, e.g. roundp(3.14159,2)=3.14                         |
+  | sigmoid     | 1        | sigmoid function                                                        |
+  | sphere_dist | 4        | sphere distance between two gps points, args(lng1, lat1, lng2, lat2)    |
+  | haversine   | 4        | haversine distance between two gps points, args(lng1, lat1, lng2, lat2) |
+  | sigmoid     | 1        | sigmoid function                                                        |
+  | min         | var.     | min of all arguments                                                    |
+  | max         | var.     | max of all arguments                                                    |
+  | sum         | var.     | sum of all arguments                                                    |
+  | avg         | var.     | mean value of all arguments                                             |
+
+备注：上述内置函数支持批量计算和广播机制
+
+- **内置向量函数**:
+
+  | 函数名       | 参数数量 | 解释                                                  |
+  | ------------ | -------- | ----------------------------------------------------- |
+  | len          | 1        | the length of a vector                                |
+  | l2_norm      | 1        | l2 normalize of a vector                              |
+  | squared_norm | 1        | squared normalize of a vector                         |
+  | dot          | 2        | dot product of two vectors                            |
+  | euclid_dist  | 2        | euclidean distance between two vectors                |
+  | std_dev      | 1        | standard deviation of a vector, divide n              |
+  | pop_std_dev  | 1        | population standard deviation of a vector, divide n-1 |
+  | variance     | 1        | sample variance of a vector, divide n                 |
+  | pop_variance | 1        | population variance of a vector, divide n-1           |
+  | reduce_min   | 1        | reduce min of a vector                                |
+  | reduce_max   | 1        | reduce max of a vector                                |
+  | reduce_sum   | 1        | reduce sum of a vector                                |
+  | reduce_mean  | 1        | reduce mean of a vector                               |
+  | reduce_prod  | 1        | reduce product of a vector                            |
+
+备注：当表达式包含上述内置向量函数时，非向量函数参数的其他变量只能是单值类型(scalar)。
 
 - **内置二元操作符**:
 
@@ -400,12 +436,17 @@ feature_configs: {
 
 - **method**: 重合计算方式，可选 query_common_ratio | title_common_ratio | is_contain | is_equal
 
-  | 方式               | 描述                                          | 备注                           |
-  | ------------------ | --------------------------------------------- | ------------------------------ |
-  | query_common_ratio | 计算query与title间重复term数占query中term比例 | 取值为[0,1]                    |
-  | title_common_ratio | 计算query与title间重复term数占title中term比例 | 取值为[0,1]                    |
-  | is_contain         | 计算query是否全部包含在title中，保持顺序      | 0表示未包含，1表示包含         |
-  | is_equal           | 计算query是否与title完全相同                  | 0表示不完全相同，1表示完全相同 |
+  | 方式                | 描述                                                        | 备注                                                          |
+  | ------------------- | ----------------------------------------------------------- | ------------------------------------------------------------- |
+  | query_common_ratio  | 计算query与title间重复term数占query中term比例               | 取值为[0,1]                                                   |
+  | title_common_ratio  | 计算query与title间重复term数占title中term比例               | 取值为[0,1]                                                   |
+  | is_contain          | 计算query是否全部包含在title中，保持顺序                    | 0表示未包含，1表示包含                                        |
+  | is_equal            | 计算query是否与title完全相同                                | 0表示不完全相同，1表示完全相同                                |
+  | index_of            | 计算query作为整体第一次出现在title中的位置                  | 没有出现返回-1.0                                              |
+  | proximity_min_cover | 计算query term在title中的邻近度                             | 取值为[0, length(title)], 0表示存在不能匹配的term             |
+  | proximity_min_dist  | 计算query term在title中的邻近度 (minimum pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
+  | proximity_max_dist  | 计算query term在title中的邻近度 (maximum pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
+  | proximity_avg_dist  | 计算query term在title中的邻近度 (average pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
 
 - 其余配置同RawFeature
 

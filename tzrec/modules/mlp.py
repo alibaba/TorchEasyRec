@@ -28,6 +28,7 @@ class Perceptron(nn.Module):
             the activation function to apply to the output of linear transformation.
             Default: torch.nn.Relu.
         use_bn (bool): use batch_norm or not.
+        bias (bool): if set to False, the layer will not learn an additive bias.
         dropout_ratio (float): dropout ratio of the layer.
         dim (int): input dims.
     """
@@ -38,6 +39,7 @@ class Perceptron(nn.Module):
         out_features: int,
         activation: Optional[str] = "nn.ReLU",
         use_bn: bool = False,
+        bias: bool = True,
         dropout_ratio: float = 0.0,
         dim: int = 2,
     ) -> None:
@@ -47,7 +49,7 @@ class Perceptron(nn.Module):
         self.dropout_ratio = dropout_ratio
 
         self.perceptron = nn.Sequential(
-            nn.Linear(in_features, out_features, bias=False if use_bn else True)
+            nn.Linear(in_features, out_features, bias=False if use_bn else bias)
         )
         if use_bn:
             assert dim in [2, 3]
@@ -92,6 +94,7 @@ class MLP(nn.Module):
         self,
         in_features: int,
         hidden_units: List[int],
+        bias: bool = True,
         activation: Optional[str] = "nn.ReLU",
         use_bn: bool = False,
         dropout_ratio: Optional[Union[List[float], float]] = None,
@@ -132,6 +135,7 @@ class MLP(nn.Module):
                     out_features=hidden_units[i],
                     activation=activation,
                     use_bn=use_bn,
+                    bias=bias,
                     dropout_ratio=dropout_ratio[i],
                     dim=dim,
                 )

@@ -108,6 +108,13 @@ def build_faiss_index(
     else:
         raise ValueError(f"Unknown index_type: {index_type}")
 
+    # pyre-ignore [16]
+    if faiss.get_num_gpus() > 0:
+        # pyre-ignore [16]
+        res = faiss.StandardGpuResources()
+        # pyre-ignore [16]
+        index = faiss.index_cpu_to_gpu(res, int(os.environ.get("LOCAL_RANK", 0)), index)
+
     embeddings = np.concatenate(embeddings)
     if index_type.startswith("IVFFlat"):
         index.train(embeddings)
@@ -115,6 +122,7 @@ def build_faiss_index(
     index.add(embeddings)
     if is_local_rank_zero:
         logger.info("Build embeddings finished.")
+
     return index, np.array(index_id_map, dtype=str)
 
 
@@ -129,6 +137,9 @@ def write_faiss_index(
             for mapping continuous ids to origin id.
         output_dir (str): index output dir.
     """
+    if hasattr(index, "getResources"):  # gpu index
+        # pyre-ignore [16]
+        index = faiss.index_gpu_to_cpu(index)
     # pyre-ignore [16]
     faiss.write_index(index, os.path.join(output_dir, "faiss_index"))
     with open(os.path.join(output_dir, "id_mapping"), "w") as f:

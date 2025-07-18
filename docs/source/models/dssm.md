@@ -108,7 +108,7 @@ model_config {
 
 ### 负采样配置
 
-目前支持两种负采样Sampler：
+目前支持4种负采样Sampler：
 
 - negative_sampler：加权随机负采样，会排除Mini-Batch内的Item Id
   - input_path: 负采样Item表, Schema为: id:int64 | weight:float | attrs:string，其中attr默认为":"分隔符拼接的Item特征
@@ -120,6 +120,21 @@ model_config {
   - user_input_path: User表, Schema为: id:int64 | weight:float
   - item_input_path: 负采样Item表, Schema为: id:int64 | weight:float | attrs:string，其中attr默认为":"分隔符拼接的Item特征
   - pos_edge_input_path: Positive边表, Schema为: userid:int64 | itemid:int64 | weight:float
+  - user_id_field: user_id列名
+  - 其余同negative_sampler
+- hard_negative_sampler：加权随机负采样，会排除Mini-Batch内的Item Id，同时HardNegative边表中(一般为曝光未点击)进行负采样作为HardNegative
+  - user_input_path: User表, Schema为: id:int64 | weight:float
+  - item_input_path: 负采样Item表, Schema为: id:int64 | weight:float | attrs:string，其中attr为":"分隔符拼接的Item特征
+  - hard_neg_edge_input_path: HardNegative边表, Schema为: userid:int64 | itemid:int64 | weight:float
+  - num_hard_sample: hard negative的最大采样数目(per user)
+  - user_id_field: user_id列名
+  - 其余同negative_sampler
+- hard_negative_sampler_v2：加权随机负采样，会跟排除Mini-Batch内的User有边的Item Id，同时HardNegative边表中(一般为曝光未点击)进行负采样作为HardNegative
+  - user_input_path: User表, Schema为: id:int64 | weight:float
+  - item_input_path: 负采样Item表, Schema为: id:int64 | weight:float | attrs:string，其中attr为":"分隔符拼接的Item特征
+  - pos_edge_input_path: Positive边表, Schema为: userid:int64 | itemid:int64 | weight:float
+  - hard_neg_edge_input_path: HardNegative边表, Schema为: userid:int64 | itemid:int64 | weight:float
+  - num_hard_sample: hard negative的最大采样数目(per user)
   - user_id_field: user_id列名
   - 其余同negative_sampler
 
