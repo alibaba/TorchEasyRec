@@ -14,13 +14,12 @@
 # thanks to their public work.
 
 import abc
-from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
 from torch.autograd.profiler import record_function
 
-from tzrec.modules.utils import BaseModule, fx_unwrap_optional_tensor
+from tzrec.modules.utils import BaseModule
 from tzrec.ops.hstu_attention import delta_hstu_mha
 from tzrec.ops.hstu_compute import (
     hstu_compute_output,
@@ -28,9 +27,12 @@ from tzrec.ops.hstu_compute import (
     hstu_preprocess_and_attention,
 )
 from tzrec.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged
+from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
 
 class STU(BaseModule, abc.ABC):
+    """STU abstract module."""
+
     def cached_forward(
         self,
         delta_x: torch.Tensor,
@@ -38,6 +40,17 @@ class STU(BaseModule, abc.ABC):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward with cached key-value tensors.
+
+        Args:
+            delta_x (torch.Tensor): delta input sequence embedding tensor.
+            num_targets (torch.Tensor): number of targets.
+            max_kv_caching_len (int): maximum key-value caching length.
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -50,29 +63,22 @@ class STU(BaseModule, abc.ABC):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward the layer.
+
+        Args:
+            x (torch.Tensor): input sequence embedding tensor.
+            x_offsets (torch.Tensor): input sequence offsets.
+            max_seq_len (int): maximum sequence length.
+            num_targets (torch.Tensor): number of targets.
+            max_kv_caching_len (int): maximum key-value caching length.
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         pass
 
 
-@dataclass
-class STULayerConfig:
-    embedding_dim: int
-    num_heads: int
-    hidden_dim: int
-    attention_dim: int
-    output_dropout_ratio: float = 0.3
-    causal: bool = True
-    target_aware: bool = True
-    max_attn_len: Optional[int] = None
-    attn_alpha: Optional[float] = None
-    use_group_norm: bool = False
-    recompute_normed_x: bool = True
-    recompute_uvqk: bool = True
-    recompute_y: bool = True
-    sort_by_length: bool = True
-    contextual_seq_len: int = 0
-
-
-# @torch.fx.wrap
 def _update_kv_cache(
     max_seq_len: int,
     seq_offsets: torch.Tensor,
@@ -163,6 +169,27 @@ def _construct_full_kv(
 
 
 class STULayer(STU):
+    """A jagged sequential transduction unit for variable-length sequences.
+
+    Args:
+        embedding_dim (int): dimension of input embeddings
+        num_heads (int): number of attention heads
+        hidden_dim (int): dimension of hidden linear layers
+        attention_dim (int): dimension of attention mechanism
+        output_dropout_ratio (float): dropout probability for linear layers
+        causal (bool): whether to use causal mask in attention
+        target_aware (bool): whether to target mask in attention
+        max_attn_len (int): maximum length of attention window
+        attn_alpha (float): alpha for mha attention
+        use_group_norm (bool): use group normalization or layer normalization.
+        recompute_normed_x (bool): whether to recompute normed_x in backward
+        recompute_uvqk (bool): whether to recompute uvqk in backward
+        recompute_y (bool): whether to recompute y in backward
+        sort_by_length (bool): whether to sort by length when forwarding
+        contextual_seq_len (bool): sequence length of contextual feature
+        is_inference (bool): whether to run in inference mode.
+    """
+
     max_kv_caching_len: int
     k_cache: Optional[torch.Tensor]
     v_cache: Optional[torch.Tensor]
@@ -170,28 +197,42 @@ class STULayer(STU):
 
     def __init__(
         self,
-        config: STULayerConfig,
+        embedding_dim: int,
+        num_heads: int,
+        hidden_dim: int,
+        attention_dim: int,
+        output_dropout_ratio: float = 0.3,
+        causal: bool = True,
+        target_aware: bool = True,
+        max_attn_len: Optional[int] = None,
+        attn_alpha: Optional[float] = None,
+        use_group_norm: bool = False,
+        recompute_normed_x: bool = True,
+        recompute_uvqk: bool = True,
+        recompute_y: bool = True,
+        sort_by_length: bool = True,
+        contextual_seq_len: int = 0,
         is_inference: bool = False,
     ) -> None:
         super().__init__(
             is_inference=is_inference,
         )
         self.reset_kv_cache()
-        self._num_heads: int = config.num_heads
-        self._embedding_dim: int = config.embedding_dim
-        self._hidden_dim: int = config.hidden_dim
-        self._attention_dim: int = config.attention_dim
-        self._output_dropout_ratio: float = config.output_dropout_ratio
-        self._target_aware: bool = config.target_aware
-        self._causal: bool = config.causal
-        self._max_attn_len: int = config.max_attn_len or 0
-        self._attn_alpha: float = config.attn_alpha or 1.0 / (self._attention_dim**0.5)
-        self._use_group_norm: bool = config.use_group_norm
-        self._recompute_normed_x: bool = config.recompute_normed_x
-        self._recompute_uvqk: bool = config.recompute_uvqk
-        self._recompute_y: bool = config.recompute_y
-        self._sort_by_length: bool = config.sort_by_length
-        self._contextual_seq_len: int = config.contextual_seq_len
+        self._num_heads: int = num_heads
+        self._embedding_dim: int = embedding_dim
+        self._hidden_dim: int = hidden_dim
+        self._attention_dim: int = attention_dim
+        self._output_dropout_ratio: float = output_dropout_ratio
+        self._target_aware: bool = target_aware
+        self._causal: bool = causal
+        self._max_attn_len: int = max_attn_len or 0
+        self._attn_alpha: float = attn_alpha or 1.0 / (self._attention_dim**0.5)
+        self._use_group_norm: bool = use_group_norm
+        self._recompute_normed_x: bool = recompute_normed_x
+        self._recompute_uvqk: bool = recompute_uvqk
+        self._recompute_y: bool = recompute_y
+        self._sort_by_length: bool = sort_by_length
+        self._contextual_seq_len: int = contextual_seq_len
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -235,6 +276,7 @@ class STULayer(STU):
         )
 
     def reset_kv_cache(self) -> None:
+        """Reset the key-value cache."""
         self.k_cache = None
         self.v_cache = None
         self.kv_caching_offsets = None
@@ -249,6 +291,16 @@ class STULayer(STU):
         max_kv_caching_len: int,
         kv_caching_lengths: Optional[torch.Tensor],
     ) -> None:
+        """Update the key-value cache.
+
+        Args:
+            max_seq_len (int): maximum sequence length
+            seq_offsets (torch.Tensor): sequence offsets
+            k (Optional[torch.Tensor]): key tensor
+            v (Optional[torch.Tensor]): value tensor
+            max_kv_caching_len (int): maximum key-value caching length
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths
+        """
         self.k_cache, self.v_cache, self.max_kv_caching_len, self.kv_caching_offsets = (
             _update_kv_cache(
                 max_seq_len=max_seq_len,
@@ -269,6 +321,19 @@ class STULayer(STU):
         delta_k: torch.Tensor,
         delta_v: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        """Construct full key-value tensor.
+
+        Args:
+            delta_k (torch.Tensor): delta key tensor.
+            delta_v (torch.Tensor): delta value tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+                full key-value tensor,
+                full value tensor,
+                full key-value caching length,
+                full key-value caching offsets.
+        """
         return _construct_full_kv(
             delta_k=delta_k,
             delta_v=delta_v,
@@ -281,13 +346,25 @@ class STULayer(STU):
     def forward(
         self,
         x: torch.Tensor,
-        x_lengths: torch.Tensor,
         x_offsets: torch.Tensor,
         max_seq_len: int,
         num_targets: torch.Tensor,
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward the layer.
+
+        Args:
+            x (torch.Tensor): input sequence embedding tensor.
+            x_offsets (torch.Tensor): input sequence offsets.
+            max_seq_len (int): maximum sequence length.
+            num_targets (torch.Tensor): number of targets.
+            max_kv_caching_len (int): maximum key-value caching length.
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,
@@ -348,6 +425,17 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward with cached key-value tensors.
+
+        Args:
+            delta_x (torch.Tensor): delta input sequence embedding tensor.
+            num_targets (torch.Tensor): number of targets.
+            max_kv_caching_len (int): maximum key-value caching length.
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         with record_function("## stu_compute_uqvk ##"):
             delta_u, delta_q, delta_k, delta_v = hstu_compute_uqvk(
                 x=delta_x,
@@ -409,6 +497,13 @@ class STULayer(STU):
 
 
 class STUStack(STU):
+    """Stack of STU layers.
+
+    Args:
+        stu_list (List[STU]): list of STU layers.
+        is_inference (bool): whether to run in inference mode.
+    """
+
     def __init__(
         self,
         stu_list: List[STU],
@@ -420,17 +515,28 @@ class STUStack(STU):
     def forward(
         self,
         x: torch.Tensor,
-        x_lengths: torch.Tensor,
         x_offsets: torch.Tensor,
         max_seq_len: int,
         num_targets: torch.Tensor,
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward stack of stu layer.
+
+        Args:
+            x (torch.Tensor): input sequence embedding tensor.
+            x_offsets (torch.Tensor): input sequence offsets.
+            max_seq_len (int): maximum sequence length.
+            num_targets (torch.Tensor): number of targets.
+            max_kv_caching_len (int): maximum key-value caching length.
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         for layer in self._stu_layers:
             x = layer(
                 x=x,
-                x_lengths=x_lengths,
                 x_offsets=x_offsets,
                 max_seq_len=max_seq_len,
                 num_targets=num_targets,
@@ -446,6 +552,17 @@ class STUStack(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward stack of stu layer with cached key-value tensors.
+
+        Args:
+            delta_x (torch.Tensor): delta input sequence embedding tensor.
+            num_targets (torch.Tensor): number of targets.
+            max_kv_caching_len (int): maximum key-value caching length.
+            kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         for layer in self._stu_layers:
             delta_x = layer.cached_forward(
                 delta_x=delta_x,

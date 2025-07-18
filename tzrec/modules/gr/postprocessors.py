@@ -9,13 +9,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# We use the OutputPostprocessors from generative-recommenders a starting point.
+# https://github.com/facebookresearch/generative-recommenders
+# thanks to their public work.
 
 from abc import abstractmethod
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Union
 
 import torch
 
 from tzrec.modules.utils import BaseModule, init_linear_xavier_weights_zero_bias
+from tzrec.protos import module_pb2
+from tzrec.utils.config_util import config_to_kwargs
 
 
 @torch.fx.wrap
@@ -49,9 +54,13 @@ class OutputPostprocessor(BaseModule):
 
 
 class L2NormPostprocessor(OutputPostprocessor):
-    """Postprocesses user embeddings with l2 norm."""
+    """Postprocesses user embeddings with l2 norm.
 
-    def __init__(self, is_inference: bool = False) -> None:
+    Args:
+        is_inference (bool): whether to run in inference mode.
+    """
+
+    def __init__(self, is_inference: bool = False, **kwargs) -> None:
         super().__init__(is_inference=is_inference)
 
     def forward(
@@ -60,19 +69,36 @@ class L2NormPostprocessor(OutputPostprocessor):
         seq_timestamps: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        """Forward the postprocessor.
+
+        Args:
+            seq_embeddings (torch.Tensor): input sequence embedding tensor.
+            seq_timestamps (torch.Tensor): input sequence timestamp tensor.
+            seq_payloads (Dict[str, torch.Tensor]):input sequence payload tensors.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         return seq_embeddings / torch.linalg.norm(
             seq_embeddings, ord=2, dim=-1, keepdim=True
         ).clamp(min=1e-6)
 
 
 class LayerNormPostprocessor(OutputPostprocessor):
-    """Postprocesses user embeddings with layer norm."""
+    """Postprocesses user embeddings with layer norm.
+
+    Args:
+        embedding_dim (int): the dimension of the sequence embedding.
+        eps (float): layer norm epsilon.
+        is_inference (bool): whether to run in inference mode.
+    """
 
     def __init__(
         self,
         embedding_dim: int,
         eps: float = 1e-5,
         is_inference: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(is_inference=is_inference)
 
@@ -86,6 +112,16 @@ class LayerNormPostprocessor(OutputPostprocessor):
         seq_timestamps: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        """Forward the postprocessor.
+
+        Args:
+            seq_embeddings (torch.Tensor): input sequence embedding tensor.
+            seq_timestamps (torch.Tensor): input sequence timestamp tensor.
+            seq_payloads (Dict[str, torch.Tensor]):input sequence payload tensors.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         # pyre-fixme[6]: For 1st argument expected `dtype` but got `Union[dtype,
         #  Tensor, Module]`.
         return self._layer_norm(seq_embeddings.to(self._layer_norm.weight.dtype))
@@ -99,30 +135,43 @@ def _unsqueeze_if_needed(t: torch.Tensor, embedding: torch.Tensor) -> torch.Tens
 
 
 class TimestampLayerNormPostprocessor(OutputPostprocessor):
-    """Postprocesses user embeddings with timestamp-based MLP -> layer norm."""
+    """Postprocesses user embeddings with timestamp-based MLP -> layer norm.
+
+    Args:
+        embedding_dim (int): the dimension of the sequence embedding.
+        time_duration_period_units (List[int]): time duration period units,
+            e.g. 60 * 60 for hour of day.
+        time_duration_units_per_period (List[int]): time duration units per period,
+            e.g. 24 for hour of day.
+        eps (float): layer norm epsilon.
+        is_inference (bool): whether to run in inference mode.
+    """
 
     def __init__(
         self,
         embedding_dim: int,
-        time_duration_features: List[Tuple[int, int]],
+        time_duration_period_units: List[int],
+        time_duration_units_per_period: List[int],
         eps: float = 1e-5,
         is_inference: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(is_inference=is_inference)
 
         self._layer_norm: torch.nn.Module = torch.nn.LayerNorm(
             normalized_shape=[embedding_dim], eps=eps
         )
+        assert len(time_duration_period_units) == len(time_duration_units_per_period)
         self.register_buffer(
             "_period_units",
-            torch.Tensor([f[0] for f in time_duration_features]).view(1, -1),
+            torch.Tensor(time_duration_period_units).view(1, -1),
         )
         self.register_buffer(
             "_units_per_period",
-            torch.Tensor([f[1] for f in time_duration_features]).view(1, -1),
+            torch.Tensor(time_duration_units_per_period).view(1, -1),
         )
         self._time_feature_combiner: torch.nn.Module = torch.nn.Linear(
-            embedding_dim + 2 * len(time_duration_features),
+            embedding_dim + 2 * len(time_duration_period_units),
             embedding_dim,
         ).apply(init_linear_xavier_weights_zero_bias)
 
@@ -166,7 +215,42 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         seq_timestamps: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        """Forward the postprocessor.
+
+        Args:
+            seq_embeddings (torch.Tensor): input sequence embedding tensor.
+            seq_timestamps (torch.Tensor): input sequence timestamp tensor.
+            seq_payloads (Dict[str, torch.Tensor]):input sequence payload tensors.
+
+        Returns:
+            torch.Tensor: output sequence embedding tensor.
+        """
         user_embeddings = self._time_feature_combiner(
             self._concat_time_features(seq_embeddings, timestamps=seq_timestamps)
         )
         return self._layer_norm(user_embeddings)
+
+
+def create_output_postprocessor(
+    postprocessor_cfg: Union[module_pb2.GROutputPostprocessor, Dict[str, Any]], **kwargs
+) -> OutputPostprocessor:
+    """Create OutputPostprocessor."""
+    if isinstance(postprocessor_cfg, module_pb2.GROutputPostprocessor):
+        postprocessor_type = postprocessor_cfg.WhichOneof("input_preprocessor")
+        config_dict = config_to_kwargs(getattr(postprocessor_cfg, postprocessor_type))
+    else:
+        assert len(postprocessor_cfg) == 1, (
+            f"postprocessor_cfg should be {{postprocessor_type: postprocessor_kwargs}},"
+            f" but got {postprocessor_cfg}"
+        )
+        postprocessor_type, config_dict = postprocessor_cfg.popitem()
+
+    config_dict = dict(config_dict, **kwargs)
+    if postprocessor_type == "l2norm_postprocessor":
+        return L2NormPostprocessor(**config_dict)
+    elif postprocessor_type == "layernorm_postprocessor":
+        return LayerNormPostprocessor(**config_dict)
+    elif postprocessor_type == "timestamp_layernorm_postprocessor":
+        return TimestampLayerNormPostprocessor(**config_dict)
+    else:
+        raise RuntimeError(f"Unknown postprocessor type: {postprocessor_type}")

@@ -17,9 +17,7 @@ import torch
 from hypothesis import Verbosity, given, settings
 from hypothesis import strategies as st
 
-from tzrec.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from tzrec.ops import Kernel
-from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.test_util import gpu_unavailable
 
 
@@ -54,11 +52,7 @@ class StuTest(unittest.TestCase):
         recompute_normed_x_in_backward=st.sampled_from([True, False]),
         recompute_y_in_backward=st.sampled_from([True, False]),
         empty_inputs=st.sampled_from([False]),
-        dtype=st.sampled_from(
-            [torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from([torch.float32]),
     )
     @unittest.skipIf(*gpu_unavailable)
     @settings(verbosity=Verbosity.verbose, max_examples=100, deadline=None)
@@ -81,27 +75,27 @@ class StuTest(unittest.TestCase):
         empty_inputs: bool,  # test the case where all the seqlen in the batch are 0
         dtype: torch.dtype,
     ) -> None:
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
         device = torch.device("cuda")
 
         stu_layers: List[STU] = [
             STULayer(
-                config=STULayerConfig(
-                    embedding_dim=embedding_dim,
-                    num_heads=num_heads,
-                    hidden_dim=linear_hidden_dim,
-                    attention_dim=attention_dim,
-                    output_dropout_ratio=0.0,
-                    causal=causal,
-                    target_aware=has_multiple_targets,
-                    max_attn_len=None,
-                    attn_alpha=None,
-                    use_group_norm=use_group_norm,
-                    recompute_normed_x=recompute_normed_x_in_backward,
-                    recompute_uvqk=recompute_uvqk_in_backward,
-                    recompute_y=recompute_y_in_backward,
-                    sort_by_length=True,
-                    contextual_seq_len=contextual_seq_len,
-                ),
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                hidden_dim=linear_hidden_dim,
+                attention_dim=attention_dim,
+                output_dropout_ratio=0.0,
+                causal=causal,
+                target_aware=has_multiple_targets,
+                max_attn_len=None,
+                attn_alpha=None,
+                use_group_norm=use_group_norm,
+                recompute_normed_x=recompute_normed_x_in_backward,
+                recompute_uvqk=recompute_uvqk_in_backward,
+                recompute_y=recompute_y_in_backward,
+                sort_by_length=True,
+                contextual_seq_len=contextual_seq_len,
                 is_inference=False,
             )
             for _ in range(num_layers)
@@ -110,9 +104,9 @@ class StuTest(unittest.TestCase):
             stu_list=stu_layers,
             is_inference=False,
         ).to(device)
-        stu.recursive_setattr("_kernel", Kernel.PYTORCH)
+        stu.set_kernel(Kernel.PYTORCH)
         stu_triton = copy.deepcopy(stu)
-        stu_triton.recursive_setattr("_kernel", Kernel.TRITON)
+        stu_triton.set_kernel(Kernel.TRITON)
 
         if empty_inputs:
             x_lengths = torch.zeros(batch_size, dtype=torch.int32, device=device)
@@ -141,14 +135,12 @@ class StuTest(unittest.TestCase):
         x_triton = x.clone().detach().requires_grad_()
         stu_output = stu(
             x=x,
-            x_lengths=x_lengths,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
         )
         stu_triton_output = stu_triton(
             x=x_triton,
-            x_lengths=x_lengths,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
@@ -164,11 +156,7 @@ class StuTest(unittest.TestCase):
 
     # pyre-ignore
     @given(
-        dtype=st.sampled_from(
-            [torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from([torch.float32]),
     )
     @unittest.skipIf(*gpu_unavailable)
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
@@ -176,6 +164,8 @@ class StuTest(unittest.TestCase):
         self,
         dtype: torch.dtype,
     ) -> None:
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
         device = torch.device("cuda")
         num_layers = 2
         num_heads = 2
@@ -192,24 +182,21 @@ class StuTest(unittest.TestCase):
         max_attn_len = None
         stu_layers: List[STU] = [
             STULayer(
-                config=STULayerConfig(
-                    embedding_dim=embedding_dim,
-                    num_heads=num_heads,
-                    hidden_dim=linear_hidden_dim,
-                    attention_dim=attention_dim,
-                    output_dropout_ratio=0.0,
-                    causal=causal,
-                    target_aware=True,
-                    max_attn_len=max_attn_len,
-                    attn_alpha=None,
-                    use_group_norm=use_group_norm,
-                    recompute_normed_x=recompute_normed_x_in_backward,
-                    recompute_uvqk=recompute_uvqk_in_backward,
-                    recompute_y=recompute_y_in_backward,
-                    sort_by_length=True,
-                    contextual_seq_len=0,
-                ),
-                is_inference=False,
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                hidden_dim=linear_hidden_dim,
+                attention_dim=attention_dim,
+                output_dropout_ratio=0.0,
+                causal=causal,
+                target_aware=True,
+                max_attn_len=max_attn_len,
+                attn_alpha=None,
+                use_group_norm=use_group_norm,
+                recompute_normed_x=recompute_normed_x_in_backward,
+                recompute_uvqk=recompute_uvqk_in_backward,
+                recompute_y=recompute_y_in_backward,
+                sort_by_length=True,
+                contextual_seq_len=0,
             )
             for _ in range(num_layers)
         ]
@@ -245,7 +232,6 @@ class StuTest(unittest.TestCase):
         ).requires_grad_(True)
         stu_output = stu(
             x=x,
-            x_lengths=x_lengths,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
@@ -270,7 +256,6 @@ class StuTest(unittest.TestCase):
         )[0].requires_grad_(True)
         swapped_stu_output = stu(
             x=swapped_x,
-            x_lengths=x_lengths,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
@@ -339,10 +324,10 @@ class StuTest(unittest.TestCase):
         linear_hidden_dim: int,
         contextual_seq_len: int,
     ) -> None:
-        device = torch.device("cuda")
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+        from tzrec.ops.jagged_tensors import split_2D_jagged
 
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cuda.matmul.allow_tf32 = True
+        device = torch.device("cuda")
 
         use_group_norm = False
         recompute_normed_x_in_backward = False
@@ -351,23 +336,21 @@ class StuTest(unittest.TestCase):
         max_attn_len = None
         stu_layers: List[STU] = [
             STULayer(
-                config=STULayerConfig(
-                    embedding_dim=embedding_dim,
-                    num_heads=num_heads,
-                    hidden_dim=linear_hidden_dim,
-                    attention_dim=attention_dim,
-                    output_dropout_ratio=0.0,
-                    causal=True,
-                    target_aware=True,
-                    max_attn_len=max_attn_len,
-                    attn_alpha=None,
-                    use_group_norm=use_group_norm,
-                    recompute_normed_x=recompute_normed_x_in_backward,
-                    recompute_uvqk=recompute_uvqk_in_backward,
-                    recompute_y=recompute_y_in_backward,
-                    sort_by_length=True,
-                    contextual_seq_len=contextual_seq_len,
-                ),
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                hidden_dim=linear_hidden_dim,
+                attention_dim=attention_dim,
+                output_dropout_ratio=0.0,
+                causal=True,
+                target_aware=True,
+                max_attn_len=max_attn_len,
+                attn_alpha=None,
+                use_group_norm=use_group_norm,
+                recompute_normed_x=recompute_normed_x_in_backward,
+                recompute_uvqk=recompute_uvqk_in_backward,
+                recompute_y=recompute_y_in_backward,
+                sort_by_length=True,
+                contextual_seq_len=contextual_seq_len,
                 is_inference=True,
             )
             for _ in range(num_layers)
@@ -376,7 +359,7 @@ class StuTest(unittest.TestCase):
             stu_list=stu_layers,
             is_inference=True,
         ).to(device)
-        stu.recursive_setattr("_kernel", Kernel.TRITON)
+        stu.set_kernel(Kernel.TRITON)
         stu.eval()
 
         x_lengths = torch.randint(
@@ -402,7 +385,6 @@ class StuTest(unittest.TestCase):
         # default forward().
         ref_y = stu(
             x=x,
-            x_lengths=x_lengths,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
@@ -431,7 +413,6 @@ class StuTest(unittest.TestCase):
         )
         _ = stu(
             x=prime_x,
-            x_lengths=prime_lengths,
             x_offsets=prime_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets - delta_size,

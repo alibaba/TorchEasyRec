@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -131,6 +131,42 @@ class DlrmHSTUTest(unittest.TestCase):
                 candidates_query_time_feature_name="item_query_time",
                 candidates_action_weight_feature_name="item_action_weight",
                 candidates_watchtime_feature_name="item_target_watchtime",
+                hstu=module_pb2.HSTU(
+                    stu=module_pb2.STU(
+                        embedding_dim=512,
+                        num_heads=4,
+                        hidden_dim=128,
+                        attention_dim=128,
+                        output_dropout_ratio=0.2,
+                    ),
+                    positional_encoder=module_pb2.GRPositionalEncoder(
+                        num_position_buckets=8192,
+                        num_time_buckets=2048,
+                        use_time_encoding=True,
+                    ),
+                    input_preprocessor=module_pb2.GRInputPreprocessor(
+                        contextual_preprocessor=module_pb2.GRContextualPreprocessor(
+                            action_encoder=module_pb2.GRActionEncoder(
+                                action_embedding_dim=8,
+                                action_feature_name="action_weight",
+                                action_weights=[1, 2, 4],
+                            ),
+                            action_mlp=module_pb2.GRContextualizedMLP(
+                                simple_mlp=module_pb2.GRSimpleContextualizedMLP(
+                                    hidden_dim=256
+                                )
+                            ),
+                            content_mlp=module_pb2.GRContextualizedMLP(
+                                simple_mlp=module_pb2.GRSimpleContextualizedMLP(
+                                    hidden_dim=256
+                                )
+                            ),
+                        )
+                    ),
+                    output_postprocessor=module_pb2.GROutputPostprocessor(
+                        layernorm_postprocessor=module_pb2.GRLayerNormPostprocessor()
+                    ),
+                ),
                 fusion_mtl_tower=tower_pb2.FusionMTLTower(
                     mlp=module_pb2.MLP(hidden_units=[512], activation="nn.SiLU"),
                     task_configs=[

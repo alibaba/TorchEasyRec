@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -22,13 +22,6 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel, _is_classification_loss
 from tzrec.modules.embedding import SequenceEmbeddingGroup
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
-from tzrec.modules.gr.positional_encoder import HSTUPositionalEncoder
-from tzrec.modules.gr.postprocessors import (
-    LayerNormPostprocessor,
-    TimestampLayerNormPostprocessor,
-)
-from tzrec.modules.gr.preprocessors import ContextualPreprocessor
-from tzrec.modules.gr.stu import STU, STULayer, STULayerConfig, STUStack
 from tzrec.modules.norm import LayerNorm, SwishLayerNorm
 from tzrec.modules.task_tower import FusionMTLTower
 from tzrec.modules.utils import (
@@ -41,6 +34,9 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
+from tzrec.utils.fx_util import fx_infer_max_len
+
+torch.fx.wrap(fx_infer_max_len)
 
 
 @torch.fx.wrap
@@ -64,19 +60,6 @@ def _fx_construct_payload(
 @torch.fx.wrap
 def _fx_mark_length_features(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
-
-
-@torch.fx.wrap
-def _fx_infer_max_len(
-    lengths: torch.Tensor,
-) -> int:
-    max_len = int(lengths.max().item())
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range [0, 10**9)
-        torch._check_is_size(max_len)
-        torch._check(max_len < 10**9)
-        torch._check(max_len > 0)
-    return max_len
 
 
 class DlrmHSTU(RankModel):
@@ -127,7 +110,7 @@ class DlrmHSTU(RankModel):
             (
                 self._model_config.uih_action_time_feature_name,
                 self._model_config.candidates_query_time_feature_name,
-                False,
+                False,  # is_sparse
             ),
             (
                 self._model_config.uih_action_weight_feature_name,
@@ -142,80 +125,15 @@ class DlrmHSTU(RankModel):
         ]
 
         self._task_configs = self._model_config.fusion_mtl_tower.task_configs
-
-        # preprocessor setup
         action_weights = []
         for task_cfg in self._task_configs:
             if task_cfg.HasField("task_bitmask"):
                 action_weights.append(task_cfg.task_bitmask)
-        preprocessor = ContextualPreprocessor(
-            input_embedding_dim=hstu_embedding_table_dim,
-            output_embedding_dim=self._model_config.hstu_transducer_embedding_dim,
-            contextual_feature_to_max_length=self._model_config.contextual_feature_to_max_length,
-            contextual_feature_to_min_uih_length=self._model_config.contextual_feature_to_min_uih_length,
-            action_embedding_dim=8,
-            action_feature_name=self._model_config.uih_action_weight_feature_name,
-            action_weights=action_weights,
-        )
-
-        # positional encoder
-        positional_encoder = HSTUPositionalEncoder(
-            num_position_buckets=8192,
-            num_time_buckets=2048,
-            embedding_dim=self._model_config.hstu_transducer_embedding_dim,
-            use_time_encoding=True,
-        )
-
-        if self._model_config.enable_postprocessor:
-            if self._model_config.use_layer_norm_postprocessor:
-                postprocessor = LayerNormPostprocessor(
-                    embedding_dim=self._model_config.hstu_transducer_embedding_dim,
-                    eps=1e-5,
-                )
-            else:
-                postprocessor = TimestampLayerNormPostprocessor(
-                    embedding_dim=self._model_config.hstu_transducer_embedding_dim,
-                    time_duration_features=[
-                        (60 * 60, 24),  # hour of day
-                        (24 * 60 * 60, 7),  # day of week
-                        # (24 * 60 * 60, 365), # time of year (approximate)
-                    ],
-                    eps=1e-5,
-                )
-        else:
-            postprocessor = None
 
         # construct HSTU
-        stu_module: STU = STUStack(
-            stu_list=[
-                STULayer(
-                    config=STULayerConfig(
-                        embedding_dim=self._model_config.hstu_transducer_embedding_dim,
-                        num_heads=self._model_config.hstu_num_heads,
-                        hidden_dim=self._model_config.hstu_attn_linear_dim,
-                        attention_dim=self._model_config.hstu_attn_qk_dim,
-                        output_dropout_ratio=self._model_config.hstu_linear_dropout_rate,
-                        use_group_norm=self._model_config.hstu_group_norm,
-                        causal=True,
-                        target_aware=True,
-                        max_attn_len=None,
-                        attn_alpha=None,
-                        recompute_normed_x=True,
-                        recompute_uvqk=True,
-                        recompute_y=True,
-                        sort_by_length=True,
-                        contextual_seq_len=0,
-                    ),
-                )
-                for _ in range(self._model_config.hstu_attn_num_layers)
-            ],
-        )
         self._hstu_transducer: HSTUTransducer = HSTUTransducer(
-            stu_module=stu_module,
-            input_preprocessor=preprocessor,
-            output_postprocessor=postprocessor,
-            input_dropout_ratio=self._model_config.hstu_input_dropout_ratio,
-            positional_encoder=positional_encoder,
+            input_embedding_dim=hstu_embedding_table_dim,
+            **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
             listwise=False,
         )
@@ -224,18 +142,18 @@ class DlrmHSTU(RankModel):
         self._item_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
                 in_features=self.embedding_group.group_total_dim("candidate"),
-                out_features=512,
+                out_features=self._model_config.item_embedding_hidden_dim,
             ),
-            SwishLayerNorm(512),
+            SwishLayerNorm(self._model_config.item_embedding_hidden_dim),
             torch.nn.Linear(
-                in_features=512,
-                out_features=self._model_config.hstu_transducer_embedding_dim,
+                in_features=self._model_config.item_embedding_hidden_dim,
+                out_features=self._model_config.hstu.stu.embedding_dim,
             ),
-            LayerNorm(self._model_config.hstu_transducer_embedding_dim),
+            LayerNorm(self._model_config.hstu.stu.embedding_dim),
         ).apply(init_linear_xavier_weights_zero_bias)
 
         self._multitask_module = FusionMTLTower(
-            tower_feature_in=self._model_config.hstu_transducer_embedding_dim,
+            tower_feature_in=self._model_config.hstu.stu.embedding_dim,
             **config_to_kwargs(self._model_config.fusion_mtl_tower),
         ).apply(init_linear_xavier_weights_zero_bias)
 
@@ -249,7 +167,7 @@ class DlrmHSTU(RankModel):
         source_lengths = uid_seq_embeddings[
             self._model_config.uih_id_feature_name
         ].lengths()
-        runtime_max_seq_len = _fx_infer_max_len(source_lengths)
+        runtime_max_seq_len = fx_infer_max_len(source_lengths)
         source_timestamps = payload_features[
             self._model_config.uih_action_time_feature_name
         ]
@@ -297,12 +215,12 @@ class DlrmHSTU(RankModel):
         num_candidates = _fx_mark_length_features(
             sparse_features[self._model_config.candidates_id_feature_name].lengths()
         )
-        max_num_candidates = _fx_infer_max_len(num_candidates)
+        max_num_candidates = fx_infer_max_len(num_candidates)
 
         uih_seq_lengths = sparse_features[
             self._model_config.uih_id_feature_name
         ].lengths()
-        max_uih_len = _fx_infer_max_len(uih_seq_lengths)
+        max_uih_len = fx_infer_max_len(uih_seq_lengths)
 
         # prepare payload features
         payload_features: Dict[str, torch.Tensor] = {}

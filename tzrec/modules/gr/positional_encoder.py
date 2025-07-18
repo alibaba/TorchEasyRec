@@ -26,13 +26,23 @@ from tzrec.ops.position import (
 
 
 class HSTUPositionalEncoder(BaseModule):
+    """HSTU Position Encoder.
+
+    Args:
+        embedding_dim (int): input embedding dim.
+        num_position_buckets (int): position bucket number.
+        num_time_buckets (int): time bucket number.
+        use_time_encoding (bool): use timestamp encoding or not.
+        is_inference (bool): whether to run in inference mode.
+    """
+
     def __init__(
         self,
-        num_position_buckets: int,
-        num_time_buckets: int,
         embedding_dim: int,
+        num_position_buckets: int,
+        num_time_buckets: int = 0,
+        use_time_encoding: bool = False,
         is_inference: bool = True,
-        use_time_encoding: bool = True,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._use_time_encoding: bool = use_time_encoding
@@ -60,6 +70,19 @@ class HSTUPositionalEncoder(BaseModule):
         seq_embeddings: torch.Tensor,
         num_targets: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            max_seq_len (int): maximum sequence length.
+            seq_lengths (torch.Tensor): input sequence lengths.
+            seq_offsets (torch.Tensor): input sequence offsets.
+            seq_timestamps (torch.Tensor): input sequence timestamps.
+            seq_embeddings (torch.Tensor): input sequence embeddings.
+            num_targets (int): number of targets.
+
+        Returns:
+            torch.Tensor: output sequence embedding with position embedding.
+        """
         if self._use_time_encoding:
             seq_embeddings = add_timestamp_positional_embeddings(
                 alpha=self._embedding_dim**0.5,

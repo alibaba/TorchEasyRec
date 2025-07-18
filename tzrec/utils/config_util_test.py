@@ -11,6 +11,7 @@
 
 import unittest
 
+from tzrec.protos import module_pb2, seq_encoder_pb2
 from tzrec.utils import config_util
 
 
@@ -39,6 +40,30 @@ class ConfigUtilTest(unittest.TestCase):
             pipeline_config.feature_configs[4].id_feature.feature_name, "age_level"
         )
         self.assertEqual(pipeline_config.feature_configs[4].id_feature.num_buckets, 3)
+
+    def test_config_to_kwargs(self):
+        cfg = seq_encoder_pb2.SeqEncoderConfig(
+            din_encoder=seq_encoder_pb2.DINEncoder(
+                name="din", input="seq", attn_mlp=module_pb2.MLP(hidden_units=[128, 64])
+            )
+        )
+        kwargs = config_util.config_to_kwargs(cfg)
+        self.assertEqual(
+            kwargs,
+            {
+                "seq_module": {
+                    "name": "din",
+                    "input": "seq",
+                    "attn_mlp": {
+                        "hidden_units": [128, 64],
+                        "dropout_ratio": [],
+                        "activation": "nn.ReLU",
+                        "use_bn": False,
+                    },
+                    "__oneof__": "din_encoder",
+                }
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -13,26 +13,27 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
 
 from tzrec.modules.gr.positional_encoder import HSTUPositionalEncoder
 from tzrec.modules.gr.postprocessors import (
-    L2NormPostprocessor,
     OutputPostprocessor,
+    create_output_postprocessor,
 )
-from tzrec.modules.gr.preprocessors import InputPreprocessor
-from tzrec.modules.gr.stu import STU
-from tzrec.modules.utils import BaseModule, fx_unwrap_optional_tensor
+from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
+from tzrec.modules.gr.stu import STU, STULayer, STUStack
+from tzrec.modules.utils import BaseModule
 from tzrec.ops.jagged_tensors import split_2D_jagged
+from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
 torch.fx.wrap("len")
 
 
 @torch.fx.wrap
-def default_seq_payload(
+def _default_seq_payload(
     seq_payloads: Optional[Dict[str, torch.Tensor]],
 ) -> Dict[str, torch.Tensor]:
     if seq_payloads is None:
@@ -42,30 +43,51 @@ def default_seq_payload(
 
 
 class HSTUTransducer(BaseModule):
+    """HSTU module.
+
+    Args:
+        input_embedding_dim (int): input embedding dimension.
+        stu (dict): STULayer config.
+        attn_num_layers (int): number of STULayer.
+        input_preprocessor (dict): InputPreprocessor config.
+        output_postprocessor (dict): OutputPostprocessor config.
+        input_dropout_ratio (float): dropout ratio after input_preprocessor.
+        positional_encoder (dict): HSTUPositionalEncoder config.
+        is_inference (bool): whether to run in inference mode.
+        return_full_embeddings (bool): return all embeddings or not.
+        listwise (bool): listwise training or not.
+    """
+
     def __init__(
         self,
-        stu_module: STU,
-        input_preprocessor: InputPreprocessor,
-        output_postprocessor: Optional[OutputPostprocessor] = None,
+        input_embedding_dim: int,
+        stu: Dict[str, Any],
+        attn_num_layers: int,
+        input_preprocessor: Dict[str, Any],
+        output_postprocessor: Dict[str, Any],
         input_dropout_ratio: float = 0.0,
-        positional_encoder: Optional[HSTUPositionalEncoder] = None,
+        positional_encoder: Optional[Dict[str, Any]] = None,
         is_inference: bool = True,
         return_full_embeddings: bool = False,
         listwise: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
-        self._stu_module = stu_module
-        self._input_preprocessor: InputPreprocessor = input_preprocessor
-        self._output_postprocessor: OutputPostprocessor = (
-            output_postprocessor
-            if output_postprocessor is not None
-            else L2NormPostprocessor(is_inference=is_inference)
+        self._stu_module: STU = STUStack(
+            stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
         )
-        assert self._is_inference == self._input_preprocessor._is_inference, (
-            f"input_preprocessor must have the same mode; self: {self._is_inference} "
-            f"vs input_preprocessor {self._input_preprocessor._is_inference}"
+        self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
+            input_preprocessor,
+            input_embedding_dim=input_embedding_dim,
+            output_embedding_dim=stu["embedding_dim"],
         )
-        self._positional_encoder: Optional[HSTUPositionalEncoder] = positional_encoder
+        self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
+            output_postprocessor, embedding_dim=stu["embedding_dim"]
+        )
+        self._positional_encoder: Optional[HSTUPositionalEncoder] = None
+        if positional_encoder is not None:
+            self._positional_encoder = HSTUPositionalEncoder(
+                embedding_dim=stu["embedding_dim"], **positional_encoder
+            )
         self._input_dropout_ratio: float = input_dropout_ratio
         self._return_full_embeddings: bool = return_full_embeddings
         self._listwise_training: bool = listwise and self.is_train
@@ -85,9 +107,8 @@ class HSTUTransducer(BaseModule):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
-        seq_payloads = default_seq_payload(seq_payloads)
+        seq_payloads = _default_seq_payload(seq_payloads)
 
         with record_function("hstu_input_preprocessor"):
             (
@@ -97,7 +118,6 @@ class HSTUTransducer(BaseModule):
                 output_seq_timestamps,
                 output_seq_embeddings,
                 output_num_targets,
-                output_seq_payloads,
             ) = self._input_preprocessor(
                 max_seq_len=max_seq_len,
                 seq_lengths=seq_lengths,
@@ -133,7 +153,6 @@ class HSTUTransducer(BaseModule):
             output_seq_timestamps,
             output_seq_embeddings,
             output_num_targets,
-            output_seq_payloads,
         )
 
     def _hstu_compute(
@@ -149,7 +168,6 @@ class HSTUTransducer(BaseModule):
             seq_embeddings = self._stu_module(
                 max_seq_len=max_seq_len,
                 x=seq_embeddings,
-                x_lengths=seq_lengths,
                 x_offsets=seq_offsets,
                 num_targets=(None if self._listwise_training else num_targets),
             )
@@ -222,10 +240,20 @@ class HSTUTransducer(BaseModule):
         torch.Tensor,
         Optional[torch.Tensor],
     ]:
-        orig_dtype = seq_embeddings.dtype
-        if not self._is_inference:
-            seq_embeddings = seq_embeddings.to(self._training_dtype)
+        """Forward the module.
 
+        Args:
+            max_seq_len (int): maximum sequence length.
+            seq_lengths (torch.Tensor): input sequence lengths.
+            seq_embeddings (torch.Tensor): input sequence embeddings.
+            seq_timestamps (torch.Tensor): input sequence timestamps.
+            num_targets (int): number of targets.
+            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+
+        Returns:
+            encoded_candidate_embeddings (torch.Tensor): output embedding of candidates.
+            encoded_embeddings (torch.Tensor): full output embeddings.
+        """
         (
             max_seq_len,
             seq_lengths,
@@ -233,7 +261,6 @@ class HSTUTransducer(BaseModule):
             seq_timestamps,
             seq_embeddings,
             num_targets,
-            seq_payloads,
         ) = self._preprocess(
             max_seq_len=max_seq_len,
             seq_lengths=seq_lengths,
@@ -263,9 +290,8 @@ class HSTUTransducer(BaseModule):
         )
 
         if not self._is_inference:
-            encoded_candidate_embeddings.to(orig_dtype)
             if self._return_full_embeddings:
-                fx_unwrap_optional_tensor(encoded_embeddings).to(orig_dtype)
+                fx_unwrap_optional_tensor(encoded_embeddings)
         return (
             encoded_candidate_embeddings,
             encoded_embeddings,

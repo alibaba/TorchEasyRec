@@ -24,17 +24,10 @@ class ActionEncoderTest(unittest.TestCase):
         device = torch.device("cuda")
         action_embedding_dim = 32
         action_weights = [1, 2, 4, 8, 16]
-        watchtime_to_action_thresholds_and_weights = [
-            (30, 32),
-            (60, 64),
-            (100, 128),
-        ]
-        num_action_types = len(action_weights) + len(
-            watchtime_to_action_thresholds_and_weights
-        )
-        combined_action_weights = action_weights + [
-            x[1] for x in watchtime_to_action_thresholds_and_weights
-        ]
+        watchtime_to_action_thresholds = [30, 60, 100]
+        watchtime_to_action_weights = [32, 64, 128]
+        num_action_types = len(action_weights) + len(watchtime_to_action_thresholds)
+        combined_action_weights = action_weights + watchtime_to_action_weights
         enabled_actions = [
             [0],
             [0, 1],
@@ -48,7 +41,9 @@ class ActionEncoderTest(unittest.TestCase):
         ]
         watchtimes = [40, 20, 110, 31, 26, 55, 33, 71, 66]
         for i, wt in enumerate(watchtimes):
-            for j, w in enumerate(watchtime_to_action_thresholds_and_weights):
+            for j, w in enumerate(
+                zip(watchtime_to_action_thresholds, watchtime_to_action_weights)
+            ):
                 if wt > w[0]:
                     enabled_actions[i].append(j + len(action_weights))
         actions = [
@@ -59,7 +54,8 @@ class ActionEncoderTest(unittest.TestCase):
             watchtime_feature_name="watchtimes",
             action_feature_name="actions",
             action_weights=action_weights,
-            watchtime_to_action_thresholds_and_weights=watchtime_to_action_thresholds_and_weights,
+            watchtime_to_action_thresholds=watchtime_to_action_thresholds,
+            watchtime_to_action_weights=watchtime_to_action_weights,
             action_embedding_dim=action_embedding_dim,
             is_inference=False,
         ).to(device)

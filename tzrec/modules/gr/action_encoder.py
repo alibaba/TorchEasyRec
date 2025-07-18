@@ -18,8 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tzrec.modules.utils import BaseModule
-from tzrec.ops.utils import fx_arange
-from tzrec.utils.fx_util import fx_int_item
+from tzrec.utils.fx_util import fx_arange, fx_int_item
 
 torch.fx.wrap(fx_arange)
 torch.fx.wrap(fx_int_item)
@@ -31,25 +30,41 @@ def _fx_mask_assign(x: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) ->
 
 
 class ActionEncoder(BaseModule):
+    """Action encoder for HSTU.
+
+    Args:
+        action_embedding_dim (int): dimension of action embedding.
+        action_feature_name (str): name of action feature in payloads.
+        action_weights (List[int]): bitmask of each action.
+        watchtime_feature_name (str): name of watchtime feature in payloads.
+        watchtime_to_action_thresholds (List[int]): threshold for watchtime of each
+            action.
+        watchtime_to_action_weights (List[int]): bitmask for watchtime of each action.
+        is_inference (bool): whether to run in inference mode.
+    """
+
     def __init__(
         self,
         action_embedding_dim: int,
         action_feature_name: str,
         action_weights: List[int],
         watchtime_feature_name: str = "",
-        watchtime_to_action_thresholds_and_weights: Optional[
-            List[Tuple[int, int]]
-        ] = None,
+        watchtime_to_action_thresholds: Optional[List[int]] = None,
+        watchtime_to_action_weights: Optional[List[int]] = None,
         is_inference: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._watchtime_feature_name: str = watchtime_feature_name
         self._action_feature_name: str = action_feature_name
-        self._watchtime_to_action_thresholds_and_weights: List[Tuple[int, int]] = (
-            watchtime_to_action_thresholds_and_weights
-            if watchtime_to_action_thresholds_and_weights is not None
-            else []
-        )
+        self._watchtime_to_action_thresholds_and_weights: List[Tuple[int, int]] = []
+        if watchtime_to_action_thresholds is not None:
+            assert len(watchtime_to_action_thresholds) == len(
+                watchtime_to_action_weights
+            )
+            self._watchtime_to_action_thresholds_and_weights = list(
+                zip(watchtime_to_action_thresholds, watchtime_to_action_weights)
+            )
         self.register_buffer(
             "_combined_action_weights",
             torch.tensor(
@@ -73,7 +88,8 @@ class ActionEncoder(BaseModule):
         )
 
     @property
-    def output_embedding_dim(self) -> int:
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
         return self._action_embedding_dim * self._num_action_types
 
     def forward(
@@ -84,6 +100,18 @@ class ActionEncoder(BaseModule):
         seq_payloads: Dict[str, torch.Tensor],
         num_targets: torch.Tensor,
     ) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            max_seq_len (int): maximum sequence length.
+            seq_lengths (torch.Tensor): input sequence lengths.
+            seq_offsets (torch.Tensor): input sequence offsets.
+            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+            num_targets (int): number of targets.
+
+        Returns:
+            torch.Tensor: output action embedding tensor.
+        """
         seq_actions = seq_payloads[self._action_feature_name]
         if len(self._watchtime_to_action_thresholds_and_weights) > 0:
             watchtimes = seq_payloads[self._watchtime_feature_name]
