@@ -139,8 +139,9 @@ if __name__ == "__main__":
                     )
                 else:
                     raise ValueError(
-                        f"{fname} has already existed in project:{project}, "
-                        f"you can add '--force_update_resource true' in command"
+                        f"{fname} already existed in the {project}. "
+                        f"You can add '--force_update_resource' in the command "
+                        f"to force update."
                     )
             else:
                 logger.info(f"uploading resource [{fname}].")
