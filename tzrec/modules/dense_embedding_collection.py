@@ -13,7 +13,7 @@ import copy
 from collections import OrderedDict
 from enum import Enum
 from math import sqrt
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import Tensor, nn
@@ -189,6 +189,39 @@ class MLPEmbedding(nn.Module):
         return torch.einsum("ni,bn->bni", self.proj_w, input).reshape(
             (-1, self.num_dense_feature * self.embedding_dim)
         )
+
+    def state_dict(
+        self,
+        destination: Optional[Dict[str, Any]] = None,
+        prefix: str = "",
+        keep_vars: bool = False,
+        no_snapshot: bool = True,
+    ) -> Dict[str, Any]:
+        """Override.
+
+        Split the parameter proj_w so that they can be exported when using shared
+        embedding models like dssm_v2.
+        """
+        if destination is None:
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        for i in range(self.proj_w.shape[0]):
+            destination[f"{prefix}proj_w_{i}.weight"] = self.proj_w[i]
+        return destination
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Dict[str, Any],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        """Override."""
+        for key, param in self.state_dict(prefix=prefix).items():
+            param.detach().copy_(state_dict[key])
 
 
 def merge_same_config_features(
