@@ -94,6 +94,7 @@ class AutoDisEmbedding(nn.Module):
     def __init__(
         self,
         num_dense_feature: int,
+        feature_names: List[str],
         embedding_dim: int,
         num_channels: int,
         temperature: float = 0.1,
@@ -102,6 +103,7 @@ class AutoDisEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.num_dense_feature = num_dense_feature
+        self.feature_names = feature_names
         self.embedding_dim = embedding_dim
         self.keep_prob = keep_prob
         self.temperature = temperature
@@ -173,9 +175,15 @@ class AutoDisEmbedding(nn.Module):
             destination = OrderedDict()
             destination._metadata = OrderedDict()
         for i in range(self.meta_emb.shape[0]):
-            destination[f"{prefix}meta_emb_{i}.weight"] = self.meta_emb[i]
-            destination[f"{prefix}proj_w_{i}.weight"] = self.proj_w[i]
-            destination[f"{prefix}proj_m_{i}.weight"] = self.proj_m[i]
+            destination[f"{prefix}meta_emb_{self.feature_names[i]}.weight"] = (
+                self.meta_emb[i]
+            )
+            destination[f"{prefix}proj_w_{self.feature_names[i]}.weight"] = self.proj_w[
+                i
+            ]
+            destination[f"{prefix}proj_m_{self.feature_names[i]}.weight"] = self.proj_m[
+                i
+            ]
         return destination
 
     def _load_from_state_dict(
@@ -199,11 +207,13 @@ class MLPEmbedding(nn.Module):
     def __init__(
         self,
         num_dense_feature: int,
+        feature_names: List[str],
         embedding_dim: int,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         self.num_dense_feature = num_dense_feature
+        self.feature_names = feature_names
         self.embedding_dim = embedding_dim
         self.proj_w = nn.Parameter(
             torch.randn(num_dense_feature, embedding_dim)
@@ -241,7 +251,9 @@ class MLPEmbedding(nn.Module):
             destination = OrderedDict()
             destination._metadata = OrderedDict()
         for i in range(self.proj_w.shape[0]):
-            destination[f"{prefix}proj_w_{i}.weight"] = self.proj_w[i]
+            destination[f"{prefix}proj_w_{self.feature_names[i]}.weight"] = self.proj_w[
+                i
+            ]
         return destination
 
     def _load_from_state_dict(
@@ -336,12 +348,14 @@ class DenseEmbeddingCollection(nn.Module):
             if conf.embedding_type == DenseEmbeddingType.MLP:
                 self.dense_embs[conf.group_key] = MLPEmbedding(
                     num_dense_feature=len(feature_names),
+                    feature_names=feature_names,
                     embedding_dim=embedding_dim,
                     device=device,
                 )
             elif conf.embedding_type == DenseEmbeddingType.AUTO_DIS:
                 self.dense_embs[conf.group_key] = AutoDisEmbedding(
                     num_dense_feature=len(feature_names),
+                    feature_names=feature_names,
                     embedding_dim=embedding_dim,
                     num_channels=conf.n_channels,
                     temperature=conf.temperature,
