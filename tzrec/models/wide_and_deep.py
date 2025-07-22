@@ -17,14 +17,13 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.fm import FactorizationMachine
 from tzrec.modules.mlp import MLP
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class DeepFM(RankModel):
-    """DeepFM model.
+class WideAndDeep(RankModel):
+    """WideAndDeep model.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -45,15 +44,6 @@ class DeepFM(RankModel):
         self.wide_embedding_dim = self._model_config.wide_embedding_dim
         self.wide_init_fn = self._model_config.wide_init_fn
         self.init_input()
-        self.fm = FactorizationMachine()
-        if self.embedding_group.has_group("fm"):
-            self._fm_feature_dims = self.embedding_group.group_dims("fm")
-        else:
-            self._fm_feature_dims = self.embedding_group.group_dims("deep")
-        assert len(set(self._fm_feature_dims)) == 1, (
-            "embedding dimension of fm features must be same. "
-            f"but got {set(self._fm_feature_dims)}"
-        )
 
         deep_feature_dim = self.embedding_group.group_total_dim("deep")
         self.deep_mlp = MLP(
@@ -62,7 +52,7 @@ class DeepFM(RankModel):
         final_dim = self.deep_mlp.output_dim()
         if self._model_config.HasField("final"):
             self.final_mlp = MLP(
-                in_features=1 + self._fm_feature_dims[0] + final_dim,
+                in_features=1 + final_dim,
                 **config_to_kwargs(self._model_config.final),
             )
             final_dim = self.final_mlp.output_dim()
@@ -88,21 +78,11 @@ class DeepFM(RankModel):
         deep_feat = grouped_features["deep"]
         y_deep = self.deep_mlp(deep_feat)
 
-        # FM
-        if self.embedding_group.has_group("fm"):
-            fm_feat = grouped_features["fm"]
-        else:
-            fm_feat = deep_feat
-        fm_feat = torch.reshape(
-            fm_feat, (-1, len(self._fm_feature_dims), self._fm_feature_dims[0])
-        )
-        y_fm = self.fm(fm_feat)
-
         if self._model_config.HasField("final"):
-            y_cat = torch.cat([y_wide, y_fm, y_deep], dim=1)
+            y_cat = torch.cat([y_wide, y_deep], dim=1)
             y_final = self.final_mlp(y_cat)
             y = self.output_mlp(y_final)
         else:
-            y = y_wide + torch.sum(y_fm, dim=1, keepdim=True) + self.output_mlp(y_deep)
+            y = y_wide + self.output_mlp(y_deep)
 
         return self._output_to_prediction(y)
