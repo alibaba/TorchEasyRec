@@ -157,6 +157,41 @@ class AutoDisEmbedding(nn.Module):
         )  # shape = [b, n * d]
         return output
 
+    def state_dict(
+        self,
+        destination: Optional[Dict[str, Any]] = None,
+        prefix: str = "",
+        keep_vars: bool = False,
+        no_snapshot: bool = True,
+    ) -> Dict[str, Any]:
+        """Override.
+
+        Split the parameters so that they can be exported when using shared
+        embedding models like dssm_v2.
+        """
+        if destination is None:
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        for i in range(self.meta_emb.shape[0]):
+            destination[f"{prefix}meta_emb_{i}.weight"] = self.meta_emb[i]
+            destination[f"{prefix}proj_w_{i}.weight"] = self.proj_w[i]
+            destination[f"{prefix}proj_m_{i}.weight"] = self.proj_m[i]
+        return destination
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Dict[str, Any],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        """Override."""
+        for key, param in self.state_dict(prefix=prefix).items():
+            param.detach().copy_(state_dict[key])
+
 
 class MLPEmbedding(nn.Module):
     """MLP embedding for dense features."""
