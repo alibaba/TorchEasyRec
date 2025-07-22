@@ -137,6 +137,12 @@ if __name__ == "__main__":
                     resource = o.create_resource(
                         fname, "file", file_obj=open(fpath, "rb")
                     )
+                else:
+                    raise ValueError(
+                        f"{fname} already existed in the {project}. "
+                        f"You can add '--force_update_resource' in the command "
+                        f"to force update."
+                    )
             else:
                 logger.info(f"uploading resource [{fname}].")
                 resource = o.create_resource(fname, "file", file_obj=open(fpath, "rb"))
