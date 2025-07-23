@@ -5,6 +5,7 @@
    :maxdepth: 2
 
    multi_tower
+   wide_and_deep
    deepfm
    dlrm
    din
