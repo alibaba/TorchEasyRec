@@ -813,8 +813,21 @@ def _copy_assets(
     return feature
 
 
+def _remove_one_feature_bucketizer(fg_json: Dict[str, Any]) -> Dict[str, Any]:
+    fg_json.pop("hash_bucket_size", None)
+    fg_json.pop("vocab_dict", None)
+    fg_json.pop("vocab_list", None)
+    fg_json.pop("boundaries", None)
+    fg_json.pop("num_buckets", None)
+    if fg_json["feature_type"] != "tokenize_feature":
+        fg_json.pop("vocab_file", None)
+    return fg_json
+
+
 def create_fg_json(
-    features: List[BaseFeature], asset_dir: Optional[str] = None
+    features: List[BaseFeature],
+    asset_dir: Optional[str] = None,
+    remove_bucketizer: bool = False,
 ) -> Dict[str, Any]:
     """Create feature generate config for features."""
     results = []
@@ -835,10 +848,14 @@ def create_fg_json(
                 )
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             results.extend(fg_json)
     return {"features": results}
 
