@@ -122,4 +122,6 @@ class ExprFeature(RawFeature):
             fg_cfg["fill_missing"] = self.config.fill_missing
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("value_dim"):
+            fg_cfg["value_dim"] = self.config.value_dim
         return [fg_cfg]

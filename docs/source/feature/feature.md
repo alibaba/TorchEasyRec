@@ -315,6 +315,8 @@ feature_configs: {
 
 - **expression**: 表达式本身
 
+- **value_dim**: 默认值是0，value_dim=0时支持多值ID输出
+
 - **内置函数**: 详见[表达式文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/built-in-feature-operator?#1d09c2da3aajb)
 
   | 函数名      | 参数数量 | 解释                                                                    |
