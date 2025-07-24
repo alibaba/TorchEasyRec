@@ -9,9 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import argparse
-import copy
 import json
 import os
 import shutil
@@ -91,17 +89,9 @@ if __name__ == "__main__":
         _ = next(iterator)
 
     tmp_dir = tempfile.mkdtemp(prefix="tzrec_")
-    fg_json = create_fg_json(features, asset_dir=tmp_dir)
-    if args.remove_bucketizer:
-        fg_json = copy.copy(fg_json)
-        for feature in fg_json["features"]:
-            feature.pop("hash_bucket_size", None)
-            feature.pop("vocab_dict", None)
-            feature.pop("vocab_list", None)
-            feature.pop("boundaries", None)
-            feature.pop("num_buckets", None)
-            if feature["feature_type"] != "tokenize_feature":
-                feature.pop("vocab_file", None)
+    fg_json = create_fg_json(
+        features, asset_dir=tmp_dir, remove_bucketizer=args.remove_bucketizer
+    )
 
     if args.reserves is not None:
         reserves = []
