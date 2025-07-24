@@ -169,6 +169,8 @@ def restore_model(
             planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
         )
         model.load_state_dict(state_dict)
+    else:
+        raise RuntimeError(f"model_ckpt_path[{model_ckpt_path}] not exists.")
     if optimizer and os.path.exists(optim_ckpt_path):
         if is_local_rank_zero:
             logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
@@ -179,6 +181,9 @@ def restore_model(
             planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
         )
         optimizer.load_state_dict(state_dict)
+    else:
+        if is_local_rank_zero:
+            logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
 
 
 def save_model(
