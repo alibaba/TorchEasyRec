@@ -392,6 +392,8 @@ message ExprFeature {
     optional string init_fn = 12;
     // mask value in training progress
     optional bool use_mask =  13;
+    // if value_dim = 0, it supports multi-value
+    optional uint32 value_dim = 14 [default = 0];
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
