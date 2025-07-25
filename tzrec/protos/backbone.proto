@@ -49,14 +49,14 @@ message Input {
 message RecurrentLayer {
     required uint32 num_steps = 1 [default = 1];
     optional uint32 fixed_input_index = 2;
-    required TorchLayer keras_layer = 3;
+    required TorchLayer module = 3;
 }
 
 message RepeatLayer {
     required uint32 num_repeat = 1 [default = 1];
     // default output the list of multiple outputs
     optional int32 output_concat_axis = 2;
-    required TorchLayer keras_layer = 3;
+    required TorchLayer module = 3;
     optional string input_slice = 4;
     optional string input_fn = 5;
 }
@@ -64,7 +64,7 @@ message RepeatLayer {
 message Layer {
     oneof layer {
         Lambda lambda = 1;
-        TorchLayer keras_layer = 2;
+        TorchLayer module = 2;
         RecurrentLayer recurrent = 3;
         RepeatLayer repeat = 4;
     }
@@ -85,7 +85,7 @@ message Block {
     oneof layer {
         InputLayer input_layer = 101;
         Lambda lambda = 102;
-        TorchLayer keras_layer = 103;
+        TorchLayer module = 103;
         RecurrentLayer recurrent = 104;
         RepeatLayer repeat = 105;
     }
