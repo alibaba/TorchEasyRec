@@ -109,6 +109,8 @@ message IdFeature {
     optional string fg_value_type = 32;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     // TODO: constrains
 }
@@ -149,6 +151,8 @@ message RawFeature {
     optional string fg_encoded_default_value = 30;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     oneof dense_emb {
         // autodis embedding
@@ -204,6 +208,8 @@ message ComboFeature {
     optional uint64 default_bucketize_value = 31;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     // TODO: constrains
 }
@@ -276,6 +282,8 @@ message LookupFeature {
     optional string fg_value_type = 32;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     oneof dense_emb {
         // autodis embedding
@@ -358,6 +366,8 @@ message MatchFeature {
     optional string fg_value_type = 32;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     oneof dense_emb {
         // autodis embedding
@@ -401,6 +411,8 @@ message ExprFeature {
     optional string fg_encoded_default_value = 30;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     oneof dense_emb {
         // autodis embedding
@@ -448,6 +460,8 @@ message OverlapFeature {
     optional string fg_encoded_default_value = 30;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     oneof dense_emb {
         // autodis embedding
@@ -516,6 +530,8 @@ message TokenizeFeature {
     optional string fg_encoded_default_value = 30;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     // TODO: constrains
 }
@@ -582,6 +598,8 @@ message CustomFeature {
     optional uint64 default_bucketize_value = 31;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     oneof dense_emb {
         // autodis embedding
@@ -643,6 +661,8 @@ message SequenceIdFeature {
     optional uint64 default_bucketize_value = 31;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     // TODO: constrains
 }
@@ -687,6 +707,8 @@ message SequenceRawFeature {
     optional string fg_encoded_default_value = 30;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
     // TODO: constrains
 }
 
@@ -757,6 +779,8 @@ message SequenceCustomFeature {
     optional uint64 default_bucketize_value = 31;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
 
     // TODO: constrains
 }

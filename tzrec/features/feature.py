@@ -518,6 +518,13 @@ class BaseFeature(object, metaclass=_meta_cls):
             self._side_inputs = side_inputs
         return self._side_inputs
 
+    @property
+    def stub_type(self) -> bool:
+        """Only used as fg dag intermediate result or not."""
+        if self.config.stub_type:
+            return self.config.stub_type
+        return False
+
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
         return NotImplemented

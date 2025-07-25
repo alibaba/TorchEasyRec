@@ -207,6 +207,8 @@ class CustomFeature(BaseFeature):
             fg_cfg["boundaries"] = list(self.config.boundaries)
 
         fg_cfg["value_dim"] = self.value_dim
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
     @property
