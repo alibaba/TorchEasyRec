@@ -194,8 +194,8 @@ def load_torch_layer(name):
         path = "torch.nn." + name
         return pydoc.locate(path), False
     except pydoc.ErrorDuringImport:
-        print("load keras layer %s failed" % name)
+        print("load torch layer %s failed" % name)
         import logging
 
-        logging.error("load keras layer %s failed: %s" % (name, traceback.format_exc()))
+        logging.error("load torch layer %s failed: %s" % (name, traceback.format_exc()))
         return None, False

@@ -22,6 +22,8 @@ from tzrec.protos.model_pb2 import ModelConfig
 
 
 class RankBackbone(RankModel):
+    """Ranking backbone model."""
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -34,6 +36,7 @@ class RankBackbone(RankModel):
         self.init_input()
         self._feature_dict = features
         self._backbone_output = None
+        self._l2_reg = None
         self._backbone_net = self.build_backbone_network()
 
     def build_backbone_network(self):
