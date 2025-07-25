@@ -169,3 +169,33 @@ def load_by_path(path):
     except pydoc.ErrorDuringImport:
         print("load %s failed: %s" % (path, traceback.format_exc()))
         return None
+
+
+def load_torch_layer(name):
+    """Load torch layer class.
+
+    Args:
+      name (str): Module class name, e.g. 'Linear' or 'YourCustomLayer'
+
+    Return:
+      (layer_class, is_customize)
+      module_class: The class object (e.g., torch.nn.Linear)
+      is_customize: True if loaded from custom namespace, False if from torch.nn
+    """
+    name = name.strip()
+    if name == "" or name is None:
+        return None
+
+    path = "tzrec.modules." + name
+    try:
+        cls = pydoc.locate(path)
+        if cls is not None:
+            return cls, True
+        path = "torch.nn." + name
+        return pydoc.locate(path), False
+    except pydoc.ErrorDuringImport:
+        print("load keras layer %s failed" % name)
+        import logging
+
+        logging.error("load keras layer %s failed: %s" % (name, traceback.format_exc()))
+        return None, False

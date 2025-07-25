@@ -2,7 +2,7 @@ syntax = "proto2";
 package tzrec.protos;
 
 import "tzrec/protos/torch_layer.proto";
-
+import "tzrec/protos/module.proto";
 
 message InputLayer {
     optional bool do_batch_norm = 1;
@@ -103,3 +103,15 @@ message BlockPackage {
     repeated string output_blocks = 4;
 }
 
+message BackboneTower {
+    // a few sub DAGs
+    repeated BlockPackage packages = 1;
+    // a few blocks generating a DAG
+    repeated Block blocks = 2;
+    // the names of output blocks, will be merge into a tensor
+    repeated string concat_blocks = 3;
+    // the names of output blocks, return as a list or single tensor
+    repeated string output_blocks = 4;
+    // optional top mlp layer
+    optional MLP top_mlp = 5;
+}

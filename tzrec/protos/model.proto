@@ -36,11 +36,33 @@ enum Kernel {
     CUDA = 2;
 }
 
+// configure backbone network common parameters
+message ModelParams {
+    optional float l2_regularization = 1;
+    repeated string outputs = 2;
+}
+
+message RankBackbone {
+    required BackboneTower backbone = 1;
+    optional ModelParams model_params = 2;
+}
+message MatchBackbone {
+    required BackboneTower backbone = 1;
+    optional ModelParams model_params = 2;
+}
+message MultiTaskBackbone {
+    required BackboneTower backbone = 1;
+    optional ModelParams model_params = 2;
+}
 message ModelConfig {
 
     repeated FeatureGroupConfig feature_groups = 1;
 
     oneof model {
+        RankBackbone rank_backbone = 1001;
+        MatchBackbone match_backbone = 1002;
+        MultiTaskBackbone multi_task_backbone = 1003;
+
 	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
