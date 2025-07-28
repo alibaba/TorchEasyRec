@@ -169,7 +169,8 @@ class MatchTowerWoEG(nn.Module):
         similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
-        variational_dropout: Optional[VariationalDropout] = None,
+        feature_dims: Dict[str, int],
+        model_config: model_pb2.ModelConfig,
     ) -> None:
         super().__init__()
         self._tower_config = tower_config
@@ -178,7 +179,41 @@ class MatchTowerWoEG(nn.Module):
         self._similarity = similarity
         self._feature_group = feature_group
         self._features = features
-        self._variational_dropout = variational_dropout
+        self._model_config = model_config
+        self._feature_dims = feature_dims
+        self.group_variational_dropouts = None
+        self.group_variational_dropout_loss = {}
+
+    def init_variational_dropouts(self) -> None:
+        """Build embedding group and group variational dropout."""
+        if self._model_config.HasField("variational_dropout"):
+            self.group_variational_dropouts = nn.ModuleDict()
+            variational_dropout_config = self._model_config.variational_dropout
+            variational_dropout_config_dict = config_to_kwargs(
+                variational_dropout_config
+            )
+            if self._feature_group.group_type != model_pb2.SEQUENCE:
+                if len(self._feature_dims) > 1:
+                    variational_dropout = VariationalDropout(
+                        self._feature_dims,
+                        self._feature_group.group_name,
+                        **variational_dropout_config_dict,
+                    )
+                    self.group_variational_dropouts[self._feature_group.group_name] = (
+                        variational_dropout
+                    )
+
+    def run_variational_dropout(self, feature: torch.Tensor) -> torch.Tensor:
+        """Run the variational dropout."""
+        if self.group_variational_dropouts is not None:
+            variational_dropout = self.group_variational_dropouts[self._group_name]
+            feature, variational_dropout_loss = variational_dropout(feature)
+            _update_tensor_2_dict(
+                self.group_variational_dropout_loss,
+                variational_dropout_loss,
+                self._group_name + "_feature_p_loss",
+            )
+        return feature
 
 
 class MatchModel(BaseModel):
@@ -440,7 +475,6 @@ class TowerWoEGWrapper(nn.Module):
         self._features = module._features
         self._tower_name = tower_name
         self._group_name = module._group_name
-        self._variational_dropout = module._variational_dropout
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -452,7 +486,8 @@ class TowerWoEGWrapper(nn.Module):
             embedding (dict): tower output embedding.
         """
         grouped_features = self.embedding_group(batch)
-        feat = grouped_features[self._group_name]
-        if self._variational_dropout:
-            feat, _ = self._variational_dropout(feat)
-        return {f"{self._tower_name}_emb": getattr(self, self._tower_name)(feat)}
+        return {
+            f"{self._tower_name}_emb": getattr(self, self._tower_name)(
+                grouped_features[self._group_name]
+            )
+        }
