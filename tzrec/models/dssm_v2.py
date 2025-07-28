@@ -19,8 +19,10 @@ from torch._tensor import Tensor
 from tzrec.datasets.utils import HARD_NEG_INDICES, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
+from tzrec.models.rank_model import _update_tensor_dict
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
+from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
@@ -46,8 +48,16 @@ class DSSMTower(MatchTowerWoEG):
         feature_group: model_pb2.FeatureGroupConfig,
         feature_group_dims: List[int],
         features: List[BaseFeature],
+        variational_dropout: Optional[VariationalDropout] = None,
     ) -> None:
-        super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        super().__init__(
+            tower_config,
+            output_dim,
+            similarity,
+            feature_group,
+            features,
+            variational_dropout,
+        )
         tower_feature_in = sum(feature_group_dims)
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
         if self._output_dim > 0:
@@ -94,7 +104,17 @@ class DSSMV2(MatchModel):
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
         )
-
+        self.group_variational_dropouts = None
+        self.init_variational_dropouts()
+        self.user_variational_dropout = None
+        self.item_variational_dropout = None
+        if self.group_variational_dropouts:
+            self.user_variational_dropout = self.group_variational_dropouts[
+                self._model_config.user_tower.input
+            ]
+            self.item_variational_dropout = self.group_variational_dropouts[
+                self._model_config.item_tower.input
+            ]
         user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
 
@@ -108,6 +128,7 @@ class DSSMV2(MatchModel):
             user_group,
             self.embedding_group.group_dims(self._model_config.user_tower.input),
             user_features,
+            self.user_variational_dropout,
         )
 
         self.item_tower = DSSMTower(
@@ -117,7 +138,28 @@ class DSSMV2(MatchModel):
             item_group,
             self.embedding_group.group_dims(self._model_config.item_tower.input),
             item_features,
+            self.item_variational_dropout,
         )
+
+    def init_variational_dropouts(self) -> None:
+        """Build group variational dropout."""
+        if self._base_model_config.HasField("variational_dropout"):
+            self.group_variational_dropouts = nn.ModuleDict()
+            variational_dropout_config = self._base_model_config.variational_dropout
+            variational_dropout_config_dict = config_to_kwargs(
+                variational_dropout_config
+            )
+            for feature_group in list(self._base_model_config.feature_groups):
+                group_name = feature_group.group_name
+                if feature_group.group_type != model_pb2.SEQUENCE:
+                    feature_dim = self.embedding_group.group_feature_dims(group_name)
+                    if len(feature_dim) > 1:
+                        variational_dropout = VariationalDropout(
+                            feature_dim, group_name, **variational_dropout_config_dict
+                        )
+                        self.group_variational_dropouts[group_name] = (
+                            variational_dropout
+                        )
 
     def predict(self, batch: Batch) -> Dict[str, Tensor]:
         """Forward the model.
@@ -133,6 +175,24 @@ class DSSMV2(MatchModel):
         batch_size = batch.labels[self._labels[0]].size(0)
         user_feat = grouped_features[self._model_config.user_tower.input][:batch_size]
         item_feat = grouped_features[self._model_config.item_tower.input]
+        if self.group_variational_dropouts is not None:
+            user_feat, user_variational_dropout_loss = self.user_variational_dropout(
+                user_feat
+            )
+            _update_tensor_dict(
+                self._loss_collection,
+                user_variational_dropout_loss,
+                self._model_config.user_tower.input + "_feature_p_loss",
+            )
+            item_feat, item_variational_dropout_loss = self.item_variational_dropout(
+                item_feat
+            )
+            _update_tensor_dict(
+                self._loss_collection,
+                item_variational_dropout_loss,
+                self._model_config.item_tower.input + "_feature_p_loss",
+            )
+
         user_tower_emb = self.user_tower(user_feat)
         item_tower_emb = self.item_tower(item_feat)
 

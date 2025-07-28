@@ -169,6 +169,7 @@ class MatchTowerWoEG(nn.Module):
         similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
+        variational_dropout: Optional[VariationalDropout] = None,
     ) -> None:
         super().__init__()
         self._tower_config = tower_config
@@ -177,6 +178,7 @@ class MatchTowerWoEG(nn.Module):
         self._similarity = similarity
         self._feature_group = feature_group
         self._features = features
+        self._variational_dropout = variational_dropout
 
 
 class MatchModel(BaseModel):
@@ -438,6 +440,7 @@ class TowerWoEGWrapper(nn.Module):
         self._features = module._features
         self._tower_name = tower_name
         self._group_name = module._group_name
+        self._variational_dropout = module._variational_dropout
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -449,8 +452,7 @@ class TowerWoEGWrapper(nn.Module):
             embedding (dict): tower output embedding.
         """
         grouped_features = self.embedding_group(batch)
-        return {
-            f"{self._tower_name}_emb": getattr(self, self._tower_name)(
-                grouped_features[self._group_name]
-            )
-        }
+        feat = grouped_features[self._group_name]
+        if self._variational_dropout:
+            feat, _ = self._variational_dropout(feat)
+        return {f"{self._tower_name}_emb": getattr(self, self._tower_name)(feat)}
