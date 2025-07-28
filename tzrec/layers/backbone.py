@@ -675,8 +675,7 @@ class Backbone(nn.Module):
 
 
 def merge_inputs(inputs, axis=-1, msg=""):
-    """
-    合并多个输入，根据输入类型和数量执行不同的逻辑处理。
+    """合并多个输入，根据输入类型和数量执行不同的逻辑处理。
 
     参数:
     inputs (list): 待合并的输入，可以是列表或张量的列表。
