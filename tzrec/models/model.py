@@ -212,7 +212,7 @@ class TrainWrapper(BaseModule):
     def __init__(
         self,
         module: nn.Module,
-        device: torch.device,
+        device: Optional[torch.device] = None,
         mixed_precision: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -220,6 +220,9 @@ class TrainWrapper(BaseModule):
         self.model.init_loss()
         self.model.init_metric()
         self._device = device
+        self._device_type = "cpu"
+        if device is not None:
+            self._device_type = device.type
         if mixed_precision is None or len(mixed_precision) == 0:
             self._mixed_dtype = None
         elif mixed_precision == "FP16":
@@ -244,7 +247,7 @@ class TrainWrapper(BaseModule):
             batch (Batch): input batch data.
         """
         with torch.amp.autocast(
-            device_type=self._device.type,
+            device_type=self._device_type,
             dtype=self._mixed_dtype,
             enabled=self._mixed_dtype is not None,
         ):
