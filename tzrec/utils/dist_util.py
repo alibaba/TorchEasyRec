@@ -161,6 +161,11 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
         with record_function("## backward ##"):
             loss = torch.sum(losses, dim=0)
             if (
+                hasattr(self._optimizer, "_gradient_accumulation_steps")
+                and self._optimizer._gradient_accumulation_steps > 1
+            ):
+                loss = loss / self._optimizer._gradient_accumulation_steps
+            if (
                 hasattr(self._optimizer, "_grad_scaler")
                 and self._optimizer._grad_scaler is not None
             ):

@@ -222,13 +222,13 @@ class TrainWrapper(BaseModule):
         self._device = device
         if mixed_precision is None or len(mixed_precision) == 0:
             self._mixed_dtype = None
-        elif mixed_precision == "fp16":
+        elif mixed_precision == "FP16":
             self._mixed_dtype = torch.float16
-        elif mixed_precision == "bf16":
+        elif mixed_precision == "BF16":
             self._mixed_dtype = torch.bfloat16
         else:
             raise ValueError(
-                f"mixed_precision should be fp16 or bf16, but got [{mixed_precision}]"
+                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
             )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
