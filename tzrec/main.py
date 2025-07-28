@@ -23,6 +23,7 @@ import pyarrow as pa
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -73,6 +74,7 @@ from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
+from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -738,7 +740,17 @@ def train_and_evaluate(
         dict(in_backward_optimizer_filter(model.named_parameters())),
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
     )
-    optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
+    grad_scaler = None
+    if pipeline_config.train_config.HasField("grad_scaler"):
+        grad_scaler = GradScaler(
+            device=device,
+            **config_util.config_to_kwargs(pipeline_config.train_config.grad_scaler),
+        )
+    optimizer = TZRecOptimizer(
+        CombinedOptimizer([model.fused_optimizer, dense_optimizer]),
+        grad_scaler=grad_scaler,
+        gradient_accumulation_steps=pipeline_config.train_config.gradient_accumulation_steps,
+    )
     sparse_lr = optimizer_builder.create_scheduler(
         model.fused_optimizer, pipeline_config.train_config.sparse_optimizer
     )
