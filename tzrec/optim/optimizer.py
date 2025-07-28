@@ -39,7 +39,7 @@ class TZRecOptimizer(OptimizerWrapper):
     def zero_grad(self, set_to_none: bool = False) -> None:
         """Zero gradients."""
         if (
-            self._gradient_accumulation_steps > 0
+            self._gradient_accumulation_steps > 1
             and self._step % self._gradient_accumulation_steps == 0
         ):
             self._optimizer.zero_grad(set_to_none=set_to_none)
@@ -48,10 +48,11 @@ class TZRecOptimizer(OptimizerWrapper):
         """Step."""
         self._step += 1
         if (
-            self._gradient_accumulation_steps > 0
+            self._gradient_accumulation_steps > 1
             and self._step % self._gradient_accumulation_steps == 0
         ):
             if self._grad_scaler is not None:
-                self._grad_scaler.step(self._optimizer, closure=closure)
+                self._grad_scaler.step(self._optimizer)
+                self._grad_scaler.update()
             else:
                 self._optimizer.step(closure=closure)

@@ -15,6 +15,7 @@ from typing import List, Optional
 import torch
 from torch import distributed as dist
 from torch import nn
+from torch.autograd.profiler import record_function
 from torchrec.distributed.embedding_types import (
     KJTList,
 )
@@ -29,6 +30,9 @@ from torchrec.distributed.mc_embedding_modules import (
 from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel as _DistributedModelParallel,
+)
+from torchrec.distributed.train_pipeline import (
+    TrainPipelineSparseDist as _TrainPipelineSparseDist,
 )
 from torchrec.distributed.types import (
     Awaitable,
@@ -148,3 +152,18 @@ def DistributedModelParallel(
         if hasattr(m, "_has_uninitialized_input_dist"):
             m._has_uninitialized_input_dist = True
     return model
+
+
+class TrainPipelineSparseDist(_TrainPipelineSparseDist):
+    """TorchEasyRec's TrainPipelineSparseDist, make backward support grad scaler."""
+
+    def _backward(self, losses: torch.Tensor) -> None:
+        with record_function("## backward ##"):
+            loss = torch.sum(losses, dim=0)
+            if (
+                hasattr(self._optimizer, "_grad_scaler")
+                and self._optimizer._grad_scaler is not None
+            ):
+                self._optimizer._grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()

@@ -27,9 +27,6 @@ from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-
-# NOQA
-from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
@@ -83,7 +80,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
-from tzrec.utils.dist_util import DistributedModelParallel
+from tzrec.utils.dist_util import DistributedModelParallel, TrainPipelineSparseDist
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -627,8 +624,9 @@ def train_and_evaluate(
         edit_config_json (str, optional): edit pipeline config json str.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    train_config = pipeline_config.train_config
     if fine_tune_checkpoint:
-        pipeline_config.train_config.fine_tune_checkpoint = fine_tune_checkpoint
+        train_config.fine_tune_checkpoint = fine_tune_checkpoint
     if train_input_path:
         pipeline_config.train_input_path = train_input_path
     if eval_input_path:
@@ -642,7 +640,7 @@ def train_and_evaluate(
     device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
-    allow_tf32(pipeline_config.train_config, backend)
+    allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -702,10 +700,12 @@ def train_and_evaluate(
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
     )
-    model = TrainWrapper(model)
+    model = TrainWrapper(
+        model, device=device, mixed_precision=train_config.mixed_precision
+    )
 
     sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
-        pipeline_config.train_config.sparse_optimizer
+        train_config.sparse_optimizer
     )
     trainable_params, frozen_params = model.model.sparse_parameters()
     apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
@@ -718,7 +718,7 @@ def train_and_evaluate(
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
         ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
-        global_constraints_cfg=pipeline_config.train_config.global_embedding_constraints,
+        global_constraints_cfg=train_config.global_embedding_constraints,
     )
 
     plan = planner.collective_plan(
@@ -734,28 +734,28 @@ def train_and_evaluate(
     )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
-        pipeline_config.train_config.dense_optimizer
+        train_config.dense_optimizer
     )
     dense_optimizer = KeyedOptimizerWrapper(
         dict(in_backward_optimizer_filter(model.named_parameters())),
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
     )
     grad_scaler = None
-    if pipeline_config.train_config.HasField("grad_scaler"):
+    if train_config.HasField("grad_scaler"):
         grad_scaler = GradScaler(
             device=device,
-            **config_util.config_to_kwargs(pipeline_config.train_config.grad_scaler),
+            **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(
         CombinedOptimizer([model.fused_optimizer, dense_optimizer]),
         grad_scaler=grad_scaler,
-        gradient_accumulation_steps=pipeline_config.train_config.gradient_accumulation_steps,
+        gradient_accumulation_steps=train_config.gradient_accumulation_steps,
     )
     sparse_lr = optimizer_builder.create_scheduler(
-        model.fused_optimizer, pipeline_config.train_config.sparse_optimizer
+        model.fused_optimizer, train_config.sparse_optimizer
     )
     dense_lr = optimizer_builder.create_scheduler(
-        dense_optimizer, pipeline_config.train_config.dense_optimizer
+        dense_optimizer, train_config.dense_optimizer
     )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
@@ -777,7 +777,7 @@ def train_and_evaluate(
         eval_dataloader,
         [sparse_lr, dense_lr],
         pipeline_config.model_dir,
-        train_config=pipeline_config.train_config,
+        train_config=train_config,
         eval_config=pipeline_config.eval_config,
         skip_steps=skip_steps,
         ckpt_path=ckpt_path,
@@ -807,7 +807,8 @@ def evaluate(
     device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
-    allow_tf32(pipeline_config.train_config, backend)
+    train_config = pipeline_config.train_config
+    allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -830,13 +831,15 @@ def evaluate(
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
     )
-    model = TrainWrapper(model)
+    model = TrainWrapper(
+        model, device=device, mixed_precision=train_config.mixed_precision
+    )
 
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
-        global_constraints_cfg=pipeline_config.train_config.global_embedding_constraints,
+        global_constraints_cfg=train_config.global_embedding_constraints,
     )
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD
