@@ -19,9 +19,10 @@ from torch._tensor import Tensor
 from tzrec.datasets.utils import HARD_NEG_INDICES, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.dssm import _update_dict_tensor
-from tzrec.models.match_model import MatchModel, MatchTowerWoEG
+from tzrec.models.match_model import MatchModel, MatchTowerWoEG, _update_tensor_2_dict
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
+from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
@@ -49,20 +50,47 @@ class DSSMTower(MatchTowerWoEG):
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
     ) -> None:
-        super().__init__(
-            tower_config,
-            output_dim,
-            similarity,
-            feature_group,
-            features,
-            feature_dims,
-            model_config,
-        )
+        super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        self._model_config = model_config
+        self._feature_dims = feature_dims
+        self.group_variational_dropouts = None
+        self.group_variational_dropout_loss = {}
         self.init_variational_dropouts()
         tower_feature_in = sum(feature_dims.values())
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
         if self._output_dim > 0:
             self.output = nn.Linear(self.mlp.output_dim(), output_dim)
+
+    def init_variational_dropouts(self) -> None:
+        """Build embedding group and group variational dropout."""
+        if self._model_config.HasField("variational_dropout"):
+            self.group_variational_dropouts = nn.ModuleDict()
+            variational_dropout_config = self._model_config.variational_dropout
+            variational_dropout_config_dict = config_to_kwargs(
+                variational_dropout_config
+            )
+            if self._feature_group.group_type != model_pb2.SEQUENCE:
+                if len(self._feature_dims) > 1:
+                    variational_dropout = VariationalDropout(
+                        self._feature_dims,
+                        self._feature_group.group_name,
+                        **variational_dropout_config_dict,
+                    )
+                    self.group_variational_dropouts[self._feature_group.group_name] = (
+                        variational_dropout
+                    )
+
+    def run_variational_dropout(self, feature: torch.Tensor) -> torch.Tensor:
+        """Run the variational dropout."""
+        if self.group_variational_dropouts is not None:
+            variational_dropout = self.group_variational_dropouts[self._group_name]
+            feature, variational_dropout_loss = variational_dropout(feature)
+            _update_tensor_2_dict(
+                self.group_variational_dropout_loss,
+                variational_dropout_loss,
+                self._group_name + "_feature_p_loss",
+            )
+        return feature
 
     def forward(self, feature: torch.Tensor) -> torch.Tensor:
         """Forward the tower.
