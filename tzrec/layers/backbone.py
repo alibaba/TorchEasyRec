@@ -48,7 +48,7 @@ class Package(nn.Module):
         super().__init__()
         self._config = config
         self._features = features
-        self._embedding_group = embedding_group
+        # self._embedding_group = embedding_group
         self._input_layer = input_layer
         self._l2_reg = l2_reg
         self._dag = DAG()
@@ -172,9 +172,9 @@ class Package(nn.Module):
                 else:
                     if layer == "input_layer":
                         # input_fn = self._embedding_group.has_group(group)
-                        input_fn = self._embedding_group
+                        input_fn = embedding_group
                         self._name_to_output_dim[block.name] = (
-                            self._embedding_group.group_total_dim(group)
+                            embedding_group.group_total_dim(group)
                         )  # 计算input_layer的输出维度
                         input_feature_groups[group] = input_fn  # not a layer is a dim
                     elif layer == "raw_input":
@@ -199,7 +199,8 @@ class Package(nn.Module):
                             block.name,
                             vocab,
                         )
-                    self._name_to_layer[block.name] = self._embedding_group
+                    # 加上的话embedding 会被实例化多次
+                    # self._name_to_layer[block.name] = embedding_group
             else:  # module
                 # 计算 self._name_to_output_dim[block.name] 由所有inputs block 的self._name_to_output_dim相加
                 # 遍历 block.inputs，获取每个输入block的output_dim 作为输入维度
@@ -255,7 +256,7 @@ class Package(nn.Module):
         #
         num_pkg_input = 0
         # 可选: 检查package输入
-
+        # 如果不配置concat_blocks，框架会自动拼接DAG的所有叶子节点并输出
         if len(config.concat_blocks) == 0 and len(config.output_blocks) == 0:
             leaf = self._dag.all_leaves()
             logging.warning(
@@ -270,6 +271,27 @@ class Package(nn.Module):
         logging.info(
             "%s layers: %s" % (config.name, ",".join(self._name_to_layer.keys()))
         )
+
+    def get_output_block_names(self):
+        """返回最终作为输出的 block 名字列表（优先 concat_blocks，否则 output_blocks）。"""
+        blocks = list(getattr(self._config, "concat_blocks", []))
+        if not blocks:
+            blocks = list(getattr(self._config, "output_blocks", []))
+        return blocks
+
+    def output_block_dims(self):
+        """返回最终输出 block 的维度组成的 list，比如 [160, 96]"""
+        blocks = self.get_output_block_names()
+        dims = []
+        for block in blocks:
+            if block not in self._name_to_output_dim:
+                raise ValueError(f"block `{block}` not in name_to_output_dim")
+            dims.append(self._name_to_output_dim[block])
+        return dims
+
+    def total_output_dim(self):
+        """返回拼接后最终输出的总维度"""
+        return sum(self.output_block_dims())
 
     def define_layers(self, layer, layer_cnf, name, reuse):
         """得到layer
@@ -481,7 +503,7 @@ class Package(nn.Module):
 
         return output
 
-    def __call__(self, is_training, group_features=None, batch=None, **kwargs):
+    def forward(self, is_training, group_features=None, batch=None, **kwargs):
         # group_features:Dict[str, torch.Tensor]
         block_outputs = {}
         self._block_outputs = block_outputs  # reset
@@ -501,9 +523,7 @@ class Package(nn.Module):
                 output = self.block_input(config, block_outputs, is_training, **kwargs)
                 for i, layer in enumerate(config.layers):
                     name_i = "%s_l%d" % (block, i)
-                    output = self.call_layer(
-                        output, layer, name_i, is_training, **kwargs
-                    )
+                    output = self.call_layer(output, layer, name_i, **kwargs)
                 block_outputs[block] = output
                 continue
 
@@ -516,7 +536,8 @@ class Package(nn.Module):
             elif layer_type == "raw_input":
                 block_outputs[block] = self._name_to_layer[block]
             elif layer_type == "input_layer":
-                input_fn = self._name_to_layer[block]  # embedding group
+                # input_fn = self._name_to_layer[block]  # embedding group
+                # 本身没有block input 了
                 input_config = config.input_layer
                 if self.input_config is not None:
                     input_config = self.input_config
@@ -528,16 +549,19 @@ class Package(nn.Module):
                 #     block_outputs[block] = input_fn(batch)
                 # else:
                 #     block_outputs[block] = input_fn(input_config)
-                block_outputs[block] = input_fn(group_features[block])
+                # block_outputs[block] = input_fn(group_features[block])
+                block_outputs[block] = group_features[
+                    block
+                ]  # group_features是一个字典，key是block name
             elif layer_type == "embedding_layer":
                 input_fn = self._name_to_layer[block]
                 feature_group = config.inputs[0].feature_group_name
                 inputs, _, weights = self._feature_group_inputs[feature_group]
                 block_outputs[block] = input_fn([inputs, weights], is_training)
             else:
-                # moudle  Custom layer 一些自定义的层  例如 mlp
+                # module  Custom layer 一些自定义的层  例如 mlp
                 inputs = self.block_input(config, block_outputs, is_training, **kwargs)
-                output = self.call_layer(inputs, config, block, is_training, **kwargs)
+                output = self.call_layer(inputs, config, block, **kwargs)
                 block_outputs[block] = output
 
         # Collect outputs
@@ -563,7 +587,7 @@ class Package(nn.Module):
             raise e
         return output
 
-    def call_keras_layer(self, inputs, name, training, **kwargs):
+    def call_keras_layer(self, inputs, name, **kwargs):
         """Call predefined torch Layer, which can be reused."""
         layer = self._name_to_layer[name]
         customize = self._name_to_customize.get(name, False)
@@ -587,10 +611,10 @@ class Package(nn.Module):
                 output = layer(inputs)
         return output
 
-    def call_layer(self, inputs, config, name, training, **kwargs):
+    def call_layer(self, inputs, config, name, **kwargs):
         layer_name = config.WhichOneof("layer")
         if layer_name == "module":
-            return self.call_keras_layer(inputs, name, training, **kwargs)
+            return self.call_keras_layer(inputs, name, **kwargs)
         raise NotImplementedError("Unsupported backbone layer:" + layer_name)
 
 
@@ -621,7 +645,7 @@ class Backbone(nn.Module):
                 pkg, features, embedding_group, input_layer, l2_reg
             )  # Package是一个子DAG
 
-    def __call__(self, is_training, group_features=None, batch=None, **kwargs):
+    def forward(self, is_training, group_features=None, batch=None, **kwargs):
         output = self._main_pkg(is_training, group_features, batch, **kwargs)
 
         if self._config.HasField("top_mlp"):
@@ -651,12 +675,14 @@ class Backbone(nn.Module):
 
 
 def merge_inputs(inputs, axis=-1, msg=""):
-    """合并多个输入，根据输入类型和数量执行不同的逻辑处理。
+    """
+    合并多个输入，根据输入类型和数量执行不同的逻辑处理。
 
     参数:
     inputs (list): 待合并的输入，可以是列表或张量的列表。
                    - 如果所有元素是列表，则合并为一个列表。
-                   - 如果元素既有列表又有非列表类型，则将非列表类型转换为单元素列表后合并。
+                   - 如果元素既有列表又有非列表类型，
+                     则将非列表类型转换为单元素列表后合并。
                    - 如果所有元素是张量，则沿指定轴进行拼接。
     axis (int): 指定张量拼接的维度，仅在输入为张量时有效。默认值为 -1。
                 - 如果 axis=-1 表示沿最后一个维度拼接。
@@ -678,14 +704,14 @@ def merge_inputs(inputs, axis=-1, msg=""):
         return inputs[0]
     from functools import reduce
 
-    if all(map(lambda x: type(x) == list, inputs)):
+    if all(isinstance(x, list) for x in inputs):
         # merge multiple lists into a list
         return reduce(lambda x, y: x + y, inputs)
 
-    if any(map(lambda x: type(x) == list, inputs)):
+    if any(isinstance(x, list) for x in inputs):
         logging.warning("%s: try to merge inputs into list" % msg)
         return reduce(
-            lambda x, y: x + y, [e if type(e) == list else [e] for e in inputs]
+            lambda x, y: x + y, [e if isinstance(e, list) else [e] for e in inputs]
         )
 
     if axis != -1:
@@ -695,10 +721,17 @@ def merge_inputs(inputs, axis=-1, msg=""):
 
 # 根据输入值的类型对其进行格式化处理
 def format_value(value):
-    value_type = type(value)
-    if value_type == str:  # Python 3 中直接使用 str 类型
+    """Format the input value based on its type.
+
+    Args:
+        value: The value to format.
+
+    Returns:
+        The formatted value.
+    """
+    if isinstance(value, str):
         return value
-    if value_type == float:
+    if isinstance(value, float):
         int_v = int(value)
         return int_v if int_v == value else value
     if isinstance(value, list):  # 替换 struct_pb2.ListValue 为普通列表支持
@@ -710,6 +743,14 @@ def format_value(value):
 
 # 将 struct_pb2.Struct 类型的对象转换为 Python 字典
 def convert_to_dict(struct):
+    """Convert a struct_pb2.Struct object to a Python dictionary.
+
+    Args:
+        struct: A struct_pb2.Struct object.
+
+    Returns:
+        dict: The converted Python dictionary.
+    """
     kwargs = {}
     for key, value in struct.items():
         kwargs[str(key)] = format_value(value)

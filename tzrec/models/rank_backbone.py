@@ -38,19 +38,25 @@ class RankBackbone(RankModel):
         self._backbone_output = None
         self._l2_reg = None
         self._backbone_net = self.build_backbone_network()
+        # output_dims = self._backbone_net._main_pkg.output_block_dims()
+        output_dims = self._backbone_net._main_pkg.total_output_dim()
+        # 如果有多个 package（如 Package.__packages 里），如何Í拿到output_dims，暂未实现
+        # for pkg_name, pkg in Package._Package__packages.items():
+        #     print(f"Package: {pkg_name}")
+        #     print("  输出block列表:", pkg.get_output_block_names())
+        #     print("  输出block维度:", pkg.output_block_dims())
+        #     print("  总输出维度:", pkg.total_output_dim())
+        self.output_mlp = nn.Linear(output_dims, self._num_class)
 
     def build_backbone_network(self):
         """Build backbone."""
-        # if self.has_backbone:
-        if True:
-            return Backbone(
-                self._base_model_config.rank_backbone.backbone,
-                self._feature_dict,
-                embedding_group=self.embedding_group,
-                # input_layer=self._input_layer,
-                l2_reg=self._l2_reg,
-            )
-        return None
+        return Backbone(
+            self._base_model_config.rank_backbone.backbone,
+            self._feature_dict,
+            embedding_group=self.embedding_group,
+            # input_layer=self._input_layer,
+            l2_reg=self._l2_reg,
+        )
 
     def backbone(
         self, group_features: Dict[str, torch.Tensor], batch: Batch
@@ -85,10 +91,5 @@ class RankBackbone(RankModel):
         """
         grouped_features = self.build_input(batch)
         output = self.backbone(group_features=grouped_features, batch=batch)
-        if output.shape[-1] != self.num_class:
-            # logging.info('add head logits layer for rank model')
-            output = self.head_layer(output)
-
-        # 返回预测结果
-        prediction_dict = {"output": output}
-        return prediction_dict
+        y = self.output_mlp(output)
+        return self._output_to_prediction(y)
