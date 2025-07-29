@@ -521,7 +521,7 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def stub_type(self) -> bool:
         """Only used as fg dag intermediate result or not."""
-        if self.config.stub_type:
+        if hasattr(self.config, "stub_type") and self.config.HasField("stub_type"):
             return self.config.stub_type
         return False
 
