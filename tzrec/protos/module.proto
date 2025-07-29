@@ -12,6 +12,8 @@ message MLP {
     optional bool use_bn = 4 [default = false];
     // use bias
     optional bool bias = 5 [default = true];
+    // use layer normalization
+    optional bool use_ln = 6 [default = false];
 }
 
 message ExtractionNetwork {

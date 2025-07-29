@@ -21,20 +21,24 @@ from tzrec.utils.test_util import TestGraphType, create_test_module
 class MLPTest(unittest.TestCase):
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, [0.9]],
-            [TestGraphType.NORMAL, 0.9],
-            [TestGraphType.NORMAL, [0.9, 0.8, 0.7]],
-            [TestGraphType.FX_TRACE, [0.9]],
-            [TestGraphType.JIT_SCRIPT, [0.9]],
+            [TestGraphType.NORMAL, [0.9], True, False],
+            [TestGraphType.NORMAL, 0.9, True, False],
+            [TestGraphType.NORMAL, [0.9, 0.8, 0.7], True, False],
+            [TestGraphType.FX_TRACE, [0.9], True, False],
+            [TestGraphType.JIT_SCRIPT, [0.9], True, False],
+            [TestGraphType.NORMAL, [0.9], False, True],
+            [TestGraphType.FX_TRACE, [0.9], False, True],
+            [TestGraphType.JIT_SCRIPT, [0.9], False, True],
         ]
     )
-    def test_mlp(self, graph_type, dropout_ratio) -> None:
+    def test_mlp(self, graph_type, dropout_ratio, use_bn, use_ln) -> None:
         mlp = MLP(
             in_features=16,
             hidden_units=[8, 4, 2],
             activation="nn.ReLU",
-            use_bn=True,
+            use_bn=use_bn,
             dropout_ratio=dropout_ratio,
+            use_ln=use_ln,
         )
         mlp = create_test_module(mlp, graph_type)
         input = torch.randn(4, 16)
@@ -55,7 +59,6 @@ class MLPTest(unittest.TestCase):
             in_features=16,
             hidden_units=[8, 4, 2],
             activation="nn.ReLU",
-            use_bn=True,
             dropout_ratio=dropout_ratio,
             return_hidden_layer_feature=True,
         )
@@ -69,20 +72,24 @@ class MLPTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, [0.9]],
-            [TestGraphType.NORMAL, 0.9],
-            [TestGraphType.NORMAL, [0.9, 0.8, 0.7]],
-            [TestGraphType.FX_TRACE, [0.9]],
-            [TestGraphType.JIT_SCRIPT, [0.9]],
+            [TestGraphType.NORMAL, [0.9], True, False],
+            [TestGraphType.NORMAL, 0.9, True, False],
+            [TestGraphType.NORMAL, [0.9, 0.8, 0.7], True, False],
+            [TestGraphType.FX_TRACE, [0.9], True, False],
+            [TestGraphType.JIT_SCRIPT, [0.9], True, False],
+            [TestGraphType.NORMAL, [0.9], False, True],
+            [TestGraphType.FX_TRACE, [0.9], False, True],
+            [TestGraphType.JIT_SCRIPT, [0.9], False, True],
         ]
     )
-    def test_mlp_seq(self, graph_type, dropout_ratio) -> None:
+    def test_mlp_seq(self, graph_type, dropout_ratio, use_bn, use_ln) -> None:
         mlp = MLP(
             in_features=16,
             hidden_units=[8, 4, 2],
             activation="nn.ReLU",
-            use_bn=True,
+            use_bn=use_bn,
             dropout_ratio=dropout_ratio,
+            use_ln=use_ln,
             dim=3,
         )
         mlp = create_test_module(mlp, graph_type)
