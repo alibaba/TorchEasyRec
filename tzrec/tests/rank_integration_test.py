@@ -706,6 +706,20 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    def test_multi_tower_din_with_fg_fp16_ga_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_fg_mock_fp16_ga.config",
+            comp_cpu_gpu_pred_result=True,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_multi_tower_din_with_fg_bf16_emb_fp16_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_fg_mock_bf16_emb_fp16.config",
+            comp_cpu_gpu_pred_result=True,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_zch_with_fg_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",

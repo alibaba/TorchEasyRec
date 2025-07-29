@@ -12,6 +12,7 @@
 from typing import Any, Dict, Tuple, Type, Union
 
 import torch
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import WeightDecayMode
 from torch.optim.optimizer import Optimizer
 from torchrec.optim import optimizers, rowwise_adagrad
 
@@ -36,6 +37,10 @@ def create_sparse_optimizer(
     optimizer_type = optimizer_config.WhichOneof("optimizer")
     oneof_optim_config = getattr(optimizer_config, optimizer_type)
     optimizer_kwargs = config_to_kwargs(oneof_optim_config)
+    if "weight_decay_mode" in optimizer_kwargs:
+        optimizer_kwargs["weight_decay_mode"] = WeightDecayMode[
+            optimizer_kwargs["weight_decay_mode"]
+        ]
 
     if optimizer_type == "sgd_optimizer":
         return optimizers.SGD, optimizer_kwargs

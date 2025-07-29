@@ -182,6 +182,8 @@ class IdFeature(BaseFeature):
             fg_cfg["value_dim"] = 0
         if self.config.HasField("fg_value_type"):
             fg_cfg["value_type"] = self.config.fg_value_type
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
     def assets(self) -> Dict[str, str]:

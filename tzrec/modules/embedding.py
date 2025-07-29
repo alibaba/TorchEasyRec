@@ -10,6 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict, defaultdict
+from functools import partial  # NOQA
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -130,6 +131,7 @@ class EmbeddingGroup(nn.Module):
         features (list): list of features.
         feature_groups (list): list of feature group config.
         wide_embedding_dim (int, optional): wide group feature embedding dim.
+        wide_init_fn (str, optional): wide embedding table init function.
         device (torch.device): embedding device, default is meta.
     """
 
@@ -138,6 +140,7 @@ class EmbeddingGroup(nn.Module):
         features: List[BaseFeature],
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -201,6 +204,7 @@ class EmbeddingGroup(nn.Module):
                 features,
                 feature_groups=v,
                 wide_embedding_dim=wide_embedding_dim,
+                wide_init_fn=wide_init_fn,
                 device=device,
             )
 
@@ -559,6 +563,7 @@ class EmbeddingGroupImpl(nn.Module):
         features (list): list of features.
         feature_groups (list): list of feature group config.
         wide_embedding_dim (int, optional): wide group feature embedding dim.
+        wide_init_fn (str, optional): wide embedding table init function.
         device (torch.device): embedding device, default is meta.
     """
 
@@ -567,6 +572,7 @@ class EmbeddingGroupImpl(nn.Module):
         features: List[BaseFeature],
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -642,6 +648,8 @@ class EmbeddingGroupImpl(nn.Module):
                         emb_bag_config.embedding_dim = output_dim = (
                             wide_embedding_dim or 4
                         )
+                        if wide_init_fn:
+                            emb_bag_config.init_fn = eval(f"partial({wide_init_fn})")
                     # we may modify ebc name at feat_to_group_to_emb_name, e.g., wide
                     emb_bag_config.name = feat_to_group_to_emb_name[name][group_name]
 

@@ -59,6 +59,7 @@ model_config {
   - deep: deep mlp的参数配置
     - hidden_units: mlp每一层的channel数目，即神经元的数目
   - wide_embedding_dim: wide部分输出的大小
+  - wide_init_fn: wide特征嵌入初始化方式，默认不需要设置，如需自定义，可以设置任意的torch内置初始化函数，如`nn.init.zeros_`
   - final: 整合wide, fm, deep的输出, 可以选择是否使用
     - hidden_units: mlp每一层的channel数目，即神经元的数目
 - losses: 损失函数配置

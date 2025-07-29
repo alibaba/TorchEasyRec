@@ -251,6 +251,8 @@ class LookupFeature(BaseFeature):
                 fg_cfg["combiner"] = ""
             if fg_cfg["combiner"] == "":
                 fg_cfg["value_dim"] = self.value_dim
+            if self.config.HasField("stub_type"):
+                fg_cfg["stub_type"] = self.config.stub_type
 
         fg_cfgs = [fg_cfg]
         if raw_fg_cfg is not None:

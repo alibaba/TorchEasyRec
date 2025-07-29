@@ -135,4 +135,6 @@ class ComboFeature(IdFeature):
         elif len(self.vocab_file) > 0:
             fg_cfg["vocab_file"] = self.vocab_file
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]

@@ -22,6 +22,10 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **trainable**: Embedding Variable是否可训练，默认为true
 
+- **stub_type**: 是否只作为FG的中间结果，不作为FG的输出特征，默认为false。注意: 不能在fg_mode=FG_NORMAL模式下使用。
+
+- **data_type**: 训练的EmbeddingTable的数据类型，支持FP32和FP16，默认为FP32。
+
 ## IdFeature: 类别型特征
 
 类别型特征，例如手机品牌、item_id、user_id、年龄段、星座等，一般在表里面存储的类型一般是string、bigint、array<string>或array<bigint>。可支持多值Id特征
@@ -314,6 +318,8 @@ feature_configs: {
 - **variables**: 特征FG所依赖表达式中的字段的来源
 
 - **expression**: 表达式本身
+
+- **value_dim**: 默认值是0，value_dim=0时支持多值ID输出
 
 - **内置函数**: 详见[表达式文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/built-in-feature-operator?#1d09c2da3aajb)
 

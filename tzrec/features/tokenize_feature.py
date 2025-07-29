@@ -188,6 +188,8 @@ class TokenizeFeature(IdFeature):
             "output_type": "word_id",
             "output_delim": self._fg_encoded_multival_sep,
         }
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         fg_cfgs.append(fg_cfg)
         return fg_cfgs
 

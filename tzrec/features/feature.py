@@ -37,6 +37,7 @@ from torchrec.modules.mc_modules import (
     dynamic_threshold_filter,  # NOQA
     probabilistic_threshold_filter,  # NOQA
 )
+from torchrec.types import DataType
 
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
@@ -199,6 +200,19 @@ def _parse_fg_encoded_dense_feature_impl(
             f" but get {feat.type}."
         )
     return DenseData(name, feat_values)
+
+
+def _dtype_str_to_data_type(data_type_str: str) -> DataType:
+    if data_type_str == "FP32":
+        data_type = DataType.FP32
+    elif data_type_str == "FP16":
+        data_type = DataType.FP16
+    else:
+        raise ValueError(
+            "Embedding only support FP32 and FP16 now, "
+            f"[{data_type_str}] is not supported."
+        )
+    return data_type
 
 
 class InvalidFgInputError(Exception):
@@ -398,6 +412,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 feature_names=[self.name],
                 pooling=self.pooling_type,
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
             emb_bag_config.trainable = self.config.trainable
             return emb_bag_config
@@ -418,6 +433,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 name=embedding_name,
                 feature_names=[self.name],
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
             emb_config.trainable = self.config.trainable
             return emb_config
@@ -517,6 +533,13 @@ class BaseFeature(object, metaclass=_meta_cls):
                     )
             self._side_inputs = side_inputs
         return self._side_inputs
+
+    @property
+    def stub_type(self) -> bool:
+        """Only used as fg dag intermediate result or not."""
+        if hasattr(self.config, "stub_type") and self.config.HasField("stub_type"):
+            return self.config.stub_type
+        return False
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
@@ -813,8 +836,21 @@ def _copy_assets(
     return feature
 
 
+def _remove_one_feature_bucketizer(fg_json: Dict[str, Any]) -> Dict[str, Any]:
+    fg_json.pop("hash_bucket_size", None)
+    fg_json.pop("vocab_dict", None)
+    fg_json.pop("vocab_list", None)
+    fg_json.pop("boundaries", None)
+    fg_json.pop("num_buckets", None)
+    if fg_json["feature_type"] != "tokenize_feature":
+        fg_json.pop("vocab_file", None)
+    return fg_json
+
+
 def create_fg_json(
-    features: List[BaseFeature], asset_dir: Optional[str] = None
+    features: List[BaseFeature],
+    asset_dir: Optional[str] = None,
+    remove_bucketizer: bool = False,
 ) -> Dict[str, Any]:
     """Create feature generate config for features."""
     results = []
@@ -835,10 +871,14 @@ def create_fg_json(
                 )
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             results.extend(fg_json)
     return {"features": results}
 

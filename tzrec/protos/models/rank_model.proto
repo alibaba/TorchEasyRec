@@ -4,10 +4,21 @@ package tzrec.protos;
 import "tzrec/protos/module.proto";
 import "tzrec/protos/tower.proto";
 
+
+message WideAndDeep {
+    required MLP deep = 1;
+    optional MLP final = 2;
+    optional uint32 wide_embedding_dim = 3 [default = 4];
+    // wide embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string wide_init_fn = 4;
+}
+
 message DeepFM {
     required MLP deep = 1;
     optional MLP final = 2;
     optional uint32 wide_embedding_dim = 3 [default = 4];
+    // wide embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string wide_init_fn = 4;
 }
 
 message MultiTower {
