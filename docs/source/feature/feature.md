@@ -24,6 +24,8 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **stub_type**: 是否只作为FG的中间结果，不作为FG的输出特征，默认为false。注意: 不能在fg_mode=FG_NORMAL模式下使用。
 
+- **data_type**: 训练的EmbeddingTable的数据类型，支持FP32和FP16，默认为FP32。
+
 ## IdFeature: 类别型特征
 
 类别型特征，例如手机品牌、item_id、user_id、年龄段、星座等，一般在表里面存储的类型一般是string、bigint、array<string>或array<bigint>。可支持多值Id特征
