@@ -30,6 +30,7 @@ class Perceptron(nn.Module):
         use_bn (bool): use batch_norm or not.
         bias (bool): if set to False, the layer will not learn an additive bias.
         dropout_ratio (float): dropout ratio of the layer.
+        use_ln (bool): use layer norm or not.
         dim (int): input dims.
     """
 
@@ -41,11 +42,17 @@ class Perceptron(nn.Module):
         use_bn: bool = False,
         bias: bool = True,
         dropout_ratio: float = 0.0,
+        use_ln: bool = False,
         dim: int = 2,
     ) -> None:
         super().__init__()
         self.activation = activation
         self.use_bn = use_bn
+        self.use_ln = use_ln
+        if self.use_bn and self.use_ln:
+            raise ValueError(
+                "Could not use_bn and use_ln at the same time in Perceptron."
+            )
         self.dropout_ratio = dropout_ratio
 
         self.perceptron = nn.Sequential(
@@ -58,6 +65,8 @@ class Perceptron(nn.Module):
             self.perceptron.append(nn.BatchNorm1d(out_features))
             if dim == 3:
                 self.perceptron.append(Transpose(1, 2))
+        if use_ln:
+            self.perceptron.append(nn.LayerNorm(out_features))
         if activation and len(activation) > 0:
             act_module = create_activation(
                 activation, hidden_size=out_features, dim=dim
@@ -86,6 +95,7 @@ class MLP(nn.Module):
             linear transformation. Default: torch.nn.ReLU.
         use_bn (bool): use batch_norm or not.
         dropout_ratio (float|list, optional): dropout ratio of each layer.
+        use_ln (bool): use layer_norm or not.
         dim (int): input dims.
         return_hidden_layer_feature (bool): output hidden layer or not.
     """
@@ -98,6 +108,7 @@ class MLP(nn.Module):
         activation: Optional[str] = "nn.ReLU",
         use_bn: bool = False,
         dropout_ratio: Optional[Union[List[float], float]] = None,
+        use_ln: bool = False,
         dim: int = 2,
         return_hidden_layer_feature: bool = False,
     ) -> None:
@@ -105,6 +116,7 @@ class MLP(nn.Module):
         self.hidden_units = hidden_units
         self.activation = activation
         self.use_bn = use_bn
+        self.use_ln = use_ln
         self.return_hidden_layer_feature = return_hidden_layer_feature
 
         if dropout_ratio is None:
