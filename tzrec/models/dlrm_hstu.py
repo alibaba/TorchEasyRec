@@ -110,7 +110,7 @@ class DlrmHSTU(RankModel):
             (
                 self._model_config.uih_action_time_feature_name,
                 self._model_config.candidates_query_time_feature_name,
-                False,  # is_sparse
+                True,  # is_sparse
             ),
             (
                 self._model_config.uih_action_weight_feature_name,
@@ -376,11 +376,11 @@ class DlrmHSTU(RankModel):
                 num_candidates=num_candidates,
             )
 
-    def _get_label(batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
+    def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name
         is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
         if is_sparse_label:
-            label = batch.sparse_features[BASE_DATA_GROUP][label_name]
+            label = batch.sparse_features[BASE_DATA_GROUP][label_name].values()
         else:
             label = batch.dense_features[BASE_DATA_GROUP][label_name]
         if task_cfg.HasField("task_bitmask"):
@@ -388,6 +388,13 @@ class DlrmHSTU(RankModel):
                 label.dtype
             )
         return label
+
+    def init_loss(self) -> None:
+        """Initialize loss modules."""
+        for task_cfg in self._task_configs:
+            for loss_cfg in task_cfg.losses:
+                task_name = task_cfg.task_name
+                self._init_loss_impl(loss_cfg, suffix=f"_{task_name}", reduction="mean")
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch

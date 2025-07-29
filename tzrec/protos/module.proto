@@ -156,9 +156,9 @@ message GRLayerNormPostprocessor {
 
 message GRTimestampLayerNormPostprocessor {
     // time duration period units, e.g. 60 * 60 for hour of day.
-    repeated uint64 time_duration_period_units = 1;
+    repeated uint32 time_duration_period_units = 1;
     // time duration units per period, e.g. 24 for hour of day.
-    repeated uint64 time_duration_units_per_period = 2;
+    repeated uint32 time_duration_units_per_period = 2;
 }
 
 message GROutputPostprocessor {

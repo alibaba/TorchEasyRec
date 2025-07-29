@@ -123,6 +123,8 @@ message FusionSubTaskConfig {
     repeated LossConfig losses = 4;
     // TODO: support multi-class classification loss
     // optional uint32 num_class = 5 [default = 1];
+    // metrics for the task
+    repeated MetricConfig metrics = 6;
 }
 
 
