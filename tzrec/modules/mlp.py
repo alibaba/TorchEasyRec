@@ -148,6 +148,7 @@ class MLP(nn.Module):
                     activation=activation,
                     use_bn=use_bn,
                     bias=bias,
+                    use_ln=use_ln,
                     dropout_ratio=dropout_ratio[i],
                     dim=dim,
                 )
