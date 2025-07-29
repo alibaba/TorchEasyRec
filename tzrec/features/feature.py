@@ -37,6 +37,7 @@ from torchrec.modules.mc_modules import (
     dynamic_threshold_filter,  # NOQA
     probabilistic_threshold_filter,  # NOQA
 )
+from torchrec.types import DataType
 
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
@@ -199,6 +200,19 @@ def _parse_fg_encoded_dense_feature_impl(
             f" but get {feat.type}."
         )
     return DenseData(name, feat_values)
+
+
+def _dtype_str_to_data_type(data_type_str: str) -> DataType:
+    if data_type_str == "FP32":
+        data_type = DataType.FP32
+    elif data_type_str == "FP16":
+        data_type = DataType.FP16
+    else:
+        raise ValueError(
+            "Embedding only support FP32 and FP16 now, "
+            f"[{data_type_str}] is not supported."
+        )
+    return data_type
 
 
 class InvalidFgInputError(Exception):
@@ -398,6 +412,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 feature_names=[self.name],
                 pooling=self.pooling_type,
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
             emb_bag_config.trainable = self.config.trainable
             return emb_bag_config
@@ -418,6 +433,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 name=embedding_name,
                 feature_names=[self.name],
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
             emb_config.trainable = self.config.trainable
             return emb_config
