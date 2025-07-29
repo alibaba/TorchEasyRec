@@ -187,7 +187,15 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
 def create_train_pipeline(
     model: _DistributedModelParallel, optimizer: Optional[torch.optim.Optimizer] = None
 ) -> TrainPipeline:
-    """Create TrainPipeline."""
+    """Create TrainPipeline.
+
+    Args:
+        model (DistributedModelParallel): a DMP model.
+        optimizer (torch.optim.Optimizer): a KeyedOptimizer.
+
+    Return:
+        a TrainPipeline.
+    """
     trainable_params, frozen_params = model.module.model.sparse_parameters()
     if len(trainable_params) == 0 and len(frozen_params) == 0:
         # use TrainPipelineBase when model do not have sparse parameters.
