@@ -17,7 +17,7 @@ from hypothesis import Verbosity, given, settings
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
 
 
 class LayerNormTest(unittest.TestCase):
@@ -27,11 +27,7 @@ class LayerNormTest(unittest.TestCase):
         N=st.integers(min_value=32, max_value=10000),
         D=st.integers(min_value=32, max_value=512),
         is_swish=st.sampled_from([True, False]),
-        dtype=st.sampled_from(
-            [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
         deadline=None,
