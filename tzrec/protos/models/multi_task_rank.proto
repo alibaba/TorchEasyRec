@@ -55,30 +55,3 @@ message PLE {
     // task tower
     repeated TaskTower task_towers = 2;
 }
-
-
-message DlrmHSTU {
-    required string uih_id_feature_name = 1;
-
-    required string uih_action_time_feature_name = 2;
-
-    required string uih_action_weight_feature_name = 3;
-
-    required string uih_watchtime_feature_name = 4;
-
-    required string candidates_id_feature_name = 5;
-
-    required string candidates_query_time_feature_name = 6;
-
-    required string candidates_action_weight_feature_name = 7;
-
-    required string candidates_watchtime_feature_name = 8;
-    // hstu config
-    required HSTU hstu = 9;
-    // multi task tower config
-    required FusionMTLTower fusion_mtl_tower = 10;
-
-    required uint32 max_seq_len = 11;
-    // item embedding mlp hidden dimension
-    optional uint32 item_embedding_hidden_dim = 12 [default = 512];
-}
