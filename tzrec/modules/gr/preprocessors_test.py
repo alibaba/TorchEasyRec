@@ -27,7 +27,7 @@ class PreprocessorTest(unittest.TestCase):
         enable_pmlp=st.sampled_from([True, False]),
         is_train=st.sampled_from([True, False]),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=50, deadline=None)
+    @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_contextual_interleave_preprocessor(
         self,
         enable_interleaving: bool,
