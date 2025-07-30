@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -49,3 +49,42 @@ class TaskTower(nn.Module):
         task_tower_out = self.linear(features)
 
         return task_tower_out
+
+
+class FusionMTLTower(nn.Module):
+    """Fusion task tower Module.
+
+    Args:
+        tower_feature_in (int): task tower input dims.
+        mlp:  mlp network config.
+    """
+
+    def __init__(
+        self,
+        tower_feature_in: int,
+        mlp: Optional[Dict[str, Any]],
+        task_configs: List[Dict[str, Any]],
+    ):
+        super().__init__()
+        self.task_configs = task_configs
+        self.tower_mlp = None
+        linear_in = tower_feature_in
+        if mlp is not None:
+            self.tower_mlp = MLP(tower_feature_in, **mlp)
+            linear_in = self.tower_mlp.output_dim()
+        self.linear = nn.Linear(linear_in, len(task_configs))
+
+    def forward(
+        self, user_emb: torch.Tensor, item_emb: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Forward the module."""
+        features = user_emb * item_emb
+        if self.tower_mlp:
+            features = self.tower_mlp(features)
+        tower_out = self.linear(features)
+        tower_outputs = tower_out.split([1] * len(self.task_configs), dim=-1)
+
+        result_dict = {}
+        for i, task_cfg in enumerate(self.task_configs):
+            result_dict[task_cfg["task_name"]] = tower_outputs[i]
+        return result_dict
