@@ -15,7 +15,6 @@ import torch
 from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
-from tzrec.modules.gr.preprocessors import ContextualInterleavePreprocessor
 from tzrec.utils.test_util import gpu_unavailable
 from tzrec.utils.test_util import hypothesis_settings as settings
 
@@ -35,6 +34,8 @@ class PreprocessorTest(unittest.TestCase):
         enable_pmlp: bool,
         is_train: bool,
     ) -> None:
+        from tzrec.modules.gr.preprocessors import ContextualInterleavePreprocessor
+
         device = torch.device("cuda")
 
         input_embedding_dim = 64

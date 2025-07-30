@@ -16,10 +16,6 @@ import torch
 from hypothesis import Verbosity, given, settings
 from hypothesis import strategies as st
 
-from tzrec.modules.norm import (
-    LayerNorm,
-    SwishLayerNorm,
-)
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import gpu_unavailable
 
@@ -61,6 +57,8 @@ class LayerNormTest(unittest.TestCase):
         real_kernel: Kernel,
         skip_comparisons: bool = False,
     ) -> None:
+        from tzrec.modules.norm import LayerNorm, SwishLayerNorm
+
         x = (
             torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
             .normal_(0.0, 1.0)
