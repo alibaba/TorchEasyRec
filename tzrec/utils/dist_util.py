@@ -31,6 +31,8 @@ from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel as _DistributedModelParallel,
 )
+from torchrec.distributed.train_pipeline import TrainPipeline
+from torchrec.distributed.train_pipeline import TrainPipelineBase as _TrainPipelineBase
 from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist as _TrainPipelineSparseDist,
 )
@@ -154,21 +156,51 @@ def DistributedModelParallel(
     return model
 
 
+def _pipeline_backward(losses: torch.Tensor, optimizer: torch.optim.Optimizer) -> None:
+    with record_function("## backward ##"):
+        loss = torch.sum(losses, dim=0)
+        if (
+            hasattr(optimizer, "_gradient_accumulation_steps")
+            and optimizer._gradient_accumulation_steps > 1
+        ):
+            loss = loss / optimizer._gradient_accumulation_steps
+        if hasattr(optimizer, "_grad_scaler") and optimizer._grad_scaler is not None:
+            optimizer._grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+
+class TrainPipelineBase(_TrainPipelineBase):
+    """TorchEasyRec's TrainPipelineBase, make backward support grad scaler."""
+
+    def _backward(self, losses: torch.Tensor) -> None:
+        _pipeline_backward(losses, self._optimizer)
+
+
 class TrainPipelineSparseDist(_TrainPipelineSparseDist):
     """TorchEasyRec's TrainPipelineSparseDist, make backward support grad scaler."""
 
     def _backward(self, losses: torch.Tensor) -> None:
-        with record_function("## backward ##"):
-            loss = torch.sum(losses, dim=0)
-            if (
-                hasattr(self._optimizer, "_gradient_accumulation_steps")
-                and self._optimizer._gradient_accumulation_steps > 1
-            ):
-                loss = loss / self._optimizer._gradient_accumulation_steps
-            if (
-                hasattr(self._optimizer, "_grad_scaler")
-                and self._optimizer._grad_scaler is not None
-            ):
-                self._optimizer._grad_scaler.scale(loss).backward()
-            else:
-                loss.backward()
+        _pipeline_backward(losses, self._optimizer)
+
+
+def create_train_pipeline(
+    model: _DistributedModelParallel, optimizer: Optional[torch.optim.Optimizer] = None
+) -> TrainPipeline:
+    """Create TrainPipeline.
+
+    Args:
+        model (DistributedModelParallel): a DMP model.
+        optimizer (torch.optim.Optimizer): a KeyedOptimizer.
+
+    Return:
+        a TrainPipeline.
+    """
+    trainable_params, frozen_params = model.module.model.sparse_parameters()
+    if len(trainable_params) == 0 and len(frozen_params) == 0:
+        # use TrainPipelineBase when model do not have sparse parameters.
+        return TrainPipelineBase(model, optimizer, model.device)
+    else:
+        return TrainPipelineSparseDist(
+            model, optimizer, model.device, execute_all_batches=True
+        )
