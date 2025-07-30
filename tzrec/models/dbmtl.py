@@ -141,7 +141,6 @@ class DBMTL(MultiTaskRank):
 
         if self.mmoe is not None:
             task_input_list = self.mmoe(net)
-            print("task_input_list:", task_input_list)
         else:
             task_input_list = [net] * len(self._task_tower_cfgs)
 
