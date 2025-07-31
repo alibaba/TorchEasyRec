@@ -15,7 +15,6 @@ import torch
 from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
-from tzrec.modules.gr.preprocessors import ContextualInterleavePreprocessor
 from tzrec.utils.test_util import gpu_unavailable
 from tzrec.utils.test_util import hypothesis_settings as settings
 
@@ -28,13 +27,15 @@ class PreprocessorTest(unittest.TestCase):
         enable_pmlp=st.sampled_from([True, False]),
         is_train=st.sampled_from([True, False]),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=50, deadline=None)
+    @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_contextual_interleave_preprocessor(
         self,
         enable_interleaving: bool,
         enable_pmlp: bool,
         is_train: bool,
     ) -> None:
+        from tzrec.modules.gr.preprocessors import ContextualInterleavePreprocessor
+
         device = torch.device("cuda")
 
         input_embedding_dim = 64
