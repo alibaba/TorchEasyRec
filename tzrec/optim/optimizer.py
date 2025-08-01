@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Alibaba Group;
+# Copyright (c) 2025, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -39,8 +39,8 @@ class TZRecOptimizer(OptimizerWrapper):
     def zero_grad(self, set_to_none: bool = False) -> None:
         """Zero gradients."""
         if (
-            self._gradient_accumulation_steps > 1
-            and self._step % self._gradient_accumulation_steps == 0
+            self._gradient_accumulation_steps <= 1
+            or self._step % self._gradient_accumulation_steps == 0
         ):
             self._optimizer.zero_grad(set_to_none=set_to_none)
 
@@ -48,8 +48,8 @@ class TZRecOptimizer(OptimizerWrapper):
         """Step."""
         self._step += 1
         if (
-            self._gradient_accumulation_steps > 1
-            and self._step % self._gradient_accumulation_steps == 0
+            self._gradient_accumulation_steps <= 1
+            or self._step % self._gradient_accumulation_steps == 0
         ):
             if self._grad_scaler is not None:
                 self._grad_scaler.step(self._optimizer)
