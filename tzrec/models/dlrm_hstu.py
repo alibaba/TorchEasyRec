@@ -242,7 +242,7 @@ class DlrmHSTU(RankModel):
             ):
                 total_candidates = torch.sum(num_candidates).item()
                 values_right = torch.zeros(
-                    total_candidates,  # pyre-ignore
+                    (total_candidates, 1),  # pyre-ignore
                     dtype=values_left.dtype,
                     device=values_left.device,
                 )

@@ -40,7 +40,6 @@ from tzrec.acc.utils import (
     allow_tf32,
     export_acc_config,
     is_aot,
-    is_cuda_export,
     is_input_tile_emb,
     is_quant,
     is_trt,
@@ -893,8 +892,8 @@ def _script_model(
 
         batch = next(iter(dataloader))
 
-        if is_cuda_export():
-            model = model.cuda()
+        # if is_cuda_export():
+        model = model.cuda()
 
         if is_quant():
             logger.info("quantize embeddings...")
@@ -916,7 +915,7 @@ def _script_model(
             export_model_aot(model, data_cuda, save_dir)
         else:
             data = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data)
+            result = model(data, device=torch.device("cuda"))
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
 
