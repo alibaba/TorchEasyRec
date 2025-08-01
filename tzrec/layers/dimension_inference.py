@@ -114,6 +114,7 @@ class DimensionInferenceEngine:
         self.block_input_dims: Dict[str, DimensionInfo] = {}
         self.block_output_dims: Dict[str, DimensionInfo] = {}
         self.block_layers: Dict[str, nn.Module] = {}
+        self.logger = logging.getLogger(__name__)
         
     def register_input_dim(self, block_name: str, dim_info: DimensionInfo):
         """注册block的输入维度"""
@@ -250,7 +251,26 @@ class DimensionInferenceEngine:
             return dim_info
     
     def _apply_input_fn(self, dim_info: DimensionInfo, input_fn: str) -> DimensionInfo:
-        """应用input_fn变换"""
+        """应用input_fn变换 - 改进版本，优先使用dummy tensor推断"""
+        try:
+            # 首先尝试使用dummy tensor进行精确推断
+            try:
+                from tzrec.layers.lambda_inference import infer_lambda_output_dim
+                result = infer_lambda_output_dim(dim_info, input_fn, safe_mode=True)
+                self.logger.info(f"Successfully inferred output dim using dummy tensor for '{input_fn}': {result}")
+                return result
+            except Exception as e:
+                self.logger.debug(f"Dummy tensor inference failed for '{input_fn}': {e}, falling back to pattern matching")
+            
+            # 如果dummy tensor推断失败，回退到原来的模式匹配方法
+            return self._apply_input_fn_pattern_matching(dim_info, input_fn)
+            
+        except Exception as e:
+            logging.error(f"Failed to apply input_fn {input_fn}: {e}")
+            return dim_info
+    
+    def _apply_input_fn_pattern_matching(self, dim_info: DimensionInfo, input_fn: str) -> DimensionInfo:
+        """应用input_fn变换 - 模式匹配版本（作为fallback）"""
         try:
             # 常见的input_fn模式匹配
             

@@ -15,13 +15,17 @@ import networkx as nx
 import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from tzrec.layers.utils import Parameter
 from tzrec.layers.dimension_inference import (
     DimensionInfo, 
     DimensionInferenceEngine, 
     create_dimension_info_from_embedding
+)
+from tzrec.layers.lambda_inference import (
+    LambdaOutputDimInferrer,
+    infer_lambda_output_dim
 )
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
@@ -31,6 +35,43 @@ from tzrec.layers.utils import infer_input_dim
 from tzrec.utils.load_class import load_torch_layer
 from tzrec.modules.enhanced_embedding import EnhancedEmbeddingGroup
 from tzrec.modules.embedding import EmbeddingGroup
+
+class BackboneDimensionInferenceEngine(DimensionInferenceEngine):
+    """为Backbone专门优化的维度推断引擎，集成lambda推断功能"""
+    
+    def __init__(self):
+        super().__init__()
+        self.lambda_inferrer = LambdaOutputDimInferrer(safe_mode=True)
+    
+    def apply_input_transforms(self, 
+                             input_dim: DimensionInfo, 
+                             input_fn: Optional[str] = None,
+                             input_slice: Optional[str] = None) -> DimensionInfo:
+        """应用input_fn和input_slice变换 - 增强版本，优先使用lambda推断"""
+        current_dim = input_dim
+        
+        # 先应用input_slice
+        if input_slice is not None:
+            current_dim = self._apply_input_slice(current_dim, input_slice)
+            
+        # 再应用input_fn - 优先使用lambda推断
+        if input_fn is not None:
+            current_dim = self._apply_input_fn_with_lambda_inference(current_dim, input_fn)
+            
+        return current_dim
+    
+    def _apply_input_fn_with_lambda_inference(self, dim_info: DimensionInfo, input_fn: str) -> DimensionInfo:
+        """使用lambda推断的input_fn处理"""
+        try:
+            # 首先尝试使用dummy tensor进行精确推断
+            result = self.lambda_inferrer.infer_output_dim(dim_info, input_fn)
+            self.logger.info(f"Successfully inferred output dim using lambda inference for '{input_fn}': {result}")
+            return result
+        except Exception as e:
+            self.logger.debug(f"Lambda inference failed for '{input_fn}': {e}, falling back to pattern matching")
+            # 如果lambda推断失败，回退到原来的模式匹配方法
+            return self._apply_input_fn(dim_info, input_fn)
+
 
 class Package(nn.Module):
     """A sub DAG of tf ops for reuse."""
@@ -72,8 +113,8 @@ class Package(nn.Module):
         name_to_layer = nn.ModuleDict()
         self._name_to_customize = {}  # 存储每个Block是否是自定义实现
         
-        # 使用新的维度推断引擎
-        self.dim_engine = DimensionInferenceEngine()
+        # 使用增强的维度推断引擎，集成lambda推断功能
+        self.dim_engine = BackboneDimensionInferenceEngine()
         
         # 保留兼容性的旧字段
         self._name_to_output_dim = {}  # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
