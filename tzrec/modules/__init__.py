@@ -10,5 +10,5 @@
 # limitations under the License.
 
 from .mlp import MLP
-
-__all__ = ["MLP"]
+from .backbone_module import Add
+__all__ = ["MLP","Add"]

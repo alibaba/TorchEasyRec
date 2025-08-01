@@ -10,19 +10,27 @@
 # limitations under the License.
 
 import logging
-
+import inspect
 import networkx as nx
 import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
+from typing import Any, Dict
 
 from tzrec.layers.utils import Parameter
+from tzrec.layers.dimension_inference import (
+    DimensionInfo, 
+    DimensionInferenceEngine, 
+    create_dimension_info_from_embedding
+)
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.dag import DAG
+from tzrec.layers.utils import infer_input_dim
 from tzrec.utils.load_class import load_torch_layer
-
+from tzrec.modules.enhanced_embedding import EnhancedEmbeddingGroup
+from tzrec.modules.embedding import EmbeddingGroup
 
 class Package(nn.Module):
     """A sub DAG of tf ops for reuse."""
@@ -44,11 +52,15 @@ class Package(nn.Module):
         backbone = Package.__packages["backbone"]
         return backbone.block_outputs(name)
 
-    def __init__(self, config, features, embedding_group, input_layer, l2_reg=None):
+    def __init__(self, config, features, embedding_group,feature_groups,wide_embedding_dim=None,wide_init_fn=None,input_layer=None,l2_reg=None):
         super().__init__()
+        # self._base_model_config = config
         self._config = config
         self._features = features
-        # self._embedding_group = embedding_group
+        self._embedding_group = embedding_group
+        self._feature_groups = feature_groups
+        self._wide_embedding_dim = wide_embedding_dim
+        self._wide_init_fn = wide_init_fn
         self._input_layer = input_layer
         self._l2_reg = l2_reg
         self._dag = DAG()
@@ -57,9 +69,16 @@ class Package(nn.Module):
         self._name_to_blocks = {}
 
         self._name_to_layer = nn.ModuleDict()  # 存储每个Block name 对应的Layer
+        name_to_layer = nn.ModuleDict()
         self._name_to_customize = {}  # 存储每个Block是否是自定义实现
+        
+        # 使用新的维度推断引擎
+        self.dim_engine = DimensionInferenceEngine()
+        
+        # 保留兼容性的旧字段
         self._name_to_output_dim = {}  # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
         self._name_to_input_dim = {}  # 存储每个Block的输入维度
+        
         self.reset_input_config(None)
         self._block_outputs = {}
         self._package_input = None
@@ -129,9 +148,7 @@ class Package(nn.Module):
         A.layout("dot")  # 用 graphviz 的 dot 布局
         A.draw("dag.png")  # 输出图片文件
         # self._dag.topological_sort()
-        for block_name in (
-            self.topo_order_list
-        ):  # ['user', 'item', 'user_mlp', 'item_mlp', 'final_mlp']
+        for block_name in (self.topo_order_list):
             block = self._name_to_blocks[block_name]
             layer = block.WhichOneof("layer")
             if layer in {"input_layer", "raw_input", "embedding_layer"}:
@@ -170,13 +187,23 @@ class Package(nn.Module):
                         input_fn = EmbeddingLayer(params, block.name)
                         self._name_to_layer[block.name] = input_fn
                 else:
+                    input_fn = EmbeddingGroup(
+                        features=self._features,
+                        feature_groups=self._feature_groups,
+                        wide_embedding_dim=self._wide_embedding_dim,
+                        wide_init_fn=self._wide_init_fn
+                    )
                     if layer == "input_layer":
-                        # input_fn = self._embedding_group.has_group(group)
-                        input_fn = embedding_group
-                        self._name_to_output_dim[block.name] = (
-                            embedding_group.group_total_dim(group)
-                        )  # 计算input_layer的输出维度
-                        input_feature_groups[group] = input_fn  # not a layer is a dim
+                        # 使用改进的维度推断引擎，支持batch_size估算
+                        dim_info = create_dimension_info_from_embedding(
+                            input_fn, group, batch_size=None  # 可以在实际使用时传入batch_size
+                        )
+                        self.dim_engine.register_output_dim(block.name, dim_info)
+                        
+                        # 保留兼容性
+                        self._name_to_output_dim[block.name] = dim_info.get_feature_dim()
+
+                        input_feature_groups[group] = embedding_group  # not a layer is a dim
                     elif layer == "raw_input":
                         raise NotImplementedError
                         input_fn = self._input_layer.get_raw_features(
@@ -199,52 +226,82 @@ class Package(nn.Module):
                             block.name,
                             vocab,
                         )
-                    # 加上的话embedding 会被实例化多次
+                    # input_fn = EnhancedEmbeddingGroup(embedding_group=embedding_group,
+                    #                                       group_name=group)
+                    self._name_to_layer[block.name] = input_fn
+                    # 加上的话embedding 会被注册多次
                     # self._name_to_layer[block.name] = embedding_group
+                    # name_to_layer[block.name] = embedding_group
             else:  # module
-                # 计算 self._name_to_output_dim[block.name] 由所有inputs block 的self._name_to_output_dim相加
-                # 遍历 block.inputs，获取每个输入block的output_dim 作为输入维度
+                # 使用新的维度推断引擎处理多输入维度
+                input_dim_infos = []
+                
                 for input_node in block.inputs:
                     input_type = input_node.WhichOneof("name")
                     input_name = getattr(input_node, input_type)
-                    if input_type == "use_package_input":  # 这是一个布尔值
-                        # 特殊处理
-                        raise NotImplementedError
-                    elif input_type == "package_name":
+                    # 解析input_fn & input_slice
+                    input_fn = getattr(input_node, 'input_fn', None)
+                    input_slice = getattr(input_node, 'input_slice', None)
+
+                    if input_type == "package_name":
                         # package 为子DAG 作为 Block 的输入
                         raise NotImplementedError
                     else:  # block_name 或者 feature_group_name 的情况
-                        if input_name in self._name_to_output_dim:
-                            output_dim = self._name_to_output_dim[
-                                input_name
-                            ]  # 上一个block的输出维度
-                            if (
-                                block.name in self._name_to_input_dim
-                            ):  # 已经在里面则叠加下一个input的维度
-                                self._name_to_input_dim[block.name] += (
-                                    output_dim  # 作为这个block的输入维度
-                                )
+                        # 从维度推断引擎获取输入维度信息
+                        input_dim_info = self.dim_engine.get_output_dim(input_name)
+                        
+                        if input_dim_info is None:
+                            # fallback到旧的方式
+                            if input_name in self._name_to_output_dim:
+                                output_dim = self._name_to_output_dim[input_name]
+                                input_dim_info = DimensionInfo(output_dim)
                             else:
-                                self._name_to_input_dim[block.name] = output_dim
-                        else:
-                            raise KeyError(
-                                f"input name `{input_name}` not found in blocks/feature_groups"
+                                raise KeyError(f"input name `{input_name}` not found in blocks/feature_groups")
+                        
+                        # 应用input_fn和input_slice变换
+                        if input_fn or input_slice:
+                            input_dim_info = self.dim_engine.apply_input_transforms(
+                                input_dim_info, input_fn, input_slice
                             )
-                self.define_layers(layer, block, block.name, reuse)
-                # # 计算输出维度
-                self._name_to_output_dim[block.name] = self._name_to_layer[
-                    block.name
-                ].output_dim()  # 计算block的输出维度
-                # self._name_to_layer[block.name] e.g.
-                # 0: MLP
-                # 1: True (if customize)
+                        
+                        input_dim_infos.append(input_dim_info)
 
-                # sequential layers
-                # not implemented yet
-                # for i, layer_cnf in enumerate(getattr(block, "layers", [])):
-                #     layer = layer_cnf.WhichOneof('layer')
-                #     name_i = '%s_l%d' % (block.name, i)
-                #     self.define_layers(layer, layer_cnf, name_i, reuse)
+                # 合并多个输入的维度信息
+                if len(input_dim_infos) == 1:
+                    merged_input_dim = input_dim_infos[0]
+                else:
+                    # 根据block配置决定合并方式
+                    merge_mode = "list" if getattr(block, "merge_inputs_into_list", False) else "concat"
+                    merged_input_dim = self.dim_engine.merge_input_dims(input_dim_infos, merge_mode)
+                
+                # 注册输入维度
+                self.dim_engine.register_input_dim(block.name, merged_input_dim)
+                
+                # 保留兼容性
+                self._name_to_input_dim[block.name] = merged_input_dim.get_total_dim()
+
+                # 定义layer
+                self.define_layers(layer, block, block.name, reuse)
+                
+                # 注册layer到维度推断引擎
+                if block.name in self._name_to_layer:
+                    layer_obj = self._name_to_layer[block.name]
+                    self.dim_engine.register_layer(block.name, layer_obj)
+                    
+                    # 验证维度兼容性
+                    if not self.dim_engine.validate_dimension_compatibility(layer_obj, merged_input_dim):
+                        logging.warning(f"Dimension compatibility check failed for block {block.name}")
+                    
+                    # 推断输出维度 - 使用改进的方法
+                    output_dim_info = self.dim_engine.infer_layer_output_dim(layer_obj, merged_input_dim)
+                    self.dim_engine.register_output_dim(block.name, output_dim_info)
+                    
+                    # 保留兼容性
+                    self._name_to_output_dim[block.name] = output_dim_info.get_feature_dim()
+                else:
+                    # 如果没有layer，使用输入维度作为输出维度
+                    self.dim_engine.register_output_dim(block.name, merged_input_dim)
+                    self._name_to_output_dim[block.name] = merged_input_dim.get_feature_dim()
 
         # ======= 后处理、输出节点推断 =======
         input_feature_groups = self._feature_group_inputs
@@ -268,9 +325,16 @@ class Package(nn.Module):
             self._config.concat_blocks.extend(leaf)
 
         Package.__packages[self._config.name] = self  # 这个是什么意思？
+        
+        # 输出维度推断摘要
+        dim_summary = self.dim_engine.get_summary()
+        logging.info(f"{config.name} dimension inference summary: {dim_summary}")
+        
         logging.info(
             "%s layers: %s" % (config.name, ",".join(self._name_to_layer.keys()))
         )
+
+    
 
     def get_output_block_names(self):
         """返回最终作为输出的 block 名字列表（优先 concat_blocks，否则 output_blocks）。"""
@@ -279,14 +343,43 @@ class Package(nn.Module):
             blocks = list(getattr(self._config, "output_blocks", []))
         return blocks
 
+    def get_dimension_summary(self) -> Dict[str, Any]:
+        """获取维度推断的详细摘要信息"""
+        summary = self.dim_engine.get_summary()
+        summary.update({
+            "config_name": self._config.name,
+            "total_layers": len(self._name_to_layer),
+            "output_blocks": list(getattr(self._config, "output_blocks", [])),
+            "concat_blocks": list(getattr(self._config, "concat_blocks", [])),
+            "final_output_dims": self.output_block_dims(),
+            "total_output_dim": self.total_output_dim(),
+        })
+        return summary
+    
+    def validate_all_dimensions(self) -> bool:
+        """验证所有block的维度兼容性"""
+        all_valid = True
+        for block_name, layer in self._name_to_layer.items():
+            input_dim_info = self.dim_engine.block_input_dims.get(block_name)
+            if input_dim_info is not None:
+                if not self.dim_engine.validate_dimension_compatibility(layer, input_dim_info):
+                    logging.error(f"Dimension validation failed for block: {block_name}")
+                    all_valid = False
+        return all_valid
+
     def output_block_dims(self):
         """返回最终输出 block 的维度组成的 list，比如 [160, 96]"""
         blocks = self.get_output_block_names()
         dims = []
         for block in blocks:
-            if block not in self._name_to_output_dim:
-                raise ValueError(f"block `{block}` not in name_to_output_dim")
-            dims.append(self._name_to_output_dim[block])
+            # 优先使用新的维度推断引擎
+            dim_info = self.dim_engine.get_output_dim(block)
+            if dim_info is not None:
+                dims.append(dim_info.get_feature_dim())
+            elif block in self._name_to_output_dim:
+                dims.append(self._name_to_output_dim[block])
+            else:
+                raise ValueError(f"block `{block}` not in output dims")
         return dims
 
     def total_output_dim(self):
@@ -338,20 +431,28 @@ class Package(nn.Module):
         # 还可以用自定义的protobuf message的格式传递参数给加载的Layer对象。
         if customize:
             # 代码假定 layer_conf.st_params 是一个结构化参数（is_struct=True），并使用它来创建一个 Parameter 对象，同时传递 L2 正则化参数。
-            if param_type is None or param_type == "st_params":
+            if param_type is None: # 没有额外的参数
+                layer = layer_cls()
+                return layer, customize
+            elif param_type == "st_params":
                 params = Parameter(layer_conf.st_params, True, l2_reg=self._l2_reg)
             # 如果 param_type 指向 oneof 中的其他字段，代码通过 getattr 动态获取该字段的值，并假定它是一个 Protocol Buffer 消息（is_struct=False）。
             else:
                 pb_params = getattr(layer_conf, param_type)
                 params = Parameter(pb_params, False, l2_reg=self._l2_reg)
-            has_reuse = True
+            has_reuse = False
             try:
-                import inspect
-
                 # 使用标准库 inspect.signature 获取构造函数的签名
                 sig = inspect.signature(layer_cls.__init__)
+                # 如果 自定义module没显式写__init__，则会继承自nn.Module，它的__init__签名其实为：def __init__(self, *args, **kwargs):
+                # params_without_self = [
+                #     p for p in list(sig.parameters.values())[1:]  # skip self
+                #     if p.default is inspect.Parameter.empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                # ]
+                # only_self = len(list(sig.parameters.values())) == 1  # 只包含 self
                 # 检查构造函数参数中是否包含 'reuse'
-                has_reuse = "reuse" in sig.parameters.keys()
+                # has_reuse = "reuse" in sig.parameters.keys()
+                has_reuse = "reuse" in inspect.signature(layer_cls.__init__).parameters
             except Exception as e:
                 # 如果出现异常，记录警告信息
                 logging.warning(f"Failed to inspect function signature: {e}")
@@ -360,14 +461,23 @@ class Package(nn.Module):
                 raise NotImplementedError
             else:
                 kwargs = config_to_kwargs(params)
-                # 检查是否需要自动推断 in_features 或 input_dim【修改点】
+                # 检查是否需要自动推断 in_features 或 input_dim【改进版本】
                 if "in_features" in sig.parameters or "input_dim" in sig.parameters:
                     if "in_features" not in kwargs and "input_dim" not in kwargs:
-                        # 优先用 input_shape，如果没有就 raise
-                        if input_dim is not None:
-                            # 通常 input_dim 是 input_shape = (..., input_dim) 的最后一个维度
-                            feature_dim = input_dim
+                        # 从维度推断引擎获取输入维度
+                        input_dim_info = self.dim_engine.block_input_dims.get(name)
+                        if input_dim_info is not None:
+                            feature_dim = input_dim_info.get_feature_dim()
                             # 兼容不同实现风格
+                            if "in_features" in sig.parameters:
+                                kwargs["in_features"] = feature_dim
+                            elif "input_dim" in sig.parameters:
+                                kwargs["input_dim"] = feature_dim
+                        elif input_dim is not None:
+                            # fallback到传入的input_dim参数
+                            feature_dim = input_dim if isinstance(input_dim, int) else (
+                                sum(input_dim) if isinstance(input_dim, (list, tuple)) else input_dim
+                            )
                             if "in_features" in sig.parameters:
                                 kwargs["in_features"] = feature_dim
                             elif "input_dim" in sig.parameters:
@@ -375,7 +485,7 @@ class Package(nn.Module):
                         else:
                             raise ValueError(
                                 f"{layer_cls.__name__} 需要 in_features 或 input_dim, "
-                                "但参数未给定，且无法自动推断，请传递 input_shape 或在参数中指定。"
+                                "但参数未给定，且无法自动推断。请检查维度推断配置。"
                             )
                 layer = layer_cls(
                     **kwargs
@@ -475,6 +585,8 @@ class Package(nn.Module):
                 # 没有tf.name_scope，直接调用
                 fn = eval(input_node.input_fn)
                 input_feature = fn(input_feature)
+                # 需要重新计算input_dim
+
 
             inputs.append(input_feature)
 
@@ -503,7 +615,7 @@ class Package(nn.Module):
 
         return output
 
-    def forward(self, is_training, group_features=None, batch=None, **kwargs):
+    def forward(self, is_training, batch=None, **kwargs):
         # group_features:Dict[str, torch.Tensor]
         block_outputs = {}
         self._block_outputs = block_outputs  # reset
@@ -536,7 +648,12 @@ class Package(nn.Module):
             elif layer_type == "raw_input":
                 block_outputs[block] = self._name_to_layer[block]
             elif layer_type == "input_layer":
-                # input_fn = self._name_to_layer[block]  # embedding group
+                # 如果self._name_to_layer有block属性且不为None
+                # 直接调用 self._name_to_layer[block]，否则调用 embedding group
+                if block in self._name_to_layer and self._name_to_layer[block] is not None:
+                    input_fn = self._name_to_layer[block]  # embedding group
+                else:
+                    input_fn = self._embedding_group
                 # 本身没有block input 了
                 input_config = config.input_layer
                 if self.input_config is not None:
@@ -545,14 +662,43 @@ class Package(nn.Module):
                         input_fn.reset(input_config, is_training)
                 # block_outputs[block] = input_fn(input_config, is_training)
                 # block_outputs[block] = input_fn(input_config) # embedding group 没有is training 参数
-                # if batch is not None:
-                #     block_outputs[block] = input_fn(batch)
-                # else:
-                #     block_outputs[block] = input_fn(input_config)
+                if batch is not None:
+                    block_outputs[block] = input_fn(batch)[block] # input_fn(batch) 是 tensor dict
+                else:
+                    block_outputs[block] = input_fn(input_config)[block]
+                # 变成 feature_dict
+    #             {'user': tensor([[ 9.1805e-04, -6.2097e-04, -8.3887e-04,  ..., -2.2219e-01,
+    #       2.0671e-01,  1.3043e-01],
+    #     [-4.1031e-04,  6.2237e-04,  8.3805e-04,  ..., -2.2219e-01,
+    #       2.0671e-01,  1.3043e-01],
+    #     [ 6.3215e-04,  6.1645e-05,  8.2621e-04,  ..., -2.2219e-01,
+    #       2.0671e-01,  1.3043e-01],
+    #     ...,
+    #     [ 4.9403e-04,  4.3865e-04, -1.7802e-04,  ...,  4.7140e-03,
+    #      -2.0951e-01,  1.6210e-01],
+    #     [-7.5025e-04,  8.3626e-04,  1.9763e-04,  ..., -2.2219e-01,
+    #       2.0671e-01,  1.3043e-01],
+    #     [-7.9191e-05,  5.5504e-05, -7.7013e-06,  ..., -2.2219e-01,
+    #       2.0671e-01,  1.3043e-01]], device='cuda:1',
+    #    grad_fn=<SplitWithSizesBackward0>), 'item': tensor([[ 8.3763e-04,  1.0169e-03,  3.5291e-04,  ..., -4.9626e-02,
+    #      -3.7418e-02,  8.3003e-03],
+    #     [-2.2792e-04, -7.1679e-04, -5.1453e-04,  ...,  6.7114e-02,
+    #       6.8413e-02, -8.0175e-02],
+    #     [ 2.0042e-04, -5.0292e-04, -6.8261e-04,  ..., -8.2772e-02,
+    #      -3.8178e-02, -7.4963e-02],
+    #     ...,
+    #     [-1.8840e-04, -6.8846e-04, -9.6214e-04,  ...,  2.5672e-02,
+    #       3.9073e-02, -4.3426e-03],
+    #     [ 3.0108e-05,  1.3784e-04,  2.5806e-04,  ..., -2.3564e-02,
+    #       1.5996e-02, -6.3699e-02],
+    #     [-1.0654e-03, -2.4731e-04, -5.2558e-04,  ..., -9.7852e-02,
+    #      -8.4175e-02, -3.0702e-03]], device='cuda:1',
+    #    grad_fn=<SplitWithSizesBackward0>)}
                 # block_outputs[block] = input_fn(group_features[block])
-                block_outputs[block] = group_features[
-                    block
-                ]  # group_features是一个字典，key是block name
+
+                # block_outputs[block] = group_features[
+                #     block
+                # ]  # group_features是一个字典，key是block name
             elif layer_type == "embedding_layer":
                 input_fn = self._name_to_layer[block]
                 feature_group = config.inputs[0].feature_group_name
@@ -622,10 +768,13 @@ class Backbone(nn.Module):
     """Configurable Backbone Network."""
 
     def __init__(
-        self, config, features, embedding_group, input_layer=None, l2_reg=None
+        self, config, features, embedding_group, feature_groups,
+        wide_embedding_dim=None,wide_init_fn=None,input_layer=None, l2_reg=None
     ):
         super().__init__()
         self._config = config
+        # self._backbone_config = config.rank_backbone.backbone
+
         self._l2_reg = l2_reg
         main_pkg = backbone_pb2.BlockPackage()
         main_pkg.name = "backbone"
@@ -638,15 +787,16 @@ class Backbone(nn.Module):
             main_pkg.output_blocks.extend(config.output_blocks)
 
         self._main_pkg = Package(
-            main_pkg, features, embedding_group, input_layer, l2_reg
+            main_pkg, features, embedding_group, feature_groups,wide_embedding_dim,wide_init_fn,input_layer, l2_reg
         )  # input_layer目前没有用到
         for pkg in config.packages:
             Package(
                 pkg, features, embedding_group, input_layer, l2_reg
             )  # Package是一个子DAG
 
-    def forward(self, is_training, group_features=None, batch=None, **kwargs):
-        output = self._main_pkg(is_training, group_features, batch, **kwargs)
+    def forward(self, is_training, batch=None, **kwargs):
+        # output = self._main_pkg(is_training, group_features, batch, **kwargs)
+        output = self._main_pkg(is_training, batch, **kwargs)
 
         if self._config.HasField("top_mlp"):
             params = Parameter.make_from_pb(self._config.top_mlp)
