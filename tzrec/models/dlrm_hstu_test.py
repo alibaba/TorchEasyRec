@@ -66,12 +66,12 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_id_feature=feature_pb2.SequenceIdFeature(
                     feature_name="action_timestamp"
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_id_feature=feature_pb2.SequenceIdFeature(
                     feature_name="item_query_time"
                 )
             ),
@@ -228,19 +228,13 @@ class DlrmHSTUTest(unittest.TestCase):
                 "item_video_id",
                 "action_weight",
                 "item_action_weight",
+                "action_timestamp",
+                "item_query_time",
             ],
-            values=torch.tensor(list(range(26))),
-            lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4]),
+            values=torch.tensor(list(range(37))),
+            lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4, 2, 3, 2, 4]),
         )
         sequence_dense_features = {
-            "action_timestamp": JaggedTensor(
-                values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
-                lengths=torch.tensor([2, 3]),
-            ),
-            "item_query_time": JaggedTensor(
-                values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5], [0.6]]),
-                lengths=torch.tensor([2, 4]),
-            ),
             "watch_time": JaggedTensor(
                 values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
                 lengths=torch.tensor([2, 3]),
