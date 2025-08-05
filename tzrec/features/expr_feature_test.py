@@ -190,15 +190,25 @@ class ExprFeatureTest(unittest.TestCase):
                 [[0.2, 0.3], [0.1, 0.2], [0.3, 0.4], []],
                 [[0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [0.2, 0.2]],
                 "0.1",
-                [2, 1, 2, 1],
+                [2, 1, 2, 2],
                 [1, 1, 1, 1],
+                None,
             ],
             [
-                ["0.2\x1d0.3", "", "0.3\x1d0.4"],
+                ["0.2\x1d0.2", "", "0.3\x1d0.4"],
                 ["0.2\x1d0.2", "0.2\x1d0.2", "0.2\x1d0.2"],
                 "",
                 [1, 2],
                 [1, 0, 1],
+                None,
+            ],
+            [
+                ["0.2,0.2", "", "0.3,0.4"],
+                ["0.2,0.2", "0.2,0.2", "0.2,0.2"],
+                "",
+                [1, 2],
+                [1, 0, 1],
+                ",",
             ],
         ]
     )
@@ -209,6 +219,7 @@ class ExprFeatureTest(unittest.TestCase):
         default_value,
         expected_values,
         expected_lengths,
+        sep,
     ):
         expr_feat_cfg = feature_pb2.FeatureConfig(
             expr_feature=feature_pb2.ExprFeature(
@@ -220,6 +231,8 @@ class ExprFeatureTest(unittest.TestCase):
                 default_value=default_value,
             )
         )
+        if sep is not None:
+            expr_feat_cfg.expr_feature.separator = sep
         expr_feat = expr_feature_lib.ExprFeature(
             expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
         )

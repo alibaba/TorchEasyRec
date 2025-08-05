@@ -9,6 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# We use the hstu_attention ops from generative-recommenders a starting point.
+# https://github.com/facebookresearch/generative-recommenders
+# thanks to their public work.
+
 
 from typing import List, Optional, Tuple
 

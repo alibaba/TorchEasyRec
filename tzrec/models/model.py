@@ -209,11 +209,30 @@ TRAIN_FWD_TYPE = Tuple[torch.Tensor, TRAIN_OUT_TYPE]
 class TrainWrapper(BaseModule):
     """Model train wrapper for pipeline."""
 
-    def __init__(self, module: nn.Module) -> None:
+    def __init__(
+        self,
+        module: nn.Module,
+        device: Optional[torch.device] = None,
+        mixed_precision: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.model = module
         self.model.init_loss()
         self.model.init_metric()
+        self._device = device
+        self._device_type = "cpu"
+        if device is not None:
+            self._device_type = device.type
+        if mixed_precision is None or len(mixed_precision) == 0:
+            self._mixed_dtype = None
+        elif mixed_precision == "FP16":
+            self._mixed_dtype = torch.float16
+        elif mixed_precision == "BF16":
+            self._mixed_dtype = torch.bfloat16
+        else:
+            raise ValueError(
+                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
+            )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -227,9 +246,14 @@ class TrainWrapper(BaseModule):
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
         """
-        predictions = self.model.predict(batch)
-        losses = self.model.loss(predictions, batch)
-        total_loss = torch.stack(list(losses.values())).sum()
+        with torch.amp.autocast(
+            device_type=self._device_type,
+            dtype=self._mixed_dtype,
+            enabled=self._mixed_dtype is not None,
+        ):
+            predictions = self.model.predict(batch)
+            losses = self.model.loss(predictions, batch)
+            total_loss = torch.stack(list(losses.values())).sum()
 
         losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}

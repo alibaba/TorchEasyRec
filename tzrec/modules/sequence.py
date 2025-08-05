@@ -8,9 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# HSTUEncoder is from generative-recommenders,
-# https://github.com/facebookresearch/generative-recommenders,
-# thanks to their public work.
+
 
 from typing import Any, Dict, List, Optional, Tuple
 

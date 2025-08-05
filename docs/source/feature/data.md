@@ -103,11 +103,12 @@ sample_weight_fields: 'col_name'
   }
   ```
 
-  - 特征输入的side一共支持四种 \[`user`, `item`, `context`, `feature`\]，上述`lookup_feat`中的`cate_map`则是属于`user`side
+  - 特征输入的side一共支持五种 \[`user`, `item`, `context`, `feature`, `const`\]，上述`lookup_feat`中的`cate_map`则是属于`user`side
     - `user`: 用户侧特征输入，线上推理时从请求中传入
     - `item`: 物品侧特征输入，线上推理时会从实时缓存在内存中的特征表里获取
     - `context`: 由上下文产生物品侧特征输入，线上推理时从请求中传入，如`recall_name`等
-    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果。
+    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果
+    - `const`: 输入为常量
     ```
     feature_configs {
         raw_feature {
@@ -126,6 +127,15 @@ sample_weight_fields: 'col_name'
             boundaries: [0, 1, 2, 3, 4]
         }
     }
+    feature_configs {
+        lookup_feature {
+            feature_name: "lookup_age_feat"
+            map: "item:age_map"
+            key: "const:age1"
+            embedding_dim: 16
+            boundaries: [0, 1, 2, 3, 4]
+        }
+    }
     ```
 
 #### fg_mode=FG_DAG
@@ -136,7 +146,7 @@ sample_weight_fields: 'col_name'
 
 #### fg_mode=FG_NORMAL
 
-- 训练时会在Dataset中执行FG，但不是以DAG方式运行。因此特征的输入中如果有`feature` side的输入，也需要在输入表中。目前更建议使用`FG_DAG`模式
+- 训练时会在Dataset中执行FG，但不是以DAG方式运行。因此特征的输入中如果有`feature`,`const`side的输入，也需要在输入表中。目前更建议使用`FG_DAG`模式
 
 #### fg_mode=FG_NONE
 
@@ -167,11 +177,11 @@ sample_weight_fields: 'col_name'
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg065-0.6.5-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
+    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg071-0.7.1-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg065 import offline_pyfg
+    from pyfg071 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",

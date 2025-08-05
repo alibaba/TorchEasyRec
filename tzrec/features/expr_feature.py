@@ -116,6 +116,14 @@ class ExprFeature(RawFeature):
             "variables": list(self.config.variables),
             "value_type": "float",
         }
+        if self.config.separator != "\x1d":
+            fg_cfg["separator"] = self.config.separator
+        if self.config.HasField("fill_missing"):
+            fg_cfg["fill_missing"] = self.config.fill_missing
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("value_dim"):
+            fg_cfg["value_dim"] = self.config.value_dim
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]

@@ -89,7 +89,7 @@ def _parse_fg_encoded_sequence_sparse_feature_impl(
     else:
         raise ValueError(
             f"{name} only support str|list<int>|list<list<int>> dtype input,"
-            f" but get {feat.dtype}."
+            f" but get {feat.type}."
         )
     return SequenceSparseData(name, feat_values, feat_lengths, seq_lengths)
 
@@ -154,7 +154,7 @@ def _parse_fg_encoded_sequence_dense_feature_impl(
     else:
         raise ValueError(
             f"{name} only support str|list<float>|list<float<float>> dtype input,"
-            f" but get {feat.dtype}."
+            f" but get {feat.type}."
         )
     return SequenceDenseData(name, feat_values, seq_lengths)
 
@@ -338,7 +338,8 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 1
-
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
 

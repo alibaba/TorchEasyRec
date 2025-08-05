@@ -85,6 +85,8 @@ class DataParser:
         self.sampler_type = sampler_type
 
         for feature in self._features:
+            if feature.stub_type:
+                continue
             if feature.is_sequence:
                 if feature.is_sparse:
                     self.sparse_keys[feature.data_group].append(feature.name)
@@ -112,8 +114,17 @@ class DataParser:
                 | self._fg_handler.item_inputs()
                 | self._fg_handler.context_inputs()
             ) - set(self._fg_handler.sequence_feature_pks().values())
+        elif self._fg_mode == FgMode.FG_NORMAL:
+            for feature in features:
+                assert not feature.stub_type, (
+                    f"feature[{feature.name}]: fg_mode=FG_NORMAL not "
+                    "support stub_type=True now."
+                )
+                self.feature_input_names |= set(feature.inputs)
         else:
             for feature in features:
+                if feature.stub_type:
+                    continue
                 self.feature_input_names |= set(feature.inputs)
 
         self.user_inputs = set()
@@ -282,6 +293,8 @@ class DataParser:
         fg_output, status = self._fg_handler.process_arrow(input_data_fg)
         assert status.ok(), status.message()
         for feature in self._features:
+            if feature.stub_type:
+                continue
             feat_name = feature.name
             feat_data = fg_output[feat_name]
             if feature.is_sequence:
@@ -777,6 +790,8 @@ class DataParser:
         """Dump parsed inputs for debug."""
         feature_rows = defaultdict(dict)
         for f in self._features:
+            if f.stub_type:
+                continue
             if f.is_sparse:
                 if f.is_sequence:
                     lengths = input_data[f"{f.name}.lengths"]

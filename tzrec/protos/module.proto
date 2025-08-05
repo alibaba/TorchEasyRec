@@ -12,6 +12,8 @@ message MLP {
     optional bool use_bn = 4 [default = false];
     // use bias
     optional bool bias = 5 [default = true];
+    // use layer normalization
+    optional bool use_ln = 6 [default = false];
 }
 
 message ExtractionNetwork {
@@ -26,7 +28,7 @@ message ExtractionNetwork {
     optional MLP share_expert_net = 5;
 }
 
-message  VariationalDropout{
+message  VariationalDropout {
     // regularization coefficient lambda
     optional float regularization_lambda = 1 [default = 0.01];
     // variational_dropout dimension
@@ -34,7 +36,7 @@ message  VariationalDropout{
 }
 
 
-message B2ICapsule{
+message B2ICapsule {
     // max number of high capsules Default: 5
     optional uint32 max_k = 1 [default = 5];
     // max behaviour sequence length
@@ -77,4 +79,154 @@ message MaskNetModule {
 message Cross {
     // number of cross layers
     optional uint32 cross_num = 1 [default=3];
+}
+
+message GRActionEncoder {
+    // action embedding dim
+    optional uint32 action_embedding_dim = 1;
+    // name of action feature in payloads
+    required string action_feature_name = 2;
+    // bitmask of each action
+    repeated uint32 action_weights = 3;
+    // thresholds for watch time to actions
+    repeated uint32 watchtime_to_action_thresholds = 4;
+    // bitmask for watch time to actions
+    repeated uint32 watchtime_to_action_weights = 5;
+}
+
+message GRSimpleContextualizedMLP {
+    // mlp hidden dimension
+    required uint32 hidden_dim = 1;
+}
+
+message GRParameterizedContextualizedMLP {
+    // mlp hidden dimension
+    required uint32 hidden_dim = 1;
+    // dropout ratio for contextual embedding
+    optional float contextual_dropout_ratio = 2 [default = 0.3];
+}
+
+message GRContextualizedMLP {
+    oneof contextualized_mlp {
+        // mlp for sequence embedding
+        GRSimpleContextualizedMLP simple_mlp = 10;
+        // mlp for sequence and contextual embedding
+        GRParameterizedContextualizedMLP parameterized_mlp = 11;
+    }
+}
+
+message GRContextualPreprocessor {
+    // a mapping from contextual feature to maximum padding length.
+    map<string, uint32> contextual_feature_to_max_length = 1;
+    // a mapping from contextual feature to uih length, if uih
+    // length < min_uih_length, will mask the contextual feature.
+    map<string, uint32> contextual_feature_to_min_uih_length = 2;
+    // action encoder config
+    optional GRActionEncoder action_encoder = 3;
+    // action embedding mlp config
+    optional GRContextualizedMLP action_mlp = 4;
+    // content embedding mlp config
+    required GRContextualizedMLP content_mlp = 5;
+}
+
+message GRContextualInterleavePreprocessor {
+    // a mapping from contextual feature to maximum padding length.
+    map<string, uint32> contextual_feature_to_max_length = 1;
+    // a mapping from contextual feature to uih length, if uih
+    // length < min_uih_length, will mask the contextual feature.
+    map<string, uint32> contextual_feature_to_min_uih_length = 2;
+    // action encoder config
+    required GRActionEncoder action_encoder = 3;
+    // enable interleave target or not
+    optional bool enable_interleaving = 4 [default=true];
+    // action embedding mlp config
+    optional GRContextualizedMLP action_mlp = 5;
+    // content embedding mlp config
+    required GRContextualizedMLP content_mlp = 6;
+}
+
+message GRInputPreprocessor {
+    oneof input_preprocessor {
+        // input preprocessor with contextual features
+        GRContextualPreprocessor contextual_preprocessor = 20;
+        // input preprocessor with interleave targets
+        GRContextualInterleavePreprocessor contextual_interleave_preprocessor = 21;
+    }
+}
+
+message GRL2NormPostprocessor {
+}
+
+message GRLayerNormPostprocessor {
+}
+
+message GRTimestampLayerNormPostprocessor {
+    // time duration period units, e.g. 60 * 60 for hour of day.
+    repeated uint32 time_duration_period_units = 1;
+    // time duration units per period, e.g. 24 for hour of day.
+    repeated uint32 time_duration_units_per_period = 2;
+}
+
+message GROutputPostprocessor {
+    oneof output_postprocessor {
+        // l2 norm postprocessor
+        GRL2NormPostprocessor l2norm_postprocessor = 31;
+        // layer norm postprocessor
+        GRLayerNormPostprocessor layernorm_postprocessor = 32;
+        // timestamp layer norm postprocessor
+        GRTimestampLayerNormPostprocessor timestamp_layernorm_postprocessor = 33;
+    }
+}
+
+message STU {
+    // dimension of input embeddings
+    required uint32 embedding_dim = 1;
+    // number of attention heads
+    required uint32 num_heads = 2;
+    // dimension of hidden linear layers
+    required uint32 hidden_dim = 3;
+    // dimension of attention mechanism
+    required uint32 attention_dim = 4;
+    // dropout probability for linear layers
+    optional float output_dropout_ratio = 5 [default = 0.3];
+    // maximum length of attention window
+    optional uint32 max_attn_len = 6;
+    // alpha for mha attention
+    optional float attn_alpha = 7;
+    // use group normalization or layer normalization.
+    optional bool use_group_norm = 8 [default = false];
+    // whether to recompute normed_x in backward
+    optional bool recompute_normed_x = 9 [default = true];
+    // whether to recompute_uvqk in backward
+    optional bool recompute_uvqk = 10 [default = true];
+    // whether to recompute y in backward
+    optional bool recompute_y = 11 [default = true];
+    // whether to sort by sequence length when forwarding
+    optional bool sort_by_length = 12 [default = true];
+    // sequence length of contextual feature
+    optional uint32 contextual_seq_len = 13;
+}
+
+message GRPositionalEncoder {
+    // buckets for position embedding
+    required uint32 num_position_buckets = 1;
+    // buckets for timestamp embedding
+    optional uint32 num_time_buckets = 2;
+    // use timestamp encoding or not.
+    optional bool use_time_encoding = 3 [default = false];
+}
+
+message HSTU {
+    // stu config
+    required STU stu = 1;
+    // dropout ratio after preprocessor
+    optional float input_dropout_ratio = 2 [default = 0.2];
+    // num stu layers
+    optional uint32 attn_num_layers = 3 [default = 3];
+    // position encoder
+    required GRPositionalEncoder positional_encoder = 4;
+    // input preprocessor
+    required GRInputPreprocessor input_preprocessor = 5;
+    // output postprocessor
+    required GROutputPostprocessor output_postprocessor = 6;
 }

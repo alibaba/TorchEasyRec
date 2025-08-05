@@ -57,7 +57,7 @@ class RankModel(BaseModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
-        self._label_name = labels[0]
+        self._label_name = labels[0] if len(labels) > 0 else ""
         self._sample_weight_name = (
             sample_weights[0] if sample_weights else sample_weights
         )
@@ -73,6 +73,7 @@ class RankModel(BaseModel):
             wide_embedding_dim=int(self.wide_embedding_dim)
             if hasattr(self, "wide_embedding_dim")
             else None,
+            wide_init_fn=self.wide_init_fn if hasattr(self, "wide_init_fn") else None,
         )
 
         if self._base_model_config.HasField("variational_dropout"):
