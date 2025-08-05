@@ -116,7 +116,15 @@ class Cross(nn.Module):
         self.b = nn.ParameterList()
         for _ in range(cross_num):
             self.w.append(nn.Linear(input_dim, 1, bias=False))
-            self.b.append(nn.Parameter(torch.rand(input_dim)))
+            self.b.append(nn.Parameter(torch.empty(input_dim)))
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize parameters."""
+        for i in range(self.cross_num):
+            nn.init.xavier_uniform_(self.w[i].weight)
+            nn.init.zeros_(self.b[i])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward."""
