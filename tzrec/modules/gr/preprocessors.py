@@ -75,6 +75,10 @@ class InputPreprocessor(BaseModule):
         """Interleave targets or not."""
         return False
 
+    def contextual_seq_len(self) -> int:
+        """Contextual feature sequence length."""
+        return 0
+
 
 def _get_contextual_input_embeddings(
     seq_lengths: torch.Tensor,
@@ -309,6 +313,10 @@ class ContextualPreprocessor(InputPreprocessor):
             output_seq_embeddings,
             output_num_targets,
         )
+
+    def contextual_seq_len(self) -> int:
+        """Contextual feature sequence length."""
+        return self._max_contextual_seq_len
 
 
 class ContextualInterleavePreprocessor(InputPreprocessor):
@@ -625,6 +633,10 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
     def interleave_targets(self) -> bool:
         """Interleave targets or not."""
         return self.is_train and self._enable_interleaving
+
+    def contextual_seq_len(self) -> int:
+        """Contextual feature sequence length."""
+        return self._max_contextual_seq_len
 
 
 def create_input_preprocessor(

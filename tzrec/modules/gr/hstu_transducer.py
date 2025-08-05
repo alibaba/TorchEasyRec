@@ -86,7 +86,9 @@ class HSTUTransducer(BaseModule):
         self._positional_encoder: Optional[HSTUPositionalEncoder] = None
         if positional_encoder is not None:
             self._positional_encoder = HSTUPositionalEncoder(
-                embedding_dim=stu["embedding_dim"], **positional_encoder
+                embedding_dim=stu["embedding_dim"],
+                contextual_seq_len=self._input_preprocessor.contextual_seq_len(),
+                **positional_encoder,
             )
         self._input_dropout_ratio: float = input_dropout_ratio
         self._return_full_embeddings: bool = return_full_embeddings
