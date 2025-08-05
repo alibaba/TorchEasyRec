@@ -58,26 +58,27 @@ message PLE {
 
 
 message DlrmHSTU {
+    // user history item id feature name
     required string uih_id_feature_name = 1;
-
+    // user history action time feature name
     required string uih_action_time_feature_name = 2;
-
+    // user history action weight feature name
     required string uih_action_weight_feature_name = 3;
-
+    // user history watch time feature name
     required string uih_watchtime_feature_name = 4;
-
+    // candidate item id feature name
     required string candidates_id_feature_name = 5;
-
+    // candidate item query time feature name
     required string candidates_query_time_feature_name = 6;
-
+    // candidate item action weight feature name
     required string candidates_action_weight_feature_name = 7;
-
+    // candidate item watch time feature name
     required string candidates_watchtime_feature_name = 8;
     // hstu config
     required HSTU hstu = 9;
     // multi task tower config
     required FusionMTLTower fusion_mtl_tower = 10;
-
+    // max sequence length
     required uint32 max_seq_len = 11;
     // item embedding mlp hidden dimension
     optional uint32 item_embedding_hidden_dim = 12 [default = 512];

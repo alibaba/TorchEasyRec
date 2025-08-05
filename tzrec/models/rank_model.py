@@ -43,6 +43,7 @@ def _is_classification_loss(loss_cfg: LossConfig) -> bool:
         "binary_cross_entropy",
         "softmax_cross_entropy",
         "jrc_loss",
+        "binary_focal_loss",
     ]
 
 
