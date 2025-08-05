@@ -15,7 +15,7 @@ import networkx as nx
 import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from tzrec.layers.utils import Parameter
 from tzrec.layers.dimension_inference import (
@@ -23,10 +23,7 @@ from tzrec.layers.dimension_inference import (
     DimensionInferenceEngine, 
     create_dimension_info_from_embedding
 )
-from tzrec.layers.lambda_inference import (
-    LambdaOutputDimInferrer,
-    infer_lambda_output_dim
-)
+from tzrec.layers.lambda_inference import LambdaOutputDimInferrer
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
 from tzrec.utils.config_util import config_to_kwargs
@@ -36,41 +33,57 @@ from tzrec.utils.load_class import load_torch_layer
 from tzrec.modules.enhanced_embedding import EnhancedEmbeddingGroup
 from tzrec.modules.embedding import EmbeddingGroup
 
-class BackboneDimensionInferenceEngine(DimensionInferenceEngine):
-    """为Backbone专门优化的维度推断引擎，集成lambda推断功能"""
+
+class LambdaWrapper(nn.Module):
+    """Lambda表达式包装器，用于维度推断和执行"""
     
-    def __init__(self):
+    def __init__(self, expression: str, name: str = "lambda_wrapper"):
         super().__init__()
-        self.lambda_inferrer = LambdaOutputDimInferrer(safe_mode=True)
+        self.expression = expression
+        self.name = name
+        self._lambda_fn = None
+        self._compile_function()
     
-    def apply_input_transforms(self, 
-                             input_dim: DimensionInfo, 
-                             input_fn: Optional[str] = None,
-                             input_slice: Optional[str] = None) -> DimensionInfo:
-        """应用input_fn和input_slice变换 - 增强版本，优先使用lambda推断"""
-        current_dim = input_dim
-        
-        # 先应用input_slice
-        if input_slice is not None:
-            current_dim = self._apply_input_slice(current_dim, input_slice)
-            
-        # 再应用input_fn - 优先使用lambda推断
-        if input_fn is not None:
-            current_dim = self._apply_input_fn_with_lambda_inference(current_dim, input_fn)
-            
-        return current_dim
-    
-    def _apply_input_fn_with_lambda_inference(self, dim_info: DimensionInfo, input_fn: str) -> DimensionInfo:
-        """使用lambda推断的input_fn处理"""
+    def _compile_function(self):
+        """编译lambda函数"""
         try:
-            # 首先尝试使用dummy tensor进行精确推断
-            result = self.lambda_inferrer.infer_output_dim(dim_info, input_fn)
-            self.logger.info(f"Successfully inferred output dim using lambda inference for '{input_fn}': {result}")
-            return result
+            # 创建安全的执行环境
+            safe_globals = {
+                'torch': torch,
+                '__builtins__': {},
+                'cat': torch.cat,
+                'stack': torch.stack,
+                'sum': torch.sum,
+                'mean': torch.mean,
+                'max': torch.max,
+                'min': torch.min,
+            }
+            self._lambda_fn = eval(self.expression, safe_globals, {})
+            if not callable(self._lambda_fn):
+                raise ValueError(f"Expression does not evaluate to callable: {self.expression}")
         except Exception as e:
-            self.logger.debug(f"Lambda inference failed for '{input_fn}': {e}, falling back to pattern matching")
-            # 如果lambda推断失败，回退到原来的模式匹配方法
-            return self._apply_input_fn(dim_info, input_fn)
+            logging.error(f"Failed to compile lambda function '{self.expression}': {e}")
+            raise
+    
+    def forward(self, x):
+        """执行lambda表达式"""
+        if self._lambda_fn is None:
+            raise ValueError("Lambda function not compiled")
+        return self._lambda_fn(x)
+    
+    def infer_output_dim(self, input_dim_info: DimensionInfo) -> DimensionInfo:
+        """使用LambdaOutputDimInferrer推断输出维度"""
+        try:
+            inferrer = LambdaOutputDimInferrer(safe_mode=True)
+            output_dim_info = inferrer.infer_output_dim(input_dim_info, self.expression)
+            logging.debug(f"Lambda wrapper {self.name} inferred output dim: {output_dim_info}")
+            return output_dim_info
+        except Exception as e:
+            logging.warning(f"Failed to infer output dim for lambda {self.name}: {e}, using input dim")
+            return input_dim_info
+    
+    def __repr__(self):
+        return f"LambdaWrapper(name={self.name}, expression='{self.expression}')"
 
 
 class Package(nn.Module):
@@ -113,8 +126,8 @@ class Package(nn.Module):
         name_to_layer = nn.ModuleDict()
         self._name_to_customize = {}  # 存储每个Block是否是自定义实现
         
-        # 使用增强的维度推断引擎，集成lambda推断功能
-        self.dim_engine = BackboneDimensionInferenceEngine()
+        # 使用新的维度推断引擎
+        self.dim_engine = DimensionInferenceEngine()
         
         # 保留兼容性的旧字段
         self._name_to_output_dim = {}  # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
@@ -235,6 +248,11 @@ class Package(nn.Module):
                         wide_init_fn=self._wide_init_fn
                     )
                     if layer == "input_layer":
+                        # 拿到input_layer的配置
+                        config_input_layer = block.input_layer
+                        print(f"config_input_layer: {config_input_layer}")
+                        # 使用EnhancedEmbeddingGroup，支持更多功能
+                        
                         # 使用改进的维度推断引擎，支持batch_size估算
                         dim_info = create_dimension_info_from_embedding(
                             input_fn, group, batch_size=None  # 可以在实际使用时传入batch_size
@@ -329,12 +347,19 @@ class Package(nn.Module):
                     layer_obj = self._name_to_layer[block.name]
                     self.dim_engine.register_layer(block.name, layer_obj)
                     
-                    # 验证维度兼容性
-                    if not self.dim_engine.validate_dimension_compatibility(layer_obj, merged_input_dim):
-                        logging.warning(f"Dimension compatibility check failed for block {block.name}")
+                    # Lambda层需要特殊处理维度推断
+                    if isinstance(layer_obj, LambdaWrapper):
+                        # 使用LambdaWrapper的infer_output_dim方法
+                        output_dim_info = layer_obj.infer_output_dim(merged_input_dim)
+                        logging.info(f"Lambda layer {block.name} inferred output dim: {output_dim_info}")
+                    else:
+                        # 验证维度兼容性
+                        if not self.dim_engine.validate_dimension_compatibility(layer_obj, merged_input_dim):
+                            logging.warning(f"Dimension compatibility check failed for block {block.name}")
+                        
+                        # 推断输出维度 - 使用改进的方法
+                        output_dim_info = self.dim_engine.infer_layer_output_dim(layer_obj, merged_input_dim)
                     
-                    # 推断输出维度 - 使用改进的方法
-                    output_dim_info = self.dim_engine.infer_layer_output_dim(layer_obj, merged_input_dim)
                     self.dim_engine.register_output_dim(block.name, output_dim_info)
                     
                     # 保留兼容性
@@ -411,10 +436,12 @@ class Package(nn.Module):
     def output_block_dims(self):
         """返回最终输出 block 的维度组成的 list，比如 [160, 96]"""
         blocks = self.get_output_block_names()
+        # import pdb; pdb.set_trace()
         dims = []
         for block in blocks:
             # 优先使用新的维度推断引擎
             dim_info = self.dim_engine.get_output_dim(block)
+            print(f"Output block `{block}` dimension info: {dim_info}")
             if dim_info is not None:
                 dims.append(dim_info.get_feature_dim())
             elif block in self._name_to_output_dim:
@@ -460,6 +487,11 @@ class Package(nn.Module):
                 name_i = "%s_%d" % (name, i)
                 layer_obj = self.load_torch_layer(keras_layer, name_i, reuse)
                 self._name_to_layer[name_i] = layer_obj
+        elif layer == "lambda":
+            expression = getattr(layer_cnf, "lambda").expression
+            lambda_layer = LambdaWrapper(expression, name=name)
+            self._name_to_layer[name] = lambda_layer
+            self._name_to_customize[name] = True
 
     # 用于动态加载  层并根据配置初始化
     def load_torch_layer(self, layer_conf, name, reuse=None, input_dim=None):
@@ -485,14 +517,6 @@ class Package(nn.Module):
             try:
                 # 使用标准库 inspect.signature 获取构造函数的签名
                 sig = inspect.signature(layer_cls.__init__)
-                # 如果 自定义module没显式写__init__，则会继承自nn.Module，它的__init__签名其实为：def __init__(self, *args, **kwargs):
-                # params_without_self = [
-                #     p for p in list(sig.parameters.values())[1:]  # skip self
-                #     if p.default is inspect.Parameter.empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-                # ]
-                # only_self = len(list(sig.parameters.values())) == 1  # 只包含 self
-                # 检查构造函数参数中是否包含 'reuse'
-                # has_reuse = "reuse" in sig.parameters.keys()
                 has_reuse = "reuse" in inspect.signature(layer_cls.__init__).parameters
             except Exception as e:
                 # 如果出现异常，记录警告信息
@@ -535,7 +559,7 @@ class Package(nn.Module):
         elif param_type is None:  # internal keras layer 内置 nn.module
             layer = layer_cls(name=name)
             return layer, customize
-        else:
+        else: # st_params 参数
             assert param_type == "st_params", (
                 "internal keras layer only support st_params"
             )
@@ -628,7 +652,6 @@ class Package(nn.Module):
                 input_feature = fn(input_feature)
                 # 需要重新计算input_dim
 
-
             inputs.append(input_feature)
 
         # 合并输入
@@ -705,6 +728,9 @@ class Package(nn.Module):
                 # block_outputs[block] = input_fn(input_config) # embedding group 没有is training 参数
                 if batch is not None:
                     block_outputs[block] = input_fn(batch)[block] # input_fn(batch) 是 tensor dict
+                    print("111111111")
+                    # print('input_fn', input_fn)
+                    print(f"block_outputs[{block}] shape: {block_outputs[block].shape}")
                 else:
                     block_outputs[block] = input_fn(input_config)[block]
                 # 变成 feature_dict
@@ -763,10 +789,21 @@ class Package(nn.Module):
 
         for output in getattr(self._config, "concat_blocks", []):
             if output in block_outputs:
+                print(f"Adding output block: {output} with shape {block_outputs[output].shape}")
                 outputs.append(block_outputs[output])
             else:
                 raise ValueError("No output `%s` of backbone to be concat" % output)
+
         try:
+            print(f"Number of outputs to merge: {len(outputs)}")
+            # 打印每个output的shape
+            for i, out in enumerate(outputs):
+                if isinstance(out, torch.Tensor):
+                    print(f"Output {i} shape: {out.shape}")
+                elif isinstance(out, (list, tuple)):
+                    print(f"Output {i} is a list/tuple with {len(out)} elements.")
+                else:
+                    print(f"Output {i} is of type {type(out)}")
             # merge_inputs需自定义为torch的concatenate等
             output = merge_inputs(outputs, msg="backbone")
         except Exception as e:
@@ -802,6 +839,16 @@ class Package(nn.Module):
         layer_name = config.WhichOneof("layer")
         if layer_name == "module":
             return self.call_keras_layer(inputs, name, **kwargs)
+        elif layer_name == "lambda":
+            # 优先使用注册的LambdaWrapper，如果存在的话
+            if name in self._name_to_layer and isinstance(self._name_to_layer[name], LambdaWrapper):
+                lambda_wrapper = self._name_to_layer[name]
+                return lambda_wrapper(inputs)
+            else:
+                # fallback到直接执行lambda表达式
+                conf = getattr(config, "lambda")
+                fn = eval(conf.expression)
+                return fn(inputs)
         raise NotImplementedError("Unsupported backbone layer:" + layer_name)
 
 
@@ -835,29 +882,51 @@ class Backbone(nn.Module):
                 pkg, features, embedding_group, input_layer, l2_reg
             )  # Package是一个子DAG
 
+        # 初始化 top_mlp 目前top_mlp也会改变输出维度，暂未修复
+        self._top_mlp = None
+        if self._config.HasField("top_mlp"):
+            params = Parameter.make_from_pb(self._config.top_mlp)
+            params.l2_regularizer = self._l2_reg
+            
+            # 从main_pkg获取总输出维度
+            total_output_dim = self._main_pkg.total_output_dim()
+            
+            kwargs = config_to_kwargs(params)
+            self._top_mlp = MLP(in_features=total_output_dim, **kwargs)
+
     def forward(self, is_training, batch=None, **kwargs):
         # output = self._main_pkg(is_training, group_features, batch, **kwargs)
         output = self._main_pkg(is_training, batch, **kwargs)
 
-        if self._config.HasField("top_mlp"):
-            params = Parameter.make_from_pb(self._config.top_mlp)
-            params.l2_regularizer = self._l2_reg
-
-            # 【修改点】自动推断 in_features
+        if hasattr(self, '_top_mlp') and self._top_mlp is not None:
             if isinstance(output, (list, tuple)):
                 output = torch.cat(output, dim=-1)
-            # output 现在是 Tensor
-            in_features = output.shape[
-                -1
-            ]  # 假设 output.shape 是 (batch_size, feature_dim)
-            kwargs = config_to_kwargs(params)
-            final_mlp = MLP(
-                in_features=in_features, **kwargs
-            )  # 也不知道 in_features是多少
-            if isinstance(output, (list, tuple)):
-                output = torch.cat(output, dim=-1)
-            output = final_mlp(output, training=is_training, **kwargs)
+            output = self._top_mlp(output)
         return output
+
+    def get_final_output_dim(self):
+        """获取最终输出维度，考虑top_mlp的影响"""
+        if hasattr(self, '_top_mlp') and self._top_mlp is not None:
+            # 如果有top_mlp，返回top_mlp的输出维度
+            if hasattr(self._top_mlp, 'output_dim'):
+                return self._top_mlp.output_dim()
+            elif hasattr(self._top_mlp, 'hidden_units') and self._top_mlp.hidden_units:
+                # 返回最后一层的hidden_units
+                return self._top_mlp.hidden_units[-1]
+            else:
+                # 尝试从MLP的mlp模块列表中获取最后一层的输出维度
+                if hasattr(self._top_mlp, 'mlp') and len(self._top_mlp.mlp) > 0:
+                    last_layer = self._top_mlp.mlp[-1]
+                    if hasattr(last_layer, 'perceptron'):
+                        # 获取最后一个Perceptron的线性层输出维度
+                        linear_layers = [module for module in last_layer.perceptron if isinstance(module, nn.Linear)]
+                        if linear_layers:
+                            return linear_layers[-1].out_features
+                    elif isinstance(last_layer, nn.Linear):
+                        return last_layer.out_features
+        
+        # 如果没有top_mlp，返回main_pkg的输出维度
+        return self._main_pkg.total_output_dim()
 
     @classmethod
     def wide_embed_dim(cls, config):
@@ -906,6 +975,9 @@ def merge_inputs(inputs, axis=-1, msg=""):
 
     if axis != -1:
         logging.info("concat inputs %s axis=%d" % (msg, axis))
+    # import pdb
+    # pdb.set_trace()
+    for i, x in enumerate(inputs): print(f"fzcccccc{i}: {x.shape}")
     return torch.cat(inputs, dim=axis)
 
 

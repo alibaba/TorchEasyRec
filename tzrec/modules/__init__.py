@@ -10,5 +10,6 @@
 # limitations under the License.
 
 from .mlp import MLP
-from .backbone_module import Add
-__all__ = ["MLP","Add"]
+from .backbone_module import Add,FM
+# from .fm import FactorizationMachine as FM
+__all__ = ["MLP","Add","FM"]

@@ -235,3 +235,8 @@ message HSTU {
     // output postprocessor
     required GROutputPostprocessor output_postprocessor = 6;
 }
+
+message FM {
+    optional bool use_variant = 1;
+    optional float l2_regularization = 5 [default = 1e-4];
+}

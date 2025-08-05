@@ -42,8 +42,8 @@ class RankBackbone(RankModel):
         self._l2_reg = None
         self._backbone_net = self.build_backbone_network()
         
-        # output_dims = self._backbone_net._main_pkg.output_block_dims()
-        output_dims = self._backbone_net._main_pkg.total_output_dim()
+        # 使用backbone的最终输出维度，考虑top_mlp的影响
+        output_dims = self._backbone_net.get_final_output_dim()
         # 如果有多个 package（如 Package.__packages 里），如何Í拿到output_dims，暂未实现
         # for pkg_name, pkg in Package._Package__packages.items():
         #     print(f"Package: {pkg_name}")
