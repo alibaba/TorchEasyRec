@@ -14,9 +14,14 @@
 # thanks to their public work.
 
 import torch
+from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
-from tzrec.ops.triton.triton_addmm import triton_addmm
+
+if has_triton():
+    from tzrec.ops.triton.triton_addmm import triton_addmm
+else:
+    triton_addmm = torch.addmm
 
 
 def addmm(

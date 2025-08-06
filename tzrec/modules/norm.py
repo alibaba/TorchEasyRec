@@ -15,12 +15,7 @@ from typing import List
 import torch
 
 from tzrec.modules.utils import BaseModule
-from tzrec.ops import Kernel
-from tzrec.ops.layer_norm import (
-    layer_norm,
-    swish_layer_norm,
-)
-from tzrec.ops.triton.triton_layer_norm import triton_rms_norm
+from tzrec.ops.layer_norm import layer_norm, rms_norm, swish_layer_norm
 
 
 class LayerNorm(BaseModule):
@@ -41,10 +36,10 @@ class LayerNorm(BaseModule):
         super().__init__(is_inference=is_inference)
         self._normalized_shape: List[int] = [dim]
         self._eps = eps
-        self._weight = torch.nn.Parameter(
+        self.weight = torch.nn.Parameter(
             torch.ones(self._normalized_shape),
         )
-        self._bias = torch.nn.Parameter(
+        self.bias = torch.nn.Parameter(
             torch.zeros(self._normalized_shape),
         )
 
@@ -52,8 +47,8 @@ class LayerNorm(BaseModule):
         """Forward the module."""
         return layer_norm(
             x=x,
-            weight=self._weight,
-            bias=self._bias,
+            weight=self.weight,
+            bias=self.bias,
             eps=self._eps,
             kernel=self.kernel(),
         )
@@ -76,18 +71,11 @@ class RMSNorm(BaseModule):
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._eps = eps
-        self._weight = torch.nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self._eps)
+        self.weight = torch.nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward the module."""
-        if self.kernel() == Kernel.TRITON:
-            return triton_rms_norm(x, self._weight, self._eps)
-        else:
-            output = self._norm(x.float()).type_as(x)
-            return output * self._weight
+        return rms_norm(x=x, weight=self.weight, eps=self._eps, kernel=self.kernel())
 
 
 class SwishLayerNorm(BaseModule):
@@ -107,8 +95,8 @@ class SwishLayerNorm(BaseModule):
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._normalized_shape: List[int] = [dim]
-        self._weight = torch.nn.Parameter(torch.ones(self._normalized_shape))
-        self._bias = torch.nn.Parameter(torch.zeros(self._normalized_shape))
+        self.weight = torch.nn.Parameter(torch.ones(self._normalized_shape))
+        self.bias = torch.nn.Parameter(torch.zeros(self._normalized_shape))
         self._eps = eps
 
     def forward(
@@ -118,8 +106,8 @@ class SwishLayerNorm(BaseModule):
         """Forward the module."""
         return swish_layer_norm(
             x=x,
-            weight=self._weight,
-            bias=self._bias,
+            weight=self.weight,
+            bias=self.bias,
             eps=self._eps,
             kernel=self.kernel(),
         )

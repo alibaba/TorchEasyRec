@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
+from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
 from tzrec.ops.pytorch.pt_jagged_tensors import (
@@ -26,14 +27,20 @@ from tzrec.ops.pytorch.pt_jagged_tensors import (
     pytorch_jagged_dense_bmm_broadcast_add,
     pytorch_split_2D_jagged,
 )
-from tzrec.ops.triton.triton_jagged_tensors import (
-    triton_concat_2D_jagged,
-    triton_jagged_dense_bmm_broadcast_add,
-    triton_split_2D_jagged,
-)
 
-torch.fx.wrap("triton_concat_2D_jagged")
-torch.fx.wrap("triton_split_2D_jagged")
+if has_triton():
+    from tzrec.ops.triton.triton_jagged_tensors import (
+        triton_concat_2D_jagged,
+        triton_jagged_dense_bmm_broadcast_add,
+        triton_split_2D_jagged,
+    )
+
+    torch.fx.wrap("triton_concat_2D_jagged")
+    torch.fx.wrap("triton_split_2D_jagged")
+else:
+    triton_concat_2D_jagged = pytorch_concat_2D_jagged
+    triton_jagged_dense_bmm_broadcast_add = pytorch_jagged_dense_bmm_broadcast_add
+    pytorch_split_2D_jagged = pytorch_split_2D_jagged
 
 
 def concat_2D_jagged(
