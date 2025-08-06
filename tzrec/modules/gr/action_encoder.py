@@ -74,7 +74,7 @@ class ActionEncoder(BaseModule):
             ),
         )
         self._target_action_embedding_table: torch.nn.Parameter = torch.nn.Parameter(
-            torch.empty((self._num_action_types, action_embedding_dim)).normal_(
+            torch.empty((1, self._num_action_types * action_embedding_dim)).normal_(
                 mean=0, std=0.1
             ),
         )

@@ -675,6 +675,7 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
 
 @torch.fx.wrap
 def triton_concat_2D_jagged(
+    max_seq_len: int,
     values_left: torch.Tensor,
     values_right: torch.Tensor,
     max_len_left: Optional[int],
@@ -684,6 +685,7 @@ def triton_concat_2D_jagged(
     n_prefix_from_right: int = 0,
 ) -> torch.Tensor:
     return _Concat2DJaggedFunction.apply(
+        max_seq_len,
         values_left,
         values_right,
         max_len_left,
