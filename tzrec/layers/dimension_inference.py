@@ -182,6 +182,55 @@ class DimensionInferenceEngine:
                 output_dim = layer.out_features
                 return DimensionInfo(output_dim, feature_dim=output_dim)
         
+        elif layer_type == "DIN":
+            # DIN模块的输出维度推断
+            if hasattr(layer, '_sequence_dim') and layer._sequence_dim is not None:
+                # 如果已经初始化，直接返回sequence_dim
+                output_dim = layer._sequence_dim
+                return DimensionInfo(output_dim, feature_dim=output_dim)
+            else:
+                # 未初始化时，尝试从输入维度推断
+                if isinstance(input_dim, DimensionInfo):
+                    # 假设输入是[sequence_features, query_features]的concat
+                    # 输出维度等于sequence_dim，通常是输入维度的一半
+                    total_dim = input_dim.get_feature_dim()
+                    if total_dim > 0:
+                        sequence_dim = total_dim // 2  # 简化假设
+                        logging.info(f"DIN output dimension inferred as {sequence_dim} (half of input {total_dim})")
+                        return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
+                
+                # 如果无法推断，返回输入维度
+                logging.warning("Cannot infer DIN output dimension, using input dimension")
+                return input_dim
+        
+        elif layer_type == "DINEncoder":
+            # DINEncoder的输出维度推断
+            if hasattr(layer, '_sequence_dim') and layer._sequence_dim is not None:
+                # 如果已经初始化，直接返回sequence_dim
+                output_dim = layer._sequence_dim
+                return DimensionInfo(output_dim, feature_dim=output_dim)
+            elif hasattr(layer, 'output_dim') and callable(getattr(layer, 'output_dim')):
+                # 使用DINEncoder的output_dim方法
+                try:
+                    output_dim = layer.output_dim()
+                    return DimensionInfo(output_dim, feature_dim=output_dim)
+                except:
+                    pass
+            
+            # 如果无法从layer获取，从输入推断
+            if isinstance(input_dim, DimensionInfo):
+                total_dim = input_dim.get_feature_dim()
+                if total_dim > 0:
+                    # DINEncoder的输出维度通常等于sequence_dim
+                    # 如果无法明确确定，假设为输入维度的一半
+                    sequence_dim = total_dim // 2
+                    logging.info(f"DINEncoder output dimension inferred as {sequence_dim}")
+                    return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
+            
+            # 如果无法推断，返回输入维度
+            logging.warning("Cannot infer DINEncoder output dimension, using input dimension")
+            return input_dim
+        
         elif layer_type in ["BatchNorm1d", "LayerNorm", "Dropout", "ReLU", "GELU", "Tanh"]:
             # 这些层不改变维度
             return input_dim
@@ -581,6 +630,80 @@ def create_dimension_info_from_layer_output(layer: nn.Module, input_dim_info: Di
                 shape=output_shape,
                 feature_dim=output_dim
             )
+    
+    # DIN层的处理
+    elif layer_type == "DIN":
+        if hasattr(layer, '_sequence_dim') and layer._sequence_dim is not None:
+            # 已初始化的DIN，直接使用sequence_dim
+            output_dim = layer._sequence_dim
+        else:
+            # 未初始化的DIN，从输入维度推断
+            # DIN通常接收[sequence_features, query_features]的concatenation
+            # 输出维度等于sequence_dim
+            total_dim = input_dim_info.get_feature_dim()
+            if total_dim > 0:
+                # 假设sequence_dim = total_dim / 2 (简化处理)
+                # 实际项目中应该从feature group配置获取更准确的维度信息
+                output_dim = total_dim // 2
+                logging.info(f"DIN output dimension inferred as {output_dim} from input {total_dim}")
+            else:
+                output_dim = input_dim_info.get_feature_dim()
+                logging.warning(f"Cannot infer DIN sequence dimension, using input dim: {output_dim}")
+        
+        # 估算输出shape
+        input_shape = input_dim_info.shape
+        if input_shape is not None:
+            output_shape = input_shape[:-1] + (output_dim,)
+        else:
+            output_shape = input_dim_info.estimate_shape()
+            if output_shape:
+                output_shape = output_shape[:-1] + (output_dim,)
+            else:
+                output_shape = None
+        
+        return DimensionInfo(
+            dim=output_dim,
+            shape=output_shape,
+            feature_dim=output_dim
+        )
+    
+    # DINEncoder层的处理
+    elif layer_type == "DINEncoder":
+        if hasattr(layer, '_sequence_dim') and layer._sequence_dim is not None:
+            # 已初始化的DINEncoder，直接使用sequence_dim
+            output_dim = layer._sequence_dim
+        elif hasattr(layer, 'output_dim') and callable(getattr(layer, 'output_dim')):
+            # 使用DINEncoder的output_dim方法
+            try:
+                output_dim = layer.output_dim()
+            except:
+                output_dim = input_dim_info.get_feature_dim()
+        else:
+            # 未初始化的DINEncoder，使用sequence_dim（如果有的话）
+            if hasattr(layer, 'sequence_dim'):
+                output_dim = layer.sequence_dim
+            else:
+                # 从输入维度推断
+                total_dim = input_dim_info.get_feature_dim()
+                output_dim = total_dim // 2 if total_dim > 0 else total_dim
+                logging.info(f"DINEncoder output dimension inferred as {output_dim}")
+        
+        # 估算输出shape
+        input_shape = input_dim_info.shape
+        if input_shape is not None:
+            output_shape = input_shape[:-1] + (output_dim,)
+        else:
+            output_shape = input_dim_info.estimate_shape()
+            if output_shape:
+                output_shape = output_shape[:-1] + (output_dim,)
+            else:
+                output_shape = None
+        
+        return DimensionInfo(
+            dim=output_dim,
+            shape=output_shape,
+            feature_dim=output_dim
+        )
     
     # 其他情况回退到通用方法
     engine = DimensionInferenceEngine()

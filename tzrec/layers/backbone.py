@@ -35,7 +35,7 @@ from tzrec.modules.embedding import EmbeddingGroup
 
 
 class LambdaWrapper(nn.Module):
-    """Lambda表达式包装器，用于维度推断和执行"""
+    """Lambda expression wrapper for dimension inference and execution."""
     
     def __init__(self, expression: str, name: str = "lambda_wrapper"):
         super().__init__()
@@ -45,9 +45,9 @@ class LambdaWrapper(nn.Module):
         self._compile_function()
     
     def _compile_function(self):
-        """编译lambda函数"""
+        """Compiling Lambda Functions"""
         try:
-            # 创建安全的执行环境
+            # Creating a secure execution environment
             safe_globals = {
                 'torch': torch,
                 '__builtins__': {},
@@ -66,13 +66,13 @@ class LambdaWrapper(nn.Module):
             raise
     
     def forward(self, x):
-        """执行lambda表达式"""
+        """Executing lambda expressions"""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
         return self._lambda_fn(x)
     
     def infer_output_dim(self, input_dim_info: DimensionInfo) -> DimensionInfo:
-        """使用LambdaOutputDimInferrer推断输出维度"""
+        """Inferring output dims using LambdaOutputDimInferrer."""
         try:
             inferrer = LambdaOutputDimInferrer(safe_mode=True)
             output_dim_info = inferrer.infer_output_dim(input_dim_info, self.expression)
@@ -118,12 +118,11 @@ class Package(nn.Module):
         self._input_layer = input_layer
         self._l2_reg = l2_reg
         self._dag = DAG()
-        # 构建有向图
+        # build DAG
         self.G = nx.DiGraph()
         self._name_to_blocks = {}
 
-        self._name_to_layer = nn.ModuleDict()  # 存储每个Block name 对应的Layer
-        name_to_layer = nn.ModuleDict()
+        self._name_to_layer = nn.ModuleDict()  # Layer corresponding to each Block name
         self._name_to_customize = {}  # 存储每个Block是否是自定义实现
         
         # 使用新的维度推断引擎
@@ -526,6 +525,7 @@ class Package(nn.Module):
                 raise NotImplementedError
             else:
                 kwargs = config_to_kwargs(params)
+                
                 # 检查是否需要自动推断 in_features 或 input_dim【改进版本】
                 if "in_features" in sig.parameters or "input_dim" in sig.parameters:
                     if "in_features" not in kwargs and "input_dim" not in kwargs:
@@ -552,6 +552,36 @@ class Package(nn.Module):
                                 f"{layer_cls.__name__} 需要 in_features 或 input_dim, "
                                 "但参数未给定，且无法自动推断。请检查维度推断配置。"
                             )
+                
+                # 【新增】通用的sequence_dim和query_dim自动推断
+                sequence_dim_missing = "sequence_dim" in sig.parameters and "sequence_dim" not in kwargs
+                query_dim_missing = "query_dim" in sig.parameters and "query_dim" not in kwargs
+                
+                if sequence_dim_missing or query_dim_missing:
+                    # Get the input information of the current block
+                    block_config = self._name_to_blocks[name]
+                    input_dims = self._infer_sequence_query_dimensions(block_config, name)
+                    
+                    if input_dims:
+                        sequence_dim, query_dim = input_dims
+                        if sequence_dim_missing:
+                            kwargs["sequence_dim"] = sequence_dim
+                        if query_dim_missing:
+                            kwargs["query_dim"] = query_dim
+                        logging.info(f"Auto-inferred dimensions for {layer_cls.__name__} {name}: "
+                                   f"sequence_dim={sequence_dim if sequence_dim_missing else 'provided'}, "
+                                   f"query_dim={query_dim if query_dim_missing else 'provided'}")
+                    else:
+                        missing_params = []
+                        if sequence_dim_missing:
+                            missing_params.append("sequence_dim")
+                        if query_dim_missing:
+                            missing_params.append("query_dim")
+                        raise ValueError(
+                            f"无法为 {layer_cls.__name__} {name} 自动推断 {', '.join(missing_params)}。"
+                            "请确保配置了正确的输入 feature groups 或手动指定这些参数。"
+                        )
+                
                 layer = layer_cls(
                     **kwargs
                 )  # 比如layer_cls是MLP,现在不知道in_features是多少
@@ -582,6 +612,84 @@ class Package(nn.Module):
     def reset_input_config(self, config):
         self.input_config = config
 
+    def _infer_sequence_query_dimensions(self, block_config, block_name):
+        """Inference module sequence_dim and query_dim
+        
+        适用于任何需要序列和查询维度的模块（如DINEncoder等）
+        
+        Args:
+            block_config: Block的配置信息
+            block_name: Block的名称
+            
+        Returns:
+            tuple: (sequence_dim, query_dim) 或 None 如果推断失败
+        """
+        try:
+            sequence_dim = None
+            query_dim = None
+            
+            # 分析输入，根据feature_group_name推断维度
+            for input_node in block_config.inputs:
+                input_type = input_node.WhichOneof("name")
+                input_name = getattr(input_node, input_type)
+                
+                # 只处理feature_group_name类型的输入
+                if input_type == "feature_group_name":
+                    group_name = input_name
+                    
+                    # 尝试获取.sequence和.query子组的维度
+                    try:
+                        sequence_group_name = f"{group_name}.sequence"
+                        query_group_name = f"{group_name}.query"
+                        # 检查是否存在这些子组
+                        if hasattr(self._name_to_layer[group_name], 'group_total_dim'):
+                            try:
+                                test_seq_dim = self._name_to_layer[group_name].group_total_dim(sequence_group_name)
+                                test_query_dim = self._name_to_layer[group_name].group_total_dim(query_group_name)
+                                
+                                # 如果能成功获取维度，说明这是正确的格式
+                                sequence_dim = test_seq_dim
+                                query_dim = test_query_dim
+                                
+                                logging.info(f"Auto-inferred dimensions from {group_name}: "
+                                           f"sequence_dim={sequence_dim} (from {sequence_group_name}), "
+                                           f"query_dim={query_dim} (from {query_group_name})")
+                                
+                                return sequence_dim, query_dim
+                                
+                            except Exception:
+                                # 如果无法获取子组维度，继续尝试其他方式
+                                logging.debug(f"Could not get .sequence/.query dimensions for {group_name}")
+                                continue
+                    except Exception as e:
+                        logging.debug(f"Error accessing embedding group dimensions: {e}")
+                        continue
+                
+                elif input_type == "block_name":
+                    # 从其他block获取维度作为fallback
+                    dim_info = self.dim_engine.get_output_dim(input_name)
+                    if dim_info is not None:
+                        dim = dim_info.get_feature_dim()
+                        # 如果还没有找到sequence_dim，使用这个作为sequence_dim
+                        if sequence_dim is None:
+                            sequence_dim = dim
+                            logging.info(f"Using block {input_name} output as sequence with dim {dim}")
+                        # 如果还没有找到query_dim，使用这个作为query_dim
+                        elif query_dim is None:
+                            query_dim = dim
+                            logging.info(f"Using block {input_name} output as query with dim {dim}")
+            
+            if sequence_dim is not None and query_dim is not None:
+                return sequence_dim, query_dim
+            else:
+                logging.warning(f"Could not infer sequence/query dimensions for {block_name}: "
+                              f"sequence_dim={sequence_dim}, query_dim={query_dim}")
+                return None
+                
+        except Exception as e:
+            logging.error(f"Error inferring sequence/query dimensions for {block_name}: {e}")
+            return None
+
     def set_package_input(self, pkg_input):
         self._package_input = pkg_input
 
@@ -593,7 +701,7 @@ class Package(nn.Module):
 
     def block_input(self, config, block_outputs, training=None, **kwargs):
         inputs = []
-        # 遍历 config.inputs 配置的每个输入节点
+        # Traverse each input node configured by config.inputs
         for input_node in config.inputs:
             input_type = input_node.WhichOneof("name")  # 'feature_group_name'
             input_name = getattr(input_node, input_type)  # example 'item'
@@ -727,12 +835,24 @@ class Package(nn.Module):
                 # block_outputs[block] = input_fn(input_config, is_training)
                 # block_outputs[block] = input_fn(input_config) # embedding group 没有is training 参数
                 if batch is not None:
-                    block_outputs[block] = input_fn(batch)[block] # input_fn(batch) 是 tensor dict
+                    embedding_outputs = input_fn(batch)  # input_fn(batch) 是 tensor dict
+                    if isinstance(embedding_outputs, dict) and block in embedding_outputs:
+                        block_outputs[block] = embedding_outputs[block]
+                    else:
+                        # 如果返回的不是字典或没有对应的key，直接使用整个输出
+                        block_outputs[block] = embedding_outputs
                     print("111111111")
                     # print('input_fn', input_fn)
-                    print(f"block_outputs[{block}] shape: {block_outputs[block].shape}")
+                    if isinstance(block_outputs[block], torch.Tensor):
+                        print(f"block_outputs[{block}] shape: {block_outputs[block].shape}")
+                    else:
+                        print(f"block_outputs[{block}] type: {type(block_outputs[block])}")
                 else:
-                    block_outputs[block] = input_fn(input_config)[block]
+                    embedding_outputs = input_fn(input_config)
+                    if isinstance(embedding_outputs, dict) and block in embedding_outputs:
+                        block_outputs[block] = embedding_outputs[block]
+                    else:
+                        block_outputs[block] = embedding_outputs
                 # 变成 feature_dict
     #             {'user': tensor([[ 9.1805e-04, -6.2097e-04, -8.3887e-04,  ..., -2.2219e-01,
     #       2.0671e-01,  1.3043e-01],
@@ -811,28 +931,142 @@ class Package(nn.Module):
             raise e
         return output
 
+    def _determine_input_format(self, layer_obj, inputs):
+        """智能判断模块需要的输入格式
+        
+        Args:
+            layer_obj: 要调用的层对象
+            inputs: 输入数据（可能是tensor dict或单个tensor）
+            
+        Returns:
+            适合该层的输入格式
+        """
+        try:
+            # 检查layer的forward方法签名
+            if hasattr(layer_obj, 'forward'):
+                sig = inspect.signature(layer_obj.forward)
+                params = list(sig.parameters.keys())
+                
+                # 排除self参数
+                if 'self' in params:
+                    params.remove('self')
+                
+                # 如果forward方法有多个参数，可能需要字典输入
+                if len(params) > 1:
+                    logging.debug(f"Layer {layer_obj.__class__.__name__} has multiple forward parameters: {params}")
+                    # 检查是否有特定的参数名暗示需要字典输入
+                    dict_indicators = ['grouped_features', 'feature_dict', 'inputs_dict', 'batch']
+                    if any(indicator in params for indicator in dict_indicators):
+                        logging.info(f"Layer {layer_obj.__class__.__name__} likely needs dict input")
+                        return inputs  # 返回原始字典格式
+                
+                # 检查是否是序列相关的模块
+                class_name = layer_obj.__class__.__name__
+                sequence_modules = ['DINEncoder', 'AttentionLayer', 'SequenceLayer', 'DIN']
+                if any(seq_name in class_name for seq_name in sequence_modules):
+                    logging.info(f"Layer {class_name} is a sequence module, using dict input")
+                    return inputs  # 序列模块通常需要字典输入
+                
+                # 检查模块是否有特定的属性暗示需要字典输入
+                dict_attributes = ['sequence_dim', 'query_dim', 'attention']
+                if any(hasattr(layer_obj, attr) for attr in dict_attributes):
+                    logging.info(f"Layer {class_name} has sequence attributes, using dict input")
+                    return inputs
+                
+                # 默认情况：如果inputs是字典且只有一个值，提取该值
+                if isinstance(inputs, dict):
+                    if len(inputs) == 1:
+                        single_key = list(inputs.keys())[0]
+                        single_value = inputs[single_key]
+                        logging.debug(f"Extracting single tensor from dict for {layer_obj.__class__.__name__}")
+                        return single_value
+                    else:
+                        # 多个值的情况，尝试拼接
+                        logging.debug(f"Multiple values in dict, trying to concatenate for {layer_obj.__class__.__name__}")
+                        tensor_list = list(inputs.values())
+                        if all(isinstance(t, torch.Tensor) for t in tensor_list):
+                            try:
+                                # 检查所有tensor是否有相同的维度数（除了最后一维）
+                                first_shape = tensor_list[0].shape
+                                batch_size = first_shape[0]
+                                
+                                # 如果维度数不同，尝试展平后拼接
+                                flattened_tensors = []
+                                for t in tensor_list:
+                                    if len(t.shape) != len(first_shape):
+                                        # 展平除了batch维度外的所有维度
+                                        flattened = t.view(batch_size, -1)
+                                        flattened_tensors.append(flattened)
+                                    else:
+                                        # 如果维度数相同但shape不同，也展平
+                                        if t.shape[:-1] != first_shape[:-1]:
+                                            flattened = t.view(batch_size, -1)
+                                            flattened_tensors.append(flattened)
+                                        else:
+                                            flattened_tensors.append(t)
+                                
+                                result = torch.cat(flattened_tensors, dim=-1)
+                                logging.debug(f"Successfully concatenated tensors, final shape: {result.shape}")
+                                return result
+                            except Exception as e:
+                                logging.debug(f"Failed to concatenate tensors: {e}, using first tensor")
+                                return tensor_list[0]
+                        else:
+                            return inputs  # 如果不能拼接，返回原字典            # 如果不是字典，直接返回
+            return inputs
+            
+        except Exception as e:
+            logging.warning(f"Error determining input format for {layer_obj.__class__.__name__}: {e}")
+            return inputs  # 出错时返回原始输入
+
     def call_keras_layer(self, inputs, name, **kwargs):
         """Call predefined torch Layer, which can be reused."""
         layer = self._name_to_layer[name]
         customize = self._name_to_customize.get(name, False)
         cls = layer.__class__.__name__
+        
+        # 智能判断输入格式
+        processed_inputs = self._determine_input_format(layer, inputs)
+        
         if customize:
             try:
                 # output = layer(inputs, training=training, **kwargs)
-                output = layer(inputs)
+                output = layer(processed_inputs)
+                logging.debug(f"Custom layer {name} ({cls}) called successfully with input type: {type(processed_inputs)}")
             except Exception as e:
                 msg = getattr(e, "message", str(e))
                 logging.error("call torch layer %s (%s) failed: %s" % (name, cls, msg))
-                raise e
+                # 尝试使用原始输入格式
+                if processed_inputs is not inputs:
+                    logging.info(f"Retrying {name} with original input format")
+                    try:
+                        output = layer(inputs)
+                        logging.info(f"Successfully called {name} with original input format")
+                    except Exception as e2:
+                        logging.error(f"Both input formats failed for {name}: {e2}")
+                        raise e
+                else:
+                    raise e
         else:
             try:
                 # output = layer(inputs, training=training)
-                output = layer(inputs)
+                output = layer(processed_inputs)
                 if cls == "BatchNormalization":
                     raise NotImplementedError
                     add_elements_to_collection(layer.updates, tf.GraphKeys.UPDATE_OPS)
             except TypeError:
-                output = layer(inputs)
+                output = layer(processed_inputs)
+            except Exception as e:
+                # 尝试使用原始输入格式
+                if processed_inputs is not inputs:
+                    logging.info(f"Retrying internal layer {name} with original input format")
+                    try:
+                        output = layer(inputs)
+                    except Exception as e2:
+                        logging.error(f"Both input formats failed for internal layer {name}: {e2}")
+                        raise e
+                else:
+                    raise e
         return output
 
     def call_layer(self, inputs, config, name, **kwargs):

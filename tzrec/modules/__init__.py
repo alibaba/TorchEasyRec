@@ -11,5 +11,6 @@
 
 from .mlp import MLP
 from .backbone_module import Add,FM
+from .sequence import DINEncoder as DIN
 # from .fm import FactorizationMachine as FM
-__all__ = ["MLP","Add","FM"]
+__all__ = ["MLP","Add","FM","DIN"]
