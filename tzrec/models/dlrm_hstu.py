@@ -33,9 +33,10 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_infer_max_len
+from tzrec.utils.fx_util import fx_infer_max_len, fx_int_item
 
 torch.fx.wrap(fx_infer_max_len)
+torch.fx.wrap(fx_int_item)
 
 
 @torch.fx.wrap
@@ -161,11 +162,11 @@ class DlrmHSTU(RankModel):
         max_uih_len: int,
         max_candidates: int,
         payload_features: Dict[str, torch.Tensor],
-        uid_seq_embeddings: OrderedDict[str, JaggedTensor],
+        uih_seq_embeddings: OrderedDict[str, JaggedTensor],
         contextual_seq_embeddings: OrderedDict[str, JaggedTensor],
         num_candidates: torch.Tensor,
     ) -> torch.Tensor:
-        source_lengths = uid_seq_embeddings[
+        source_lengths = uih_seq_embeddings[
             self._model_config.uih_id_feature_name
         ].lengths()
         source_timestamps = concat_2D_jagged(
@@ -174,7 +175,7 @@ class DlrmHSTU(RankModel):
                 self._model_config.uih_action_time_feature_name
             ],
             values_right=payload_features[
-                self._model_config.candidates_querytime_feature_name
+                self._model_config.candidates_query_time_feature_name
             ],
             max_len_left=max_uih_len,
             max_len_right=max_candidates,
@@ -182,13 +183,13 @@ class DlrmHSTU(RankModel):
             offsets_right=payload_features["candidate_offsets"],
             kernel=self.kernel(),
         ).squeeze(-1)
-        total_targets = int(num_candidates.sum().item())
+        total_targets = fx_int_item(num_candidates.sum())
         candidates_user_embeddings, _ = self._hstu_transducer(
             max_uih_len=max_uih_len,
             max_targets=max_candidates,
             total_uih_len=source_timestamps.numel() - total_targets,
             total_targets=total_targets,
-            seq_embeddings=uid_seq_embeddings[
+            seq_embeddings=uih_seq_embeddings[
                 self._model_config.uih_id_feature_name
             ].values(),
             seq_lengths=source_lengths,

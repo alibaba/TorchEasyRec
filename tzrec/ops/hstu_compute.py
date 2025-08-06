@@ -32,6 +32,12 @@ if has_triton():
     from tzrec.ops.triton.triton_hstu_linear import (
         triton_hstu_compute_output,
     )
+    from tzrec.ops.triton.triton_hstu_preprocess_and_attention import (
+        triton_hstu_preprocess_and_attention,
+    )
+
+    torch.fx.wrap("triton_hstu_compute_output")
+    torch.fx.wrap("triton_hstu_preprocess_and_attention")
 else:
     triton_hstu_compute_output = pytorch_hstu_compute_output
 
@@ -166,10 +172,6 @@ def hstu_preprocess_and_attention(
             "uvqk_weight.shape[1] must equal 2 * num_heads * (hidden_dim + attn_dim)",
         )
     if kernel == Kernel.TRITON and prefill is False:
-        from tzrec.ops.triton.triton_hstu_preprocess_and_attention import (
-            triton_hstu_preprocess_and_attention,
-        )
-
         u, attn_output = triton_hstu_preprocess_and_attention(
             x=x,
             norm_weight=norm_weight,

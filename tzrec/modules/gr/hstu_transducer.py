@@ -316,7 +316,6 @@ class HSTUTransducer(BaseModule):
             total_uih_len=total_uih_len,
             total_targets=total_targets,
             seq_lengths=seq_lengths,
-            seq_offsets=seq_offsets,
             seq_embeddings=encoded_embeddings,
             seq_timestamps=seq_timestamps,
             num_targets=num_targets,

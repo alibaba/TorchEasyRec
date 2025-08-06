@@ -28,14 +28,21 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model
+from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
 
 
 class DlrmHSTUTest(unittest.TestCase):
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH],
+            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH],
+            [TestGraphType.JIT_SCRIPT, torch.device("cpu"), Kernel.PYTORCH],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON],
+            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON],
+        ]
     )
-    def test_dlrm_hstu(self, graph_type) -> None:
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dlrm_hstu(self, graph_type, device, kernel) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -216,8 +223,9 @@ class DlrmHSTUTest(unittest.TestCase):
             features=features,
             labels=["item_action_weight", "item_target_watchtime"],
         )
-        dlrm_hstu.set_kernel(Kernel.PYTORCH)
-        init_parameters(dlrm_hstu, device=torch.device("cpu"))
+        dlrm_hstu.set_kernel(kernel)
+        init_parameters(dlrm_hstu, device=device)
+        dlrm_hstu.to(device)
         dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
@@ -248,7 +256,7 @@ class DlrmHSTUTest(unittest.TestCase):
             sequence_dense_features=sequence_dense_features,
             sparse_features={BASE_DATA_GROUP: sparse_feature},
             labels={},
-        )
+        ).to(device)
         if graph_type == TestGraphType.JIT_SCRIPT:
             predictions = dlrm_hstu(batch.to_dict())
         else:

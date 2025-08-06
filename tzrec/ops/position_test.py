@@ -265,7 +265,9 @@ class PositionEmbeddingsTest(unittest.TestCase):
         num_time_buckets = 1000
         timestamp_embeddings_weight = (
             torch.empty(
-                (num_time_buckets, D), dtype=torch.float32, device=torch.device("cuda")
+                (num_time_buckets + 1, D),
+                dtype=torch.float32,
+                device=torch.device("cuda"),
             )
             .uniform_(-1.0, 1.0)
             .requires_grad_()
