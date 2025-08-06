@@ -96,13 +96,18 @@ class HSTUTransducer(BaseModule):
 
     def _preprocess(
         self,
-        max_seq_len: int,
+        max_uih_len: int,
+        max_targets: int,
+        total_uih_len: int,
+        total_targets: int,
         seq_lengths: torch.Tensor,
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
     ) -> Tuple[
+        int,
+        int,
         int,
         torch.Tensor,
         torch.Tensor,
@@ -115,13 +120,18 @@ class HSTUTransducer(BaseModule):
         with record_function("hstu_input_preprocessor"):
             (
                 output_max_seq_len,
+                output_total_uih_len,
+                output_total_targets,
                 output_seq_lengths,
                 output_seq_offsets,
                 output_seq_timestamps,
                 output_seq_embeddings,
                 output_num_targets,
             ) = self._input_preprocessor(
-                max_seq_len=max_seq_len,
+                max_uih_len=max_uih_len,
+                max_targets=max_targets,
+                total_uih_len=total_uih_len,
+                total_targets=total_targets,
                 seq_lengths=seq_lengths,
                 seq_timestamps=seq_timestamps,
                 seq_embeddings=seq_embeddings,
@@ -150,6 +160,8 @@ class HSTUTransducer(BaseModule):
 
         return (
             output_max_seq_len,
+            output_total_uih_len,
+            output_total_targets,
             output_seq_lengths,
             output_seq_offsets,
             output_seq_timestamps,
@@ -178,8 +190,9 @@ class HSTUTransducer(BaseModule):
     def _postprocess(
         self,
         max_seq_len: int,
+        total_uih_len: int,
+        total_targets: int,
         seq_lengths: torch.Tensor,
-        seq_offsets: torch.Tensor,
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
@@ -201,8 +214,11 @@ class HSTUTransducer(BaseModule):
             _, candidate_embeddings = split_2D_jagged(
                 values=seq_embeddings,
                 max_seq_len=max_seq_len,
+                total_len_left=total_uih_len,
+                total_len_right=total_targets,
                 offsets_left=uih_offsets,
                 offsets_right=candidates_offsets,
+                kernel=self.kernel(),
             )
             interleave_targets: bool = self._input_preprocessor.interleave_targets()
             if interleave_targets:
@@ -213,8 +229,11 @@ class HSTUTransducer(BaseModule):
                 _, candidate_timestamps = split_2D_jagged(
                     values=seq_timestamps.unsqueeze(-1),
                     max_seq_len=max_seq_len,
+                    total_len_left=total_uih_len,
+                    total_len_right=total_targets,
                     offsets_left=uih_offsets,
                     offsets_right=candidates_offsets,
+                    kernel=self.kernel(),
                 )
                 candidate_timestamps = candidate_timestamps.squeeze(-1)
                 if interleave_targets:
@@ -232,7 +251,10 @@ class HSTUTransducer(BaseModule):
 
     def forward(
         self,
-        max_seq_len: int,
+        max_uih_len: int,
+        max_targets: int,
+        total_uih_len: int,
+        total_targets: int,
         seq_lengths: torch.Tensor,
         seq_embeddings: torch.Tensor,
         seq_timestamps: torch.Tensor,
@@ -245,11 +267,14 @@ class HSTUTransducer(BaseModule):
         """Forward the module.
 
         Args:
-            max_seq_len (int): maximum sequence length.
+            max_uih_len (int): maximum user history sequence length.
+            max_targets (int): maximum candidates length.
+            total_uih_len (int): total user history sequence length.
+            total_targets (int): total candidates length.
             seq_lengths (torch.Tensor): input sequence lengths.
             seq_embeddings (torch.Tensor): input sequence embeddings.
             seq_timestamps (torch.Tensor): input sequence timestamps.
-            num_targets (int): number of targets.
+            num_targets (torch.Tensor): number of targets.
             seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
 
         Returns:
@@ -258,13 +283,18 @@ class HSTUTransducer(BaseModule):
         """
         (
             max_seq_len,
+            total_uih_len,
+            total_targets,
             seq_lengths,
             seq_offsets,
             seq_timestamps,
             seq_embeddings,
             num_targets,
         ) = self._preprocess(
-            max_seq_len=max_seq_len,
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
+            total_uih_len=total_uih_len,
+            total_targets=total_targets,
             seq_lengths=seq_lengths,
             seq_timestamps=seq_timestamps,
             seq_embeddings=seq_embeddings,
@@ -283,6 +313,8 @@ class HSTUTransducer(BaseModule):
 
         encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
             max_seq_len=max_seq_len,
+            total_uih_len=total_uih_len,
+            total_targets=total_targets,
             seq_lengths=seq_lengths,
             seq_offsets=seq_offsets,
             seq_embeddings=encoded_embeddings,

@@ -18,15 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tzrec.modules.utils import BaseModule
-from tzrec.utils.fx_util import fx_arange, fx_int_item
-
-torch.fx.wrap(fx_arange)
-torch.fx.wrap(fx_int_item)
-
-
-@torch.fx.wrap
-def _fx_mask_assign(x: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) -> None:
-    x[mask] = value
+from tzrec.ops.jagged_tensors import concat_2D_jagged
 
 
 class ActionEncoder(BaseModule):
@@ -94,20 +86,22 @@ class ActionEncoder(BaseModule):
 
     def forward(
         self,
-        max_seq_len: int,
-        seq_lengths: torch.Tensor,
-        seq_offsets: torch.Tensor,
+        max_uih_len: int,
+        max_targets: int,
+        uih_offsets: torch.Tensor,
+        target_offsets: torch.Tensor,
+        seq_embeddings: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
-        num_targets: torch.Tensor,
     ) -> torch.Tensor:
         """Forward the module.
 
         Args:
-            max_seq_len (int): maximum sequence length.
-            seq_lengths (torch.Tensor): input sequence lengths.
-            seq_offsets (torch.Tensor): input sequence offsets.
+            max_uih_len (int): maximum user history sequence length.
+            max_targets (int): maximum targets sequence length.
+            uih_offsets (torch.Tensor): input user history sequence offsets.
+            target_offsets (torch.Tensor): target sequence lengths.
+            seq_embeddings (torch.Tensor): input sequence embeddings.
             seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
-            num_targets (int): number of targets.
 
         Returns:
             torch.Tensor: output action embedding tensor.
@@ -129,27 +123,18 @@ class ActionEncoder(BaseModule):
             exploded_actions.unsqueeze(-1) * self._action_embedding_table.unsqueeze(0)
         ).view(-1, self._num_action_types * self._action_embedding_dim)
 
-        padded_action_embeddings = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=action_embeddings,
-            offsets=[seq_offsets],
-            max_lengths=[max_seq_len],
-            padding_value=0.0,
-        )
-        mask = fx_arange(max_seq_len, device=seq_offsets.device).view(1, max_seq_len)
-        mask = torch.logical_and(
-            mask >= (seq_lengths - num_targets).unsqueeze(1),
-            mask < seq_lengths.unsqueeze(1),
-        )
-        _fx_mask_assign(
-            padded_action_embeddings,
-            mask,
-            self._target_action_embedding_table.view(1, -1).tile(
-                fx_int_item(torch.sum(num_targets)),
+        total_targets: int = seq_embeddings.size(0) - action_embeddings.size(0)
+        action_embeddings = concat_2D_jagged(
+            max_seq_len=max_uih_len + max_targets,
+            values_left=action_embeddings,
+            values_right=self._target_action_embedding_table.tile(
+                total_targets,
                 1,
             ),
+            max_len_left=max_uih_len,
+            max_len_right=max_targets,
+            offsets_left=uih_offsets,
+            offsets_right=target_offsets,
+            kernel=self.kernel(),
         )
-        action_embeddings = torch.ops.fbgemm.dense_to_jagged(
-            dense=padded_action_embeddings,
-            x_offsets=[seq_offsets],
-        )[0]
         return action_embeddings
