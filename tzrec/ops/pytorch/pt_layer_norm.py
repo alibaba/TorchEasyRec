@@ -36,6 +36,20 @@ def pytorch_layer_norm(
     ).to(dtype)
 
 
+def pytorch_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    return (
+        x
+        * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        * weight.to(torch.float32)
+    ).to(dtype)
+
+
 def pytorch_swish_layer_norm(
     x: torch.Tensor,
     normalized_shape: List[int],

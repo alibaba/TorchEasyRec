@@ -13,7 +13,6 @@ import copy
 from typing import List
 
 import torch
-import triton
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
@@ -28,6 +27,8 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
 
 @torch.fx.wrap
 def prev_power_of_2(x: int) -> int:
+    import triton
+
     if torch.compiler.is_compiling():
         # Re-write to make Dynamo happy
         x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
