@@ -136,6 +136,6 @@
       "auc_is_click": 0.718
     },
     "threshold": 0.005,
-    "run_cnt": 5
+    "run_cnt": 3
   }
 }
