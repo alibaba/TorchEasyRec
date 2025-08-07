@@ -494,7 +494,7 @@ class Package(nn.Module):
 
     # 用于动态加载  层并根据配置初始化
     def load_torch_layer(self, layer_conf, name, reuse=None, input_dim=None):
-        # 修改这个函数，多加一个参数， customize 表示是否是自定义实现
+        # customize 表示是否是自定义实现
         layer_cls, customize = load_torch_layer(layer_conf.class_name)
         if layer_cls is None:
             raise ValueError("Invalid keras layer class name: " + layer_conf.class_name)
@@ -851,39 +851,6 @@ class Package(nn.Module):
                         block_outputs[block] = embedding_outputs[block]
                     else:
                         block_outputs[block] = embedding_outputs
-                # 变成 feature_dict
-    #             {'user': tensor([[ 9.1805e-04, -6.2097e-04, -8.3887e-04,  ..., -2.2219e-01,
-    #       2.0671e-01,  1.3043e-01],
-    #     [-4.1031e-04,  6.2237e-04,  8.3805e-04,  ..., -2.2219e-01,
-    #       2.0671e-01,  1.3043e-01],
-    #     [ 6.3215e-04,  6.1645e-05,  8.2621e-04,  ..., -2.2219e-01,
-    #       2.0671e-01,  1.3043e-01],
-    #     ...,
-    #     [ 4.9403e-04,  4.3865e-04, -1.7802e-04,  ...,  4.7140e-03,
-    #      -2.0951e-01,  1.6210e-01],
-    #     [-7.5025e-04,  8.3626e-04,  1.9763e-04,  ..., -2.2219e-01,
-    #       2.0671e-01,  1.3043e-01],
-    #     [-7.9191e-05,  5.5504e-05, -7.7013e-06,  ..., -2.2219e-01,
-    #       2.0671e-01,  1.3043e-01]], device='cuda:1',
-    #    grad_fn=<SplitWithSizesBackward0>), 'item': tensor([[ 8.3763e-04,  1.0169e-03,  3.5291e-04,  ..., -4.9626e-02,
-    #      -3.7418e-02,  8.3003e-03],
-    #     [-2.2792e-04, -7.1679e-04, -5.1453e-04,  ...,  6.7114e-02,
-    #       6.8413e-02, -8.0175e-02],
-    #     [ 2.0042e-04, -5.0292e-04, -6.8261e-04,  ..., -8.2772e-02,
-    #      -3.8178e-02, -7.4963e-02],
-    #     ...,
-    #     [-1.8840e-04, -6.8846e-04, -9.6214e-04,  ...,  2.5672e-02,
-    #       3.9073e-02, -4.3426e-03],
-    #     [ 3.0108e-05,  1.3784e-04,  2.5806e-04,  ..., -2.3564e-02,
-    #       1.5996e-02, -6.3699e-02],
-    #     [-1.0654e-03, -2.4731e-04, -5.2558e-04,  ..., -9.7852e-02,
-    #      -8.4175e-02, -3.0702e-03]], device='cuda:1',
-    #    grad_fn=<SplitWithSizesBackward0>)}
-                # block_outputs[block] = input_fn(group_features[block])
-
-                # block_outputs[block] = group_features[
-                #     block
-                # ]  # group_features是一个字典，key是block name
             elif layer_type == "embedding_layer":
                 input_fn = self._name_to_layer[block]
                 feature_group = config.inputs[0].feature_group_name

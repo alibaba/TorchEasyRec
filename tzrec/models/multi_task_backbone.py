@@ -92,7 +92,7 @@ class MultiTaskBackbone(MultiTaskRank):
         return Backbone(
             config=self._base_model_config.multi_task_backbone.backbone,
             features=self._features,
-            embedding_group=self.embedding_group,
+            embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
             wide_init_fn=wide_init_fn,
