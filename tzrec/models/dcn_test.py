@@ -18,7 +18,7 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.masknet import MaskNet
+from tzrec.models.dcn import DCNv1
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
@@ -55,27 +55,18 @@ class DCNV1Test(unittest.TestCase):
         ]
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            mask_net=rank_model_pb2.MaskNet(
-                mask_net_module=module_pb2.MaskNetModule(
-                    n_mask_blocks=3,
-                    mask_block=module_pb2.MaskBlock(
-                        reduction_ratio=2,
-                        aggregation_dim=32,
-                        hidden_dim=16,
-                    ),
-                    use_parallel=True,
-                    top_mlp=module_pb2.MLP(hidden_units=[8, 4]),
-                )
+            dcn_v1=rank_model_pb2.DCNv1(
+                cross_tower=module_pb2.Cross(cross_num=3),
+                deep_tower=module_pb2.MLP(hidden_units=[8, 4]),
+                final_dnn=module_pb2.MLP(hidden_units=[2]),
             ),
             losses=[
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
             ],
         )
-        mask_net = MaskNet(
-            model_config=model_config, features=features, labels=["label"]
-        )
-        init_parameters(mask_net, device=torch.device("cpu"))
-        mask_net = create_test_model(mask_net, graph_type)
+        dcn_v1 = DCNv1(model_config=model_config, features=features, labels=["label"])
+        init_parameters(dcn_v1, device=torch.device("cpu"))
+        dcn_v1 = create_test_model(dcn_v1, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b"],
@@ -92,9 +83,9 @@ class DCNV1Test(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = mask_net(batch.to_dict())
+            predictions = dcn_v1(batch.to_dict())
         else:
-            predictions = mask_net(batch)
+            predictions = dcn_v1(batch)
         self.assertEqual(predictions["logits"].size(), (2,))
         self.assertEqual(predictions["probs"].size(), (2,))
 
