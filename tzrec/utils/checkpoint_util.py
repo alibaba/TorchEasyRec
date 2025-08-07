@@ -171,19 +171,20 @@ def restore_model(
         model.load_state_dict(state_dict)
     else:
         raise RuntimeError(f"model_ckpt_path[{model_ckpt_path}] not exists.")
-    if optimizer and os.path.exists(optim_ckpt_path):
-        if is_local_rank_zero:
-            logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
-        state_dict = optimizer.state_dict()
-        load(
-            state_dict,
-            checkpoint_id=optim_ckpt_path,
-            planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
-        )
-        optimizer.load_state_dict(state_dict)
-    else:
-        if is_local_rank_zero:
-            logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
+    if optimizer:
+        if os.path.exists(optim_ckpt_path):
+            if is_local_rank_zero:
+                logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
+            state_dict = optimizer.state_dict()
+            load(
+                state_dict,
+                checkpoint_id=optim_ckpt_path,
+                planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
+            )
+            optimizer.load_state_dict(state_dict)
+        else:
+            if is_local_rank_zero:
+                logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
 
 
 def save_model(
