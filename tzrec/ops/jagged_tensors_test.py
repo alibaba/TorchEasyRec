@@ -265,7 +265,6 @@ class JaggedTensorsTest(unittest.TestCase):
         )
 
         ref_values = concat_2D_jagged(
-            max_seq_len=max_len_a + max_len_b,
             values_left=values_a,
             values_right=values_b,
             max_len_left=max_len_a,
@@ -288,7 +287,6 @@ class JaggedTensorsTest(unittest.TestCase):
         values_b = values_b.detach().clone().requires_grad_()
         dout = dout.detach().clone()
         real_values = concat_2D_jagged(
-            max_seq_len=max_len_a + max_len_b,
             values_left=values_a,
             values_right=values_b,
             max_len_left=max_len_a,

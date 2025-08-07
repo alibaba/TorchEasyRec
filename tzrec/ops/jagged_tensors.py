@@ -42,7 +42,6 @@ else:
 
 
 def concat_2D_jagged(
-    max_seq_len: int,
     values_left: torch.Tensor,
     values_right: torch.Tensor,
     max_len_left: Optional[int] = None,
@@ -60,7 +59,6 @@ def concat_2D_jagged(
         )
     if kernel == Kernel.TRITON:
         return triton_concat_2D_jagged(
-            max_seq_len=max_seq_len,
             values_left=values_left,
             values_right=values_right,
             max_len_left=max_len_left,
@@ -70,7 +68,6 @@ def concat_2D_jagged(
         )
     else:
         return pytorch_concat_2D_jagged(
-            max_seq_len=max_seq_len,
             values_left=values_left,
             values_right=values_right,
             max_len_left=max_len_left,

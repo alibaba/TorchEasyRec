@@ -110,7 +110,6 @@ class ContentEncoder(BaseModule):
                     seq_embeddings.dtype
                 )
                 enrich_embeddings = concat_2D_jagged(
-                    max_seq_len=max_uih_len + max_targets,
                     values_left=enrich_embeddings_uih,
                     values_right=enrich_embeddings_target,
                     max_len_left=max_uih_len,

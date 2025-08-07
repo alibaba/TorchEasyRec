@@ -60,7 +60,6 @@ def _concat_2D_jagged_jagged(
 
 @torch.fx.wrap
 def pytorch_concat_2D_jagged(
-    max_seq_len: int,
     values_left: torch.Tensor,
     values_right: torch.Tensor,
     max_len_left: Optional[int],

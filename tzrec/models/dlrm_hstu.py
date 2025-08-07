@@ -170,7 +170,6 @@ class DlrmHSTU(RankModel):
             self._model_config.uih_id_feature_name
         ].lengths()
         source_timestamps = concat_2D_jagged(
-            max_seq_len=max_uih_len + max_candidates,
             values_left=payload_features[
                 self._model_config.uih_action_time_feature_name
             ],
@@ -306,7 +305,6 @@ class DlrmHSTU(RankModel):
             uih_seq_embeddings[uih_feature_name] = JaggedTensor(
                 lengths=uih_seq_lengths + num_candidates,
                 values=concat_2D_jagged(
-                    max_seq_len=max_uih_len + max_num_candidates,
                     max_len_left=max_uih_len,
                     offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
                         uih_seq_lengths

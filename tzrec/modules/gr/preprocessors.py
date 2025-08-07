@@ -305,7 +305,6 @@ class ContextualPreprocessor(InputPreprocessor):
         # concat contextual embeddings
         if self._max_contextual_seq_len > 0:
             output_seq_embeddings = concat_2D_jagged(
-                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
                 values_left=fx_unwrap_optional_tensor(contextual_embeddings).reshape(
                     -1, self._output_embedding_dim
                 ),
@@ -317,7 +316,6 @@ class ContextualPreprocessor(InputPreprocessor):
                 kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
-                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
                 values_left=torch.zeros(
                     (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
                     dtype=output_seq_timestamps.dtype,
@@ -523,7 +521,6 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         )
         if self._max_contextual_seq_len > 0:
             output_seq_embeddings = concat_2D_jagged(
-                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
                 values_left=fx_unwrap_optional_tensor(contextual_embeddings).reshape(
                     -1, self._output_embedding_dim
                 ),
@@ -535,7 +532,6 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
                 kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
-                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
                 values_left=torch.zeros(
                     (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
                     dtype=output_seq_timestamps.dtype,

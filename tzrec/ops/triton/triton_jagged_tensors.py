@@ -350,7 +350,6 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
     # pyre-ignore[14]
     def forward(
         ctx,
-        max_seq_len: int,
         values_a: torch.Tensor,
         values_b: torch.Tensor,
         max_len_a: Optional[int],
@@ -378,6 +377,7 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             assert offsets_b is not None
             B = offsets_b.shape[0] - 1
         total_seq_len = total_len_a + total_len_b
+        max_seq_len = max_len_a + max_len_b
         BLOCK_D = triton.next_power_of_2(D)
         values_out = torch.empty(
             (total_seq_len, D), device=values_a.device, dtype=values_a.dtype
@@ -417,7 +417,7 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
     # pyre-ignore[14]
     def backward(
         ctx, d_out: torch.Tensor
-    ) -> Tuple[None, torch.Tensor, torch.Tensor, None, None, None, None, None]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
         _, D = d_out.shape
         BLOCK_D = triton.next_power_of_2(D)
@@ -444,7 +444,7 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             IS_DENSE_A=ctx.is_dense_a,
             IS_DENSE_B=ctx.is_dense_b,
         )
-        return None, d_values_a, d_values_b, None, None, None, None, None
+        return d_values_a, d_values_b, None, None, None, None, None
 
 
 class _Split2DJaggedFunction(torch.autograd.Function):
@@ -675,7 +675,6 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
 
 @torch.fx.wrap
 def triton_concat_2D_jagged(
-    max_seq_len: int,
     values_left: torch.Tensor,
     values_right: torch.Tensor,
     max_len_left: Optional[int],
@@ -685,7 +684,6 @@ def triton_concat_2D_jagged(
     n_prefix_from_right: int = 0,
 ) -> torch.Tensor:
     return _Concat2DJaggedFunction.apply(
-        max_seq_len,
         values_left,
         values_right,
         max_len_left,
