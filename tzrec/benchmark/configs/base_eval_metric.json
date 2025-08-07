@@ -135,7 +135,7 @@
     "label": {
       "auc": 0.796
     },
-    "threshold": 0.001,
+    "threshold": 0.002,
     "run_cnt": 1
   },
   "tzrec/benchmark/configs/criteo/rocket_launching.config": {
