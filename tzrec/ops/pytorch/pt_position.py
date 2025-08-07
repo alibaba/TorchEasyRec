@@ -105,7 +105,7 @@ def pytorch_add_timestamp_positional_embeddings(
     )
     B, _ = pos_inds.shape
     # timestamp encoding
-    num_time_buckets = 2048
+    num_time_buckets = ts_embeddings.shape[0] - 1
     time_bucket_increments = 60.0
     time_bucket_divisor = 1.0
     time_delta = 0

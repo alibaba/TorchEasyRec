@@ -33,6 +33,7 @@ class HSTUPositionalEncoder(BaseModule):
         num_position_buckets (int): position bucket number.
         num_time_buckets (int): time bucket number.
         use_time_encoding (bool): use timestamp encoding or not.
+        contextual_seq_len (int): contextual feature sequence length.
         is_inference (bool): whether to run in inference mode.
     """
 
@@ -42,10 +43,12 @@ class HSTUPositionalEncoder(BaseModule):
         num_position_buckets: int,
         num_time_buckets: int = 0,
         use_time_encoding: bool = False,
+        contextual_seq_len: int = 0,
         is_inference: bool = True,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._use_time_encoding: bool = use_time_encoding
+        self._contextual_seq_len: int = contextual_seq_len
         self._embedding_dim: int = embedding_dim
         self._position_embeddings_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(num_position_buckets, embedding_dim).uniform_(
@@ -87,7 +90,7 @@ class HSTUPositionalEncoder(BaseModule):
             seq_embeddings = add_timestamp_positional_embeddings(
                 alpha=self._embedding_dim**0.5,
                 max_seq_len=max_seq_len,
-                max_contextual_seq_len=0,
+                max_contextual_seq_len=self._contextual_seq_len,
                 position_embeddings_weight=self._position_embeddings_weight,
                 timestamp_embeddings_weight=self._timestamp_embeddings_weight,
                 seq_offsets=seq_offsets,

@@ -27,16 +27,16 @@ from tzrec.modules.task_tower import FusionMTLTower
 from tzrec.modules.utils import (
     init_linear_xavier_weights_zero_bias,
 )
-from tzrec.ops import Kernel
 from tzrec.ops.jagged_tensors import concat_2D_jagged
 from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_infer_max_len
+from tzrec.utils.fx_util import fx_infer_max_len, fx_int_item
 
 torch.fx.wrap(fx_infer_max_len)
+torch.fx.wrap(fx_int_item)
 
 
 @torch.fx.wrap
@@ -159,21 +159,36 @@ class DlrmHSTU(RankModel):
 
     def _user_forward(
         self,
+        max_uih_len: int,
+        max_candidates: int,
         payload_features: Dict[str, torch.Tensor],
-        uid_seq_embeddings: OrderedDict[str, JaggedTensor],
+        uih_seq_embeddings: OrderedDict[str, JaggedTensor],
         contextual_seq_embeddings: OrderedDict[str, JaggedTensor],
         num_candidates: torch.Tensor,
     ) -> torch.Tensor:
-        source_lengths = uid_seq_embeddings[
+        source_lengths = uih_seq_embeddings[
             self._model_config.uih_id_feature_name
         ].lengths()
-        runtime_max_seq_len = fx_infer_max_len(source_lengths)
-        source_timestamps = payload_features[
-            self._model_config.uih_action_time_feature_name
-        ]
+        source_timestamps = concat_2D_jagged(
+            values_left=payload_features[
+                self._model_config.uih_action_time_feature_name
+            ],
+            values_right=payload_features[
+                self._model_config.candidates_query_time_feature_name
+            ],
+            max_len_left=max_uih_len,
+            max_len_right=max_candidates,
+            offsets_left=payload_features["uih_offsets"],
+            offsets_right=payload_features["candidate_offsets"],
+            kernel=self.kernel(),
+        ).squeeze(-1)
+        total_targets = fx_int_item(num_candidates.sum())
         candidates_user_embeddings, _ = self._hstu_transducer(
-            max_seq_len=runtime_max_seq_len,
-            seq_embeddings=uid_seq_embeddings[
+            max_uih_len=max_uih_len,
+            max_targets=max_candidates,
+            total_uih_len=source_timestamps.numel() - total_targets,
+            total_targets=total_targets,
+            seq_embeddings=uih_seq_embeddings[
                 self._model_config.uih_id_feature_name
             ].values(),
             seq_lengths=source_lengths,
@@ -253,23 +268,13 @@ class DlrmHSTU(RankModel):
             else:
                 values_right = sequence_dense_features[candidate_feature_name].values()
 
-            merged_values = concat_2D_jagged(
-                max_len_left=max_uih_len,
-                offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    uih_seq_lengths
-                ),
-                values_left=values_left,
-                max_len_right=max_num_candidates,
-                offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    num_candidates
-                ),
-                values_right=values_right,
-                kernel=Kernel.PYTORCH if self._is_inference else self.kernel(),
-            ).squeeze(-1)
-            payload_features[uih_feature_name] = merged_values
+            payload_features[uih_feature_name] = values_left
             payload_features[candidate_feature_name] = values_right
-        payload_features["offsets"] = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            uih_seq_lengths + num_candidates
+        payload_features["uih_offsets"] = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            uih_seq_lengths
+        )
+        payload_features["candidate_offsets"] = (
+            torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
         )
 
         return (
@@ -292,12 +297,12 @@ class DlrmHSTU(RankModel):
     ) -> Dict[str, torch.Tensor]:
         """Forward User and Item network."""
         # merge uih and candidates embeddings
-        uid_seq_embeddings = OrderedDict()
+        uih_seq_embeddings = OrderedDict()
         for (
             uih_feature_name,
             candidate_feature_name,
         ) in self._merge_uih_candidate_feature_mapping:
-            uid_seq_embeddings[uih_feature_name] = JaggedTensor(
+            uih_seq_embeddings[uih_feature_name] = JaggedTensor(
                 lengths=uih_seq_lengths + num_candidates,
                 values=concat_2D_jagged(
                     max_len_left=max_uih_len,
@@ -323,9 +328,11 @@ class DlrmHSTU(RankModel):
             )
         with record_function("## user_forward ##"):
             candidates_user_embeddings = self._user_forward(
-                payload_features,
-                uid_seq_embeddings,
-                grouped_features["contextual"],
+                max_uih_len=max_uih_len,
+                max_candidates=max_num_candidates,
+                payload_features=payload_features,
+                uih_seq_embeddings=uih_seq_embeddings,
+                contextual_seq_embeddings=grouped_features["contextual"],
                 num_candidates=num_candidates,
             )
         with record_function("## multitask_module ##"):

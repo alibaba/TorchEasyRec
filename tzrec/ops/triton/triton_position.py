@@ -391,7 +391,6 @@ def _add_embeddings_bwd_kernel(
     ValueInds,
     Out,
     AUTOTUNE_MAX_SEQ_LEN,
-    B,
     AUTOTUNE_B,
     D,
     jagged_size,
@@ -473,6 +472,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         timestamps = switch_to_contiguous_if_needed(timestamps)
         ts_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
         pos_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
+        ts_emb_size = ts_embeddings.shape[0]
 
         grid = lambda meta: (  # noqa E731
             B,
@@ -492,7 +492,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             NumTargets=num_targets,
             AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
             D=D,
-            num_time_buckets=2048,
+            num_time_buckets=ts_emb_size - 1,
             time_bucket_increments=60.0,
             time_bucket_scale=1.0,
             time_delta=0,
@@ -564,15 +564,13 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             (ctx.ts_emb_size, ctx.D), device=d_out.device, dtype=torch.float32
         )
         grid = lambda meta: (triton.cdiv(d_out.shape[0], meta["BLOCK"]),)  # noqa E731
-        B = ctx.B
-        AUTOTUNE_B = prev_power_of_2(B)
+        AUTOTUNE_B = prev_power_of_2(ctx.B)
         _add_embeddings_bwd_kernel[grid](
             In=d_out,
             KeyInds=sorted_pos_key_inds,
             ValueInds=sorted_pos_value_inds,
             Out=d_pos_embeddings,
             AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(ctx.max_seq_len),
-            B=B,
             AUTOTUNE_B=AUTOTUNE_B,
             D=ctx.D,
             jagged_size=d_out.shape[0],
@@ -586,7 +584,6 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             ValueInds=sorted_ts_value_inds,
             Out=d_ts_embeddings,
             AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(ctx.max_seq_len),
-            B=B,
             AUTOTUNE_B=AUTOTUNE_B,
             D=ctx.D,
             jagged_size=d_out.shape[0],

@@ -57,8 +57,14 @@ class PreprocessorTest(unittest.TestCase):
             contextual_feature_to_min_uih_length={"c_1": 4},
             pmlp_contextual_dropout_ratio=0.2,
             content_encoder=dict(
-                additional_content_feature_names=["a0", "a1"],
-                target_enrich_feature_names=["t0", "t1"],
+                additional_content_features={
+                    "a0": input_embedding_dim,
+                    "a1": input_embedding_dim,
+                },
+                target_enrich_features={
+                    "t0": input_embedding_dim,
+                    "t1": input_embedding_dim,
+                },
             ),
             content_mlp=dict(
                 parameterized_mlp=dict(hidden_dim=content_encoder_hidden_dim)
@@ -95,10 +101,12 @@ class PreprocessorTest(unittest.TestCase):
             [1, 2, 3, 4, 5, 6, 10, 20, 30],
             device=device,
         )
-        watchtimes = [40, 20, 110, 31, 26, 55, 33, 71, 66]
-        actions = [1, 3, 26, 30, 6, 4, 8, 6, 8]
+        watchtimes = [40, 20, 110, 31, 26, 55]
+        actions = [1, 3, 26, 30, 6, 4]
         (
             output_max_seq_len,
+            output_total_uih_len,
+            output_total_targets,
             output_seq_lengths,
             output_seq_offsets,
             output_seq_timestamps,
@@ -106,7 +114,10 @@ class PreprocessorTest(unittest.TestCase):
             output_num_targets,
             _,
         ) = preprocessor(
-            max_seq_len=6,
+            max_uih_len=4,
+            max_targets=2,
+            total_uih_len=sum(seq_lengths) - sum(num_targets),
+            total_targets=sum(num_targets),
             seq_lengths=torch.tensor(seq_lengths, device=device),
             seq_timestamps=seq_timestamps,
             seq_embeddings=seq_embeddings,

@@ -36,10 +36,10 @@ class LayerNorm(BaseModule):
         super().__init__(is_inference=is_inference)
         self._normalized_shape: List[int] = [dim]
         self._eps = eps
-        self._weight = torch.nn.Parameter(
+        self.weight = torch.nn.Parameter(
             torch.ones(self._normalized_shape),
         )
-        self._bias = torch.nn.Parameter(
+        self.bias = torch.nn.Parameter(
             torch.zeros(self._normalized_shape),
         )
 
@@ -47,8 +47,8 @@ class LayerNorm(BaseModule):
         """Forward the module."""
         return layer_norm(
             x=x,
-            weight=self._weight,
-            bias=self._bias,
+            weight=self.weight,
+            bias=self.bias,
             eps=self._eps,
             kernel=self.kernel(),
         )
@@ -71,11 +71,11 @@ class RMSNorm(BaseModule):
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._eps = eps
-        self._weight = torch.nn.Parameter(torch.ones(dim))
+        self.weight = torch.nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward the module."""
-        return rms_norm(x=x, weight=self._weight, eps=self._eps, kernel=self.kernel())
+        return rms_norm(x=x, weight=self.weight, eps=self._eps, kernel=self.kernel())
 
 
 class SwishLayerNorm(BaseModule):
@@ -95,8 +95,8 @@ class SwishLayerNorm(BaseModule):
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._normalized_shape: List[int] = [dim]
-        self._weight = torch.nn.Parameter(torch.ones(self._normalized_shape))
-        self._bias = torch.nn.Parameter(torch.zeros(self._normalized_shape))
+        self.weight = torch.nn.Parameter(torch.ones(self._normalized_shape))
+        self.bias = torch.nn.Parameter(torch.zeros(self._normalized_shape))
         self._eps = eps
 
     def forward(
@@ -106,8 +106,8 @@ class SwishLayerNorm(BaseModule):
         """Forward the module."""
         return swish_layer_norm(
             x=x,
-            weight=self._weight,
-            bias=self._bias,
+            weight=self.weight,
+            bias=self.bias,
             eps=self._eps,
             kernel=self.kernel(),
         )
