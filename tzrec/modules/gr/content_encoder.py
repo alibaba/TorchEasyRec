@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 import torch
 
 from tzrec.modules.utils import BaseModule
+from tzrec.ops.jagged_tensors import concat_2D_jagged
 
 
 class ContentEncoder(BaseModule):
@@ -25,105 +26,103 @@ class ContentEncoder(BaseModule):
 
     Args:
         input_embedding_dim (int): dimension of input embeddings.
-        additional_content_feature_names (List[str]): content feature names in payloads.
-        target_enrich_feature_names (List[str]): target feature names in payloads.
+        additional_content_features (Dict[str, int]): content feature name to embedding
+            dim in payloads.
+        target_enrich_features (Dict[str, int]): target feature name to embedding
+            dim in payloads.
         is_inference (bool): whether to run in inference mode.
     """
 
     def __init__(
         self,
         input_embedding_dim: int,
-        additional_content_feature_names: Optional[List[str]] = None,
-        target_enrich_feature_names: Optional[List[str]] = None,
+        additional_content_features: Optional[Dict[str, int]] = None,
+        target_enrich_features: Optional[Dict[str, int]] = None,
         is_inference: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._input_embedding_dim: int = input_embedding_dim
-        self._additional_content_feature_names: List[str] = (
-            additional_content_feature_names
-            if additional_content_feature_names is not None
-            else []
+        self._additional_content_features: Dict[str, int] = (
+            additional_content_features
+            if additional_content_features is not None
+            else {}
         )
-        self._target_enrich_feature_names: List[str] = (
-            target_enrich_feature_names
-            if target_enrich_feature_names is not None
-            else []
+        self._target_enrich_features: Dict[str, int] = (
+            target_enrich_features if target_enrich_features is not None else {}
         )
-        self._target_enrich_dummy_embeddings: torch.nn.ParameterList = (
-            torch.nn.ParameterList(
-                [
-                    torch.nn.Parameter(
-                        torch.empty((self._input_embedding_dim,)).normal_(
-                            mean=0, std=0.1
-                        ),
+        self._target_enrich_dummy_embeddings: torch.nn.ParameterDict = (
+            torch.nn.ParameterDict(
+                {
+                    name: torch.nn.Parameter(
+                        torch.empty((1, dim)).normal_(mean=0, std=0.1),
                     )
-                    for _ in self._target_enrich_feature_names
-                ]
+                    for name, dim in self._target_enrich_features.items()
+                }
             )
         )
 
     @property
     def output_dim(self) -> int:
         """Output dimension of the module."""
-        return self._input_embedding_dim * (
-            1
-            + len(self._additional_content_feature_names)
-            + len(self._target_enrich_feature_names)
+        return self._input_embedding_dim + sum(
+            list(self._additional_content_features.values())
+            + list(self._target_enrich_features.values())
         )
 
     def forward(
         self,
-        max_seq_len: int,
+        max_uih_len: int,
+        max_targets: int,
+        uih_offsets: torch.Tensor,
+        target_offsets: torch.Tensor,
         seq_embeddings: torch.Tensor,
-        seq_lengths: torch.Tensor,
-        seq_offsets: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
-        num_targets: torch.Tensor,
     ) -> torch.Tensor:
         """Forward the module.
 
         Args:
-            max_seq_len (int): maximum sequence length.
+            max_uih_len (int): maximum user history sequence length.
+            max_targets (int): maximum targets sequence length.
+            uih_offsets (torch.Tensor): input user history sequence offsets.
+            target_offsets (torch.Tensor): target sequence lengths.
             seq_embeddings (torch.Tensor): input sequence embeddings.
-            seq_lengths (torch.Tensor): input sequence lengths.
-            seq_offsets (torch.Tensor): input sequence offsets.
             seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
-            num_targets (int): number of targets.
 
         Returns:
             torch.Tensor: output content embedding tensor.
         """
         content_embeddings_list: List[torch.Tensor] = []
 
-        if len(self._additional_content_feature_names) > 0:
-            content_embeddings_list = [seq_embeddings] + [
+        content_embeddings_list: List[torch.Tensor] = [seq_embeddings]
+        if len(self._additional_content_features) > 0:
+            content_embeddings_list = content_embeddings_list + [
                 (seq_payloads[x].to(seq_embeddings.dtype))
-                for x in self._additional_content_feature_names
+                for x in self._additional_content_features.keys()
             ]
 
-        for i, f in enumerate(self._target_enrich_feature_names):
-            padded_enrich_embeddings = (
-                self._target_enrich_dummy_embeddings[i]
-                .view(1, 1, -1)
-                .repeat(seq_lengths.size(0), max_seq_len, 1)
-            ).to(seq_embeddings.dtype)
-            mask = torch.arange(max_seq_len, device=seq_offsets.device).view(
-                1, max_seq_len
-            )
-            mask = torch.logical_and(
-                mask >= (seq_lengths - num_targets).unsqueeze(1),
-                mask < seq_lengths.unsqueeze(1),
-            )
-            padded_enrich_embeddings[mask] = seq_payloads[f].to(seq_embeddings.dtype)
-            enrich_embeddings = torch.ops.fbgemm.dense_to_jagged(
-                padded_enrich_embeddings,
-                [seq_offsets],
-            )[0]
-            content_embeddings_list.append(enrich_embeddings)
+        if self._target_enrich_dummy_embeddings:
+            total_seq_len: int = seq_embeddings.size(0)
+            for name, param in self._target_enrich_dummy_embeddings.items():
+                enrich_embeddings_target = seq_payloads[name].to(seq_embeddings.dtype)
+                total_targets: int = enrich_embeddings_target.size(0)
+                total_uih_len: int = total_seq_len - total_targets
+                enrich_embeddings_uih = param.tile(total_uih_len, 1).to(
+                    seq_embeddings.dtype
+                )
+                enrich_embeddings = concat_2D_jagged(
+                    values_left=enrich_embeddings_uih,
+                    values_right=enrich_embeddings_target,
+                    max_len_left=max_uih_len,
+                    max_len_right=max_targets,
+                    offsets_left=uih_offsets,
+                    offsets_right=target_offsets,
+                    kernel=self.kernel(),
+                )
+                content_embeddings_list.append(enrich_embeddings)
 
         if (
-            len(self._target_enrich_feature_names) == 0
-            and len(self._additional_content_feature_names) == 0
+            len(self._target_enrich_features) == 0
+            and len(self._additional_content_features) == 0
         ):
             return seq_embeddings
         else:

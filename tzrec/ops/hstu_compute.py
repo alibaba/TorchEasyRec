@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.fx._symbolic_trace import is_fx_tracing
+from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention import hstu_mha
@@ -26,12 +27,19 @@ from tzrec.ops.mm import addmm
 from tzrec.ops.pytorch.pt_hstu_linear import (
     pytorch_hstu_compute_output,
 )
-from tzrec.ops.triton.triton_hstu_linear import (
-    triton_hstu_compute_output,
-)
-from tzrec.ops.triton.triton_hstu_preprocess_and_attention import (
-    triton_hstu_preprocess_and_attention,
-)
+
+if has_triton():
+    from tzrec.ops.triton.triton_hstu_linear import (
+        triton_hstu_compute_output,
+    )
+    from tzrec.ops.triton.triton_hstu_preprocess_and_attention import (
+        triton_hstu_preprocess_and_attention,
+    )
+
+    torch.fx.wrap("triton_hstu_compute_output")
+    torch.fx.wrap("triton_hstu_preprocess_and_attention")
+else:
+    triton_hstu_compute_output = pytorch_hstu_compute_output
 
 
 def hstu_compute_uqvk(

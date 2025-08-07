@@ -94,6 +94,13 @@ message GRActionEncoder {
     repeated uint32 watchtime_to_action_weights = 5;
 }
 
+message GRContentEncoder {
+    // content feature name to embedding dim in payloads.
+    map<string, uint32> additional_content_features = 1;
+    // target feature name to embedding dim in payloads.
+    map<string, uint32> target_enrich_features = 2;
+}
+
 message GRSimpleContextualizedMLP {
     // mlp hidden dimension
     required uint32 hidden_dim = 1;
@@ -141,8 +148,10 @@ message GRContextualInterleavePreprocessor {
     optional bool enable_interleaving = 4 [default=true];
     // action embedding mlp config
     optional GRContextualizedMLP action_mlp = 5;
+    // content encoder config
+    required GRContentEncoder content_encoder = 6;
     // content embedding mlp config
-    required GRContextualizedMLP content_mlp = 6;
+    required GRContextualizedMLP content_mlp = 7;
 }
 
 message GRInputPreprocessor {

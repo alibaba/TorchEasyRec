@@ -17,32 +17,37 @@ from typing import Optional, Tuple
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
+from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
 from tzrec.ops.pytorch.pt_jagged_tensors import (
     pytorch_concat_2D_jagged,
-    pytorch_hstu_concat_l2_embeddings,
-    pytorch_hstu_split_l2_embeddings,
     pytorch_jagged_dense_bmm_broadcast_add,
     pytorch_split_2D_jagged,
 )
-from tzrec.ops.triton.triton_jagged_tensors import (
-    triton_concat_2D_jagged,
-    triton_jagged_dense_bmm_broadcast_add,
-    triton_split_2D_jagged,
-)
 
-torch.fx.wrap("triton_concat_2D_jagged")
-torch.fx.wrap("triton_split_2D_jagged")
+if has_triton():
+    from tzrec.ops.triton.triton_jagged_tensors import (
+        triton_concat_2D_jagged,
+        triton_jagged_dense_bmm_broadcast_add,
+        triton_split_2D_jagged,
+    )
+
+    torch.fx.wrap("triton_concat_2D_jagged")
+    torch.fx.wrap("triton_split_2D_jagged")
+else:
+    triton_concat_2D_jagged = pytorch_concat_2D_jagged
+    triton_jagged_dense_bmm_broadcast_add = pytorch_jagged_dense_bmm_broadcast_add
+    pytorch_split_2D_jagged = pytorch_split_2D_jagged
 
 
 def concat_2D_jagged(
     values_left: torch.Tensor,
     values_right: torch.Tensor,
-    max_len_left: int,
-    max_len_right: int,
-    offsets_left: Optional[torch.Tensor],
-    offsets_right: Optional[torch.Tensor],
+    max_len_left: Optional[int] = None,
+    max_len_right: Optional[int] = None,
+    offsets_left: Optional[torch.Tensor] = None,
+    offsets_right: Optional[torch.Tensor] = None,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
     if not is_fx_tracing():
@@ -75,6 +80,8 @@ def concat_2D_jagged(
 def split_2D_jagged(
     max_seq_len: int,
     values: torch.Tensor,
+    total_len_left: Optional[int] = None,
+    total_len_right: Optional[int] = None,
     max_len_left: Optional[int] = None,
     max_len_right: Optional[int] = None,
     offsets_left: Optional[torch.Tensor] = None,
@@ -106,6 +113,8 @@ def split_2D_jagged(
         return triton_split_2D_jagged(
             max_seq_len=max_seq_len,
             values=values,
+            total_len_left=total_len_left,
+            total_len_right=total_len_right,
             max_len_left=max_len_left,
             max_len_right=max_len_right,
             offsets_left=offsets_left,
@@ -115,70 +124,12 @@ def split_2D_jagged(
         return pytorch_split_2D_jagged(
             max_seq_len=max_seq_len,
             values=values,
+            total_len_left=total_len_left,
+            total_len_right=total_len_right,
             max_len_left=max_len_left,
             max_len_right=max_len_right,
             offsets_left=offsets_left,
             offsets_right=offsets_right,
-        )
-
-
-def hstu_split_l2_embeddings(
-    max_seq_len: int,
-    x: torch.Tensor,
-    minus_l2_offsets: torch.Tensor,
-    l2_offsets: torch.Tensor,
-    contextual_seq_len: int,
-    kernel: Kernel = Kernel.PYTORCH,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if kernel == Kernel.TRITON:
-        return triton_split_2D_jagged(
-            max_seq_len=max_seq_len,
-            values=x,
-            max_len_left=None,
-            max_len_right=None,
-            offsets_left=minus_l2_offsets,
-            offsets_right=l2_offsets,
-            n_prefix_to_right=contextual_seq_len,
-        )
-    else:
-        return pytorch_hstu_split_l2_embeddings(
-            max_seq_len=max_seq_len,
-            x=x,
-            minus_l2_offsets=minus_l2_offsets,
-            l2_offsets=l2_offsets,
-            contextual_seq_len=contextual_seq_len,
-        )
-
-
-def hstu_concat_l2_embeddings(
-    max_minus_l2_len: int,
-    minus_l2_x: torch.Tensor,
-    minus_l2_offsets: torch.Tensor,
-    max_l2_len: int,
-    l2_x: torch.Tensor,
-    l2_offsets: torch.Tensor,
-    contextual_seq_len: int,
-    kernel: Kernel = Kernel.PYTORCH,
-) -> torch.Tensor:
-    if kernel == Kernel.TRITON:
-        return triton_concat_2D_jagged(
-            values_left=minus_l2_x,
-            values_right=l2_x,
-            max_len_left=max_minus_l2_len,
-            max_len_right=max_l2_len,
-            offsets_left=minus_l2_offsets,
-            offsets_right=l2_offsets,
-            n_prefix_from_right=contextual_seq_len,
-        )
-    else:
-        return pytorch_hstu_concat_l2_embeddings(
-            contextual_seq_len=contextual_seq_len,
-            max_minus_l2_len=max_minus_l2_len,
-            minus_l2_x=minus_l2_x,
-            minus_l2_offsets=minus_l2_offsets,
-            max_l2_len=max_l2_len,
-            l2_x=l2_x,
-            l2_offsets=l2_offsets,
         )
 
 
