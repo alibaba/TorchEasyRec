@@ -841,8 +841,6 @@ class Package(nn.Module):
                     else:
                         # 如果返回的不是字典或没有对应的key，直接使用整个输出
                         block_outputs[block] = embedding_outputs
-                    print("111111111")
-                    # print('input_fn', input_fn)
                     if isinstance(block_outputs[block], torch.Tensor):
                         print(f"block_outputs[{block}] shape: {block_outputs[block].shape}")
                     else:
@@ -909,7 +907,7 @@ class Package(nn.Module):
 
         for output in getattr(self._config, "concat_blocks", []):
             if output in block_outputs:
-                print(f"Adding output block: {output} with shape {block_outputs[output].shape}")
+                # print(f"Adding output block: {output} with shape {block_outputs[output].shape}") 不一定是tensor 有可能是tensor list 不一定能.shape
                 outputs.append(block_outputs[output])
             else:
                 raise ValueError("No output `%s` of backbone to be concat" % output)

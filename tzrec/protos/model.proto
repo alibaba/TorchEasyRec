@@ -9,6 +9,8 @@ import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
 import "tzrec/protos/module.proto";
+import "tzrec/protos/backbone.proto";
+import "tzrec/protos/tower.proto";
 
 enum FeatureGroupType {
     DEEP = 0;
@@ -40,6 +42,7 @@ enum Kernel {
 message ModelParams {
     optional float l2_regularization = 1;
     repeated string outputs = 2;
+    repeated TaskTower task_towers = 3;
 }
 
 message RankBackbone {
@@ -53,6 +56,7 @@ message MatchBackbone {
 message MultiTaskBackbone {
     required BackboneTower backbone = 1;
     optional ModelParams model_params = 2;
+    repeated TaskTower task_towers = 3;
 }
 message ModelConfig {
 

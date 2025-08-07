@@ -17,15 +17,23 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.layers.backbone import Backbone
-from tzrec.models.rank_model import RankModel
-from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.models.multi_task_rank import MultiTaskRank
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.protos import model_pb2
-from tzrec.utils.config_util import config_to_kwargs
 from tzrec.modules.variational_dropout import VariationalDropout
+from tzrec.protos import model_pb2
+from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.config_util import config_to_kwargs
 
-class RankBackbone(RankModel):
-    """Ranking backbone model."""
+
+class MultiTaskBackbone(MultiTaskRank):
+    """Multi-task backbone model.
+
+    Args:
+        model_config (ModelConfig): an instance of ModelConfig.
+        features (list): list of features.
+        labels (list): list of label names.
+        sample_weights (list): sample weight names.
+    """
 
     def __init__(
         self,
@@ -36,22 +44,16 @@ class RankBackbone(RankModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
+        
+        # 初始化输入处理
         # self.init_input()
-        self._feature_dict = features
-        self._backbone_output = None
-        self._l2_reg = None
+        self._task_tower_cfgs = list(self._model_config.model_params.task_towers)
+        # 构建backbone网络
         self._backbone_net = self.build_backbone_network()
         
-        # 使用backbone的最终输出维度，考虑top_mlp的影响
-        output_dims = self._backbone_net.get_final_output_dim()
-        # 如果有多个 package（如 Package.__packages 里），如何Í拿到output_dims，暂未实现
-        # for pkg_name, pkg in Package._Package__packages.items():
-        #     print(f"Package: {pkg_name}")
-        #     print("  输出block列表:", pkg.get_output_block_names())
-        #     print("  输出block维度:", pkg.output_block_dims())
-        #     print("  总输出维度:", pkg.total_output_dim())
-        self.output_mlp = nn.Linear(output_dims, self._num_class)
-    
+        # 构建任务塔
+        self._task_towers = self.build_task_towers()
+
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(
@@ -80,50 +82,59 @@ class RankBackbone(RankModel):
                         self.group_variational_dropouts[group_name] = (
                             variational_dropout
                         )
-        
 
     def build_backbone_network(self):
-        """Build backbone."""
-        # return Backbone(
-        #     self._base_model_config.rank_backbone.backbone,
-        #     self._feature_dict,
-        #     embedding_group=self.embedding_group,
-        #     # input_layer=self._input_layer,
-        #     l2_reg=self._l2_reg,
-        # )
-        wide_embedding_dim=int(self.wide_embedding_dim) if hasattr(self, "wide_embedding_dim") else None
-        wide_init_fn=self.wide_init_fn if hasattr(self, "wide_init_fn") else None
+        """Build backbone network."""
+        wide_embedding_dim = int(self.wide_embedding_dim) if hasattr(self, "wide_embedding_dim") else None
+        wide_init_fn = self.wide_init_fn if hasattr(self, "wide_init_fn") else None
         feature_groups = list(self._base_model_config.feature_groups)
+        
         return Backbone(
-            config=self._base_model_config.rank_backbone.backbone,
-            features=self._feature_dict,
-            embedding_group=self.embedding_group,# can remove
+            config=self._base_model_config.multi_task_backbone.backbone,
+            features=self._features,
+            embedding_group=self.embedding_group,
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
             wide_init_fn=wide_init_fn,
-            # input_layer=self._input_layer,
-            l2_reg=self._l2_reg,
+            l2_reg=self._l2_reg if hasattr(self, "_l2_reg") else None,
         )
 
-    def backbone(
-        self, 
-        # group_features: Dict[str, torch.Tensor], 
-        batch: Batch
-    ) -> Optional[nn.Module]:
-        # -> torch.Tensor:
-        """Get backbone."""
-        if self._backbone_output:
-            return self._backbone_output
+    def build_task_towers(self):
+        """Build task towers based on backbone output dimension."""
+        # 获取backbone的最终输出维度
+        backbone_output_dim = self._backbone_net.get_final_output_dim()
+        
+        task_towers = nn.ModuleDict()
+        for task_tower_cfg in self._task_tower_cfgs:
+            tower_name = task_tower_cfg.tower_name
+            num_class = task_tower_cfg.num_class
+            
+            # 检查是否有自定义MLP配置
+            if task_tower_cfg.HasField("mlp"):
+                from tzrec.modules.mlp import MLP
+                mlp_config = config_to_kwargs(task_tower_cfg.mlp)
+                task_tower = nn.Sequential(
+                    MLP(in_features=backbone_output_dim, **mlp_config),
+                    nn.Linear(mlp_config["hidden_units"][-1], num_class)
+                )
+            else:
+                # 直接连接到输出层
+                task_tower = nn.Linear(backbone_output_dim, num_class)
+                
+            task_towers[tower_name] = task_tower
+            
+        return task_towers
+
+    def backbone(self, batch: Batch) -> torch.Tensor:
+        """Get backbone output."""
         if self._backbone_net:
             kwargs = {
                 "loss_modules": self._loss_modules,
                 "metric_modules": self._metric_modules,
-                # 'prediction_modules': self._prediction_modules,
                 "labels": self._labels,
             }
             return self._backbone_net(
                 is_training=self.training,
-                # group_features=group_features,
                 batch=batch,
                 **kwargs,
             )
@@ -138,8 +149,29 @@ class RankBackbone(RankModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        # grouped_features = self.build_input(batch)
-        # output = self.backbone(group_features=grouped_features, batch=batch)
-        output = self.backbone( batch=batch)
-        y = self.output_mlp(output)
-        return self._output_to_prediction(y)
+        # 获取backbone输出
+        backbone_output = self.backbone(batch)
+        
+        # 处理backbone输出：可能是单个tensor或tensor列表
+        if isinstance(backbone_output, (list, tuple)):
+            # backbone返回列表（如MMoE模块），需要与任务塔一一对应
+            if len(backbone_output) != len(self._task_tower_cfgs):
+                raise ValueError(
+                    f'The number of backbone outputs ({len(backbone_output)}) and '
+                    f'task towers ({len(self._task_tower_cfgs)}) must be equal'
+                )
+            task_input_list = backbone_output
+        else:
+            # backbone返回单个tensor，复制给所有任务塔
+            task_input_list = [backbone_output] * len(self._task_tower_cfgs)
+        
+        # 通过各个任务塔生成预测
+        tower_outputs = {}
+        for i, task_tower_cfg in enumerate(self._task_tower_cfgs):
+            tower_name = task_tower_cfg.tower_name
+            task_input = task_input_list[i]  # 使用对应的输入
+            tower_output = self._task_towers[tower_name](task_input)
+            tower_outputs[tower_name] = tower_output
+
+        # 转换为最终预测格式
+        return self._multi_task_output_to_prediction(tower_outputs)

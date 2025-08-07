@@ -240,3 +240,14 @@ message FM {
     optional bool use_variant = 1;
     optional float l2_regularization = 5 [default = 1e-4];
 }
+
+message MMoEModule {
+    // mmoe expert module definition
+    required MLP expert_mlp = 1;
+    // number of mmoe experts
+    required uint32 num_expert = 3 [default=3];
+    // task tower
+    required uint32 num_task = 4;
+    // mmoe gate module definition
+    optional MLP gate_mlp = 2;
+}
