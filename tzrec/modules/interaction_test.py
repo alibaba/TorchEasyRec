@@ -15,7 +15,7 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.interaction import InputSENet, InteractionArch
+from tzrec.modules.interaction import Cross, InputSENet, InteractionArch
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -43,6 +43,18 @@ class InteractionArchTest(unittest.TestCase):
         sparse_features = torch.randn([10, 3, 8])
         result = ia(dense_features, sparse_features)
         self.assertEqual(result.size(), (10, 6))
+
+
+class CrossModuleTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_cross(self, graph_type) -> None:
+        cross_layer = Cross(cross_num=3, input_dim=16)
+        cross_layer = create_test_module(cross_layer, graph_type)
+        input_data = torch.randn((10, 16))
+        result = cross_layer(input_data)
+        self.assertEqual(result.size(), (10, 16))
 
 
 if __name__ == "__main__":
