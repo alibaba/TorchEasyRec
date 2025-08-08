@@ -136,7 +136,6 @@ class Package(nn.Module):
         self._block_outputs = {}
         self._package_input = None
         self._feature_group_inputs = {}
-        # reuse = None if config.name == 'backbone' else tf.AUTO_REUSE
         reuse = None
         input_feature_groups = self._feature_group_inputs
 
@@ -246,12 +245,7 @@ class Package(nn.Module):
                         wide_embedding_dim=self._wide_embedding_dim,
                         wide_init_fn=self._wide_init_fn
                     )
-                    if layer == "input_layer":
-                        # 拿到input_layer的配置
-                        config_input_layer = block.input_layer
-                        print(f"config_input_layer: {config_input_layer}")
-                        # 使用EnhancedEmbeddingGroup，支持更多功能
-                        
+                    if layer == "input_layer": 
                         # 使用改进的维度推断引擎，支持batch_size估算
                         dim_info = create_dimension_info_from_embedding(
                             input_fn, group, batch_size=None  # 可以在实际使用时传入batch_size
@@ -284,12 +278,7 @@ class Package(nn.Module):
                             block.name,
                             vocab,
                         )
-                    # input_fn = EnhancedEmbeddingGroup(embedding_group=embedding_group,
-                    #                                       group_name=group)
                     self._name_to_layer[block.name] = input_fn
-                    # 加上的话embedding 会被注册多次
-                    # self._name_to_layer[block.name] = embedding_group
-                    # name_to_layer[block.name] = embedding_group
             else:  # module
                 # 使用新的维度推断引擎处理多输入维度
                 input_dim_infos = []
@@ -389,7 +378,7 @@ class Package(nn.Module):
             )
             self._config.concat_blocks.extend(leaf)
 
-        Package.__packages[self._config.name] = self  # 这个是什么意思？
+        Package.__packages[self._config.name] = self
         
         # 输出维度推断摘要
         dim_summary = self.dim_engine.get_summary()
@@ -703,8 +692,8 @@ class Package(nn.Module):
         inputs = []
         # Traverse each input node configured by config.inputs
         for input_node in config.inputs:
-            input_type = input_node.WhichOneof("name")  # 'feature_group_name'
-            input_name = getattr(input_node, input_type)  # example 'item'
+            input_type = input_node.WhichOneof("name")
+            input_name = getattr(input_node, input_type)
 
             if input_type == "use_package_input":
                 input_feature = self._package_input
@@ -788,7 +777,6 @@ class Package(nn.Module):
         return output
 
     def forward(self, is_training, batch=None, **kwargs):
-        # group_features:Dict[str, torch.Tensor]
         block_outputs = {}
         self._block_outputs = block_outputs  # reset
         blocks = self.topo_order_list
@@ -812,7 +800,6 @@ class Package(nn.Module):
                 continue
 
             # Case 2: single layer  just one of layer
-            # layer_type = getattr(config, "layer_type", None) #
             layer_type = config.WhichOneof("layer")
             if layer_type is None:  # identity layer
                 output = self.block_input(config, block_outputs, is_training, **kwargs)
@@ -990,12 +977,11 @@ class Package(nn.Module):
         customize = self._name_to_customize.get(name, False)
         cls = layer.__class__.__name__
         
-        # 智能判断输入格式
+        # 判断输入格式
         processed_inputs = self._determine_input_format(layer, inputs)
         
         if customize:
             try:
-                # output = layer(inputs, training=training, **kwargs)
                 output = layer(processed_inputs)
                 logging.debug(f"Custom layer {name} ({cls}) called successfully with input type: {type(processed_inputs)}")
             except Exception as e:
@@ -1014,7 +1000,6 @@ class Package(nn.Module):
                     raise e
         else:
             try:
-                # output = layer(inputs, training=training)
                 output = layer(processed_inputs)
                 if cls == "BatchNormalization":
                     raise NotImplementedError
@@ -1060,8 +1045,6 @@ class Backbone(nn.Module):
     ):
         super().__init__()
         self._config = config
-        # self._backbone_config = config.rank_backbone.backbone
-
         self._l2_reg = l2_reg
         main_pkg = backbone_pb2.BlockPackage()
         main_pkg.name = "backbone"
@@ -1094,7 +1077,6 @@ class Backbone(nn.Module):
             self._top_mlp = MLP(in_features=total_output_dim, **kwargs)
 
     def forward(self, is_training, batch=None, **kwargs):
-        # output = self._main_pkg(is_training, group_features, batch, **kwargs)
         output = self._main_pkg(is_training, batch, **kwargs)
 
         if hasattr(self, '_top_mlp') and self._top_mlp is not None:
@@ -1174,9 +1156,7 @@ def merge_inputs(inputs, axis=-1, msg=""):
 
     if axis != -1:
         logging.info("concat inputs %s axis=%d" % (msg, axis))
-    # import pdb
-    # pdb.set_trace()
-    for i, x in enumerate(inputs): print(f"fzcccccc{i}: {x.shape}")
+    # for i, x in enumerate(inputs): print(f"fzcccccc{i}: {x.shape}")
     return torch.cat(inputs, dim=axis)
 
 
