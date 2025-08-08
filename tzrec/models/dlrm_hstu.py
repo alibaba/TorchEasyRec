@@ -255,11 +255,11 @@ class DlrmHSTU(RankModel):
                 or candidate_feature_name
                 == self._model_config.candidates_watchtime_feature_name
             ):
-                total_candidates = torch.sum(num_candidates).item()
-                values_right = torch.zeros(
-                    (total_candidates, 1),  # pyre-ignore
+                values_right = torch.zeros_like(
+                    sparse_features[
+                        self._model_config.candidates_id_feature_name
+                    ].values(),
                     dtype=values_left.dtype,
-                    device=values_left.device,
                 )
             elif is_sparse:
                 values_right = (

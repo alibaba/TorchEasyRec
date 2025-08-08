@@ -770,6 +770,23 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
 
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config", self.test_dir
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+        )
+
     @unittest.skip("skip trt test")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
