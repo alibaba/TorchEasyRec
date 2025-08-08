@@ -97,3 +97,39 @@ class InteractionArch(nn.Module):
         interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
 
         return interactions_flat
+
+
+class Cross(nn.Module):
+    """Cross Layer in Deep & Cross Network to learn explicit feature interactions.
+
+    Ref: https://arxiv.org/pdf/1708.05123
+
+    Args:
+        cross_num(int): number of cross layers
+        input_dim(int): input tensor dimension
+    """
+
+    def __init__(self, cross_num: int, input_dim: int) -> None:
+        super().__init__()
+        self.cross_num = cross_num
+        self.w = nn.ModuleList()
+        self.b = nn.ParameterList()
+        for _ in range(cross_num):
+            self.w.append(nn.Linear(input_dim, 1, bias=False))
+            self.b.append(nn.Parameter(torch.empty(input_dim)))
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize parameters."""
+        for i in range(self.cross_num):
+            nn.init.xavier_uniform_(self.w[i].weight)
+            nn.init.zeros_(self.b[i])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward."""
+        x1 = x
+        for i in range(self.cross_num):
+            x1 = self.w[i](x1) * x + self.b[i] + x1
+
+        return x1
