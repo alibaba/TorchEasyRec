@@ -18,7 +18,7 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.dcn import DCNv1
+from tzrec.models.dcn import DCNV1
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
@@ -29,7 +29,7 @@ class DCNV1Test(unittest.TestCase):
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
-    def test_dcnv1(self, graph_type) -> None:
+    def test_DCNV1(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -55,7 +55,7 @@ class DCNV1Test(unittest.TestCase):
         ]
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            dcn_v1=rank_model_pb2.DCNv1(
+            dcn_v1=rank_model_pb2.DCNV1(
                 cross_tower=module_pb2.Cross(cross_num=3),
                 deep_tower=module_pb2.MLP(hidden_units=[8, 4]),
                 final_dnn=module_pb2.MLP(hidden_units=[2]),
@@ -64,7 +64,7 @@ class DCNV1Test(unittest.TestCase):
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
             ],
         )
-        dcn_v1 = DCNv1(model_config=model_config, features=features, labels=["label"])
+        dcn_v1 = DCNV1(model_config=model_config, features=features, labels=["label"])
         init_parameters(dcn_v1, device=torch.device("cpu"))
         dcn_v1 = create_test_model(dcn_v1, graph_type)
 

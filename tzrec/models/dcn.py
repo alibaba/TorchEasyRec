@@ -23,7 +23,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class DCNv1(RankModel):
+class DCNV1(RankModel):
     """Deep cross network v1.
 
     Args:

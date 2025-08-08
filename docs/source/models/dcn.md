@@ -6,11 +6,11 @@
 
 Deep＆Cross Network（DCN）是在DNN模型的基础上，引入了交叉网络，该网络在学习某些特征交叉时效率更高。特别是，DCN显式地在每一层应用特征交叉，不需要人工特征工程，并且只增加了很小的额外复杂性。
 
-![dcnv1](../../images/models/dcn_v1.jpg)
+![DCNV1](../../images/models/dcn_v1.jpg)
 
 ## 配置说明
 
-### DCNv1
+### DCNV1
 
 ```
 model_config {
