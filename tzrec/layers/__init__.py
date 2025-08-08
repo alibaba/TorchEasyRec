@@ -9,10 +9,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .backbone_module import FM, Add
-from .mlp import MLP
-from .mmoe import MMoE
-from .sequence import DINEncoder as DIN
-
-# from .fm import FactorizationMachine as FM
-__all__ = ["MLP", "Add", "FM", "DIN", "MMoE"]
+"""TorchEasyRec layers module."""

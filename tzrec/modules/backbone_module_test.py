@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+
 import torch
 from parameterized import parameterized
 
@@ -19,132 +20,134 @@ from tzrec.utils.test_util import TestGraphType, create_test_module
 
 class BackboneModuleTest(unittest.TestCase):
     """Test cases for backbone modules."""
-    
+
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_fm_with_3d_tensor(self, graph_type):
         """Test FM module with 3D tensor input."""
         batch_size, field_size, embedding_size = 32, 4, 16
-        
+
         # Create FM module
         fm = FM(use_variant=False, l2_regularization=1e-4)
         fm = create_test_module(fm, graph_type)
-        
+
         # Create input tensor
         input_tensor = torch.randn(batch_size, field_size, embedding_size)
-        
+
         # Forward pass
         output = fm(input_tensor)
-        
+
         # Check output shape
         self.assertEqual(output.shape, (batch_size, 1))
         self.assertEqual(fm.output_dim(), 1)
-    
+
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_fm_with_list_input(self, graph_type):
         """Test FM module with list of 2D tensors input."""
         batch_size, field_size, embedding_size = 32, 4, 16
-        
+
         # Create FM module
         fm = FM(use_variant=False, l2_regularization=1e-4)
         fm = create_test_module(fm, graph_type)
-        
+
         # Create list of 2D tensors
-        input_list = [torch.randn(batch_size, embedding_size) for _ in range(field_size)]
-        
+        input_list = [
+            torch.randn(batch_size, embedding_size) for _ in range(field_size)
+        ]
+
         # Forward pass
         output = fm(input_list)
-        
+
         # Check output shape
         self.assertEqual(output.shape, (batch_size, 1))
         self.assertEqual(fm.output_dim(), 1)
-    
+
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_fm_variant(self, graph_type):
         """Test FM module with variant computation."""
         batch_size, field_size, embedding_size = 32, 4, 16
-        
+
         # Create FM module with variant
         fm = FM(use_variant=True, l2_regularization=1e-4)
         fm = create_test_module(fm, graph_type)
-        
+
         # Create input tensor
         input_tensor = torch.randn(batch_size, field_size, embedding_size)
-        
+
         # Forward pass
         output = fm(input_tensor)
-        
+
         # Check output shape
         self.assertEqual(output.shape, (batch_size, 1))
         self.assertEqual(fm.output_dim(), 1)
-    
+
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_fm_equivalence(self, graph_type):
         """Test that both input formats produce same results."""
         batch_size, field_size, embedding_size = 8, 3, 4
-        
+
         # Create FM module
         fm = FM(use_variant=False, l2_regularization=0.0)
         fm = create_test_module(fm, graph_type)
-        
+
         # Create test data
         input_3d = torch.randn(batch_size, field_size, embedding_size)
         input_list = [input_3d[:, i, :] for i in range(field_size)]
-        
+
         # Forward pass with both input formats
         output_3d = fm(input_3d)
         output_list = fm(input_list)
-        
+
         # Check equivalence
         torch.testing.assert_close(output_3d, output_list, rtol=1e-5, atol=1e-5)
-    
+
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_fm_edge_cases(self, graph_type):
         """Test FM module edge cases."""
         batch_size, embedding_size = 32, 16
-        
+
         # Create FM module
         fm = FM(use_variant=False, l2_regularization=1e-4)
         fm = create_test_module(fm, graph_type)
-        
+
         # Test with single field (no interactions)
         single_field = torch.randn(batch_size, 1, embedding_size)
         output = fm(single_field)
         self.assertEqual(output.shape, (batch_size, 1))
         # Should be zero since no interactions possible
         self.assertTrue(torch.allclose(output, torch.zeros_like(output)))
-        
+
         # Note: 对于JIT_SCRIPT和FX_TRACE，不能测试运行时错误（如empty list），
         # 因为这些是编译时图优化，所以跳过empty list测试
-    
+
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_add_module(self, graph_type):
         """Test Add module."""
         batch_size, features = 32, 16
-        
+
         # Create Add module
         add_module = Add()
         add_module = create_test_module(add_module, graph_type)
-        
+
         # Create input tensors
         input1 = torch.randn(batch_size, features)
         input2 = torch.randn(batch_size, features)
         input3 = torch.randn(batch_size, features)
-        
+
         # Forward pass
         output = add_module(input1, input2, input3)
-        
+
         # Check output shape and value
         self.assertEqual(output.shape, (batch_size, features))
         expected = input1 + input2 + input3
@@ -154,7 +157,7 @@ class BackboneModuleTest(unittest.TestCase):
         """Test FM module runtime errors (only for NORMAL graph type)."""
         # 这些测试只适用于正常运行时，不适用于编译后的图
         fm = FM(use_variant=False, l2_regularization=1e-4)
-        
+
         # Test with empty list
         with self.assertRaises(IndexError):
             fm([])

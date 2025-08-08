@@ -18,11 +18,12 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.layers.backbone import Backbone
 from tzrec.models.rank_model import RankModel
-from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.protos import model_pb2
-from tzrec.utils.config_util import config_to_kwargs
 from tzrec.modules.variational_dropout import VariationalDropout
+from tzrec.protos import model_pb2
+from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.config_util import config_to_kwargs
+
 
 class RankBackbone(RankModel):
     """Ranking backbone model."""
@@ -41,7 +42,7 @@ class RankBackbone(RankModel):
         self._backbone_output = None
         self._l2_reg = None
         self._backbone_net = self.build_backbone_network()
-        
+
         # 使用backbone的最终输出维度，考虑top_mlp的影响
         output_dims = self._backbone_net.get_final_output_dim()
         # 如果有多个 package（如 Package.__packages 里），如何Í拿到output_dims，暂未实现
@@ -51,7 +52,7 @@ class RankBackbone(RankModel):
         #     print("  输出block维度:", pkg.output_block_dims())
         #     print("  总输出维度:", pkg.total_output_dim())
         self.output_mlp = nn.Linear(output_dims, self._num_class)
-    
+
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(
@@ -80,7 +81,6 @@ class RankBackbone(RankModel):
                         self.group_variational_dropouts[group_name] = (
                             variational_dropout
                         )
-        
 
     def build_backbone_network(self):
         """Build backbone."""
@@ -91,8 +91,12 @@ class RankBackbone(RankModel):
         #     # input_layer=self._input_layer,
         #     l2_reg=self._l2_reg,
         # )
-        wide_embedding_dim=int(self.wide_embedding_dim) if hasattr(self, "wide_embedding_dim") else None
-        wide_init_fn=self.wide_init_fn if hasattr(self, "wide_init_fn") else None
+        wide_embedding_dim = (
+            int(self.wide_embedding_dim)
+            if hasattr(self, "wide_embedding_dim")
+            else None
+        )
+        wide_init_fn = self.wide_init_fn if hasattr(self, "wide_init_fn") else None
         feature_groups = list(self._base_model_config.feature_groups)
         return Backbone(
             config=self._base_model_config.rank_backbone.backbone,
@@ -106,9 +110,9 @@ class RankBackbone(RankModel):
         )
 
     def backbone(
-        self, 
-        # group_features: Dict[str, torch.Tensor], 
-        batch: Batch
+        self,
+        # group_features: Dict[str, torch.Tensor],
+        batch: Batch,
     ) -> Optional[nn.Module]:
         # -> torch.Tensor:
         """Get backbone."""
@@ -140,6 +144,6 @@ class RankBackbone(RankModel):
         """
         # grouped_features = self.build_input(batch)
         # output = self.backbone(group_features=grouped_features, batch=batch)
-        output = self.backbone( batch=batch)
+        output = self.backbone(batch=batch)
         y = self.output_mlp(output)
         return self._output_to_prediction(y)

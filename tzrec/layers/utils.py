@@ -136,9 +136,9 @@ def params_to_dict(parameter):
 
     return convert(parameter)
 
+
 def infer_input_dim(input_dim, input_fn=None, input_slice=None):
-    """
-    input_dim: int 或 List[int]，原始输入维度
+    """input_dim: int 或 List[int]，原始输入维度
     input_fn: str，lambda表达式字符串
     input_slice: str，格式如'[1]'或'[0:2]'
     返回: 变换后的输入维度（int或list）
@@ -156,14 +156,15 @@ def infer_input_dim(input_dim, input_fn=None, input_slice=None):
         elif isinstance(idx, list):
             input_dim = [input_dim[i] for i in idx]
         else:
-            raise ValueError(f'input_slice({input_slice})格式无法识别')
-    
+            raise ValueError(f"input_slice({input_slice})格式无法识别")
+
     # 再处理input_fn (只支持常见表达式)
     if input_fn is not None:
         # 仅支持有限的自动推断，比如sum、reshape等
         if "sum" in input_fn:
             # 提取dim和keepdim
             import re
+
             m = re.search(r"sum\(dim=(\d+)(?:, *keepdim=(True|False))?", input_fn)
             if m:
                 dim = int(m.group(1))
@@ -181,7 +182,7 @@ def infer_input_dim(input_dim, input_fn=None, input_slice=None):
                     return new_dim[0]
                 else:
                     return tuple(new_dim)
-        
+
         elif "lambda x: [x]" in input_fn or input_fn.strip() == "lambda x: [x]":
             # 将输入打包成列表
             return [input_dim]
