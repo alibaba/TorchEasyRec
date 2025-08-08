@@ -97,3 +97,130 @@ class InteractionArch(nn.Module):
         interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
 
         return interactions_flat
+
+
+class CrossNetV2(nn.Module):
+    """Cross network v2.
+
+    Args:
+        in_features (int): number of elements in each input sample.
+        low_rank (int): W dimension
+        num_layers (int): number of cross layers.
+    """
+
+    def __init__(self, in_features: int, low_rank=32, num_layers=3):
+        super(CrossNetV2, self).__init__()
+        self._num_layers = num_layers
+        self._low_rank = low_rank
+        self._in_features = in_features
+        self.u_kernels = torch.nn.ParameterList(
+            [
+                torch.nn.Parameter(
+                    torch.nn.init.xavier_normal_(
+                        torch.empty(self._in_features, self._low_rank)
+                    )
+                )
+                for _ in range(self._num_layers)
+            ]
+        )
+        self.v_kernels = torch.nn.ParameterList(
+            [
+                torch.nn.Parameter(
+                    torch.nn.init.xavier_normal_(
+                        torch.empty(self._low_rank, self._in_features)
+                    )
+                )
+                for _ in range(self._num_layers)
+            ]
+        )
+
+        self.bias = torch.nn.ParameterList(
+            [
+                torch.nn.Parameter(torch.nn.init.zeros_(torch.empty(self._in_features)))
+                for _ in range(self._num_layers)
+            ]
+        )
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._in_features
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            input (torch.Tensor): tensor with shape [batch_size, in_features].
+        """
+        x_0 = input
+        x_l = x_0
+        for layer in range(self._num_layers):
+            x_l_v = torch.nn.functional.linear(x_l, self.v_kernels[layer])
+            x_l_w = torch.nn.functional.linear(x_l_v, self.u_kernels[layer])
+            x_l = x_0 * (x_l_w + self.bias[layer]) + x_l  # (batch_size, in_features)
+
+        return x_l
+
+
+class CIN(nn.Module):
+    """CIN module for XDeepFM.
+
+    Args:
+        feature_num (int): feature_num
+        cin_layer_size(list[int]): cin_layer_size
+    """
+
+    def __init__(self, feature_num: int, cin_layer_size: List[int], use_bias=False):
+        super(CIN, self).__init__()
+        self.feature_num = feature_num
+        self.cin_layer_size = cin_layer_size
+        self.use_bias = use_bias
+
+        self.cin_layers = nn.ModuleList()
+        for i, layer_size in enumerate(cin_layer_size):
+            in_channels = (
+                feature_num * self.cin_layer_size[i - 1]
+                if i > 0
+                else feature_num * feature_num
+            )
+            self.cin_layers.append(
+                nn.Conv1d(
+                    in_channels=in_channels, out_channels=layer_size, kernel_size=1
+                )
+            )
+
+        if self.use_bias:
+            self.bias = nn.ParameterList(
+                [
+                    nn.Parameter(torch.Tensor(cin_layer_size[i]))
+                    for i in range(len(cin_layer_size))
+                ]
+            )
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return sum(self.cin_layer_size)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            input (torch.Tensor): tensor with shape [batch_size, field_num, embed_dim].
+        """
+        batch_size, field_num, embed_dim = input.shape
+        x_vec = input
+        x_out = []
+        for i, _ in enumerate(self.cin_layer_size):
+            z = torch.einsum("bhd,bfd->bhfd", x_vec, input)
+            if i > 0:
+                h = field_num * self.cin_layer_size[i - 1]
+            else:
+                h = field_num * field_num
+            z = z.view(batch_size, h, embed_dim)
+            z = self.cin_layers[i](z)  # (batch_size, cin_layer_size[i], embed_dim)
+            if self.use_bias:
+                z += self.bias[i]
+            z = torch.relu(z)
+            x_vec = z
+            x_out.append(torch.sum(x_vec, dim=2))
+
+        return torch.cat(x_out, dim=1)

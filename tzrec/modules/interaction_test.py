@@ -15,7 +15,7 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.interaction import InputSENet, InteractionArch
+from tzrec.modules.interaction import CIN, CrossNetV2, InputSENet, InteractionArch
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -43,6 +43,30 @@ class InteractionArchTest(unittest.TestCase):
         sparse_features = torch.randn([10, 3, 8])
         result = ia(dense_features, sparse_features)
         self.assertEqual(result.size(), (10, 6))
+
+
+class CrossNetV2Test(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_cross_net_v2(self, graph_type) -> None:
+        dcn = CrossNetV2(32, 6, 2)
+        dcn = create_test_module(dcn, graph_type)
+        features = torch.randn([10, 32])
+        result = dcn(features)
+        self.assertEqual(result.size(), (10, 32))
+
+
+class CINTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_cin(self, graph_type) -> None:
+        cin = CIN(feature_num=9, cin_layer_size=[10, 15, 20])
+        cin = create_test_module(cin, graph_type)
+        features = torch.randn([5, 9, 16])
+        result = cin(features)
+        self.assertEqual(result.size(), (5, 45))
 
 
 if __name__ == "__main__":
