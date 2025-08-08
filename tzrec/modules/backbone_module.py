@@ -16,11 +16,28 @@ import torch.nn as nn
 
 
 class Add(nn.Module):
+    """Element-wise addition module for multiple tensors.
+
+    This module performs element-wise addition of multiple input tensors.
+    It supports variable number of tensor inputs and adds them together.
+    """
+
     def forward(self, *inputs):
-        # Supports list/tuple input
+        """Add multiple input tensors element-wise.
+
+        Args:
+            *inputs: Variable number of tensors to add together.
+
+        Returns:
+            torch.Tensor: Sum of all input tensors.
+        """
+        # Supports list/tuple input - avoid len() for FX tracing compatibility
+        if not inputs:
+            raise ValueError("At least one input tensor is required")
+        
         out = inputs[0]
-        for i in range(1, len(inputs)):
-            out = out + inputs[i]
+        for input_tensor in inputs[1:]:
+            out = out + input_tensor
         return out
 
 

@@ -1,13 +1,26 @@
-from tzrec.datasets.utils import Batch
-from tzrec.modules.embedding import EmbeddingGroup
+# Copyright (c) 2025, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, List, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
+
+from tzrec.datasets.utils import Batch
+from tzrec.modules.embedding import EmbeddingGroup
+
+
 class EnhancedEmbeddingGroup(nn.Module):
-    """
-    对EmbeddingGroup输出的分组特征做增强处理：归一化、特征Dropout、普通Dropout等。
-    支持灵活输出格式。
-    """
+    """对EmbeddingGroup输出的分组特征做增强处理：归一化、特征Dropout、普通Dropout等."""
+
     def __init__(
         self,
         embedding_group: EmbeddingGroup,
@@ -40,44 +53,37 @@ class EnhancedEmbeddingGroup(nn.Module):
 
         # 归一化/Dropout层后面动态创建
         self._built = False
-    
+
     def output_dim(self) -> int:
-        """
-        获取整体拼接后（默认输出）的特征总维度。
-        对应 default 返回 torch.cat(processed_features, dim=-1) 的维度。
+        """获取整体拼接后（默认输出）的特征总维度.
+
+        对应 default 返回 torch.cat(processed_features, dim=-1) 的维度.
         """
         # 用 group_total_dim 方法最合理
         return self.group_total_dim()
 
     def group_feature_dims(self) -> Dict[str, int]:
-        """
-        返回该 group 内每个特征的维度，字典格式：特征名 -> 维度
-        """
+        """返回该 group 内每个特征的维度，字典格式：特征名 -> 维度."""
         return self.embedding_group.group_feature_dims(self.group_name)
 
     def group_dims(self) -> List[int]:
-        """
-        返回该 group 内每个特征的维度，list形式
-        """
+        """返回该 group 内每个特征的维度，list形式."""
         dims = self.group_feature_dims()
         return list(dims.values())
 
     def group_total_dim(self) -> int:
-        """
-        该 group 所有特征拼接起来的总维度
-        """
+        """该 group 所有特征拼接起来的总维度."""
         # 推荐调用 embedding_group 的 group_total_dim
         return self.embedding_group.group_total_dim(self.group_name)
 
     # 可选，实现一个能返回3D输出时每个维的size的方法
     def output_3d_shape(self, batch_size: int) -> torch.Size:
-        """
-        如果 only_output_3d_tensor 为 True，返回输出tensor的shape
-        """
+        """如果 only_output_3d_tensor 为 True，返回输出tensor的shape."""
         dims = self.group_dims()
         return torch.Size([batch_size, len(dims), max(dims)])
 
     def build(self, sample_feature: torch.Tensor):
+        """Build normalization and dropout layers based on feature dimensions."""
         feature_dim = sample_feature.shape[-1]
         if self.do_batch_norm:
             self.bn = nn.BatchNorm1d(feature_dim)
@@ -92,10 +98,21 @@ class EnhancedEmbeddingGroup(nn.Module):
         else:
             self.dropout = None
         self._built = True
-    
+
     def forward(
         self, batch: Batch, is_training: bool = True
-    ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+    ) -> Union[
+        torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]
+    ]:
+        """Forward pass with enhanced feature processing.
+
+        Args:
+            batch: Input batch data.
+            is_training: Whether in training mode.
+
+        Returns:
+            Processed features in various formats based on configuration.
+        """
         # Step 1: 调用embedding_group获得特征
         group_features = self.embedding_group.forward(batch)
         # group_features: dict[group_name] -> torch.Tensor or list
@@ -105,7 +122,11 @@ class EnhancedEmbeddingGroup(nn.Module):
         # for sequence特征你可以自定义适配
         if isinstance(features, (list, tuple)):
             feature_list = list(features)
-            features = torch.cat(feature_list, dim=-1) if self.concat_seq_feature else feature_list
+            features = (
+                torch.cat(feature_list, dim=-1)
+                if self.concat_seq_feature
+                else feature_list
+            )
         else:
             feature_list = [features]
 
@@ -134,7 +155,11 @@ class EnhancedEmbeddingGroup(nn.Module):
             if self.do_layer_norm:
                 out = self.ln(out)
             if is_training and 0.0 < self.feature_dropout_rate < 1.0:
-                mask = torch.bernoulli(torch.full(out.shape, 1 - self.feature_dropout_rate, device=out.device))
+                mask = torch.bernoulli(
+                    torch.full(
+                        out.shape, 1 - self.feature_dropout_rate, device=out.device
+                    )
+                )
                 out = out * mask / (1 - self.feature_dropout_rate)
             if self.dropout is not None:
                 out = self.dropout(out)
@@ -156,11 +181,11 @@ class EnhancedEmbeddingGroup(nn.Module):
         # 默认：输出拼接后的特征
         return features_concat
 
-    def predict(
-        self, batch: Batch
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    def predict(self, batch: Batch) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Perform prediction with training mode disabled."""
         return self.forward(batch, is_training=False)
-    
+
+
 # embedding_group = EmbeddingGroup(...)
 # enhanced = EnhancedEmbeddingGroup(
 #     embedding_group,
