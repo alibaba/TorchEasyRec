@@ -32,6 +32,17 @@ from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
 
+@torch.fx.wrap
+def _fx_timestamp_contextual_zeros(
+    seq_timestamp: torch.Tensor, seq_lengths: torch.Tensor, max_contextual_seq_len: int
+) -> torch.Tensor:
+    return torch.zeros(
+        (seq_lengths.size(0) * max_contextual_seq_len, 1),
+        dtype=seq_timestamp.dtype,
+        device=seq_timestamp.device,
+    )
+
+
 class InputPreprocessor(BaseModule):
     """An abstract class for pre-processing sequence embeddings before HSTU layers."""
 
@@ -316,10 +327,10 @@ class ContextualPreprocessor(InputPreprocessor):
                 kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
-                values_left=torch.zeros(
-                    (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
-                    dtype=output_seq_timestamps.dtype,
-                    device=output_seq_timestamps.device,
+                values_left=_fx_timestamp_contextual_zeros(
+                    output_seq_timestamps,
+                    output_seq_lengths,
+                    self._max_contextual_seq_len,
                 ),
                 values_right=output_seq_timestamps.unsqueeze(-1),
                 max_len_left=self._max_contextual_seq_len,
@@ -532,10 +543,10 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
                 kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
-                values_left=torch.zeros(
-                    (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
-                    dtype=output_seq_timestamps.dtype,
-                    device=output_seq_timestamps.device,
+                values_left=_fx_timestamp_contextual_zeros(
+                    output_seq_timestamps,
+                    output_seq_lengths,
+                    self._max_contextual_seq_len,
                 ),
                 values_right=output_seq_timestamps.unsqueeze(-1),
                 max_len_left=self._max_contextual_seq_len,

@@ -485,7 +485,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
-@triton.autotune(
+@triton_autotune(
     configs=_get_fw_configs(),
     key=[
         "AUTOTUNE_Z",
@@ -577,138 +577,6 @@ def _hstu_attn_fwd(  # noqa C901
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )
-
-
-@triton.autotune(
-    configs=_get_fw_configs(),
-    key=[
-        "AUTOTUNE_Z",
-        "H",
-        "AUTOTUNE_MAX_SEQ_LEN",
-        "DimQ",
-        "DimV",
-        "DeltaSize",
-        "IS_DELTA_Q",
-    ],
-)
-@triton.jit
-def _hstu_attn_fwd_persistent(  # noqa C901
-    Q,
-    K,
-    V,
-    sort_by_length_indices,
-    seq_offsets,
-    num_targets,
-    Out,
-    stride_qm,
-    stride_qh,
-    stride_kn,
-    stride_kh,
-    stride_vn,
-    stride_vh,
-    stride_om,
-    stride_oh,
-    alpha,
-    Z,
-    AUTOTUNE_Z,
-    H,
-    MAX_SEQ_LEN,
-    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
-    DimQ,
-    DimV,
-    DeltaSize,
-    contextual_seq_len,
-    max_attn_len,
-    CAUSAL: tl.constexpr,
-    HAS_MULTIPLE_TARGETS: tl.constexpr,
-    IS_DELTA_Q: tl.constexpr,
-    ALLOW_TF32: tl.constexpr,
-    BLOCK_D_Q: tl.constexpr,
-    BLOCK_D_V: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
-    HAS_MAX_ATTN_LEN: tl.constexpr,
-    HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
-):
-    n_tile_num = tl.cdiv(MAX_SEQ_LEN, BLOCK_M)
-    prog_id = tl.program_id(0)
-    num_progs = tl.num_programs(0)
-
-    total_tiles = n_tile_num * Z * H
-
-    tiles_per_sm = total_tiles // num_progs
-    if prog_id < total_tiles % num_progs:
-        tiles_per_sm += 1
-
-    tile_idx = prog_id
-    for _ in range(0, tiles_per_sm):
-        pid = (total_tiles - tile_idx - 1) // (Z * H)
-        off_hz = (total_tiles - tile_idx - 1) % (Z * H)
-        off_z = off_hz // H
-        off_h = off_hz % H
-        _hstu_attn_fwd_compute(
-            Q=Q,
-            K=K,
-            V=V,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            Out=Out,
-            stride_qm=stride_qm,
-            stride_qh=stride_qh,
-            stride_kn=stride_kn,
-            stride_kh=stride_kh,
-            stride_vn=stride_vn,
-            stride_vh=stride_vh,
-            stride_om=stride_om,
-            stride_oh=stride_oh,
-            alpha=alpha,
-            MAX_SEQ_LEN=MAX_SEQ_LEN,
-            DeltaSize=DeltaSize,
-            contextual_seq_len=contextual_seq_len,
-            max_attn_len=max_attn_len,
-            off_z=off_z,
-            off_h=off_h,
-            pid=pid,
-            CAUSAL=CAUSAL,
-            HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
-            IS_DELTA_Q=IS_DELTA_Q,
-            ALLOW_TF32=ALLOW_TF32,
-            BLOCK_D_Q=BLOCK_D_Q,
-            BLOCK_D_V=BLOCK_D_V,
-            HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-            HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-        )
-        tile_idx += num_progs
-
-
-_hstu_attn_fwd = triton_autotune(
-    configs=_get_fw_configs(),
-    key=[
-        "AUTOTUNE_Z",
-        "H",
-        "AUTOTUNE_MAX_SEQ_LEN",
-        "DimQ",
-        "DimV",
-        "DeltaSize",
-        "IS_DELTA_Q",
-    ],
-)(_hstu_attn_fwd.fn)
-
-_hstu_attn_fwd_persistent = triton_autotune(
-    configs=_get_fw_configs(),
-    key=[
-        "AUTOTUNE_Z",
-        "H",
-        "AUTOTUNE_MAX_SEQ_LEN",
-        "DimQ",
-        "DimV",
-        "DeltaSize",
-        "IS_DELTA_Q",
-    ],
-)(_hstu_attn_fwd_persistent.fn)
 
 
 @triton.jit
