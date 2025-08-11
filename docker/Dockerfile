@@ -29,7 +29,7 @@ RUN case ${DEVICE} in \
         "cu126") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
                  dpkg -i cuda-keyring_1.1-1_all.deb && \
                  apt-get update && \
-                 apt-get install cuda-compat-12-6 && \
+                 apt-get install -y cuda-12-6 cuda-compat-12-6 && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \

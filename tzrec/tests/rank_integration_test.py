@@ -100,6 +100,15 @@ class RankIntegrationTest(unittest.TestCase):
                 env_str="INPUT_TILE=3 ENABLE_AOT=1",
             )
         self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt"))
+        )
 
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
         self._test_rank_nofg(
