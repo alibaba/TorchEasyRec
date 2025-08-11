@@ -34,7 +34,7 @@ class Add(nn.Module):
         # Supports list/tuple input - avoid len() for FX tracing compatibility
         if not inputs:
             raise ValueError("At least one input tensor is required")
-        
+
         out = inputs[0]
         for input_tensor in inputs[1:]:
             out = out + input_tensor

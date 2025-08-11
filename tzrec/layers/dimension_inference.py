@@ -19,7 +19,7 @@ import torch.nn as nn
 
 
 class DimensionInfo:
-    """表示维度信息的类，支持多种维度表示方式"""
+    """表示维度信息的类，支持多种维度表示方式."""
 
     def __init__(
         self,
@@ -28,11 +28,13 @@ class DimensionInfo:
         is_list: bool = False,
         feature_dim: Optional[int] = None,
     ):
-        """Args:
-        dim: 维度信息，可以是int（单一维度）或list/tuple（多个维度）
-        shape: 完整的tensor shape信息（如果可用）
-        is_list: 是否表示list类型的输出
-        feature_dim: 显式指定的特征维度，用于覆盖自动推断
+        """Initialize DimensionInfo.
+
+        Args:
+            dim: 维度信息，可以是int（单一维度）或list/tuple（多个维度）
+            shape: 完整的tensor shape信息（如果可用）
+            is_list: 是否表示list类型的输出
+            feature_dim: 显式指定的特征维度，用于覆盖自动推断
         """
         self.dim = dim
         self.shape = shape
@@ -40,10 +42,13 @@ class DimensionInfo:
         self._feature_dim = feature_dim
 
     def __repr__(self):
-        return f"DimensionInfo(dim={self.dim}, shape={self.shape}, is_list={self.is_list}, feature_dim={self._feature_dim})"
+        return (
+            f"DimensionInfo(dim={self.dim}, shape={self.shape}, "
+            f"is_list={self.is_list}, feature_dim={self._feature_dim})"
+        )
 
     def get_feature_dim(self) -> int:
-        """获取特征维度（最后一个维度）"""
+        """获取特征维度（最后一个维度）."""
         # 优先使用显式指定的特征维度
         if self._feature_dim is not None:
             return self._feature_dim
@@ -58,19 +63,19 @@ class DimensionInfo:
         return self.dim
 
     def get_total_dim(self) -> int:
-        """获取总维度（用于concat等操作）"""
+        """获取总维度（用于concat等操作）."""
         if isinstance(self.dim, (list, tuple)):
             return sum(self.dim)
         return self.dim
 
     def to_list(self) -> List[int]:
-        """转换为list形式的维度表示"""
+        """转换为list形式的维度表示."""
         if isinstance(self.dim, (list, tuple)):
             return list(self.dim)
         return [self.dim]
 
     def with_shape(self, shape: Tuple[int, ...]) -> "DimensionInfo":
-        """返回带有指定shape信息的新DimensionInfo"""
+        """返回带有指定shape信息的新DimensionInfo."""
         feature_dim = shape[-1] if shape else self.get_feature_dim()
         return DimensionInfo(
             dim=self.dim, shape=shape, is_list=self.is_list, feature_dim=feature_dim
@@ -79,7 +84,7 @@ class DimensionInfo:
     def estimate_shape(
         self, batch_size: int = None, seq_len: int = None
     ) -> Tuple[int, ...]:
-        """基于已知信息估算shape
+        """基于已知信息估算shape.
 
         Args:
             batch_size: 批次大小
@@ -107,7 +112,7 @@ class DimensionInfo:
 
 
 class DimensionInferenceEngine:
-    """维度推断引擎，负责管理和推断block之间的维度信息"""
+    """维度推断引擎，负责管理和推断block之间的维度信息."""
 
     def __init__(self):
         self.block_input_dims: Dict[str, DimensionInfo] = {}
@@ -116,27 +121,27 @@ class DimensionInferenceEngine:
         self.logger = logging.getLogger(__name__)
 
     def register_input_dim(self, block_name: str, dim_info: DimensionInfo):
-        """注册block的输入维度"""
+        """注册block的输入维度."""
         self.block_input_dims[block_name] = dim_info
         logging.debug(f"Registered input dim for {block_name}: {dim_info}")
 
     def register_output_dim(self, block_name: str, dim_info: DimensionInfo):
-        """注册block的输出维度"""
+        """注册block的输出维度."""
         self.block_output_dims[block_name] = dim_info
         logging.debug(f"Registered output dim for {block_name}: {dim_info}")
 
     def register_layer(self, block_name: str, layer: nn.Module):
-        """注册block对应的layer"""
+        """注册block对应的layer."""
         self.block_layers[block_name] = layer
 
     def get_output_dim(self, block_name: str) -> Optional[DimensionInfo]:
-        """获取block的输出维度"""
+        """获取block的输出维度."""
         return self.block_output_dims.get(block_name)
 
     def infer_layer_output_dim(
         self, layer: nn.Module, input_dim: DimensionInfo
     ) -> DimensionInfo:
-        """推断layer的输出维度"""
+        """推断layer的输出维度."""
         if hasattr(layer, "output_dim") and callable(layer.output_dim):
             # 如果layer有output_dim方法，直接调用
             try:
@@ -163,7 +168,7 @@ class DimensionInferenceEngine:
         # 使用专门的辅助函数
         try:
             return create_dimension_info_from_layer_output(layer, input_dim)
-        except:
+        except Exception:
             # 如果辅助函数失败，回退到原始逻辑
             pass
 
@@ -198,7 +203,8 @@ class DimensionInferenceEngine:
                     if total_dim > 0:
                         sequence_dim = total_dim // 2  # 简化假设
                         logging.info(
-                            f"DIN output dimension inferred as {sequence_dim} (half of input {total_dim})"
+                            f"DIN output dimension inferred as {sequence_dim} "
+                            f"(half of input {total_dim})"
                         )
                         return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
 
@@ -219,7 +225,7 @@ class DimensionInferenceEngine:
                 try:
                     output_dim = layer.output_dim()
                     return DimensionInfo(output_dim, feature_dim=output_dim)
-                except:
+                except Exception:
                     pass
 
             # 如果无法从layer获取，从输入推断
@@ -276,7 +282,7 @@ class DimensionInferenceEngine:
         input_fn: Optional[str] = None,
         input_slice: Optional[str] = None,
     ) -> DimensionInfo:
-        """应用input_fn和input_slice变换"""
+        """应用input_fn和input_slice变换."""
         current_dim = input_dim
 
         # 先应用input_slice
@@ -292,7 +298,7 @@ class DimensionInferenceEngine:
     def _apply_input_slice(
         self, dim_info: DimensionInfo, input_slice: str
     ) -> DimensionInfo:
-        """应用input_slice变换"""
+        """应用input_slice变换."""
         try:
             # 解析slice表达式
             slice_expr = eval(
@@ -308,7 +314,8 @@ class DimensionInferenceEngine:
                     return DimensionInfo(new_dim)
                 else:
                     raise ValueError(
-                        f"Cannot apply index {slice_expr} to scalar dimension {dim_info.dim}"
+                        f"Cannot apply index {slice_expr} to scalar dimension "
+                        f"{dim_info.dim}"
                     )
 
             elif isinstance(slice_expr, slice):
@@ -318,7 +325,8 @@ class DimensionInferenceEngine:
                     return DimensionInfo(new_dim, is_list=True)
                 else:
                     raise ValueError(
-                        f"Cannot apply slice {slice_expr} to scalar dimension {dim_info.dim}"
+                        f"Cannot apply slice {slice_expr} to scalar dimension "
+                        f"{dim_info.dim}"
                     )
 
             else:
@@ -330,7 +338,7 @@ class DimensionInferenceEngine:
             return dim_info
 
     def _apply_input_fn(self, dim_info: DimensionInfo, input_fn: str) -> DimensionInfo:
-        """应用input_fn变换 - 改进版本，优先使用dummy tensor推断"""
+        """应用input_fn变换 - 改进版本，优先使用dummy tensor推断."""
         try:
             # 首先尝试使用dummy tensor进行精确推断
             try:
@@ -338,12 +346,14 @@ class DimensionInferenceEngine:
 
                 result = infer_lambda_output_dim(dim_info, input_fn, safe_mode=True)
                 self.logger.info(
-                    f"Successfully inferred output dim using dummy tensor for '{input_fn}': {result}"
+                    f"Successfully inferred output dim using dummy tensor for "
+                    f"'{input_fn}': {result}"
                 )
                 return result
             except Exception as e:
                 self.logger.debug(
-                    f"Dummy tensor inference failed for '{input_fn}': {e}, falling back to pattern matching"
+                    f"Dummy tensor inference failed for '{input_fn}': {e}, "
+                    f"falling back to pattern matching"
                 )
 
             # 如果dummy tensor推断失败，回退到原来的模式匹配方法
@@ -356,7 +366,7 @@ class DimensionInferenceEngine:
     def _apply_input_fn_pattern_matching(
         self, dim_info: DimensionInfo, input_fn: str
     ) -> DimensionInfo:
-        """应用input_fn变换 - 模式匹配版本（作为fallback）"""
+        """应用input_fn变换 - 模式匹配版本（作为fallback）."""
         try:
             # 常见的input_fn模式匹配
 
@@ -365,7 +375,10 @@ class DimensionInferenceEngine:
                 return DimensionInfo(dim_info.to_list(), is_list=True)
 
             # lambda x: x.sum(dim=...) - 求和操作
-            sum_pattern = r"lambda\s+x:\s+x\.sum\s*\(\s*dim\s*=\s*(-?\d+)(?:\s*,\s*keepdim\s*=\s*(True|False))?\s*\)"
+            sum_pattern = (
+                r"lambda\s+x:\s+x\.sum\s*\(\s*dim\s*=\s*(-?\d+)"
+                r"(?:\s*,\s*keepdim\s*=\s*(True|False))?\s*\)"
+            )
             match = re.search(sum_pattern, input_fn)
             if match:
                 dim = int(match.group(1))
@@ -412,12 +425,16 @@ class DimensionInferenceEngine:
                     else:
                         # 其他维度的求和，保守处理
                         logging.warning(
-                            f"Sum on dim={dim} with limited shape info, assuming feature dim unchanged"
+                            f"Sum on dim={dim} with limited shape info, "
+                            f"assuming feature dim unchanged"
                         )
                         return dim_info
 
             # lambda x: x.mean(dim=...) - 均值操作，类似于sum
-            mean_pattern = r"lambda\s+x:\s+x\.mean\s*\(\s*dim\s*=\s*(-?\d+)(?:\s*,\s*keepdim\s*=\s*(True|False))?\s*\)"
+            mean_pattern = (
+                r"lambda\s+x:\s+x\.mean\s*\(\s*dim\s*=\s*(-?\d+)"
+                r"(?:\s*,\s*keepdim\s*=\s*(True|False))?\s*\)"
+            )
             match = re.search(mean_pattern, input_fn)
             if match:
                 # 均值操作的维度变化与sum相同
@@ -448,7 +465,7 @@ class DimensionInferenceEngine:
                         if last_dim_match:
                             last_dim = int(last_dim_match.group(1))
                             return DimensionInfo(last_dim, feature_dim=last_dim)
-                    except:
+                    except Exception:
                         pass
 
                 logging.warning(
@@ -511,7 +528,8 @@ class DimensionInferenceEngine:
             if "transpose" in input_fn:
                 # 转置通常不改变特征维度，只改变维度顺序
                 logging.info(
-                    f"Transpose operation detected: {input_fn}, assuming feature dim unchanged"
+                    f"Transpose operation detected: {input_fn}, assuming "
+                    f"feature dim unchanged"
                 )
                 return dim_info
 
@@ -526,7 +544,7 @@ class DimensionInferenceEngine:
     def merge_input_dims(
         self, input_dims: List[DimensionInfo], merge_mode: str = "concat"
     ) -> DimensionInfo:
-        """合并多个输入维度"""
+        """合并多个输入维度."""
         if not input_dims:
             raise ValueError("No input dimensions to merge")
 
@@ -563,7 +581,7 @@ class DimensionInferenceEngine:
     def validate_dimension_compatibility(
         self, layer: nn.Module, input_dim: DimensionInfo
     ) -> bool:
-        """验证layer与输入维度的兼容性"""
+        """验证layer与输入维度的兼容性."""
         try:
             layer_type = type(layer).__name__
 
@@ -574,7 +592,8 @@ class DimensionInferenceEngine:
                     expected_dim != -1 and expected_dim != actual_dim
                 ):  # -1表示LazyLinear未初始化
                     logging.warning(
-                        f"Dimension mismatch for {layer_type}: expected {expected_dim}, got {actual_dim}"
+                        f"Dimension mismatch for {layer_type}: expected "
+                        f"{expected_dim}, got {actual_dim}"
                     )
                     return False
 
@@ -583,7 +602,8 @@ class DimensionInferenceEngine:
                 actual_dim = input_dim.get_feature_dim()
                 if expected_dim != actual_dim:
                     logging.warning(
-                        f"Dimension mismatch for MLP: expected {expected_dim}, got {actual_dim}"
+                        f"Dimension mismatch for MLP: expected {expected_dim}, "
+                        f"got {actual_dim}"
                     )
                     return False
 
@@ -594,7 +614,7 @@ class DimensionInferenceEngine:
             return True  # 验证失败时默认兼容
 
     def get_summary(self) -> Dict[str, Any]:
-        """获取维度推断的摘要信息"""
+        """获取维度推断的摘要信息."""
         return {
             "total_blocks": len(self.block_output_dims),
             "input_dims": {
@@ -609,7 +629,7 @@ class DimensionInferenceEngine:
 def create_dimension_info_from_embedding(
     embedding_group, group_name: str, batch_size: int = None
 ) -> DimensionInfo:
-    """从embedding group创建维度信息
+    """从embedding group创建维度信息.
 
     Args:
         embedding_group: embedding组对象
@@ -641,9 +661,9 @@ def create_dimension_info_from_embedding(
 def create_dimension_info_from_layer_output(
     layer: nn.Module, input_dim_info: DimensionInfo
 ) -> DimensionInfo:
-    """从layer和输入维度信息创建输出维度信息
+    """从layer和输入维度信息创建输出维度信息.
 
-    这是一个辅助函数，用于更准确地推断layer的输出维度
+    这是一个辅助函数，用于更准确地推断layer的输出维度.
     """
     layer_type = type(layer).__name__
 
@@ -710,12 +730,14 @@ def create_dimension_info_from_layer_output(
                 # 实际项目中应该从feature group配置获取更准确的维度信息
                 output_dim = total_dim // 2
                 logging.info(
-                    f"DIN output dimension inferred as {output_dim} from input {total_dim}"
+                    f"DIN output dimension inferred as {output_dim} "
+                    f"from input {total_dim}"
                 )
             else:
                 output_dim = input_dim_info.get_feature_dim()
                 logging.warning(
-                    f"Cannot infer DIN sequence dimension, using input dim: {output_dim}"
+                    f"Cannot infer DIN sequence dimension, using input dim: "
+                    f"{output_dim}"
                 )
 
         # 估算输出shape
@@ -740,7 +762,7 @@ def create_dimension_info_from_layer_output(
             # 使用DINEncoder的output_dim方法
             try:
                 output_dim = layer.output_dim()
-            except:
+            except Exception:
                 output_dim = input_dim_info.get_feature_dim()
         else:
             # 未初始化的DINEncoder，使用sequence_dim（如果有的话）

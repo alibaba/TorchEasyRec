@@ -44,7 +44,7 @@ class LambdaWrapper(nn.Module):
         self._compile_function()
 
     def _compile_function(self):
-        """Compiling Lambda Functions"""
+        """Compiling Lambda Functions."""
         try:
             # Creating a secure execution environment
             safe_globals = {
@@ -67,7 +67,7 @@ class LambdaWrapper(nn.Module):
             raise
 
     def forward(self, x):
-        """Executing lambda expressions"""
+        """Executing lambda expressions."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
         return self._lambda_fn(x)
@@ -83,7 +83,7 @@ class LambdaWrapper(nn.Module):
             return output_dim_info
         except Exception as e:
             logging.warning(
-                f"Failed to infer output dim for lambda {self.name}: {e}, using input dim"
+                f"Failed to infer output dim for lambda {self.name}: {e}, using input dim"  # NOQA
             )
             return input_dim_info
 
@@ -106,6 +106,15 @@ class Package(nn.Module):
 
     @staticmethod
     def backbone_block_outputs(name):
+        """Get the outputs of a backbone block by name.
+
+        Args:
+            name (str): The name of the backbone block to retrieve outputs for.
+
+        Returns:
+            Any: The output of the specified backbone block, or None if the backbone
+                package doesn't exist or the block is not found.
+        """
         if "backbone" not in Package.__packages:
             return None
         backbone = Package.__packages["backbone"]
@@ -144,7 +153,8 @@ class Package(nn.Module):
         self.dim_engine = DimensionInferenceEngine()
 
         # 保留兼容性的旧字段
-        self._name_to_output_dim = {}  # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
+        # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
+        self._name_to_output_dim = {}
         self._name_to_input_dim = {}  # 存储每个Block的输入维度
 
         self.reset_input_config(None)
@@ -186,7 +196,10 @@ class Package(nn.Module):
                         self._dag.add_edge(input_name, name)
                         self.G.add_edge(input_name, name)
                 elif input_type == "package_name":
-                    # package 为子DAG 作为 Block 的输入 | block package可以打包一组block，构成一个可被复用的子网络，即被打包的子网络以共享参数的方式在同一个模型中调用多次
+                    # package 为子DAG 作为 Block 的输入
+                    # block package可以打包一组block，
+                    # 构成一个可被复用的子网络，
+                    # 被打包的子网络以共享参数的方式在同一个模型中调用多次
                     raise NotImplementedError
                     self._dag.add_node_if_not_exists(input_name)
                     self._dag.add_edge(input_name, name)
@@ -203,7 +216,7 @@ class Package(nn.Module):
                         self.G.add_edge(input_name, name)
                     else:
                         raise KeyError(
-                            f"input name `{input_name}` not found in blocks/feature_groups"
+                            f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
                         )
         # ========== step 3: topo排序后依次define_layer ============
         # self.G拓扑排序 输出图片
@@ -233,8 +246,6 @@ class Package(nn.Module):
                         + block.name
                     )
                 group = one_input.feature_group_name
-                # 计算output_dim
-                # self._name_to_output_dim[block_name] = self._embedding_group.group_total_dim(group) # 计算input_layer的输出维度
 
                 if group in input_feature_groups:
                     # 已有，不重复注册
@@ -248,11 +259,6 @@ class Package(nn.Module):
                         self._name_to_layer[block.name] = input_fn
                     elif layer == "embedding_layer":
                         raise NotImplementedError
-                        inputs, vocab, weights = input_feature_groups[group]
-                        block.embedding_layer.vocab_size = vocab
-                        params = Parameter.make_from_pb(block.embedding_layer)
-                        input_fn = EmbeddingLayer(params, block.name)
-                        self._name_to_layer[block.name] = input_fn
                 else:
                     input_fn = EmbeddingGroup(
                         features=self._features,
@@ -279,26 +285,8 @@ class Package(nn.Module):
                         )
                     elif layer == "raw_input":
                         raise NotImplementedError
-                        input_fn = self._input_layer.get_raw_features(
-                            self._features, group
-                        )
-                        input_feature_groups[group] = input_fn
                     else:  # embedding_layer
                         raise NotImplementedError
-                        inputs, vocab, weights = (
-                            self._input_layer.get_bucketized_features(
-                                self._features, group
-                            )
-                        )
-                        block.embedding_layer.vocab_size = vocab
-                        params = Parameter.make_from_pb(block.embedding_layer)
-                        input_fn = EmbeddingLayer(params, block.name)
-                        input_feature_groups[group] = (inputs, vocab, weights)
-                        logging.info(
-                            "add an embedding layer %s with vocab size %d",
-                            block.name,
-                            vocab,
-                        )
                     self._name_to_layer[block.name] = input_fn
             else:  # module
                 # 使用新的维度推断引擎处理多输入维度
@@ -325,7 +313,7 @@ class Package(nn.Module):
                                 input_dim_info = DimensionInfo(output_dim)
                             else:
                                 raise KeyError(
-                                    f"input name `{input_name}` not found in blocks/feature_groups"
+                                    f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
                                 )
 
                         # 应用input_fn和input_slice变换
@@ -369,7 +357,7 @@ class Package(nn.Module):
                         # 使用LambdaWrapper的infer_output_dim方法
                         output_dim_info = layer_obj.infer_output_dim(merged_input_dim)
                         logging.info(
-                            f"Lambda layer {block.name} inferred output dim: {output_dim_info}"
+                            f"Lambda layer {block.name} inferred output dim: {output_dim_info}"  # NOQA
                         )
                     else:
                         # 验证维度兼容性
@@ -377,7 +365,7 @@ class Package(nn.Module):
                             layer_obj, merged_input_dim
                         ):
                             logging.warning(
-                                f"Dimension compatibility check failed for block {block.name}"
+                                f"Dimension compatibility check failed for block {block.name}"  # NOQA
                             )
 
                         # 推断输出维度 - 使用改进的方法
@@ -405,8 +393,7 @@ class Package(nn.Module):
             len(self._name_to_blocks) - num_groups
         )  # 减去输入特征组的数量,blocks里包含了 feature_groups e.g. feature group user
         assert num_blocks > 0, "there must be at least one block in backbone"
-        #
-        num_pkg_input = 0
+        # num_pkg_input = 0 处理多pkg 暂未支持
         # 可选: 检查package输入
         # 如果不配置concat_blocks，框架会自动拼接DAG的所有叶子节点并输出
         if len(config.concat_blocks) == 0 and len(config.output_blocks) == 0:
@@ -430,14 +417,14 @@ class Package(nn.Module):
         )
 
     def get_output_block_names(self):
-        """返回最终作为输出的 block 名字列表（优先 concat_blocks，否则 output_blocks）。"""
+        """返回最终作为输出的 block 名字列表（优先 concat_blocks，否则 output_blocks）。"""  # NOQA
         blocks = list(getattr(self._config, "concat_blocks", []))
         if not blocks:
             blocks = list(getattr(self._config, "output_blocks", []))
         return blocks
 
     def get_dimension_summary(self) -> Dict[str, Any]:
-        """获取维度推断的详细摘要信息"""
+        """获取维度推断的详细摘要信息."""
         summary = self.dim_engine.get_summary()
         summary.update(
             {
@@ -452,7 +439,7 @@ class Package(nn.Module):
         return summary
 
     def validate_all_dimensions(self) -> bool:
-        """验证所有block的维度兼容性"""
+        """验证所有block的维度兼容性."""
         all_valid = True
         for block_name, layer in self._name_to_layer.items():
             input_dim_info = self.dim_engine.block_input_dims.get(block_name)
@@ -467,7 +454,7 @@ class Package(nn.Module):
         return all_valid
 
     def output_block_dims(self):
-        """返回最终输出 block 的维度组成的 list，比如 [160, 96]"""
+        """返回最终输出 block 的维度组成的 list，比如 [160, 96]."""
         blocks = self.get_output_block_names()
         # import pdb; pdb.set_trace()
         dims = []
@@ -484,11 +471,11 @@ class Package(nn.Module):
         return dims
 
     def total_output_dim(self):
-        """返回拼接后最终输出的总维度"""
+        """返回拼接后最终输出的总维度."""
         return sum(self.output_block_dims())
 
     def define_layers(self, layer, layer_cnf, name, reuse):
-        """得到layer
+        """得到layer.
 
         Args:
             layer (str): the type of layer, e.g., 'module', 'recurrent', 'repeat'.
@@ -528,6 +515,22 @@ class Package(nn.Module):
 
     # 用于动态加载  层并根据配置初始化
     def load_torch_layer(self, layer_conf, name, reuse=None, input_dim=None):
+        """Dynamically load and initialize a torch layer based on configuration.
+
+        Args:
+            layer_conf: Layer configuration containing class name and parameters.
+            name (str): Name of the layer to be created.
+            reuse (bool, optional): Whether to reuse existing layer weights.
+            input_dim (int, optional): Input dimension for the layer.
+
+        Returns:
+            tuple: A tuple containing (layer_instance, customize_flag) where
+                layer_instance is the initialized layer object and customize_flag
+                indicates if it's a custom implementation.
+
+        Raises:
+            ValueError: If the layer class name is invalid or layer creation fails.
+        """
         # customize 表示是否是自定义实现
         layer_cls, customize = load_torch_layer(layer_conf.class_name)
         if layer_cls is None:
@@ -536,13 +539,15 @@ class Package(nn.Module):
         # st_params是以google.protobuf.Struct对象格式配置的参数；
         # 还可以用自定义的protobuf message的格式传递参数给加载的Layer对象。
         if customize:
-            # 代码假定 layer_conf.st_params 是一个结构化参数（is_struct=True），并使用它来创建一个 Parameter 对象，同时传递 L2 正则化参数。
+            # 代码假定 layer_conf.st_params 是一个结构化参数（is_struct=True），
+            # 并使用它来创建一个 Parameter 对象，同时传递 L2 正则化参数。
             if param_type is None:  # 没有额外的参数
                 layer = layer_cls()
                 return layer, customize
             elif param_type == "st_params":
                 params = Parameter(layer_conf.st_params, True, l2_reg=self._l2_reg)
-            # 如果 param_type 指向 oneof 中的其他字段，代码通过 getattr 动态获取该字段的值，并假定它是一个 Protocol Buffer 消息（is_struct=False）。
+            # 如果 param_type 指向 oneof 中的其他字段，代码通过 getattr
+            # 动态获取该字段的值，并假定它是一个Protocol Buffer消息is_struct=False）。
             else:
                 pb_params = getattr(layer_conf, param_type)
                 params = Parameter(pb_params, False, l2_reg=self._l2_reg)
@@ -615,9 +620,9 @@ class Package(nn.Module):
                         if query_dim_missing:
                             kwargs["query_dim"] = query_dim
                         logging.info(
-                            f"Auto-inferred dimensions for {layer_cls.__name__} {name}: "
-                            f"sequence_dim={sequence_dim if sequence_dim_missing else 'provided'}, "
-                            f"query_dim={query_dim if query_dim_missing else 'provided'}"
+                            f"Auto-inferred dimensions for {layer_cls.__name__} {name}: "  # NOQA
+                            f"sequence_dim={sequence_dim if sequence_dim_missing else 'provided'}, "  # NOQA
+                            f"query_dim={query_dim if query_dim_missing else 'provided'}"  # NOQA
                         )
                     else:
                         missing_params = []
@@ -626,7 +631,7 @@ class Package(nn.Module):
                         if query_dim_missing:
                             missing_params.append("query_dim")
                         raise ValueError(
-                            f"无法为 {layer_cls.__name__} {name} 自动推断 {', '.join(missing_params)}。"
+                            f"无法为 {layer_cls.__name__} {name} 自动推断 {', '.join(missing_params)}。"  # NOQA
                             "请确保配置了正确的输入 feature groups 或手动指定这些参数。"
                         )
 
@@ -658,10 +663,15 @@ class Package(nn.Module):
             return layer, customize
 
     def reset_input_config(self, config):
+        """Reset the input configuration for this package.
+
+        Args:
+            config: The new input configuration to set.
+        """
         self.input_config = config
 
     def _infer_sequence_query_dimensions(self, block_config, block_name):
-        """Inference module sequence_dim and query_dim
+        """Inference module sequence_dim and query_dim.
 
         适用于任何需要序列和查询维度的模块（如DINEncoder等）
 
@@ -705,7 +715,7 @@ class Package(nn.Module):
 
                                 logging.info(
                                     f"Auto-inferred dimensions from {group_name}: "
-                                    f"sequence_dim={sequence_dim} (from {sequence_group_name}), "
+                                    f"sequence_dim={sequence_dim} (from {sequence_group_name}), "  # NOQA
                                     f"query_dim={query_dim} (from {query_group_name})"
                                 )
 
@@ -714,7 +724,7 @@ class Package(nn.Module):
                             except Exception:
                                 # 如果无法获取子组维度，继续尝试其他方式
                                 logging.debug(
-                                    f"Could not get .sequence/.query dimensions for {group_name}"
+                                    f"Could not get .sequence/.query dimensions for {group_name}"  # NOQA
                                 )
                                 continue
                     except Exception as e:
@@ -732,13 +742,13 @@ class Package(nn.Module):
                         if sequence_dim is None:
                             sequence_dim = dim
                             logging.info(
-                                f"Using block {input_name} output as sequence with dim {dim}"
+                                f"Using block {input_name} output as sequence with dim {dim}"  # NOQA
                             )
                         # 如果还没有找到query_dim，使用这个作为query_dim
                         elif query_dim is None:
                             query_dim = dim
                             logging.info(
-                                f"Using block {input_name} output as query with dim {dim}"
+                                f"Using block {input_name} output as query with dim {dim}"  # NOQA
                             )
 
             if sequence_dim is not None and query_dim is not None:
@@ -757,15 +767,47 @@ class Package(nn.Module):
             return None
 
     def set_package_input(self, pkg_input):
+        """Set the package input for this package.
+
+        Args:
+            pkg_input: The input data to be used by this package.
+        """
         self._package_input = pkg_input
 
     def has_block(self, name):
+        """Check if a block with the given name exists in this package.
+
+        Args:
+            name (str): The name of the block to check for.
+
+        Returns:
+            bool: True if the block exists, False otherwise.
+        """
         return name in self._name_to_blocks
 
     def block_outputs(self, name):
+        """Get the output of a specific block by name.
+
+        Args:
+            name (str): The name of the block to retrieve outputs for.
+
+        Returns:
+            Any: The output of the specified block, or None if not found.
+        """
         return self._block_outputs.get(name, None)
 
     def block_input(self, config, block_outputs, training=None, **kwargs):
+        """Process and merge inputs for a block based on its configuration.
+
+        Args:
+            config: Block configuration containing input specifications.
+            block_outputs (dict): Dictionary of outputs from previously executed blocks.
+            training (bool, optional): Whether the model is in training mode.
+            **kwargs: Additional keyword arguments passed to downstream components.
+
+        Returns:
+            torch.Tensor or list: Processed and merged input data ready for the block.
+        """
         inputs = []
         # Traverse each input node configured by config.inputs
         for input_node in config.inputs:
@@ -818,9 +860,9 @@ class Package(nn.Module):
                 fn = eval("lambda x: x" + input_node.input_slice.strip())
                 input_feature = fn(input_feature)
 
-            if input_node.HasField(
-                "input_fn"
-            ):  # 指定一个lambda函数对输入做一些简单的变换。比如配置input_fn: 'lambda x: [x]'可以把输入变成列表格式。
+            if input_node.HasField("input_fn"):
+                # 指定一个lambda函数对输入做一些简单的变换。
+                # 比如配置input_fn: 'lambda x: [x]'可以把输入变成列表格式。
                 # 没有tf.name_scope，直接调用
                 fn = eval(input_node.input_fn)
                 input_feature = fn(input_feature)
@@ -854,6 +896,20 @@ class Package(nn.Module):
         return output
 
     def forward(self, is_training, batch=None, **kwargs):
+        """Execute forward pass through the package DAG.
+
+        Args:
+            is_training (bool): Whether the model is in training mode.
+            batch (Any, optional): Input batch data. Defaults to None.
+            **kwargs: Additional keyword arguments passed to layers.
+
+        Returns:
+            torch.Tensor or List[torch.Tensor]: Output tensor(s) from the package.
+
+        Raises:
+            ValueError: If required output blocks are not found.
+            KeyError: If input names are invalid or not found.
+        """
         block_outputs = {}
         self._block_outputs = block_outputs  # reset
         blocks = self.topo_order_list
@@ -900,7 +956,6 @@ class Package(nn.Module):
                     if hasattr(input_fn, "reset"):
                         input_fn.reset(input_config, is_training)
                 # block_outputs[block] = input_fn(input_config, is_training)
-                # block_outputs[block] = input_fn(input_config) # embedding group 没有is training 参数
                 if batch is not None:
                     embedding_outputs = input_fn(
                         batch
@@ -915,7 +970,7 @@ class Package(nn.Module):
                         block_outputs[block] = embedding_outputs
                     if isinstance(block_outputs[block], torch.Tensor):
                         print(
-                            f"block_outputs[{block}] shape: {block_outputs[block].shape}"
+                            f"block_outputs[{block}]shape: {block_outputs[block].shape}"
                         )
                     else:
                         print(
@@ -953,7 +1008,6 @@ class Package(nn.Module):
 
         for output in getattr(self._config, "concat_blocks", []):
             if output in block_outputs:
-                # print(f"Adding output block: {output} with shape {block_outputs[output].shape}") 不一定是tensor 有可能是tensor list 不一定能.shape
                 outputs.append(block_outputs[output])
             else:
                 raise ValueError("No output `%s` of backbone to be concat" % output)
@@ -976,7 +1030,7 @@ class Package(nn.Module):
         return output
 
     def _determine_input_format(self, layer_obj, inputs):
-        """智能判断模块需要的输入格式
+        """智能判断模块需要的输入格式.
 
         Args:
             layer_obj: 要调用的层对象
@@ -998,7 +1052,7 @@ class Package(nn.Module):
                 # 如果forward方法有多个参数，可能需要字典输入
                 if len(params) > 1:
                     logging.debug(
-                        f"Layer {layer_obj.__class__.__name__} has multiple forward parameters: {params}"
+                        f"Layer {layer_obj.__class__.__name__} has multiple forward parameters: {params}"  # NOQA
                     )
                     # 检查是否有特定的参数名暗示需要字典输入
                     dict_indicators = [
@@ -1009,7 +1063,7 @@ class Package(nn.Module):
                     ]
                     if any(indicator in params for indicator in dict_indicators):
                         logging.info(
-                            f"Layer {layer_obj.__class__.__name__} likely needs dict input"
+                            f"Layer {layer_obj.__class__.__name__} likely needs dict input"  # NOQA
                         )
                         return inputs  # 返回原始字典格式
 
@@ -1041,13 +1095,13 @@ class Package(nn.Module):
                         single_key = list(inputs.keys())[0]
                         single_value = inputs[single_key]
                         logging.debug(
-                            f"Extracting single tensor from dict for {layer_obj.__class__.__name__}"
+                            f"Extracting single tensor from dict for {layer_obj.__class__.__name__}"  # NOQA
                         )
                         return single_value
                     else:
                         # 多个值的情况，尝试拼接
                         logging.debug(
-                            f"Multiple values in dict, trying to concatenate for {layer_obj.__class__.__name__}"
+                            f"Multiple values in dict, trying to concatenate for {layer_obj.__class__.__name__}"  # NOQA
                         )
                         tensor_list = list(inputs.values())
                         if all(isinstance(t, torch.Tensor) for t in tensor_list):
@@ -1073,21 +1127,23 @@ class Package(nn.Module):
 
                                 result = torch.cat(flattened_tensors, dim=-1)
                                 logging.debug(
-                                    f"Successfully concatenated tensors, final shape: {result.shape}"
+                                    f"Successfully concatenated tensors, final shape: {result.shape}"  # NOQA
                                 )
                                 return result
                             except Exception as e:
                                 logging.debug(
-                                    f"Failed to concatenate tensors: {e}, using first tensor"
+                                    f"Failed to concatenate tensors: {e}, "
+                                    f"using first tensor"
                                 )
                                 return tensor_list[0]
                         else:
-                            return inputs  # 如果不能拼接，返回原字典            # 如果不是字典，直接返回
+                            return inputs  # 如果不能拼接返回原字典 如果不是字典直接返回
             return inputs
 
         except Exception as e:
             logging.warning(
-                f"Error determining input format for {layer_obj.__class__.__name__}: {e}"
+                f"Error determining input format for "
+                f"{layer_obj.__class__.__name__}: {e}"
             )
             return inputs  # 出错时返回原始输入
 
@@ -1104,7 +1160,8 @@ class Package(nn.Module):
             try:
                 output = layer(processed_inputs)
                 logging.debug(
-                    f"Custom layer {name} ({cls}) called successfully with input type: {type(processed_inputs)}"
+                    f"Custom layer {name} ({cls}) called successfully with input type: "
+                    f"{type(processed_inputs)}"
                 )
             except Exception as e:
                 msg = getattr(e, "message", str(e))
@@ -1119,7 +1176,7 @@ class Package(nn.Module):
                         )
                     except Exception as e2:
                         logging.error(f"Both input formats failed for {name}: {e2}")
-                        raise e
+                        raise e from e2
                 else:
                     raise e
         else:
@@ -1127,7 +1184,6 @@ class Package(nn.Module):
                 output = layer(processed_inputs)
                 if cls == "BatchNormalization":
                     raise NotImplementedError
-                    add_elements_to_collection(layer.updates, tf.GraphKeys.UPDATE_OPS)
             except TypeError:
                 output = layer(processed_inputs)
             except Exception as e:
@@ -1142,12 +1198,26 @@ class Package(nn.Module):
                         logging.error(
                             f"Both input formats failed for internal layer {name}: {e2}"
                         )
-                        raise e
+                        raise e from e2
                 else:
                     raise e
         return output
 
     def call_layer(self, inputs, config, name, **kwargs):
+        """Call a layer based on its configuration type.
+
+        Args:
+            inputs: Input data to be processed by the layer.
+            config: Layer configuration containing layer type and parameters.
+            name (str): Name of the layer to be called.
+            **kwargs: Additional keyword arguments passed to the layer.
+
+        Returns:
+            Output from the called layer.
+
+        Raises:
+            NotImplementedError: If the layer type is not supported.
+        """
         layer_name = config.WhichOneof("layer")
         if layer_name == "module":
             return self.call_keras_layer(inputs, name, **kwargs)
@@ -1190,7 +1260,9 @@ class Backbone(nn.Module):
             config.concat_blocks
         ):  # 如果不配置concat_blocks，框架会自动拼接DAG的所有叶子节点并输出。
             main_pkg.concat_blocks.extend(config.concat_blocks)
-        if config.output_blocks:  # 如果多个block的输出不需要 concat 在一起，而是作为一个list类型（下游对接多目标学习的tower）可以用output_blocks代替concat_blocks
+        if config.output_blocks:
+            # 如果多个block的输出不需要 concat 在一起，而是作为一个list类型
+            # （下游对接多目标学习的tower）可以用output_blocks代替concat_blocks
             main_pkg.output_blocks.extend(config.output_blocks)
 
         self._main_pkg = Package(
@@ -1221,6 +1293,16 @@ class Backbone(nn.Module):
             self._top_mlp = MLP(in_features=total_output_dim, **kwargs)
 
     def forward(self, is_training, batch=None, **kwargs):
+        """Forward pass through the backbone network.
+
+        Args:
+            is_training (bool): Whether the model is in training mode.
+            batch (Any, optional): Input batch data. Defaults to None.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            torch.Tensor: Output tensor from the backbone network.
+        """
         output = self._main_pkg(is_training, batch, **kwargs)
 
         if hasattr(self, "_top_mlp") and self._top_mlp is not None:
@@ -1230,7 +1312,7 @@ class Backbone(nn.Module):
         return output
 
     def get_final_output_dim(self):
-        """获取最终输出维度，考虑top_mlp的影响"""
+        """获取最终输出维度，考虑top_mlp的影响."""
         if hasattr(self, "_top_mlp") and self._top_mlp is not None:
             # 如果有top_mlp，返回top_mlp的输出维度
             if hasattr(self._top_mlp, "output_dim"):
@@ -1259,12 +1341,12 @@ class Backbone(nn.Module):
 
     @classmethod
     def wide_embed_dim(cls, config):
-        wide_embed_dim = None
+        """Get wide embedding dimension from config."""
         raise NotImplementedError
 
 
 def merge_inputs(inputs, axis=-1, msg=""):
-    """合并多个输入，根据输入类型和数量执行不同的逻辑处理。
+    """合并多个输入，根据输入类型和数量执行不同的逻辑处理.
 
     参数:
     inputs (list): 待合并的输入，可以是列表或张量的列表。

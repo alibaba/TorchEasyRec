@@ -15,8 +15,20 @@ from google.protobuf import struct_pb2
 from google.protobuf.descriptor import FieldDescriptor
 
 
-# is_proto_message 是一个用于检查 Protocol Buffer (PB) 对象的工具函数，它判断给定的字段是否是 PB 消息类型字段。该函数的设计主要用于处理 Protocol Buffer 对象的动态属性和类型检查，确保字段符合特定的消息类型。
 def is_proto_message(pb_obj, field):
+    """Check if a given field in a Protocol Buffer object is a message type field.
+
+    This utility function is designed to handle Protocol Buffer object dynamic
+    attributes and type checking, ensuring that fields conform to specific
+    message types.
+
+    Args:
+        pb_obj: The Protocol Buffer object to inspect.
+        field: The field name to check for message type.
+
+    Returns:
+        bool: True if the field is a Protocol Buffer message type, False otherwise.
+    """
     if not hasattr(pb_obj, "DESCRIPTOR"):
         return False
     if field not in pb_obj.DESCRIPTOR.fields_by_name:
@@ -25,25 +37,56 @@ def is_proto_message(pb_obj, field):
     return field_type == FieldDescriptor.TYPE_MESSAGE
 
 
-# Parameter 类是一个用于封装参数的工具类，支持处理结构化参数和 Protocol Buffer (PB) 消息类型的参数。它提供了一些便捷的方法和属性，用于访问、修改和验证参数，同时支持嵌套结构和默认值处理。
 class Parameter(object):
+    """A utility class for encapsulating and managing parameters.
+
+    This class supports handling both structured parameters and Protocol Buffer (PB)
+    message type parameters. It provides convenient methods and properties for
+    accessing, modifying, and validating parameters, while supporting nested
+    structures and default value handling.
+
+    Attributes:
+        params: The parameter data (dict for struct or PB message object).
+        is_struct: Boolean indicating if this is a struct-type parameter.
+        _l2_reg: L2 regularization value for this parameter.
+    """
+
     def __init__(self, params, is_struct, l2_reg=None):
-        # if params is None: # 表示自定义module没有额外参数
-        #     params = {}
         self.params = params
         self.is_struct = is_struct
         self._l2_reg = l2_reg
 
     @staticmethod
     def make_from_pb(config):
+        """Create a Parameter instance from a Protocol Buffer configuration.
+
+        Args:
+            config: The Protocol Buffer configuration object.
+
+        Returns:
+            Parameter: A new Parameter instance with is_struct=False.
+        """
         return Parameter(config, False)
 
     def get_pb_config(self):
+        """Get the Protocol Buffer configuration object.
+
+        Returns:
+            The Protocol Buffer configuration object.
+
+        Raises:
+            AssertionError: If this Parameter instance is a struct type.
+        """
         assert not self.is_struct, "Struct parameter can not convert to pb config"
         return self.params
 
     @property
     def l2_regularizer(self):
+        """Get the L2 regularization value.
+
+        Returns:
+            The L2 regularization value or None if not set.
+        """
         return self._l2_reg
 
     @l2_regularizer.setter
@@ -55,7 +98,7 @@ class Parameter(object):
             if key not in self.params:
                 return None
             value = self.params[key]
-            if type(value) == struct_pb2.Struct:
+            if isinstance(value, struct_pb2.Struct):
                 return Parameter(value, True, self._l2_reg)
             else:
                 return value
@@ -68,12 +111,21 @@ class Parameter(object):
         return self.__getattr__(key)
 
     def get_or_default(self, key, def_val):
+        """Get parameter value or return default if not present or empty.
+
+        Args:
+            key: The parameter key to retrieve.
+            def_val: The default value to return if key is not found or empty.
+
+        Returns:
+            The parameter value if present and non-empty, otherwise def_val.
+        """
         if self.is_struct:
             if key in self.params:
                 if def_val is None:
                     return self.params[key]
                 value = self.params[key]
-                if type(value) == float:
+                if isinstance(value, float):
                     return type(def_val)(value)
                 return value
             return def_val
@@ -89,6 +141,14 @@ class Parameter(object):
             return def_val  # maybe not equal to the default value of msg field
 
     def check_required(self, keys):
+        """Check that required keys are present in the struct parameters.
+
+        Args:
+            keys: A key name or list/tuple of key names to check for presence.
+
+        Raises:
+            KeyError: If any required key is missing from the struct parameters.
+        """
         if not self.is_struct:
             return
         if not isinstance(keys, (list, tuple)):
@@ -98,6 +158,14 @@ class Parameter(object):
                 raise KeyError("%s must be set in params" % key)
 
     def has_field(self, key):
+        """Check if the parameter has the specified field.
+
+        Args:
+            key: The field name to check.
+
+        Returns:
+            bool: True if the field exists, False otherwise.
+        """
         if self.is_struct:
             return key in self.params
         else:
@@ -138,10 +206,15 @@ def params_to_dict(parameter):
 
 
 def infer_input_dim(input_dim, input_fn=None, input_slice=None):
-    """input_dim: int 或 List[int]，原始输入维度
-    input_fn: str，lambda表达式字符串
-    input_slice: str，格式如'[1]'或'[0:2]'
-    返回: 变换后的输入维度（int或list）
+    """推断经过变换后的输入维度.
+
+    Args:
+        input_dim: int 或 List[int]，原始输入维度
+        input_fn: str，lambda表达式字符串
+        input_slice: str，格式如'[1]'或'[0:2]'
+
+    Returns:
+        变换后的输入维度（int或list）
     """
     # 先处理input_slice
     if input_slice is not None:

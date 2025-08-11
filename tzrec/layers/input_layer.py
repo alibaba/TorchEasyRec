@@ -17,11 +17,30 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 
 
 class VariationalDropout(nn.Module):
+    """Variational dropout layer for neural networks.
+
+    Implements variational dropout that applies the same dropout mask across
+    all dimensions of the input tensor during training. Unlike standard dropout,
+    this maintains consistency in the dropout pattern.
+
+    Attributes:
+        p: Dropout probability (0.0 to 1.0).
+    """
+
     def __init__(self, p):
         super().__init__()
         self.p = p
 
     def forward(self, x):
+        """Apply variational dropout to input tensor.
+
+        Args:
+            x: Input tensor to apply dropout to.
+
+        Returns:
+            torch.Tensor: Output tensor with dropout applied during training,
+                or original tensor during evaluation or when p <= 0.
+        """
         if not self.training or self.p <= 0:
             return x
         mask = (torch.rand_like(x) > self.p).float()
@@ -29,6 +48,25 @@ class VariationalDropout(nn.Module):
 
 
 class InputLayer(nn.Module):
+    """Input layer for processing feature groups with embeddings and regularization.
+
+    This layer handles different types of features (sparse, dense, sequence) organized
+    into feature groups. It supports embedding lookup for sparse features, sequence
+    processing with attention or TextCNN, variational dropout, and regularization.
+
+    Attributes:
+        training: Whether the layer is in training mode.
+        variational_dropout_p: Probability for variational dropout.
+        embedding_reg: Regularization module for embeddings.
+        kernel_reg: Regularization module for dense features.
+        group_special_ops: Special operations for feature groups.
+        seq_attention: Attention modules for sequence features.
+        seq_textcnn: TextCNN modules for sequence features.
+        group_features: Mapping from group names to feature lists.
+        embeddings: Embedding layers for sparse features.
+        vdrop: Variational dropout module.
+    """
+
     def __init__(
         self,
         features: List[Any],  # 特征对象列表
@@ -76,6 +114,15 @@ class InputLayer(nn.Module):
         )
 
     def apply_regularization(self, weight_list, reg_module):
+        """Apply regularization to a list of weights.
+
+        Args:
+            weight_list: List of weight tensors to regularize.
+            reg_module: Regularization module to apply, or None to skip.
+
+        Returns:
+            float: Sum of regularization losses, or 0 if no regularization.
+        """
         if reg_module is None or not weight_list:
             return 0
         return sum(reg_module(w) for w in weight_list)
@@ -87,6 +134,24 @@ class InputLayer(nn.Module):
         mode: str = "concat",  # "concat"|"list"|"dict"
         return_reg_loss: bool = False,
     ):
+        """Forward pass to process features for a specific group.
+
+        Args:
+            batch: The input batch object containing feature data.
+            group_name: The name of the feature group to process.
+            mode: Output mode - "concat" for concatenated tensor, "list" for list
+                of tensors, or "dict" for dictionary of tensors.
+            return_reg_loss: Whether to return regularization loss along with output.
+
+        Returns:
+            If return_reg_loss is False, returns the processed features according
+            to mode. If return_reg_loss is True, returns tuple of (output,
+            regularization_loss).
+
+        Raises:
+            AssertionError: If the specified group_name is not found in group_features.
+            ValueError: If an unknown mode is specified.
+        """
         assert group_name in self.group_features
         feats = self.group_features[group_name]
         tensors = []
@@ -176,10 +241,28 @@ class InputLayer(nn.Module):
         return out
 
     def add_attention(self, feat_name, attn_module):
+        """Add attention module for a sequence feature.
+
+        Args:
+            feat_name: The name of the sequence feature.
+            attn_module: The attention module to apply to the feature.
+        """
         self.seq_attention[feat_name] = attn_module
 
     def add_textcnn(self, feat_name, cnn_module):
+        """Add TextCNN module for a sequence feature.
+
+        Args:
+            feat_name: The name of the sequence feature.
+            cnn_module: The TextCNN module to apply to the feature.
+        """
         self.seq_textcnn[feat_name] = cnn_module
 
     def add_special_op(self, group_name, op):
+        """Add special operation for a feature group.
+
+        Args:
+            group_name: The name of the feature group.
+            op: The special operation module to apply to the group.
+        """
         self.group_special_ops[group_name] = op
