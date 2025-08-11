@@ -270,16 +270,16 @@ class DlrmHSTUTest(unittest.TestCase):
 
         export_pm(CudaExportWrapper(dlrm_hstu), batch.to_dict(), "tmp")
 
-        # if graph_type == TestGraphType.JIT_SCRIPT:
-        #     predictions = dlrm_hstu(batch.to_dict(), device)
-        # else:
-        #     predictions = dlrm_hstu(batch)
-        # self.assertEqual(predictions["logits_is_click"].size(), (6,))
-        # self.assertEqual(predictions["probs_is_click"].size(), (6,))
-        # self.assertEqual(predictions["logits_is_like"].size(), (6,))
-        # self.assertEqual(predictions["probs_is_like"].size(), (6,))
-        # self.assertEqual(predictions["logits_is_comment"].size(), (6,))
-        # self.assertEqual(predictions["probs_is_comment"].size(), (6,))
+        if graph_type == TestGraphType.JIT_SCRIPT:
+            predictions = dlrm_hstu(batch.to_dict(), device)
+        else:
+            predictions = dlrm_hstu(batch)
+        self.assertEqual(predictions["logits_is_click"].size(), (6,))
+        self.assertEqual(predictions["probs_is_click"].size(), (6,))
+        self.assertEqual(predictions["logits_is_like"].size(), (6,))
+        self.assertEqual(predictions["probs_is_like"].size(), (6,))
+        self.assertEqual(predictions["logits_is_comment"].size(), (6,))
+        self.assertEqual(predictions["probs_is_comment"].size(), (6,))
 
 
 if __name__ == "__main__":
