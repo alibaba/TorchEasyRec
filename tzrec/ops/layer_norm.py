@@ -32,8 +32,8 @@ if has_triton():
         triton_swish_layer_norm,
     )
 
-    torch.fx.wrap("triton_layer_norm")
-    torch.fx.wrap("triton_swish_layer_norm")
+    # torch.fx.wrap("triton_layer_norm")
+    # torch.fx.wrap("triton_swish_layer_norm")
 else:
     triton_layer_norm = pytorch_layer_norm
     triton_rms_norm = pytorch_rms_norm

@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
 from tzrec.ops.utils import (
@@ -1240,6 +1241,7 @@ def _hstu_attn_bwd(  # noqa C901
             )
 
 
+@triton_op("tzrec::triton_hstu_attention_fwd", mutates_args={})
 def triton_hstu_attention_fwd(
     N: int,
     alpha: float,
@@ -1270,7 +1272,7 @@ def triton_hstu_attention_fwd(
         Z * H,
     )
 
-    _hstu_attn_fwd[grid](
+    wrap_triton(_hstu_attn_fwd)[grid](
         Q=q,
         K=k,
         V=v,

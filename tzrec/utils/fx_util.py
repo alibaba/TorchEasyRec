@@ -61,7 +61,15 @@ def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
 @torch.fx.wrap
 def fx_int_item(x: torch.Tensor) -> int:
     """Fx trace wrapper for `int(x.item())`."""
-    return int(x.item())
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        int_item = x.item()
+        # Tell Dynamo this data-dependent value is in the range [0, 10**9)
+        torch._check_is_size(int_item)
+        torch._check(int_item < 10**9)
+        torch._check(int_item > 0)
+    else:
+        int_item = int(x.item())
+    return int_item
 
 
 @torch.fx.wrap
@@ -69,10 +77,12 @@ def fx_infer_max_len(
     lengths: torch.Tensor,
 ) -> int:
     """Fx trace wrapper for `int(engths.max().item())`."""
-    max_len = int(lengths.max().item())
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         # Tell Dynamo this data-dependent value is in the range [0, 10**9)
+        max_len = lengths.max().item()
         torch._check_is_size(max_len)
         torch._check(max_len < 10**9)
         torch._check(max_len > 0)
+    else:
+        max_len = int(lengths.max().item())
     return max_len

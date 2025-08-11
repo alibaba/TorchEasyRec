@@ -203,7 +203,7 @@ def export_pm(
 
     gm = gm.cuda()
 
-    batch = Dim("batch")
+    batch = Dim("batch", max=499999999)
     dynamic_shapes = {}
     for key in data:
         if key == "hard_neg_indices":
@@ -245,7 +245,7 @@ def export_pm(
                 )
                 data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
             logger.info("sparse or seq dense fea=%s shape=%s" % (key, data[key].shape))
-            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
+            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0, max=999999993)
             dynamic_shapes[key] = {0: tmp_val_dim}
 
         # trt need contiguous format
@@ -254,7 +254,7 @@ def export_pm(
 
     logger.info("dynamic shapes=%s" % dynamic_shapes)
     exported_pg = torch.export.export(
-        gm, args=(data,), dynamic_shapes=(dynamic_shapes,)
+        gm, args=(data,), dynamic_shapes=(dynamic_shapes,), strict=False
     )
 
     export_path = os.path.join(save_dir, "exported_pg.py")
@@ -262,5 +262,12 @@ def export_pm(
         fout.write(str(exported_pg))
 
     exported_pg.module()(data)
+
+    torch._inductor.aoti_compile_and_package(
+        exported_pg,
+        # [Optional] Specify the generated shared library path. If not specified,
+        # the generated artifact is stored in your system temp directory.
+        package_path=os.path.join(save_dir, "model.pt2"),
+    )
 
     return (exported_pg, data)

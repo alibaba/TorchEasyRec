@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
 from tzrec.ops.utils import switch_to_contiguous_if_needed
@@ -303,6 +304,7 @@ def _layer_norm_bwd_dwdb(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
+@triton_op("tzrec::triton_weighted_layer_norm_fwd", mutates_args=())
 def triton_weighted_layer_norm_fwd(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -340,7 +342,7 @@ def triton_weighted_layer_norm_fwd(
         return y, mean, rstd, BLOCK_D, num_warps
     if learnable:
         # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
+        wrap_triton(_weighted_layer_norm_fwd)[(N,)](
             x,
             y,
             weight,
@@ -359,7 +361,7 @@ def triton_weighted_layer_norm_fwd(
         )
     else:
         # pyre-ignore[28]
-        _layer_norm_fwd[(N,)](
+        wrap_triton(_layer_norm_fwd)[(N,)](
             x,
             y,
             mean,
@@ -743,6 +745,54 @@ class RMSNormFunction(torch.autograd.Function):
         return dx, dweight, None
 
 
+@triton_op("tzrec::triton_swish_layer_norm_fwd", mutates_args=())
+def triton_swish_layer_norm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
+    x = switch_to_contiguous_if_needed(x)
+    N, D = x.shape
+
+    assert bias is not None and weight is not None
+    assert weight.dim() == 1
+    assert bias.dim() == 1
+    assert weight.numel() == D
+    assert bias.numel() == D
+
+    y = torch.empty_like(x)
+    mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+
+    BLOCK_D = triton.next_power_of_2(D)
+    num_warps = min(max(BLOCK_D // 256, 1), 8)
+
+    if N == 0:
+        return y, mean, rstd, BLOCK_D, num_warps
+
+    # pyre-ignore[28]
+    wrap_triton(_weighted_layer_norm_fwd)[(N,)](
+        x,
+        y,
+        weight,
+        bias,
+        mean,
+        rstd,
+        D,
+        eps,
+        x.stride(0),
+        y.stride(0),
+        IS_SWISH=True,
+        TRAINING=True,
+        BLOCK_D=BLOCK_D,
+        COMPUTE_MEAN_AND_RSTD=True,
+        num_warps=num_warps,
+    )
+    return y, mean, rstd, BLOCK_D, num_warps
+
+
 class SwishLayerNormFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -753,49 +803,13 @@ class SwishLayerNormFunction(torch.autograd.Function):
         bias: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
-        assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
-        x = switch_to_contiguous_if_needed(x)
-        N, D = x.shape
-
-        assert bias is not None and weight is not None
-        assert weight.dim() == 1
-        assert bias.dim() == 1
-        assert weight.numel() == D
-        assert bias.numel() == D
-
-        y = torch.empty_like(x)
-        mean = torch.empty((N,), dtype=torch.float32, device=x.device)
-        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-
-        BLOCK_D = triton.next_power_of_2(D)
-        num_warps = min(max(BLOCK_D // 256, 1), 8)
-
+        y, mean, rstd, BLOCK_D, num_warps = triton_swish_layer_norm_fwd(
+            x=x, weight=weight, bias=bias, eps=eps
+        )
         ctx.save_for_backward(x, weight, bias, mean, rstd)
         ctx.BLOCK_D = BLOCK_D
         ctx.num_warps = num_warps
         ctx.eps = eps
-        if N == 0:
-            return y
-
-        # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
-            x,
-            y,
-            weight,
-            bias,
-            mean,
-            rstd,
-            D,
-            eps,
-            x.stride(0),
-            y.stride(0),
-            IS_SWISH=True,
-            TRAINING=True,
-            BLOCK_D=BLOCK_D,
-            COMPUTE_MEAN_AND_RSTD=True,
-            num_warps=num_warps,
-        )
-
         return y
 
     @staticmethod

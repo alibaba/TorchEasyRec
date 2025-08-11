@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
 from tzrec.ops.triton.triton_addmm import triton_addmm_fwd
@@ -308,6 +309,7 @@ def _ln_mul_dropout_bwd_dwdb(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
+@triton_op("tzrec::triton_layer_norm_mul_dropout_fwd", mutates_args={})
 def triton_layer_norm_mul_dropout_fwd(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -347,7 +349,7 @@ def triton_layer_norm_mul_dropout_fwd(
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     # pyre-ignore[28]
-    _ln_mul_dropout_fwd[(N,)](
+    wrap_triton(_ln_mul_dropout_fwd)[(N,)](
         x,
         u,
         y,
@@ -776,6 +778,7 @@ def _group_norm_mul_dropout_bwd_dx_du(
     )
 
 
+@triton_op("tzrec::triton_group_norm_mul_dropout_fwd", mutates_args={})
 def triton_group_norm_mul_dropout_fwd(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -823,7 +826,7 @@ def triton_group_norm_mul_dropout_fwd(
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D * BLOCK_H // 256, 1), 8)
     # pyre-ignore[28]
-    _group_norm_mul_dropout_fwd[(N,)](
+    wrap_triton(_group_norm_mul_dropout_fwd)[(N,)](
         x,
         u,
         y,

@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 from typing import List
 
 import torch
@@ -29,12 +28,18 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
 def prev_power_of_2(x: int) -> int:
     import triton
 
+    return triton.next_power_of_2(x)
+
     if torch.compiler.is_compiling():
-        # Re-write to make Dynamo happy
-        x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
-        x_tensor_orig = x_tensor.clone()
-        out = triton.next_power_of_2(x_tensor)  # type: ignore[arg-type]
-        return int(torch.where(torch.lt(x_tensor_orig, out), out // 2, out).item())  # type: ignore[return-value]
+        # # Re-write to make Dynamo happy
+        # x_tensor = torch.scalar_tensor(x, dtype=torch.int64)
+        # x_tensor_orig = x_tensor.clone()
+        # out = triton.next_power_of_2(x_tensor)
+        # result = torch.where(torch.lt(x_tensor_orig, out), out // 2, out).item()
+        out = triton.next_power_of_2(x)
+        result = out // 2 if out > x else out
+        torch._check_is_size(result)
+        return result
     else:
         out = triton.next_power_of_2(x)
         return out // 2 if out > x else out
@@ -46,7 +51,7 @@ USE_RUNTIME_MAX_SEQ_LEN: bool = False
 
 def set_static_max_seq_lens(max_seq_lens: List[int]) -> None:
     global STATIC_MAX_SEQ_LENS
-    STATIC_MAX_SEQ_LENS = copy.deepcopy(max_seq_lens)
+    # STATIC_MAX_SEQ_LENS = copy.deepcopy(max_seq_lens)
     STATIC_MAX_SEQ_LENS.sort()
 
 
@@ -65,5 +70,12 @@ def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
             return 1
         for max_len in STATIC_MAX_SEQ_LENS:
             if max_len >= runtime_max_seq_len:
+                # if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+                #     torch._check_is_size(max_len)
+                #     torch._check(max_len >= runtime_max_seq_len)
                 return max_len
-        return STATIC_MAX_SEQ_LENS[-1]
+        max_len = STATIC_MAX_SEQ_LENS[-1]
+        # if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        #     torch._check_is_size(max_len)
+        #     torch._check(max_len >= runtime_max_seq_len)
+        return max_len

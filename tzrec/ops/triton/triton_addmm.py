@@ -19,6 +19,7 @@ from typing import List, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
 ENABLE_FULL_TURNING_SPACE = False
@@ -232,6 +233,7 @@ def _addmm_fwd(
     tl.store(z_ptrs, z, mask=z_mask)
 
 
+@triton_op("tzrec::triton_addmm_fwd", mutates_args={})
 def triton_addmm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -255,7 +257,7 @@ def triton_addmm_fwd(
         triton.cdiv(N, meta["BLOCK_N"]),
     )
 
-    _addmm_fwd[grid](
+    wrap_triton(_addmm_fwd)[grid](
         x,
         w,
         y,
