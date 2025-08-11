@@ -32,8 +32,8 @@ class Add(nn.Module):
             torch.Tensor: Sum of all input tensors.
         """
         # Supports list/tuple input - avoid len() for FX tracing compatibility
-        if not inputs:
-            raise ValueError("At least one input tensor is required")
+        # if not inputs:
+        #     raise ValueError("At least one input tensor is required")
 
         out = inputs[0]
         for input_tensor in inputs[1:]:
@@ -87,11 +87,8 @@ class FM(nn.Module):
         else:
             feature = inputs
 
-        # Ensure input is 3D
-        if feature.dim() != 3:
-            raise ValueError(
-                f"Expected 3D tensor after conversion, got {feature.dim()}D"
-            )
+        # For FX tracing compatibility, we assume inputs are correctly formatted
+        # The dimension check is moved to a separate validation method if needed
 
         batch_size, field_size, embedding_size = feature.shape
 
@@ -114,31 +111,25 @@ class FM(nn.Module):
             # Sum across embedding dimension and add batch dimension
             output = torch.sum(fm_output, dim=1, keepdim=True)  # (batch_size, 1)
         else:
-            # Standard FM computation
-            # Pairwise interactions: sum over all pairs (i,j) where i<j
-            interactions = []
-            for i in range(field_size):
-                for j in range(i + 1, field_size):
-                    # Element-wise product of embeddings
-                    interaction = (
-                        feature[:, i, :] * feature[:, j, :]
-                    )  # (batch_size, embedding_size)
-                    interactions.append(interaction)
+            # Standard FM computation using vectorized operations
+            # This is equivalent to pairwise interactions but FX-trace friendly
+            
+            # Sum pooling across fields
+            sum_of_features = torch.sum(feature, dim=1)  # (batch_size, embedding_size)
+            square_of_sum = sum_of_features.pow(2)  # (batch_size, embedding_size)
 
-            if interactions:
-                # Stack and sum all interactions
-                all_interactions = torch.stack(
-                    interactions, dim=1
-                )  # (batch_size, num_pairs, embedding_size)
-                fm_output = torch.sum(all_interactions, dim=[1, 2])  # (batch_size,)
-                fm_output = fm_output.unsqueeze(1)  # (batch_size, 1)
-            else:
-                # No interactions possible (less than 2 fields)
-                fm_output = torch.zeros(
-                    batch_size, 1, device=feature.device, dtype=feature.dtype
-                )
+            # Sum of squares
+            sum_of_squares = torch.sum(
+                feature.pow(2), dim=1
+            )  # (batch_size, embedding_size)
 
-            output = fm_output
+            # FM interaction: 0.5 * (square_of_sum - sum_of_squares)
+            fm_interaction = 0.5 * (
+                square_of_sum - sum_of_squares
+            )  # (batch_size, embedding_size)
+
+            # Sum across embedding dimension to get final output
+            output = torch.sum(fm_interaction, dim=1, keepdim=True)  # (batch_size, 1)
 
         # Apply L2 regularization if specified (add to loss during training)
         if self.training and self.l2_regularization > 0:
