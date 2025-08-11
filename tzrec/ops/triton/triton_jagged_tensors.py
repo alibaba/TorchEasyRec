@@ -352,8 +352,8 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         ctx,
         values_a: torch.Tensor,
         values_b: torch.Tensor,
-        max_len_a: Optional[int],
-        max_len_b: Optional[int],
+        max_len_a: int,
+        max_len_b: int,
         offsets_a: Optional[torch.Tensor],
         offsets_b: Optional[torch.Tensor],
         n_prefix_from_B: int,
@@ -365,10 +365,8 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         total_len_a, D = values_a.shape
         total_len_b, _ = values_b.shape
         if is_dense_a:
-            assert max_len_a is not None
             B = total_len_a // max_len_a
         else:
-            assert max_len_b is not None
             assert offsets_a is not None
             B = offsets_a.shape[0] - 1
         if is_dense_b:
@@ -677,8 +675,8 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
 def triton_concat_2D_jagged(
     values_left: torch.Tensor,
     values_right: torch.Tensor,
-    max_len_left: Optional[int],
-    max_len_right: Optional[int],
+    max_len_left: int,
+    max_len_right: int,
     offsets_left: Optional[torch.Tensor],
     offsets_right: Optional[torch.Tensor],
     n_prefix_from_right: int = 0,
