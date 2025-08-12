@@ -101,13 +101,13 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt"))
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt"))
+            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
         )
 
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
