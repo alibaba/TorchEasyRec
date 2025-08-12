@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Union
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -19,33 +19,39 @@ class Add(nn.Module):
     """Element-wise addition module for multiple tensors.
 
     This module performs element-wise addition of multiple input tensors.
-    It supports variable number of tensor inputs and adds them together.
+    It supports a fixed number of tensor inputs for FX tracing and JIT Script compatibility.
     """
 
-    def forward(self, *inputs):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, input1, input2, input3=None):
         """Add multiple input tensors element-wise.
 
         Args:
-            *inputs: Variable number of tensors to add together.
+            input1: First tensor (required)
+            input2: Second tensor (required)
+            input3: Third tensor (optional)
 
         Returns:
             torch.Tensor: Sum of all input tensors.
         """
-        # Supports list/tuple input - avoid len() for FX tracing compatibility
-        # if not inputs:
-        #     raise ValueError("At least one input tensor is required")
-
-        out = inputs[0]
-        for input_tensor in inputs[1:]:
-            out = out + input_tensor
-        return out
+        # Add the first two tensors
+        result = input1 + input2
+        
+        # Add the third tensor if provided
+        if input3 is not None:
+            result = result + input3
+            
+        return result
 
 
 class FM(nn.Module):
     """Factorization Machine module for backbone architecture.
 
     This module implements the FM interaction computation that learns 2nd-order
-    feature interactions. It supports both list of 2D tensors and 3D tensor inputs.
+    feature interactions. It only supports 3D tensor inputs for better compatibility
+    with PyTorch graph compilation modes (FX tracing and JIT Script).
 
     Args:
         use_variant (bool, optional): Whether to use variant FM calculation.
@@ -54,8 +60,7 @@ class FM(nn.Module):
             Defaults to 1e-4.
 
     Input shapes:
-        - List of 2D tensors with shape: ``(batch_size, embedding_size)``
-        - Or a 3D tensor with shape: ``(batch_size, field_size, embedding_size)``
+        - 3D tensor with shape: ``(batch_size, field_size, embedding_size)``
 
     Output shape:
         - 2D tensor with shape: ``(batch_size, 1)``
@@ -68,28 +73,19 @@ class FM(nn.Module):
         self.use_variant = use_variant
         self.l2_regularization = l2_regularization
 
-    def forward(self, inputs: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Forward pass of FM module.
 
         Args:
-            inputs: Either a list of 2D tensors [(batch_size, embedding_size), ...]
-                   or a 3D tensor (batch_size, field_size, embedding_size)
+            inputs: 3D tensor with shape (batch_size, field_size, embedding_size)
 
         Returns:
             torch.Tensor: FM interaction output with shape (batch_size, 1)
         """
-        # Convert list of 2D tensors to 3D tensor if needed
-        if isinstance(inputs, list):
-            # Stack list of 2D tensors to form 3D tensor
-            feature = torch.stack(
-                inputs, dim=1
-            )  # (batch_size, field_size, embedding_size)
-        else:
-            feature = inputs
-
-        # For FX tracing compatibility, we assume inputs are correctly formatted
-        # The dimension check is moved to a separate validation method if needed
-
+        # Note: Dimension validation is skipped for FX tracing compatibility
+        # Users should ensure inputs are 3D tensors with shape (batch_size, field_size, embedding_size)
+        
+        feature = inputs
         batch_size, field_size, embedding_size = feature.shape
 
         if self.use_variant:
