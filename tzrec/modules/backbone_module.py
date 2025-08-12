@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
 
 import torch
 import torch.nn as nn
@@ -19,7 +18,6 @@ class Add(nn.Module):
     """Element-wise addition module for multiple tensors.
 
     This module performs element-wise addition of multiple input tensors.
-    It supports a fixed number of tensor inputs for FX tracing and JIT Script compatibility.
     """
 
     def __init__(self) -> None:
@@ -38,11 +36,11 @@ class Add(nn.Module):
         """
         # Add the first two tensors
         result = input1 + input2
-        
+
         # Add the third tensor if provided
         if input3 is not None:
             result = result + input3
-            
+
         return result
 
 
@@ -77,14 +75,14 @@ class FM(nn.Module):
         """Forward pass of FM module.
 
         Args:
-            inputs: 3D tensor with shape (batch_size, field_size, embedding_size)
+            inputs: 3D tensor with shape (batch_size, field_size, embedding_size) # NOQA
 
         Returns:
             torch.Tensor: FM interaction output with shape (batch_size, 1)
         """
         # Note: Dimension validation is skipped for FX tracing compatibility
-        # Users should ensure inputs are 3D tensors with shape (batch_size, field_size, embedding_size)
-        
+        # Users should ensure inputs are 3D tensors with shape (batch_size, field_size, embedding_size) # NOQA
+
         feature = inputs
         batch_size, field_size, embedding_size = feature.shape
 

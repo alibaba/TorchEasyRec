@@ -115,7 +115,7 @@ class BackboneModuleTest(unittest.TestCase):
         # This test is kept for documentation purposes but may not fail as expected
         fm = FM(use_variant=False, l2_regularization=1e-4)
 
-        # These tests may not work as expected since dimension validation 
+        # These tests may not work as expected since dimension validation
         # is disabled for graph compilation compatibility
         # Test with wrong dimensions - may not raise errors due to FX compatibility
         try:
