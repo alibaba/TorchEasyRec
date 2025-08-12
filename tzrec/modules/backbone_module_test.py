@@ -45,10 +45,11 @@ class BackboneModuleTest(unittest.TestCase):
             self.assertEqual(fm.output_dim(), 1)
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], 
-         [TestGraphType.FX_TRACE], 
-        #  [TestGraphType.JIT_SCRIPT]
-         ]
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            #  [TestGraphType.JIT_SCRIPT]
+        ]
     )
     def test_fm_with_list_input(self, graph_type):
         """Test FM module with list of 2D tensors input."""
@@ -56,7 +57,7 @@ class BackboneModuleTest(unittest.TestCase):
 
         # Create FM module
         fm = FM(use_variant=False, l2_regularization=1e-4)
-        
+
         # Create list of 2D tensors
         input_list = [
             torch.randn(batch_size, embedding_size) for _ in range(field_size)
@@ -120,7 +121,7 @@ class BackboneModuleTest(unittest.TestCase):
 
         # Forward pass with both input formats
         output_3d = fm(input_3d)
-        
+
         # For graph-traced modules, we can't test list inputs directly
         # So we test equivalence by converting list to tensor
         if graph_type in [TestGraphType.FX_TRACE, TestGraphType.JIT_SCRIPT]:

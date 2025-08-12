@@ -113,7 +113,7 @@ class FM(nn.Module):
         else:
             # Standard FM computation using vectorized operations
             # This is equivalent to pairwise interactions but FX-trace friendly
-            
+
             # Sum pooling across fields
             sum_of_features = torch.sum(feature, dim=1)  # (batch_size, embedding_size)
             square_of_sum = sum_of_features.pow(2)  # (batch_size, embedding_size)
