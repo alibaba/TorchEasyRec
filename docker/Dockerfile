@@ -33,12 +33,12 @@ RUN case ${DEVICE} in \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu126") pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126 && \
-                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.7.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
-                 pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cu126 ;; \
-        * )      pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cpu && \
+        "cu126") pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install fbgemm-gpu==2025.6.28 torchrec==1.3.0.dev.20250628 --index-url https://download.pytorch.org/whl/nightly/cu126 ;; \
+        * )      pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cpu ;; \
+                 pip install fbgemm-gpu==2025.6.28 torchrec==1.3.0.dev.20250628 --index-url https://download.pytorch.org/whl/nightly/cpu ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
 
