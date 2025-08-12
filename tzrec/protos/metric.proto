@@ -43,5 +43,13 @@ message MetricConfig {
         MeanSquaredError mean_squared_error = 5;
         Accuracy accuracy = 6;
         GroupedAUC grouped_auc = 7;
+        XAUC xauc = 8;
     }
+}
+
+
+message XAUC {
+    optional float sample_ratio = 1 [default = 1.0];
+    optional bool memory_saving = 2 [default = false];
+
 }
