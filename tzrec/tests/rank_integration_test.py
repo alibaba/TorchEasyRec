@@ -785,12 +785,14 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",
