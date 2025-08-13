@@ -251,3 +251,15 @@ message MMoEModule {
     // mmoe gate module definition
     optional MLP gate_mlp = 2;
 }
+
+message CrossNet {
+    // number of cross layers
+    required uint32 num_layers = 1;
+}
+
+message DCNv2Net {
+    // number of cross layers
+    required uint32 num_layers = 1;
+    // low rank dimension for DCN-v2
+    required uint32 low_rank = 2;
+}
