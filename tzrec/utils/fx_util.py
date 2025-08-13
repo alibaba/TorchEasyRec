@@ -63,10 +63,7 @@ def fx_int_item(x: torch.Tensor) -> int:
     """Fx trace wrapper for `int(x.item())`."""
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         int_item = x.item()
-        # Tell Dynamo this data-dependent value is in the range [0, 10**9)
         torch._check_is_size(int_item)
-        torch._check(int_item < 10**9)
-        torch._check(int_item > 0)
     else:
         int_item = int(x.item())
     return int_item

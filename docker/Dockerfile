@@ -8,7 +8,7 @@ RUN sed -i "s@http://archive.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/so
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates \
-        ccache cmake gcc git vim watchman wget curl && \
+        ccache cmake gcc git vim watchman wget curl sudo iprouter2 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/libidn11_1.33-2.2ubuntu2_amd64.deb && \
@@ -29,16 +29,17 @@ RUN case ${DEVICE} in \
         "cu126") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
                  dpkg -i cuda-keyring_1.1-1_all.deb && \
                  apt-get update && \
-                 apt-get install cuda-compat-12-6 && \
+                 apt-get install -y cuda-toolkit-12-6 cuda-compat-12-6 && \
+                 rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu126") pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126 && \
-                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.7.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
-                 pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cu126 ;; \
-        * )      pip install torch==2.7.0 fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cpu && \
+        "cu126") pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install fbgemm-gpu==2025.6.28 torchrec==1.3.0.dev.20250628 --index-url https://download.pytorch.org/whl/nightly/cu126 ;; \
+        * )      pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cpu ;; \
+                 pip install fbgemm-gpu==2025.6.28 torchrec==1.3.0.dev.20250628 --index-url https://download.pytorch.org/whl/nightly/cpu ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
 
