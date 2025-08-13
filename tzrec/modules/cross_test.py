@@ -15,16 +15,16 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.cross import CrossLayer, CrossNet, DCNv2Layer, DCNv2Net
+from tzrec.modules.cross import Cross, CrossNet, DCNv2Layer, DCNv2Net
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
-class CrossLayerTest(unittest.TestCase):
+class CrossTest(unittest.TestCase):
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_cross_layer(self, graph_type) -> None:
-        layer = CrossLayer(input_dim=64)
+        layer = Cross(input_dim=64)
         layer = create_test_module(layer, graph_type)
         x0 = torch.randn(32, 64)
         xl = torch.randn(32, 64)
@@ -35,7 +35,7 @@ class CrossLayerTest(unittest.TestCase):
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_cross_layer_3d(self, graph_type) -> None:
-        layer = CrossLayer(input_dim=64)
+        layer = Cross(input_dim=64)
         layer = create_test_module(layer, graph_type)
         x0 = torch.randn(32, 10, 64)
         xl = torch.randn(32, 10, 64)

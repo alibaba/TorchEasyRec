@@ -14,7 +14,8 @@ message TorchLayer {
         MLP mlp = 11;
         DINEncoder din = 12;
         MMoEModule mmoe = 14;
-        CrossNet cross_net = 15;
-        DCNv2Net dcnv2_net = 16;
+        Cross cross = 15;
+        CrossNet cross_net = 16;
+        DCNv2Net dcnv2_net = 17;
     }
 }

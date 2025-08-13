@@ -252,6 +252,11 @@ message MMoEModule {
     optional MLP gate_mlp = 2;
 }
 
+message Cross {
+    // input feature dimension (optional, can be inferred from input)
+    optional uint32 input_dim = 1;
+}
+
 message CrossNet {
     // number of cross layers
     required uint32 num_layers = 1;

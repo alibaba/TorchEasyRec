@@ -32,6 +32,28 @@ from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.dag import DAG
 from tzrec.utils.load_class import load_torch_layer
 
+# 强制设置日志级别，确保显示INFO级别的日志
+logging.basicConfig(
+    level=logging.DEBUG,  # 设置为DEBUG级别确保显示所有日志
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,  # 强制覆盖已有的日志配置
+)
+
+# 获取当前模块的logger并设置级别
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# 同时设置根logger的级别
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+# 测试日志配置是否生效
+print("[TEST] Testing logging configuration...")
+logger.info("Logger configuration test - INFO level")
+logger.debug("Logger configuration test - DEBUG level")
+logging.info("Direct logging test - INFO level")
+print("[TEST] Logging configuration test complete")
+
 
 class LambdaWrapper(nn.Module):
     """Lambda expression wrapper for dimension inference and execution."""
@@ -306,6 +328,30 @@ class Package(nn.Module):
                         # 从维度推断引擎获取输入维度信息
                         input_dim_info = self.dim_engine.get_output_dim(input_name)
 
+                        # 特殊处理：如果是recurrent或repeat层，确保获取最新的输出维度
+                        if input_name in self._name_to_blocks:
+                            input_block = self._name_to_blocks[input_name]
+                            input_layer_type = input_block.WhichOneof("layer")
+                            if input_layer_type in ["recurrent", "repeat"]:
+                                # 强制从兼容性字段获取最新的输出维度
+                                if input_name in self._name_to_output_dim:
+                                    latest_output_dim = self._name_to_output_dim[
+                                        input_name
+                                    ]
+                                    latest_dim_info = DimensionInfo(latest_output_dim)
+                                    logging.info(
+                                        f"Overriding dim_engine cache for {input_layer_type} layer {input_name}: {latest_output_dim}"  # NOQA
+                                    )
+                                    # 强制更新维度推断引擎的缓存
+                                    self.dim_engine.register_output_dim(
+                                        input_name, latest_dim_info
+                                    )
+                                    input_dim_info = latest_dim_info
+                                else:
+                                    logging.warning(
+                                        f"{input_layer_type} layer {input_name} not found in _name_to_output_dim"  # NOQA
+                                    )
+
                         if input_dim_info is None:
                             # fallback到旧的方式
                             if input_name in self._name_to_output_dim:
@@ -344,6 +390,19 @@ class Package(nn.Module):
                 # 保留兼容性
                 self._name_to_input_dim[block.name] = merged_input_dim.get_total_dim()
 
+                # 添加调试信息
+                logger.info(
+                    f"Block {block.name} input dimensions: merged_input_dim={merged_input_dim}, total_dim={merged_input_dim.get_total_dim()}"  # NOQA
+                )
+                if merged_input_dim.is_list:
+                    logger.info(
+                        f"  - is_list=True, dims_list={merged_input_dim.to_list()}"
+                    )
+                else:
+                    logger.info(
+                        f"  - is_list=False, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
+                    )
+
                 # 定义layer
                 self.define_layers(layer, block, block.name, reuse)
 
@@ -360,18 +419,42 @@ class Package(nn.Module):
                             f"Lambda layer {block.name} inferred output dim: {output_dim_info}"  # NOQA
                         )
                     else:
-                        # 验证维度兼容性
-                        if not self.dim_engine.validate_dimension_compatibility(
-                            layer_obj, merged_input_dim
-                        ):
-                            logging.warning(
-                                f"Dimension compatibility check failed for block {block.name}"  # NOQA
-                            )
+                        # 检查是否已经是recurrent或repeat层，如果是则跳过输出维度推断
+                        if layer in {"recurrent", "repeat"}:
+                            # 输出维度已经在define_layers中设置，不需要重新推断
+                            output_dim_info = self.dim_engine.get_output_dim(block.name)
+                            if output_dim_info is None:
+                                # 如果维度推断引擎中没有，从兼容性字段获取
+                                if block.name in self._name_to_output_dim:
+                                    output_dim = self._name_to_output_dim[block.name]
+                                    output_dim_info = DimensionInfo(output_dim)
+                                    self.dim_engine.register_output_dim(
+                                        block.name, output_dim_info
+                                    )
+                                    logging.info(
+                                        f"{layer.capitalize()} layer {block.name} output dim restored from compatibility field: {output_dim}"  # NOQA
+                                    )
+                                else:
+                                    raise ValueError(
+                                        f"{layer.capitalize()} layer {block.name} missing output dimension"  # NOQA
+                                    )
+                            else:
+                                logging.info(
+                                    f"{layer.capitalize()} layer {block.name} output dim already set: {output_dim_info}"  # NOQA
+                                )
+                        else:
+                            # 验证维度兼容性
+                            if not self.dim_engine.validate_dimension_compatibility(
+                                layer_obj, merged_input_dim
+                            ):
+                                logging.warning(
+                                    f"Dimension compatibility check failed for block {block.name}"  # NOQA
+                                )
 
-                        # 推断输出维度 - 使用改进的方法
-                        output_dim_info = self.dim_engine.infer_layer_output_dim(
-                            layer_obj, merged_input_dim
-                        )
+                            # 推断输出维度 - 使用改进的方法
+                            output_dim_info = self.dim_engine.infer_layer_output_dim(
+                                layer_obj, merged_input_dim
+                            )
 
                     self.dim_engine.register_output_dim(block.name, output_dim_info)
 
@@ -379,12 +462,39 @@ class Package(nn.Module):
                     self._name_to_output_dim[block.name] = (
                         output_dim_info.get_feature_dim()
                     )
-                else:
-                    # 如果没有layer，使用输入维度作为输出维度
-                    self.dim_engine.register_output_dim(block.name, merged_input_dim)
-                    self._name_to_output_dim[block.name] = (
-                        merged_input_dim.get_feature_dim()
+
+                    # 添加调试信息
+                    logging.info(
+                        f"Block {block.name} output dimensions: output_dim_info={output_dim_info}, feature_dim={output_dim_info.get_feature_dim()}"  # NOQA
                     )
+                else:
+                    # 检查是否是recurrent或repeat层，如果是则不覆盖已设置的输出维度
+                    layer_type = layer
+                    if layer_type in ["recurrent", "repeat"]:
+                        # recurrent层的输出维度已经在define_layers中正确设置，不覆盖
+                        existing_output_dim_info = self.dim_engine.get_output_dim(
+                            block.name
+                        )
+                        existing_output_dim = self._name_to_output_dim.get(block.name)
+                        print(
+                            f"[SKIP OVERRIDE] {layer_type.capitalize()} layer {block.name} - keeping existing output dim: engine={existing_output_dim_info}, compat={existing_output_dim}"  # NOQA
+                        )
+                        logging.info(
+                            f"Skipping override for {layer_type} layer {block.name} - keeping existing output dimensions"  # NOQA
+                        )
+                    else:
+                        # 如果没有layer，使用输入维度作为输出维度
+                        self.dim_engine.register_output_dim(
+                            block.name, merged_input_dim
+                        )
+                        self._name_to_output_dim[block.name] = (
+                            merged_input_dim.get_feature_dim()
+                        )
+
+                        # 添加调试信息
+                        logging.info(
+                            f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
+                        )
 
         # ======= 后处理、输出节点推断 =======
         input_feature_groups = self._feature_group_inputs
@@ -411,6 +521,17 @@ class Package(nn.Module):
         # 输出维度推断摘要
         dim_summary = self.dim_engine.get_summary()
         logging.info(f"{config.name} dimension inference summary: {dim_summary}")
+
+        # 详细输出所有block的维度信息
+        logging.info("=== Final dimension summary ===")
+        for block_name in self.topo_order_list:
+            if block_name in self._name_to_input_dim:
+                input_dim = self._name_to_input_dim[block_name]
+                output_dim = self._name_to_output_dim.get(block_name, "N/A")
+                dim_engine_output = self.dim_engine.get_output_dim(block_name)
+                logging.info(
+                    f"Block {block_name}: input_dim={input_dim}, output_dim={output_dim}, dim_engine={dim_engine_output}"  # NOQA
+                )
 
         logging.info(
             "%s layers: %s" % (config.name, ",".join(self._name_to_layer.keys()))
@@ -497,16 +618,233 @@ class Package(nn.Module):
             self._name_to_customize[name] = customize
         elif layer == "recurrent":
             keras_layer = layer_cnf.recurrent.module
+            # 获取父层的输入维度信息，用于子层的维度推断
+            parent_input_dim_info = self.dim_engine.block_input_dims.get(name)
+            parent_input_dim = self._name_to_input_dim.get(name, None)
+
+            # 检查是否有fixed_input_index配置
+            fixed_input_index = getattr(layer_cnf.recurrent, "fixed_input_index", None)
+
+            # 如果有fixed_input_index且parent_input_dim_info是list类型，需要特殊处理
+            child_input_dim_info = parent_input_dim_info
+            child_input_dim = parent_input_dim
+
+            if fixed_input_index is not None and parent_input_dim_info is not None:
+                if parent_input_dim_info.is_list:
+                    # 从list中取fixed_input_index指定的维度
+                    dims_list = parent_input_dim_info.to_list()
+                    if fixed_input_index < len(dims_list):
+                        fixed_dim = dims_list[fixed_input_index]
+                        child_input_dim_info = DimensionInfo(fixed_dim)
+                        child_input_dim = fixed_dim
+                        logging.info(
+                            f"Recurrent layer {name} using fixed_input_index={fixed_input_index}, child input_dim={fixed_dim}"  # NOQA
+                        )
+                    else:
+                        logging.warning(
+                            f"fixed_input_index={fixed_input_index} out of range for input dims: {dims_list}"  # NOQA
+                        )
+
+            # 用于记录最后一个子层的输出维度
+            last_output_dim_info = None
+            last_output_dim = None
+
             for i in range(layer_cnf.recurrent.num_steps):
                 name_i = "%s_%d" % (name, i)
-                layer_obj = self.load_torch_layer(keras_layer, name_i, reuse)
+
+                # 为每个子层注册输入维度信息
+                if child_input_dim_info is not None:
+                    self.dim_engine.register_input_dim(name_i, child_input_dim_info)
+                if child_input_dim is not None:
+                    self._name_to_input_dim[name_i] = child_input_dim
+
+                # 加载子层，传递正确的input_dim参数
+                layer_obj, customize = self.load_torch_layer(
+                    keras_layer, name_i, reuse, child_input_dim
+                )
                 self._name_to_layer[name_i] = layer_obj
+                self._name_to_customize[name_i] = customize
+
+                # 为子层注册到维度推断引擎
+                self.dim_engine.register_layer(name_i, layer_obj)
+
+                # 推断子层的输出维度
+                if child_input_dim_info is not None:
+                    if isinstance(layer_obj, LambdaWrapper):
+                        output_dim_info = layer_obj.infer_output_dim(
+                            child_input_dim_info
+                        )
+                    else:
+                        output_dim_info = self.dim_engine.infer_layer_output_dim(
+                            layer_obj, child_input_dim_info
+                        )
+
+                    self.dim_engine.register_output_dim(name_i, output_dim_info)
+                    self._name_to_output_dim[name_i] = output_dim_info.get_feature_dim()
+
+                    # 记录最后一个子层的输出维度
+                    last_output_dim_info = output_dim_info
+                    last_output_dim = output_dim_info.get_feature_dim()
+                elif child_input_dim is not None:
+                    # fallback: 使用简单的维度推断
+                    if hasattr(layer_obj, "output_dim") and callable(
+                        layer_obj.output_dim
+                    ):
+                        output_dim = layer_obj.output_dim()
+                    else:
+                        # 假设输入输出维度相同（如Cross层）
+                        output_dim = (
+                            child_input_dim
+                            if isinstance(child_input_dim, int)
+                            else (
+                                sum(child_input_dim)
+                                if isinstance(child_input_dim, (list, tuple))
+                                else child_input_dim
+                            )
+                        )
+                    self._name_to_output_dim[name_i] = output_dim
+
+                    # 记录最后一个子层的输出维度
+                    last_output_dim = output_dim
+
+            # 立即设置父层(recurrent层)的输出维度为最后一个子层的输出维度
+            # 这样后续依赖该层的block就能获取到正确的输出维度
+            if last_output_dim_info is not None:
+                # 立即更新维度推断引擎和兼容性字段
+                self.dim_engine.register_output_dim(name, last_output_dim_info)
+                self._name_to_output_dim[name] = last_output_dim
+                logging.info(
+                    f"Recurrent layer {name} output dim set to {last_output_dim} (from last child layer)"  # NOQA
+                )
+                logging.info(f"  - last_output_dim_info: {last_output_dim_info}")
+                logging.info(
+                    f"  - Updated _name_to_output_dim[{name}]: {self._name_to_output_dim[name]}"  # NOQA
+                )
+
+                # 验证更新是否成功
+                updated_dim_info = self.dim_engine.get_output_dim(name)
+                print(
+                    f"[VERIFY] Updated dim_engine output for {name}: {updated_dim_info}"
+                )
+
+            elif last_output_dim is not None:
+                output_dim_info = DimensionInfo(last_output_dim)
+                self.dim_engine.register_output_dim(name, output_dim_info)
+                self._name_to_output_dim[name] = last_output_dim
+                logging.info(
+                    f"Recurrent layer {name} output dim set to {last_output_dim} (fallback from last child layer)"  # NOQA
+                )
+                logging.info(f"  - Created output_dim_info: {output_dim_info}")
+                logging.info(
+                    f"  - Updated _name_to_output_dim[{name}]: {self._name_to_output_dim[name]}"  # NOQA
+                )
+
+            else:
+                logging.error(
+                    f"Recurrent layer {name} failed to set output dimension - no child layers found"  # NOQA
+                )
+                # 获取输入维度作为fallback
+                if parent_input_dim_info is not None:
+                    self.dim_engine.register_output_dim(name, parent_input_dim_info)
+                    self._name_to_output_dim[name] = (
+                        parent_input_dim_info.get_feature_dim()
+                    )
+                    logging.warning(
+                        f"Recurrent layer {name} using input dim as output dim: {parent_input_dim_info.get_feature_dim()}"  # NOQA
+                    )
+                elif parent_input_dim is not None:
+                    output_dim_info = DimensionInfo(parent_input_dim)
+                    self.dim_engine.register_output_dim(name, output_dim_info)
+                    self._name_to_output_dim[name] = parent_input_dim
+                    logging.warning(
+                        f"Recurrent layer {name} using fallback input dim as output dim: {parent_input_dim}"  # NOQA
+                    )
+                else:
+                    raise ValueError(
+                        f"Recurrent layer {name} cannot determine output dimension"
+                    )
         elif layer == "repeat":
             keras_layer = layer_cnf.repeat.module
+            # 获取父层的输入维度信息，用于子层的维度推断
+            parent_input_dim_info = self.dim_engine.block_input_dims.get(name)
+            parent_input_dim = self._name_to_input_dim.get(name, None)
+
+            # 用于记录最后一个子层的输出维度
+            last_output_dim_info = None
+            last_output_dim = None
+
             for i in range(layer_cnf.repeat.num_repeat):
                 name_i = "%s_%d" % (name, i)
-                layer_obj = self.load_torch_layer(keras_layer, name_i, reuse)
+
+                # 为每个子层注册输入维度信息
+                if parent_input_dim_info is not None:
+                    self.dim_engine.register_input_dim(name_i, parent_input_dim_info)
+                if parent_input_dim is not None:
+                    self._name_to_input_dim[name_i] = parent_input_dim
+
+                # 加载子层，传递正确的input_dim参数
+                layer_obj, customize = self.load_torch_layer(
+                    keras_layer, name_i, reuse, parent_input_dim
+                )
                 self._name_to_layer[name_i] = layer_obj
+                self._name_to_customize[name_i] = customize
+
+                # 为子层注册到维度推断引擎
+                self.dim_engine.register_layer(name_i, layer_obj)
+
+                # 推断子层的输出维度
+                if parent_input_dim_info is not None:
+                    if isinstance(layer_obj, LambdaWrapper):
+                        output_dim_info = layer_obj.infer_output_dim(
+                            parent_input_dim_info
+                        )
+                    else:
+                        output_dim_info = self.dim_engine.infer_layer_output_dim(
+                            layer_obj, parent_input_dim_info
+                        )
+
+                    self.dim_engine.register_output_dim(name_i, output_dim_info)
+                    self._name_to_output_dim[name_i] = output_dim_info.get_feature_dim()
+
+                    # 记录最后一个子层的输出维度
+                    last_output_dim_info = output_dim_info
+                    last_output_dim = output_dim_info.get_feature_dim()
+                elif parent_input_dim is not None:
+                    # fallback: 使用简单的维度推断
+                    if hasattr(layer_obj, "output_dim") and callable(
+                        layer_obj.output_dim
+                    ):
+                        output_dim = layer_obj.output_dim()
+                    else:
+                        # 假设输入输出维度相同
+                        output_dim = (
+                            parent_input_dim
+                            if isinstance(parent_input_dim, int)
+                            else (
+                                sum(parent_input_dim)
+                                if isinstance(parent_input_dim, (list, tuple))
+                                else parent_input_dim
+                            )
+                        )
+                    self._name_to_output_dim[name_i] = output_dim
+
+                    # 记录最后一个子层的输出维度
+                    last_output_dim = output_dim
+
+            # 设置父层(repeat层)的输出维度为最后一个子层的输出维度
+            if last_output_dim_info is not None:
+                self.dim_engine.register_output_dim(name, last_output_dim_info)
+                self._name_to_output_dim[name] = last_output_dim
+                logging.info(
+                    f"Repeat layer {name} output dim set to {last_output_dim} (from last child layer)"  # NOQA
+                )
+            elif last_output_dim is not None:
+                output_dim_info = DimensionInfo(last_output_dim)
+                self.dim_engine.register_output_dim(name, output_dim_info)
+                self._name_to_output_dim[name] = last_output_dim
+                logging.info(
+                    f"Repeat layer {name} output dim set to {last_output_dim} (fallback from last child layer)"  # NOQA
+                )
         elif layer == "lambda":
             expression = getattr(layer_cnf, "lambda").expression
             lambda_layer = LambdaWrapper(expression, name=name)
@@ -575,8 +913,14 @@ class Package(nn.Module):
                             # 兼容不同实现风格
                             if "in_features" in sig.parameters:
                                 kwargs["in_features"] = feature_dim
+                                logging.info(
+                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred in_features={feature_dim} from dim_engine"  # NOQA
+                                )
                             elif "input_dim" in sig.parameters:
                                 kwargs["input_dim"] = feature_dim
+                                logging.info(
+                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred input_dim={feature_dim} from dim_engine"  # NOQA
+                                )
                         elif input_dim is not None:
                             # fallback到传入的input_dim参数
                             feature_dim = (
@@ -590,9 +934,30 @@ class Package(nn.Module):
                             )
                             if "in_features" in sig.parameters:
                                 kwargs["in_features"] = feature_dim
+                                logging.info(
+                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred in_features={feature_dim} from fallback input_dim"  # NOQA
+                                )
                             elif "input_dim" in sig.parameters:
                                 kwargs["input_dim"] = feature_dim
+                                logging.info(
+                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred input_dim={feature_dim} from fallback input_dim"  # NOQA
+                                )
                         else:
+                            logging.error(
+                                f"Layer {name} ({layer_cls.__name__}) dimension inference failed - no input_dim available"  # NOQA
+                            )
+                            # 打印调试信息
+                            logging.error(
+                                f"  - input_dim_info from dim_engine: {input_dim_info}"
+                            )
+                            logging.error(f"  - fallback input_dim: {input_dim}")
+                            logging.error(
+                                f"  - block_input_dims keys: {list(self.dim_engine.block_input_dims.keys())}"  # NOQA
+                            )
+                            if name in self._name_to_input_dim:
+                                logging.error(
+                                    f"  - _name_to_input_dim[{name}]: {self._name_to_input_dim[name]}"  # NOQA
+                                )
                             raise ValueError(
                                 f"{layer_cls.__name__} 需要 in_features 或 input_dim, "
                                 "但参数未给定，且无法自动推断。请检查维度推断配置。"
@@ -1221,6 +1586,10 @@ class Package(nn.Module):
         layer_name = config.WhichOneof("layer")
         if layer_name == "module":
             return self.call_keras_layer(inputs, name, **kwargs)
+        elif layer_name == "recurrent":
+            return self._call_recurrent_layer(inputs, config, name, **kwargs)
+        elif layer_name == "repeat":
+            return self._call_repeat_layer(inputs, config, name, **kwargs)
         elif layer_name == "lambda":
             # 优先使用注册的LambdaWrapper，如果存在的话
             if name in self._name_to_layer and isinstance(
@@ -1234,6 +1603,88 @@ class Package(nn.Module):
                 fn = eval(conf.expression)
                 return fn(inputs)
         raise NotImplementedError("Unsupported backbone layer:" + layer_name)
+
+    def _call_recurrent_layer(self, inputs, config, name, **kwargs):
+        """Call recurrent layer by iterating through all steps.
+
+        Args:
+            inputs: Input data to be processed by the recurrent layer.
+            config: Recurrent layer configuration.
+            name (str): Name of the recurrent layer.
+            **kwargs: Additional keyword arguments passed to sub-layers.
+
+        Returns:
+            Output from the last step of the recurrent layer.
+        """
+        recurrent_config = config.recurrent
+        fixed_input_index = getattr(recurrent_config, "fixed_input_index", None)
+
+        # 解析输入
+        if isinstance(inputs, (list, tuple)) and len(inputs) > 1:
+            # 多输入情况
+            if fixed_input_index is not None:
+                # 有固定输入索引，用于Cross层的x0
+                x0 = inputs[fixed_input_index]
+                xl = inputs[1 - fixed_input_index] if len(inputs) == 2 else inputs[-1]
+            else:
+                # 没有固定输入索引，使用第一个作为初始输入
+                x0 = inputs[0]
+                xl = inputs[0]
+        else:
+            # 单输入情况
+            single_input = inputs[0] if isinstance(inputs, (list, tuple)) else inputs
+            x0 = single_input
+            xl = single_input
+
+        # 逐步执行recurrent
+        for i in range(recurrent_config.num_steps):
+            name_i = f"{name}_{i}"
+            if name_i in self._name_to_layer:
+                layer = self._name_to_layer[name_i]
+
+                # 根据层类型调用
+                if hasattr(layer, "forward"):
+                    # 检查层是否需要两个参数（如Cross层）
+                    import inspect
+
+                    sig = inspect.signature(layer.forward)
+                    params = list(sig.parameters.keys())
+
+                    if len(params) >= 3:  # self, x0, xl (可能还有可选参数)
+                        xl = layer(x0, xl)
+                    else:  # 只需要一个输入参数
+                        xl = layer(xl)
+                else:
+                    xl = layer(xl)
+            else:
+                logging.warning(f"Recurrent sub-layer {name_i} not found, skipping")
+
+        return xl
+
+    def _call_repeat_layer(self, inputs, config, name, **kwargs):
+        """Call repeat layer by iterating through all repetitions.
+
+        Args:
+            inputs: Input data to be processed by the repeat layer.
+            config: Repeat layer configuration.
+            name (str): Name of the repeat layer.
+            **kwargs: Additional keyword arguments passed to sub-layers.
+
+        Returns:
+            Output from the last repetition of the repeat layer.
+        """
+        repeat_config = config.repeat
+        output = inputs
+
+        # 逐步执行repeat
+        for i in range(repeat_config.num_repeat):
+            name_i = f"{name}_{i}"
+            if name_i in self._name_to_layer:
+                output = self.call_keras_layer(output, name_i, **kwargs)
+            else:
+                logging.warning(f"Repeat sub-layer {name_i} not found, skipping")
+
+        return output
 
 
 class Backbone(nn.Module):
