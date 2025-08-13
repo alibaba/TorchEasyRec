@@ -111,7 +111,7 @@ class DINEncoder(SequenceEncoder):
         attn_output = self.linear(attn_output)
         attn_output = attn_output.transpose(1, 2)
 
-        padding = torch.ones_like(attn_output) * (-(2**32) + 1)
+        padding = torch.ones_like(attn_output) * (-(2**31) + 1)
         scores = torch.where(sequence_mask.unsqueeze(1), attn_output, padding)
         scores = F.softmax(scores, dim=-1)
         return torch.matmul(scores, sequence).squeeze(1)
@@ -154,7 +154,7 @@ class SimpleAttention(SequenceEncoder):
         ) < sequence_length.unsqueeze(1)
 
         attn_output = torch.matmul(sequence, query.unsqueeze(2)).squeeze(2)
-        padding = torch.ones_like(attn_output) * (-(2**32) + 1)
+        padding = torch.ones_like(attn_output) * (-(2**31) + 1)
         scores = torch.where(sequence_mask, attn_output, padding)
         scores = F.softmax(scores, dim=-1)
         return torch.matmul(scores.unsqueeze(1), sequence).squeeze(1)

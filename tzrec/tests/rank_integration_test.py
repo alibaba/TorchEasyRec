@@ -37,9 +37,7 @@ class RankIntegrationTest(unittest.TestCase):
         if self.success:
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
-        os.environ.pop("QUANT_EMB", None)
         os.environ.pop("INPUT_TILE", None)
-        os.environ.pop("ENABLE_TRT", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
@@ -787,14 +785,12 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
-    @unittest.skip("skip trt test")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skip("skip trt test")
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",
