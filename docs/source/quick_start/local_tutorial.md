@@ -15,10 +15,10 @@ pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu126
-pip install fbgemm-gpu==1.2.0 --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+pip install fbgemm-gpu==1.3.0 --index-url https://download.pytorch.org/whl/cu126
 pip install torchmetrics==1.0.3 tensordict
-pip install torchrec==1.2.0 --index-url https://download.pytorch.org/whl/cu126
+pip install torchrec==1.3.0 --index-url https://download.pytorch.org/whl/cu126
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
