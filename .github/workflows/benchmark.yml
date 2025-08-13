@@ -8,6 +8,7 @@ on:
 jobs:
   ci-test:
     runs-on: tzrec-bench-runner
+    timeout-minutes: 960
     container:
       image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-test:0.9
       options: --gpus all --ipc host

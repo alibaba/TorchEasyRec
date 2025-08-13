@@ -8,7 +8,7 @@ RUN sed -i "s@http://archive.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/so
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates \
-        ccache cmake gcc git vim watchman wget curl && \
+        ccache cmake gcc git vim watchman wget curl sudo iprouter2 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/libidn11_1.33-2.2ubuntu2_amd64.deb && \
@@ -30,6 +30,7 @@ RUN case ${DEVICE} in \
                  dpkg -i cuda-keyring_1.1-1_all.deb && \
                  apt-get update && \
                  apt-get install -y cuda-toolkit-12-6 cuda-compat-12-6 && \
+                 rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
