@@ -99,64 +99,100 @@ class InteractionArch(nn.Module):
         return interactions_flat
 
 
-class CrossNetV2(nn.Module):
+class Cross(nn.Module):
+    """Cross Layer in Deep & Cross Network to learn explicit feature interactions.
+
+    Ref: https://arxiv.org/pdf/1708.05123
+
+    Args:
+        cross_num(int): number of cross layers
+        input_dim(int): input tensor dimension
+    """
+
+    def __init__(self, cross_num: int, input_dim: int) -> None:
+        super().__init__()
+        self.cross_num = cross_num
+        self.w = nn.ModuleList()
+        self.b = nn.ParameterList()
+        for _ in range(cross_num):
+            self.w.append(nn.Linear(input_dim, 1, bias=False))
+            self.b.append(nn.Parameter(torch.empty(input_dim)))
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize parameters."""
+        for i in range(self.cross_num):
+            nn.init.xavier_uniform_(self.w[i].weight)
+            nn.init.zeros_(self.b[i])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward."""
+        x1 = x
+        for i in range(self.cross_num):
+            x1 = self.w[i](x1) * x + self.b[i] + x1
+
+        return x1
+
+
+class CrossV2(nn.Module):
     """Cross network v2.
 
     Args:
-        in_features (int): number of elements in each input sample.
+        input_dim (int): input tensor dimension.
         low_rank (int): W dimension
         num_layers (int): number of cross layers.
     """
 
-    def __init__(self, in_features: int, low_rank=32, num_layers=3):
-        super(CrossNetV2, self).__init__()
-        self._num_layers = num_layers
+    def __init__(self, input_dim: int, low_rank=32, cross_num=3):
+        super(CrossV2, self).__init__()
+        self.cross_num = cross_num
         self._low_rank = low_rank
-        self._in_features = in_features
+        self._input_dim = input_dim
         self.u_kernels = torch.nn.ParameterList(
             [
                 torch.nn.Parameter(
                     torch.nn.init.xavier_normal_(
-                        torch.empty(self._in_features, self._low_rank)
+                        torch.empty(self._input_dim, self._low_rank)
                     )
                 )
-                for _ in range(self._num_layers)
+                for _ in range(self.cross_num)
             ]
         )
         self.v_kernels = torch.nn.ParameterList(
             [
                 torch.nn.Parameter(
                     torch.nn.init.xavier_normal_(
-                        torch.empty(self._low_rank, self._in_features)
+                        torch.empty(self._low_rank, self._input_dim)
                     )
                 )
-                for _ in range(self._num_layers)
+                for _ in range(self.cross_num)
             ]
         )
 
         self.bias = torch.nn.ParameterList(
             [
-                torch.nn.Parameter(torch.nn.init.zeros_(torch.empty(self._in_features)))
-                for _ in range(self._num_layers)
+                torch.nn.Parameter(torch.nn.init.zeros_(torch.empty(self._input_dim)))
+                for _ in range(self.cross_num)
             ]
         )
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
-        return self._in_features
+        return self._input_dim
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Forward the module.
 
         Args:
-            input (torch.Tensor): tensor with shape [batch_size, in_features].
+            input (torch.Tensor): tensor with shape [batch_size, input_dim].
         """
         x_0 = input
         x_l = x_0
-        for layer in range(self._num_layers):
+        for layer in range(self.cross_num):
             x_l_v = torch.nn.functional.linear(x_l, self.v_kernels[layer])
             x_l_w = torch.nn.functional.linear(x_l_v, self.u_kernels[layer])
-            x_l = x_0 * (x_l_w + self.bias[layer]) + x_l  # (batch_size, in_features)
+            x_l = x_0 * (x_l_w + self.bias[layer]) + x_l  # (batch_size, input_dim)
 
         return x_l
 

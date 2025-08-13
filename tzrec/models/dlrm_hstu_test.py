@@ -36,7 +36,7 @@ class DlrmHSTUTest(unittest.TestCase):
         [
             [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH],
             [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH],
-            [TestGraphType.JIT_SCRIPT, torch.device("cpu"), Kernel.PYTORCH],
+            [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH],
             [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON],
             [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON],
         ]
@@ -154,6 +154,10 @@ class DlrmHSTUTest(unittest.TestCase):
                     ),
                     input_preprocessor=module_pb2.GRInputPreprocessor(
                         contextual_preprocessor=module_pb2.GRContextualPreprocessor(
+                            contextual_feature_to_max_length={
+                                "user_id": 1,
+                                "user_active_degree": 1,
+                            },
                             action_encoder=module_pb2.GRActionEncoder(
                                 action_embedding_dim=8,
                                 action_feature_name="action_weight",
@@ -224,6 +228,8 @@ class DlrmHSTUTest(unittest.TestCase):
             labels=["item_action_weight", "item_target_watchtime"],
         )
         dlrm_hstu.set_kernel(kernel)
+        if graph_type == TestGraphType.JIT_SCRIPT:
+            dlrm_hstu.set_is_inference(True)
         init_parameters(dlrm_hstu, device=device)
         dlrm_hstu.to(device)
         dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
@@ -258,7 +264,7 @@ class DlrmHSTUTest(unittest.TestCase):
             labels={},
         ).to(device)
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = dlrm_hstu(batch.to_dict())
+            predictions = dlrm_hstu(batch.to_dict(), device)
         else:
             predictions = dlrm_hstu(batch)
         self.assertEqual(predictions["logits_is_click"].size(), (6,))
