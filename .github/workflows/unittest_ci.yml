@@ -21,4 +21,4 @@ jobs:
         id: run_unittest_ci
         run: |
           cd run_${{ github.run_id }}
-          CI_HYPOTHESIS=true bash scripts/ci/ci_test.sh
+          TRITON_CACHE_AUTOTUNING=1 TRITON_CACHE_DIR=../.triton_cache CI_HYPOTHESIS=true bash scripts/ci/ci_test.sh
