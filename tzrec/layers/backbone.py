@@ -67,18 +67,8 @@ class LambdaWrapper(nn.Module):
     def _compile_function(self):
         """Compiling Lambda Functions."""
         try:
-            # Creating a secure execution environment
-            safe_globals = {
-                "torch": torch,
-                "__builtins__": {},
-                "cat": torch.cat,
-                "stack": torch.stack,
-                "sum": torch.sum,
-                "mean": torch.mean,
-                "max": torch.max,
-                "min": torch.min,
-            }
-            self._lambda_fn = eval(self.expression, safe_globals, {})
+            # 直接使用当前模块的全局环境，无需构建额外的globals_env
+            self._lambda_fn = eval(self.expression)
             if not callable(self._lambda_fn):
                 raise ValueError(
                     f"Expression does not evaluate to callable: {self.expression}"
@@ -96,7 +86,7 @@ class LambdaWrapper(nn.Module):
     def infer_output_dim(self, input_dim_info: DimensionInfo) -> DimensionInfo:
         """Inferring output dims using LambdaOutputDimInferrer."""
         try:
-            inferrer = LambdaOutputDimInferrer(safe_mode=True)
+            inferrer = LambdaOutputDimInferrer(safe_mode=False)
             output_dim_info = inferrer.infer_output_dim(input_dim_info, self.expression)
             logging.debug(
                 f"Lambda wrapper {self.name} inferred output dim: {output_dim_info}"
@@ -113,7 +103,7 @@ class LambdaWrapper(nn.Module):
 
 
 class Package(nn.Module):
-    """A sub DAG of tf ops for reuse."""
+    """A sub DAG for reuse."""
 
     __packages = {}
 
@@ -241,7 +231,7 @@ class Package(nn.Module):
         self.topo_order = nx.topological_sort(self.G)  # 迭代器
         self.topo_order_list = list(self.topo_order)  # list
         A = to_agraph(self.G)
-        A.layout("dot")  # 用 graphviz 的 dot 布局
+        A.layout("dot") 
         A.draw("dag.png")  # 输出图片文件
         for block_name in self.topo_order_list:
             block = self._name_to_blocks[block_name]

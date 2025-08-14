@@ -26,13 +26,8 @@ class LambdaOutputDimInferrer:
     通过创建dummy tensor并执行lambda表达式来推断输出维度.
     """
 
-    def __init__(self, safe_mode: bool = True):
-        """Initialize the Lambda output dimension inferrer.
-
-        Args:
-            safe_mode: 安全模式，在安全模式下会进行额外的检查和错误处理
-        """
-        self.safe_mode = safe_mode
+    def __init__(self):
+        """Initialize the Lambda output dimension inferrer."""
         self.logger = logging.getLogger(__name__)
 
     def infer_output_dim(
@@ -73,12 +68,9 @@ class LambdaOutputDimInferrer:
             self.logger.error(
                 f"Failed to infer output dim for lambda '{lambda_fn_str}': {e}"
             )
-            if self.safe_mode:
-                # 安全模式下返回输入维度
-                self.logger.warning("Falling back to input dimension")
-                return input_dim_info
-            else:
-                raise
+            # 出错时返回输入维度作为fallback
+            self.logger.warning("Falling back to input dimension")
+            return input_dim_info
 
     def _create_dummy_tensor(
         self,
@@ -115,25 +107,9 @@ class LambdaOutputDimInferrer:
             # 清理字符串
             lambda_fn_str = lambda_fn_str.strip()
 
-            # 安全检查
-            if self.safe_mode:
-                self._validate_lambda_safety(lambda_fn_str)
-
-            # 编译lambda函数
-            # 为了安全起见，限制可用的全局变量
-            safe_globals = {
-                "torch": torch,
-                "__builtins__": {},
-                # 添加常用的torch函数
-                "cat": torch.cat,
-                "stack": torch.stack,
-                "sum": torch.sum,
-                "mean": torch.mean,
-                "max": torch.max,
-                "min": torch.min,
-            }
-
-            lambda_fn = eval(lambda_fn_str, safe_globals, {})
+            # 移除安全检查，直接编译lambda函数
+            # 编译lambda函数 - 使用完整的全局环境
+            lambda_fn = eval(lambda_fn_str)
 
             if not callable(lambda_fn):
                 raise ValueError(
@@ -148,39 +124,6 @@ class LambdaOutputDimInferrer:
                 f"Failed to compile lambda function '{lambda_fn_str}': {e}"
             )
             raise ValueError(f"Invalid lambda expression: {lambda_fn_str}") from e
-
-    def _validate_lambda_safety(self, lambda_fn_str: str) -> None:
-        """验证lambda表达式的安全性."""
-        # 检查危险的关键词
-        dangerous_keywords = [
-            "import",
-            "exec",
-            "eval",
-            "open",
-            "file",
-            "__import__",
-            "getattr",
-            "setattr",
-            "delattr",
-            "globals",
-            "locals",
-            "vars",
-            "dir",
-            "compile",
-            "reload",
-        ]
-
-        lambda_lower = lambda_fn_str.lower()
-        for keyword in dangerous_keywords:
-            if keyword in lambda_lower:
-                raise ValueError(
-                    f"Potentially unsafe lambda expression contains '{keyword}': "
-                    f"{lambda_fn_str}"
-                )
-
-        # 检查是否是有效的lambda表达式格式
-        if not lambda_fn_str.strip().startswith("lambda"):
-            raise ValueError(f"Expression must be a lambda function: {lambda_fn_str}")
 
     def _analyze_output(
         self, output_tensor: torch.Tensor, input_dim_info: DimensionInfo
@@ -259,7 +202,7 @@ class LambdaLayer(nn.Module):
 
     def _compile_function(self):
         """编译lambda函数."""
-        inferrer = LambdaOutputDimInferrer(safe_mode=True)
+        inferrer = LambdaOutputDimInferrer()
         self._lambda_fn = inferrer._compile_lambda_function(self.lambda_fn_str)
 
     def _infer_output_dim(self):
@@ -269,7 +212,7 @@ class LambdaLayer(nn.Module):
                 "Cannot infer output dimension without input dimension info"
             )
 
-        inferrer = LambdaOutputDimInferrer(safe_mode=True)
+        inferrer = LambdaOutputDimInferrer()
         self._output_dim_info = inferrer.infer_output_dim(
             self._input_dim_info, self.lambda_fn_str
         )
@@ -321,8 +264,8 @@ def create_lambda_layer_from_input_fn(
 
 # 便捷函数
 def infer_lambda_output_dim(
-    input_dim_info: DimensionInfo, lambda_fn_str: str, safe_mode: bool = True
+    input_dim_info: DimensionInfo, lambda_fn_str: str
 ) -> DimensionInfo:
     """便捷函数：推断lambda表达式的输出维度."""
-    inferrer = LambdaOutputDimInferrer(safe_mode=safe_mode)
+    inferrer = LambdaOutputDimInferrer()
     return inferrer.infer_output_dim(input_dim_info, lambda_fn_str)
