@@ -33,9 +33,6 @@ if has_triton():
         triton_add_position_embeddings,
         triton_add_timestamp_positional_embeddings,
     )
-
-    # torch.fx.wrap("triton_add_position_embeddings")
-    # torch.fx.wrap("triton_add_timestamp_positional_embeddings")
 else:
     triton_add_position_embeddings = pytorch_add_position_embeddings
     triton_add_timestamp_positional_embeddings = (

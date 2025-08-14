@@ -317,7 +317,6 @@ class _AddMmFunction(torch.autograd.Function):
         return triton_addmm_bwd(x, w, dz, ctx.is_y_1d)
 
 
-@torch.fx.wrap
 def triton_addmm(
     input: torch.Tensor,
     mat1: torch.Tensor,

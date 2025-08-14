@@ -1515,7 +1515,6 @@ class _AttentionFunction(torch.autograd.Function):
             )
 
 
-@torch.fx.wrap
 def triton_hstu_mha(
     N: int,
     alpha: float,
@@ -1544,7 +1543,7 @@ def triton_hstu_mha(
     )
 
 
-@torch.fx.wrap
+@triton_op("tzrec::triton_cached_hstu_mha", mutates_args={})
 def triton_cached_hstu_mha(
     N: int,
     alpha: float,
@@ -1568,7 +1567,7 @@ def triton_cached_hstu_mha(
     )
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
-    _hstu_attn_fwd[grid](
+    wrap_triton(_hstu_attn_fwd)[grid](
         Q=delta_q,
         K=k,
         V=v,

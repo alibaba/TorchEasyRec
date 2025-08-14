@@ -181,6 +181,44 @@ def _add_position_embeddings_bwd_kernel(
     )
 
 
+@triton_op("tzrec::triton_add_position_embeddings_fwd", mutates_args=())
+def triton_add_position_embeddings_fwd(
+    jagged: torch.Tensor,
+    jagged_offsets: torch.Tensor,
+    high_inds: torch.Tensor,
+    max_seq_len: int,
+    dense: torch.Tensor,
+    scale: float = 1.0,
+) -> Tuple[torch.Tensor, int, int, int]:
+    jagged = switch_to_contiguous_if_needed(jagged)
+    dense = switch_to_contiguous_if_needed(dense)
+    L, D = jagged.shape
+    assert len(dense.shape) == 2
+    out = torch.empty_like(jagged)
+    B = high_inds.size(0)
+    grid = lambda meta: (  # noqa E731
+        B,
+        triton.cdiv(max_seq_len, meta["BLOCK_N"]),
+    )
+    BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
+    wrap_triton(_add_position_embeddings_kernel)[grid](
+        Jagged=jagged,
+        seq_offsets=jagged_offsets,
+        high_inds=high_inds,
+        Dense=dense,
+        Out=out,
+        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
+        D=D,
+        scale=scale,
+        stride_jn=jagged.stride(0),
+        stride_dk=dense.stride(0),
+        stride_on=out.stride(0),
+        SCALE_JAGGED=scale != 1.0,
+        BLOCK_D=BLOCK_D,
+    )
+    return out, B, D, BLOCK_D
+
+
 class _AddPositionEmbeddingsFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -193,31 +231,13 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
         dense: torch.Tensor,
         scale: float = 1.0,
     ):
-        jagged = switch_to_contiguous_if_needed(jagged)
-        dense = switch_to_contiguous_if_needed(dense)
-        L, D = jagged.shape
-        assert len(dense.shape) == 2
-        out = torch.empty_like(jagged)
-        B = high_inds.size(0)
-        grid = lambda meta: (  # noqa E731
-            B,
-            triton.cdiv(max_seq_len, meta["BLOCK_N"]),
-        )
-        BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
-        _add_position_embeddings_kernel[grid](
-            Jagged=jagged,
-            seq_offsets=jagged_offsets,
+        out, B, D, BLOCK_D = triton_add_position_embeddings_fwd(
+            jagged=jagged,
+            jagged_offsets=jagged_offsets,
             high_inds=high_inds,
-            Dense=dense,
-            Out=out,
-            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
-            D=D,
+            max_seq_len=max_seq_len,
+            dense=dense,
             scale=scale,
-            stride_jn=jagged.stride(0),
-            stride_dk=dense.stride(0),
-            stride_on=out.stride(0),
-            SCALE_JAGGED=scale != 1.0,
-            BLOCK_D=BLOCK_D,
         )
         ctx.save_for_backward(jagged_offsets, high_inds)
         ctx.B = B

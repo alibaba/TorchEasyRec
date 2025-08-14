@@ -66,10 +66,7 @@ def _fx_mark_length_features(tensor: torch.Tensor) -> torch.Tensor:
 def _fx_numel(tensor: torch.Tensor) -> int:
     total_len = tensor.numel()
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range [0, 10**9)
         torch._check_is_size(total_len)
-        torch._check(total_len < 10**9)
-        torch._check(total_len > 0)
     return total_len
 
 
@@ -195,7 +192,6 @@ class DlrmHSTU(RankModel):
         ).squeeze(-1)
         total_targets = fx_int_item(num_candidates.sum())
         total_len = _fx_numel(source_timestamps)
-        # torch._check_is_size(total_len)
         candidates_user_embeddings, _ = self._hstu_transducer(
             max_uih_len=max_uih_len,
             max_targets=max_candidates,

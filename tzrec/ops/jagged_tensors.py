@@ -35,9 +35,6 @@ if has_triton():
         triton_jagged_dense_bmm_broadcast_add,
         triton_split_2D_jagged,
     )
-
-    # torch.fx.wrap("triton_concat_2D_jagged")
-    # torch.fx.wrap("triton_split_2D_jagged")
 else:
     triton_concat_2D_jagged = pytorch_concat_2D_jagged
     triton_jagged_dense_bmm_broadcast_add = pytorch_jagged_dense_bmm_broadcast_add

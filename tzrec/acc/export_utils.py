@@ -123,7 +123,7 @@ def export_pm(
 
     logger.info("dynamic shapes=%s" % dynamic_shapes)
     exported_pg = torch.export.export(
-        gm, args=(data,), dynamic_shapes=(dynamic_shapes,), strict=False
+        gm, args=(data,), dynamic_shapes=(dynamic_shapes,)
     )
 
     export_path = os.path.join(save_dir, "exported_pg.py")
@@ -131,12 +131,5 @@ def export_pm(
         fout.write(str(exported_pg))
 
     exported_pg.module()(data)
-
-    torch._inductor.aoti_compile_and_package(
-        exported_pg,
-        # [Optional] Specify the generated shared library path. If not specified,
-        # the generated artifact is stored in your system temp directory.
-        package_path=os.path.join(save_dir, "model.pt2"),
-    )
 
     return (exported_pg, data)

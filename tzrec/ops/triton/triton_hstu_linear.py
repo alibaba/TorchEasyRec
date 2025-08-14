@@ -1256,7 +1256,6 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         )
 
 
-@torch.fx.wrap
 def triton_norm_mul_dropout(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -1291,7 +1290,6 @@ def triton_norm_mul_dropout(
         )
 
 
-@torch.fx.wrap
 def triton_hstu_compute_output(
     attn: torch.Tensor,
     u: torch.Tensor,
