@@ -49,7 +49,7 @@ message ModelConfig {
         WideAndDeep wide_and_deep = 105;
         DCNV1 dcn_v1 = 106;
         DCNV2 dcn_v2 = 107;
-        XDeepFM xdeepfm = 108;
+        xDeepFM xdeepfm = 108;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;

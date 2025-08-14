@@ -53,20 +53,21 @@ message MaskNet {
 
 
 message DCNV1 {
-    required Cross cross_tower = 1;
-    required MLP deep_tower = 2;
-    required MLP final_dnn = 3;
-}
-
-
-message DCNV2 {
-    required CrossV2 cross = 1;
-    optional MLP deep = 2;
+    required Cross cross = 1;
+    required MLP deep = 2;
     required MLP final = 3;
 }
 
 
-message XDeepFM {
+message DCNV2 {
+    optional MLP backbone = 1;
+    required CrossV2 cross = 2;
+    optional MLP deep = 3;
+    required MLP final = 4;
+}
+
+
+message xDeepFM {
     required CIN cin = 1;
     required MLP deep = 2;
     required MLP final = 3;

@@ -64,9 +64,9 @@ class DCNV2Test(unittest.TestCase):
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
             ],
         )
-        dcn_v1 = DCNV2(model_config=model_config, features=features, labels=["label"])
-        init_parameters(dcn_v1, device=torch.device("cpu"))
-        dcn_v1 = create_test_model(dcn_v1, graph_type)
+        dcn_v2 = DCNV2(model_config=model_config, features=features, labels=["label"])
+        init_parameters(dcn_v2, device=torch.device("cpu"))
+        dcn_v2 = create_test_model(dcn_v2, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b"],
@@ -83,9 +83,9 @@ class DCNV2Test(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = dcn_v1(batch.to_dict())
+            predictions = dcn_v2(batch.to_dict())
         else:
-            predictions = dcn_v1(batch)
+            predictions = dcn_v2(batch)
         self.assertEqual(predictions["logits"].size(), (2,))
         self.assertEqual(predictions["probs"].size(), (2,))
 

@@ -17,7 +17,7 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.xdeepfm import XDeepFM
+from tzrec.models.xdeepfm import xDeepFM
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, seq_encoder_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
@@ -28,7 +28,7 @@ class XDeepFMTest(unittest.TestCase):
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
-    def test_deepfm_has_sequences(self, graph_type=TestGraphType.NORMAL) -> None:
+    def test_xdeepfm_has_sequences(self, graph_type=TestGraphType.NORMAL) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -139,7 +139,7 @@ class XDeepFMTest(unittest.TestCase):
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
             ],
         )
-        xdeepfm = XDeepFM(
+        xdeepfm = xDeepFM(
             model_config=model_config, features=features, labels=["label"]
         )
         init_parameters(xdeepfm, device=torch.device("cpu"))

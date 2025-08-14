@@ -23,7 +23,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class XDeepFM(RankModel):
+class xDeepFM(RankModel):
     """XDeepFM model.
 
     Args:

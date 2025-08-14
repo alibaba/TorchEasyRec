@@ -105,13 +105,14 @@ class Cross(nn.Module):
     Ref: https://arxiv.org/pdf/1708.05123
 
     Args:
-        cross_num(int): number of cross layers
         input_dim(int): input tensor dimension
+        cross_num(int): number of cross layers
     """
 
-    def __init__(self, cross_num: int, input_dim: int) -> None:
+    def __init__(self, input_dim: int, cross_num: int = 3) -> None:
         super().__init__()
         self.cross_num = cross_num
+        self._input_dim = input_dim
         self.w = nn.ModuleList()
         self.b = nn.ParameterList()
         for _ in range(cross_num):
@@ -119,6 +120,10 @@ class Cross(nn.Module):
             self.b.append(nn.Parameter(torch.empty(input_dim)))
 
         self.reset_parameters()
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._input_dim
 
     def reset_parameters(self) -> None:
         """Initialize parameters."""
@@ -140,36 +145,28 @@ class CrossV2(nn.Module):
 
     Args:
         input_dim (int): input tensor dimension.
+        cross_num (int): number of cross layers.
         low_rank (int): W dimension
-        num_layers (int): number of cross layers.
     """
 
-    def __init__(self, input_dim: int, low_rank=32, cross_num=3):
+    def __init__(self, input_dim: int, cross_num: int = 3, low_rank: int = 32):
         super(CrossV2, self).__init__()
         self.cross_num = cross_num
         self._low_rank = low_rank
         self._input_dim = input_dim
-        self.u_kernels = torch.nn.ParameterList(
-            [
-                torch.nn.Parameter(
-                    torch.nn.init.xavier_normal_(
-                        torch.empty(self._input_dim, self._low_rank)
-                    )
-                )
-                for _ in range(self.cross_num)
-            ]
-        )
-        self.v_kernels = torch.nn.ParameterList(
-            [
-                torch.nn.Parameter(
-                    torch.nn.init.xavier_normal_(
-                        torch.empty(self._low_rank, self._input_dim)
-                    )
-                )
-                for _ in range(self.cross_num)
-            ]
-        )
 
+        self.u_kernels = nn.ModuleList(
+            [
+                nn.Linear(self._input_dim, self._low_rank, bias=False)
+                for _ in range(cross_num)
+            ]
+        )
+        self.v_kernels = nn.ModuleList(
+            [
+                nn.Linear(self._low_rank, self._input_dim, bias=False)
+                for _ in range(cross_num)
+            ]
+        )
         self.bias = torch.nn.ParameterList(
             [
                 torch.nn.Parameter(torch.nn.init.zeros_(torch.empty(self._input_dim)))
@@ -189,10 +186,10 @@ class CrossV2(nn.Module):
         """
         x_0 = input
         x_l = x_0
-        for layer in range(self.cross_num):
-            x_l_v = torch.nn.functional.linear(x_l, self.v_kernels[layer])
-            x_l_w = torch.nn.functional.linear(x_l_v, self.u_kernels[layer])
-            x_l = x_0 * (x_l_w + self.bias[layer]) + x_l  # (batch_size, input_dim)
+        for i in range(self.cross_num):
+            x_l_v = self.u_kernels[i](x_l)
+            x_l_w = self.v_kernels[i](x_l_v)
+            x_l = x_0 * (x_l_w + self.bias[i]) + x_l  # (batch_size, input_dim)
 
         return x_l
 
@@ -205,11 +202,10 @@ class CIN(nn.Module):
         cin_layer_size(list[int]): cin_layer_size
     """
 
-    def __init__(self, feature_num: int, cin_layer_size: List[int], use_bias=False):
+    def __init__(self, feature_num: int, cin_layer_size: List[int]):
         super(CIN, self).__init__()
         self.feature_num = feature_num
         self.cin_layer_size = cin_layer_size
-        self.use_bias = use_bias
 
         self.cin_layers = nn.ModuleList()
         for i, layer_size in enumerate(cin_layer_size):
@@ -222,14 +218,6 @@ class CIN(nn.Module):
                 nn.Conv1d(
                     in_channels=in_channels, out_channels=layer_size, kernel_size=1
                 )
-            )
-
-        if self.use_bias:
-            self.bias = nn.ParameterList(
-                [
-                    nn.Parameter(torch.Tensor(cin_layer_size[i]))
-                    for i in range(len(cin_layer_size))
-                ]
             )
 
     def output_dim(self) -> int:
@@ -253,9 +241,6 @@ class CIN(nn.Module):
                 h = field_num * field_num
             z = z.view(batch_size, h, embed_dim)
             z = self.cin_layers[i](z)  # (batch_size, cin_layer_size[i], embed_dim)
-            if self.use_bias:
-                z += self.bias[i]
-            z = torch.relu(z)
             x_vec = z
             x_out.append(torch.sum(x_vec, dim=2))
 

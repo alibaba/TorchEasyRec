@@ -24,7 +24,7 @@ from tzrec.utils.config_util import config_to_kwargs
 
 
 class DCNV2(RankModel):
-    """Deep cross network v1.
+    """Deep cross network v2.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -45,14 +45,23 @@ class DCNV2(RankModel):
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
         feature_dim = self.embedding_group.group_total_dim(self.group_name)
+
+        self.backbone = None
+        if self._model_config.HasField("backbone"):
+            self.backbone = MLP(
+                in_features=feature_dim, **config_to_kwargs(self._model_config.backbone)
+            )
+            feature_dim = self.backbone.output_dim()
+
         self.cross = CrossV2(
             input_dim=feature_dim, **config_to_kwargs(self._model_config.cross)
         )
         final_input_dim = self.cross.output_dim()
         self.deep = None
         if self._model_config.HasField("deep"):
+            in_features = self.embedding_group.group_total_dim(self.group_name)
             self.deep = MLP(
-                in_features=feature_dim, **config_to_kwargs(self._model_config.deep)
+                in_features=in_features, **config_to_kwargs(self._model_config.deep)
             )
             final_input_dim += self.deep.output_dim()
         self.final = MLP(
@@ -67,11 +76,13 @@ class DCNV2(RankModel):
         """Forward method."""
         feature_dict = self.build_input(batch)
         features = feature_dict[self.group_name]
-        net = self.cross(features)
-
+        if self.backbone:
+            net = self.backbone(features)
+        else:
+            net = features
+        net = self.cross(net)
         if self.deep:
             deep_net = self.deep(features)
             net = torch.concat([net, deep_net], dim=-1)
-
         out = self.output_mlp(self.final(net))
         return self._output_to_prediction(out)
