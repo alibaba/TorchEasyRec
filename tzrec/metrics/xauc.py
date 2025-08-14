@@ -24,12 +24,12 @@ class XAUC(Metric):
         https://arxiv.org/pdf/2401.07521
 
     Args:
-        sample_ratio(float): The ratio of sample pairs. Maximum number of
-            sample pairs is n*(n-1)/2, where n is the number of samples.
-            Actual number of sample pairs is n*(n-1)/2 * ratio. Reduce the
-            ratio when eval set is huge and GPU memory is limited. Default
-            value 1.0.
-        in_batch(bool): Get sample pair within a batch. When True,
+        sample_ratio(float): The ratio of downsampling pairs. Maximum number
+            of pairs is n*(n-1)/2, where n is the number of eval samples.
+            Actual number of pairs is n*(n-1)/2 * ratio. Reduce the
+            ratio when eval set is large(which is common) and memory is
+            limited. Default value 1e-3.
+        in_batch(bool): Get sample pairs within a batch. When True,
             sampling is done per batch, xauc is calculated batch-wise and
             finally averaged, sample_ratio is ignored. Otherwise, xauc is
             calculated on the whole eval set. Pls note that in_batch
@@ -40,7 +40,7 @@ class XAUC(Metric):
     """
 
     def __init__(
-        self, sample_ratio: float = 1.0, in_batch: bool = False, **kwargs: Any
+        self, sample_ratio: float = 1e-3, in_batch: bool = False, **kwargs: Any
     ) -> None:
         super().__init__(**kwargs)
         assert sample_ratio > 0 and sample_ratio <= 1.0, (
@@ -78,10 +78,18 @@ class XAUC(Metric):
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
         if self.in_batch:
-            return self.batch_xauc.mean()
+            return torch.mean(torch.stack(self.batch_xauc))
         else:
-            preds = self.eval_preds
-            target = self.eval_targets
+            preds = (
+                torch.concat(self.eval_preds)
+                if isinstance(self.eval_preds, list)
+                else self.eval_preds
+            )
+            target = (
+                torch.concat(self.eval_targets)
+                if isinstance(self.eval_targets, list)
+                else self.eval_targets
+            )
 
             n = self.total_sample_count
             n_sample_pairs = int(n * (n - 1) // 2 * self.sample_ratio)
@@ -97,7 +105,7 @@ class XAUC(Metric):
         n_sample_pairs: int,
         batch_size: int,
     ) -> torch.Tensor:
-        """Sample pairs."""
+        """Sample pairs and calc xauc."""
         n = int(n)
         total_pairs = n * (n - 1) // 2
         n_sample_pairs = int(n_sample_pairs)
@@ -121,8 +129,14 @@ class XAUC(Metric):
         idx_i = torch.concat(idx_i)
         idx_j = torch.concat(idx_j)
 
-        idx_i = idx_i.to(preds.device)
-        idx_j = idx_j.to(preds.device)
+        # idx_i = idx_i.to(preds.device)
+        # idx_j = idx_j.to(preds.device)
+
+        # duplicate removal
+        pairs = torch.stack([idx_i, idx_j], dim=1)
+        unique_pairs = torch.unique(pairs, dim=0)
+        idx_i = unique_pairs[:, 0]
+        idx_j = unique_pairs[:, 1]
 
         preds_i = preds[idx_i]
         preds_j = preds[idx_j]
@@ -130,6 +144,7 @@ class XAUC(Metric):
         targets_j = targets[idx_j]
 
         correct = ((targets_i - targets_j) * (preds_i - preds_j) > 0).float()
+
         xauc = correct.mean()
         return xauc
 
