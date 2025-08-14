@@ -33,6 +33,10 @@ message GroupedAUC {
     required string grouping_key = 1;
 }
 
+message XAUC {
+    optional float sample_ratio = 1 [default = 1e-3];
+    optional bool in_batch = 2 [default = false];
+}
 
 message MetricConfig {
     oneof metric {
@@ -45,11 +49,4 @@ message MetricConfig {
         GroupedAUC grouped_auc = 7;
         XAUC xauc = 8;
     }
-}
-
-
-message XAUC {
-    optional float sample_ratio = 1 [default = 1.0];
-    optional bool memory_saving = 2 [default = false];
-
 }
