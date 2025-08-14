@@ -56,7 +56,6 @@ message MatchBackbone {
 message MultiTaskBackbone {
     required BackboneTower backbone = 1;
     optional ModelParams model_params = 2;
-    repeated TaskTower task_towers = 3;
 }
 message ModelConfig {
 
