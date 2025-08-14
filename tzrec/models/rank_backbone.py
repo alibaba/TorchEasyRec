@@ -18,11 +18,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.layers.backbone import Backbone
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.variational_dropout import VariationalDropout
-from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.utils.config_util import config_to_kwargs
 
 
 class RankBackbone(RankModel):
@@ -82,7 +78,6 @@ class RankBackbone(RankModel):
 
     def backbone(
         self,
-        # group_features: Dict[str, torch.Tensor],
         batch: Batch,
     ) -> Optional[nn.Module]:
         # -> torch.Tensor:
@@ -93,12 +88,10 @@ class RankBackbone(RankModel):
             kwargs = {
                 "loss_modules": self._loss_modules,
                 "metric_modules": self._metric_modules,
-                # 'prediction_modules': self._prediction_modules,
                 "labels": self._labels,
             }
             return self._backbone_net(
                 is_training=self.training,
-                # group_features=group_features,
                 batch=batch,
                 **kwargs,
             )

@@ -328,7 +328,8 @@ class Package(nn.Module):
                         # 从维度推断引擎获取输入维度信息
                         input_dim_info = self.dim_engine.get_output_dim(input_name)
 
-                        # 特殊处理：如果是recurrent或repeat层，确保获取最新的输出维度
+                        # 特殊处理：如果是recurrent或repeat层，
+                        # 确保获取最新的输出维度，需要在这里先做处理
                         if input_name in self._name_to_blocks:
                             input_block = self._name_to_blocks[input_name]
                             input_layer_type = input_block.WhichOneof("layer")
@@ -491,7 +492,6 @@ class Package(nn.Module):
                             merged_input_dim.get_feature_dim()
                         )
 
-                        # 添加调试信息
                         logging.info(
                             f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
                         )
@@ -617,7 +617,7 @@ class Package(nn.Module):
             self._name_to_layer[name] = layer_cls
             self._name_to_customize[name] = customize
         elif layer == "recurrent":
-            keras_layer = layer_cnf.recurrent.module
+            torch_layer = layer_cnf.recurrent.module
             # 获取父层的输入维度信息，用于子层的维度推断
             parent_input_dim_info = self.dim_engine.block_input_dims.get(name)
             parent_input_dim = self._name_to_input_dim.get(name, None)
@@ -660,7 +660,7 @@ class Package(nn.Module):
 
                 # 加载子层，传递正确的input_dim参数
                 layer_obj, customize = self.load_torch_layer(
-                    keras_layer, name_i, reuse, child_input_dim
+                    torch_layer, name_i, reuse, child_input_dim
                 )
                 self._name_to_layer[name_i] = layer_obj
                 self._name_to_customize[name_i] = customize
@@ -764,7 +764,7 @@ class Package(nn.Module):
                         f"Recurrent layer {name} cannot determine output dimension"
                     )
         elif layer == "repeat":
-            keras_layer = layer_cnf.repeat.module
+            torch_layer = layer_cnf.repeat.module
             # 获取父层的输入维度信息，用于子层的维度推断
             parent_input_dim_info = self.dim_engine.block_input_dims.get(name)
             parent_input_dim = self._name_to_input_dim.get(name, None)
@@ -784,7 +784,7 @@ class Package(nn.Module):
 
                 # 加载子层，传递正确的input_dim参数
                 layer_obj, customize = self.load_torch_layer(
-                    keras_layer, name_i, reuse, parent_input_dim
+                    torch_layer, name_i, reuse, parent_input_dim
                 )
                 self._name_to_layer[name_i] = layer_obj
                 self._name_to_customize[name_i] = customize
@@ -872,7 +872,7 @@ class Package(nn.Module):
         # customize 表示是否是自定义实现
         layer_cls, customize = load_torch_layer(layer_conf.class_name)
         if layer_cls is None:
-            raise ValueError("Invalid keras layer class name: " + layer_conf.class_name)
+            raise ValueError("Invalid torch layer class name: " + layer_conf.class_name)
         param_type = layer_conf.WhichOneof("params")
         # st_params是以google.protobuf.Struct对象格式配置的参数；
         # 还可以用自定义的protobuf message的格式传递参数给加载的Layer对象。
@@ -1004,12 +1004,12 @@ class Package(nn.Module):
                     **kwargs
                 )  # 比如layer_cls是MLP,现在不知道in_features是多少
             return layer, customize
-        elif param_type is None:  # internal keras layer 内置 nn.module
+        elif param_type is None:  # internal torch layer 内置 nn.module
             layer = layer_cls(name=name)
             return layer, customize
         else:  # st_params 参数
             assert param_type == "st_params", (
-                "internal keras layer only support st_params"
+                "internal torch layer only support st_params"
             )
             try:
                 kwargs = convert_to_dict(layer_conf.st_params)
@@ -1512,7 +1512,7 @@ class Package(nn.Module):
             )
             return inputs  # 出错时返回原始输入
 
-    def call_keras_layer(self, inputs, name, **kwargs):
+    def call_torch_layer(self, inputs, name, **kwargs):
         """Call predefined torch Layer, which can be reused."""
         layer = self._name_to_layer[name]
         customize = self._name_to_customize.get(name, False)
@@ -1585,7 +1585,7 @@ class Package(nn.Module):
         """
         layer_name = config.WhichOneof("layer")
         if layer_name == "module":
-            return self.call_keras_layer(inputs, name, **kwargs)
+            return self.call_torch_layer(inputs, name, **kwargs)
         elif layer_name == "recurrent":
             return self._call_recurrent_layer(inputs, config, name, **kwargs)
         elif layer_name == "repeat":
@@ -1680,7 +1680,7 @@ class Package(nn.Module):
         for i in range(repeat_config.num_repeat):
             name_i = f"{name}_{i}"
             if name_i in self._name_to_layer:
-                output = self.call_keras_layer(output, name_i, **kwargs)
+                output = self.call_torch_layer(output, name_i, **kwargs)
             else:
                 logging.warning(f"Repeat sub-layer {name_i} not found, skipping")
 
