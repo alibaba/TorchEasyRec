@@ -29,7 +29,7 @@ class DCNV2Test(unittest.TestCase):
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
-    def test_DCNV2(self, graph_type) -> None:
+    def test_dcn_v2(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
