@@ -254,7 +254,6 @@ class Package(nn.Module):
             block = self._name_to_blocks[block_name]
             layer = block.WhichOneof("layer")
             if layer in {"input_layer", "raw_input", "embedding_layer"}:
-                # raise NotImplementedError
                 # 注册输入相关层 需要1个输入
                 if len(block.inputs) != 1:
                     raise ValueError(
