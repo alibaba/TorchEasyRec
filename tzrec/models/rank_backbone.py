@@ -42,22 +42,10 @@ class RankBackbone(RankModel):
         # 使用backbone的最终输出维度，考虑top_mlp的影响
         output_dims = self._backbone_net.get_final_output_dim()
         # 如果有多个 package（如 Package.__packages 里），如何拿到output_dims，暂未实现
-        # for pkg_name, pkg in Package._Package__packages.items():
-        #     print(f"Package: {pkg_name}")
-        #     print("  输出block列表:", pkg.get_output_block_names())
-        #     print("  输出block维度:", pkg.output_block_dims())
-        #     print("  总输出维度:", pkg.total_output_dim())
         self.output_mlp = nn.Linear(output_dims, self._num_class)
 
     def build_backbone_network(self):
         """Build backbone."""
-        # return Backbone(
-        #     self._base_model_config.rank_backbone.backbone,
-        #     self._feature_dict,
-        #     embedding_group=self.embedding_group,
-        #     # input_layer=self._input_layer,
-        #     l2_reg=self._l2_reg,
-        # )
         wide_embedding_dim = (
             int(self.wide_embedding_dim)
             if hasattr(self, "wide_embedding_dim")

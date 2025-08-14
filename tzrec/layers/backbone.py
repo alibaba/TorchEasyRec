@@ -29,7 +29,6 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.dag import DAG
 from tzrec.utils.load_class import load_torch_layer
 
 # 强制设置日志级别，确保显示INFO级别的日志
@@ -163,8 +162,7 @@ class Package(nn.Module):
         self._wide_init_fn = wide_init_fn
         self._input_layer = input_layer
         self._l2_reg = l2_reg
-        self._dag = DAG()
-        # build DAG
+        # build DAG using networkx DiGraph
         self.G = nx.DiGraph()
         self._name_to_blocks = {}
 
@@ -191,7 +189,6 @@ class Package(nn.Module):
             if len(block.inputs) == 0:
                 raise ValueError("block takes at least one input: %s" % block.name)
             self._name_to_blocks[block.name] = block
-            self._dag.add_node(block.name)
             self.G.add_node(block.name)
 
         # ======= step 2: 补全所有DAG边 ========
@@ -213,9 +210,7 @@ class Package(nn.Module):
                         new_block.inputs.append(input_cfg)
                         new_block.input_layer.CopyFrom(backbone_pb2.InputLayer())
                         self._name_to_blocks[input_name] = new_block
-                        self._dag.add_node(input_name)
                         self.G.add_node(input_name)
-                        self._dag.add_edge(input_name, name)
                         self.G.add_edge(input_name, name)
                 elif input_type == "package_name":
                     # package 为子DAG 作为 Block 的输入
@@ -223,18 +218,19 @@ class Package(nn.Module):
                     # 构成一个可被复用的子网络，
                     # 被打包的子网络以共享参数的方式在同一个模型中调用多次
                     raise NotImplementedError
-                    self._dag.add_node_if_not_exists(input_name)
-                    self._dag.add_edge(input_name, name)
+                    if input_name not in self.G:
+                        self.G.add_node(input_name)
+                    self.G.add_edge(input_name, name)
                     if input_node.HasField("package_input"):
                         pkg_input_name = input_node.package_input
-                        self._dag.add_node_if_not_exists(pkg_input_name)
-                        self._dag.add_edge(pkg_input_name, input_name)
+                        if pkg_input_name not in self.G:
+                            self.G.add_node(pkg_input_name)
+                        self.G.add_edge(pkg_input_name, input_name)
                 elif input_type == "use_package_input":  # delete
                     continue  # 特殊处理
                 else:
                     # block-to-block
                     if input_name in self._name_to_blocks:
-                        self._dag.add_edge(input_name, name)
                         self.G.add_edge(input_name, name)
                     else:
                         raise KeyError(
@@ -242,14 +238,11 @@ class Package(nn.Module):
                         )
         # ========== step 3: topo排序后依次define_layer ============
         # self.G拓扑排序 输出图片
-        # self.G.topological_sort()
-        # conda install -c conda-forge pygraphviz
         self.topo_order = nx.topological_sort(self.G)  # 迭代器
         self.topo_order_list = list(self.topo_order)  # list
         A = to_agraph(self.G)
         A.layout("dot")  # 用 graphviz 的 dot 布局
         A.draw("dag.png")  # 输出图片文件
-        # self._dag.topological_sort()
         for block_name in self.topo_order_list:
             block = self._name_to_blocks[block_name]
             layer = block.WhichOneof("layer")
@@ -506,7 +499,8 @@ class Package(nn.Module):
         # 可选: 检查package输入
         # 如果不配置concat_blocks，框架会自动拼接DAG的所有叶子节点并输出
         if len(config.concat_blocks) == 0 and len(config.output_blocks) == 0:
-            leaf = self._dag.all_leaves()
+            # 获取所有叶子节点（没有后继节点的节点）
+            leaf = [node for node in self.G.nodes() if self.G.out_degree(node) == 0]
             logging.warning(
                 (
                     f"{config.name} has no `concat_blocks` or `output_blocks`, "
@@ -1276,8 +1270,7 @@ class Package(nn.Module):
         """
         block_outputs = {}
         self._block_outputs = block_outputs  # reset
-        blocks = self.topo_order_list
-        blocks = self._dag.topological_sort()  # 拓扑排序
+        blocks = self.topo_order_list  # 使用已经计算好的拓扑排序
         logging.info(self._config.name + " topological order: " + ",".join(blocks))
 
         for block in blocks:  # 遍历每个block
