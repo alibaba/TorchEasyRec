@@ -122,6 +122,8 @@ class TreeBuilder:
             if node.item_id is None:
                 node.attrs = self._column_modes(node.attrs_list)
                 node.raw_attrs = self._column_means(node.raw_attrs_list)
+                # we should use fixed length code when use_hash_node_id
+                # because we need sort ids in TDMSampler
                 node.item_id = (
                     # pyre-ignore [58]
                     f"nonleaf#{code:0{max_code_len}d}"

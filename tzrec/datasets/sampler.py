@@ -845,7 +845,8 @@ class TDMSampler(BaseSampler):
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
         if use_hash_node_id():
-            # node id with format nonleaf#0001
+            # pos_nodes.ids are ids after hash, so that we should get raw
+            # ids from attributes
             pos_non_leaf_ids = (
                 pos_fea_result[valid_attr_names.index(self._item_id_field)]
                 .to_numpy(zero_copy_only=False)
