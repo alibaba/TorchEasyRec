@@ -62,6 +62,14 @@ def _fx_mark_length_features(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+@torch.fx.wrap
+def _fx_numel(tensor: torch.Tensor) -> int:
+    total_len = tensor.numel()
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check_is_size(total_len)
+    return total_len
+
+
 class DlrmHSTU(RankModel):
     """DLRM HSTU model.
 
@@ -183,10 +191,11 @@ class DlrmHSTU(RankModel):
             kernel=self.kernel(),
         ).squeeze(-1)
         total_targets = fx_int_item(num_candidates.sum())
+        total_len = _fx_numel(source_timestamps)
         candidates_user_embeddings, _ = self._hstu_transducer(
             max_uih_len=max_uih_len,
             max_targets=max_candidates,
-            total_uih_len=source_timestamps.numel() - total_targets,
+            total_uih_len=total_len - total_targets,
             total_targets=total_targets,
             seq_embeddings=uih_seq_embeddings[
                 self._model_config.uih_id_feature_name

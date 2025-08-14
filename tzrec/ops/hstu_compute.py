@@ -35,9 +35,6 @@ if has_triton():
     from tzrec.ops.triton.triton_hstu_preprocess_and_attention import (
         triton_hstu_preprocess_and_attention,
     )
-
-    torch.fx.wrap("triton_hstu_compute_output")
-    torch.fx.wrap("triton_hstu_preprocess_and_attention")
 else:
     triton_hstu_compute_output = pytorch_hstu_compute_output
 
