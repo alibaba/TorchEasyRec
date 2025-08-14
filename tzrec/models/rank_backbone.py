@@ -53,35 +53,6 @@ class RankBackbone(RankModel):
         #     print("  总输出维度:", pkg.total_output_dim())
         self.output_mlp = nn.Linear(output_dims, self._num_class)
 
-    def init_input(self) -> None:
-        """Build embedding group and group variational dropout."""
-        self.embedding_group = EmbeddingGroup(
-            self._features,
-            list(self._base_model_config.feature_groups),
-            wide_embedding_dim=int(self.wide_embedding_dim)
-            if hasattr(self, "wide_embedding_dim")
-            else None,
-            wide_init_fn=self.wide_init_fn if hasattr(self, "wide_init_fn") else None,
-        )
-
-        if self._base_model_config.HasField("variational_dropout"):
-            self.group_variational_dropouts = nn.ModuleDict()
-            variational_dropout_config = self._base_model_config.variational_dropout
-            variational_dropout_config_dict = config_to_kwargs(
-                variational_dropout_config
-            )
-            for feature_group in list(self._base_model_config.feature_groups):
-                group_name = feature_group.group_name
-                if feature_group.group_type != model_pb2.SEQUENCE:
-                    feature_dim = self.embedding_group.group_feature_dims(group_name)
-                    if len(feature_dim) > 1:
-                        variational_dropout = VariationalDropout(
-                            feature_dim, group_name, **variational_dropout_config_dict
-                        )
-                        self.group_variational_dropouts[group_name] = (
-                            variational_dropout
-                        )
-
     def build_backbone_network(self):
         """Build backbone."""
         # return Backbone(
