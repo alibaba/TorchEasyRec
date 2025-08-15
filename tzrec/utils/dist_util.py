@@ -206,8 +206,8 @@ def create_train_pipeline(
         return TrainPipelineBase(model, optimizer, model.device)
     else:
         return TrainPipelineSparseDist(
-            # pyre-ignore [6]
             model,
+            # pyre-ignore [6]
             optimizer,
             model.device,
             execute_all_batches=True,

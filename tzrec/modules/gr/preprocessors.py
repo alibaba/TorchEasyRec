@@ -67,7 +67,6 @@ class InputPreprocessor(BaseModule):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
         """Forward the module.
 
@@ -205,6 +204,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 **self._action_encoder_cfg,
                 is_inference=is_inference,
             )
+            assert action_mlp is not None
             self._action_embedding_mlp: torch.nn.Module = create_contextualized_mlp(
                 action_mlp,
                 sequential_input_dim=self._action_encoder.output_dim,
@@ -232,7 +232,6 @@ class ContextualPreprocessor(InputPreprocessor):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
         """Forward the module.
 
@@ -596,7 +595,6 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
         """Forward the module.
 
@@ -711,7 +709,6 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             output_seq_timestamps,
             output_seq_embeddings,
             output_num_targets,
-            seq_payloads,
         )
 
     def interleave_targets(self) -> bool:

@@ -51,6 +51,7 @@ class ActionEncoder(BaseModule):
         self._action_feature_name: str = action_feature_name
         self._watchtime_to_action_thresholds_and_weights: List[Tuple[int, int]] = []
         if watchtime_to_action_thresholds is not None:
+            assert watchtime_to_action_weights is not None
             assert len(watchtime_to_action_thresholds) == len(
                 watchtime_to_action_weights
             )

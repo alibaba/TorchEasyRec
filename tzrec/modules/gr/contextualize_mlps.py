@@ -176,6 +176,7 @@ class ParameterizedContextualizedMLP(ContextualizedMLP):
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
+        assert contextual_embeddings is not None
         contextual_embeddings = torch.nn.functional.dropout(
             contextual_embeddings,
             p=self._contextual_dropout_ratio,

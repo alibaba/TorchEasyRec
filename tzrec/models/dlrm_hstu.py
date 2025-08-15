@@ -162,8 +162,8 @@ class DlrmHSTU(RankModel):
         max_uih_len: int,
         max_candidates: int,
         payload_features: Dict[str, torch.Tensor],
-        uih_seq_embeddings: OrderedDict[str, JaggedTensor],
-        contextual_seq_embeddings: OrderedDict[str, JaggedTensor],
+        uih_seq_embeddings: Dict[str, JaggedTensor],
+        contextual_seq_embeddings: Dict[str, JaggedTensor],
         num_candidates: torch.Tensor,
     ) -> torch.Tensor:
         source_lengths = uih_seq_embeddings[
@@ -204,7 +204,7 @@ class DlrmHSTU(RankModel):
 
     def _item_forward(
         self,
-        candidate_seq_embeddings: OrderedDict[str, JaggedTensor],
+        candidate_seq_embeddings: Dict[str, JaggedTensor],
     ) -> torch.Tensor:  # [L, D]
         all_embeddings = _fx_odict_jt_vcat(candidate_seq_embeddings)
         item_embeddings = self._item_embedding_mlp(all_embeddings)
@@ -214,7 +214,7 @@ class DlrmHSTU(RankModel):
         self,
         batch: Batch,
     ) -> Tuple[
-        Dict[str, Dict[str, JaggedTensor]],
+        Dict[str, OrderedDict[str, JaggedTensor]],
         Dict[str, torch.Tensor],
         int,
         torch.Tensor,
@@ -288,7 +288,7 @@ class DlrmHSTU(RankModel):
 
     def main_forward(
         self,
-        grouped_features: Dict[str, Dict[str, JaggedTensor]],
+        grouped_features: Dict[str, OrderedDict[str, JaggedTensor]],
         payload_features: Dict[str, torch.Tensor],
         max_uih_len: int,
         uih_seq_lengths: torch.Tensor,
