@@ -19,6 +19,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
+from parameterized import parameterized
 from torch import distributed as dist
 
 from tzrec.datasets.sampler import (
@@ -37,6 +38,7 @@ from tzrec.utils import misc_util
 class SamplerTest(unittest.TestCase):
     def setUp(self):
         self._temp_files = []
+        os.environ.pop("USE_HASH_NODE_ID", None)
 
     def tearDown(self):
         for f in self._temp_files:
@@ -87,16 +89,25 @@ class SamplerTest(unittest.TestCase):
         f.flush()
         return f
 
-    def _create_item_gl_data_for_tdm(self):
+    def _create_item_gl_data_for_tdm(self, id_type="bigint"):
+        id_type = "int64" if id_type == "bigint" else "string"
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("id:int64\tweight:float\tattrs:string\n")
+        f.write(f"id:{id_type}\tweight:float\tattrs:string\n")
         for i in range(63):
-            f.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:我们{i}\n")
+            if i <= 30 and id_type == "string":
+                node_id = f"nonleaf#{i:02d}"
+            else:
+                node_id = i
+            f.write(
+                f"{node_id}\t{1}\t{int(math.log(i + 1, 2))}:{node_id}:{i}:{i + 1000}:我们{i}\n"  # NOQA
+            )
         f.flush()
         return f
 
-    def _create_edge_gl_data_for_tdm(self):
+    def _create_edge_gl_data_for_tdm(self, id_type="bigint"):
+        id_type = "int64" if id_type == "bigint" else "string"
+
         def _ancestor(code):
             ancs = []
             while True:
@@ -108,25 +119,30 @@ class SamplerTest(unittest.TestCase):
 
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("src_id:int64\tdst_id:int\tweight:float\n")
+        f.write(f"src_id:{id_type}\tdst_id:{id_type}\tweight:float\n")
         for i in range(31, 63):
             for ancestor in _ancestor(i):
-                f.write(f"{i}\t{ancestor}\t{1.0}\n")
+                node_id = f"nonleaf#{ancestor:02d}" if id_type == "string" else ancestor
+                f.write(f"{i}\t{node_id}\t{1.0}\n")
         f.flush()
         return f
 
-    def _create_predict_edge_gl_data_for_tdm(self):
+    def _create_predict_edge_gl_data_for_tdm(self, id_type="bigint"):
+        id_type = "int64" if id_type == "bigint" else "string"
+
         def _childern(code):
             return [2 * code + 1, 2 * code + 2]
 
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("src_id:int64\tdst_id:int\tweight:float\n")
+        f.write(f"src_id:{id_type}\tdst_id:{id_type}\tweight:float\n")
         for i in range(7, 15):
-            f.write(f"0\t{i}\t{1}\n")
+            node_id = f"nonleaf#{i:02d}" if id_type == "string" else i
+            f.write(f"0\t{node_id}\t{1}\n")
         for i in range(7, 31):
+            node_id = f"nonleaf#{i:02d}" if id_type == "string" else i
             for child in _childern(i):
-                f.write(f"{i}\t{child}\t{1}\n")
+                f.write(f"{node_id}\t{child}\t{1}\n")
         f.flush()
         return f
 
@@ -485,23 +501,30 @@ class SamplerTest(unittest.TestCase):
         self.assertGreater(len(res["float_b"]), 8)
         self.assertGreater(len(res["str_c"]), 8)
 
-    def test_tdm_sampler(self):
-        f_item = self._create_item_gl_data_for_tdm()
-        f_edge = self._create_edge_gl_data_for_tdm()
-        f_predict_edge = self._create_predict_edge_gl_data_for_tdm()
+    @parameterized.expand([["bigint"], ["string"]])
+    def test_tdm_sampler(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
+        f_item = self._create_item_gl_data_for_tdm(id_type)
+        f_edge = self._create_edge_gl_data_for_tdm(id_type)
+        f_predict_edge = self._create_predict_edge_gl_data_for_tdm(id_type)
 
         def _sampler_worker(pos_res, neg_res):
             config = sampler_pb2.TDMSampler(
                 item_input_path=f_item.name,
                 edge_input_path=f_edge.name,
                 predict_edge_input_path=f_predict_edge.name,
-                attr_fields=["tree_level", "int_a", "float_b", "str_c"],
+                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"],
                 item_id_field="item_id",
                 layer_num_sample=[0, 1, 2, 3, 4, 5],
             )
             sampler = TDMSampler(
                 config=config,
                 fields=[
+                    pa.field(
+                        name="item_id",
+                        type=pa.int64() if id_type == "bigint" else pa.string(),
+                    ),
                     pa.field(name="int_a", type=pa.int64()),
                     pa.field(name="float_b", type=pa.float64()),
                     pa.field(name="str_c", type=pa.string()),
@@ -515,14 +538,18 @@ class SamplerTest(unittest.TestCase):
             pos_res.update(
                 sampler.get(
                     {
-                        "item_id": pa.array([31, 41, 51, 61]),
+                        "item_id": pa.array([31, 41, 51, 61])
+                        if id_type == "bigint"
+                        else pa.array(["31", "41", "51", "61"], type=pa.string()),
                     }
                 )[0]
             )
             neg_res.update(
                 sampler.get(
                     {
-                        "item_id": pa.array([31, 41, 51, 61]),
+                        "item_id": pa.array([31, 41, 51, 61])
+                        if id_type == "bigint"
+                        else pa.array(["31", "41", "51", "61"], type=pa.string()),
                     }
                 )[1]
             )
@@ -547,23 +574,30 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(neg_res["float_b"]), 4 * 15)
         self.assertEqual(len(neg_res["str_c"]), 4 * 15)
 
-    def test_tdm_predict_sampler(self):
-        f_item = self._create_item_gl_data_for_tdm()
-        f_edge = self._create_edge_gl_data_for_tdm()
-        f_predict_edge = self._create_predict_edge_gl_data_for_tdm()
+    @parameterized.expand([["bigint"], ["string"]])
+    def test_tdm_predict_sampler(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
+        f_item = self._create_item_gl_data_for_tdm(id_type)
+        f_edge = self._create_edge_gl_data_for_tdm(id_type)
+        f_predict_edge = self._create_predict_edge_gl_data_for_tdm(id_type)
 
         def _sampler_worker(res):
             config = sampler_pb2.TDMSampler(
                 item_input_path=f_item.name,
                 edge_input_path=f_edge.name,
                 predict_edge_input_path=f_predict_edge.name,
-                attr_fields=["tree_level", "int_a", "float_b", "str_c"],
+                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"],
                 item_id_field="item_id",
                 layer_num_sample=[0, 1, 2, 3, 4, 5],
             )
             sampler = TDMPredictSampler(
                 config=config,
                 fields=[
+                    pa.field(
+                        name="item_id",
+                        type=pa.int64() if id_type == "bigint" else pa.string(),
+                    ),
                     pa.field(name="int_a", type=pa.int64()),
                     pa.field(name="float_b", type=pa.float64()),
                     pa.field(name="str_c", type=pa.string()),
@@ -577,7 +611,14 @@ class SamplerTest(unittest.TestCase):
             sampler.init_sampler(2)
             res.update(
                 sampler.get(
-                    {"item_id": pa.array([21, 22, 23, 24])},
+                    {
+                        "item_id": pa.array([21, 22, 23, 24])
+                        if id_type == "bigint"
+                        else pa.array(
+                            ["nonleaf#21", "nonleaf#22", "nonleaf#23", "nonleaf#24"],
+                            type=pa.string(),
+                        )
+                    },
                 )
             )
 
