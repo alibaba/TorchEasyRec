@@ -155,12 +155,14 @@ class TreeSearch(object):
                     if first_node:
                         ids.append("-1" if use_hash_node_id() else -1)
                         weight.append(1.0)
-                        features.append(",".join(["-1"] + list(map(str, fea[1:]))))
+                        features.append(
+                            attr_delimiter.join(["-1"] + list(map(str, fea[1:])))
+                        )
                         first_node = False
 
                     ids.append(node.item_id)
                     weight.append(1.0)
-                    features.append(",".join(map(str, fea)))
+                    features.append(attr_delimiter.join(map(str, fea)))
 
             node_table_dict = OrderedDict()
             node_table_dict["id"] = pa.array(ids)
@@ -217,9 +219,13 @@ class TreeSearch(object):
                             )
                         # add a node with id -1 for graph-learn to get root node
                         if first_node:
-                            f.write(f"-1\t1.0\t-1,{','.join(map(str, fea[1:]))}\n")
+                            f.write(
+                                f"-1\t1.0\t-1{attr_delimiter}{attr_delimiter.join(map(str, fea[1:]))}\n"  # NOQA
+                            )
                             first_node = False
-                        f.write(f"{node.item_id}\t1.0\t{','.join(map(str, fea))}\n")
+                        f.write(
+                            f"{node.item_id}\t1.0\t{attr_delimiter.join(map(str, fea))}\n"  # NOQA
+                        )
 
             with open(os.path.join(self.output_file, "edge_table.txt"), "w") as f:
                 id_type = "string" if use_hash_node_id() else "int64"

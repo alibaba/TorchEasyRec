@@ -40,8 +40,8 @@ class TreeSearchtest(unittest.TestCase):
         shutil.rmtree(self.test_dir)
         os.environ.pop("USE_HASH_NODE_ID", None)
 
-    @parameterized.expand([[False], [True]])
-    def test_tree_search(self, use_hash_id: bool) -> None:
+    @parameterized.expand([[False, ","], [True, ","], [True, ":"]])
+    def test_tree_search(self, use_hash_id: bool, attr_delimiter: str = ",") -> None:
         if use_hash_id:
             os.environ["USE_HASH_NODE_ID"] = "1"
         cluster = TreeCluster(
@@ -57,7 +57,7 @@ class TreeSearchtest(unittest.TestCase):
 
         root = cluster.train(save_tree=False)
         search = TreeSearch(output_file=self.test_dir, root=root, child_num=2)
-        search.save()
+        search.save(attr_delimiter=attr_delimiter)
         search.save_predict_edge()
         search.save_node_feature("int_a,str_c", "float_b")
         search.save_serving_tree(self.test_dir)
@@ -67,7 +67,9 @@ class TreeSearchtest(unittest.TestCase):
         predict_edge_table = []
         serving_tree = []
         with open(os.path.join(self.test_dir, "node_table.txt")) as f:
-            for line in f:
+            for i, line in enumerate(f):
+                if i > 0:
+                    self.assertEqual(len(line.split("\t")[-1].split(attr_delimiter)), 5)
                 node_table.append(line)
         with open(os.path.join(self.test_dir, "edge_table.txt")) as f:
             for line in f:
