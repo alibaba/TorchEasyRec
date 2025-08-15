@@ -81,6 +81,18 @@ message Cross {
     optional uint32 cross_num = 1 [default=3];
 }
 
+message CrossV2 {
+    // number of cross layers
+    optional uint32 cross_num = 1 [default=3];
+    // Matrix decomposition with minimal rank.
+    optional uint32 low_rank = 2 [default=32];
+}
+
+message CIN {
+    // every layer size
+    repeated uint32 cin_layer_size = 1;
+}
+
 message GRActionEncoder {
     // action embedding dim
     optional uint32 action_embedding_dim = 1;

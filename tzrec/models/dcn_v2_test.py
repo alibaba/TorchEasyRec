@@ -18,18 +18,18 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.dcn import DCNV1
+from tzrec.models.dcn_v2 import DCNV2
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
-class DCNV1Test(unittest.TestCase):
+class DCNV2Test(unittest.TestCase):
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
-    def test_DCNV1(self, graph_type) -> None:
+    def test_dcn_v2(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -55,8 +55,8 @@ class DCNV1Test(unittest.TestCase):
         ]
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            dcn_v1=rank_model_pb2.DCNV1(
-                cross=module_pb2.Cross(cross_num=3),
+            dcn_v2=rank_model_pb2.DCNV2(
+                cross=module_pb2.CrossV2(cross_num=3, low_rank=64),
                 deep=module_pb2.MLP(hidden_units=[8, 4]),
                 final=module_pb2.MLP(hidden_units=[2]),
             ),
@@ -64,9 +64,9 @@ class DCNV1Test(unittest.TestCase):
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
             ],
         )
-        dcn_v1 = DCNV1(model_config=model_config, features=features, labels=["label"])
-        init_parameters(dcn_v1, device=torch.device("cpu"))
-        dcn_v1 = create_test_model(dcn_v1, graph_type)
+        dcn_v2 = DCNV2(model_config=model_config, features=features, labels=["label"])
+        init_parameters(dcn_v2, device=torch.device("cpu"))
+        dcn_v2 = create_test_model(dcn_v2, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b"],
@@ -83,9 +83,9 @@ class DCNV1Test(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = dcn_v1(batch.to_dict())
+            predictions = dcn_v2(batch.to_dict())
         else:
-            predictions = dcn_v1(batch)
+            predictions = dcn_v2(batch)
         self.assertEqual(predictions["logits"].size(), (2,))
         self.assertEqual(predictions["probs"].size(), (2,))
 
