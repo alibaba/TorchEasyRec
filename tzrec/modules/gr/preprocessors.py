@@ -156,7 +156,7 @@ class ContextualPreprocessor(InputPreprocessor):
         action_encoder: Optional[Dict[str, Any]] = None,
         action_mlp: Optional[Dict[str, Any]] = None,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._output_embedding_dim: int = output_embedding_dim
@@ -396,7 +396,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         action_mlp: Dict[str, Any],
         enable_interleaving: bool = True,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._input_embedding_dim: int = input_embedding_dim
@@ -724,7 +724,8 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
 
 
 def create_input_preprocessor(
-    preprocessor_cfg: Union[module_pb2.GRInputPreprocessor, Dict[str, Any]], **kwargs
+    preprocessor_cfg: Union[module_pb2.GRInputPreprocessor, Dict[str, Any]],
+    **kwargs: Any,
 ) -> InputPreprocessor:
     """Create InputPreprocessor."""
     if isinstance(preprocessor_cfg, module_pb2.GRInputPreprocessor):
