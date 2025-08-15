@@ -29,6 +29,7 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
 from tzrec.utils.config_util import config_to_kwargs
+from tzrec.utils.load_class import load_torch_layer
 
 # 自动推断参数常量定义
 # 输入维度相关参数
@@ -39,7 +40,6 @@ SEQUENCE_QUERY_PARAMS = ["sequence_dim", "query_dim"]
 
 # 所有支持自动推断的参数
 AUTO_INFER_PARAMS = INPUT_DIM_PARAMS + SEQUENCE_QUERY_PARAMS
-from tzrec.utils.load_class import load_torch_layer
 
 # 强制设置日志级别，确保显示INFO级别的日志
 logging.basicConfig(
@@ -1501,52 +1501,46 @@ class Package(nn.Module):
         # 判断输入格式
         processed_inputs = self._determine_input_format(layer, inputs)
 
-        if customize:
-            try:
-                output = layer(processed_inputs)
-                logging.debug(
-                    f"Custom layer {name} ({cls}) called successfully with input type: "
-                    f"{type(processed_inputs)}"
-                )
-            except Exception as e:
-                msg = getattr(e, "message", str(e))
-                logging.error("call torch layer %s (%s) failed: %s" % (name, cls, msg))
-                # 尝试使用原始输入格式
-                if processed_inputs is not inputs:
-                    logging.info(f"Retrying {name} with original input format")
-                    try:
-                        output = layer(inputs)
-                        logging.info(
-                            f"Successfully called {name} with original input format"
-                        )
-                    except Exception as e2:
-                        logging.error(f"Both input formats failed for {name}: {e2}")
-                        raise e from e2
-                else:
-                    raise e
+        # 首先尝试处理后的输入格式
+        if self._try_call_layer(layer, processed_inputs, name, cls, customize):
+            return self._last_output
+        
+        # 如果失败且输入格式被修改过，尝试原始输入格式
+        if processed_inputs is not inputs:
+            logging.info(f"Retrying {name} with original input format")
+            if self._try_call_layer(layer, inputs, name, cls):
+                logging.info(f"Successfully called {name} with original input format")
+                return self._last_output
+            else:
+                logging.error(f"Both input formats failed for {name}")
+                raise RuntimeError(f"Layer {name} failed with both processed and original input formats")
         else:
-            try:
-                output = layer(processed_inputs)
-                if cls == "BatchNormalization":
-                    raise NotImplementedError
-            except TypeError:
-                output = layer(processed_inputs)
-            except Exception as e:
-                # 尝试使用原始输入格式
-                if processed_inputs is not inputs:
-                    logging.info(
-                        f"Retrying internal layer {name} with original input format"
-                    )
-                    try:
-                        output = layer(inputs)
-                    except Exception as e2:
-                        logging.error(
-                            f"Both input formats failed for internal layer {name}: {e2}"
-                        )
-                        raise e from e2
-                else:
-                    raise e
-        return output
+            # 如果输入格式没有改变，直接抛出异常
+            raise RuntimeError(f"Layer {name} ({cls}) failed to execute")
+
+    def _try_call_layer(self, layer, inputs, name, cls):
+        """尝试调用层，成功返回True，失败返回False并记录错误.
+        
+        Args:
+            layer: 要调用的层对象
+            inputs: 输入数据
+            name: 层名称
+            cls: 层类名
+            customize: 是否为自定义层
+            
+        Returns:
+            bool: 成功返回True，失败返回False
+        """
+        try:
+            self._last_output = layer(inputs)
+            logging.debug(
+                f"Layer {name} ({cls}) called successfully with input type: {type(inputs)}"
+            )
+            return True
+        except Exception as e:
+            msg = getattr(e, "message", str(e))
+            logging.error(f"Call layer {name} ({cls}) failed: {msg}")
+            return False
 
     def call_layer(self, inputs, config, name, **kwargs):
         """Call a layer based on its configuration type.
