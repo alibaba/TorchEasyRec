@@ -29,6 +29,16 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
 from tzrec.utils.config_util import config_to_kwargs
+
+# 自动推断参数常量定义
+# 输入维度相关参数
+INPUT_DIM_PARAMS = ["in_features", "input_dim"]
+
+# 序列和查询维度相关参数  
+SEQUENCE_QUERY_PARAMS = ["sequence_dim", "query_dim"]
+
+# 所有支持自动推断的参数
+AUTO_INFER_PARAMS = INPUT_DIM_PARAMS + SEQUENCE_QUERY_PARAMS
 from tzrec.utils.load_class import load_torch_layer
 
 # 强制设置日志级别，确保显示INFO级别的日志
@@ -230,15 +240,14 @@ class Package(nn.Module):
         self.topo_order = nx.topological_sort(self.G)  # 迭代器
         self.topo_order_list = list(self.topo_order)  # list
         A = to_agraph(self.G)
-        A.layout("dot") 
-        import time
-        import os
+        A.layout("dot")
         import hashlib
-        
+        import time
+
         config_info = f"{config.name}_{len(config.blocks)}_{len(self._name_to_layer)}"
         config_hash = hashlib.md5(config_info.encode()).hexdigest()[:8]
         timestamp = int(time.time())
-        
+
         dag_filename = f"dag_{config.name}_{config_hash}_{timestamp}.png"
         A.draw(dag_filename)
         for block_name in self.topo_order_list:
@@ -878,29 +887,26 @@ class Package(nn.Module):
             else:
                 pb_params = getattr(layer_conf, param_type)
                 params = Parameter(pb_params, False, l2_reg=self._l2_reg)
-            
+
             # 使用标准库 inspect.signature 获取构造函数的签名
             sig = inspect.signature(layer_cls.__init__)
             kwargs = config_to_kwargs(params)
 
-            # 检查是否需要自动推断 in_features 或 input_dim【改进版本】
-            if "in_features" in sig.parameters or "input_dim" in sig.parameters:
-                if "in_features" not in kwargs and "input_dim" not in kwargs:
+            # 检查是否需要自动推断输入维度参数【改进版本】
+            input_dim_params_in_sig = [param for param in INPUT_DIM_PARAMS if param in sig.parameters]
+            if input_dim_params_in_sig:
+                input_dim_params_missing = [param for param in INPUT_DIM_PARAMS if param not in kwargs]
+                if input_dim_params_missing:
                     # 从维度推断引擎获取输入维度
                     input_dim_info = self.dim_engine.block_input_dims.get(name)
                     if input_dim_info is not None:
                         feature_dim = input_dim_info.get_feature_dim()
-                        # 兼容不同实现风格
-                        if "in_features" in sig.parameters:
-                            kwargs["in_features"] = feature_dim
-                            logging.info(
-                                f"Layer {name} ({layer_cls.__name__}) auto-inferred in_features={feature_dim} from dim_engine"  # NOQA
-                            )
-                        elif "input_dim" in sig.parameters:
-                            kwargs["input_dim"] = feature_dim
-                            logging.info(
-                                f"Layer {name} ({layer_cls.__name__}) auto-inferred input_dim={feature_dim} from dim_engine"  # NOQA
-                            )
+                        # 使用第一个在签名中找到的参数名
+                        param_name = input_dim_params_in_sig[0]
+                        kwargs[param_name] = feature_dim
+                        logging.info(
+                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"
+                        )
                     elif input_dim is not None:
                         # fallback到传入的input_dim参数
                         feature_dim = (
@@ -912,16 +918,12 @@ class Package(nn.Module):
                                 else input_dim
                             )
                         )
-                        if "in_features" in sig.parameters:
-                            kwargs["in_features"] = feature_dim
-                            logging.info(
-                                f"Layer {name} ({layer_cls.__name__}) auto-inferred in_features={feature_dim} from fallback input_dim"  # NOQA
-                            )
-                        elif "input_dim" in sig.parameters:
-                            kwargs["input_dim"] = feature_dim
-                            logging.info(
-                                f"Layer {name} ({layer_cls.__name__}) auto-inferred input_dim={feature_dim} from fallback input_dim"  # NOQA
-                            )
+                        # 使用第一个在签名中找到的参数名
+                        param_name = input_dim_params_in_sig[0]
+                        kwargs[param_name] = feature_dim
+                        logging.info(
+                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from fallback input_dim"
+                        )
                     else:
                         logging.error(
                             f"Layer {name} ({layer_cls.__name__}) dimension inference failed - no input_dim available"  # NOQA
@@ -938,43 +940,42 @@ class Package(nn.Module):
                             logging.error(
                                 f"  - _name_to_input_dim[{name}]: {self._name_to_input_dim[name]}"  # NOQA
                             )
+                        input_dim_params_str = " 或 ".join(INPUT_DIM_PARAMS)
                         raise ValueError(
-                            f"{layer_cls.__name__} 需要 in_features 或 input_dim, "
+                            f"{layer_cls.__name__} 需要 {input_dim_params_str}, "
                             "但参数未给定，且无法自动推断。请检查维度推断配置。"
                         )
 
             # 【新增】通用的sequence_dim和query_dim自动推断
             sequence_dim_missing = (
-                "sequence_dim" in sig.parameters and "sequence_dim" not in kwargs
+                SEQUENCE_QUERY_PARAMS[0] in sig.parameters and SEQUENCE_QUERY_PARAMS[0] not in kwargs
             )
             query_dim_missing = (
-                "query_dim" in sig.parameters and "query_dim" not in kwargs
+                SEQUENCE_QUERY_PARAMS[1] in sig.parameters and SEQUENCE_QUERY_PARAMS[1] not in kwargs
             )
 
             if sequence_dim_missing or query_dim_missing:
                 # Get the input information of the current block
                 block_config = self._name_to_blocks[name]
-                input_dims = self._infer_sequence_query_dimensions(
-                    block_config, name
-                )
+                input_dims = self._infer_sequence_query_dimensions(block_config, name)
 
                 if input_dims:
                     sequence_dim, query_dim = input_dims
                     if sequence_dim_missing:
-                        kwargs["sequence_dim"] = sequence_dim
+                        kwargs[SEQUENCE_QUERY_PARAMS[0]] = sequence_dim
                     if query_dim_missing:
-                        kwargs["query_dim"] = query_dim
+                        kwargs[SEQUENCE_QUERY_PARAMS[1]] = query_dim
                     logging.info(
                         f"Auto-inferred dimensions for {layer_cls.__name__} {name}: "  # NOQA
-                        f"sequence_dim={sequence_dim if sequence_dim_missing else 'provided'}, "  # NOQA
-                        f"query_dim={query_dim if query_dim_missing else 'provided'}"  # NOQA
+                        f"{SEQUENCE_QUERY_PARAMS[0]}={sequence_dim if sequence_dim_missing else 'provided'}, "  # NOQA
+                        f"{SEQUENCE_QUERY_PARAMS[1]}={query_dim if query_dim_missing else 'provided'}"  # NOQA
                     )
                 else:
                     missing_params = []
                     if sequence_dim_missing:
-                        missing_params.append("sequence_dim")
+                        missing_params.append(SEQUENCE_QUERY_PARAMS[0])
                     if query_dim_missing:
-                        missing_params.append("query_dim")
+                        missing_params.append(SEQUENCE_QUERY_PARAMS[1])
                     raise ValueError(
                         f"无法为 {layer_cls.__name__} {name} 自动推断 {', '.join(missing_params)}。"  # NOQA
                         "请确保配置了正确的输入 feature groups 或手动指定这些参数。"
@@ -982,7 +983,7 @@ class Package(nn.Module):
 
             layer = layer_cls(
                 **kwargs
-            )  # 比如layer_cls是MLP,现在不知道in_features是多少
+            )  # 比如layer_cls是MLP,现在可以自动推断输入维度参数
             return layer, customize
         elif param_type is None:  # internal torch layer 内置 nn.module
             layer = layer_cls(name=name)
@@ -1426,7 +1427,7 @@ class Package(nn.Module):
                     return inputs  # 序列模块通常需要字典输入
 
                 # 检查模块是否有特定的属性暗示需要字典输入
-                dict_attributes = ["sequence_dim", "query_dim", "attention"]
+                dict_attributes = SEQUENCE_QUERY_PARAMS + ["attention"]
                 if any(hasattr(layer_obj, attr) for attr in dict_attributes):
                     logging.info(
                         f"Layer {class_name} has sequence attributes, using dict input"
@@ -1492,7 +1493,7 @@ class Package(nn.Module):
             return inputs  # 出错时返回原始输入
 
     def call_torch_layer(self, inputs, name, **kwargs):
-        """Call predefined torch Layer"""
+        """Call predefined torch Layer."""
         layer = self._name_to_layer[name]
         customize = self._name_to_customize.get(name, False)
         cls = layer.__class__.__name__
