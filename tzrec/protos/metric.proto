@@ -35,7 +35,8 @@ message GroupedAUC {
 
 message XAUC {
     optional float sample_ratio = 1 [default = 1e-3];
-    optional bool in_batch = 2 [default = false];
+    optional uint64 max_pairs = 2;
+    optional bool in_batch = 3 [default = false];
 }
 
 message MetricConfig {

@@ -9,10 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torchmetrics import Metric
+
+from tzrec.utils.logging_util import logger
 
 
 class XAUC(Metric):
@@ -29,6 +31,8 @@ class XAUC(Metric):
             Actual number of pairs is n*(n-1)/2 * ratio. Reduce the
             ratio when eval set is large(which is common) and memory is
             limited. Default value 1e-3.
+        max_pairs(int): The maximum number of pairs to sample. If
+            specified, sample_ratio is ignored. Default None.
         in_batch(bool): Get sample pairs within a batch. When True,
             sampling is done per batch, xauc is calculated batch-wise and
             finally averaged, sample_ratio is ignored. Otherwise, xauc is
@@ -40,13 +44,18 @@ class XAUC(Metric):
     """
 
     def __init__(
-        self, sample_ratio: float = 1e-3, in_batch: bool = False, **kwargs: Any
+        self,
+        sample_ratio: float = 1e-3,
+        max_pairs: Optional[int] = None,
+        in_batch: bool = False,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         assert sample_ratio > 0 and sample_ratio <= 1.0, (
             "sample_ratio must be between (0, 1]"
         )
         self.sample_ratio = sample_ratio
+        self.max_pairs = int(max_pairs) if max_pairs else None
         self.in_batch = in_batch
 
         if in_batch:
@@ -73,10 +82,9 @@ class XAUC(Metric):
             self.eval_targets.append(targets)
             self.total_sample_count += torch.tensor(preds.shape[0])
 
-        self.batch_size = int(preds.shape[0])
-
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
+        logger.info("xauc computing...")
         if self.in_batch:
             return torch.mean(torch.stack(self.batch_xauc))
         else:
@@ -91,10 +99,15 @@ class XAUC(Metric):
                 else self.eval_targets
             )
 
-            n = self.total_sample_count
-            n_sample_pairs = int(n * (n - 1) // 2 * self.sample_ratio)
+            n = int(self.total_sample_count)
+            if self.max_pairs:
+                assert self.max_pairs < n * (n - 1) // 2, "max_pairs is larger"
+                "than maximum possible pairs, please check your setting."
+                n_sample_pairs = self.max_pairs
+            else:
+                n_sample_pairs = int(n * (n - 1) // 2 * self.sample_ratio)
 
-            xauc = self.sampling_xauc(preds, target, n, n_sample_pairs, self.batch_size)
+            xauc = self.sampling_xauc(preds, target, n, n_sample_pairs)
             return xauc
 
     def sampling_xauc(
@@ -103,40 +116,22 @@ class XAUC(Metric):
         targets: torch.Tensor,
         n: int,
         n_sample_pairs: int,
-        batch_size: int,
     ) -> torch.Tensor:
         """Sample pairs and calc xauc."""
-        n = int(n)
         total_pairs = n * (n - 1) // 2
-        n_sample_pairs = int(n_sample_pairs)
 
-        idx_i = []
-        idx_j = []
+        # caution: may cost extreme high memory when n_sample_pairs is huge
+        sampled_flat = torch.randint(0, total_pairs, (n_sample_pairs,))
+        i = torch.floor((-1 + torch.sqrt(1 + 8 * sampled_flat.float())) / 2).long()
+        base = i * (i + 1) // 2
+        idx_i = sampled_flat - base
+        idx_j = i + 1
 
-        n_batch = n_sample_pairs // batch_size
-
-        for _ in range(n_batch):
-            sampled_flat = torch.randint(0, total_pairs, (batch_size,))
-
-            i = torch.floor((-1 + torch.sqrt(1 + 8 * sampled_flat.float())) / 2).long()
-            base = i * (i + 1) // 2
-            batch_idx_i = sampled_flat - base
-            batch_idx_j = i + 1
-
-            idx_i.append(batch_idx_i)
-            idx_j.append(batch_idx_j)
-
-        idx_i = torch.concat(idx_i)
-        idx_j = torch.concat(idx_j)
-
-        # idx_i = idx_i.to(preds.device)
-        # idx_j = idx_j.to(preds.device)
-
-        # duplicate removal
-        pairs = torch.stack([idx_i, idx_j], dim=1)
-        unique_pairs = torch.unique(pairs, dim=0)
-        idx_i = unique_pairs[:, 0]
-        idx_j = unique_pairs[:, 1]
+        # # duplicate removal, caution: slow when n_sample_pairs is large
+        # pairs = torch.stack([idx_i, idx_j], dim=1)
+        # unique_pairs = torch.unique(pairs, dim=0)
+        # idx_i = unique_pairs[:, 0]
+        # idx_j = unique_pairs[:, 1]
 
         preds_i = preds[idx_i]
         preds_j = preds[idx_j]
