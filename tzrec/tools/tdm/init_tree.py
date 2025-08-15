@@ -78,7 +78,6 @@ if __name__ == "__main__":
         help="maxcompute storage api/tunnel data quota name.",
     )
     args, extra_args = parser.parse_known_args()
-
     generator = TreeGenerator(
         item_input_path=args.item_input_path,
         item_id_field=args.item_id_field,
