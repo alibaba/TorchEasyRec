@@ -35,7 +35,7 @@ from tzrec.utils.load_class import load_torch_layer
 # 输入维度相关参数
 INPUT_DIM_PARAMS = ["in_features", "input_dim"]
 
-# 序列和查询维度相关参数  
+# 序列和查询维度相关参数
 SEQUENCE_QUERY_PARAMS = ["sequence_dim", "query_dim"]
 
 # 所有支持自动推断的参数
@@ -878,24 +878,31 @@ class Package(nn.Module):
             # 代码假定 layer_conf.st_params 是一个结构化参数（is_struct=True），
             # 并使用它来创建一个 Parameter 对象，同时传递 L2 正则化参数。
             if param_type is None:  # 没有额外的参数
-                layer = layer_cls()
-                return layer, customize
+                # 获取构造函数签名，检查是否需要维度推断
+                sig = inspect.signature(layer_cls.__init__)
+                kwargs = {}
             elif param_type == "st_params":
                 params = Parameter(layer_conf.st_params, True, l2_reg=self._l2_reg)
+                # 使用标准库 inspect.signature 获取构造函数的签名
+                sig = inspect.signature(layer_cls.__init__)
+                kwargs = config_to_kwargs(params)
             # 如果 param_type 指向 oneof 中的其他字段，代码通过 getattr
             # 动态获取该字段的值，并假定它是一个Protocol Buffer消息is_struct=False）。
             else:
                 pb_params = getattr(layer_conf, param_type)
                 params = Parameter(pb_params, False, l2_reg=self._l2_reg)
-
-            # 使用标准库 inspect.signature 获取构造函数的签名
-            sig = inspect.signature(layer_cls.__init__)
-            kwargs = config_to_kwargs(params)
+                # 使用标准库 inspect.signature 获取构造函数的签名
+                sig = inspect.signature(layer_cls.__init__)
+                kwargs = config_to_kwargs(params)
 
             # 检查是否需要自动推断输入维度参数【改进版本】
-            input_dim_params_in_sig = [param for param in INPUT_DIM_PARAMS if param in sig.parameters]
+            input_dim_params_in_sig = [
+                param for param in INPUT_DIM_PARAMS if param in sig.parameters
+            ]
             if input_dim_params_in_sig:
-                input_dim_params_missing = [param for param in INPUT_DIM_PARAMS if param not in kwargs]
+                input_dim_params_missing = [
+                    param for param in INPUT_DIM_PARAMS if param not in kwargs
+                ]
                 if input_dim_params_missing:
                     # 从维度推断引擎获取输入维度
                     input_dim_info = self.dim_engine.block_input_dims.get(name)
@@ -905,7 +912,7 @@ class Package(nn.Module):
                         param_name = input_dim_params_in_sig[0]
                         kwargs[param_name] = feature_dim
                         logging.info(
-                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"
+                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"  # NOQA
                         )
                     elif input_dim is not None:
                         # fallback到传入的input_dim参数
@@ -922,7 +929,7 @@ class Package(nn.Module):
                         param_name = input_dim_params_in_sig[0]
                         kwargs[param_name] = feature_dim
                         logging.info(
-                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from fallback input_dim"
+                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from fallback input_dim"  # NOQA
                         )
                     else:
                         logging.error(
@@ -948,10 +955,12 @@ class Package(nn.Module):
 
             # 【新增】通用的sequence_dim和query_dim自动推断
             sequence_dim_missing = (
-                SEQUENCE_QUERY_PARAMS[0] in sig.parameters and SEQUENCE_QUERY_PARAMS[0] not in kwargs
+                SEQUENCE_QUERY_PARAMS[0] in sig.parameters
+                and SEQUENCE_QUERY_PARAMS[0] not in kwargs
             )
             query_dim_missing = (
-                SEQUENCE_QUERY_PARAMS[1] in sig.parameters and SEQUENCE_QUERY_PARAMS[1] not in kwargs
+                SEQUENCE_QUERY_PARAMS[1] in sig.parameters
+                and SEQUENCE_QUERY_PARAMS[1] not in kwargs
             )
 
             if sequence_dim_missing or query_dim_missing:
@@ -1495,16 +1504,15 @@ class Package(nn.Module):
     def call_torch_layer(self, inputs, name, **kwargs):
         """Call predefined torch Layer."""
         layer = self._name_to_layer[name]
-        customize = self._name_to_customize.get(name, False)
         cls = layer.__class__.__name__
 
         # 判断输入格式
         processed_inputs = self._determine_input_format(layer, inputs)
 
         # 首先尝试处理后的输入格式
-        if self._try_call_layer(layer, processed_inputs, name, cls, customize):
+        if self._try_call_layer(layer, processed_inputs, name, cls):
             return self._last_output
-        
+
         # 如果失败且输入格式被修改过，尝试原始输入格式
         if processed_inputs is not inputs:
             logging.info(f"Retrying {name} with original input format")
@@ -1513,29 +1521,55 @@ class Package(nn.Module):
                 return self._last_output
             else:
                 logging.error(f"Both input formats failed for {name}")
-                raise RuntimeError(f"Layer {name} failed with both processed and original input formats")
+                raise RuntimeError(
+                    f"Layer {name} failed with both processed and original input formats"  # NOQA
+                )
         else:
             # 如果输入格式没有改变，直接抛出异常
             raise RuntimeError(f"Layer {name} ({cls}) failed to execute")
 
     def _try_call_layer(self, layer, inputs, name, cls):
         """尝试调用层，成功返回True，失败返回False并记录错误.
-        
+
         Args:
             layer: 要调用的层对象
             inputs: 输入数据
             name: 层名称
             cls: 层类名
-            customize: 是否为自定义层
-            
+
         Returns:
             bool: 成功返回True，失败返回False
         """
         try:
-            self._last_output = layer(inputs)
-            logging.debug(
-                f"Layer {name} ({cls}) called successfully with input type: {type(inputs)}"
-            )
+            # 检查layer的forward方法签名以决定如何传递参数
+            if hasattr(layer, "forward"):
+                sig = inspect.signature(layer.forward)
+                params = list(sig.parameters.keys())
+                if "self" in params:
+                    params.remove("self")
+
+                # 如果inputs是列表/元组且layer期望多个参数，尝试展开传递
+                if (
+                    isinstance(inputs, (list, tuple))
+                    and len(params) > 1
+                    and len(inputs) == len(params)
+                ):
+                    self._last_output = layer(*inputs)
+                    logging.debug(
+                        f"Layer {name} ({cls}) called successfully with {len(inputs)} separate arguments"  # NOQA
+                    )
+                else:
+                    # 默认情况：单参数传递
+                    self._last_output = layer(inputs)
+                    logging.debug(
+                        f"Layer {name} ({cls}) called successfully with input type: {type(inputs)}"  # NOQA
+                    )
+            else:
+                # 如果没有forward方法，直接调用
+                self._last_output = layer(inputs)
+                logging.debug(
+                    f"Layer {name} ({cls}) called successfully with input type: {type(inputs)}"  # NOQA
+                )
             return True
         except Exception as e:
             msg = getattr(e, "message", str(e))
@@ -1591,49 +1625,58 @@ class Package(nn.Module):
             Output from the last step of the recurrent layer.
         """
         recurrent_config = config.recurrent
-        fixed_input_index = getattr(recurrent_config, "fixed_input_index", None)
 
-        # 解析输入
-        if isinstance(inputs, (list, tuple)) and len(inputs) > 1:
-            # 多输入情况
-            if fixed_input_index is not None:
-                # 有固定输入索引，用于Cross层的x0
-                x0 = inputs[fixed_input_index]
-                xl = inputs[1 - fixed_input_index] if len(inputs) == 2 else inputs[-1]
-            else:
-                # 没有固定输入索引，使用第一个作为初始输入
-                x0 = inputs[0]
-                xl = inputs[0]
-        else:
-            # 单输入情况
-            single_input = inputs[0] if isinstance(inputs, (list, tuple)) else inputs
-            x0 = single_input
-            xl = single_input
+        # 获取固定输入索引，默认为-1表示没有固定输入
+        fixed_input_index = -1
+        if hasattr(recurrent_config, "fixed_input_index"):
+            fixed_input_index = recurrent_config.fixed_input_index
+
+        # 如果有固定输入索引，输入必须是列表或元组
+        if fixed_input_index >= 0:
+            assert isinstance(inputs, (tuple, list)), (
+                f"{name} inputs must be a list when using fixed_input_index"
+            )
+
+        # 初始化输出为输入
+        output = inputs
 
         # 逐步执行recurrent
         for i in range(recurrent_config.num_steps):
             name_i = f"{name}_{i}"
             if name_i in self._name_to_layer:
-                layer = self._name_to_layer[name_i]
+                # 调用子层
+                output_i = self.call_torch_layer(output, name_i, **kwargs)
 
-                # 根据层类型调用
-                if hasattr(layer, "forward"):
-                    # 检查层是否需要两个参数（如Cross层）
-                    import inspect
+                if fixed_input_index >= 0:
+                    # 有固定输入索引的情况：更新除固定索引外的所有输入
+                    j = 0
+                    for idx in range(len(output)):
+                        if idx == fixed_input_index:
+                            continue  # 跳过固定输入索引
 
-                    sig = inspect.signature(layer.forward)
-                    params = list(sig.parameters.keys())
-
-                    if len(params) >= 3:  # self, x0, xl (可能还有可选参数)
-                        xl = layer(x0, xl)
-                    else:  # 只需要一个输入参数
-                        xl = layer(xl)
+                        if isinstance(output_i, (tuple, list)):
+                            output[idx] = output_i[j]
+                        else:
+                            output[idx] = output_i
+                        j += 1
                 else:
-                    xl = layer(xl)
+                    # 没有固定输入索引的情况：直接替换整个输出
+                    output = output_i
             else:
                 logging.warning(f"Recurrent sub-layer {name_i} not found, skipping")
 
-        return xl
+        # 后处理输出
+        if fixed_input_index >= 0:
+            # 删除固定输入索引对应的元素
+            output = list(output)  # 确保是可变列表
+            del output[fixed_input_index]
+
+            # 如果只剩一个元素，直接返回该元素
+            if len(output) == 1:
+                return output[0]
+            return output
+
+        return output
 
     def _call_repeat_layer(self, inputs, config, name, **kwargs):
         """Call repeat layer by iterating through all repetitions.
