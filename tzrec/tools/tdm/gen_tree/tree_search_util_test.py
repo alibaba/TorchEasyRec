@@ -59,7 +59,7 @@ class TreeSearchtest(unittest.TestCase):
         search = TreeSearch(output_file=self.test_dir, root=root, child_num=2)
         search.save(attr_delimiter=attr_delimiter)
         search.save_predict_edge()
-        search.save_node_feature("int_a,str_c", "float_b")
+        search.save_node_feature("item_id", "int_a,str_c", "float_b")
         search.save_serving_tree(self.test_dir)
 
         node_table = []
