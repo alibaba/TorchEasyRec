@@ -20,6 +20,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.grouped_auc import GroupedAUC
+from tzrec.metrics.xauc import XAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import div_no_nan
@@ -301,6 +302,8 @@ class RankModel(BaseModel):
                 f"num_class must less than 2 when metric type is {metric_type}"
             )
             self._metric_modules[metric_name] = GroupedAUC()
+        elif metric_type == "xauc":
+            self._metric_modules[metric_name] = XAUC(**metric_kwargs)
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
@@ -358,6 +361,9 @@ class RankModel(BaseModel):
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
             self._metric_modules[metric_name].update(pred, label, grouping_key)
+        elif metric_type == "xauc":
+            pred = predictions["y" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
