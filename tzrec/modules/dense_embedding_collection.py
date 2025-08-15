@@ -159,6 +159,7 @@ class AutoDisEmbedding(nn.Module):
         )  # shape = [b, n * d]
         return output
 
+    # pyre-ignore[14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -173,6 +174,7 @@ class AutoDisEmbedding(nn.Module):
         """
         if destination is None:
             destination = OrderedDict()
+            # pyre-ignore[16]
             destination._metadata = OrderedDict()
         for i in range(self.meta_emb.shape[0]):
             destination[f"{prefix}meta_emb_{self.feature_names[i]}.weight"] = (
@@ -235,6 +237,7 @@ class MLPEmbedding(nn.Module):
             (-1, self.num_dense_feature * self.embedding_dim)
         )
 
+    # pyre-ignore[14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -249,6 +252,7 @@ class MLPEmbedding(nn.Module):
         """
         if destination is None:
             destination = OrderedDict()
+            # pyre-ignore[16]
             destination._metadata = OrderedDict()
         for i in range(self.proj_w.shape[0]):
             destination[f"{prefix}proj_w_{self.feature_names[i]}.weight"] = self.proj_w[

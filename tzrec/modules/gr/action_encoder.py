@@ -13,7 +13,7 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -44,13 +44,14 @@ class ActionEncoder(BaseModule):
         watchtime_to_action_thresholds: Optional[List[int]] = None,
         watchtime_to_action_weights: Optional[List[int]] = None,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._watchtime_feature_name: str = watchtime_feature_name
         self._action_feature_name: str = action_feature_name
         self._watchtime_to_action_thresholds_and_weights: List[Tuple[int, int]] = []
         if watchtime_to_action_thresholds is not None:
+            assert watchtime_to_action_weights is not None
             assert len(watchtime_to_action_thresholds) == len(
                 watchtime_to_action_weights
             )

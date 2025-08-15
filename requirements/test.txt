@@ -1,3 +1,4 @@
+click<8.2.0
 hypothesis
 parameterized
 pre-commit

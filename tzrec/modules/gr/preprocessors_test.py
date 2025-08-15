@@ -112,7 +112,6 @@ class PreprocessorTest(unittest.TestCase):
             output_seq_timestamps,
             output_seq_embeddings,
             output_num_targets,
-            _,
         ) = preprocessor(
             max_uih_len=4,
             max_targets=2,

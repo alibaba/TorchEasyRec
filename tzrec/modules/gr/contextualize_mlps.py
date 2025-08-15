@@ -66,7 +66,7 @@ class SimpleContextualizedMLP(ContextualizedMLP):
         sequential_output_dim: int,
         hidden_dim: int,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._mlp: torch.nn.Module = torch.nn.Sequential(
@@ -122,7 +122,7 @@ class ParameterizedContextualizedMLP(ContextualizedMLP):
         hidden_dim: int,
         contextual_dropout_ratio: float = 0.3,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
 
@@ -176,6 +176,7 @@ class ParameterizedContextualizedMLP(ContextualizedMLP):
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
+        assert contextual_embeddings is not None
         contextual_embeddings = torch.nn.functional.dropout(
             contextual_embeddings,
             p=self._contextual_dropout_ratio,
@@ -198,7 +199,7 @@ class ParameterizedContextualizedMLP(ContextualizedMLP):
 
 
 def create_contextualized_mlp(
-    mlp_cfg: Union[module_pb2.GRContextualizedMLP, Dict[str, Any]], **kwargs
+    mlp_cfg: Union[module_pb2.GRContextualizedMLP, Dict[str, Any]], **kwargs: Any
 ) -> ContextualizedMLP:
     """Create ContextualizedMLP."""
     if isinstance(mlp_cfg, module_pb2.GRContextualizedMLP):

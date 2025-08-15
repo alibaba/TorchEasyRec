@@ -44,6 +44,7 @@ class TZRecOptimizer(OptimizerWrapper):
         ):
             self._optimizer.zero_grad(set_to_none=set_to_none)
 
+    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         """Step."""
         self._step += 1
@@ -53,6 +54,7 @@ class TZRecOptimizer(OptimizerWrapper):
         ):
             if self._grad_scaler is not None:
                 self._grad_scaler.step(self._optimizer)
+                # pyre-ignore [16]
                 self._grad_scaler.update()
             else:
                 self._optimizer.step(closure=closure)

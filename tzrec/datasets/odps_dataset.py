@@ -22,8 +22,8 @@ import urllib3
 from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
 from odps.accounts import (
-    AliyunAccount,
     BaseAccount,
+    CloudAccount,
     CredentialProviderAccount,
 )
 from odps.apis.storage_api import (
@@ -142,7 +142,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.environ["ODPS_CONFIG_FILE_PATH"]
         )
-        account = AliyunAccount(account_id, account_key)
+        account = CloudAccount(account_id, account_key)
     elif (
         "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
         or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
@@ -166,7 +166,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.path.join(os.getenv("HOME", "/home/admin"), ".odps_config.ini")
         )
-        account = AliyunAccount(account_id, account_key)
+        account = CloudAccount(account_id, account_key)
 
     # prevent graph-learn parse odps config hang
     os.environ["ACCESS_ID"] = account_id

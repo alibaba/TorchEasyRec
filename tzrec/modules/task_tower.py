@@ -64,7 +64,7 @@ class FusionMTLTower(nn.Module):
         tower_feature_in: int,
         mlp: Optional[Dict[str, Any]],
         task_configs: List[Dict[str, Any]],
-    ):
+    ) -> None:
         super().__init__()
         self.task_configs = task_configs
         self.tower_mlp = None

@@ -125,9 +125,9 @@ class TreeBuilder:
                 # we should use fixed length code when use_hash_node_id
                 # because we need sort ids in TDMSampler
                 node.item_id = (
-                    # pyre-ignore [58]
                     f"nonleaf#{code:0{max_code_len}d}"
                     if use_hash_node_id()
+                    # pyre-ignore [58]
                     else max_item_id + code + 1
                 )
 
