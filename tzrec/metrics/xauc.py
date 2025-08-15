@@ -20,6 +20,9 @@ from tzrec.utils.logging_util import logger
 class XAUC(Metric):
     """XAUC metric for short video rec.
 
+    XAUC is O(n^2) complexity, downsampling is necessary in practice. Set
+    proper sample_ratio or max_pairs args when use.
+
     Ref:
         https://arxiv.org/pdf/2206.06003
         https://arxiv.org/pdf/2408.07759
@@ -31,7 +34,7 @@ class XAUC(Metric):
             Actual number of pairs is n*(n-1)/2 * ratio. Reduce the
             ratio when eval set is large(which is common) and memory is
             limited. Default value 1e-3.
-        max_pairs(int): The maximum number of pairs to sample. If
+        max_pairs(optional int): The maximum number of pairs to sample. If
             specified, sample_ratio is ignored. Default None.
         in_batch(bool): Get sample pairs within a batch. When True,
             sampling is done per batch, xauc is calculated batch-wise and
@@ -127,7 +130,8 @@ class XAUC(Metric):
         idx_i = sampled_flat - base
         idx_j = i + 1
 
-        # # duplicate removal, caution: slow when n_sample_pairs is large
+        # # duplicates removal, caution: slow when n_sample_pairs is large,
+        # but unnecessary when the sample pool is big.
         # pairs = torch.stack([idx_i, idx_j], dim=1)
         # unique_pairs = torch.unique(pairs, dim=0)
         # idx_i = unique_pairs[:, 0]
