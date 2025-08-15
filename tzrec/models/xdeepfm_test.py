@@ -130,7 +130,7 @@ class XDeepFMTest(unittest.TestCase):
         ]
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
-            xdeepfm=rank_model_pb2.XDeepFM(
+            xdeepfm=rank_model_pb2.xDeepFM(
                 cin=module_pb2.CIN(cin_layer_size=[8, 4, 2]),
                 deep=module_pb2.MLP(hidden_units=[8, 4]),
                 final=module_pb2.MLP(hidden_units=[2]),
