@@ -17,14 +17,14 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.interaction import Cross
+from tzrec.modules.interaction import CrossV2
 from tzrec.modules.mlp import MLP
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class DCNV1(RankModel):
-    """Deep cross network v1.
+class DCNV2(RankModel):
+    """Deep cross network v2.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -45,29 +45,44 @@ class DCNV1(RankModel):
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
         feature_dim = self.embedding_group.group_total_dim(self.group_name)
-        self.cross = Cross(
+
+        self.backbone = None
+        if self._model_config.HasField("backbone"):
+            self.backbone = MLP(
+                in_features=feature_dim, **config_to_kwargs(self._model_config.backbone)
+            )
+            feature_dim = self.backbone.output_dim()
+
+        self.cross = CrossV2(
             input_dim=feature_dim, **config_to_kwargs(self._model_config.cross)
         )
-        self.deep = MLP(
-            in_features=feature_dim, **config_to_kwargs(self._model_config.deep)
-        )
-        final_dnn_input_dim = self.cross.output_dim() + self.deep.output_dim()
-        self.final_dnn = MLP(
-            in_features=final_dnn_input_dim,
+        final_input_dim = self.cross.output_dim()
+        self.deep = None
+        if self._model_config.HasField("deep"):
+            in_features = self.embedding_group.group_total_dim(self.group_name)
+            self.deep = MLP(
+                in_features=in_features, **config_to_kwargs(self._model_config.deep)
+            )
+            final_input_dim += self.deep.output_dim()
+        self.final = MLP(
+            in_features=final_input_dim,
             **config_to_kwargs(self._model_config.final),
         )
-        self.output_linear = nn.Linear(
-            self.final_dnn.output_dim(), self._num_class, bias=False
+        self.output_mlp = nn.Linear(
+            self.final.output_dim(), self._num_class, bias=False
         )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward method."""
         feature_dict = self.build_input(batch)
         features = feature_dict[self.group_name]
-
-        cross_out = self.cross(features)
-        deep_out = self.deep(features)
-
-        concat = torch.concat([cross_out, deep_out], dim=-1)
-        out = self.output_linear(self.final_dnn(concat))
+        if self.backbone:
+            net = self.backbone(features)
+        else:
+            net = features
+        net = self.cross(net)
+        if self.deep:
+            deep_net = self.deep(features)
+            net = torch.concat([net, deep_net], dim=-1)
+        out = self.output_mlp(self.final(net))
         return self._output_to_prediction(out)
