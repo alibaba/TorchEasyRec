@@ -163,14 +163,8 @@ class CrossV2(nn.Module):
         )
         self.v_kernels = nn.ModuleList(
             [
-                nn.Linear(self._low_rank, self._input_dim, bias=False)
+                nn.Linear(self._low_rank, self._input_dim, bias=True)
                 for _ in range(cross_num)
-            ]
-        )
-        self.bias = torch.nn.ParameterList(
-            [
-                torch.nn.Parameter(torch.nn.init.zeros_(torch.empty(self._input_dim)))
-                for _ in range(self.cross_num)
             ]
         )
 
@@ -189,7 +183,7 @@ class CrossV2(nn.Module):
         for i in range(self.cross_num):
             x_l_v = self.u_kernels[i](x_l)
             x_l_w = self.v_kernels[i](x_l_v)
-            x_l = x_0 * (x_l_w + self.bias[i]) + x_l  # (batch_size, input_dim)
+            x_l = x_0 * x_l_w + x_l  # (batch_size, input_dim)
 
         return x_l
 

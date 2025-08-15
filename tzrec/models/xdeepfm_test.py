@@ -24,7 +24,7 @@ from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
-class XDeepFMTest(unittest.TestCase):
+class xDeepFMTest(unittest.TestCase):
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
