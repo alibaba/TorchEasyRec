@@ -171,7 +171,6 @@ class Package(nn.Module):
         self._block_outputs = {}
         self._package_input = None
         self._feature_group_inputs = {}
-        reuse = None
         input_feature_groups = self._feature_group_inputs
 
         # ======= step 1: 注册所有节点 =======
@@ -396,7 +395,7 @@ class Package(nn.Module):
                     )
 
                 # 定义layer
-                self.define_layers(layer, block, block.name, reuse)
+                self.define_layers(layer, block, block.name)
 
                 # 注册layer到维度推断引擎
                 if block.name in self._name_to_layer:
@@ -587,7 +586,7 @@ class Package(nn.Module):
         """返回拼接后最终输出的总维度."""
         return sum(self.output_block_dims())
 
-    def define_layers(self, layer, layer_cnf, name, reuse):
+    def define_layers(self, layer, layer_cnf, name):
         """得到layer.
 
         Args:
@@ -600,11 +599,10 @@ class Package(nn.Module):
                 activation: "nn.ReLU"
                 }
             name (str): the name of the layer. e.g., 'user_mlp'.
-            reuse (bool): whether to reuse the layer.
         """
         if layer == "module":
             layer_cls, customize = self.load_torch_layer(
-                layer_cnf.module, name, reuse, self._name_to_input_dim.get(name, None)
+                layer_cnf.module, name, self._name_to_input_dim.get(name, None)
             )
             self._name_to_layer[name] = layer_cls
             self._name_to_customize[name] = customize
@@ -652,7 +650,7 @@ class Package(nn.Module):
 
                 # 加载子层，传递正确的input_dim参数
                 layer_obj, customize = self.load_torch_layer(
-                    torch_layer, name_i, reuse, child_input_dim
+                    torch_layer, name_i, child_input_dim
                 )
                 self._name_to_layer[name_i] = layer_obj
                 self._name_to_customize[name_i] = customize
@@ -776,7 +774,7 @@ class Package(nn.Module):
 
                 # 加载子层，传递正确的input_dim参数
                 layer_obj, customize = self.load_torch_layer(
-                    torch_layer, name_i, reuse, parent_input_dim
+                    torch_layer, name_i, parent_input_dim
                 )
                 self._name_to_layer[name_i] = layer_obj
                 self._name_to_customize[name_i] = customize
@@ -844,13 +842,12 @@ class Package(nn.Module):
             self._name_to_customize[name] = True
 
     # 用于动态加载  层并根据配置初始化
-    def load_torch_layer(self, layer_conf, name, reuse=None, input_dim=None):
+    def load_torch_layer(self, layer_conf, name, input_dim=None):
         """Dynamically load and initialize a torch layer based on configuration.
 
         Args:
             layer_conf: Layer configuration containing class name and parameters.
             name (str): Name of the layer to be created.
-            reuse (bool, optional): Whether to reuse existing layer weights.
             input_dim (int, optional): Input dimension for the layer.
 
         Returns:
@@ -1495,7 +1492,7 @@ class Package(nn.Module):
             return inputs  # 出错时返回原始输入
 
     def call_torch_layer(self, inputs, name, **kwargs):
-        """Call predefined torch Layer, which can be reused."""
+        """Call predefined torch Layer"""
         layer = self._name_to_layer[name]
         customize = self._name_to_customize.get(name, False)
         cls = layer.__class__.__name__
