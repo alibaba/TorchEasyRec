@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Alibaba Group;
+# Copyright (c) 2024, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -17,14 +17,14 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.interaction import Cross
+from tzrec.modules.interaction import CIN
 from tzrec.modules.mlp import MLP
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class DCNV1(RankModel):
-    """Deep cross network v1.
+class xDeepFM(RankModel):
+    """XDeepFM model.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -42,32 +42,45 @@ class DCNV1(RankModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
+        self.wide_embedding_dim = self._model_config.wide_embedding_dim
+        self.wide_init_fn = self._model_config.wide_init_fn
         self.init_input()
-        self.group_name = self.embedding_group.group_names()[0]
-        feature_dim = self.embedding_group.group_total_dim(self.group_name)
-        self.cross = Cross(
-            input_dim=feature_dim, **config_to_kwargs(self._model_config.cross)
-        )
+        deep_feature_dim = self.embedding_group.group_total_dim("deep")
         self.deep = MLP(
-            in_features=feature_dim, **config_to_kwargs(self._model_config.deep)
+            in_features=deep_feature_dim, **config_to_kwargs(self._model_config.deep)
         )
-        final_dnn_input_dim = self.cross.output_dim() + self.deep.output_dim()
-        self.final_dnn = MLP(
-            in_features=final_dnn_input_dim,
+        self.feature_num = len(self.embedding_group.group_dims("wide"))
+        self.cin = CIN(
+            feature_num=self.feature_num, **config_to_kwargs(self._model_config.cin)
+        )
+
+        self.final = MLP(
+            in_features=self.deep.output_dim() + self.cin.output_dim(),
             **config_to_kwargs(self._model_config.final),
         )
-        self.output_linear = nn.Linear(
-            self.final_dnn.output_dim(), self._num_class, bias=False
-        )
+        self.output_mlp = nn.Linear(self.final.output_dim(), self._num_class)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Forward method."""
-        feature_dict = self.build_input(batch)
-        features = feature_dict[self.group_name]
+        """Forward the model.
 
-        cross_out = self.cross(features)
-        deep_out = self.deep(features)
+        Args:
+            batch (Batch): input batch data.
 
-        concat = torch.concat([cross_out, deep_out], dim=-1)
-        out = self.output_linear(self.final_dnn(concat))
-        return self._output_to_prediction(out)
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        grouped_features = self.build_input(batch)
+
+        # Wide
+        wide_feat = grouped_features["wide"]
+        wide_feat = wide_feat.reshape(-1, self.feature_num, self.wide_embedding_dim)
+        cin_feat = self.cin(wide_feat)
+
+        # Deep
+        deep_feat = grouped_features["deep"]
+        deep_feat = self.deep(deep_feat)
+
+        all_feat = torch.cat([cin_feat, deep_feat], dim=1)
+        y = self.final(all_feat)
+        y = self.output_mlp(y)
+        return self._output_to_prediction(y)
