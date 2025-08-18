@@ -35,7 +35,8 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc.aot_utils import export_model_aot
-from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
+from tzrec.acc.export_utils import get_max_export_batch_size
+from tzrec.acc.trt_utils import export_model_trt
 from tzrec.acc.utils import (
     allow_tf32,
     export_acc_config,
@@ -982,12 +983,11 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
-    is_trt_convert = is_trt()
-    if is_trt_convert:
-        # export batch_size too large may OOM in trt convert phase
-        max_batch_size = get_trt_max_batch_size()
+    if is_cuda_export():
+        # export batch_size too large may OOM in compile phase
+        max_batch_size = get_max_export_batch_size()
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in trt export", data_config.batch_size)
+        logger.info("using new batch_size: %s in export", data_config.batch_size)
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
@@ -1128,7 +1128,7 @@ def predict(
     is_trt_convert: bool = is_trt_predict(scripted_model_path)
     if is_trt_convert:
         # predict batch_size too large may out of range
-        max_batch_size = get_trt_max_batch_size()
+        max_batch_size = get_max_export_batch_size()
         pipeline_config.data_config.batch_size = min(
             pipeline_config.data_config.batch_size, max_batch_size
         )

@@ -145,12 +145,6 @@ class DataParser:
             logger.info(f"self.dense_keys: {self.dense_keys}")
             logger.info(f"self.sequence_dense_keys: {self.sequence_dense_keys}")
 
-            # get dense keys list
-            self.dense_keys_list = []
-            for _, keys in self.dense_keys.items():
-                for key in keys:
-                    self.dense_keys_list.append(f"{key}")
-
     def _init_fg_hander(self) -> None:
         """Init pyfg dag handler."""
         if not self._fg_handler:
