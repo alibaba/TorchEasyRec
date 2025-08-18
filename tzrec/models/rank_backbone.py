@@ -16,7 +16,8 @@ from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.layers.backbone import Backbone
+# from tzrec.layers.backbone import Backbone
+from tzrec.modules.backbone import Backbone
 from tzrec.models.rank_model import RankModel
 from tzrec.protos.model_pb2 import ModelConfig
 
