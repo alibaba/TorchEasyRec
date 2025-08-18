@@ -33,10 +33,10 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_infer_max_len, fx_int_item
+from tzrec.utils.fx_util import fx_int_item, fx_numel
 
-torch.fx.wrap(fx_infer_max_len)
 torch.fx.wrap(fx_int_item)
+torch.fx.wrap(fx_numel)
 
 
 @torch.fx.wrap
@@ -55,19 +55,6 @@ def _fx_construct_payload(
         results[k + "_offsets"] = v.offsets()
     results.update(payload_features)
     return results
-
-
-@torch.fx.wrap
-def _fx_mark_length_features(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor
-
-
-@torch.fx.wrap
-def _fx_numel(tensor: torch.Tensor) -> int:
-    total_len = tensor.numel()
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        torch._check_is_size(total_len)
-    return total_len
 
 
 class DlrmHSTU(RankModel):
@@ -191,7 +178,7 @@ class DlrmHSTU(RankModel):
             kernel=self.kernel(),
         ).squeeze(-1)
         total_targets = fx_int_item(num_candidates.sum())
-        total_len = _fx_numel(source_timestamps)
+        total_len = fx_numel(source_timestamps)
         candidates_user_embeddings, _ = self._hstu_transducer(
             max_uih_len=max_uih_len,
             max_targets=max_candidates,
@@ -236,15 +223,15 @@ class DlrmHSTU(RankModel):
         sparse_features = batch.sparse_features[BASE_DATA_GROUP].to_dict()
         sequence_dense_features = batch.sequence_dense_features
 
-        num_candidates = _fx_mark_length_features(
-            sparse_features[self._model_config.candidates_id_feature_name].lengths()
-        )
-        max_num_candidates = fx_infer_max_len(num_candidates)
+        num_candidates = sparse_features[
+            self._model_config.candidates_id_feature_name
+        ].lengths()
+        max_num_candidates = fx_int_item(num_candidates.max())
 
         uih_seq_lengths = sparse_features[
             self._model_config.uih_id_feature_name
         ].lengths()
-        max_uih_len = fx_infer_max_len(uih_seq_lengths)
+        max_uih_len = fx_int_item(uih_seq_lengths.max())
 
         # prepare payload features
         payload_features: Dict[str, torch.Tensor] = {}
