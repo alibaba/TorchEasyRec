@@ -17,5 +17,6 @@ message TorchLayer {
         Cross cross = 15;
         CrossNet cross_net = 16;
         DCNv2Net dcnv2_net = 17;
+        MaskNetModule mask_net_module = 18;
     }
 }

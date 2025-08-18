@@ -18,22 +18,22 @@ import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
 
-from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.mlp import MLP
-from tzrec.protos import backbone_pb2
-from tzrec.utils.backbone_utils import Parameter
-from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.dimension_inference import (
     DimensionInferenceEngine,
     DimensionInfo,
     create_dimension_info_from_embedding,
 )
-from tzrec.utils.lambda_inference import LambdaOutputDimInferrer
+from tzrec.layers.lambda_inference import LambdaOutputDimInferrer
+from tzrec.layers.utils import Parameter
+from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.mlp import MLP
+from tzrec.protos import backbone_pb2
+from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.load_class import load_torch_layer
 
 # 自动推断参数常量定义
 # 输入维度相关参数
-INPUT_DIM_PARAMS = ["in_features", "input_dim", "feature_dim"]
+INPUT_DIM_PARAMS = ["in_features", "input_dim"]
 
 # 序列和查询维度相关参数
 SEQUENCE_QUERY_PARAMS = ["sequence_dim", "query_dim"]
@@ -149,7 +149,7 @@ class Package(nn.Module):
         feature_groups,
         wide_embedding_dim=None,
         wide_init_fn=None,
-        input_layer=None,
+        input_layer=None
     ):
         super().__init__()
         # self._base_model_config = config
@@ -170,9 +170,10 @@ class Package(nn.Module):
         # 使用新的维度推断引擎
         self.dim_engine = DimensionInferenceEngine()
 
+        # 保留兼容性的旧字段
         # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
-        self._name_to_output_dim = {}
-        self._name_to_input_dim = {}  # 存储每个Block的输入维度
+        # self._name_to_output_dim = {}
+        # self._name_to_input_dim = {}  # 存储每个Block的输入维度
 
         self.reset_input_config(None)
         self._block_outputs = {}
@@ -294,9 +295,9 @@ class Package(nn.Module):
                         self.dim_engine.register_output_dim(block.name, dim_info)
 
                         # 保留兼容性
-                        self._name_to_output_dim[block.name] = (
-                            dim_info.get_feature_dim()
-                        )
+                        # self._name_to_output_dim[block.name] = (
+                        #     dim_info.get_feature_dim()
+                        # )
 
                         input_feature_groups[group] = (
                             embedding_group  # not a layer is a dim
@@ -326,38 +327,38 @@ class Package(nn.Module):
 
                         # 特殊处理：如果是recurrent或repeat层，
                         # 确保获取最新的输出维度，需要在这里先做处理
-                        if input_name in self._name_to_blocks:
-                            input_block = self._name_to_blocks[input_name]
-                            input_layer_type = input_block.WhichOneof("layer")
-                            if input_layer_type in ["recurrent", "repeat"]:
-                                # 强制从兼容性字段获取最新的输出维度
-                                if input_name in self._name_to_output_dim:
-                                    latest_output_dim = self._name_to_output_dim[
-                                        input_name
-                                    ]
-                                    latest_dim_info = DimensionInfo(latest_output_dim)
-                                    logging.info(
-                                        f"Overriding dim_engine cache for {input_layer_type} layer {input_name}: {latest_output_dim}"  # NOQA
-                                    )
-                                    # 强制更新维度推断引擎的缓存
-                                    self.dim_engine.register_output_dim(
-                                        input_name, latest_dim_info
-                                    )
-                                    input_dim_info = latest_dim_info
-                                else:
-                                    logging.warning(
-                                        f"{input_layer_type} layer {input_name} not found in _name_to_output_dim"  # NOQA
-                                    )
+                        # if input_name in self._name_to_blocks:
+                        #     input_block = self._name_to_blocks[input_name]
+                        #     input_layer_type = input_block.WhichOneof("layer")
+                        #     if input_layer_type in ["recurrent", "repeat"]:
+                        #         # 强制从兼容性字段获取最新的输出维度
+                        #         if input_name in self._name_to_output_dim:
+                        #             latest_output_dim = self._name_to_output_dim[
+                        #                 input_name
+                        #             ]
+                        #             latest_dim_info = DimensionInfo(latest_output_dim)
+                        #             logging.info(
+                        #                 f"Overriding dim_engine cache for {input_layer_type} layer {input_name}: {latest_output_dim}"  # NOQA
+                        #             )
+                        #             # 强制更新维度推断引擎的缓存
+                        #             self.dim_engine.register_output_dim(
+                        #                 input_name, latest_dim_info
+                        #             )
+                        #             input_dim_info = latest_dim_info
+                        #         else:
+                        #             logging.warning(
+                        #                 f"{input_layer_type} layer {input_name} not found in _name_to_output_dim"  # NOQA
+                        #             )
 
-                        if input_dim_info is None:
-                            # fallback到旧的方式
-                            if input_name in self._name_to_output_dim:
-                                output_dim = self._name_to_output_dim[input_name]
-                                input_dim_info = DimensionInfo(output_dim)
-                            else:
-                                raise KeyError(
-                                    f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
-                                )
+                        # if input_dim_info is None:
+                        #     # fallback到旧的方式
+                        #     if input_name in self._name_to_output_dim:
+                        #         output_dim = self._name_to_output_dim[input_name]
+                        #         input_dim_info = DimensionInfo(output_dim)
+                        #     else:
+                        #         raise KeyError(
+                        #             f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
+                        #         )
 
                         # 应用input_fn和input_slice变换
                         if input_fn or input_slice:
@@ -385,7 +386,7 @@ class Package(nn.Module):
                 self.dim_engine.register_input_dim(block.name, merged_input_dim)
 
                 # 保留兼容性
-                self._name_to_input_dim[block.name] = merged_input_dim.get_total_dim()
+                # self._name_to_input_dim[block.name] = merged_input_dim.get_total_dim()
 
                 # 添加调试信息
                 logger.info(
@@ -422,19 +423,22 @@ class Package(nn.Module):
                             output_dim_info = self.dim_engine.get_output_dim(block.name)
                             if output_dim_info is None:
                                 # 如果维度推断引擎中没有，从兼容性字段获取
-                                if block.name in self._name_to_output_dim:
-                                    output_dim = self._name_to_output_dim[block.name]
-                                    output_dim_info = DimensionInfo(output_dim)
-                                    self.dim_engine.register_output_dim(
-                                        block.name, output_dim_info
-                                    )
-                                    logging.info(
-                                        f"{layer.capitalize()} layer {block.name} output dim restored from compatibility field: {output_dim}"  # NOQA
-                                    )
-                                else:
-                                    raise ValueError(
-                                        f"{layer.capitalize()} layer {block.name} missing output dimension"  # NOQA
-                                    )
+                                # if block.name in self._name_to_output_dim:
+                                #     output_dim = self._name_to_output_dim[block.name]
+                                #     output_dim_info = DimensionInfo(output_dim)
+                                #     self.dim_engine.register_output_dim(
+                                #         block.name, output_dim_info
+                                #     )
+                                #     logging.info(
+                                #         f"{layer.capitalize()} layer {block.name} output dim restored from compatibility field: {output_dim}"  # NOQA
+                                #     )
+                                # else:
+                                #     raise ValueError(
+                                #         f"{layer.capitalize()} layer {block.name} missing output dimension"  # NOQA
+                                #     )
+                                raise ValueError(
+                                    f"{layer.capitalize()} layer {block.name} missing output dimension"  # NOQA
+                                )
                             else:
                                 logging.info(
                                     f"{layer.capitalize()} layer {block.name} output dim already set: {output_dim_info}"  # NOQA
@@ -456,9 +460,9 @@ class Package(nn.Module):
                     self.dim_engine.register_output_dim(block.name, output_dim_info)
 
                     # 保留兼容性
-                    self._name_to_output_dim[block.name] = (
-                        output_dim_info.get_feature_dim()
-                    )
+                    # self._name_to_output_dim[block.name] = (
+                    #     output_dim_info.get_feature_dim()
+                    # )
 
                     # 添加调试信息
                     logging.info(
@@ -472,9 +476,9 @@ class Package(nn.Module):
                         existing_output_dim_info = self.dim_engine.get_output_dim(
                             block.name
                         )
-                        existing_output_dim = self._name_to_output_dim.get(block.name)
+                        # existing_output_dim = self._name_to_output_dim.get(block.name)
                         print(
-                            f"[SKIP OVERRIDE] {layer_type.capitalize()} layer {block.name} - keeping existing output dim: engine={existing_output_dim_info}, compat={existing_output_dim}"  # NOQA
+                            f"[SKIP OVERRIDE] {layer_type.capitalize()} layer {block.name} - keeping existing output dim: engine={existing_output_dim_info}"  # NOQA
                         )
                         logging.info(
                             f"Skipping override for {layer_type} layer {block.name} - keeping existing output dimensions"  # NOQA
@@ -484,9 +488,9 @@ class Package(nn.Module):
                         self.dim_engine.register_output_dim(
                             block.name, merged_input_dim
                         )
-                        self._name_to_output_dim[block.name] = (
-                            merged_input_dim.get_feature_dim()
-                        )
+                        # self._name_to_output_dim[block.name] = (
+                        #     merged_input_dim.get_feature_dim()
+                        # )
 
                         logging.info(
                             f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
@@ -616,14 +620,14 @@ class Package(nn.Module):
             torch_layer = layer_cnf.recurrent.module
             # 获取父层的输入维度信息，用于子层的维度推断
             parent_input_dim_info = self.dim_engine.block_input_dims.get(name)
-            parent_input_dim = self._name_to_input_dim.get(name, None)
+            # parent_input_dim = self._name_to_input_dim.get(name, None)  # Legacy dimension tracking
 
             # 检查是否有fixed_input_index配置
             fixed_input_index = getattr(layer_cnf.recurrent, "fixed_input_index", None)
 
             # 如果有fixed_input_index且parent_input_dim_info是list类型，需要特殊处理
             child_input_dim_info = parent_input_dim_info
-            child_input_dim = parent_input_dim
+            # child_input_dim = parent_input_dim  # Legacy dimension tracking
 
             if fixed_input_index is not None and parent_input_dim_info is not None:
                 if parent_input_dim_info.is_list:
@@ -632,7 +636,7 @@ class Package(nn.Module):
                     if fixed_input_index < len(dims_list):
                         fixed_dim = dims_list[fixed_input_index]
                         child_input_dim_info = DimensionInfo(fixed_dim)
-                        child_input_dim = fixed_dim
+                        # child_input_dim = fixed_dim  # Legacy dimension tracking
                         logging.info(
                             f"Recurrent layer {name} using fixed_input_index={fixed_input_index}, child input_dim={fixed_dim}"  # NOQA
                         )
@@ -643,7 +647,7 @@ class Package(nn.Module):
 
             # 用于记录最后一个子层的输出维度
             last_output_dim_info = None
-            last_output_dim = None
+            # last_output_dim = None  # Legacy dimension tracking
 
             for i in range(layer_cnf.recurrent.num_steps):
                 name_i = "%s_%d" % (name, i)
@@ -651,12 +655,17 @@ class Package(nn.Module):
                 # 为每个子层注册输入维度信息
                 if child_input_dim_info is not None:
                     self.dim_engine.register_input_dim(name_i, child_input_dim_info)
-                if child_input_dim is not None:
-                    self._name_to_input_dim[name_i] = child_input_dim
+                # if child_input_dim is not None:  # Legacy dimension tracking
+                #     self._name_to_input_dim[name_i] = child_input_dim
+
+                # 获取推断的输入维度用于layer加载
+                input_dim_for_layer = None
+                if child_input_dim_info is not None:
+                    input_dim_for_layer = child_input_dim_info.get_feature_dim()
 
                 # 加载子层，传递正确的input_dim参数
                 layer_obj, customize = self.load_torch_layer(
-                    torch_layer, name_i, child_input_dim
+                    torch_layer, name_i, input_dim_for_layer
                 )
                 self._name_to_layer[name_i] = layer_obj
                 self._name_to_customize[name_i] = customize
@@ -676,46 +685,46 @@ class Package(nn.Module):
                         )
 
                     self.dim_engine.register_output_dim(name_i, output_dim_info)
-                    self._name_to_output_dim[name_i] = output_dim_info.get_feature_dim()
+                    # self._name_to_output_dim[name_i] = output_dim_info.get_feature_dim()  # Legacy compatibility
 
                     # 记录最后一个子层的输出维度
                     last_output_dim_info = output_dim_info
-                    last_output_dim = output_dim_info.get_feature_dim()
-                elif child_input_dim is not None:
-                    # fallback: 使用简单的维度推断
-                    if hasattr(layer_obj, "output_dim") and callable(
-                        layer_obj.output_dim
-                    ):
-                        output_dim = layer_obj.output_dim()
-                    else:
-                        # 假设输入输出维度相同（如Cross层）
-                        output_dim = (
-                            child_input_dim
-                            if isinstance(child_input_dim, int)
-                            else (
-                                sum(child_input_dim)
-                                if isinstance(child_input_dim, (list, tuple))
-                                else child_input_dim
-                            )
-                        )
-                    self._name_to_output_dim[name_i] = output_dim
-
-                    # 记录最后一个子层的输出维度
-                    last_output_dim = output_dim
+                    # last_output_dim = output_dim_info.get_feature_dim()  # Legacy dimension tracking
+                # elif child_input_dim is not None:  # Legacy fallback logic commented out
+                #     # fallback: 使用简单的维度推断
+                #     if hasattr(layer_obj, "output_dim") and callable(
+                #         layer_obj.output_dim
+                #     ):
+                #         output_dim = layer_obj.output_dim()
+                #     else:
+                #         # 假设输入输出维度相同（如Cross层）
+                #         output_dim = (
+                #             child_input_dim
+                #             if isinstance(child_input_dim, int)
+                #             else (
+                #                 sum(child_input_dim)
+                #                 if isinstance(child_input_dim, (list, tuple))
+                #                 else child_input_dim
+                #             )
+                #         )
+                #     self._name_to_output_dim[name_i] = output_dim
+                #
+                #     # 记录最后一个子层的输出维度
+                #     last_output_dim = output_dim
 
             # 立即设置父层(recurrent层)的输出维度为最后一个子层的输出维度
             # 这样后续依赖该层的block就能获取到正确的输出维度
             if last_output_dim_info is not None:
-                # 立即更新维度推断引擎和兼容性字段
+                # 立即更新维度推断引擎
                 self.dim_engine.register_output_dim(name, last_output_dim_info)
-                self._name_to_output_dim[name] = last_output_dim
+                # self._name_to_output_dim[name] = last_output_dim  # Legacy compatibility
                 logging.info(
-                    f"Recurrent layer {name} output dim set to {last_output_dim} (from last child layer)"  # NOQA
+                    f"Recurrent layer {name} output dim set to {last_output_dim_info.get_feature_dim()} (from last child layer)"  # NOQA
                 )
                 logging.info(f"  - last_output_dim_info: {last_output_dim_info}")
-                logging.info(
-                    f"  - Updated _name_to_output_dim[{name}]: {self._name_to_output_dim[name]}"  # NOQA
-                )
+                # logging.info(
+                #     f"  - Updated _name_to_output_dim[{name}]: {self._name_to_output_dim[name]}"  # NOQA
+                # )  # Legacy compatibility logging
 
                 # 验证更新是否成功
                 updated_dim_info = self.dim_engine.get_output_dim(name)
@@ -869,7 +878,7 @@ class Package(nn.Module):
         if layer_cls is None:
             raise ValueError("Invalid torch layer class name: " + layer_conf.class_name)
         param_type = layer_conf.WhichOneof("params")
-        # st_params是以google.protobuf.Struct对象格式配置的参数； 不需要重新定义proto
+        # st_params是以google.protobuf.Struct对象格式配置的参数；
         # 还可以用自定义的protobuf message的格式传递参数给加载的Layer对象。
         if customize:
             # 代码假定 layer_conf.st_params 是一个结构化参数（is_struct=True），
@@ -1738,7 +1747,9 @@ class Backbone(nn.Module):
             input_layer,
         )  # input_layer目前没有用到
         for pkg in config.packages:
-            Package(pkg, features, embedding_group, input_layer)  # Package是一个子DAG
+            Package(
+                pkg, features, embedding_group, input_layer
+            )  # Package是一个子DAG
 
         # 初始化 top_mlp 目前top_mlp也会改变输出维度，暂未修复
         self._top_mlp = None
