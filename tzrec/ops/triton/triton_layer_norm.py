@@ -304,8 +304,7 @@ def _layer_norm_bwd_dwdb(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
-@triton_op("tzrec::triton_weighted_layer_norm_fwd", mutates_args=())
-def triton_weighted_layer_norm_fwd(
+def _triton_weighted_layer_norm_fwd(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
@@ -375,7 +374,33 @@ def triton_weighted_layer_norm_fwd(
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
             num_warps=num_warps,
         )
+
     return y, mean, rstd, BLOCK_D, num_warps
+
+
+@triton_op("tzrec::triton_weighted_layer_norm_fwd", mutates_args=())
+def triton_weighted_layer_norm_fwd(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    return _triton_weighted_layer_norm_fwd(x=x, weight=weight, bias=bias, eps=eps)
+
+
+@triton_op("tzrec::triton_weighted_layer_norm_fwd_with_mean_rstd", mutates_args=())
+def triton_weighted_layer_norm_fwd_with_mean_rstd(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    eps: float,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+) -> Tuple[torch.Tensor, int, int]:
+    y, _, _, BLOCK_D, num_warps = _triton_weighted_layer_norm_fwd(
+        x=x, weight=weight, bias=bias, eps=eps, mean=mean, rstd=rstd
+    )
+    return y, BLOCK_D, num_warps
 
 
 def triton_weighted_layer_norm_bwd(
