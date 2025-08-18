@@ -11,10 +11,10 @@
 
 from .backbone_module import FM, Add
 from .cross import Cross, CrossNet
-from .masknet import MaskNetModule
+from .masknet import MaskNetModule, MaskBlock
 from .mlp import MLP
 from .mmoe import MMoE
 from .sequence import DINEncoder as DIN
 
 # from .fm import FactorizationMachine as FM
-__all__ = ["MLP", "Add", "FM", "DIN", "MMoE", "Cross", "CrossNet", "MaskNetModule"]
+__all__ = ["MLP", "Add", "FM", "DIN", "MMoE", "Cross", "CrossNet", "MaskNetModule", "MaskBlock"]

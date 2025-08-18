@@ -33,7 +33,7 @@ from tzrec.utils.load_class import load_torch_layer
 
 # 自动推断参数常量定义
 # 输入维度相关参数
-INPUT_DIM_PARAMS = ["in_features", "input_dim", "feature_dim"]
+INPUT_DIM_PARAMS = ["in_features", "input_dim", "feature_dim", "mask_input_dim"]
 
 # 序列和查询维度相关参数
 SEQUENCE_QUERY_PARAMS = ["sequence_dim", "query_dim"]
