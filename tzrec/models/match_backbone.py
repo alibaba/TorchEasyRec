@@ -16,8 +16,8 @@ from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.layers.backbone import Backbone
 from tzrec.models.match_model import MatchModel
+from tzrec.modules.backbone import Backbone
 from tzrec.protos import simi_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 
@@ -98,7 +98,7 @@ class MatchBackbone(MatchModel):
             embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
-            wide_init_fn=wide_init_fn
+            wide_init_fn=wide_init_fn,
         )
 
     def _get_output_blocks(self) -> Dict[str, str]:

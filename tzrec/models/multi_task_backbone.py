@@ -16,8 +16,8 @@ from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.layers.backbone import Backbone
 from tzrec.models.multi_task_rank import MultiTaskRank
+from tzrec.modules.backbone import Backbone
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2
@@ -99,7 +99,7 @@ class MultiTaskBackbone(MultiTaskRank):
             embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
-            wide_init_fn=wide_init_fn
+            wide_init_fn=wide_init_fn,
         )
 
     def build_task_towers(self):

@@ -16,9 +16,8 @@ from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-# from tzrec.layers.backbone import Backbone
-from tzrec.modules.backbone import Backbone
 from tzrec.models.rank_model import RankModel
+from tzrec.modules.backbone import Backbone
 from tzrec.protos.model_pb2 import ModelConfig
 
 
@@ -59,7 +58,7 @@ class RankBackbone(RankModel):
             embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
-            wide_init_fn=wide_init_fn
+            wide_init_fn=wide_init_fn,
         )
 
     def backbone(

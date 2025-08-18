@@ -18,17 +18,17 @@ import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
 
+from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.mlp import MLP
+from tzrec.protos import backbone_pb2
+from tzrec.utils.backbone_utils import Parameter
+from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.dimension_inference import (
     DimensionInferenceEngine,
     DimensionInfo,
     create_dimension_info_from_embedding,
 )
 from tzrec.utils.lambda_inference import LambdaOutputDimInferrer
-from tzrec.utils.backbone_utils import Parameter
-from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.mlp import MLP
-from tzrec.protos import backbone_pb2
-from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.load_class import load_torch_layer
 
 # 自动推断参数常量定义
@@ -149,7 +149,7 @@ class Package(nn.Module):
         feature_groups,
         wide_embedding_dim=None,
         wide_init_fn=None,
-        input_layer=None
+        input_layer=None,
     ):
         super().__init__()
         # self._base_model_config = config
@@ -1739,9 +1739,7 @@ class Backbone(nn.Module):
             input_layer,
         )  # input_layer目前没有用到
         for pkg in config.packages:
-            Package(
-                pkg, features, embedding_group, input_layer
-            )  # Package是一个子DAG
+            Package(pkg, features, embedding_group, input_layer)  # Package是一个子DAG
 
         # 初始化 top_mlp 目前top_mlp也会改变输出维度，暂未修复
         self._top_mlp = None

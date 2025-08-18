@@ -17,7 +17,7 @@ from typing import Callable, Optional, Union
 import torch
 import torch.nn as nn
 
-from tzrec.layers.dimension_inference import DimensionInfo
+from tzrec.utils.dimension_inference import DimensionInfo
 
 
 class LambdaOutputDimInferrer:
