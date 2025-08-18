@@ -739,6 +739,10 @@ class TDMSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
+        if config.attr_fields[0] != "tree_level":
+            config.attr_fields.insert(0, "tree_level")
+        if config.attr_fields[1] != config.item_id_field:
+            config.attr_fields.insert(1, config.item_id_field)
         super().__init__(
             config,
             fields,
@@ -765,10 +769,6 @@ class TDMSampler(BaseSampler):
             )
         )
         self._item_id_field = config.item_id_field
-        if use_hash_node_id():
-            assert self._item_id_field in self._valid_attr_names, (
-                "item_id_field should in attr_names when USE_HASH_NODE_ID=1."
-            )
         self._max_level = len(config.layer_num_sample)
         self._layer_num_sample = config.layer_num_sample
         assert self._layer_num_sample[0] == 0, "sample num of tree root must be 0"
@@ -950,8 +950,18 @@ class TDMPredictSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
-        fields = [pa.field("tree_level", pa.int64())] + fields
-        super().__init__(config, fields, batch_size, is_training, multival_sep)
+        if config.attr_fields[0] != "tree_level":
+            config.attr_fields.insert(0, "tree_level")
+        if config.attr_fields[1] != config.item_id_field:
+            config.attr_fields.insert(1, config.item_id_field)
+        super().__init__(
+            config,
+            fields,
+            batch_size,
+            is_training,
+            multival_sep,
+            typed_fields=[pa.field("tree_level", pa.int64())],
+        )
         self._g = (
             gl.Graph()
             .node(
