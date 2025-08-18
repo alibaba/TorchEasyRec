@@ -99,8 +99,7 @@ class MultiTaskBackbone(MultiTaskRank):
             embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
-            wide_init_fn=wide_init_fn,
-            l2_reg=self._l2_reg if hasattr(self, "_l2_reg") else None,
+            wide_init_fn=wide_init_fn
         )
 
     def build_task_towers(self):

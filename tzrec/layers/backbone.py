@@ -149,8 +149,7 @@ class Package(nn.Module):
         feature_groups,
         wide_embedding_dim=None,
         wide_init_fn=None,
-        input_layer=None,
-        l2_reg=None,
+        input_layer=None
     ):
         super().__init__()
         # self._base_model_config = config
@@ -161,7 +160,6 @@ class Package(nn.Module):
         self._wide_embedding_dim = wide_embedding_dim
         self._wide_init_fn = wide_init_fn
         self._input_layer = input_layer
-        self._l2_reg = l2_reg
         # build DAG using networkx DiGraph
         self.G = nx.DiGraph()
         self._name_to_blocks = {}
@@ -882,7 +880,7 @@ class Package(nn.Module):
                 sig = inspect.signature(layer_cls.__init__)
                 kwargs = {}
             elif param_type == "st_params":
-                params = Parameter(layer_conf.st_params, True, l2_reg=self._l2_reg)
+                params = Parameter(layer_conf.st_params, True)
                 # 使用标准库 inspect.signature 获取构造函数的签名
                 sig = inspect.signature(layer_cls.__init__)
                 kwargs = config_to_kwargs(params)
@@ -890,7 +888,7 @@ class Package(nn.Module):
             # 动态获取该字段的值，并假定它是一个Protocol Buffer消息is_struct=False）。
             else:
                 pb_params = getattr(layer_conf, param_type)
-                params = Parameter(pb_params, False, l2_reg=self._l2_reg)
+                params = Parameter(pb_params, False)
                 # 使用标准库 inspect.signature 获取构造函数的签名
                 sig = inspect.signature(layer_cls.__init__)
                 kwargs = config_to_kwargs(params)
@@ -1716,11 +1714,9 @@ class Backbone(nn.Module):
         wide_embedding_dim=None,
         wide_init_fn=None,
         input_layer=None,
-        l2_reg=None,
     ):
         super().__init__()
         self._config = config
-        self._l2_reg = l2_reg
         main_pkg = backbone_pb2.BlockPackage()
         main_pkg.name = "backbone"
         main_pkg.blocks.MergeFrom(config.blocks)
@@ -1741,18 +1737,16 @@ class Backbone(nn.Module):
             wide_embedding_dim,
             wide_init_fn,
             input_layer,
-            l2_reg,
         )  # input_layer目前没有用到
         for pkg in config.packages:
             Package(
-                pkg, features, embedding_group, input_layer, l2_reg
+                pkg, features, embedding_group, input_layer
             )  # Package是一个子DAG
 
         # 初始化 top_mlp 目前top_mlp也会改变输出维度，暂未修复
         self._top_mlp = None
         if self._config.HasField("top_mlp"):
             params = Parameter.make_from_pb(self._config.top_mlp)
-            params.l2_regularizer = self._l2_reg
 
             # 从main_pkg获取总输出维度
             total_output_dim = self._main_pkg.total_output_dim()

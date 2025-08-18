@@ -36,7 +36,6 @@ class RankBackbone(RankModel):
         # self.init_input()
         self._feature_dict = features
         self._backbone_output = None
-        self._l2_reg = None
         self._backbone_net = self.build_backbone_network()
 
         # 使用backbone的最终输出维度，考虑top_mlp的影响
@@ -59,9 +58,7 @@ class RankBackbone(RankModel):
             embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
-            wide_init_fn=wide_init_fn,
-            # input_layer=self._input_layer,
-            l2_reg=self._l2_reg,
+            wide_init_fn=wide_init_fn
         )
 
     def backbone(
