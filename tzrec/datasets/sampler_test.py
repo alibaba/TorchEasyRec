@@ -531,8 +531,8 @@ class SamplerTest(unittest.TestCase):
         self.assertGreater(len(res["float_b"]), 8)
         self.assertGreater(len(res["str_c"]), 8)
 
-    @parameterized.expand([["int64"], ["string"]])
-    def test_tdm_sampler(self, id_type):
+    @parameterized.expand([["int64", True], ["string", True], ["string", False]])
+    def test_tdm_sampler(self, id_type, cfg_additional_attrs=True):
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         f_item = self._create_item_gl_data_for_tdm(id_type)
@@ -544,7 +544,9 @@ class SamplerTest(unittest.TestCase):
                 item_input_path=f_item.name,
                 edge_input_path=f_edge.name,
                 predict_edge_input_path=f_predict_edge.name,
-                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"],
+                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"]
+                if cfg_additional_attrs
+                else ["int_a", "float_b", "str_c"],
                 item_id_field="item_id",
                 layer_num_sample=[0, 1, 2, 3, 4, 5],
             )
@@ -604,8 +606,8 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(neg_res["float_b"]), 4 * 15)
         self.assertEqual(len(neg_res["str_c"]), 4 * 15)
 
-    @parameterized.expand([["int64"], ["string"]])
-    def test_tdm_predict_sampler(self, id_type):
+    @parameterized.expand([["int64", True], ["string", True], ["string", False]])
+    def test_tdm_predict_sampler(self, id_type, cfg_additional_attrs=True):
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         f_item = self._create_item_gl_data_for_tdm(id_type)
@@ -617,7 +619,9 @@ class SamplerTest(unittest.TestCase):
                 item_input_path=f_item.name,
                 edge_input_path=f_edge.name,
                 predict_edge_input_path=f_predict_edge.name,
-                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"],
+                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"]
+                if cfg_additional_attrs
+                else ["int_a", "float_b", "str_c"],
                 item_id_field="item_id",
                 layer_num_sample=[0, 1, 2, 3, 4, 5],
             )

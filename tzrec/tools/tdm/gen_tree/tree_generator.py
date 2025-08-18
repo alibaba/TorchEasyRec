@@ -48,6 +48,9 @@ class TreeGenerator:
         self.raw_attr_fields = []
         if attr_fields:
             self.attr_fields = [x.strip() for x in attr_fields.split(",")]
+            assert item_id_field not in self.attr_fields, (
+                "item_id_field do not need in attr_fields."
+            )
         if raw_attr_fields:
             self.raw_attr_fields = [x.strip() for x in raw_attr_fields.split(",")]
         self.tree_output_dir = tree_output_dir
