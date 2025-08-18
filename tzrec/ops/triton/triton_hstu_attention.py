@@ -39,9 +39,6 @@ except ImportError:
         from triton.language.math import fast_dividef  # @manual=//triton:triton
 
 
-torch.fx.wrap(prev_power_of_2)
-
-
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     configs = []
     if torch.version.hip:
