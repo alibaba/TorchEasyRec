@@ -14,31 +14,24 @@ import unittest
 import numpy as np
 import torch
 
-from tzrec.metrics.xauc import XAUC
+from tzrec.metrics.grouped_xauc import GroupedXAUC
 
 
-class XAUCTest(unittest.TestCase):
-    def test_xauc_1(self):
-        metric = XAUC(sample_ratio=1.0, in_batch=True)
-        preds = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
-        target = torch.tensor([0.2, 0.3, 0.5, 0.4, 0.3, 0.2, 0.8, 0.9])
-        metric.update(preds, target)
-        value = metric.compute()
-        torch.testing.assert_close(value, torch.tensor(0.6786), rtol=1e-4, atol=1e-4)
-
-    def test_xauc_2(self):
+class GroupedXAUCTest(unittest.TestCase):
+    def test_grouped_xauc(self):
         res = []
 
         for _ in range(300):
-            metric = XAUC(sample_ratio=1.0)
+            metric = GroupedXAUC(max_pairs_per_group=2)
             preds = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
             target = torch.tensor([0.2, 0.3, 0.5, 0.4, 0.3, 0.2, 0.8, 0.9])
-            metric.update(preds, target)
+            group_id = torch.tensor([1, 2, 2, 1, 3, 3, 4, 4])
+            metric.update(preds, target, group_id)
             value = metric.compute()
             res.append(value)
         mean_value = np.mean(res)
 
-        torch.testing.assert_close(mean_value, 0.6786, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(mean_value, 0.75, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
