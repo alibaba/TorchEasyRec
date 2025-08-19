@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
 from tzrec.ops.utils import (
@@ -26,8 +27,6 @@ from tzrec.ops.utils import (
     prev_power_of_2,
     switch_to_contiguous_if_needed,
 )
-
-torch.fx.wrap(prev_power_of_2)
 
 
 def _add_position_embeddings_configs() -> List[triton.Config]:
@@ -179,6 +178,44 @@ def _add_position_embeddings_bwd_kernel(
     )
 
 
+@triton_op("tzrec::triton_add_position_embeddings_fwd", mutates_args=())
+def triton_add_position_embeddings_fwd(
+    jagged: torch.Tensor,
+    jagged_offsets: torch.Tensor,
+    high_inds: torch.Tensor,
+    max_seq_len: int,
+    dense: torch.Tensor,
+    scale: float = 1.0,
+) -> Tuple[torch.Tensor, int, int, int]:
+    jagged = switch_to_contiguous_if_needed(jagged)
+    dense = switch_to_contiguous_if_needed(dense)
+    L, D = jagged.shape
+    assert len(dense.shape) == 2
+    out = torch.empty_like(jagged)
+    B = high_inds.size(0)
+    grid = lambda meta: (  # noqa E731
+        B,
+        triton.cdiv(max_seq_len, meta["BLOCK_N"]),
+    )
+    BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
+    wrap_triton(_add_position_embeddings_kernel)[grid](
+        Jagged=jagged,
+        seq_offsets=jagged_offsets,
+        high_inds=high_inds,
+        Dense=dense,
+        Out=out,
+        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
+        D=D,
+        scale=scale,
+        stride_jn=jagged.stride(0),
+        stride_dk=dense.stride(0),
+        stride_on=out.stride(0),
+        SCALE_JAGGED=scale != 1.0,
+        BLOCK_D=BLOCK_D,
+    )
+    return out, B, D, BLOCK_D
+
+
 class _AddPositionEmbeddingsFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -191,31 +228,13 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
         dense: torch.Tensor,
         scale: float = 1.0,
     ):
-        jagged = switch_to_contiguous_if_needed(jagged)
-        dense = switch_to_contiguous_if_needed(dense)
-        L, D = jagged.shape
-        assert len(dense.shape) == 2
-        out = torch.empty_like(jagged)
-        B = high_inds.size(0)
-        grid = lambda meta: (  # noqa E731
-            B,
-            triton.cdiv(max_seq_len, meta["BLOCK_N"]),
-        )
-        BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
-        _add_position_embeddings_kernel[grid](
-            Jagged=jagged,
-            seq_offsets=jagged_offsets,
+        out, B, D, BLOCK_D = triton_add_position_embeddings_fwd(
+            jagged=jagged,
+            jagged_offsets=jagged_offsets,
             high_inds=high_inds,
-            Dense=dense,
-            Out=out,
-            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
-            D=D,
+            max_seq_len=max_seq_len,
+            dense=dense,
             scale=scale,
-            stride_jn=jagged.stride(0),
-            stride_dk=dense.stride(0),
-            stride_on=out.stride(0),
-            SCALE_JAGGED=scale != 1.0,
-            BLOCK_D=BLOCK_D,
         )
         ctx.save_for_backward(jagged_offsets, high_inds)
         ctx.B = B
@@ -435,6 +454,91 @@ def _add_embeddings_bwd_kernel(
         )
 
 
+@triton_op("tzrec::triton_add_timestamp_positional_embeddings_fwd", mutates_args=())
+def triton_add_timestamp_positional_embeddings_fwd(
+    seq_embeddings: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    pos_embeddings: torch.Tensor,
+    ts_embeddings: torch.Tensor,
+    timestamps: torch.Tensor,
+    max_seq_len: int,
+    max_contextual_seq_len: int,
+    seq_lengths: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    interleave_targets: bool,
+    time_bucket_fn: str,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int
+]:
+    seq_embeddings = switch_to_contiguous_if_needed(seq_embeddings)
+    pos_embeddings = switch_to_contiguous_if_needed(pos_embeddings)
+    ts_embeddings = switch_to_contiguous_if_needed(ts_embeddings)
+
+    max_pos_ind = pos_embeddings.shape[0]
+    B = seq_lengths.shape[0]
+    N, D = seq_embeddings.shape
+    assert len(pos_embeddings.shape) == 2
+    assert len(ts_embeddings.shape) == 2
+    assert pos_embeddings.shape[1] == D, (
+        "shape[1] of pos_embeddings much match seq_embeddings"
+    )
+    assert ts_embeddings.shape[1] == D, (
+        "shape[1] of ts_embeddings much match seq_embeddings"
+    )
+    out = torch.empty_like(seq_embeddings)
+
+    timestamps = switch_to_contiguous_if_needed(timestamps)
+    ts_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
+    pos_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
+    ts_emb_size = ts_embeddings.shape[0]
+
+    grid = lambda meta: (  # noqa E731
+        B,
+        triton.cdiv(max_seq_len, meta["BLOCK_N"]),
+    )
+    BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
+    wrap_triton(_add_timestamp_position_embeddings_kernel)[grid](
+        SeqEmb=seq_embeddings,
+        Offsets=seq_offsets,
+        Lengths=seq_lengths,
+        PosEmb=pos_embeddings,
+        TsEmb=ts_embeddings,
+        Out=out,
+        TS=timestamps,
+        PosInds=pos_inds,
+        TsInds=ts_inds,
+        NumTargets=num_targets,
+        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
+        D=D,
+        num_time_buckets=ts_emb_size - 1,
+        time_bucket_increments=60.0,
+        time_bucket_scale=1.0,
+        time_delta=0,
+        max_contextual_seq_len=max_contextual_seq_len,
+        max_pos_ind=max_pos_ind,
+        stride_sn=seq_embeddings.stride(0),
+        stride_pn=pos_embeddings.stride(0),
+        stride_tn=ts_embeddings.stride(0),
+        stride_on=out.stride(0),
+        TRAINING=True,
+        HAS_MULTIPLE_TARGETS=num_targets is not None,
+        INTERLEAVE_TARGETS=interleave_targets,
+        TIME_BUCKET_FN=time_bucket_fn,
+        BLOCK_D=BLOCK_D,
+    )
+    sorted_ts_key_inds, sorted_ts_value_inds = torch.sort(ts_inds)
+    sorted_pos_key_inds, sorted_pos_value_inds = torch.sort(pos_inds)
+    return (
+        out,
+        sorted_pos_key_inds,
+        sorted_pos_value_inds,
+        sorted_ts_key_inds,
+        sorted_ts_value_inds,
+        B,
+        D,
+    )
+
+
 class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -452,64 +556,27 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         interleave_targets: bool,
         time_bucket_fn: str,
     ):
-        seq_embeddings = switch_to_contiguous_if_needed(seq_embeddings)
-        pos_embeddings = switch_to_contiguous_if_needed(pos_embeddings)
-        ts_embeddings = switch_to_contiguous_if_needed(ts_embeddings)
-
-        max_pos_ind = pos_embeddings.shape[0]
-        B = seq_lengths.shape[0]
-        N, D = seq_embeddings.shape
-        assert len(pos_embeddings.shape) == 2
-        assert len(ts_embeddings.shape) == 2
-        assert pos_embeddings.shape[1] == D, (
-            "shape[1] of pos_embeddings much match seq_embeddings"
-        )
-        assert ts_embeddings.shape[1] == D, (
-            "shape[1] of ts_embeddings much match seq_embeddings"
-        )
-        out = torch.empty_like(seq_embeddings)
-
-        timestamps = switch_to_contiguous_if_needed(timestamps)
-        ts_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
-        pos_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
-        ts_emb_size = ts_embeddings.shape[0]
-
-        grid = lambda meta: (  # noqa E731
+        (
+            out,
+            sorted_pos_key_inds,
+            sorted_pos_value_inds,
+            sorted_ts_key_inds,
+            sorted_ts_value_inds,
             B,
-            triton.cdiv(max_seq_len, meta["BLOCK_N"]),
-        )
-        BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
-        _add_timestamp_position_embeddings_kernel[grid](
-            SeqEmb=seq_embeddings,
-            Offsets=seq_offsets,
-            Lengths=seq_lengths,
-            PosEmb=pos_embeddings,
-            TsEmb=ts_embeddings,
-            Out=out,
-            TS=timestamps,
-            PosInds=pos_inds,
-            TsInds=ts_inds,
-            NumTargets=num_targets,
-            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
-            D=D,
-            num_time_buckets=ts_emb_size - 1,
-            time_bucket_increments=60.0,
-            time_bucket_scale=1.0,
-            time_delta=0,
+            D,
+        ) = triton_add_timestamp_positional_embeddings_fwd(
+            seq_embeddings=seq_embeddings,
+            seq_offsets=seq_offsets,
+            pos_embeddings=pos_embeddings,
+            ts_embeddings=ts_embeddings,
+            timestamps=timestamps,
+            max_seq_len=max_seq_len,
             max_contextual_seq_len=max_contextual_seq_len,
-            max_pos_ind=max_pos_ind,
-            stride_sn=seq_embeddings.stride(0),
-            stride_pn=pos_embeddings.stride(0),
-            stride_tn=ts_embeddings.stride(0),
-            stride_on=out.stride(0),
-            TRAINING=True,
-            HAS_MULTIPLE_TARGETS=num_targets is not None,
-            INTERLEAVE_TARGETS=interleave_targets,
-            TIME_BUCKET_FN=time_bucket_fn,
-            BLOCK_D=BLOCK_D,
+            seq_lengths=seq_lengths,
+            num_targets=num_targets,
+            interleave_targets=interleave_targets,
+            time_bucket_fn=time_bucket_fn,
         )
-        sorted_ts_key_inds, sorted_ts_value_inds = torch.sort(ts_inds)
-        sorted_pos_key_inds, sorted_pos_value_inds = torch.sort(pos_inds)
         ctx.save_for_backward(
             sorted_pos_key_inds,
             sorted_pos_value_inds,
