@@ -827,19 +827,71 @@ class Package(nn.Module):
                     # 记录最后一个子层的输出维度
                     last_output_dim = output_dim
 
-            # 设置父层(repeat层)的输出维度为最后一个子层的输出维度
+            # 计算父层(repeat层)的输出维度，考虑output_concat_axis配置
             if last_output_dim_info is not None:
-                self.dim_engine.register_output_dim(name, last_output_dim_info)
-                self._name_to_output_dim[name] = last_output_dim
+                final_output_dim_info = last_output_dim_info
+                final_output_dim = last_output_dim
+                
+                # 检查是否配置了output_concat_axis，如果有则需要调整维度
+                if hasattr(layer_cnf.repeat, 'output_concat_axis') and layer_cnf.repeat.output_concat_axis is not None:
+                    axis = layer_cnf.repeat.output_concat_axis
+                    num_repeat = layer_cnf.repeat.num_repeat
+                    
+                    # 如果在最后一维拼接（axis=-1），需要将该维度乘以repeat次数
+                    if axis == -1:
+                        # 单个子层的输出维度乘以repeat次数
+                        final_output_dim = last_output_dim * num_repeat
+                        final_output_dim_info = DimensionInfo(final_output_dim)
+                        logging.info(
+                            f"Repeat layer {name} with output_concat_axis={axis}: "
+                            f"single_output_dim={last_output_dim} * num_repeat={num_repeat} = {final_output_dim}"
+                        )
+                    else:
+                        # 对于其他轴的拼接，当前先保持不变，可能需要更复杂的维度推断逻辑
+                        logging.warning(
+                            f"Repeat layer {name} with output_concat_axis={axis}: "
+                            f"non-last axis concatenation not fully supported, using single layer output dim={last_output_dim}"
+                        )
+                else:
+                    logging.info(
+                        f"Repeat layer {name} without output_concat_axis: using last layer output dim={last_output_dim}"
+                    )
+                
+                self.dim_engine.register_output_dim(name, final_output_dim_info)
+                self._name_to_output_dim[name] = final_output_dim
                 logging.info(
-                    f"Repeat layer {name} output dim set to {last_output_dim} (from last child layer)"  # NOQA
+                    f"Repeat layer {name} final output dim set to {final_output_dim}"
                 )
             elif last_output_dim is not None:
-                output_dim_info = DimensionInfo(last_output_dim)
+                final_output_dim = last_output_dim
+                
+                # 检查是否配置了output_concat_axis，如果有则需要调整维度
+                if hasattr(layer_cnf.repeat, 'output_concat_axis') and layer_cnf.repeat.output_concat_axis is not None:
+                    axis = layer_cnf.repeat.output_concat_axis
+                    num_repeat = layer_cnf.repeat.num_repeat
+                    
+                    # 如果在最后一维拼接（axis=-1），需要将该维度乘以repeat次数
+                    if axis == -1:
+                        final_output_dim = last_output_dim * num_repeat
+                        logging.info(
+                            f"Repeat layer {name} (fallback) with output_concat_axis={axis}: "
+                            f"single_output_dim={last_output_dim} * num_repeat={num_repeat} = {final_output_dim}"
+                        )
+                    else:
+                        logging.warning(
+                            f"Repeat layer {name} (fallback) with output_concat_axis={axis}: "
+                            f"non-last axis concatenation not fully supported, using single layer output dim={last_output_dim}"
+                        )
+                else:
+                    logging.info(
+                        f"Repeat layer {name} (fallback) without output_concat_axis: using last layer output dim={last_output_dim}"
+                    )
+                
+                output_dim_info = DimensionInfo(final_output_dim)
                 self.dim_engine.register_output_dim(name, output_dim_info)
-                self._name_to_output_dim[name] = last_output_dim
+                self._name_to_output_dim[name] = final_output_dim
                 logging.info(
-                    f"Repeat layer {name} output dim set to {last_output_dim} (fallback from last child layer)"  # NOQA
+                    f"Repeat layer {name} (fallback) final output dim set to {final_output_dim}"
                 )
         elif layer == "lambda":
             expression = getattr(layer_cnf, "lambda").expression
@@ -904,13 +956,70 @@ class Package(nn.Module):
                     # 从维度推断引擎获取输入维度
                     input_dim_info = self.dim_engine.block_input_dims.get(name)
                     if input_dim_info is not None:
-                        feature_dim = input_dim_info.get_feature_dim()
-                        # 使用第一个在签名中找到的参数名
-                        param_name = input_dim_params_in_sig[0]
-                        kwargs[param_name] = feature_dim
-                        logging.info(
-                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"  # NOQA
-                        )
+                        # 特殊处理：对于接收多个独立张量的模块，检查是否需要避免sum
+                        should_use_single_dim = False
+                        
+                        # # 检查方法1：模块是否有多个不同含义的维度参数
+                        # if len(input_dim_params_in_sig) > 1:
+                        #     # 如果有多个维度参数且输入是列表，可能需要分别设置
+                        #     param_names = set(input_dim_params_in_sig)
+                        #     # 检查是否有"input_dim"和"mask_input_dim"这样的组合
+                        #     if ('input_dim' in param_names and 'mask_input_dim' in param_names) or \
+                        #        ('feature_dim' in param_names and 'mask_input_dim' in param_names):
+                        #         should_use_single_dim = True
+                        #         logging.info(f"Detected multi-tensor input module {layer_cls.__name__} with separate dimension parameters")
+                        
+                        # 检查方法2：forward方法是否接收多个张量参数
+                        if hasattr(layer_cls, 'forward'):
+                            try:
+                                forward_sig = inspect.signature(layer_cls.forward)
+                                forward_params = [p for p in forward_sig.parameters.keys() if p != 'self']
+                                # 如果forward方法有2个或更多非self参数，可能是多张量输入
+                                if len(forward_params) >= 2:
+                                    should_use_single_dim = True
+                                    logging.info(f"Detected multi-tensor input module {layer_cls.__name__} with {len(forward_params)} forward parameters")
+                            except Exception:
+                                pass
+                        
+                        if (should_use_single_dim and input_dim_info.is_list and 
+                            isinstance(input_dim_info.dim, (list, tuple))):
+                            # 对于多张量输入模块，使用第一个输入的维度，而不是sum
+                            single_feature_dim = input_dim_info.dim[0]
+                            for param_name in input_dim_params_in_sig:
+                                kwargs[param_name] = single_feature_dim
+                                logging.info(
+                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={single_feature_dim} from first input dim (avoiding sum for multi-tensor input)"
+                                )
+                        else:
+                            # 对于其他模块，使用总维度
+                            feature_dim = input_dim_info.get_feature_dim()
+                            for param_name in input_dim_params_in_sig:
+                                kwargs[param_name] = feature_dim
+                                logging.info(
+                                f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"  # NOQA
+                                )
+                        #                             # 特殊处理MaskBlock等需要多个不同维度参数的模块
+                        # if layer_cls.__name__ == 'MaskBlock' and input_dim_info.is_list:
+                        #     # 对于MaskBlock，如果输入是列表格式，通常第一个元素是feature_input，第二个是mask_input
+                        #     dims_list = input_dim_info.to_list()
+                        #     if len(dims_list) >= 2:
+                        #         # 假设两个输入的维度相同（都是原始特征维度）
+                        #         single_dim = dims_list[0]  # 使用第一个输入的维度
+                        #         for param_name in input_dim_params_in_sig:
+                        #             kwargs[param_name] = single_dim
+                        #             logging.info(
+                        #                 f"Layer {name} (MaskBlock) auto-inferred {param_name}={single_dim} from first input dim"
+                        #             )
+                        #     else:
+                        #         # 如果只有一个输入，使用该维度
+                        #         single_dim = dims_list[0]
+                        #         for param_name in input_dim_params_in_sig:
+                        #             kwargs[param_name] = single_dim
+                        #             logging.info(
+                        #                 f"Layer {name} (MaskBlock) auto-inferred {param_name}={single_dim} from single input dim"
+                        #             )
+                        # else:
+                        #     # 对于其他模块，使用总维度
                     elif input_dim is not None:
                         # fallback到传入的input_dim参数
                         feature_dim = (
@@ -1685,20 +1794,43 @@ class Package(nn.Module):
             **kwargs: Additional keyword arguments passed to sub-layers.
 
         Returns:
-            Output from the last repetition of the repeat layer.
+            Output based on configuration: single tensor, concatenated tensor, or list of tensors.
         """
         repeat_config = config.repeat
-        output = inputs
+        n_loop = repeat_config.num_repeat
+        outputs = []
 
         # 逐步执行repeat
-        for i in range(repeat_config.num_repeat):
+        for i in range(n_loop):
             name_i = f"{name}_{i}"
+            ly_inputs = inputs
+
+            # 处理input_slice配置
+            if hasattr(repeat_config, 'input_slice') and repeat_config.input_slice:
+                fn = eval('lambda x, i: x' + repeat_config.input_slice.strip())
+                ly_inputs = fn(ly_inputs, i)
+
+            # 处理input_fn配置
+            if hasattr(repeat_config, 'input_fn') and repeat_config.input_fn:
+                fn = eval(repeat_config.input_fn)
+                ly_inputs = fn(ly_inputs, i)
+
+            # 调用子层
             if name_i in self._name_to_layer:
-                output = self.call_torch_layer(output, name_i, **kwargs)
+                output = self.call_torch_layer(ly_inputs, name_i, **kwargs)
+                outputs.append(output)
             else:
                 logging.warning(f"Repeat sub-layer {name_i} not found, skipping")
 
-        return output
+        # 根据配置决定输出格式
+        if len(outputs) == 1:
+            return outputs[0]
+
+        if hasattr(repeat_config, 'output_concat_axis') and repeat_config.output_concat_axis is not None:
+            axis = repeat_config.output_concat_axis
+            return torch.cat(outputs, dim=axis)
+        
+        return outputs
 
 
 class Backbone(nn.Module):
