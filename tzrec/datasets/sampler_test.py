@@ -44,10 +44,10 @@ class SamplerTest(unittest.TestCase):
         for f in self._temp_files:
             f.close()
 
-    def _create_item_gl_data(self):
+    def _create_item_gl_data(self, id_type="int64"):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("id:int64\tweight:float\tattrs:string\n")
+        f.write(f"id:{id_type}\tweight:float\tattrs:string\n")
         for i in range(100):
             f.write(f"{i}\t{1}\t{i}:{i + 1000}:我们{i}\n")
         f.flush()
@@ -62,35 +62,34 @@ class SamplerTest(unittest.TestCase):
         f.flush()
         return f
 
-    def _create_user_gl_data(self):
+    def _create_user_gl_data(self, id_type="int64"):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("id:int64\tweight:float\n")
+        f.write(f"id:{id_type}\tweight:float\n")
         for i in range(100):
             f.write(f"{i}\t{1}\n")
         f.flush()
         return f
 
-    def _create_clk_edge_gl_data(self):
+    def _create_clk_edge_gl_data(self, id_type="int64"):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("userid:int64\titemid:int64\tweight:float\n")
+        f.write(f"userid:{id_type}\titemid:{id_type}\tweight:float\n")
         for i in range(100):
             f.write(f"{i}\t{i}\t{1}\n")
         f.flush()
         return f
 
-    def _create_noclk_edge_gl_data(self):
+    def _create_noclk_edge_gl_data(self, id_type="int64"):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
-        f.write("userid:int64\titemid:int64\tweight:float\n")
+        f.write(f"userid:{id_type}\titemid:{id_type}\tweight:float\n")
         for i in range(100):
             f.write(f"{i}\t{99 - i}\t{1}\n")
         f.flush()
         return f
 
-    def _create_item_gl_data_for_tdm(self, id_type="bigint"):
-        id_type = "int64" if id_type == "bigint" else "string"
+    def _create_item_gl_data_for_tdm(self, id_type="int64"):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
         f.write(f"id:{id_type}\tweight:float\tattrs:string\n")
@@ -105,9 +104,7 @@ class SamplerTest(unittest.TestCase):
         f.flush()
         return f
 
-    def _create_edge_gl_data_for_tdm(self, id_type="bigint"):
-        id_type = "int64" if id_type == "bigint" else "string"
-
+    def _create_edge_gl_data_for_tdm(self, id_type="int64"):
         def _ancestor(code):
             ancs = []
             while True:
@@ -127,9 +124,7 @@ class SamplerTest(unittest.TestCase):
         f.flush()
         return f
 
-    def _create_predict_edge_gl_data_for_tdm(self, id_type="bigint"):
-        id_type = "int64" if id_type == "bigint" else "string"
-
+    def _create_predict_edge_gl_data_for_tdm(self, id_type="int64"):
         def _childern(code):
             return [2 * code + 1, 2 * code + 2]
 
@@ -164,8 +159,11 @@ class SamplerTest(unittest.TestCase):
             ),
         )
 
-    def test_negative_sampler(self):
-        f = self._create_item_gl_data()
+    @parameterized.expand([["int64"], ["string"]])
+    def test_negative_sampler(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
+        f = self._create_item_gl_data(id_type)
 
         def _sampler_worker(res):
             config = sampler_pb2.NegativeSampler(
@@ -187,7 +185,15 @@ class SamplerTest(unittest.TestCase):
             sampler.init_cluster()
             sampler.launch_server()
             sampler.init()
-            res.update(sampler.get({"item_id": pa.array([0, 1, 2, 3])}))
+            res.update(
+                sampler.get(
+                    {
+                        "item_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string())
+                    }
+                )
+            )
 
         res = mp.Manager().dict()
         p = mp.Process(target=_sampler_worker, args=(res,))
@@ -356,10 +362,13 @@ class SamplerTest(unittest.TestCase):
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed.")
 
-    def test_negative_sampler_v2(self):
-        f_user = self._create_user_gl_data()
-        f_item = self._create_item_gl_data()
-        f_clk_edge = self._create_clk_edge_gl_data()
+    @parameterized.expand([["int64"], ["string"]])
+    def test_negative_sampler_v2(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
+        f_user = self._create_user_gl_data(id_type)
+        f_item = self._create_item_gl_data(id_type)
+        f_clk_edge = self._create_clk_edge_gl_data(id_type)
 
         def _sampler_worker(res):
             config = sampler_pb2.NegativeSamplerV2(
@@ -387,8 +396,12 @@ class SamplerTest(unittest.TestCase):
             res.update(
                 sampler.get(
                     {
-                        "user_id": pa.array([0, 1, 2, 3]),
-                        "item_id": pa.array([0, 1, 2, 3]),
+                        "user_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string()),
+                        "item_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string()),
                     }
                 )
             )
@@ -403,10 +416,13 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(res["float_b"]), 8)
         self.assertEqual(len(res["str_c"]), 8)
 
-    def test_hard_negative_sampler(self):
-        f_user = self._create_user_gl_data()
-        f_item = self._create_item_gl_data()
-        f_noclk_edge = self._create_noclk_edge_gl_data()
+    @parameterized.expand([["int64"], ["string"]])
+    def test_hard_negative_sampler(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
+        f_user = self._create_user_gl_data(id_type)
+        f_item = self._create_item_gl_data(id_type)
+        f_noclk_edge = self._create_noclk_edge_gl_data(id_type)
 
         def _sampler_worker(res):
             config = sampler_pb2.HardNegativeSampler(
@@ -422,7 +438,10 @@ class SamplerTest(unittest.TestCase):
             sampler = HardNegativeSampler(
                 config=config,
                 fields=[
-                    pa.field(name="int_a", type=pa.int64()),
+                    pa.field(
+                        name="int_a",
+                        type=pa.int64() if id_type == "int64" else pa.string(),
+                    ),
                     pa.field(name="float_b", type=pa.float64()),
                     pa.field(name="str_c", type=pa.string()),
                 ],
@@ -435,8 +454,12 @@ class SamplerTest(unittest.TestCase):
             res.update(
                 sampler.get(
                     {
-                        "user_id": pa.array([0, 1, 2, 3]),
-                        "item_id": pa.array([0, 1, 2, 3]),
+                        "user_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string()),
+                        "item_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string()),
                     }
                 )
             )
@@ -451,11 +474,14 @@ class SamplerTest(unittest.TestCase):
         self.assertGreater(len(res["float_b"]), 8)
         self.assertGreater(len(res["str_c"]), 8)
 
-    def test_hard_negative_sampler_v2(self):
-        f_user = self._create_user_gl_data()
-        f_item = self._create_item_gl_data()
-        f_clk_edge = self._create_clk_edge_gl_data()
-        f_noclk_edge = self._create_noclk_edge_gl_data()
+    @parameterized.expand([["int64"], ["string"]])
+    def test_hard_negative_sampler_v2(self, id_type):
+        if id_type == "string":
+            os.environ["USE_HASH_NODE_ID"] = "1"
+        f_user = self._create_user_gl_data(id_type)
+        f_item = self._create_item_gl_data(id_type)
+        f_clk_edge = self._create_clk_edge_gl_data(id_type)
+        f_noclk_edge = self._create_noclk_edge_gl_data(id_type)
 
         def _sampler_worker(res):
             config = sampler_pb2.HardNegativeSamplerV2(
@@ -485,8 +511,12 @@ class SamplerTest(unittest.TestCase):
             res.update(
                 sampler.get(
                     {
-                        "user_id": pa.array([0, 1, 2, 3]),
-                        "item_id": pa.array([0, 1, 2, 3]),
+                        "user_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string()),
+                        "item_id": pa.array([0, 1, 2, 3])
+                        if id_type == "int64"
+                        else pa.array(["0", "1", "2", "3"], type=pa.string()),
                     }
                 )
             )
@@ -501,8 +531,8 @@ class SamplerTest(unittest.TestCase):
         self.assertGreater(len(res["float_b"]), 8)
         self.assertGreater(len(res["str_c"]), 8)
 
-    @parameterized.expand([["bigint"], ["string"]])
-    def test_tdm_sampler(self, id_type):
+    @parameterized.expand([["int64", True], ["string", True], ["string", False]])
+    def test_tdm_sampler(self, id_type, cfg_additional_attrs=True):
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         f_item = self._create_item_gl_data_for_tdm(id_type)
@@ -514,7 +544,9 @@ class SamplerTest(unittest.TestCase):
                 item_input_path=f_item.name,
                 edge_input_path=f_edge.name,
                 predict_edge_input_path=f_predict_edge.name,
-                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"],
+                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"]
+                if cfg_additional_attrs
+                else ["int_a", "float_b", "str_c"],
                 item_id_field="item_id",
                 layer_num_sample=[0, 1, 2, 3, 4, 5],
             )
@@ -523,7 +555,7 @@ class SamplerTest(unittest.TestCase):
                 fields=[
                     pa.field(
                         name="item_id",
-                        type=pa.int64() if id_type == "bigint" else pa.string(),
+                        type=pa.int64() if id_type == "int64" else pa.string(),
                     ),
                     pa.field(name="int_a", type=pa.int64()),
                     pa.field(name="float_b", type=pa.float64()),
@@ -539,7 +571,7 @@ class SamplerTest(unittest.TestCase):
                 sampler.get(
                     {
                         "item_id": pa.array([31, 41, 51, 61])
-                        if id_type == "bigint"
+                        if id_type == "int64"
                         else pa.array(["31", "41", "51", "61"], type=pa.string()),
                     }
                 )[0]
@@ -548,7 +580,7 @@ class SamplerTest(unittest.TestCase):
                 sampler.get(
                     {
                         "item_id": pa.array([31, 41, 51, 61])
-                        if id_type == "bigint"
+                        if id_type == "int64"
                         else pa.array(["31", "41", "51", "61"], type=pa.string()),
                     }
                 )[1]
@@ -574,8 +606,8 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(neg_res["float_b"]), 4 * 15)
         self.assertEqual(len(neg_res["str_c"]), 4 * 15)
 
-    @parameterized.expand([["bigint"], ["string"]])
-    def test_tdm_predict_sampler(self, id_type):
+    @parameterized.expand([["int64", True], ["string", True], ["string", False]])
+    def test_tdm_predict_sampler(self, id_type, cfg_additional_attrs=True):
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         f_item = self._create_item_gl_data_for_tdm(id_type)
@@ -587,7 +619,9 @@ class SamplerTest(unittest.TestCase):
                 item_input_path=f_item.name,
                 edge_input_path=f_edge.name,
                 predict_edge_input_path=f_predict_edge.name,
-                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"],
+                attr_fields=["tree_level", "item_id", "int_a", "float_b", "str_c"]
+                if cfg_additional_attrs
+                else ["int_a", "float_b", "str_c"],
                 item_id_field="item_id",
                 layer_num_sample=[0, 1, 2, 3, 4, 5],
             )
@@ -596,7 +630,7 @@ class SamplerTest(unittest.TestCase):
                 fields=[
                     pa.field(
                         name="item_id",
-                        type=pa.int64() if id_type == "bigint" else pa.string(),
+                        type=pa.int64() if id_type == "int64" else pa.string(),
                     ),
                     pa.field(name="int_a", type=pa.int64()),
                     pa.field(name="float_b", type=pa.float64()),
@@ -613,7 +647,7 @@ class SamplerTest(unittest.TestCase):
                 sampler.get(
                     {
                         "item_id": pa.array([21, 22, 23, 24])
-                        if id_type == "bigint"
+                        if id_type == "int64"
                         else pa.array(
                             ["nonleaf#21", "nonleaf#22", "nonleaf#23", "nonleaf#24"],
                             type=pa.string(),

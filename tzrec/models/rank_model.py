@@ -85,7 +85,9 @@ class RankModel(BaseModel):
             wide_embedding_dim=int(self.wide_embedding_dim)
             if hasattr(self, "wide_embedding_dim")
             else None,
-            wide_init_fn=self.wide_init_fn if hasattr(self, "wide_init_fn") else None,
+            wide_init_fn=str(self.wide_init_fn)
+            if hasattr(self, "wide_init_fn")
+            else None,
         )
 
         if self._base_model_config.HasField("variational_dropout"):

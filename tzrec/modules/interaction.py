@@ -149,7 +149,7 @@ class CrossV2(nn.Module):
         low_rank (int): W dimension
     """
 
-    def __init__(self, input_dim: int, cross_num: int = 3, low_rank: int = 32):
+    def __init__(self, input_dim: int, cross_num: int = 3, low_rank: int = 32) -> None:
         super(CrossV2, self).__init__()
         self.cross_num = cross_num
         self._low_rank = low_rank
@@ -196,7 +196,7 @@ class CIN(nn.Module):
         cin_layer_size(list[int]): cin_layer_size
     """
 
-    def __init__(self, feature_num: int, cin_layer_size: List[int]):
+    def __init__(self, feature_num: int, cin_layer_size: List[int]) -> None:
         super(CIN, self).__init__()
         self.feature_num = feature_num
         self.cin_layer_size = cin_layer_size
