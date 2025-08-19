@@ -738,7 +738,7 @@ def train_and_evaluate(
     grad_scaler = None
     if train_config.HasField("grad_scaler"):
         grad_scaler = GradScaler(
-            device=device,
+            device=device.type,
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(
