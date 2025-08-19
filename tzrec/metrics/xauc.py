@@ -17,6 +17,60 @@ from torchmetrics import Metric
 from tzrec.utils.logging_util import logger
 
 
+def sampling_xauc(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    n: int,
+    n_sample_pairs: int,
+) -> torch.Tensor:
+    """Sample pairs and calc xauc."""
+    total_pairs = n * (n - 1) // 2
+
+    n_sample_pairs = n_sample_pairs if n_sample_pairs <= total_pairs else total_pairs
+    # caution: may cost extreme high memory when n_sample_pairs is huge
+    sampled_flat = torch.randint(0, total_pairs, (n_sample_pairs,))
+    i = torch.floor((-1 + torch.sqrt(1 + 8 * sampled_flat.float())) / 2).long()
+    base = i * (i + 1) // 2
+    idx_i = sampled_flat - base
+    idx_j = i + 1
+
+    # # duplicates removal, caution: slow when n_sample_pairs is large,
+    # but unnecessary when the sample pool is big.
+    # pairs = torch.stack([idx_i, idx_j], dim=1)
+    # unique_pairs = torch.unique(pairs, dim=0)
+    # idx_i = unique_pairs[:, 0]
+    # idx_j = unique_pairs[:, 1]
+
+    preds_i = preds[idx_i]
+    preds_j = preds[idx_j]
+    targets_i = targets[idx_i]
+    targets_j = targets[idx_j]
+
+    correct = ((targets_i - targets_j) * (preds_i - preds_j) > 0).float()
+
+    xauc = correct.mean()
+    return xauc
+
+
+def in_batch_xauc(
+    batch_preds: torch.Tensor, batch_targets: torch.Tensor
+) -> torch.Tensor:
+    """Xauc in a batch."""
+    b = batch_preds.shape[0]
+    all_pairs = torch.triu_indices(b, b, offset=1).t()
+    idx_i = all_pairs[:, 0]
+    idx_j = all_pairs[:, 1]
+
+    preds_i = batch_preds[idx_i]
+    preds_j = batch_preds[idx_j]
+    targets_i = batch_targets[idx_i]
+    targets_j = batch_targets[idx_j]
+
+    correct = ((targets_i - targets_j) * (preds_i - preds_j) > 0).float()
+    xauc = correct.mean()
+    return xauc
+
+
 class XAUC(Metric):
     """XAUC metric for short video rec.
 
@@ -78,7 +132,7 @@ class XAUC(Metric):
             targets (Tensor): a integer 1d-tensor of target.
         """
         if self.in_batch:
-            batch_xauc = self.in_batch_xauc(preds, targets)
+            batch_xauc = in_batch_xauc(preds, targets)
             self.batch_xauc.append(batch_xauc)
         else:
             self.eval_preds.append(preds)
@@ -110,57 +164,5 @@ class XAUC(Metric):
             else:
                 n_sample_pairs = int(n * (n - 1) // 2 * self.sample_ratio)
 
-            xauc = self.sampling_xauc(preds, target, n, n_sample_pairs)
+            xauc = sampling_xauc(preds, target, n, n_sample_pairs)
             return xauc
-
-    def sampling_xauc(
-        self,
-        preds: torch.Tensor,
-        targets: torch.Tensor,
-        n: int,
-        n_sample_pairs: int,
-    ) -> torch.Tensor:
-        """Sample pairs and calc xauc."""
-        total_pairs = n * (n - 1) // 2
-
-        # caution: may cost extreme high memory when n_sample_pairs is huge
-        sampled_flat = torch.randint(0, total_pairs, (n_sample_pairs,))
-        i = torch.floor((-1 + torch.sqrt(1 + 8 * sampled_flat.float())) / 2).long()
-        base = i * (i + 1) // 2
-        idx_i = sampled_flat - base
-        idx_j = i + 1
-
-        # # duplicates removal, caution: slow when n_sample_pairs is large,
-        # but unnecessary when the sample pool is big.
-        # pairs = torch.stack([idx_i, idx_j], dim=1)
-        # unique_pairs = torch.unique(pairs, dim=0)
-        # idx_i = unique_pairs[:, 0]
-        # idx_j = unique_pairs[:, 1]
-
-        preds_i = preds[idx_i]
-        preds_j = preds[idx_j]
-        targets_i = targets[idx_i]
-        targets_j = targets[idx_j]
-
-        correct = ((targets_i - targets_j) * (preds_i - preds_j) > 0).float()
-
-        xauc = correct.mean()
-        return xauc
-
-    def in_batch_xauc(
-        self, batch_preds: torch.Tensor, batch_targets: torch.Tensor
-    ) -> torch.Tensor:
-        """Xauc in a batch."""
-        b = batch_preds.shape[0]
-        all_pairs = torch.triu_indices(b, b, offset=1).t()
-        idx_i = all_pairs[:, 0]
-        idx_j = all_pairs[:, 1]
-
-        preds_i = batch_preds[idx_i]
-        preds_j = batch_preds[idx_j]
-        targets_i = batch_targets[idx_i]
-        targets_j = batch_targets[idx_j]
-
-        correct = ((targets_i - targets_j) * (preds_i - preds_j) > 0).float()
-        xauc = correct.mean()
-        return xauc
