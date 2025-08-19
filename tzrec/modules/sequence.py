@@ -35,6 +35,21 @@ _SEQ_ENCODER_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_SEQ_ENCODER_CLASS_MAP)
 
 
+@torch.fx.wrap
+def _attention_mask(
+    sequence: torch.Tensor, sequence_length: torch.Tensor
+) -> torch.Tensor:
+    batch_size, max_seq_length, _ = sequence.size()
+    mask = (
+        torch.arange(max_seq_length, device=sequence_length.device)
+        .unsqueeze(0)
+        .expand(batch_size, max_seq_length)
+    )
+    mask = (mask < sequence_length.unsqueeze(1)).int()
+    mask = torch.multiply(mask.unsqueeze(2), mask.unsqueeze(1))
+    return mask
+
+
 class SequenceEncoder(nn.Module, metaclass=_meta_cls):
     """Base module of sequence encoder."""
 
@@ -205,6 +220,57 @@ class PoolingEncoder(SequenceEncoder):
             sequence_length = torch.clamp_min(sequence_length, 1)
             feature = feature / sequence_length.unsqueeze(1)
         return feature
+
+
+class SelfAttentionEncoder(SequenceEncoder):
+    """Mean/Sum pooling sequence encoder.
+
+    Args:
+        sequence_dim (int): sequence tensor channel dimension.
+        input (str): input feature group name.
+        pooling_type (str): pooling type, sum or mean.
+        query_dim (int): query tensor channel dimension.
+    """
+
+    def __init__(
+        self,
+        sequence_dim: int,
+        input: str,
+        max_seq_length: int = 0,
+        **kwargs: Optional[Dict[str, Any]],
+    ) -> None:
+        super().__init__(input)
+        self._sequence_dim = sequence_dim
+        self._sequence_name = f"{input}.sequence"
+        self._sequence_length_name = f"{input}.sequence_length"
+        self._max_seq_length = max_seq_length
+        self._query = nn.Linear(sequence_dim, sequence_dim)
+        self._key = nn.Linear(sequence_dim, sequence_dim)
+        self._value = nn.Linear(sequence_dim, sequence_dim)
+        self._scale = nn.Parameter(
+            torch.tensor(sequence_dim**-0.5), requires_grad=False
+        )
+
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._sequence_dim
+
+    def forward(self, sequence_embedded: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward the module."""
+        sequence = sequence_embedded[self._sequence_name]
+        if self._max_seq_length > 0:
+            sequence = sequence[:, : self._max_seq_length, :]
+
+        Q = self._query(sequence)
+        K = self._key(sequence)
+        V = self._value(sequence)
+        attention = torch.matmul(Q, K.transpose(-2, -1)) * self._scale
+        sequence_length = sequence_embedded[self._sequence_length_name]
+        mask = _attention_mask(sequence, sequence_length)
+        attention = attention.masked_fill(mask == 0, -1e9)
+        attention_weight = F.softmax(attention, dim=-1)
+        output = torch.matmul(attention_weight, V)
+        return output.mean(dim=1)
 
 
 class MultiWindowDINEncoder(SequenceEncoder):
