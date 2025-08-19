@@ -306,7 +306,9 @@ class RankModel(BaseModel):
         elif metric_type == "xauc":
             self._metric_modules[metric_name] = XAUC(**metric_kwargs)
         elif metric_type == "grouped_xauc":
-            self._metric_modules[metric_name] = GroupedXAUC(**metric_kwargs)
+            self._metric_modules[metric_name] = GroupedXAUC(
+                metric_kwargs["max_pairs_per_group"]
+            )
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
@@ -331,7 +333,7 @@ class RankModel(BaseModel):
         metric_name = metric_type + suffix
 
         base_sparse_feat = None
-        if metric_type in ["grouped_auc"]:
+        if metric_type in ["grouped_auc", "grouped_xauc"]:
             base_sparse_feat = batch.sparse_features[BASE_DATA_GROUP].to_dict()
 
         if metric_type == "auc":

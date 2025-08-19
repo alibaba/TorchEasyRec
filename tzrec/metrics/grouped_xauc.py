@@ -10,12 +10,14 @@
 # limitations under the License.
 
 import os
-from typing import Any, List, Tuple
+from typing import List, Tuple
 
 import torch
 from torch import distributed as dist
 from torchmetrics import Metric
-from xauc import sampling_xauc
+
+from tzrec.metrics.xauc import sampling_xauc
+from tzrec.utils.logging_util import logger
 
 
 def custom_reduce_fx(
@@ -63,8 +65,8 @@ def custom_reduce_fx(
 class GroupedXAUC(Metric):
     """Grouped XAUC."""
 
-    def __init__(self, max_pairs_per_group: int, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, max_pairs_per_group: int) -> None:
+        super().__init__()
 
         self.max_pairs_per_group = (
             int(max_pairs_per_group) if max_pairs_per_group else 100
@@ -89,6 +91,7 @@ class GroupedXAUC(Metric):
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
+        logger.info("grouped_xauc computing...")
         if not dist.is_initialized():
             preds = torch.cat(
                 [data["preds"] for data in self.eval_data]  # pyre-ignore [29]
@@ -119,11 +122,12 @@ class GroupedXAUC(Metric):
         xaucs = []
         group_weight = []
         for preds, target in zip(grouped_preds, grouped_target):
-            g_xauc = sampling_xauc(
-                preds, target, int(preds.shape[0]), self.max_pairs_per_group
-            )
-            xaucs.append(g_xauc)
-            group_weight.append(int(preds.shape[0]))
+            if preds.shape[0] > 1:
+                g_xauc = sampling_xauc(
+                    preds, target, int(preds.shape[0]), self.max_pairs_per_group
+                )
+                xaucs.append(g_xauc)
+                group_weight.append(int(preds.shape[0]))
 
         group_weight = torch.Tensor(group_weight)
         weigted_sum_gxauc = torch.sum(torch.Tensor(xaucs) * group_weight)
