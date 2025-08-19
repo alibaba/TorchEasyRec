@@ -86,10 +86,11 @@ class RankIntegrationTest(unittest.TestCase):
         input_tile_dir = os.path.join(self.test_dir, "input_tile")
         input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
         if self.success:
+            # when INPUT_TILE=2, AsserScalar codegen is not correct.
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir,
-                env_str="INPUT_TILE=2 ENABLE_AOT=1",
+                env_str="TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=2 ENABLE_AOT=1",
             )
         if self.success:
             self.success = utils.test_export(
