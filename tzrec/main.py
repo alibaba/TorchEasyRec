@@ -1174,14 +1174,22 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    # disable jit compile， as it compile too slow now.
-    if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-        os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+    if os.path.exists(os.path.join(scripted_model_path, "scripted_model.pt")):
+        # disable jit compile， as it compile too slow now.
+        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
+            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
 
-    model: torch.jit.ScriptModule = torch.jit.load(
-        os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-    )
-    model.eval()
+        model: torch.jit.ScriptModule = torch.jit.load(
+            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
+        )
+        model.eval()
+    elif os.path.exists(os.path.join(scripted_model_path, "aoti_model.pt2")):
+        model = torch._inductor.aoti_load_package(
+            os.path.join(scripted_model_path, "aoti_model.pt2"),
+            device_index=device.index,
+        )
+    else:
+        raise RuntimeError(f"No model exists in {scripted_model_path}")
 
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
