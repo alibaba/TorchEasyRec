@@ -148,20 +148,19 @@ class XAUC(Metric):
             # pyre-ignore [6]
             return torch.mean(torch.stack(self.batch_xauc))
         else:
-            # pyre-ignore [6]
             preds = (
-                torch.concat(self.eval_preds)
+                torch.concat(self.eval_preds)  # pyre-ignore [6]
                 if isinstance(self.eval_preds, list)
                 else self.eval_preds
             )
-            # pyre-ignore [6]
+
             target = (
-                torch.concat(self.eval_targets)
+                torch.concat(self.eval_targets)  # pyre-ignore [6]
                 if isinstance(self.eval_targets, list)
                 else self.eval_targets
             )
 
-            n = int(self.total_sample_count)
+            n = int(self.total_sample_count)  # pyre-ignore [6]
             if self.max_pairs:
                 assert self.max_pairs < n * (n - 1) // 2, "max_pairs is larger"
                 "than maximum possible pairs, please check your setting."
