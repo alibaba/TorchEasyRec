@@ -349,15 +349,15 @@ class Package(nn.Module):
                                         f"{input_layer_type} layer {input_name} not found in _name_to_output_dim"  # NOQA
                                     )
 
-                        if input_dim_info is None:
-                            # fallback到旧的方式
-                            if input_name in self._name_to_output_dim:
-                                output_dim = self._name_to_output_dim[input_name]
-                                input_dim_info = DimensionInfo(output_dim)
-                            else:
-                                raise KeyError(
-                                    f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
-                                )
+                        # if input_dim_info is None:
+                        #     # fallback到旧的方式
+                        #     if input_name in self._name_to_output_dim:
+                        #         output_dim = self._name_to_output_dim[input_name]
+                        #         input_dim_info = DimensionInfo(output_dim)
+                        #     else:
+                        #         raise KeyError(
+                        #             f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
+                        #         )
 
                         # 应用input_fn和input_slice变换
                         if input_fn or input_slice:
@@ -1056,21 +1056,23 @@ class Package(nn.Module):
                     )
                     return sequence_dim, query_dim
 
-            elif input_type == "block_name":
-                # 从其他block获取维度作为fallback
-                dim_info = self.dim_engine.get_output_dim(input_name)
-                if dim_info is not None:
-                    dim = dim_info.get_feature_dim()
-                    if sequence_dim is None:
-                        sequence_dim = dim
-                        logging.info(
-                            f"Using block {input_name} output as sequence with dim {dim}"
-                        )
-                    elif query_dim is None:
-                        query_dim = dim
-                        logging.info(
-                            f"Using block {input_name} output as query with dim {dim}"
-                        )
+            # elif input_type == "block_name":
+            #     # 从其他block获取维度作为fallback
+            #     dim_info = self.dim_engine.get_output_dim(input_name)
+            #     if dim_info is not None:
+            #         dim = dim_info.get_feature_dim()
+            #         if sequence_dim is None:
+            #             sequence_dim = dim
+            #             logging.info(
+            #                 f"Using block {input_name} output as sequence with dim {dim}"
+            #             )
+            #         elif query_dim is None:
+            #             query_dim = dim
+            #             logging.info(
+            #                 f"Using block {input_name} output as query with dim {dim}"
+            #             )
+            else:
+                raise NotImplementedError
 
         # 检查推断结果
         if sequence_dim is not None and query_dim is not None:
@@ -1084,10 +1086,10 @@ class Package(nn.Module):
 
     def _try_get_sequence_query_dims_from_group(self, group_name):
         """尝试从embedding group获取sequence和query维度.
-        
+
         Args:
             group_name: embedding group的名称
-            
+
         Returns:
             tuple: (sequence_dim, query_dim) 或 None 如果失败
         """
@@ -1095,30 +1097,30 @@ class Package(nn.Module):
         if group_name not in self._name_to_layer:
             logging.debug(f"Group {group_name} not found in _name_to_layer")
             return None
-            
+
         layer = self._name_to_layer[group_name]
-        
+
         # 检查是否有group_total_dim方法
         if not hasattr(layer, "group_total_dim"):
             logging.debug(f"Group {group_name} does not have group_total_dim method")
             return None
-        
+
         # 尝试获取.sequence和.query子组的维度
         sequence_group_name = f"{group_name}.sequence"
         query_group_name = f"{group_name}.query"
-        
+
         try:
             sequence_dim = layer.group_total_dim(sequence_group_name)
             query_dim = layer.group_total_dim(query_group_name)
             return sequence_dim, query_dim
         except (KeyError, AttributeError, ValueError) as e:
             logging.debug(
-                f"Could not get .sequence/.query dimensions for {group_name}: {type(e).__name__}: {e}"
+                f"Could not get .sequence/.query dimensions for {group_name}: {type(e).__name__}: {e}"  # NOQA
             )
             return None
         except Exception as e:
             logging.warning(
-                f"Unexpected error getting dimensions for {group_name}: {type(e).__name__}: {e}"
+                f"Unexpected error getting dimensions for {group_name}: {type(e).__name__}: {e}"  # NOQA
             )
             return None
 
