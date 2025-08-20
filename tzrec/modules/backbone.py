@@ -421,7 +421,7 @@ class Package(nn.Module):
                             # 输出维度已经在define_layers中设置，不需要重新推断
                             output_dim_info = self.dim_engine.get_output_dim(block.name)
                             if output_dim_info is None:
-                                # 如果维度推断引擎中没有，从兼容性字段获取
+                                # 如果维度推断引擎中没有，从self._name_to_output_dim获取
                                 if block.name in self._name_to_output_dim:
                                     output_dim = self._name_to_output_dim[block.name]
                                     output_dim_info = DimensionInfo(output_dim)
@@ -441,12 +441,12 @@ class Package(nn.Module):
                                 )
                         else:
                             # 验证维度兼容性
-                            if not self.dim_engine.validate_dimension_compatibility(
-                                layer_obj, merged_input_dim
-                            ):
-                                logging.warning(
-                                    f"Dimension compatibility check failed for block {block.name}"  # NOQA
-                                )
+                            # if not self.dim_engine.validate_dimension_compatibility(
+                            #     layer_obj, merged_input_dim
+                            # ):
+                            #     logging.warning(
+                            #         f"Dimension compatibility check failed for block {block.name}"  # NOQA
+                            #     )
 
                             # 推断输出维度 - 使用改进的方法
                             output_dim_info = self.dim_engine.infer_layer_output_dim(
@@ -556,20 +556,20 @@ class Package(nn.Module):
         )
         return summary
 
-    def validate_all_dimensions(self) -> bool:
-        """验证所有block的维度兼容性."""
-        all_valid = True
-        for block_name, layer in self._name_to_layer.items():
-            input_dim_info = self.dim_engine.block_input_dims.get(block_name)
-            if input_dim_info is not None:
-                if not self.dim_engine.validate_dimension_compatibility(
-                    layer, input_dim_info
-                ):
-                    logging.error(
-                        f"Dimension validation failed for block: {block_name}"
-                    )
-                    all_valid = False
-        return all_valid
+    # def validate_all_dimensions(self) -> bool:
+    #     """验证所有block的维度兼容性."""
+    #     all_valid = True
+    #     for block_name, layer in self._name_to_layer.items():
+    #         input_dim_info = self.dim_engine.block_input_dims.get(block_name)
+    #         if input_dim_info is not None:
+    #             if not self.dim_engine.validate_dimension_compatibility(
+    #                 layer, input_dim_info
+    #             ):
+    #                 logging.error(
+    #                     f"Dimension validation failed for block: {block_name}"
+    #                 )
+    #                 all_valid = False
+    #     return all_valid
 
     def output_block_dims(self):
         """返回最终输出 block 的维度组成的 list，比如 [160, 96]."""
@@ -681,32 +681,15 @@ class Package(nn.Module):
                     # 记录最后一个子层的输出维度
                     last_output_dim_info = output_dim_info
                     last_output_dim = output_dim_info.get_feature_dim()
-                elif child_input_dim is not None:
-                    # fallback: 使用简单的维度推断
-                    if hasattr(layer_obj, "output_dim") and callable(
-                        layer_obj.output_dim
-                    ):
-                        output_dim = layer_obj.output_dim()
-                    else:
-                        # 假设输入输出维度相同（如Cross层）
-                        output_dim = (
-                            child_input_dim
-                            if isinstance(child_input_dim, int)
-                            else (
-                                sum(child_input_dim)
-                                if isinstance(child_input_dim, (list, tuple))
-                                else child_input_dim
-                            )
-                        )
-                    self._name_to_output_dim[name_i] = output_dim
+                else:
+                    raise ValueError(
+                        f"Cannot determine input dimension for layer {name_i}"
+                    )
 
-                    # 记录最后一个子层的输出维度
-                    last_output_dim = output_dim
-
-            # 立即设置父层(recurrent层)的输出维度为最后一个子层的输出维度
+            # 设置父层(recurrent层)的输出维度为最后一个子层的输出维度
             # 这样后续依赖该层的block就能获取到正确的输出维度
             if last_output_dim_info is not None:
-                # 立即更新维度推断引擎和兼容性字段
+                # 立即更新维度推断引擎和self._name_to_output_dim
                 self.dim_engine.register_output_dim(name, last_output_dim_info)
                 self._name_to_output_dim[name] = last_output_dim
                 logging.info(
@@ -722,43 +705,8 @@ class Package(nn.Module):
                 print(
                     f"[VERIFY] Updated dim_engine output for {name}: {updated_dim_info}"
                 )
-
-            elif last_output_dim is not None:
-                output_dim_info = DimensionInfo(last_output_dim)
-                self.dim_engine.register_output_dim(name, output_dim_info)
-                self._name_to_output_dim[name] = last_output_dim
-                logging.info(
-                    f"Recurrent layer {name} output dim set to {last_output_dim} (fallback from last child layer)"  # NOQA
-                )
-                logging.info(f"  - Created output_dim_info: {output_dim_info}")
-                logging.info(
-                    f"  - Updated _name_to_output_dim[{name}]: {self._name_to_output_dim[name]}"  # NOQA
-                )
-
             else:
-                logging.error(
-                    f"Recurrent layer {name} failed to set output dimension - no child layers found"  # NOQA
-                )
-                # 获取输入维度作为fallback
-                if parent_input_dim_info is not None:
-                    self.dim_engine.register_output_dim(name, parent_input_dim_info)
-                    self._name_to_output_dim[name] = (
-                        parent_input_dim_info.get_feature_dim()
-                    )
-                    logging.warning(
-                        f"Recurrent layer {name} using input dim as output dim: {parent_input_dim_info.get_feature_dim()}"  # NOQA
-                    )
-                elif parent_input_dim is not None:
-                    output_dim_info = DimensionInfo(parent_input_dim)
-                    self.dim_engine.register_output_dim(name, output_dim_info)
-                    self._name_to_output_dim[name] = parent_input_dim
-                    logging.warning(
-                        f"Recurrent layer {name} using fallback input dim as output dim: {parent_input_dim}"  # NOQA
-                    )
-                else:
-                    raise ValueError(
-                        f"Recurrent layer {name} cannot determine output dimension"
-                    )
+                raise ValueError(f"Cannot determine input dimension for layer {name}")
         elif layer == "repeat":
             torch_layer = layer_cnf.repeat.module
             # 获取父层的输入维度信息，用于子层的维度推断
@@ -805,27 +753,10 @@ class Package(nn.Module):
                     # 记录最后一个子层的输出维度
                     last_output_dim_info = output_dim_info
                     last_output_dim = output_dim_info.get_feature_dim()
-                elif parent_input_dim is not None:
-                    # fallback: 使用简单的维度推断
-                    if hasattr(layer_obj, "output_dim") and callable(
-                        layer_obj.output_dim
-                    ):
-                        output_dim = layer_obj.output_dim()
-                    else:
-                        # 假设输入输出维度相同
-                        output_dim = (
-                            parent_input_dim
-                            if isinstance(parent_input_dim, int)
-                            else (
-                                sum(parent_input_dim)
-                                if isinstance(parent_input_dim, (list, tuple))
-                                else parent_input_dim
-                            )
-                        )
-                    self._name_to_output_dim[name_i] = output_dim
-
-                    # 记录最后一个子层的输出维度
-                    last_output_dim = output_dim
+                else:
+                    raise ValueError(
+                        f"Cannot determine output dimension for layer {name_i}"
+                    )
 
             # 计算父层(repeat层)的输出维度，考虑output_concat_axis配置
             if last_output_dim_info is not None:
@@ -863,12 +794,12 @@ class Package(nn.Module):
                     list_dims = [last_output_dim] * num_repeat
                     final_output_dim_info = DimensionInfo(list_dims, is_list=True)
 
-                    # final_output_dim，使用列表的总维度（不完全准确）
+                    # final_output_dim，默认使用列表的总维度（不一定是下游需要的）
                     # 实际使用时应该通过维度推断引擎获取正确的维度信息
                     final_output_dim = sum(list_dims)  # 实际下游维度还需具体推断
 
                     logging.info(
-                        f"Repeat layer {name} without output_concat_axis: returns list of {num_repeat} outputs, "
+                        f"Repeat layer {name} without output_concat_axis: returns list of {num_repeat} outputs, "  # NOQA
                         f"each with dim={last_output_dim}, list_dims={list_dims}"
                     )
 
@@ -877,58 +808,8 @@ class Package(nn.Module):
                 logging.info(
                     f"Repeat layer {name} final output dim set to {final_output_dim}"
                 )
-            elif last_output_dim is not None:
-                final_output_dim = last_output_dim
-
-                # 检查是否配置了output_concat_axis，如果有则需要调整维度
-                if (
-                    hasattr(layer_cnf.repeat, "output_concat_axis")
-                    and layer_cnf.repeat.output_concat_axis is not None
-                ):
-                    axis = layer_cnf.repeat.output_concat_axis
-                    num_repeat = layer_cnf.repeat.num_repeat
-
-                    # 如果在最后一维拼接（axis=-1），需要将该维度乘以repeat次数
-                    if axis == -1:
-                        final_output_dim = last_output_dim * num_repeat
-                        logging.info(
-                            f"Repeat layer {name} (fallback) with output_concat_axis={axis}: "
-                            f"single_output_dim={last_output_dim} * num_repeat={num_repeat} = {final_output_dim}"
-                        )
-                    else:
-                        logging.warning(
-                            f"Repeat layer {name} (fallback) with output_concat_axis={axis}: "
-                            f"non-last axis concatenation not fully supported, using single layer output dim={last_output_dim}"
-                        )
-                else:
-                    # 没有配置output_concat_axis，返回列表格式
-                    num_repeat = layer_cnf.repeat.num_repeat
-                    # 创建列表格式的维度信息，包含num_repeat个相同的子层输出维度
-                    list_dims = [last_output_dim] * num_repeat
-                    final_output_dim = sum(list_dims)  # 兼容性字段使用总维度
-
-                    logging.info(
-                        f"Repeat layer {name} (fallback) without output_concat_axis: returns list of {num_repeat} outputs, "
-                        f"each with dim={last_output_dim}, list_dims={list_dims}"
-                    )
-
-                # 根据是否配置output_concat_axis创建相应的DimensionInfo
-                if (
-                    hasattr(layer_cnf.repeat, "output_concat_axis")
-                    and layer_cnf.repeat.output_concat_axis is not None
-                ):
-                    output_dim_info = DimensionInfo(final_output_dim)
-                else:
-                    # 没有配置output_concat_axis，创建列表格式的DimensionInfo
-                    num_repeat = layer_cnf.repeat.num_repeat
-                    list_dims = [last_output_dim] * num_repeat
-                    output_dim_info = DimensionInfo(list_dims, is_list=True)
-
-                self.dim_engine.register_output_dim(name, output_dim_info)
-                self._name_to_output_dim[name] = final_output_dim
-                logging.info(
-                    f"Repeat layer {name} (fallback) final output dim set to {final_output_dim}"
-                )
+            else:
+                raise ValueError(f"Cannot determine output dimension for layer {name}")
         elif layer == "lambda":
             expression = getattr(layer_cnf, "lambda").expression
             lambda_layer = LambdaWrapper(expression, name=name)
@@ -995,17 +876,7 @@ class Package(nn.Module):
                         # 特殊处理：对于接收多个独立张量的模块，检查是否需要避免sum
                         should_use_single_dim = False
 
-                        # # 检查方法1：模块是否有多个不同含义的维度参数
-                        # if len(input_dim_params_in_sig) > 1:
-                        #     # 如果有多个维度参数且输入是列表，可能需要分别设置
-                        #     param_names = set(input_dim_params_in_sig)
-                        #     # 检查是否有"input_dim"和"mask_input_dim"这样的组合
-                        #     if ('input_dim' in param_names and 'mask_input_dim' in param_names) or \
-                        #        ('feature_dim' in param_names and 'mask_input_dim' in param_names):
-                        #         should_use_single_dim = True
-                        #         logging.info(f"Detected multi-tensor input module {layer_cls.__name__} with separate dimension parameters")
-
-                        # 检查方法2：forward方法是否接收多个张量参数
+                        # 检查方法：forward方法是否接收多个张量参数
                         if hasattr(layer_cls, "forward"):
                             try:
                                 forward_sig = inspect.signature(layer_cls.forward)
@@ -1018,22 +889,22 @@ class Package(nn.Module):
                                 if len(forward_params) >= 2:
                                     should_use_single_dim = True
                                     logging.info(
-                                        f"Detected multi-tensor input module {layer_cls.__name__} with {len(forward_params)} forward parameters"
+                                        f"Detected multi-tensor input module {layer_cls.__name__} with {len(forward_params)} forward parameters"  # NOQA
                                     )
-                            except Exception:
-                                pass
-
+                            except Exception as err:
+                                raise ValueError(
+                                    f"Failed to inspect forward method of {layer_cls.__name__} for dimension inference"  # NOQA
+                                ) from err
                         if (
                             should_use_single_dim
                             and input_dim_info.is_list
                             and isinstance(input_dim_info.dim, (list, tuple))
                         ):
-                            # 对于多张量输入模块，使用第一个输入的维度，而不是sum
-                            single_feature_dim = input_dim_info.dim[0]
-                            for param_name in input_dim_params_in_sig:
-                                kwargs[param_name] = single_feature_dim
+                            # 对于forward需要多张量输入的模块,使用列表格式的维度
+                            for idx, param_name in enumerate(input_dim_params_in_sig):
+                                kwargs[param_name] = input_dim_info.dim[idx]
                                 logging.info(
-                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={single_feature_dim} from first input dim (avoiding sum for multi-tensor input)"
+                                    f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={input_dim_info.dim[idx]} from input dim list"  # NOQA
                                 )
                         else:
                             # 对于其他模块，使用总维度
@@ -1043,45 +914,23 @@ class Package(nn.Module):
                                 logging.info(
                                     f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"  # NOQA
                                 )
-                        #                             # 特殊处理MaskBlock等需要多个不同维度参数的模块
-                        # if layer_cls.__name__ == 'MaskBlock' and input_dim_info.is_list:
-                        #     # 对于MaskBlock，如果输入是列表格式，通常第一个元素是feature_input，第二个是mask_input
-                        #     dims_list = input_dim_info.to_list()
-                        #     if len(dims_list) >= 2:
-                        #         # 假设两个输入的维度相同（都是原始特征维度）
-                        #         single_dim = dims_list[0]  # 使用第一个输入的维度
-                        #         for param_name in input_dim_params_in_sig:
-                        #             kwargs[param_name] = single_dim
-                        #             logging.info(
-                        #                 f"Layer {name} (MaskBlock) auto-inferred {param_name}={single_dim} from first input dim"
-                        #             )
-                        #     else:
-                        #         # 如果只有一个输入，使用该维度
-                        #         single_dim = dims_list[0]
-                        #         for param_name in input_dim_params_in_sig:
-                        #             kwargs[param_name] = single_dim
-                        #             logging.info(
-                        #                 f"Layer {name} (MaskBlock) auto-inferred {param_name}={single_dim} from single input dim"
-                        #             )
-                        # else:
-                        #     # 对于其他模块，使用总维度
-                    elif input_dim is not None:
-                        # fallback到传入的input_dim参数
-                        feature_dim = (
-                            input_dim
-                            if isinstance(input_dim, int)
-                            else (
-                                sum(input_dim)
-                                if isinstance(input_dim, (list, tuple))
-                                else input_dim
-                            )
-                        )
-                        # 使用第一个在签名中找到的参数名
-                        param_name = input_dim_params_in_sig[0]
-                        kwargs[param_name] = feature_dim
-                        logging.info(
-                            f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from fallback input_dim"  # NOQA
-                        )
+                    # elif input_dim is not None:
+                    #     # fallback到传入的input_dim参数
+                    #     feature_dim = (
+                    #         input_dim
+                    #         if isinstance(input_dim, int)
+                    #         else (
+                    #             sum(input_dim)
+                    #             if isinstance(input_dim, (list, tuple))
+                    #             else input_dim
+                    #         )
+                    #     )
+                    #     # 使用第一个在签名中找到的参数名
+                    #     param_name = input_dim_params_in_sig[0]
+                    #     kwargs[param_name] = feature_dim
+                    #     logging.info(
+                    #         f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from fallback input_dim"  # NOQA
+                    #     )
                     else:
                         logging.error(
                             f"Layer {name} ({layer_cls.__name__}) dimension inference failed - no input_dim available"  # NOQA
@@ -1090,7 +939,7 @@ class Package(nn.Module):
                         logging.error(
                             f"  - input_dim_info from dim_engine: {input_dim_info}"
                         )
-                        logging.error(f"  - fallback input_dim: {input_dim}")
+                        logging.error(f"  - input_dim: {input_dim}")
                         logging.error(
                             f"  - block_input_dims keys: {list(self.dim_engine.block_input_dims.keys())}"  # NOQA
                         )
@@ -1188,87 +1037,88 @@ class Package(nn.Module):
         Returns:
             tuple: (sequence_dim, query_dim) 或 None 如果推断失败
         """
-        try:
-            sequence_dim = None
-            query_dim = None
+        sequence_dim = None
+        query_dim = None
 
-            # 分析输入，根据feature_group_name推断维度
-            for input_node in block_config.inputs:
-                input_type = input_node.WhichOneof("name")
-                input_name = getattr(input_node, input_type)
+        # 分析输入，根据feature_group_name推断维度
+        for input_node in block_config.inputs:
+            input_type = input_node.WhichOneof("name")
+            input_name = getattr(input_node, input_type)
 
-                # 只处理feature_group_name类型的输入
-                if input_type == "feature_group_name":
-                    group_name = input_name
+            if input_type == "feature_group_name":
+                # 尝试从embedding group获取sequence和query维度
+                dims = self._try_get_sequence_query_dims_from_group(input_name)
+                if dims:
+                    sequence_dim, query_dim = dims
+                    logging.info(
+                        f"Auto-inferred dimensions from {input_name}: "
+                        f"sequence_dim={sequence_dim}, query_dim={query_dim}"
+                    )
+                    return sequence_dim, query_dim
 
-                    # 尝试获取.sequence和.query子组的维度
-                    try:
-                        sequence_group_name = f"{group_name}.sequence"
-                        query_group_name = f"{group_name}.query"
-                        # 检查是否存在这些子组
-                        if hasattr(self._name_to_layer[group_name], "group_total_dim"):
-                            try:
-                                test_seq_dim = self._name_to_layer[
-                                    group_name
-                                ].group_total_dim(sequence_group_name)
-                                test_query_dim = self._name_to_layer[
-                                    group_name
-                                ].group_total_dim(query_group_name)
-
-                                # 如果能成功获取维度，说明这是正确的格式
-                                sequence_dim = test_seq_dim
-                                query_dim = test_query_dim
-
-                                logging.info(
-                                    f"Auto-inferred dimensions from {group_name}: "
-                                    f"sequence_dim={sequence_dim} (from {sequence_group_name}), "  # NOQA
-                                    f"query_dim={query_dim} (from {query_group_name})"
-                                )
-
-                                return sequence_dim, query_dim
-
-                            except Exception:
-                                # 如果无法获取子组维度，继续尝试其他方式
-                                logging.debug(
-                                    f"Could not get .sequence/.query dimensions for {group_name}"  # NOQA
-                                )
-                                continue
-                    except Exception as e:
-                        logging.debug(
-                            f"Error accessing embedding group dimensions: {e}"
+            elif input_type == "block_name":
+                # 从其他block获取维度作为fallback
+                dim_info = self.dim_engine.get_output_dim(input_name)
+                if dim_info is not None:
+                    dim = dim_info.get_feature_dim()
+                    if sequence_dim is None:
+                        sequence_dim = dim
+                        logging.info(
+                            f"Using block {input_name} output as sequence with dim {dim}"
                         )
-                        continue
+                    elif query_dim is None:
+                        query_dim = dim
+                        logging.info(
+                            f"Using block {input_name} output as query with dim {dim}"
+                        )
 
-                elif input_type == "block_name":
-                    # 从其他block获取维度作为fallback
-                    dim_info = self.dim_engine.get_output_dim(input_name)
-                    if dim_info is not None:
-                        dim = dim_info.get_feature_dim()
-                        # 如果还没有找到sequence_dim，使用这个作为sequence_dim
-                        if sequence_dim is None:
-                            sequence_dim = dim
-                            logging.info(
-                                f"Using block {input_name} output as sequence with dim {dim}"  # NOQA
-                            )
-                        # 如果还没有找到query_dim，使用这个作为query_dim
-                        elif query_dim is None:
-                            query_dim = dim
-                            logging.info(
-                                f"Using block {input_name} output as query with dim {dim}"  # NOQA
-                            )
+        # 检查推断结果
+        if sequence_dim is not None and query_dim is not None:
+            return sequence_dim, query_dim
+        else:
+            logging.warning(
+                f"Could not infer sequence/query dimensions for {block_name}: "
+                f"sequence_dim={sequence_dim}, query_dim={query_dim}"
+            )
+            return None
 
-            if sequence_dim is not None and query_dim is not None:
-                return sequence_dim, query_dim
-            else:
-                logging.warning(
-                    f"Could not infer sequence/query dimensions for {block_name}: "
-                    f"sequence_dim={sequence_dim}, query_dim={query_dim}"
-                )
-                return None
-
+    def _try_get_sequence_query_dims_from_group(self, group_name):
+        """尝试从embedding group获取sequence和query维度.
+        
+        Args:
+            group_name: embedding group的名称
+            
+        Returns:
+            tuple: (sequence_dim, query_dim) 或 None 如果失败
+        """
+        # 检查group是否存在
+        if group_name not in self._name_to_layer:
+            logging.debug(f"Group {group_name} not found in _name_to_layer")
+            return None
+            
+        layer = self._name_to_layer[group_name]
+        
+        # 检查是否有group_total_dim方法
+        if not hasattr(layer, "group_total_dim"):
+            logging.debug(f"Group {group_name} does not have group_total_dim method")
+            return None
+        
+        # 尝试获取.sequence和.query子组的维度
+        sequence_group_name = f"{group_name}.sequence"
+        query_group_name = f"{group_name}.query"
+        
+        try:
+            sequence_dim = layer.group_total_dim(sequence_group_name)
+            query_dim = layer.group_total_dim(query_group_name)
+            return sequence_dim, query_dim
+        except (KeyError, AttributeError, ValueError) as e:
+            logging.debug(
+                f"Could not get .sequence/.query dimensions for {group_name}: {type(e).__name__}: {e}"
+            )
+            return None
         except Exception as e:
-            logging.error(
-                f"Error inferring sequence/query dimensions for {block_name}: {e}"
+            logging.warning(
+                f"Unexpected error getting dimensions for {group_name}: {type(e).__name__}: {e}"
             )
             return None
 
@@ -1757,7 +1607,7 @@ class Package(nn.Module):
                 lambda_wrapper = self._name_to_layer[name]
                 return lambda_wrapper(inputs)
             else:
-                # fallback到直接执行lambda表达式
+                # 直接执行lambda表达式 / 直接抛出错误
                 conf = getattr(config, "lambda")
                 fn = eval(conf.expression)
                 return fn(inputs)
@@ -1839,7 +1689,8 @@ class Package(nn.Module):
             **kwargs: Additional keyword arguments passed to sub-layers.
 
         Returns:
-            Output based on configuration: single tensor, concatenated tensor, or list of tensors.
+            Output based on configuration: single tensor, concatenated tensor, or
+        list of tensors.
         """
         repeat_config = config.repeat
         n_loop = repeat_config.num_repeat

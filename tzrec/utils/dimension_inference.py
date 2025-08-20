@@ -110,84 +110,6 @@ class DimensionInfo:
             # 只返回特征维度
             return (feature_dim,)
 
-    def get_dim_at_index(self, index: int) -> int:
-        """从list格式的维度中获取指定index的维度.
-
-        Args:
-            index: 要获取的index，支持负数索引
-
-        Returns:
-            指定index处的维度值
-
-        Raises:
-            ValueError: 如果当前不是list格式或index超出范围
-        """
-        if not self.is_list:
-            raise ValueError(
-                f"Cannot get index {index} from non-list DimensionInfo: {self}"
-            )
-
-        if not isinstance(self.dim, (list, tuple)):
-            raise ValueError(f"DimensionInfo.dim is not list/tuple: {self.dim}")
-
-        try:
-            return self.dim[index]
-        except IndexError:
-            raise ValueError(f"Index {index} out of range for dims {self.dim}")
-
-    def slice_to_single_dim(self, index: int) -> "DimensionInfo":
-        """从list格式的DimensionInfo中取出指定index，返回单一维度的DimensionInfo.
-
-        Args:
-            index: 要获取的index，支持负数索引
-
-        Returns:
-            新的DimensionInfo对象，包含指定index的维度
-        """
-        if not self.is_list:
-            # 如果不是list格式，直接返回自身
-            return self
-
-        single_dim = self.get_dim_at_index(index)
-
-        # 如果有shape信息，也需要相应调整
-        new_shape = None
-        if self.shape is not None:
-            # 假设shape的最后一维对应feature_dim，其他维度保持不变
-            new_shape = self.shape[:-1] + (single_dim,)
-
-        return DimensionInfo(
-            dim=single_dim, shape=new_shape, is_list=False, feature_dim=single_dim
-        )
-
-    def slice_to_range(
-        self, start: int = None, stop: int = None, step: int = None
-    ) -> "DimensionInfo":
-        """从list格式的DimensionInfo中取出指定范围，返回新的list格式DimensionInfo.
-
-        Args:
-            start: 起始index
-            stop: 结束index
-            step: 步长
-
-        Returns:
-            新的DimensionInfo对象，包含指定范围的维度列表
-        """
-        if not self.is_list:
-            # 如果不是list格式，无法进行范围切片
-            raise ValueError(f"Cannot slice range from non-list DimensionInfo: {self}")
-
-        if not isinstance(self.dim, (list, tuple)):
-            raise ValueError(f"DimensionInfo.dim is not list/tuple: {self.dim}")
-
-        sliced_dims = self.dim[start:stop:step]
-
-        return DimensionInfo(
-            dim=list(sliced_dims),
-            is_list=True,
-            feature_dim=None,  # 让get_feature_dim自动计算
-        )
-
 
 class DimensionInferenceEngine:
     """维度推断引擎，负责管理和推断block之间的维度信息."""
@@ -656,41 +578,6 @@ class DimensionInferenceEngine:
 
         else:
             raise ValueError(f"Unsupported merge mode: {merge_mode}")
-
-    def validate_dimension_compatibility(
-        self, layer: nn.Module, input_dim: DimensionInfo
-    ) -> bool:
-        """验证layer与输入维度的兼容性."""
-        try:
-            layer_type = type(layer).__name__
-
-            if layer_type in ["Linear", "LazyLinear"] and hasattr(layer, "in_features"):
-                expected_dim = layer.in_features
-                actual_dim = input_dim.get_feature_dim()
-                if (
-                    expected_dim != -1 and expected_dim != actual_dim
-                ):  # -1表示LazyLinear未初始化
-                    logging.warning(
-                        f"Dimension mismatch for {layer_type}: expected "
-                        f"{expected_dim}, got {actual_dim}"
-                    )
-                    return False
-
-            elif layer_type == "MLP" and hasattr(layer, "in_features"):
-                expected_dim = layer.in_features
-                actual_dim = input_dim.get_feature_dim()
-                if expected_dim != actual_dim:
-                    logging.warning(
-                        f"Dimension mismatch for MLP: expected {expected_dim}, "
-                        f"got {actual_dim}"
-                    )
-                    return False
-
-            return True
-
-        except Exception as e:
-            logging.error(f"Failed to validate dimension compatibility: {e}")
-            return True  # 验证失败时默认兼容
 
     def get_summary(self) -> Dict[str, Any]:
         """获取维度推断的摘要信息."""
