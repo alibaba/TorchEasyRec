@@ -124,7 +124,8 @@ class XAUC(Metric):
                 "total_sample_count", default=torch.tensor(0), dist_reduce_fx="sum"
             )
 
-    def update(self, preds: torch.Tensor, targets: torch.Tensor):
+    # pyre-ignore [14]
+    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
         """Update the metric.
 
         Args:
@@ -137,19 +138,23 @@ class XAUC(Metric):
         else:
             self.eval_preds.append(preds)
             self.eval_targets.append(targets)
+            # pyre-ignore [16, 29]
             self.total_sample_count += torch.tensor(preds.shape[0])
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
         logger.info("xauc computing...")
         if self.in_batch:
+            # pyre-ignore [6]
             return torch.mean(torch.stack(self.batch_xauc))
         else:
+            # pyre-ignore [6]
             preds = (
                 torch.concat(self.eval_preds)
                 if isinstance(self.eval_preds, list)
                 else self.eval_preds
             )
+            # pyre-ignore [6]
             target = (
                 torch.concat(self.eval_targets)
                 if isinstance(self.eval_targets, list)
@@ -164,5 +169,6 @@ class XAUC(Metric):
             else:
                 n_sample_pairs = int(n * (n - 1) // 2 * self.sample_ratio)
 
+            # pyre-ignore [6]
             xauc = sampling_xauc(preds, target, n, n_sample_pairs)
             return xauc
