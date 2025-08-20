@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import os
+from queue import Queue
 from typing import List, Optional
 
 import torch
@@ -39,6 +40,7 @@ from torchrec.distributed.train_pipeline import (
 from torchrec.distributed.types import (
     Awaitable,
     ModuleSharder,
+    ShardedModule,
     ShardingEnv,
     ShardingPlan,
 )
@@ -199,8 +201,20 @@ def create_train_pipeline(
     Return:
         a TrainPipeline.
     """
-    trainable_params, frozen_params = model.module.model.sparse_parameters()
-    if len(trainable_params) == 0 and len(frozen_params) == 0:
+    has_sparse_module = False
+
+    q = Queue()
+    q.put(model.module)
+    while not q.empty():
+        m = q.get()
+        if isinstance(m, ShardedModule):
+            has_sparse_module = True
+            break
+        else:
+            for child in m.children():
+                q.put(child)
+
+    if not has_sparse_module:
         # use TrainPipelineBase when model do not have sparse parameters.
         # pyre-ignore [6]
         return TrainPipelineBase(model, optimizer, model.device)
