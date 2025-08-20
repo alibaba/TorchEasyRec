@@ -91,8 +91,6 @@ class RankBackbone(RankModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        # grouped_features = self.build_input(batch)
-        # output = self.backbone(group_features=grouped_features, batch=batch)
         output = self.backbone(batch=batch)
         y = self.output_mlp(output)
         return self._output_to_prediction(y)

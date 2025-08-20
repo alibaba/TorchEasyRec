@@ -110,6 +110,84 @@ class DimensionInfo:
             # 只返回特征维度
             return (feature_dim,)
 
+    def get_dim_at_index(self, index: int) -> int:
+        """从list格式的维度中获取指定index的维度.
+
+        Args:
+            index: 要获取的index，支持负数索引
+
+        Returns:
+            指定index处的维度值
+
+        Raises:
+            ValueError: 如果当前不是list格式或index超出范围
+        """
+        if not self.is_list:
+            raise ValueError(
+                f"Cannot get index {index} from non-list DimensionInfo: {self}"
+            )
+
+        if not isinstance(self.dim, (list, tuple)):
+            raise ValueError(f"DimensionInfo.dim is not list/tuple: {self.dim}")
+
+        try:
+            return self.dim[index]
+        except IndexError:
+            raise ValueError(f"Index {index} out of range for dims {self.dim}")
+
+    def slice_to_single_dim(self, index: int) -> "DimensionInfo":
+        """从list格式的DimensionInfo中取出指定index，返回单一维度的DimensionInfo.
+
+        Args:
+            index: 要获取的index，支持负数索引
+
+        Returns:
+            新的DimensionInfo对象，包含指定index的维度
+        """
+        if not self.is_list:
+            # 如果不是list格式，直接返回自身
+            return self
+
+        single_dim = self.get_dim_at_index(index)
+
+        # 如果有shape信息，也需要相应调整
+        new_shape = None
+        if self.shape is not None:
+            # 假设shape的最后一维对应feature_dim，其他维度保持不变
+            new_shape = self.shape[:-1] + (single_dim,)
+
+        return DimensionInfo(
+            dim=single_dim, shape=new_shape, is_list=False, feature_dim=single_dim
+        )
+
+    def slice_to_range(
+        self, start: int = None, stop: int = None, step: int = None
+    ) -> "DimensionInfo":
+        """从list格式的DimensionInfo中取出指定范围，返回新的list格式DimensionInfo.
+
+        Args:
+            start: 起始index
+            stop: 结束index
+            step: 步长
+
+        Returns:
+            新的DimensionInfo对象，包含指定范围的维度列表
+        """
+        if not self.is_list:
+            # 如果不是list格式，无法进行范围切片
+            raise ValueError(f"Cannot slice range from non-list DimensionInfo: {self}")
+
+        if not isinstance(self.dim, (list, tuple)):
+            raise ValueError(f"DimensionInfo.dim is not list/tuple: {self.dim}")
+
+        sliced_dims = self.dim[start:stop:step]
+
+        return DimensionInfo(
+            dim=list(sliced_dims),
+            is_list=True,
+            feature_dim=None,  # 让get_feature_dim自动计算
+        )
+
 
 class DimensionInferenceEngine:
     """维度推断引擎，负责管理和推断block之间的维度信息."""
@@ -342,9 +420,9 @@ class DimensionInferenceEngine:
         try:
             # 首先尝试使用dummy tensor进行精确推断
             try:
-                from tzrec.layers.lambda_inference import infer_lambda_output_dim
+                from tzrec.utils.lambda_inference import infer_lambda_output_dim
 
-                result = infer_lambda_output_dim(dim_info, input_fn, safe_mode=True)
+                result = infer_lambda_output_dim(dim_info, input_fn)
                 self.logger.info(
                     f"Successfully inferred output dim using dummy tensor for "
                     f"'{input_fn}': {result}"
@@ -357,12 +435,13 @@ class DimensionInferenceEngine:
                 )
 
             # 如果dummy tensor推断失败，回退到原来的模式匹配方法
-            return self._apply_input_fn_pattern_matching(dim_info, input_fn)
+            # return self._apply_input_fn_pattern_matching(dim_info, input_fn)
 
         except Exception as e:
             logging.error(f"Failed to apply input_fn {input_fn}: {e}")
             return dim_info
 
+    # not need
     def _apply_input_fn_pattern_matching(
         self, dim_info: DimensionInfo, input_fn: str
     ) -> DimensionInfo:
