@@ -70,7 +70,7 @@ class MultiTaskBackbone(MultiTaskRank):
     def build_task_towers(self):
         """Build task towers based on backbone output dimension."""
         # 获取backbone的最终输出维度
-        backbone_output_dim = self._backbone_net.get_final_output_dim()
+        backbone_output_dim = self._backbone_net.output_dim()
 
         task_towers = nn.ModuleDict()
         for task_tower_cfg in self._task_tower_cfgs:

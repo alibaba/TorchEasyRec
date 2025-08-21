@@ -1710,7 +1710,7 @@ class Backbone(nn.Module):
             output = self._top_mlp(output)
         return output
 
-    def get_final_output_dim(self):
+    def output_dim(self):
         """获取最终输出维度，考虑top_mlp的影响."""
         if hasattr(self, "_top_mlp") and self._top_mlp is not None:
             # 如果有top_mlp，返回top_mlp的输出维度

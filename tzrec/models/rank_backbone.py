@@ -39,7 +39,7 @@ class RankBackbone(RankModel):
         self._backbone_net = self.build_backbone_network()
 
         # 使用backbone的最终输出维度，考虑top_mlp的影响
-        output_dims = self._backbone_net.get_final_output_dim()
+        output_dims = self._backbone_net.output_dim()
         # 如果有多个 package（如 Package.__packages 里），如何拿到output_dims，暂未实现
         self.output_mlp = nn.Linear(output_dims, self._num_class)
 
