@@ -44,15 +44,15 @@ message ModelParams {
     repeated string outputs = 2;
 }
 
-message RankBackbone {
+message ModularRank {
     required BackboneTower backbone = 1;
     optional ModelParams model_params = 2;
 }
-message MatchBackbone {
+message ModularMatch {
     required BackboneTower backbone = 1;
     optional ModelParams model_params = 2;
 }
-message MultiTaskBackbone {
+message ModularMultiTask {
     required BackboneTower backbone = 1;
     optional ModelParams model_params = 2;
     repeated TaskTower task_towers = 3;
@@ -62,9 +62,9 @@ message ModelConfig {
     repeated FeatureGroupConfig feature_groups = 1;
 
     oneof model {
-        RankBackbone rank_backbone = 1001;
-        MatchBackbone match_backbone = 1002;
-        MultiTaskBackbone multi_task_backbone = 1003;
+        ModularRank rank_backbone = 1001;
+        ModularMatch match_backbone = 1002;
+        ModularMultiTask multi_task_backbone = 1003;
 
 	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
