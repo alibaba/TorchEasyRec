@@ -42,7 +42,6 @@ enum Kernel {
 message ModelParams {
     optional float l2_regularization = 1;
     repeated string outputs = 2;
-    repeated TaskTower task_towers = 3;
 }
 
 message RankBackbone {
@@ -56,6 +55,7 @@ message MatchBackbone {
 message MultiTaskBackbone {
     required BackboneTower backbone = 1;
     optional ModelParams model_params = 2;
+    repeated TaskTower task_towers = 3;
 }
 message ModelConfig {
 

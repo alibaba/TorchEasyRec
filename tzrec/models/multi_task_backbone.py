@@ -18,9 +18,6 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.multi_task_rank import MultiTaskRank
 from tzrec.modules.backbone import Backbone
-from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.variational_dropout import VariationalDropout
-from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
@@ -45,43 +42,11 @@ class MultiTaskBackbone(MultiTaskRank):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # 初始化输入处理
-        # self.init_input()
-        self._task_tower_cfgs = list(self._model_config.model_params.task_towers)
         # 构建backbone网络
         self._backbone_net = self.build_backbone_network()
 
         # 构建任务塔
         self._task_towers = self.build_task_towers()
-
-    def init_input(self) -> None:
-        """Build embedding group and group variational dropout."""
-        self.embedding_group = EmbeddingGroup(
-            self._features,
-            list(self._base_model_config.feature_groups),
-            wide_embedding_dim=int(self.wide_embedding_dim)
-            if hasattr(self, "wide_embedding_dim")
-            else None,
-            wide_init_fn=self.wide_init_fn if hasattr(self, "wide_init_fn") else None,
-        )
-
-        if self._base_model_config.HasField("variational_dropout"):
-            self.group_variational_dropouts = nn.ModuleDict()
-            variational_dropout_config = self._base_model_config.variational_dropout
-            variational_dropout_config_dict = config_to_kwargs(
-                variational_dropout_config
-            )
-            for feature_group in list(self._base_model_config.feature_groups):
-                group_name = feature_group.group_name
-                if feature_group.group_type != model_pb2.SEQUENCE:
-                    feature_dim = self.embedding_group.group_feature_dims(group_name)
-                    if len(feature_dim) > 1:
-                        variational_dropout = VariationalDropout(
-                            feature_dim, group_name, **variational_dropout_config_dict
-                        )
-                        self.group_variational_dropouts[group_name] = (
-                            variational_dropout
-                        )
 
     def build_backbone_network(self):
         """Build backbone network."""

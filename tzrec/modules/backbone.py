@@ -454,8 +454,6 @@ class Package(nn.Module):
                             )
 
                     self.dim_engine.register_output_dim(block.name, output_dim_info)
-
-                    # 保留兼容性
                     self._name_to_output_dim[block.name] = (
                         output_dim_info.get_feature_dim()
                     )
@@ -764,7 +762,8 @@ class Package(nn.Module):
                 final_output_dim = last_output_dim
 
                 # 检查是否配置了output_concat_axis，如果有则需要调整维度
-                # 例如 repeat 3次 maskblock 并在最后一维拼接（output_concat_axis: -1），等价于：[maskblock1_out, maskblock2_out, maskblock3_out] 在最后一维cat
+                # 例如 repeat 3次 maskblock 并在最后一维拼接（output_concat_axis: -1），
+                # 等价于：[maskblock1_out, maskblock2_out, maskblock3_out] 在最后一维cat
                 if (
                     hasattr(layer_cnf.repeat, "output_concat_axis")
                     and layer_cnf.repeat.output_concat_axis is not None
@@ -779,13 +778,13 @@ class Package(nn.Module):
                         final_output_dim_info = DimensionInfo(final_output_dim)
                         logging.info(
                             f"Repeat layer {name} with output_concat_axis={axis}: "
-                            f"single_output_dim={last_output_dim} * num_repeat={num_repeat} = {final_output_dim}"
+                            f"single_output_dim={last_output_dim} * num_repeat={num_repeat} = {final_output_dim}"  # NOQA
                         )
                     else:
-                        # 对于其他轴的拼接，当前先保持不变，可能需要更复杂的维度推断逻辑
+                        # 对于其他轴的拼接，当前先保持不变，需要更复杂的维度推断逻辑
                         logging.warning(
                             f"Repeat layer {name} with output_concat_axis={axis}: "
-                            f"non-last axis concatenation not fully supported, using single layer output dim={last_output_dim}"
+                            f"non-last axis concatenation not fully supported, using single layer output dim={last_output_dim}"  # NOQA
                         )
                 else:
                     # 没有配置output_concat_axis，返回列表格式
@@ -914,23 +913,6 @@ class Package(nn.Module):
                                 logging.info(
                                     f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"  # NOQA
                                 )
-                    # elif input_dim is not None:
-                    #     # fallback到传入的input_dim参数
-                    #     feature_dim = (
-                    #         input_dim
-                    #         if isinstance(input_dim, int)
-                    #         else (
-                    #             sum(input_dim)
-                    #             if isinstance(input_dim, (list, tuple))
-                    #             else input_dim
-                    #         )
-                    #     )
-                    #     # 使用第一个在签名中找到的参数名
-                    #     param_name = input_dim_params_in_sig[0]
-                    #     kwargs[param_name] = feature_dim
-                    #     logging.info(
-                    #         f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from fallback input_dim"  # NOQA
-                    #     )
                     else:
                         logging.error(
                             f"Layer {name} ({layer_cls.__name__}) dimension inference failed - no input_dim available"  # NOQA
@@ -1055,22 +1037,6 @@ class Package(nn.Module):
                         f"sequence_dim={sequence_dim}, query_dim={query_dim}"
                     )
                     return sequence_dim, query_dim
-
-            # elif input_type == "block_name":
-            #     # 从其他block获取维度作为fallback
-            #     dim_info = self.dim_engine.get_output_dim(input_name)
-            #     if dim_info is not None:
-            #         dim = dim_info.get_feature_dim()
-            #         if sequence_dim is None:
-            #             sequence_dim = dim
-            #             logging.info(
-            #                 f"Using block {input_name} output as sequence with dim {dim}"
-            #             )
-            #         elif query_dim is None:
-            #             query_dim = dim
-            #             logging.info(
-            #                 f"Using block {input_name} output as query with dim {dim}"
-            #             )
             else:
                 raise NotImplementedError
 
@@ -1773,7 +1739,7 @@ class Backbone(nn.Module):
         for pkg in config.packages:
             Package(pkg, features, embedding_group, input_layer)  # Package是一个子DAG
 
-        # 初始化 top_mlp 目前top_mlp也会改变输出维度，暂未修复
+        # 初始化 top_mlp
         self._top_mlp = None
         if self._config.HasField("top_mlp"):
             params = Parameter.make_from_pb(self._config.top_mlp)
