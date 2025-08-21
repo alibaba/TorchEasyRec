@@ -47,11 +47,7 @@ def _attention_mask(
     )
     mask = (mask < sequence_length.unsqueeze(1)).int()
     mask = ~(torch.multiply(mask.unsqueeze(2), mask.unsqueeze(1)).type(torch.bool))
-    mask = (
-        mask.unsqueeze(1)
-        .expand(batch_size, num_heads, max_seq_length, max_seq_length)
-        .reshape(batch_size * num_heads, max_seq_length, max_seq_length)
-    )
+    mask = mask.repeat_interleave(repeats=num_heads, dim=0)
     return mask
 
 
@@ -289,6 +285,7 @@ class SelfAttentionEncoder(SequenceEncoder):
         )  # [B*num_heads, L, L]
         attn_output, attn_weights = self._multihead_attn(Q, K, V, attn_mask=attn_mask)
         attn_output = torch.nan_to_num(attn_output, nan=0.0)
+        sequence_length = torch.clamp_min(sequence_length, 1)
         output = attn_output.sum(dim=1) / sequence_length.unsqueeze(1)
         return output
 
