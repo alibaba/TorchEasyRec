@@ -22,7 +22,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class MultiTaskBackbone(MultiTaskRank):
+class ModularMultiTask(MultiTaskRank):
     """Multi-task backbone model.
 
     Args:

@@ -21,7 +21,7 @@ from tzrec.modules.backbone import Backbone
 from tzrec.protos.model_pb2 import ModelConfig
 
 
-class RankBackbone(RankModel):
+class ModularRank(RankModel):
     """Ranking backbone model."""
 
     def __init__(

@@ -22,7 +22,7 @@ from tzrec.protos import simi_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 
 
-class MatchBackbone(MatchModel):
+class ModularMatch(MatchModel):
     """Match backbone model for flexible dual-tower matching with configurable backbone.
 
     This implementation supports various matching models (DSSM, DAT, etc.) by using
