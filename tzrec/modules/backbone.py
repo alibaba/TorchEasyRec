@@ -148,31 +148,27 @@ class Package(nn.Module):
         embedding_group,
         feature_groups,
         wide_embedding_dim=None,
-        wide_init_fn=None,
-        input_layer=None,
+        wide_init_fn=None
     ):
         super().__init__()
-        # self._base_model_config = config
         self._config = config
         self._features = features
         self._embedding_group = embedding_group
         self._feature_groups = feature_groups
         self._wide_embedding_dim = wide_embedding_dim
         self._wide_init_fn = wide_init_fn
-        self._input_layer = input_layer
         # build DAG using networkx DiGraph
         self.G = nx.DiGraph()
         self._name_to_blocks = {}
 
         self._name_to_layer = nn.ModuleDict()  # Layer corresponding to each Block name
-        self._name_to_customize = {}  # 存储每个Block是否是自定义实现
+        self._name_to_customize = {}  # 每个Block是否是自定义实现
 
         # 使用新的维度推断引擎
         self.dim_engine = DimensionInferenceEngine()
 
-        # 存储每个Block的输出维度  e.g. {'user': 160, 'item': 96}
         self._name_to_output_dim = {}
-        self._name_to_input_dim = {}  # 存储每个Block的输入维度
+        self._name_to_input_dim = {}
 
         self.reset_input_config(None)
         self._block_outputs = {}
@@ -214,16 +210,6 @@ class Package(nn.Module):
                     # 构成一个可被复用的子网络，
                     # 被打包的子网络以共享参数的方式在同一个模型中调用多次
                     raise NotImplementedError
-                    if input_name not in self.G:
-                        self.G.add_node(input_name)
-                    self.G.add_edge(input_name, name)
-                    if input_node.HasField("package_input"):
-                        pkg_input_name = input_node.package_input
-                        if pkg_input_name not in self.G:
-                            self.G.add_node(pkg_input_name)
-                        self.G.add_edge(pkg_input_name, input_name)
-                elif input_type == "use_package_input":  # delete
-                    continue  # 特殊处理
                 else:
                     # block-to-block
                     if input_name in self._name_to_blocks:
@@ -233,9 +219,8 @@ class Package(nn.Module):
                             f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
                         )
         # ========== step 3: topo排序后依次define_layer ============
-        # self.G拓扑排序 输出图片
-        self.topo_order = nx.topological_sort(self.G)  # 迭代器
-        self.topo_order_list = list(self.topo_order)  # list
+        self.topo_order = nx.topological_sort(self.G)
+        self.topo_order_list = list(self.topo_order)
         A = to_agraph(self.G)
         A.layout("dot")
         import hashlib
@@ -273,8 +258,6 @@ class Package(nn.Module):
                         )
                     elif layer == "raw_input":
                         raise NotImplementedError
-                        input_fn = input_feature_groups[group]
-                        self._name_to_layer[block.name] = input_fn
                     elif layer == "embedding_layer":
                         raise NotImplementedError
                 else:
@@ -285,15 +268,13 @@ class Package(nn.Module):
                         wide_init_fn=self._wide_init_fn,
                     )
                     if layer == "input_layer":
-                        # 使用改进的维度推断引擎，支持batch_size估算
+                        # 使用维度推断引擎
                         dim_info = create_dimension_info_from_embedding(
                             input_fn,
                             group,
-                            batch_size=None,  # 可以在实际使用时传入batch_size
+                            batch_size=None,
                         )
                         self.dim_engine.register_output_dim(block.name, dim_info)
-
-                        # 保留兼容性
                         self._name_to_output_dim[block.name] = (
                             dim_info.get_feature_dim()
                         )
@@ -307,7 +288,7 @@ class Package(nn.Module):
                         raise NotImplementedError
                     self._name_to_layer[block.name] = input_fn
             else:  # module
-                # 使用新的维度推断引擎处理多输入维度
+                # 使用维度推断引擎处理多输入维度
                 input_dim_infos = []
 
                 for input_node in block.inputs:
@@ -348,17 +329,6 @@ class Package(nn.Module):
                                     logging.warning(
                                         f"{input_layer_type} layer {input_name} not found in _name_to_output_dim"  # NOQA
                                     )
-
-                        # if input_dim_info is None:
-                        #     # fallback到旧的方式
-                        #     if input_name in self._name_to_output_dim:
-                        #         output_dim = self._name_to_output_dim[input_name]
-                        #         input_dim_info = DimensionInfo(output_dim)
-                        #     else:
-                        #         raise KeyError(
-                        #             f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
-                        #         )
-
                         # 应用input_fn和input_slice变换
                         if input_fn or input_slice:
                             input_dim_info = self.dim_engine.apply_input_transforms(
@@ -440,15 +410,7 @@ class Package(nn.Module):
                                     f"{layer.capitalize()} layer {block.name} output dim already set: {output_dim_info}"  # NOQA
                                 )
                         else:
-                            # 验证维度兼容性
-                            # if not self.dim_engine.validate_dimension_compatibility(
-                            #     layer_obj, merged_input_dim
-                            # ):
-                            #     logging.warning(
-                            #         f"Dimension compatibility check failed for block {block.name}"  # NOQA
-                            #     )
-
-                            # 推断输出维度 - 使用改进的方法
+                            # 推断输出维度
                             output_dim_info = self.dim_engine.infer_layer_output_dim(
                                 layer_obj, merged_input_dim
                             )
@@ -553,21 +515,6 @@ class Package(nn.Module):
             }
         )
         return summary
-
-    # def validate_all_dimensions(self) -> bool:
-    #     """验证所有block的维度兼容性."""
-    #     all_valid = True
-    #     for block_name, layer in self._name_to_layer.items():
-    #         input_dim_info = self.dim_engine.block_input_dims.get(block_name)
-    #         if input_dim_info is not None:
-    #             if not self.dim_engine.validate_dimension_compatibility(
-    #                 layer, input_dim_info
-    #             ):
-    #                 logging.error(
-    #                     f"Dimension validation failed for block: {block_name}"
-    #                 )
-    #                 all_valid = False
-    #     return all_valid
 
     def output_block_dims(self):
         """返回最终输出 block 的维度组成的 list，比如 [160, 96]."""
@@ -681,7 +628,7 @@ class Package(nn.Module):
                     last_output_dim = output_dim_info.get_feature_dim()
                 else:
                     raise ValueError(
-                        f"Cannot determine input dimension for layer {name_i}"
+                        f"Cannot determine output dimension for layer {name_i}"
                     )
 
             # 设置父层(recurrent层)的输出维度为最后一个子层的输出维度
@@ -971,10 +918,7 @@ class Package(nn.Module):
                         f"无法为 {layer_cls.__name__} {name} 自动推断 {', '.join(missing_params)}。"  # NOQA
                         "请确保配置了正确的输入 feature groups 或手动指定这些参数。"
                     )
-
-            layer = layer_cls(
-                **kwargs
-            )  # 比如layer_cls是MLP,现在可以自动推断输入维度参数
+            layer = layer_cls(**kwargs)
             return layer, customize
         elif param_type is None:  # internal torch layer 内置 nn.module
             layer = layer_cls(name=name)
@@ -1180,7 +1124,6 @@ class Package(nn.Module):
             if input_node.HasField(
                 "input_slice"
             ):  # 通过python切片语法获取到输入元组的某个元素作为输入
-                # input_slice例子："[..., :10]"
                 fn = eval("lambda x: x" + input_node.input_slice.strip())
                 input_feature = fn(input_feature)
 
@@ -1278,7 +1221,6 @@ class Package(nn.Module):
                     input_config = self.input_config
                     if hasattr(input_fn, "reset"):
                         input_fn.reset(input_config, is_training)
-                # block_outputs[block] = input_fn(input_config, is_training)
                 if batch is not None:
                     embedding_outputs = input_fn(
                         batch
@@ -1353,7 +1295,7 @@ class Package(nn.Module):
         return output
 
     def _determine_input_format(self, layer_obj, inputs):
-        """智能判断模块需要的输入格式.
+        """判断模块需要的输入格式.
 
         Args:
             layer_obj: 要调用的层对象
@@ -1394,8 +1336,8 @@ class Package(nn.Module):
                 class_name = layer_obj.__class__.__name__
                 sequence_modules = [
                     "DINEncoder",
-                    "AttentionLayer",
-                    "SequenceLayer",
+                    "SimpleAttention",
+                    "PoolingEncoder",
                     "DIN",
                 ]
                 if any(seq_name in class_name for seq_name in sequence_modules):
@@ -1711,7 +1653,6 @@ class Backbone(nn.Module):
         feature_groups,
         wide_embedding_dim=None,
         wide_init_fn=None,
-        input_layer=None,
     ):
         super().__init__()
         self._config = config
@@ -1734,10 +1675,10 @@ class Backbone(nn.Module):
             feature_groups,
             wide_embedding_dim,
             wide_init_fn,
-            input_layer,
+            # input_layer,
         )  # input_layer目前没有用到
         for pkg in config.packages:
-            Package(pkg, features, embedding_group, input_layer)  # Package是一个子DAG
+            Package(pkg, features, embedding_group)  # Package是一个子DAG
 
         # 初始化 top_mlp
         self._top_mlp = None
