@@ -287,7 +287,7 @@ class Package(nn.Module):
                     else:  # embedding_layer
                         raise NotImplementedError
                     self._name_to_layer[block.name] = input_fn
-            else:  # module
+            elif layer is not None:  # module 为None的情况可能是sequential c
                 # 使用维度推断引擎处理多输入维度
                 input_dim_infos = []
 
@@ -451,14 +451,66 @@ class Package(nn.Module):
                         logging.info(
                             f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
                         )
+            else:  # layer is None, e.g. sequential block
+                if len(block.inputs) == 0:
+                    # sequential block without inputs, use input_dim_info
+                    raise ValueError(
+                        f"Sequential block {block.name} has no input dimensions registered"  # NOQA
+                    )
+                else:
+                    # sequential block with inputs, use merged input dimensions
+                    for input_node in block.inputs:
+                        input_type = input_node.WhichOneof("name")
+                        input_name = getattr(input_node, input_type)
+                        # 解析input_fn & input_slice 暂不支持 sequential 里的 input_fn & input_slice
+                        input_fn = getattr(input_node, "input_fn", None)
+                        input_slice = getattr(input_node, "input_slice", None)
 
-            # sequential layers
-            # for i, layer_cnf in enumerate(block.layers):
-            #     layer = layer_cnf.WhichOneof('layer')
-            #     name_i = '%s_l%d' % (block.name, i)
-            #     self.define_layers(layer, layer_cnf, name_i)
-            #     print(f"Defining sequential layer {name_i} of type {layer}")
-
+                        if input_type == "package_name":
+                            # package 为子DAG 作为 Block 的输入
+                            # sequential里再嵌套package的情况
+                            raise NotImplementedError
+                        else:  # block_name 或者 feature_group_name 的情况
+                            # 从维度推断引擎获取输入维度信息
+                            input_dim_info = self.dim_engine.get_output_dim(input_name)
+                # sequential layers 维度推断
+                prev_output_dim_info = input_dim_info
+                prev_output_dim = input_dim_info.get_feature_dim()
+                last_output_dim_info = None
+                last_output_dim = None
+                for i, layer_cnf in enumerate(block.layers):
+                    layer = layer_cnf.WhichOneof('layer')
+                    name_i = '%s_l%d' % (block.name, i) # e.g. block1_l0
+                    # 注册输入维度
+                    self.dim_engine.register_input_dim(name_i, prev_output_dim_info)
+                    self._name_to_input_dim[name_i] = prev_output_dim
+                    # 定义layer
+                    self.define_layers(layer, layer_cnf, name_i)
+                    # 注册layer到维度推断引擎
+                    if name_i in self._name_to_layer:
+                        layer_obj = self._name_to_layer[name_i]
+                        self.dim_engine.register_layer(name_i, layer_obj)
+                        # 推断输出维度
+                        if isinstance(layer_obj, LambdaWrapper):
+                            output_dim_info = layer_obj.infer_output_dim(prev_output_dim_info)
+                        else:
+                            output_dim_info = self.dim_engine.infer_layer_output_dim(layer_obj, prev_output_dim_info)
+                        self.dim_engine.register_output_dim(name_i, output_dim_info)
+                        self._name_to_output_dim[name_i] = output_dim_info.get_feature_dim()
+                        # 更新prev为当前输出
+                        prev_output_dim_info = output_dim_info
+                        prev_output_dim = output_dim_info.get_feature_dim()
+                        last_output_dim_info = output_dim_info
+                        last_output_dim = output_dim_info.get_feature_dim()
+                    else:
+                        raise ValueError(f"Sequential layer {name_i} not found in _name_to_layer")
+                # block输出维度为最后一层输出
+                if last_output_dim_info is not None:
+                    self.dim_engine.register_output_dim(block.name, last_output_dim_info)
+                    self._name_to_output_dim[block.name] = last_output_dim
+                    logging.info(f"Sequential block {block.name} output dim set to {last_output_dim}")
+                else:
+                    raise ValueError(f"Cannot determine output dimension for sequential block {block.name}")
 
         # ======= 后处理、输出节点推断 =======
         input_feature_groups = self._feature_group_inputs
@@ -929,18 +981,19 @@ class Package(nn.Module):
             layer = layer_cls(**kwargs)
             return layer, customize
         elif param_type is None:  # internal torch layer 内置 nn.module
-            layer = layer_cls(name=name)
+            layer = layer_cls()
             return layer, customize
         else:  # st_params 参数
             assert param_type == "st_params", (
-                "internal torch layer only support st_params"
+                "internal torch layer only support st_params as parameters"
             )
             try:
                 kwargs = convert_to_dict(layer_conf.st_params)
                 logging.info(
                     "call %s layer with params %r" % (layer_conf.class_name, kwargs)
                 )
-                layer = layer_cls(name=name, **kwargs)
+                # layer = layer_cls(name=name, **kwargs)
+                layer = layer_cls(**kwargs)
             except TypeError as e:
                 logging.warning(e)
                 args = map(format_value, layer_conf.st_params.values())
@@ -1680,9 +1733,8 @@ class Backbone(nn.Module):
             embedding_group,
             feature_groups,
             wide_embedding_dim,
-            wide_init_fn,
-            # input_layer,
-        )  # input_layer目前没有用到
+            wide_init_fn
+        )
         for pkg in config.packages:
             Package(pkg, features, embedding_group)  # Package是一个子DAG
 
