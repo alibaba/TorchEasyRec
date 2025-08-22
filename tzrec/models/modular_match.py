@@ -154,7 +154,6 @@ class ModularMatch(MatchModel):
                 "labels": self._labels,
             }
             return self._backbone_net(
-                is_training=self.training,
                 batch=batch,
                 **kwargs,
             )
@@ -310,7 +309,7 @@ class ModularMatch(MatchModel):
                     self.user_projection_layer = None
 
             def forward(self, batch: Batch) -> torch.Tensor:
-                backbone_output = self.backbone_net(is_training=False, batch=batch)
+                backbone_output = self.backbone_net(batch=batch)
 
                 # 提取用户特征
                 if isinstance(backbone_output, dict):
@@ -361,7 +360,7 @@ class ModularMatch(MatchModel):
                     self.item_projection_layer = None
 
             def forward(self, batch: Batch) -> torch.Tensor:
-                backbone_output = self.backbone_net(is_training=False, batch=batch)
+                backbone_output = self.backbone_net(batch=batch)
 
                 # 提取物品特征
                 if isinstance(backbone_output, dict):

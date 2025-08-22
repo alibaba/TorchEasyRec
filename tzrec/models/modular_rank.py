@@ -76,7 +76,6 @@ class ModularRank(RankModel):
                 "labels": self._labels,
             }
             return self._backbone_net(
-                is_training=self.training,
                 batch=batch,
                 **kwargs,
             )

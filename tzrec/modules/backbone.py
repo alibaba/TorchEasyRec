@@ -452,6 +452,14 @@ class Package(nn.Module):
                             f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
                         )
 
+            # sequential layers
+            # for i, layer_cnf in enumerate(block.layers):
+            #     layer = layer_cnf.WhichOneof('layer')
+            #     name_i = '%s_l%d' % (block.name, i)
+            #     self.define_layers(layer, layer_cnf, name_i)
+            #     print(f"Defining sequential layer {name_i} of type {layer}")
+
+
         # ======= 后处理、输出节点推断 =======
         input_feature_groups = self._feature_group_inputs
         num_groups = len(input_feature_groups)  # input_feature_groups的数量
@@ -1064,13 +1072,12 @@ class Package(nn.Module):
         """
         return self._block_outputs.get(name, None)
 
-    def block_input(self, config, block_outputs, training=None, **kwargs):
+    def block_input(self, config, block_outputs, **kwargs):
         """Process and merge inputs for a block based on its configuration.
 
         Args:
             config: Block configuration containing input specifications.
             block_outputs (dict): Dictionary of outputs from previously executed blocks.
-            training (bool, optional): Whether the model is in training mode.
             **kwargs: Additional keyword arguments passed to downstream components.
 
         Returns:
@@ -1102,12 +1109,12 @@ class Package(nn.Module):
                                 f"package name `{pkg_input_name}` does not exist"
                             )
                         inner_package = Package.__packages[pkg_input_name]
-                        pkg_input = inner_package(training)
+                        pkg_input = inner_package()
                     if input_node.HasField("package_input_fn"):
                         fn = eval(input_node.package_input_fn)
                         pkg_input = fn(pkg_input)
                     package.set_package_input(pkg_input)
-                input_feature = package(training, **kwargs)
+                input_feature = package(**kwargs)
 
             elif input_name in block_outputs:
                 input_feature = block_outputs[input_name]
@@ -1162,11 +1169,10 @@ class Package(nn.Module):
 
         return output
 
-    def forward(self, is_training, batch=None, **kwargs):
+    def forward(self, batch=None, **kwargs):
         """Execute forward pass through the package DAG.
 
         Args:
-            is_training (bool): Whether the model is in training mode.
             batch (Any, optional): Input batch data. Defaults to None.
             **kwargs: Additional keyword arguments passed to layers.
 
@@ -1191,7 +1197,7 @@ class Package(nn.Module):
             # Case 1: sequential layers
             if hasattr(config, "layers") and config.layers:
                 logging.info("call sequential %d layers" % len(config.layers))
-                output = self.block_input(config, block_outputs, is_training, **kwargs)
+                output = self.block_input(config, block_outputs, **kwargs)
                 for i, layer in enumerate(config.layers):
                     name_i = "%s_l%d" % (block, i)
                     output = self.call_layer(output, layer, name_i, **kwargs)
@@ -1201,7 +1207,7 @@ class Package(nn.Module):
             # Case 2: single layer  just one of layer
             layer_type = config.WhichOneof("layer")
             if layer_type is None:  # identity layer
-                output = self.block_input(config, block_outputs, is_training, **kwargs)
+                output = self.block_input(config, block_outputs, **kwargs)
                 block_outputs[block] = output
             elif layer_type == "raw_input":
                 block_outputs[block] = self._name_to_layer[block]
@@ -1220,7 +1226,7 @@ class Package(nn.Module):
                 if self.input_config is not None:
                     input_config = self.input_config
                     if hasattr(input_fn, "reset"):
-                        input_fn.reset(input_config, is_training)
+                        input_fn.reset(input_config)
                 if batch is not None:
                     embedding_outputs = input_fn(
                         batch
@@ -1254,10 +1260,10 @@ class Package(nn.Module):
                 input_fn = self._name_to_layer[block]
                 feature_group = config.inputs[0].feature_group_name
                 inputs, _, weights = self._feature_group_inputs[feature_group]
-                block_outputs[block] = input_fn([inputs, weights], is_training)
+                block_outputs[block] = input_fn([inputs, weights])
             else:
                 # module  Custom layer 一些自定义的层  例如 mlp
-                inputs = self.block_input(config, block_outputs, is_training, **kwargs)
+                inputs = self.block_input(config, block_outputs, **kwargs)
                 output = self.call_layer(inputs, config, block, **kwargs)
                 block_outputs[block] = output
 
@@ -1691,18 +1697,17 @@ class Backbone(nn.Module):
             kwargs = config_to_kwargs(params)
             self._top_mlp = MLP(in_features=total_output_dim, **kwargs)
 
-    def forward(self, is_training, batch=None, **kwargs):
+    def forward(self, batch=None, **kwargs):
         """Forward pass through the backbone network.
 
         Args:
-            is_training (bool): Whether the model is in training mode.
             batch (Any, optional): Input batch data. Defaults to None.
             **kwargs: Additional keyword arguments.
 
         Returns:
             torch.Tensor: Output tensor from the backbone network.
         """
-        output = self._main_pkg(is_training, batch, **kwargs)
+        output = self._main_pkg(batch, **kwargs)
 
         if hasattr(self, "_top_mlp") and self._top_mlp is not None:
             if isinstance(output, (list, tuple)):
