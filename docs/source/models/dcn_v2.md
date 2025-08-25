@@ -1,16 +1,19 @@
-# DCN
+# DCN V2
 
 ## 简介
 
-### DCN v1
+### DCN v2
 
-Deep＆Cross Network（DCN）是在DNN模型的基础上，引入了交叉网络，该网络在学习某些特征交叉时效率更高。特别是，DCN显式地在每一层应用特征交叉，不需要人工特征工程，并且只增加了很小的额外复杂性。
+相对于DCN v1模型，主要的改进点在于：
 
-![DCNV1](../../images/models/dcn_v1.jpg)
+1. Wide侧-Cross Network中用矩阵替代向量,方阵可以分解成2个低维矩阵;
+1. 提出2种模型结构，传统的Wide&Deep并行 + Wide&Deep串行。
+   ![dcn_v2](../../images/models/dcn_v2.jpg)
+   ![dcn_v2_cross](../../images/models/dcn_v2_cross.jpg)
 
 ## 配置说明
 
-### DCNV1
+### DCNV2
 
 ```
 model_config {
@@ -34,22 +37,28 @@ model_config {
         feature_names: "price"
         group_type: DEEP
     }
-    dcn_v1 {
+    dcn_v2 {
+        backbone {
+            hidden_units: 512
+            hidden_units: 256
+            hidden_units: 128
+        }
         cross {
-            cross_num: 3
+            cross_num: 2
+            low_rank: 32
         }
         deep {
-            hidden_units: [256, 128]
+            hidden_units: 512
+            hidden_units: 256
         }
         final {
-            hidden_units: [64, 32]
+            hidden_units: 128
+            hidden_units: 32
         }
     }
+    num_class: 1
     metrics {
         auc {}
-        grouped_auc {
-            grouping_key: "user_id"
-        }
     }
     losses {
         binary_cross_entropy {}
@@ -57,12 +66,18 @@ model_config {
 }
 ```
 
+- backbone: dnn层,可选配置,特征在进入cross层的时候是否要经过dnn层的处理
 - cross
   - cross_num: 交叉层层数，默认为3
+  - low_rank: cross层中大矩阵分解成2个低维矩阵的维度
 - deep
   - hidden_units: dnn每一层的channel数目，即神经元的数目
 - final: 整合cross层, deep层的全连接层
 
-## 参考论文
+### 示例Config
 
-[dcn.pdf](https://arxiv.org/abs/1708.05123)
+[dcn_v2_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dcn_v2_criteo.config)
+
+### 参考论文
+
+[DCN v2](https://arxiv.org/abs/2008.13535)

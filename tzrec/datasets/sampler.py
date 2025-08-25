@@ -739,6 +739,10 @@ class TDMSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
+        if config.attr_fields[0] != "tree_level":
+            config.attr_fields.insert(0, "tree_level")
+        if config.attr_fields[1] != config.item_id_field:
+            config.attr_fields.insert(1, config.item_id_field)
         super().__init__(
             config,
             fields,
@@ -819,7 +823,7 @@ class TDMSampler(BaseSampler):
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         time.sleep(random.randint(0, num_workers * local_world_size))
         if use_hash_node_id():
-            self.get({self._item_id_field: pa.array(["0"], type=np.object_)})
+            self.get({self._item_id_field: pa.array(["0"], type=pa.string())})
         else:
             self.get({self._item_id_field: pa.array([0])})
 
@@ -834,15 +838,25 @@ class TDMSampler(BaseSampler):
         """
         ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
         batch_size = len(ids)
-        num_fea = len(self._valid_attr_names[1:])
+        valid_attr_names = self._valid_attr_names[1:]
+        num_fea = len(valid_attr_names)
 
         # positive node.
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
-
-        # the ids of non-leaf nodes is arranged in ascending order.
-        pos_non_leaf_ids = np.sort(pos_nodes.ids, axis=1)
-        pos_ids = np.concatenate((pos_non_leaf_ids, ids), axis=1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
+        if use_hash_node_id():
+            # pos_nodes.ids are ids after hash, so that we should get raw
+            # ids from attributes
+            pos_non_leaf_ids = (
+                pos_fea_result[valid_attr_names.index(self._item_id_field)]
+                .to_numpy(zero_copy_only=False)
+                .reshape(batch_size, -1)
+            )
+        else:
+            pos_non_leaf_ids = pos_nodes.ids
+        # the ids of non-leaf nodes is arranged in ascending order.
+        pos_non_leaf_ids = np.sort(pos_non_leaf_ids, axis=1)
+        pos_ids = np.concatenate((pos_non_leaf_ids, ids), axis=1)
 
         # randomly select layers to keep
         if self._remain_ratio < 1.0:
@@ -904,8 +918,8 @@ class TDMSampler(BaseSampler):
             for i in range(num_fea)
         ]
 
-        pos_result_dict = dict(zip(self._valid_attr_names[1:], pos_fea_result))
-        neg_result_dict = dict(zip(self._valid_attr_names[1:], neg_fea_result))
+        pos_result_dict = dict(zip(valid_attr_names, pos_fea_result))
+        neg_result_dict = dict(zip(valid_attr_names, neg_fea_result))
 
         return pos_result_dict, neg_result_dict
 
@@ -936,8 +950,18 @@ class TDMPredictSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
-        fields = [pa.field("tree_level", pa.int64())] + fields
-        super().__init__(config, fields, batch_size, is_training, multival_sep)
+        if config.attr_fields[0] != "tree_level":
+            config.attr_fields.insert(0, "tree_level")
+        if config.attr_fields[1] != config.item_id_field:
+            config.attr_fields.insert(1, config.item_id_field)
+        super().__init__(
+            config,
+            fields,
+            batch_size,
+            is_training,
+            multival_sep,
+            typed_fields=[pa.field("tree_level", pa.int64())],
+        )
         self._g = (
             gl.Graph()
             .node(

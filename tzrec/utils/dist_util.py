@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import os
+from queue import Queue
 from typing import List, Optional
 
 import torch
@@ -39,6 +40,7 @@ from torchrec.distributed.train_pipeline import (
 from torchrec.distributed.types import (
     Awaitable,
     ModuleSharder,
+    ShardedModule,
     ShardingEnv,
     ShardingPlan,
 )
@@ -50,6 +52,7 @@ def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.Proces
     pg = None
     world_size = world_size or int(os.environ.get("WORLD_SIZE", 1))
     if world_size > 1:
+        # pyre-ignore [16]
         if dist.is_initialized() and dist.GroupMember.WORLD.size() == world_size:
             pg = dist.GroupMember.WORLD
         else:
@@ -161,9 +164,11 @@ def _pipeline_backward(losses: torch.Tensor, optimizer: torch.optim.Optimizer) -
         loss = torch.sum(losses, dim=0)
         if (
             hasattr(optimizer, "_gradient_accumulation_steps")
+            # pyre-ignore [16]
             and optimizer._gradient_accumulation_steps > 1
         ):
             loss = loss / optimizer._gradient_accumulation_steps
+        # pyre-ignore [16]
         if hasattr(optimizer, "_grad_scaler") and optimizer._grad_scaler is not None:
             optimizer._grad_scaler.scale(loss).backward()
         else:
@@ -185,22 +190,39 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
 
 
 def create_train_pipeline(
-    model: _DistributedModelParallel, optimizer: Optional[torch.optim.Optimizer] = None
+    model: nn.Module, optimizer: Optional[torch.optim.Optimizer] = None
 ) -> TrainPipeline:
     """Create TrainPipeline.
 
     Args:
-        model (DistributedModelParallel): a DMP model.
+        model (nn.Module): a DMP model.
         optimizer (torch.optim.Optimizer): a KeyedOptimizer.
 
     Return:
         a TrainPipeline.
     """
-    trainable_params, frozen_params = model.module.model.sparse_parameters()
-    if len(trainable_params) == 0 and len(frozen_params) == 0:
+    has_sparse_module = False
+
+    q = Queue()
+    q.put(model.module)
+    while not q.empty():
+        m = q.get()
+        if isinstance(m, ShardedModule):
+            has_sparse_module = True
+            break
+        else:
+            for child in m.children():
+                q.put(child)
+
+    if not has_sparse_module:
         # use TrainPipelineBase when model do not have sparse parameters.
+        # pyre-ignore [6]
         return TrainPipelineBase(model, optimizer, model.device)
     else:
         return TrainPipelineSparseDist(
-            model, optimizer, model.device, execute_all_batches=True
+            model,
+            # pyre-ignore [6]
+            optimizer,
+            model.device,
+            execute_all_batches=True,
         )
