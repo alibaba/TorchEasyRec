@@ -52,6 +52,19 @@ def _softmax(x: torch.Tensor, dim: int, half_to_float: bool) -> torch.Tensor:
     return result
 
 
+def get_max_export_batch_size() -> int:
+    """Get max export batch size.
+
+    Returns:
+        int: max_batch_size
+    """
+    batch_size = int(os.environ.get("MAX_EXPORT_BATCH_SIZE", 512))
+    # compact with old trt batch size config
+    if "TRT_MAX_BATCH_SIZE" in os.environ:
+        batch_size = int(os.environ.get("TRT_MAX_BATCH_SIZE"))
+    return batch_size
+
+
 def export_pm(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> Tuple[torch.export.ExportedProgram, Dict[str, torch.Tensor]]:
@@ -71,6 +84,11 @@ def export_pm(
         f.write(gm.code)
 
     gm = gm.cuda()
+
+    # get dense keys list
+    dense_keys_list = []
+    for _, keys in model._data_parser.dense_keys.items():
+        dense_keys_list.extend(keys)
 
     batch = Dim("batch")
     dynamic_shapes = {}
@@ -94,7 +112,7 @@ def export_pm(
             dynamic_shapes[key] = {}
 
         # dense values
-        elif key.split(".")[0] in model._data_parser.dense_keys_list:
+        elif key.split(".")[0] in dense_keys_list:
             # user feats
             if key.split(".")[0] in model._data_parser.user_feats:
                 assert data[key].shape[0] == 1

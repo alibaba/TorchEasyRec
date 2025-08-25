@@ -9,6 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import shutil
+import tempfile
 import unittest
 
 import torch
@@ -28,14 +31,29 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model
+from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
 
 
 class MultiTowerDINTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = None
+
+    def tearDown(self):
+        if self.test_dir is not None and os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            [TestGraphType.JIT_SCRIPT],
+            [TestGraphType.AOT_INDUCTOR],
+        ]
     )
     def test_multi_tower_din(self, graph_type) -> None:
+        if graph_type == TestGraphType.AOT_INDUCTOR and gpu_unavailable[0]:
+            return
+
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -130,7 +148,6 @@ class MultiTowerDINTest(unittest.TestCase):
             model_config=model_config, features=features, labels=["label"]
         )
         init_parameters(multi_tower_din, device=torch.device("cpu"))
-        multi_tower_din = create_test_model(multi_tower_din, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b", "click_seq__cat_a", "click_seq__cat_b"],
@@ -153,8 +170,18 @@ class MultiTowerDINTest(unittest.TestCase):
             labels={},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
+            multi_tower_din = create_test_model(multi_tower_din, graph_type)
             predictions = multi_tower_din(batch.to_dict())
+        elif graph_type == TestGraphType.AOT_INDUCTOR:
+            print("aot")
+            data = batch.to_dict()
+            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            multi_tower_din = create_test_model(
+                multi_tower_din, graph_type, data, self.test_dir
+            )
+            predictions = multi_tower_din(data)
         else:
+            multi_tower_din = create_test_model(multi_tower_din, graph_type)
             predictions = multi_tower_din(batch)
         self.assertEqual(predictions["logits"].size(), (2,))
         self.assertEqual(predictions["probs"].size(), (2,))
