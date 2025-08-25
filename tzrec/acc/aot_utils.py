@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import os
 from typing import Dict
 
 import torch
@@ -21,7 +22,7 @@ from tzrec.acc.export_utils import export_pm
 def export_model_aot(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> torch.export.ExportedProgram:
-    """Export aot model.
+    """Export AOTInductor model.
 
     Args:
         model (nn.Module): the model
@@ -30,5 +31,8 @@ def export_model_aot(
     """
     exported_pg, data = export_pm(model, data, save_dir)
 
-    # TODO(aot cmpile)
+    torch._inductor.aoti_compile_and_package(
+        exported_pg,
+        package_path=os.path.join(save_dir, "aoti_model.pt2"),
+    )
     return exported_pg
