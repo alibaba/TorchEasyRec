@@ -396,6 +396,7 @@ def tdm_retrieval(
         p.join()
     for t in forward_t_list:
         t.join()
+    assert write_t is not None
     write_t.join()
     writer.close()
 
