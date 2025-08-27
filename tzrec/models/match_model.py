@@ -230,7 +230,10 @@ class MatchModel(BaseModel):
                 hard_negative_sampler_v2"
         )
 
-        if self.sampler_type in ["negative_sampler", "negative_sampler_v2"]:
+        if (
+            self.sampler_type in ["negative_sampler", "negative_sampler_v2"]
+            or hard_neg_indices.size(0) == 0
+        ):
             pos_item_emb = item_emb[:batch_size]
             neg_item_emb = item_emb[batch_size:]
             pos_ui_sim = torch.sum(

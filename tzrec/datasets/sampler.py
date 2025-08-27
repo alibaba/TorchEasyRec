@@ -598,11 +598,13 @@ class HardNegativeSampler(BaseSampler):
         nodes = self._neg_sampler.get(dst_ids)
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
-        hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
-
-        results = []
-        for i, v in enumerate(hard_neg_features):
-            results.append(pa.concat_arrays([neg_features[i], v]))
+        if len(sparse_nodes.indices) > 0:
+            results = []
+            hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+            for i, v in enumerate(hard_neg_features):
+                results.append(pa.concat_arrays([neg_features[i], v]))
+        else:
+            results = neg_features
 
         result_dict = dict(zip(self._valid_attr_names, results))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
@@ -700,11 +702,13 @@ class HardNegativeSamplerV2(BaseSampler):
         nodes = self._neg_sampler.get(padded_src_ids, dst_ids)
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
-        hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
-
-        results = []
-        for i, v in enumerate(hard_neg_features):
-            results.append(pa.concat_arrays([neg_features[i], v]))
+        if len(sparse_nodes.indices) > 0:
+            results = []
+            hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+            for i, v in enumerate(hard_neg_features):
+                results.append(pa.concat_arrays([neg_features[i], v]))
+        else:
+            results = neg_features
 
         result_dict = dict(zip(self._valid_attr_names, results))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
