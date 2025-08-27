@@ -1206,7 +1206,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         if need_input_tile_emb:
             self.ec_dict_user = nn.ModuleDict()
             for k, emb_configs in dim_to_emb_configs_user.items():
-                self.ec_dict[str(k)] = EmbeddingCollection(
+                self.ec_dict_user[str(k)] = EmbeddingCollection(
                     list(emb_configs.values()), device=device
                 )
 
