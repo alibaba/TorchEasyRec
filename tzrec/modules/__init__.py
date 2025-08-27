@@ -8,3 +8,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from .backbone_module import FM, Add
+from .cross import Cross, CrossNet
+from .masknet import MaskBlock, MaskNetModule
+from .mlp import MLP
+from .mmoe import MMoE
+from .sequence import DINEncoder as DIN
+
+# from .fm import FactorizationMachine as FM
+__all__ = [
+    "MLP",
+    "Add",
+    "FM",
+    "DIN",
+    "MMoE",
+    "Cross",
+    "CrossNet",
+    "MaskNetModule",
+    "MaskBlock",
+]
