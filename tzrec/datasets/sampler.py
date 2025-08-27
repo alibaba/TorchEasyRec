@@ -327,6 +327,8 @@ class BaseSampler(metaclass=_meta_cls):
         self, nodes: gl.Nodes
     ) -> Tuple[List[pa.Array], npt.NDArray]:
         features = []
+        if len(nodes.indices) == 0:
+            return features, nodes.indices
         int_idx = 0
         float_idx = 0
         string_idx = 0
@@ -598,15 +600,12 @@ class HardNegativeSampler(BaseSampler):
         nodes = self._neg_sampler.get(dst_ids)
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
-        if len(sparse_nodes.indices) > 0:
-            results = []
-            hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+        hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+        if len(hard_neg_indices) > 0:
             for i, v in enumerate(hard_neg_features):
-                results.append(pa.concat_arrays([neg_features[i], v]))
-        else:
-            results = neg_features
+                neg_features[i] = pa.concat_arrays([neg_features[i], v])
 
-        result_dict = dict(zip(self._valid_attr_names, results))
+        result_dict = dict(zip(self._valid_attr_names, neg_features))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
         return result_dict
 
@@ -702,15 +701,12 @@ class HardNegativeSamplerV2(BaseSampler):
         nodes = self._neg_sampler.get(padded_src_ids, dst_ids)
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
-        if len(sparse_nodes.indices) > 0:
-            results = []
-            hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+        hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+        if len(hard_neg_indices) > 0:
             for i, v in enumerate(hard_neg_features):
-                results.append(pa.concat_arrays([neg_features[i], v]))
-        else:
-            results = neg_features
+                neg_features[i] = pa.concat_arrays([neg_features[i], v])
 
-        result_dict = dict(zip(self._valid_attr_names, results))
+        result_dict = dict(zip(self._valid_attr_names, neg_features))
         result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
         return result_dict
 
