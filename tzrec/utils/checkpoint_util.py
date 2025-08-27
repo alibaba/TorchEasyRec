@@ -61,6 +61,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
 
         # mapping old __BASE__.ec_list.0 to new __BASE__.ec_dict.{dim}
         ec_compat_map = {}
+        # pyre-ignore [16]
         for k, v in self.metadata.state_dict_metadata.items():
             if k.endswith(".weight") and isinstance(v, TensorStorageMetadata):
                 for old_pattern, new_pattern in [
@@ -95,7 +96,6 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                         "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
                     )
 
-            # pyre-ignore [16]
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
