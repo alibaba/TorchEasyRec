@@ -26,6 +26,7 @@ from graphlearn.python.nn.pytorch.data.utils import launch_server
 from torch import distributed as dist
 from torch.utils.data import get_worker_info
 
+from tzrec.datasets.utils import HARD_NEG_INDICES
 from tzrec.protos import sampler_pb2
 from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
@@ -601,12 +602,14 @@ class HardNegativeSampler(BaseSampler):
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
         hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+
+        result_dict = {}
         if len(hard_neg_indices) > 0:
+            result_dict[HARD_NEG_INDICES] = pa.array(hard_neg_indices)
             for i, v in enumerate(hard_neg_features):
                 neg_features[i] = pa.concat_arrays([neg_features[i], v])
 
-        result_dict = dict(zip(self._valid_attr_names, neg_features))
-        result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
+        result_dict.update(dict(zip(self._valid_attr_names, neg_features)))
         return result_dict
 
     @property

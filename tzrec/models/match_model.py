@@ -230,10 +230,7 @@ class MatchModel(BaseModel):
                 hard_negative_sampler_v2"
         )
 
-        if (
-            self.sampler_type in ["negative_sampler", "negative_sampler_v2"]
-            or hard_neg_indices.size(0) == 0
-        ):
+        if hard_neg_indices is None:
             pos_item_emb = item_emb[:batch_size]
             neg_item_emb = item_emb[batch_size:]
             pos_ui_sim = torch.sum(
@@ -241,7 +238,7 @@ class MatchModel(BaseModel):
             )
             neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
             return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
-        else:  # hard_negative_sampler and hard_negative_sampler_v2
+        else:  # hard negative
             n_hard = hard_neg_indices.size(0)  # pyre-ignore [16]
 
             # compute simple sample similarities
