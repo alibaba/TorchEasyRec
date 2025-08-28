@@ -608,7 +608,6 @@ class HardNegativeSampler(BaseSampler):
             result_dict[HARD_NEG_INDICES] = pa.array(hard_neg_indices)
             for i, v in enumerate(hard_neg_features):
                 neg_features[i] = pa.concat_arrays([neg_features[i], v])
-
         result_dict.update(dict(zip(self._valid_attr_names, neg_features)))
         return result_dict
 
@@ -705,12 +704,13 @@ class HardNegativeSamplerV2(BaseSampler):
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
         hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
+
+        result_dict = {}
         if len(hard_neg_indices) > 0:
+            result_dict[HARD_NEG_INDICES] = pa.array(hard_neg_indices)
             for i, v in enumerate(hard_neg_features):
                 neg_features[i] = pa.concat_arrays([neg_features[i], v])
-
-        result_dict = dict(zip(self._valid_attr_names, neg_features))
-        result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
+        result_dict.update(dict(zip(self._valid_attr_names, neg_features)))
         return result_dict
 
     @property
