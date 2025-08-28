@@ -80,14 +80,14 @@ def _sim_with_sampler(
             0,
             hard_neg_indices[:, 0],
         )  # [n_hard, d]
-        _hard_neg_ui_sim = torch.sum(
+        hard_neg_ui_sim = torch.sum(
             torch.multiply(hard_user_emb, hard_item_emb), dim=-1, keepdim=True
         )  # [n_hard, 1]
 
         sparse_shape = [batch_size, int(torch.max(hard_neg_indices[:, 1]).item()) + 1]
         hard_neg_ui_sim = torch.sparse_coo_tensor(
             hard_neg_indices.T,
-            _hard_neg_ui_sim.ravel(),
+            hard_neg_ui_sim.ravel(),
             sparse_shape,
             device=hard_neg_indices.device,
         ).to_dense()
