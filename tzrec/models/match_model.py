@@ -61,8 +61,8 @@ def _sim_with_sampler(
         )
         neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
         return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
-    else:  # hard_negative_sampler and hard_negative_sampler_v2
-        n_hard = hard_neg_indices.size(0)  # pyre-ignore [16]
+    else:
+        n_hard = hard_neg_indices.size(0)
 
         # compute simple sample similarities
         simple_item_emb = item_emb[0:-n_hard]
@@ -78,7 +78,7 @@ def _sim_with_sampler(
         hard_user_emb = torch.index_select(
             user_emb,
             0,
-            hard_neg_indices[:, 0],  # pyre-ignore [16]
+            hard_neg_indices[:, 0],
         )  # [n_hard, d]
         _hard_neg_ui_sim = torch.sum(
             torch.multiply(hard_user_emb, hard_item_emb), dim=-1, keepdim=True
