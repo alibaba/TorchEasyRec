@@ -80,12 +80,13 @@ class SamplerTest(unittest.TestCase):
         f.flush()
         return f
 
-    def _create_noclk_edge_gl_data(self, id_type="int64"):
+    def _create_noclk_edge_gl_data(self, id_type="int64", empty=False):
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
         f.write(f"userid:{id_type}\titemid:{id_type}\tweight:float\n")
-        for i in range(100):
-            f.write(f"{i}\t{99 - i}\t{1}\n")
+        if not empty:
+            for i in range(100):
+                f.write(f"{i}\t{99 - i}\t{1}\n")
         f.flush()
         return f
 
@@ -416,13 +417,13 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(res["float_b"]), 8)
         self.assertEqual(len(res["str_c"]), 8)
 
-    @parameterized.expand([["int64"], ["string"]])
-    def test_hard_negative_sampler(self, id_type):
+    @parameterized.expand([["int64", False], ["string", False], ["int64", True]])
+    def test_hard_negative_sampler(self, id_type, empty_edge=False):
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         f_user = self._create_user_gl_data(id_type)
         f_item = self._create_item_gl_data(id_type)
-        f_noclk_edge = self._create_noclk_edge_gl_data(id_type)
+        f_noclk_edge = self._create_noclk_edge_gl_data(id_type, empty=empty_edge)
 
         def _sampler_worker(res):
             config = sampler_pb2.HardNegativeSampler(
@@ -470,18 +471,23 @@ class SamplerTest(unittest.TestCase):
         p.join()
         if p.exitcode != 0:
             raise RuntimeError("worker failed.")
-        self.assertGreater(len(res["int_a"]), 8)
-        self.assertGreater(len(res["float_b"]), 8)
-        self.assertGreater(len(res["str_c"]), 8)
+        if empty_edge:
+            self.assertEqual(len(res["int_a"]), 8)
+            self.assertEqual(len(res["float_b"]), 8)
+            self.assertEqual(len(res["str_c"]), 8)
+        else:
+            self.assertGreater(len(res["int_a"]), 8)
+            self.assertGreater(len(res["float_b"]), 8)
+            self.assertGreater(len(res["str_c"]), 8)
 
-    @parameterized.expand([["int64"], ["string"]])
-    def test_hard_negative_sampler_v2(self, id_type):
+    @parameterized.expand([["int64", False], ["string", False], ["int64", True]])
+    def test_hard_negative_sampler_v2(self, id_type, empty_edge=False):
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
         f_user = self._create_user_gl_data(id_type)
         f_item = self._create_item_gl_data(id_type)
         f_clk_edge = self._create_clk_edge_gl_data(id_type)
-        f_noclk_edge = self._create_noclk_edge_gl_data(id_type)
+        f_noclk_edge = self._create_noclk_edge_gl_data(id_type, empty=empty_edge)
 
         def _sampler_worker(res):
             config = sampler_pb2.HardNegativeSamplerV2(
@@ -527,9 +533,14 @@ class SamplerTest(unittest.TestCase):
         p.join()
         if p.exitcode != 0:
             raise RuntimeError("worker failed.")
-        self.assertGreater(len(res["int_a"]), 8)
-        self.assertGreater(len(res["float_b"]), 8)
-        self.assertGreater(len(res["str_c"]), 8)
+        if empty_edge:
+            self.assertEqual(len(res["int_a"]), 8)
+            self.assertEqual(len(res["float_b"]), 8)
+            self.assertEqual(len(res["str_c"]), 8)
+        else:
+            self.assertGreater(len(res["int_a"]), 8)
+            self.assertGreater(len(res["float_b"]), 8)
+            self.assertGreater(len(res["str_c"]), 8)
 
     @parameterized.expand([["int64", True], ["string", True], ["string", False]])
     def test_tdm_sampler(self, id_type, cfg_additional_attrs=True):
