@@ -328,6 +328,7 @@ class BaseSampler(metaclass=_meta_cls):
         self, nodes: gl.Nodes
     ) -> Tuple[List[pa.Array], npt.NDArray]:
         features = []
+        # pyre-ignore [16]
         if len(nodes.indices) == 0:
             return features, nodes.indices
         int_idx = 0
@@ -354,7 +355,6 @@ class BaseSampler(metaclass=_meta_cls):
             feature = feature.astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
-        # pyre-ignore [16]
         return features, nodes.indices
 
     @property
