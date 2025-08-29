@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import torch
 
-from tzrec.acc.utils import is_trt_predict
+from tzrec.acc.utils import is_aot_predict, is_trt_predict
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
@@ -1116,8 +1116,9 @@ def test_predict(
     """Run predict integration test."""
     log_dir = os.path.join(test_dir, "log_predict")
     is_trt = is_trt_predict(scripted_model_path)
-    if is_trt:
-        # trt script model don't support device,default is cuda:0
+    is_aot = is_aot_predict(scripted_model_path)
+    if is_trt or is_aot:
+        # trt script and aoti model don't support device,default is cuda:0
         nproc_per_node = 1
     else:
         nproc_per_node = 2

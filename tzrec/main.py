@@ -34,21 +34,10 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
+from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.export_utils import get_max_export_batch_size
 from tzrec.acc.trt_utils import export_model_trt
-from tzrec.acc.utils import (
-    allow_tf32,
-    export_acc_config,
-    is_aot,
-    is_cuda_export,
-    is_input_tile_emb,
-    is_quant,
-    is_trt,
-    is_trt_predict,
-    quant_dtype,
-    write_mapping_file_for_input_tile,
-)
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
@@ -636,7 +625,7 @@ def train_and_evaluate(
     device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
-    allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -804,7 +793,7 @@ def evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     train_config = pipeline_config.train_config
-    allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -880,7 +869,7 @@ def _script_model(
     save_dir: str,
 ) -> None:
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    is_trt_convert = is_trt()
+    is_trt_convert = acc_utils.is_trt()
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -894,12 +883,12 @@ def _script_model(
 
         batch = next(iter(dataloader))
 
-        if is_cuda_export():
+        if acc_utils.is_cuda_export():
             model = model.cuda()
 
-        if is_quant():
+        if acc_utils.is_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            quantize_embeddings(model, dtype=acc_utils.quant_dtype(), inplace=True)
             logger.info("finish quantize embeddings...")
 
         model.eval()
@@ -911,7 +900,7 @@ def _script_model(
             logger.info(f"Model Outputs: {result_info}")
             export_model_trt(model, data_cuda, save_dir)
 
-        elif is_aot():
+        elif acc_utils.is_aot():
             data_cuda = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data_cuda)
             export_model_aot(model, data_cuda, save_dir)
@@ -941,7 +930,7 @@ def _script_model(
         with open(os.path.join(save_dir, "fg.json"), "w") as f:
             json.dump(fg_json, f, indent=4)
         with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(export_acc_config(), f, indent=4)
+            json.dump(acc_utils.export_acc_config(), f, indent=4)
 
 
 def export(
@@ -983,7 +972,7 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
-    if is_cuda_export():
+    if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = get_max_export_batch_size()
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
@@ -1005,7 +994,7 @@ def export(
         list(data_config.label_fields),
         sampler_type=None,
     )
-    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    InferWrapper = CudaExportWrapper if acc_utils.is_aot() else ScriptWrapper
     model = InferWrapper(model)
     init_parameters(model, torch.device("cpu"))
 
@@ -1014,12 +1003,14 @@ def export(
             pipeline_config.model_dir
         )
     if checkpoint_path:
-        if is_input_tile_emb():
+        if acc_utils.is_input_tile_emb():
             remap_file_path = os.path.join(export_dir, "emb_ckpt_mapping.txt")
             if is_rank_zero:
                 if not os.path.exists(export_dir):
                     os.makedirs(export_dir)
-                write_mapping_file_for_input_tile(model.state_dict(), remap_file_path)
+                acc_utils.write_mapping_file_for_input_tile(
+                    model.state_dict(), remap_file_path
+                )
 
             dist.barrier()
             checkpoint_util.restore_model(
@@ -1125,8 +1116,12 @@ def predict(
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
 
-    is_trt_convert: bool = is_trt_predict(scripted_model_path)
-    if is_trt_convert:
+    is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
+    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
+    is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
+    print("is_input_tile:", is_input_tile)
+
+    if is_trt:
         # predict batch_size too large may out of range
         max_batch_size = get_max_export_batch_size()
         pipeline_config.data_config.batch_size = min(
@@ -1174,22 +1169,19 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    if os.path.exists(os.path.join(scripted_model_path, "scripted_model.pt")):
-        # disable jit compile， as it compile too slow now.
-        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-
-        model: torch.jit.ScriptModule = torch.jit.load(
-            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-        )
-        model.eval()
-    elif os.path.exists(os.path.join(scripted_model_path, "aoti_model.pt2")):
+    if is_aot:
         model = torch._inductor.aoti_load_package(
             os.path.join(scripted_model_path, "aoti_model.pt2"),
             device_index=device.index,
         )
     else:
-        raise RuntimeError(f"No model exists in {scripted_model_path}")
+        # disable jit compile， as it compile too slow now.
+        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
+            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+        model: torch.jit.ScriptModule = torch.jit.load(
+            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
+        )
+        model.eval()
 
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
@@ -1218,10 +1210,11 @@ def predict(
     def _forward(batch: Batch) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
             parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-            # when predicting with a model exported using INPUT_TILE,
-            #  we set the batch size tensor to 1 to disable tiling.
-            parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if is_trt_convert:
+            if is_input_tile:
+                # when predicting with a model exported using INPUT_TILE,
+                #  we set the batch size tensor to 1 to disable tiling.
+                parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
+            if is_trt or is_aot:
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
