@@ -31,6 +31,7 @@ message Accuracy {
 
 message GroupedAUC {
     required string grouping_key = 1;
+    optional bool dist_sync_on_step = 2 [default = false];
 }
 
 message XAUC {

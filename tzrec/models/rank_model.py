@@ -304,7 +304,7 @@ class RankModel(BaseModel):
             assert num_class <= 2, (
                 f"num_class must less than 2 when metric type is {metric_type}"
             )
-            self._metric_modules[metric_name] = GroupedAUC()
+            self._metric_modules[metric_name] = GroupedAUC(**metric_kwargs)
         elif metric_type == "xauc":
             self._metric_modules[metric_name] = XAUC(**metric_kwargs)
         elif metric_type == "grouped_xauc":
@@ -367,7 +367,10 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
-            self._metric_modules[metric_name].update(pred, label, grouping_key)
+            if self._metric_modules[metric_name].dist_sync_on_step:
+                self._metric_modules[metric_name].forward(pred, label, grouping_key)
+            else:
+                self._metric_modules[metric_name].update(pred, label, grouping_key)
         elif metric_type == "xauc":
             pred = predictions["y" + suffix]
             self._metric_modules[metric_name].update(pred, label)

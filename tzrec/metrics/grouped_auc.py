@@ -65,7 +65,9 @@ class GroupedAUC(Metric):
     """Grouped AUC."""
 
     def __init__(self, **kwargs: Any) -> None:
+        kwargs.pop("grouping_key")
         super().__init__(**kwargs)
+        self.dist_sync_on_step = kwargs.get("dist_sync_on_step", False)
 
         self.add_state("eval_data", default=[], dist_reduce_fx=custom_reduce_fx)
 
