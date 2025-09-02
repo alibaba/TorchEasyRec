@@ -91,6 +91,7 @@ def export_pm(
         dense_keys_list.extend(keys)
 
     batch = Dim("batch")
+    batch_tile = Dim("batch_tile")
     dynamic_shapes = {}
     for key in data:
         if key == "hard_neg_indices":
@@ -100,11 +101,11 @@ def export_pm(
         if key.endswith(".lengths"):
             # user feats
             if key.split(".")[0] in model._data_parser.user_feats:
-                assert data[key].shape[0] == 1
-                logger.info(
-                    "uniq user length fea %s length=%s" % (key, data[key].shape)
-                )
-                dynamic_shapes[key] = {}
+                # assert data[key].shape[0] == 1
+                # logger.info(
+                #     "uniq user length fea %s length=%s" % (key, data[key].shape)
+                # )
+                dynamic_shapes[key] = {0: batch_tile}
             else:
                 logger.info("batch length fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
@@ -115,9 +116,9 @@ def export_pm(
         elif key.split(".")[0] in dense_keys_list:
             # user feats
             if key.split(".")[0] in model._data_parser.user_feats:
-                assert data[key].shape[0] == 1
-                logger.info("uniq user dense_fea=%s shape=%s" % (key, data[key].shape))
-                dynamic_shapes[key] = {}
+                # assert data[key].shape[0] == 1
+                # logger.info("uniq user dense_fea=%s shape=%s" % (key, data[key].shape))   # NOQA
+                dynamic_shapes[key] = {0: batch_tile}
             else:
                 logger.info("batch dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
