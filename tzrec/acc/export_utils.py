@@ -130,7 +130,10 @@ def export_pm(
                     [0, 0] * (len(data[key].shape) - 1) + [0, 2],
                     mode="constant",
                 )
-                data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
+                if key.split(".")[0] + ".key_lengths" in data:
+                    data[key.split(".")[0] + ".key_lengths"][0] = data[key].shape[0]
+                else:
+                    data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
             logger.info("sparse or seq dense fea=%s shape=%s" % (key, data[key].shape))
             tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
             dynamic_shapes[key] = {0: tmp_val_dim}
@@ -140,6 +143,7 @@ def export_pm(
             data[key] = data[key].contiguous()
 
     logger.info("dynamic shapes=%s" % dynamic_shapes)
+
     exported_pg = torch.export.export(
         gm, args=(data,), dynamic_shapes=(dynamic_shapes,)
     )

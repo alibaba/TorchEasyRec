@@ -869,7 +869,6 @@ def _script_model(
     save_dir: str,
 ) -> None:
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    is_trt_convert = acc_utils.is_trt()
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -893,19 +892,20 @@ def _script_model(
 
         model.eval()
 
-        if is_trt_convert:
-            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda, "cuda:0")
+        data = batch.to_dict(sparse_dtype=torch.int64)
+        if acc_utils.is_trt():
+            data = OrderedDict(sorted(data.items()))
+            result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            export_model_trt(model, data_cuda, save_dir)
-
+            export_model_trt(model, data, save_dir)
         elif acc_utils.is_aot():
-            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda)
-            export_model_aot(model, data_cuda, save_dir)
+            data = OrderedDict(sorted(data.items()))
+            result = model(data)
+            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+            logger.info(f"Model Outputs: {result_info}")
+            export_model_aot(model, data, save_dir)
         else:
-            data = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
@@ -1119,7 +1119,6 @@ def predict(
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
-    print("is_input_tile:", is_input_tile)
 
     if is_trt:
         # predict batch_size too large may out of range
@@ -1131,6 +1130,10 @@ def predict(
             "using new batch_size: %s in trt predict",
             pipeline_config.data_config.batch_size,
         )
+    elif is_aot and is_input_tile:
+        # INPUT_TILE user_feat do not support dynamic shape
+        pipeline_config.data_config.batch_size = 1
+        logger.info("using new batch_size: 1 in aot predict when input_tile")
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1215,6 +1218,7 @@ def predict(
                 #  we set the batch size tensor to 1 to disable tiling.
                 parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
             if is_trt or is_aot:
+                parsed_inputs = OrderedDict(sorted(parsed_inputs.items()))
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)

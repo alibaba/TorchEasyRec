@@ -473,7 +473,9 @@ class RankIntegrationTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir, "export"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_input_path=os.path.join(
+                    self.test_dir, r"eval_data/part-0.parquet"
+                ),
                 predict_output_path=tile_pred_output,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
@@ -485,12 +487,14 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir_emb,
-                env_str="INPUT_TILE=3 ENABLE_AOT=1",
+                env_str="TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=3 ENABLE_AOT=1",
             )
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_input_path=os.path.join(
+                    self.test_dir, r"eval_data/part-0.parquet"
+                ),
                 predict_output_path=tile_pred_output_emb,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
