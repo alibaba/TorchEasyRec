@@ -11,6 +11,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -33,9 +34,9 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        # if self.success:
-        #     if os.path.exists(self.test_dir):
-        #         shutil.rmtree(self.test_dir)
+        if self.success:
+            if os.path.exists(self.test_dir):
+                shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
