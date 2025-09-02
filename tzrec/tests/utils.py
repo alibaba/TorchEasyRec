@@ -1112,6 +1112,8 @@ def test_predict(
     reserved_columns: str,
     output_columns: str,
     test_dir: str,
+    predict_threads: Optional[int] = None,
+    predict_steps: Optional[int] = None,
 ) -> bool:
     """Run predict integration test."""
     log_dir = os.path.join(test_dir, "log_predict")
@@ -1132,7 +1134,11 @@ def test_predict(
         f"--reserved_columns {reserved_columns} "
     )
     if output_columns:
-        cmd_str += f"--output_columns {output_columns}"
+        cmd_str += f"--output_columns {output_columns} "
+    if predict_threads is not None:
+        cmd_str += f"--predict_threads {predict_threads} "
+    if predict_steps is not None:
+        cmd_str += f"--predict_steps {predict_steps} "
 
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600

@@ -1084,6 +1084,7 @@ def predict(
     predict_threads: Optional[int] = None,
     writer_type: Optional[str] = None,
     edit_config_json: Optional[str] = None,
+    predict_steps: Optional[int] = None,
 ) -> None:
     """Evaluate a EasyRec model.
 
@@ -1102,6 +1103,7 @@ def predict(
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
+        predict_steps (int, optional): total predict steps limit.
     """
     reserved_cols: Optional[List[str]] = None
     output_cols: Optional[List[str]] = None
@@ -1287,6 +1289,8 @@ def predict(
             if is_profiling:
                 prof.step()
             i_step += 1
+            if predict_steps is not None and i_step >= predict_steps:
+                break
         except StopIteration:
             break
 

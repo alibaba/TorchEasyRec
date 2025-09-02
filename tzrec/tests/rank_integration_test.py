@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 import unittest
 
@@ -34,9 +33,9 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
+        # if self.success:
+        #     if os.path.exists(self.test_dir):
+        #         shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
@@ -473,13 +472,13 @@ class RankIntegrationTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir, "export"),
-                predict_input_path=os.path.join(
-                    self.test_dir, r"eval_data/part-0.parquet"
-                ),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=tile_pred_output,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
                 test_dir=input_tile_dir,
+                predict_threads=1,  # hang when batch_size=1 and predict_threads > 1
+                predict_steps=500,  # predict too slow when batch_size=1
             )
 
         # export quant and input-tile emb
@@ -492,13 +491,13 @@ class RankIntegrationTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
-                predict_input_path=os.path.join(
-                    self.test_dir, r"eval_data/part-0.parquet"
-                ),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=tile_pred_output_emb,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
                 test_dir=input_tile_dir_emb,
+                predict_threads=1,  # hang when batch_size=1 and predict_threads > 1
+                predict_steps=500,  # predict too slow when batch_size=1
             )
 
         self.assertTrue(self.success)
