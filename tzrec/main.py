@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 from collections import OrderedDict
+from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -101,7 +102,7 @@ def init_process_group() -> Tuple[torch.device, str]:
     else:
         device: torch.device = torch.device("cpu")
         backend = "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600))
     return device, backend
 
 
