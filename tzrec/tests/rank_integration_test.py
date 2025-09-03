@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 import unittest
 
@@ -34,9 +33,9 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
+        # if self.success:
+        #     if os.path.exists(self.test_dir):
+        #         shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
@@ -450,7 +449,9 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="ENABLE_AOT=1",
+                # inductor generate a lot of triton kernel, may result in triton cache
+                #  conflict, so that we set TRITON_HOME in tests.
+                env_str=f"TRITON_HOME={self.test_dir} ENABLE_AOT=1",
             )
         if self.success:
             self.success = utils.test_predict(
@@ -464,11 +465,12 @@ class RankIntegrationTest(unittest.TestCase):
 
         # export quant and input-tile
         if self.success:
-            # when INPUT_TILE=2, AsserScalar codegen is not correct.
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir,
-                env_str="TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=2 ENABLE_AOT=1",
+                # when INPUT_TILE=2, AsserScalar codegen is not correct, set
+                # TORCHINDUCTOR_SCALAR_ASSERTS=0 to workaround
+                env_str=f"TRITON_HOME={input_tile_dir} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=2 ENABLE_AOT=1",  # NOQA
             )
         if self.success:
             self.success = utils.test_predict(
@@ -487,7 +489,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir_emb,
-                env_str="TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=3 ENABLE_AOT=1",
+                env_str=f"TRITON_HOME={input_tile_dir_emb} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=3 ENABLE_AOT=1",  # NOQA
             )
         if self.success:
             self.success = utils.test_predict(
