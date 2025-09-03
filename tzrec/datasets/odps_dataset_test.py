@@ -272,6 +272,72 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["raw_c.values"]), 8296)
             self.assertEqual(len(data_dict["raw_e.values"]), 8196)
 
+    def test_odps_dataset_has_schema(self, is_orderby_partition=False):
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+        )
+        schema = "rec"
+        if not self.o.exist_schema(schema):
+            self.o.create_schema(schema)
+        self.o = self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+            schema=schema,
+        )
+
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        dataset = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+                is_orderby_partition=is_orderby_partition,
+                odps_data_quota_name="",
+            ),
+            features=features,
+            input_path=f"odps://{self.test_project}/tables/rec.test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+        )
+        self.assertEqual(len(dataset.input_fields), 9)
+        self.assertEqual(
+            len(list(dataset._reader._input_to_sess.values())[0]),
+            2 if is_orderby_partition else 1,
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        for _ in range(2):
+            data = next(iterator)
+            data_dict = data.to_dict()
+            self.assertEqual(
+                sorted(data_dict.keys()),
+                [
+                    "id_a.lengths",
+                    "id_a.values",
+                    "label",
+                    "lookup_h.values",
+                    "raw_c.values",
+                    "raw_d.values",
+                    "raw_e.values",
+                    "raw_f.values",
+                    "raw_g.values",
+                    "tag_b.lengths",
+                    "tag_b.values",
+                ],
+            )
+            self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
+
 
 class OdpsWriterTest(unittest.TestCase):
     def setUp(self):
@@ -316,6 +382,70 @@ class OdpsWriterTest(unittest.TestCase):
             time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
+                quota_name="",
+                world_size=writer_world_size,
+            )
+            for _ in range(5):
+                writer.write(
+                    {
+                        "int_a": pa.array(np.random.randint(0, 100, 128)),
+                        "float_b": pa.array(np.random.random(128)),
+                    }
+                )
+            writer.close()
+
+        writer_world_size = 2
+        port = get_free_port()
+        procs = []
+        for rank in range(writer_world_size):
+            p = mp.Process(
+                target=_writer_worker,
+                args=(rank, port),
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"writer worker-{i} failed.")
+
+        t = self.o.get_table(f"test_odps_dataset_{self.test_suffix}")
+        if partition_spec:
+            partition = ",".join(partition_spec.strip("/").split("/"))
+        else:
+            partition = None
+        with t.open_reader(partition=partition) as reader:
+            self.assertEqual(reader.count, 1280)
+
+    def test_odps_writer_has_schema(self):
+        partition_spec = "/dt=20240401"
+        default_world_size = 2
+        writer_world_size = 2
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+        )
+        schema = "rec"
+        if not self.o.exist_schema(schema):
+            self.o.create_schema(schema)
+        self.o = ODPS(
+            account=account,
+            project=self.test_project,
+            endpoint=odps_endpoint,
+            schema=schema,
+        )
+
+        def _writer_worker(rank, port):
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(default_world_size)
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(port)
+            dist.init_process_group(backend="gloo")
+            time.sleep(rank)  # prevent get credential failed
+            writer = OdpsWriter(
+                f"odps://{self.test_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
                 world_size=writer_world_size,
             )
