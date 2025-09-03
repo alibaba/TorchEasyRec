@@ -404,7 +404,6 @@ class OdpsReader(BaseReader):
         """Init storage api client."""
         for input_path in self._input_path.split(","):
             project, table_name, _, schema = _parse_table_path(input_path)
-            print("table_name:", table_name, " schema:", schema)
             if project not in self._proj_to_o:
                 self._proj_to_o[project] = ODPS(
                     account=self._account,

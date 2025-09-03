@@ -33,6 +33,7 @@ class OdpsDatasetTest(unittest.TestCase):
     def setUp(self):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
+        self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -276,7 +277,7 @@ class OdpsDatasetTest(unittest.TestCase):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
             account=account,
-            project=self.test_project,
+            project=self.test_schema_project,
             endpoint=odps_endpoint,
         )
         schema = "rec"
@@ -284,7 +285,7 @@ class OdpsDatasetTest(unittest.TestCase):
             self.o.create_schema(schema)
         self.o = self.o = ODPS(
             account=account,
-            project=self.test_project,
+            project=self.test_schema_project,
             endpoint=odps_endpoint,
             schema=schema,
         )
@@ -302,7 +303,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 odps_data_quota_name="",
             ),
             features=features,
-            input_path=f"odps://{self.test_project}/tables/rec.test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{self.test_schema_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         self.assertEqual(len(dataset.input_fields), 9)
         self.assertEqual(
@@ -343,6 +344,7 @@ class OdpsWriterTest(unittest.TestCase):
     def setUp(self):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
+        self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -424,7 +426,7 @@ class OdpsWriterTest(unittest.TestCase):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
             account=account,
-            project=self.test_project,
+            project=self.test_schema_project,
             endpoint=odps_endpoint,
         )
         schema = "rec"
@@ -432,7 +434,7 @@ class OdpsWriterTest(unittest.TestCase):
             self.o.create_schema(schema)
         self.o = ODPS(
             account=account,
-            project=self.test_project,
+            project=self.test_schema_project,
             endpoint=odps_endpoint,
             schema=schema,
         )
@@ -445,7 +447,7 @@ class OdpsWriterTest(unittest.TestCase):
             dist.init_process_group(backend="gloo")
             time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
-                f"odps://{self.test_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}{partition_spec}",
+                f"odps://{self.test_schema_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
                 world_size=writer_world_size,
             )
