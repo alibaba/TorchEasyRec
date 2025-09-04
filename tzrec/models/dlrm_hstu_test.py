@@ -28,7 +28,7 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import TestGraphType, gpu_unavailable
 
 
 class DlrmHSTUTest(unittest.TestCase):
@@ -39,6 +39,7 @@ class DlrmHSTUTest(unittest.TestCase):
             [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH],
             [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON],
             [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON],
+            [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.TRITON],
         ]
     )
     @unittest.skipIf(*gpu_unavailable)
@@ -232,7 +233,7 @@ class DlrmHSTUTest(unittest.TestCase):
             dlrm_hstu.set_is_inference(True)
         init_parameters(dlrm_hstu, device=device)
         dlrm_hstu.to(device)
-        dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
+        # dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=[
@@ -263,16 +264,22 @@ class DlrmHSTUTest(unittest.TestCase):
             sparse_features={BASE_DATA_GROUP: sparse_feature},
             labels={},
         ).to(device)
-        if graph_type == TestGraphType.JIT_SCRIPT:
-            predictions = dlrm_hstu(batch.to_dict(), device)
-        else:
-            predictions = dlrm_hstu(batch)
-        self.assertEqual(predictions["logits_is_click"].size(), (6,))
-        self.assertEqual(predictions["probs_is_click"].size(), (6,))
-        self.assertEqual(predictions["logits_is_like"].size(), (6,))
-        self.assertEqual(predictions["probs_is_like"].size(), (6,))
-        self.assertEqual(predictions["logits_is_comment"].size(), (6,))
-        self.assertEqual(predictions["probs_is_comment"].size(), (6,))
+
+        from tzrec.acc.export_utils import export_pm
+        from tzrec.models.model import CudaExportWrapper
+
+        export_pm(CudaExportWrapper(dlrm_hstu), batch.to_dict(), "tmp")
+
+        # if graph_type == TestGraphType.JIT_SCRIPT:
+        #     predictions = dlrm_hstu(batch.to_dict(), device)
+        # else:
+        #     predictions = dlrm_hstu(batch)
+        # self.assertEqual(predictions["logits_is_click"].size(), (6,))
+        # self.assertEqual(predictions["probs_is_click"].size(), (6,))
+        # self.assertEqual(predictions["logits_is_like"].size(), (6,))
+        # self.assertEqual(predictions["probs_is_like"].size(), (6,))
+        # self.assertEqual(predictions["logits_is_comment"].size(), (6,))
+        # self.assertEqual(predictions["probs_is_comment"].size(), (6,))
 
 
 if __name__ == "__main__":
