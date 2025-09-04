@@ -102,7 +102,11 @@ def init_process_group() -> Tuple[torch.device, str]:
     else:
         device: torch.device = torch.device("cpu")
         backend = "gloo"
-    dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600))
+
+    nccl_timeout_sec = int(os.getenv("PROCESS_GROUP_TIMEOUT_SECONDS", "3600"))
+    dist.init_process_group(
+        backend=backend, timeout=timedelta(seconds=nccl_timeout_sec)
+    )
     return device, backend
 
 
