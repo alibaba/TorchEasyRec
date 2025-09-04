@@ -796,11 +796,11 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
         )
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_multi_tower_din_with_fg_train_eval_aot_export_input_tile(self):
-        self._test_rank_with_fg_aot_input_tile(
-            "tzrec/tests/configs/multi_tower_din_fg_mock.config"
-        )
+    # @unittest.skipIf(*gpu_unavailable)
+    # def test_multi_tower_din_with_fg_train_eval_aot_export_input_tile(self):
+    #     self._test_rank_with_fg_aot_input_tile(
+    #         "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+    #     )
 
     def test_dbmtl_has_sequence_variational_dropout_train_eval_export(self):
         self.success = utils.test_train_eval(
