@@ -12,3 +12,5 @@
    rocket_launching
    masknet
    dcn
+   dcn_v2
+   xdeepfm

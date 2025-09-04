@@ -20,7 +20,7 @@ from pyarrow import dataset as ds
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
-from tzrec.utils import config_util
+from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
 
 
@@ -105,6 +105,10 @@ class RankIntegrationTest(unittest.TestCase):
                 f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}",
             )
         self.assertTrue(self.success)
+        _, steps = checkpoint_util.latest_checkpoint(
+            os.path.join(self.test_dir, "2/train")
+        )
+        self.assertGreater(steps, 5)
 
     def _test_rank_with_fg(self, pipeline_config_path, comp_cpu_gpu_pred_result=False):
         self.success = utils.test_train_eval(

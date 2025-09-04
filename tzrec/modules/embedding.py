@@ -1188,37 +1188,35 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self._group_output_dims[f"{group_name}.sequence"] = sequence_dims
             self._group_output_dims[group_name] = output_dims
 
-        self.ec_list = nn.ModuleList()
-        for _, emb_configs in dim_to_emb_configs.items():
-            self.ec_list.append(
-                EmbeddingCollection(list(emb_configs.values()), device=device)
+        self.ec_dict = nn.ModuleDict()
+        for k, emb_configs in dim_to_emb_configs.items():
+            self.ec_dict[str(k)] = EmbeddingCollection(
+                list(emb_configs.values()), device=device
             )
 
-        self.mc_ec_list = nn.ModuleList()
+        self.mc_ec_dict = nn.ModuleDict()
         for k, emb_configs in dim_to_mc_emb_configs.items():
-            self.mc_ec_list.append(
-                ManagedCollisionEmbeddingCollection(
+            self.mc_ec_dict[str(k)] = ManagedCollisionEmbeddingCollection(
+                EmbeddingCollection(list(emb_configs.values()), device=device),
+                ManagedCollisionCollection(
+                    dim_to_mc_modules[k], list(emb_configs.values())
+                ),
+            )
+
+        if need_input_tile_emb:
+            self.ec_dict_user = nn.ModuleDict()
+            for k, emb_configs in dim_to_emb_configs_user.items():
+                self.ec_dict_user[str(k)] = EmbeddingCollection(
+                    list(emb_configs.values()), device=device
+                )
+
+            self.mc_ec_dict_user = nn.ModuleDict()
+            for k, emb_configs in dim_to_mc_emb_configs_user.items():
+                self.mc_ec_dict_user[str(k)] = ManagedCollisionEmbeddingCollection(
                     EmbeddingCollection(list(emb_configs.values()), device=device),
                     ManagedCollisionCollection(
-                        dim_to_mc_modules[k], list(emb_configs.values())
+                        dim_to_mc_modules_user[k], list(emb_configs.values())
                     ),
-                )
-            )
-        if need_input_tile_emb:
-            self.ec_list_user = nn.ModuleList()
-            for _, emb_configs in dim_to_emb_configs_user.items():
-                self.ec_list_user.append(
-                    EmbeddingCollection(list(emb_configs.values()), device=device)
-                )
-            self.mc_ec_list_user = nn.ModuleList()
-            for k, emb_configs in dim_to_mc_emb_configs_user.items():
-                self.mc_ec_list_user.append(
-                    ManagedCollisionEmbeddingCollection(
-                        EmbeddingCollection(list(emb_configs.values()), device=device),
-                        ManagedCollisionCollection(
-                            dim_to_mc_modules_user[k], list(emb_configs.values())
-                        ),
-                    )
                 )
 
     def group_dims(self, group_name: str) -> List[int]:
@@ -1258,22 +1256,22 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
-            for ec in self.ec_list:
+            for ec in self.ec_dict.values():
                 sparse_jt_dict_list.append(ec(sparse_feature))
 
         if self.has_mc_sparse:
-            for ec in self.mc_ec_list:
+            for ec in self.mc_ec_dict.values():
                 sparse_jt_dict_list.append(ec(sparse_feature)[0])
 
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
         if self.has_sparse_user:
-            for ec in self.ec_list_user:
+            for ec in self.ec_dict_user.values():
                 sparse_jt_dict_list.append(ec(sparse_feature_user))
 
         if self.has_mc_sparse_user:
-            for ec in self.mc_ec_list_user:
+            for ec in self.mc_ec_dict_user.values():
                 sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
         if self.has_mulval_seq_user:

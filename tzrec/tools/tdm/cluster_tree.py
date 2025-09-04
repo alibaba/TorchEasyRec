@@ -106,7 +106,9 @@ if __name__ == "__main__":
     )
     tree_search.save(attr_delimiter=args.attr_delimiter)
     tree_search.save_predict_edge()
-    tree_search.save_node_feature(args.attr_fields, args.raw_attr_fields)
+    tree_search.save_node_feature(
+        args.item_id_field, args.attr_fields, args.raw_attr_fields
+    )
     if args.tree_output_dir:
         tree_search.save_serving_tree(args.tree_output_dir)
     logger.info("Save nodes and edges table done.")

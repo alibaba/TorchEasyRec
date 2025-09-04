@@ -405,7 +405,7 @@ class DataParser:
             try:
                 additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
             except Exception:
-                print(f"{HARD_NEG_INDICES} is ignored.")
+                logger.warning("No hard negative samples exist in the batch.")
 
         batch = Batch(
             dense_features=dense_features,

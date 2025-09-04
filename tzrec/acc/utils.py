@@ -148,6 +148,8 @@ def write_mapping_file_for_input_tile(
         ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
         ".ec_list_user.": ".ec_list.",
         ".mc_ec_list_user.": ".mc_ec_list.",
+        ".ec_dict_user.": ".ec_dict.",
+        ".mc_ec_dict_user.": ".mc_ec_dict.",
     }
 
     remap_str = ""
