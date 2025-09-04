@@ -178,7 +178,9 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
     return account, odps_endpoint
 
 
-def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str]]]:
+def _parse_table_path(
+    odps_table_path: str,
+) -> Tuple[str, str, Optional[List[str]], Optional[str]]:
     """Method that parse odps table path."""
     str_list = odps_table_path.split("/")
     if len(str_list) < 5 or str_list[3] != "tables":
@@ -192,7 +194,12 @@ def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str
         table_partitions = None
     else:
         table_partitions = table_partition.split("&")
-    return str_list[2], str_list[4], table_partitions
+
+    table_name = str_list[4]
+    schema = None
+    if "." in table_name:
+        table_name, schema = table_name.split(".")[1], table_name.split(".")[0]
+    return str_list[2], table_name, table_partitions, schema
 
 
 def _read_rows_arrow_with_retry(
@@ -377,7 +384,7 @@ class OdpsReader(BaseReader):
 
         self.schema = []
         self._ordered_cols = []
-        _, table_name, _ = _parse_table_path(self._input_path.split(",")[0])
+        _, table_name, _, _ = _parse_table_path(self._input_path.split(",")[0])
         table = self._table_to_cli[table_name].table
         for column in table.schema.simple_columns:
             if not self._selected_cols or column.name in self._selected_cols:
@@ -396,12 +403,13 @@ class OdpsReader(BaseReader):
     def _init_client(self) -> None:
         """Init storage api client."""
         for input_path in self._input_path.split(","):
-            project, table_name, _ = _parse_table_path(input_path)
+            project, table_name, _, schema = _parse_table_path(input_path)
             if project not in self._proj_to_o:
                 self._proj_to_o[project] = ODPS(
                     account=self._account,
                     project=project,
                     endpoint=self._odps_endpoint,
+                    schema=schema,
                 )
             if table_name not in self._table_to_cli:
                 o = self._proj_to_o[project]
@@ -414,7 +422,7 @@ class OdpsReader(BaseReader):
         sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             session_ids = []
-            _, table_name, partitions = _parse_table_path(input_path)
+            _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
             if self._is_orderby_partition and partitions is not None:
                 splited_partitions = [[x] for x in partitions]
@@ -450,7 +458,7 @@ class OdpsReader(BaseReader):
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
-        _, table_name, _ = _parse_table_path(input_path)
+        _, table_name, _, _ = _parse_table_path(input_path)
         client = self._table_to_cli[table_name]
 
         sess_reqs = self._input_to_sess[input_path]
@@ -495,7 +503,9 @@ class OdpsWriter(BaseWriter):
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
 
-        self._project, self._table_name, partitions = _parse_table_path(output_path)
+        self._project, self._table_name, partitions, schema = _parse_table_path(
+            output_path
+        )
         if partitions is None:
             self._partition_spec = None
         else:
@@ -504,6 +514,7 @@ class OdpsWriter(BaseWriter):
             account=self._account,
             project=self._project,
             endpoint=self._odps_endpoint,
+            schema=schema,
         )
         self._client = None
         self._sess_req = None
