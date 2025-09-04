@@ -273,6 +273,11 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["raw_c.values"]), 8296)
             self.assertEqual(len(data_dict["raw_e.values"]), 8196)
 
+    @unittest.skipIf(
+        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        or "ODPS_CONFIG_FILE_PATH" not in os.environ,
+        "schema odps project not found",
+    )
     def test_odps_dataset_has_schema(self, is_orderby_partition=False):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
@@ -419,6 +424,11 @@ class OdpsWriterTest(unittest.TestCase):
         with t.open_reader(partition=partition) as reader:
             self.assertEqual(reader.count, 1280)
 
+    @unittest.skipIf(
+        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        or "ODPS_CONFIG_FILE_PATH" not in os.environ,
+        "schema odps project not found",
+    )
     def test_odps_writer_has_schema(self):
         partition_spec = "/dt=20240401"
         default_world_size = 2
