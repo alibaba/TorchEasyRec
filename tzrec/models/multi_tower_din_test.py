@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from collections import OrderedDict
 
 import torch
 from parameterized import parameterized
@@ -173,8 +174,8 @@ class MultiTowerDINTest(unittest.TestCase):
             multi_tower_din = create_test_model(multi_tower_din, graph_type)
             predictions = multi_tower_din(batch.to_dict())
         elif graph_type == TestGraphType.AOT_INDUCTOR:
-            print("aot")
             data = batch.to_dict()
+            data = OrderedDict(sorted(data.items()))
             self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
             multi_tower_din = create_test_model(
                 multi_tower_din, graph_type, data, self.test_dir

@@ -456,7 +456,7 @@ class RankIntegrationTest(unittest.TestCase):
                 self.test_dir,
                 # inductor generate a lot of triton kernel, may result in triton cache
                 #  conflict, so that we set TRITON_HOME in tests.
-                env_str=f"CUDA_HOME=/usr/cuda-12 TRITON_HOME={self.test_dir} ENABLE_AOT=1",  # NOQA
+                env_str=f"TRITON_HOME={self.test_dir} ENABLE_AOT=1",  # NOQA
             )
         if self.success:
             self.success = utils.test_predict(
@@ -475,7 +475,7 @@ class RankIntegrationTest(unittest.TestCase):
                 input_tile_dir,
                 # when INPUT_TILE=2, AsserScalar codegen is not correct, set
                 # TORCHINDUCTOR_SCALAR_ASSERTS=0 to workaround
-                env_str=f"CUDA_HOME=/usr/cuda-12 TRITON_HOME={input_tile_dir} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=2 ENABLE_AOT=1",  # NOQA
+                env_str=f"TRITON_HOME={input_tile_dir} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=2 ENABLE_AOT=1",  # NOQA
             )
         # if self.success:
         #     self.success = utils.test_predict(
@@ -494,7 +494,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir_emb,
-                env_str=f"CUDA_HOME=/usr/cuda-12 TRITON_HOME={input_tile_dir_emb} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=3 ENABLE_AOT=1",  # NOQA
+                env_str=f"TRITON_HOME={input_tile_dir_emb} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=3 ENABLE_AOT=1",  # NOQA
             )
         # if self.success:
         #     self.success = utils.test_predict(
