@@ -367,7 +367,6 @@ class DataParser:
 
         tile_size = -1
         if input_tile:
-            # tile_size = input_data["batch_size"].item()
             tile_size = _tile_size(input_data["batch_size"])
 
         if input_tile_emb:
@@ -598,7 +597,6 @@ class DataParser:
         """
         sparse_features = {}
         sequence_mulval_lengths = {}
-        # tile_size = input_data["batch_size"].item()
         tile_size = _tile_size(input_data["batch_size"])
 
         for dg, keys in self.sparse_keys.items():
