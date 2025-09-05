@@ -446,8 +446,8 @@ class RankIntegrationTest(unittest.TestCase):
         input_tile_dir = os.path.join(self.test_dir, "input_tile")
         input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
         pred_output = os.path.join(self.test_dir, "predict_result")
-        # tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
-        # tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
+        tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
+        tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
 
         # export quant and no-input-tile
         if self.success:
@@ -470,43 +470,42 @@ class RankIntegrationTest(unittest.TestCase):
 
         # export quant and input-tile
         if self.success:
+            # when INPUT_TILE=2,
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir,
-                # when INPUT_TILE=2, AsserScalar codegen is not correct, set
-                # TORCHINDUCTOR_SCALAR_ASSERTS=0 to workaround
-                env_str=f"TRITON_HOME={input_tile_dir} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=2 ENABLE_AOT=1",  # NOQA
+                env_str="QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT=1",
             )
-        # if self.success:
-        #     self.success = utils.test_predict(
-        #         scripted_model_path=os.path.join(input_tile_dir, "export"),
-        #         predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),  # NOQA
-        #         predict_output_path=tile_pred_output,
-        #         reserved_columns="user_id,item_id,clk",
-        #         output_columns="probs",
-        #         test_dir=input_tile_dir,
-        #         predict_threads=1,  # hang when batch_size=1 and predict_threads > 1
-        #         predict_steps=500,  # predict too slow when batch_size=1
-        #     )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_dir, "export"),
+                predict_input_path=os.path.join(
+                    self.test_dir, r"eval_data/part-0.parquet"
+                ),
+                predict_output_path=tile_pred_output,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_dir,
+            )
 
         # export quant and input-tile emb
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir_emb,
-                env_str=f"TRITON_HOME={input_tile_dir_emb} TORCHINDUCTOR_SCALAR_ASSERTS=0 INPUT_TILE=3 ENABLE_AOT=1",  # NOQA
+                env_str="QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT=1",
             )
-        # if self.success:
-        #     self.success = utils.test_predict(
-        #         scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
-        #         predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),  # NOQA
-        #         predict_output_path=tile_pred_output_emb,
-        #         reserved_columns="user_id,item_id,clk",
-        #         output_columns="probs",
-        #         test_dir=input_tile_dir_emb,
-        #         predict_threads=1,  # hang when batch_size=1 and predict_threads > 1
-        #         predict_steps=500,  # predict too slow when batch_size=1
-        #     )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
+                predict_input_path=os.path.join(
+                    self.test_dir, r"eval_data/part-0.parquet"
+                ),
+                predict_output_path=tile_pred_output_emb,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_dir_emb,
+            )
 
         self.assertTrue(self.success)
         self.assertTrue(

@@ -40,6 +40,17 @@ def _to_tensor(x: npt.NDArray) -> torch.Tensor:
     return torch.from_numpy(x)
 
 
+@torch.fx.wrap
+def _tile_size(x: torch.Tensor) -> torch.Tensor:
+    tile_size = x.item()
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check_is_size(tile_size)
+        # check tile_size = 1 to make dynamo check size happy
+        # because
+        torch._check(tile_size == 1)
+    return tile_size
+
+
 class DataParser:
     """Input Data Parser.
 
@@ -166,6 +177,8 @@ class DataParser:
         """
         output_data = {}
         if is_input_tile():
+            # When making offline predictions, we set the tile_size to 1.
+            # During online serving, we will set the tile_size to batch_size
             output_data["batch_size"] = torch.tensor(1)
             # flag = False
             # for k, v in input_data.items():
@@ -354,7 +367,8 @@ class DataParser:
 
         tile_size = -1
         if input_tile:
-            tile_size = input_data["batch_size"].item()
+            # tile_size = input_data["batch_size"].item()
+            tile_size = _tile_size(input_data["batch_size"])
 
         if input_tile_emb:
             # For INPUT_TILE = 3 mode, batch_size of user features for sparse and dense
@@ -584,7 +598,8 @@ class DataParser:
         """
         sparse_features = {}
         sequence_mulval_lengths = {}
-        tile_size = input_data["batch_size"].item()
+        # tile_size = input_data["batch_size"].item()
+        tile_size = _tile_size(input_data["batch_size"])
 
         for dg, keys in self.sparse_keys.items():
             values = []

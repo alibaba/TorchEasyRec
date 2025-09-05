@@ -31,8 +31,10 @@ def export_model_aot(
     """
     exported_pg, data = export_pm(model, data, save_dir)
 
-    package_path = torch._inductor.aoti_compile_and_package(
-        exported_pg,
-        package_path=os.path.join(save_dir, "aoti_model.pt2"),
-    )
+    # AsserScalar codegen is not correct.
+    with torch._inductor.config.patch({"scalar_asserts": False}):
+        package_path = torch._inductor.aoti_compile_and_package(
+            exported_pg,
+            package_path=os.path.join(save_dir, "aoti_model.pt2"),
+        )
     return package_path

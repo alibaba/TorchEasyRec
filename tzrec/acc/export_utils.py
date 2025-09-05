@@ -82,7 +82,6 @@ def export_pm(
     gm = symbolic_trace(model)
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(gm.code)
-
     gm = gm.cuda()
 
     # get dense keys list
@@ -90,8 +89,8 @@ def export_pm(
     for _, keys in model._data_parser.dense_keys.items():
         dense_keys_list.extend(keys)
 
-    batch = Dim("batch")
-    batch_tile = Dim("batch_tile")
+    batch = Dim("batch", min=1)
+    batch_tile = Dim("batch_tile", min=1)
     dynamic_shapes = {}
     for key in data:
         if key == "hard_neg_indices":

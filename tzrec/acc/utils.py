@@ -103,10 +103,18 @@ def is_debug_trt() -> bool:
 
 def is_quant() -> bool:
     """Judge is quant or not."""
-    is_quant = os.environ.get("QUANT_EMB")
-    if is_quant and is_quant[0] == "0":
-        return False
-    return True
+    is_quant = os.environ.get("QUANT_EMB", "1")
+    if is_quant and is_quant[0] == "1":
+        return True
+    return False
+
+
+def is_ec_quant() -> bool:
+    """Judge EmbeddingCollection is quant or not."""
+    is_ec_quant = os.environ.get("QUANT_EC_EMB", "0")
+    if is_ec_quant and is_ec_quant[0] == "1":
+        return True
+    return False
 
 
 def quant_dtype() -> torch.dtype:

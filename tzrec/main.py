@@ -28,11 +28,15 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.inference.modules import quantize_embeddings
+from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
+from torchrec.quant.embedding_modules import (
+    EmbeddingCollection as QuantEmbeddingCollection,
+)
 
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
@@ -887,7 +891,18 @@ def _script_model(
 
         if acc_utils.is_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=acc_utils.quant_dtype(), inplace=True)
+            additional_qconfig_spec_keys = []
+            additional_mapping = {}
+            if acc_utils.is_ec_quant():
+                additional_qconfig_spec_keys.append(EmbeddingCollection)
+                additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
+            quantize_embeddings(
+                model,
+                dtype=acc_utils.quant_dtype(),
+                inplace=True,
+                additional_qconfig_spec_keys=additional_qconfig_spec_keys,
+                additional_mapping=additional_mapping,
+            )
             logger.info("finish quantize embeddings...")
 
         model.eval()
@@ -1132,10 +1147,10 @@ def predict(
             "using new batch_size: %s in trt predict",
             pipeline_config.data_config.batch_size,
         )
-    elif is_aot and is_input_tile:
-        # INPUT_TILE user_feat do not support dynamic shape
-        pipeline_config.data_config.batch_size = 1
-        logger.info("using new batch_size: 1 in aot predict when input_tile")
+    elif is_aot:
+        # AOTInductor may hang when predict_threads > 1
+        predict_threads = 1
+        logger.info("using new predict_threads: 1 when use aot")
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
