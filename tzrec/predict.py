@@ -87,6 +87,12 @@ if __name__ == "__main__":
         default=None,
         help='edit pipeline config str, example: {"data_config.fg_mode":"FG_DAG"}',
     )
+    parser.add_argument(
+        "--predict_steps",
+        type=int,
+        default=None,
+        help="total predict steps limit.",
+    )
     args, extra_args = parser.parse_known_args()
 
     predict(
@@ -102,4 +108,5 @@ if __name__ == "__main__":
         predict_threads=args.predict_threads,
         writer_type=args.writer_type,
         edit_config_json=args.edit_config_json,
+        predict_steps=args.predict_steps,
     )

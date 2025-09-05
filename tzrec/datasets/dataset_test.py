@@ -353,15 +353,15 @@ class DatasetTest(unittest.TestCase):
             if not force_base_data_group:
                 self.assertEqual(
                     batch.dense_features[BASE_DATA_GROUP + "_user"].values().size(),
-                    (1, 1),
+                    (4, 1),
                 )
                 self.assertEqual(
                     batch.sparse_features[BASE_DATA_GROUP + "_user"].values().size(),
-                    (1,),
+                    (4,),
                 )
                 self.assertEqual(
                     batch.sparse_features[BASE_DATA_GROUP + "_user"].lengths().size(),
-                    (1,),
+                    (4,),
                 )
                 self.assertEqual(
                     batch.dense_features[NEG_DATA_GROUP].values().size(), (4, 1)
@@ -375,15 +375,15 @@ class DatasetTest(unittest.TestCase):
             else:
                 self.assertEqual(
                     batch.dense_features[BASE_DATA_GROUP + "_user"].values().size(),
-                    (1, 1),
+                    (4, 1),
                 )
                 self.assertEqual(
                     batch.sparse_features[BASE_DATA_GROUP + "_user"].values().size(),
-                    (1,),
+                    (4,),
                 )
                 self.assertEqual(
                     batch.sparse_features[BASE_DATA_GROUP + "_user"].lengths().size(),
-                    (1,),
+                    (4,),
                 )
                 self.assertEqual(
                     batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)

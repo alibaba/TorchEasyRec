@@ -967,9 +967,9 @@ class DataParserTest(unittest.TestCase):
                     "f_int_a": pa.array([7, 8, 9], pa.float32()),
                     "f_int_b": pa.array(["27\x0337", "28\x0338", "29\x0339"]),
                     "f_lookup_a": pa.array([0.1, 0.0, 0.2]),
-                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", ""]),
-                    "click_seq__f_int_a": pa.array(["14;15;16", "17", ""]),
-                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", ""]),
+                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", "0"]),
+                    "click_seq__f_int_a": pa.array(["14;15;16", "17", "0"]),
+                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", "0"]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
                 FgMode.FG_NONE,
@@ -1001,26 +1001,28 @@ class DataParserTest(unittest.TestCase):
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
-        expected_tag_b_values = torch.tensor([4, 5], dtype=torch.int64)
-        expected_tag_b_lengths = torch.tensor([2], dtype=torch.int32)
-        expected_int_a_values = torch.tensor([[7]], dtype=torch.float32)
+        expected_tag_b_values = torch.tensor([4, 5, 6], dtype=torch.int64)
+        expected_tag_b_lengths = torch.tensor([2, 0, 1], dtype=torch.int32)
+        expected_int_a_values = torch.tensor([[7], [8], [9]], dtype=torch.float32)
         expected_int_b_values = torch.tensor(
             [[27, 37], [28, 38], [29, 39]], dtype=torch.float32
         )
         expected_lookup_a_values = torch.tensor(
             [[0.1], [0.0], [0.2]], dtype=torch.float32
         )
-        expected_seq_cat_a_values = torch.tensor([10, 11, 12], dtype=torch.int64)
-        expected_seq_cat_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_cat_a_values = torch.tensor([10, 11, 12, 13, 0], dtype=torch.int64)
+        expected_seq_cat_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_int_a_values = torch.tensor(
-            [[14], [15], [16]], dtype=torch.float32
+            [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
-        expected_seq_int_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_tag_b_values = torch.tensor(
-            [17, 18, 19, 20, 21], dtype=torch.int64
+            [17, 18, 19, 20, 21, 22, 0], dtype=torch.int64
         )
-        expected_seq_tag_b_key_lengths = torch.tensor([2, 1, 2], dtype=torch.int32)
-        expected_seq_tag_b_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_tag_b_key_lengths = torch.tensor(
+            [2, 1, 2, 1, 1], dtype=torch.int32
+        )
+        expected_seq_tag_b_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["f_cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["f_cat_a.lengths"], expected_cat_a_lengths)
@@ -1056,7 +1058,7 @@ class DataParserTest(unittest.TestCase):
             keys=["f_int_a"],
             length_per_key=[1],
             values=torch.tensor(
-                [[7]],
+                [[7], [8], [9]],
                 dtype=torch.float32,
             ),
         )
@@ -1077,48 +1079,33 @@ class DataParserTest(unittest.TestCase):
                     3,
                     4,
                     5,
-                    4,
-                    5,
-                    4,
-                    5,
+                    6,
                     10,
                     11,
                     12,
-                    10,
-                    11,
-                    12,
-                    10,
-                    11,
-                    12,
+                    13,
+                    0,
                     17,
                     18,
                     19,
                     20,
                     21,
-                    17,
-                    18,
-                    19,
-                    20,
-                    21,
-                    17,
-                    18,
-                    19,
-                    20,
-                    21,
+                    22,
+                    0,
                 ]
             ),
             lengths=torch.tensor(
-                [1, 1, 1, 2, 2, 2, 3, 3, 3, 5, 5, 5], dtype=torch.int32
+                [1, 1, 1, 2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32
             ),
         )
         expected_seq_mulval_lengths = KeyedJaggedTensor.from_lengths_sync(
             keys=["click_seq__f_tag_b"],
-            values=torch.tensor([2, 1, 2, 2, 1, 2, 2, 1, 2], dtype=torch.int32),
-            lengths=torch.tensor([3, 3, 3], dtype=torch.int32),
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         expected_seq_dense_feat = JaggedTensor(
-            values=torch.tensor([[14], [15], [16]], dtype=torch.float32),
-            lengths=torch.tensor([3], dtype=torch.int32),
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         batch = data_parser.to_batch(data)
         torch.testing.assert_close(
@@ -1153,9 +1140,9 @@ class DataParserTest(unittest.TestCase):
                     "f_int_a": pa.array([7, 8, 9], pa.float32()),
                     "f_int_b": pa.array(["27\x0337", "28\x0338", "29\x0339"]),
                     "f_lookup_a": pa.array([0.1, 0.0, 0.2]),
-                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", ""]),
-                    "click_seq__f_int_a": pa.array(["14;15;16", "17", ""]),
-                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", ""]),
+                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", "0"]),
+                    "click_seq__f_int_a": pa.array(["14;15;16", "17", "0"]),
+                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", "0"]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
                 FgMode.FG_NONE,
@@ -1187,26 +1174,28 @@ class DataParserTest(unittest.TestCase):
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
-        expected_tag_b_values = torch.tensor([4, 5], dtype=torch.int64)
-        expected_tag_b_lengths = torch.tensor([2], dtype=torch.int32)
-        expected_int_a_values = torch.tensor([[7]], dtype=torch.float32)
+        expected_tag_b_values = torch.tensor([4, 5, 6], dtype=torch.int64)
+        expected_tag_b_lengths = torch.tensor([2, 0, 1], dtype=torch.int32)
+        expected_int_a_values = torch.tensor([[7], [8], [9]], dtype=torch.float32)
         expected_int_b_values = torch.tensor(
             [[27, 37], [28, 38], [29, 39]], dtype=torch.float32
         )
         expected_lookup_a_values = torch.tensor(
             [[0.1], [0.0], [0.2]], dtype=torch.float32
         )
-        expected_seq_cat_a_values = torch.tensor([10, 11, 12], dtype=torch.int64)
-        expected_seq_cat_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_cat_a_values = torch.tensor([10, 11, 12, 13, 0], dtype=torch.int64)
+        expected_seq_cat_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_int_a_values = torch.tensor(
-            [[14], [15], [16]], dtype=torch.float32
+            [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
-        expected_seq_int_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_tag_b_values = torch.tensor(
-            [17, 18, 19, 20, 21], dtype=torch.int64
+            [17, 18, 19, 20, 21, 22, 0], dtype=torch.int64
         )
-        expected_seq_tag_b_key_lengths = torch.tensor([2, 1, 2], dtype=torch.int32)
-        expected_seq_tag_b_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_tag_b_key_lengths = torch.tensor(
+            [2, 1, 2, 1, 1], dtype=torch.int32
+        )
+        expected_seq_tag_b_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["f_cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["f_cat_a.lengths"], expected_cat_a_lengths)
@@ -1242,7 +1231,7 @@ class DataParserTest(unittest.TestCase):
             keys=["f_int_a"],
             length_per_key=[1],
             values=torch.tensor(
-                [[7]],
+                [[7], [8], [9]],
                 dtype=torch.float32,
             ),
         )
@@ -1261,18 +1250,20 @@ class DataParserTest(unittest.TestCase):
         )
         expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
             keys=["click_seq__f_tag_b"],
-            values=torch.tensor([2, 1, 2], dtype=torch.int32),
-            lengths=torch.tensor([3], dtype=torch.int32),
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         expected_sparse_feat_user = KeyedJaggedTensor.from_lengths_sync(
             keys=["f_tag_b", "click_seq__f_cat_a", "click_seq__f_tag_b"],
-            values=torch.tensor([4, 5, 10, 11, 12, 17, 18, 19, 20, 21]),
-            lengths=torch.tensor([2, 3, 5], dtype=torch.int32),
+            values=torch.tensor(
+                [4, 5, 6, 10, 11, 12, 13, 0, 17, 18, 19, 20, 21, 22, 0]
+            ),
+            lengths=torch.tensor([2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32),
         )
 
         expected_seq_dense_feat = JaggedTensor(
-            values=torch.tensor([[14], [15], [16]], dtype=torch.float32),
-            lengths=torch.tensor([3], dtype=torch.int32),
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         batch = data_parser.to_batch(data)
 

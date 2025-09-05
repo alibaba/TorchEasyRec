@@ -40,6 +40,17 @@ def _to_tensor(x: npt.NDArray) -> torch.Tensor:
     return torch.from_numpy(x)
 
 
+@torch.fx.wrap
+def _tile_size(x: torch.Tensor) -> int:
+    tile_size = x.item()
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check_is_size(tile_size)
+        # check tile_size = 1 to make dynamo check size happy,
+        # because in DataParser.parse, we always set tile_size = 1.
+        torch._check(tile_size == 1)
+    return tile_size
+
+
 class DataParser:
     """Input Data Parser.
 
@@ -145,12 +156,6 @@ class DataParser:
             logger.info(f"self.dense_keys: {self.dense_keys}")
             logger.info(f"self.sequence_dense_keys: {self.sequence_dense_keys}")
 
-            # get dense keys list
-            self.dense_keys_list = []
-            for _, keys in self.dense_keys.items():
-                for key in keys:
-                    self.dense_keys_list.append(f"{key}")
-
     def _init_fg_hander(self) -> None:
         """Init pyfg dag handler."""
         if not self._fg_handler:
@@ -172,17 +177,20 @@ class DataParser:
         """
         output_data = {}
         if is_input_tile():
-            flag = False
-            for k, v in input_data.items():
-                if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
-                    if k in self.user_feats:
-                        input_data[k] = v.take([0])
-                else:
-                    if k in self.user_inputs:
-                        input_data[k] = v.take([0])
-                if not flag:
-                    output_data["batch_size"] = torch.tensor(v.__len__())
-                    flag = True
+            # When making offline predictions, we set the tile_size to 1.
+            # During online serving, we will set the tile_size to batch_size
+            output_data["batch_size"] = torch.tensor(1)
+            # flag = False
+            # for k, v in input_data.items():
+            #     if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+            #         if k in self.user_feats:
+            #             input_data[k] = v.take([0])
+            #     else:
+            #         if k in self.user_inputs:
+            #             input_data[k] = v.take([0])
+            #     if not flag:
+            #         output_data["batch_size"] = torch.tensor(v.__len__())
+            #         flag = True
 
         if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_BUCKETIZE):
             self._parse_feature_fg_handler(input_data, output_data)
@@ -359,7 +367,7 @@ class DataParser:
 
         tile_size = -1
         if input_tile:
-            tile_size = input_data["batch_size"].item()
+            tile_size = _tile_size(input_data["batch_size"])
 
         if input_tile_emb:
             # For INPUT_TILE = 3 mode, batch_size of user features for sparse and dense
@@ -589,7 +597,7 @@ class DataParser:
         """
         sparse_features = {}
         sequence_mulval_lengths = {}
-        tile_size = input_data["batch_size"].item()
+        tile_size = _tile_size(input_data["batch_size"])
 
         for dg, keys in self.sparse_keys.items():
             values = []
