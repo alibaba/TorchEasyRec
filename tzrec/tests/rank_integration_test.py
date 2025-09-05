@@ -456,7 +456,7 @@ class RankIntegrationTest(unittest.TestCase):
                 self.test_dir,
                 # inductor generate a lot of triton kernel, may result in triton cache
                 #  conflict, so that we set TRITON_HOME in tests.
-                env_str=f"TRITON_HOME={self.test_dir} ENABLE_AOT=1",  # NOQA
+                env_str=f"ENABLE_AOT=1",  # NOQA
             )
         if self.success:
             self.success = utils.test_predict(
