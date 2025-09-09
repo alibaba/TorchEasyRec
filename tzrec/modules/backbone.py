@@ -149,7 +149,7 @@ class Package(nn.Module):
         embedding_group,
         feature_groups,
         wide_embedding_dim=None,
-        wide_init_fn=None
+        wide_init_fn=None,
     ):
         super().__init__()
         self._config = config
@@ -193,7 +193,7 @@ class Package(nn.Module):
                 )  # feature_group_name / block_name
                 input_name = getattr(input_node, input_type)
                 if input_type == "feature_group_name":
-                    # If not registered, register it as an input node. 
+                    # If not registered, register it as an input node.
                     # "feature_group_name" requires adding a new DAG node.
                     if input_name not in self._name_to_blocks:
                         new_block = backbone_pb2.Block()
@@ -216,7 +216,7 @@ class Package(nn.Module):
                         raise KeyError(
                             f"input name `{input_name}` not found in blocks/feature_groups"  # NOQA
                         )
-        # ========== step 3: After topological sorting, define_layer in order ============
+        # ========== step 3: After topological sorting, define_layer in order ==========
         self.topo_order = nx.topological_sort(self.G)
         self.topo_order_list = list(self.topo_order)
         A = to_agraph(self.G)
@@ -285,14 +285,16 @@ class Package(nn.Module):
                     else:  # embedding_layer
                         raise NotImplementedError
                     self._name_to_layer[block.name] = input_fn
-            # If module is None, it may be a sequential module        
+            # If module is None, it may be a sequential module
             elif layer is not None:
-                # 使用维度推断引擎处理多输入维度
+                # Use the dimension inference engine to handle multiple input dimensions
                 input_dim_infos = []
 
                 for input_node in block.inputs:
-                    if(len(block.inputs)) > 1:
-                        logging.debug(f"Processing multiple inputs for block {block.name}: {[getattr(n, n.WhichOneof('name')) for n in block.inputs]}")
+                    if (len(block.inputs)) > 1:
+                        logging.debug(
+                            f"Processing multiple inputs for block {block.name}: {[getattr(n, n.WhichOneof('name')) for n in block.inputs]}"  # NOQA
+                        )
                     input_type = input_node.WhichOneof("name")
                     input_name = getattr(input_node, input_type)
                     # Parse input_fn & input_slice
@@ -307,7 +309,8 @@ class Package(nn.Module):
                         input_dim_info = self.dim_engine.get_output_dim(input_name)
 
                         # If it is a recurrent or repeat layer
-                        # To ensure the latest output dimensions, need to do some processing first.
+                        # To ensure the latest output dimensions,
+                        # need to do some processing first.
                         if input_name in self._name_to_blocks:
                             input_block = self._name_to_blocks[input_name]
                             input_layer_type = input_block.WhichOneof("layer")
@@ -385,12 +388,15 @@ class Package(nn.Module):
                             f"Lambda layer {block.name} inferred output dim: {output_dim_info}"  # NOQA
                         )
                     else:
-                        # 检查是否已经是recurrent或repeat层，如果是则跳过输出维度推断
+                        # Check if it is already a recurrent or repeat layer
+                        # if so skip output dimension inference
                         if layer in {"recurrent", "repeat"}:
-                            # Output dimension is already set in define_layers, no need to infer again
+                            # Output dimension is already set in define_layers,
+                            # no need to infer again
                             output_dim_info = self.dim_engine.get_output_dim(block.name)
                             if output_dim_info is None:
-                                # If not in dimension inference engine, get from self._name_to_output_dim
+                                # If not in dimension inference engine,
+                                # get from self._name_to_output_dim
                                 if block.name in self._name_to_output_dim:
                                     output_dim = self._name_to_output_dim[block.name]
                                     output_dim_info = DimensionInfo(output_dim)
@@ -409,7 +415,7 @@ class Package(nn.Module):
                                     f"{layer.capitalize()} layer {block.name} output dim already set: {output_dim_info}"  # NOQA
                                 )
                         else:
-                            # 推断输出维度
+                            # Inferred output dimensions
                             output_dim_info = self.dim_engine.infer_layer_output_dim(
                                 layer_obj, merged_input_dim
                             )
@@ -419,7 +425,6 @@ class Package(nn.Module):
                         output_dim_info.get_feature_dim()
                     )
 
-                    # 添加调试信息
                     logging.info(
                         f"Block {block.name} output dimensions: output_dim_info={output_dim_info}, feature_dim={output_dim_info.get_feature_dim()}"  # NOQA
                     )
@@ -450,7 +455,7 @@ class Package(nn.Module):
                         logging.info(
                             f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
                         )
-            else:  # layer is None, e.g. sequential block layer is None不一定是sequential
+            else:  # layer is None, e.g. sequential
                 if len(block.inputs) == 0:
                     # sequential block without inputs, use input_dim_info
                     raise ValueError(
@@ -461,7 +466,8 @@ class Package(nn.Module):
                     for input_node in block.inputs:
                         input_type = input_node.WhichOneof("name")
                         input_name = getattr(input_node, input_type)
-                        # 解析input_fn & input_slice 暂不支持 sequential 里的 input_fn & input_slice
+                        # Parsing input_fn & input_slice does
+                        # not support input_fn & input_slice in sequential
                         input_fn = getattr(input_node, "input_fn", None)
                         input_slice = getattr(input_node, "input_slice", None)
 
@@ -470,7 +476,7 @@ class Package(nn.Module):
                             # sequential里再嵌套package的情况
                             raise NotImplementedError
                         else:  # block_name 或者 feature_group_name 的情况
-                        # Get input dimension info from dimension inference engine
+                            # Get input dimension info from dimension inference engine
                             input_dim_info = self.dim_engine.get_output_dim(input_name)
                 # Dimension inference for sequential layers
                 prev_output_dim_info = input_dim_info
@@ -478,8 +484,8 @@ class Package(nn.Module):
                 last_output_dim_info = None
                 last_output_dim = None
                 for i, layer_cnf in enumerate(block.layers):
-                    layer = layer_cnf.WhichOneof('layer')
-                    name_i = '%s_l%d' % (block.name, i) # e.g. block1_l0
+                    layer = layer_cnf.WhichOneof("layer")
+                    name_i = "%s_l%d" % (block.name, i)  # e.g. block1_l0
                     # Register input dimension
                     self.dim_engine.register_input_dim(name_i, prev_output_dim_info)
                     self._name_to_input_dim[name_i] = prev_output_dim
@@ -491,25 +497,39 @@ class Package(nn.Module):
                         self.dim_engine.register_layer(name_i, layer_obj)
                         # Infer output dimension
                         if isinstance(layer_obj, LambdaWrapper):
-                            output_dim_info = layer_obj.infer_output_dim(prev_output_dim_info)
+                            output_dim_info = layer_obj.infer_output_dim(
+                                prev_output_dim_info
+                            )
                         else:
-                            output_dim_info = self.dim_engine.infer_layer_output_dim(layer_obj, prev_output_dim_info)
+                            output_dim_info = self.dim_engine.infer_layer_output_dim(
+                                layer_obj, prev_output_dim_info
+                            )
                         self.dim_engine.register_output_dim(name_i, output_dim_info)
-                        self._name_to_output_dim[name_i] = output_dim_info.get_feature_dim()
+                        self._name_to_output_dim[name_i] = (
+                            output_dim_info.get_feature_dim()
+                        )
                         # 更新prev为当前输出
                         prev_output_dim_info = output_dim_info
                         prev_output_dim = output_dim_info.get_feature_dim()
                         last_output_dim_info = output_dim_info
                         last_output_dim = output_dim_info.get_feature_dim()
                     else:
-                        raise ValueError(f"Sequential layer {name_i} not found in _name_to_layer")
+                        raise ValueError(
+                            f"Sequential layer {name_i} not found in _name_to_layer"
+                        )
                 # block输出维度为最后一层输出
                 if last_output_dim_info is not None:
-                    self.dim_engine.register_output_dim(block.name, last_output_dim_info)
+                    self.dim_engine.register_output_dim(
+                        block.name, last_output_dim_info
+                    )
                     self._name_to_output_dim[block.name] = last_output_dim
-                    logging.info(f"Sequential block {block.name} output dim set to {last_output_dim}")
+                    logging.info(
+                        f"Sequential block {block.name} output dim set to {last_output_dim}"  # NOQA
+                    )
                 else:
-                    raise ValueError(f"Cannot determine output dimension for sequential block {block.name}")
+                    raise ValueError(
+                        f"Cannot determine output dimension for sequential block {block.name}"  # NOQA
+                    )
 
         # ======= 后处理、输出节点推断 =======
         input_feature_groups = self._feature_group_inputs
@@ -596,7 +616,7 @@ class Package(nn.Module):
         return sum(self.output_block_dims())
 
     def define_layers(self, layer, layer_cnf, name):
-        """define layers.
+        """Define layers.
 
         Args:
             layer (str): the type of layer, e.g., 'module', 'recurrent', 'repeat'.
@@ -617,14 +637,16 @@ class Package(nn.Module):
             self._name_to_customize[name] = customize
         elif layer == "recurrent":
             torch_layer = layer_cnf.recurrent.module
-            # Get the input dimension info of the parent layer, used for child layer dimension inference
+            # Get the input dimension info of the parent layer,
+            # used for child layer dimension inference
             parent_input_dim_info = self.dim_engine.block_input_dims.get(name)
             parent_input_dim = self._name_to_input_dim.get(name, None)
 
             # Check if there is a fixed_input_index configuration
             fixed_input_index = getattr(layer_cnf.recurrent, "fixed_input_index", None)
 
-            # If fixed_input_index exists and parent_input_dim_info is a list, special handling is needed
+            # If fixed_input_index exists and parent_input_dim_info is a list,
+            # special handling is needed
             child_input_dim_info = parent_input_dim_info
             child_input_dim = parent_input_dim
 
@@ -776,9 +798,11 @@ class Package(nn.Module):
                     axis = layer_cnf.repeat.output_concat_axis
                     num_repeat = layer_cnf.repeat.num_repeat
 
-                    # 如果在最后一维拼接（axis=-1），需要将该维度乘以repeat次数
+                    # IF in the last dimension splicing (axis=-1),
+                    # you need to multiply the dimension by the number of repeats
                     if axis == -1:
-                        # The output dimension of a single child layer multiplied by repeat times
+                        # The output dimension of a single child layer
+                        # multiplied by repeat times
                         final_output_dim = last_output_dim * num_repeat
                         final_output_dim_info = DimensionInfo(final_output_dim)
                         logging.info(
@@ -1496,7 +1520,7 @@ class Package(nn.Module):
             raise RuntimeError(f"Layer {name} ({cls}) failed to execute")
 
     def _try_call_layer(self, layer, inputs, name, cls):
-        """Attempt to call the layer, return True if successful, return False if failed and log the error.
+        """Attempt to call the layer.
 
         Args:
             layer: the layer object to call
@@ -1508,7 +1532,8 @@ class Package(nn.Module):
             bool: Returns True on success, False on failure
         """
         try:
-            # Check the module's forward method signature to determine how to pass parameters
+            # Check the module's forward method signature
+            # to determine how to pass parameters
             if hasattr(layer, "forward"):
                 sig = inspect.signature(layer.forward)
                 params = list(sig.parameters.keys())
@@ -1526,7 +1551,10 @@ class Package(nn.Module):
                 if (
                     isinstance(inputs, (list, tuple))
                     and len(params) > 1
-                    and (len(inputs) == len(params) or len(required_params) >= len(inputs))
+                    and (
+                        len(inputs) == len(params)
+                        or len(required_params) >= len(inputs)
+                    )
                 ):
                     self._last_output = layer(*inputs)
                     logging.debug(
@@ -1737,7 +1765,7 @@ class Backbone(nn.Module):
             embedding_group,
             feature_groups,
             wide_embedding_dim,
-            wide_init_fn
+            wide_init_fn,
         )
         for pkg in config.packages:
             Package(pkg, features, embedding_group)  # Package是一个子DAG
