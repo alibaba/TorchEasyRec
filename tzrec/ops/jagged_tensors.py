@@ -26,15 +26,15 @@ from tzrec.ops.pytorch.pt_jagged_tensors import (
     pytorch_split_2D_jagged,
 )
 
+torch.fx.wrap("pytorch_concat_2D_jagged")
+torch.fx.wrap("pytorch_split_2D_jagged")
+
 if has_triton():
     from tzrec.ops.triton.triton_jagged_tensors import (
         triton_concat_2D_jagged,
         triton_jagged_dense_bmm_broadcast_add,
         triton_split_2D_jagged,
     )
-
-    torch.fx.wrap("triton_concat_2D_jagged")
-    torch.fx.wrap("triton_split_2D_jagged")
 else:
     triton_concat_2D_jagged = pytorch_concat_2D_jagged
     triton_jagged_dense_bmm_broadcast_add = pytorch_jagged_dense_bmm_broadcast_add
@@ -44,8 +44,8 @@ else:
 def concat_2D_jagged(
     values_left: torch.Tensor,
     values_right: torch.Tensor,
-    max_len_left: Optional[int] = None,
-    max_len_right: Optional[int] = None,
+    max_len_left: int,
+    max_len_right: int,
     offsets_left: Optional[torch.Tensor] = None,
     offsets_right: Optional[torch.Tensor] = None,
     kernel: Kernel = Kernel.PYTORCH,

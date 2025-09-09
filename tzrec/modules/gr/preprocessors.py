@@ -32,6 +32,17 @@ from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
 
+@torch.fx.wrap
+def _fx_timestamp_contextual_zeros(
+    seq_timestamp: torch.Tensor, seq_lengths: torch.Tensor, max_contextual_seq_len: int
+) -> torch.Tensor:
+    return torch.zeros(
+        (seq_lengths.size(0) * max_contextual_seq_len, 1),
+        dtype=seq_timestamp.dtype,
+        device=seq_timestamp.device,
+    )
+
+
 class InputPreprocessor(BaseModule):
     """An abstract class for pre-processing sequence embeddings before HSTU layers."""
 
@@ -56,7 +67,6 @@ class InputPreprocessor(BaseModule):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
         """Forward the module.
 
@@ -145,7 +155,7 @@ class ContextualPreprocessor(InputPreprocessor):
         action_encoder: Optional[Dict[str, Any]] = None,
         action_mlp: Optional[Dict[str, Any]] = None,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._output_embedding_dim: int = output_embedding_dim
@@ -194,6 +204,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 **self._action_encoder_cfg,
                 is_inference=is_inference,
             )
+            assert action_mlp is not None
             self._action_embedding_mlp: torch.nn.Module = create_contextualized_mlp(
                 action_mlp,
                 sequential_input_dim=self._action_encoder.output_dim,
@@ -221,7 +232,6 @@ class ContextualPreprocessor(InputPreprocessor):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
         """Forward the module.
 
@@ -316,10 +326,10 @@ class ContextualPreprocessor(InputPreprocessor):
                 kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
-                values_left=torch.zeros(
-                    (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
-                    dtype=output_seq_timestamps.dtype,
-                    device=output_seq_timestamps.device,
+                values_left=_fx_timestamp_contextual_zeros(
+                    output_seq_timestamps,
+                    output_seq_lengths,
+                    self._max_contextual_seq_len,
                 ),
                 values_right=output_seq_timestamps.unsqueeze(-1),
                 max_len_left=self._max_contextual_seq_len,
@@ -385,7 +395,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         action_mlp: Dict[str, Any],
         enable_interleaving: bool = True,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._input_embedding_dim: int = input_embedding_dim
@@ -532,10 +542,10 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
                 kernel=self.kernel(),
             )
             output_seq_timestamps = concat_2D_jagged(
-                values_left=torch.zeros(
-                    (output_seq_lengths.size(0) * self._max_contextual_seq_len, 1),
-                    dtype=output_seq_timestamps.dtype,
-                    device=output_seq_timestamps.device,
+                values_left=_fx_timestamp_contextual_zeros(
+                    output_seq_timestamps,
+                    output_seq_lengths,
+                    self._max_contextual_seq_len,
                 ),
                 values_right=output_seq_timestamps.unsqueeze(-1),
                 max_len_left=self._max_contextual_seq_len,
@@ -585,7 +595,6 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
     ]:
         """Forward the module.
 
@@ -700,7 +709,6 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             output_seq_timestamps,
             output_seq_embeddings,
             output_num_targets,
-            seq_payloads,
         )
 
     def interleave_targets(self) -> bool:
@@ -713,7 +721,8 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
 
 
 def create_input_preprocessor(
-    preprocessor_cfg: Union[module_pb2.GRInputPreprocessor, Dict[str, Any]], **kwargs
+    preprocessor_cfg: Union[module_pb2.GRInputPreprocessor, Dict[str, Any]],
+    **kwargs: Any,
 ) -> InputPreprocessor:
     """Create InputPreprocessor."""
     if isinstance(preprocessor_cfg, module_pb2.GRInputPreprocessor):

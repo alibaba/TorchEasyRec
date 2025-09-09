@@ -6,7 +6,7 @@
 
 ### TorchEasyRec is an easy-to-use framework for Recommendation
 
-TorchEasyRec implements state of the art deep learning models used in common recommendation tasks: candidate generation(matching), scoring(ranking), and multi-task learning. It improves the efficiency of generating high performance models by simple configuration and easy customization.
+TorchEasyRec implements state of the art deep learning models used in common recommendation tasks: candidate generation(matching), scoring(ranking), multi-task learning and generative recommendation. It improves the efficiency of generating high performance models by simple configuration and easy customization.
 
 ### Get Started
 
@@ -38,14 +38,16 @@ TorchEasyRec implements state of the art deep learning models used in common rec
 - Large scale embedding with different sharding strategies
 - Hybrid data-parallelism/model-parallelism
 - Optimized kernels for RecSys powered by TorchRec
+- Mixed precision
 - Consistency guarantee: train and serving
 
 ### A variety of features & models
 
 - IdFeature / RawFeature / ComboFeature / LookupFeature / MatchFeature / ExprFeature / OverlapFeature / TokenizeFeature / SequenceIdFeature / SequenceRawFeature / SequenceFeature
-- [DSSM](docs/source/models/dssm.md) / [TDM](docs/source/models/tdm.md) / [DAT](docs/source/models/dat.md) / [MIND](docs/source/models/mind.md)
-- [WideAndDeep](docs/source/models/wide_and_deep.md) / [DeepFM](docs/source/models/deepfm.md) / [MultiTower](docs/source/models/multi_tower.md) / [DIN](docs/source/models/din.md) / [RocketLaunching](docs/source/models/rocket_launching.md) / [DLRM](docs/source/models/dlrm.md) / [MaskNet](docs/source/models/masknet.md)
-- [MMoE](docs/source/models/mmoe.md) / [DBMTL](docs/source/models/dbmtl.md) / [PLE](docs/source/models/ple.md)
+- Match: [DSSM](docs/source/models/dssm.md) / [TDM](docs/source/models/tdm.md) / [DAT](docs/source/models/dat.md) / [MIND](docs/source/models/mind.md)
+- Rank: [WideAndDeep](docs/source/models/wide_and_deep.md) / [DeepFM](docs/source/models/deepfm.md) / [MultiTower](docs/source/models/multi_tower.md) / [DIN](docs/source/models/din.md) / [RocketLaunching](docs/source/models/rocket_launching.md) / [DLRM](docs/source/models/dlrm.md) / [MaskNet](docs/source/models/masknet.md) / [DCN](docs/source/models/dcn.md) / [DCNv2](docs/source/models/dcn_v2.md) / [xDeepFM](docs/source/models/xdeepfm.md)
+- Multi-Task: [MMoE](docs/source/models/mmoe.md) / [DBMTL](docs/source/models/dbmtl.md) / [PLE](docs/source/models/ple.md)
+- Generative-Rec: [DlrmHSTU](docs/source/models/dlrm_hstu.md)
 - More models in development
 
 ## Contribute

@@ -50,6 +50,12 @@ if __name__ == "__main__":
         help="odps project name.",
     )
     parser.add_argument(
+        "--odps_schema_name",
+        type=str,
+        default=None,
+        help="odps project name.",
+    )
+    parser.add_argument(
         "--fg_resource_name",
         type=str,
         default=None,
@@ -115,6 +121,7 @@ if __name__ == "__main__":
             account=account,
             project=project,
             endpoint=odps_endpoint,
+            schema=args.odps_schema_name if args.odps_schema_name else None,
         )
         for fname in os.listdir(tmp_dir):
             fpath = os.path.join(tmp_dir, fname)

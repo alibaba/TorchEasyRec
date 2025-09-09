@@ -50,3 +50,28 @@ message DLRM {
 message MaskNet {
     required MaskNetModule mask_net_module = 1;
 }
+
+
+message DCNV1 {
+    required Cross cross = 1;
+    required MLP deep = 2;
+    required MLP final = 3;
+}
+
+
+message DCNV2 {
+    optional MLP backbone = 1;
+    required CrossV2 cross = 2;
+    optional MLP deep = 3;
+    required MLP final = 4;
+}
+
+
+message xDeepFM {
+    required CIN cin = 1;
+    required MLP deep = 2;
+    required MLP final = 3;
+    optional uint32 wide_embedding_dim = 4 [default = 16];
+    // wide embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string wide_init_fn = 5;
+}

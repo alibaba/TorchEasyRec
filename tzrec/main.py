@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 from collections import OrderedDict
+from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -101,7 +102,14 @@ def init_process_group() -> Tuple[torch.device, str]:
     else:
         device: torch.device = torch.device("cpu")
         backend = "gloo"
-    dist.init_process_group(backend=backend)
+
+    pg_timeout = None
+    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+        pg_timeout = timedelta(
+            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
+        )
+    dist.init_process_group(backend=backend, timeout=pg_timeout)
+
     return device, backend
 
 
@@ -283,9 +291,9 @@ def _evaluate(
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
-    if global_epoch:
+    if global_epoch is not None:
         desc_suffix += f" Epoch-{global_epoch}"
-    if global_step:
+    if global_step is not None:
         desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
@@ -538,7 +546,7 @@ def _train_and_evaluate(
                 prof.step()
 
         if save_checkpoints_epochs > 0 and i_step > 0:
-            if i_epoch % save_checkpoints_epochs == 0:
+            if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
                 checkpoint_util.save_model(
                     os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -738,7 +746,7 @@ def train_and_evaluate(
     grad_scaler = None
     if train_config.HasField("grad_scaler"):
         grad_scaler = GradScaler(
-            device=device,
+            device=device.type,
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(

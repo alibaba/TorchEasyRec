@@ -842,8 +842,13 @@ def load_config_for_test(
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
-    data_config = pipeline_config.data_config
+    pipeline_config.model_dir = os.path.join(test_dir, "train")
+    if len(pipeline_config.train_input_path) > 0:
+        # use prepared data
+        return pipeline_config
 
+    # rewrite config with mock data
+    data_config = pipeline_config.data_config
     features = create_features(
         list(pipeline_config.feature_configs),
         fg_mode=data_config.fg_mode,
@@ -999,7 +1004,6 @@ def load_config_for_test(
             sampler_config.item_input_path = item_gl_path
 
     data_config.dataset_type = data_pb2.ParquetDataset
-    pipeline_config.model_dir = os.path.join(test_dir, "train")
 
     return pipeline_config
 

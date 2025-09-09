@@ -140,6 +140,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
                 frozen_names = {
                     f".{t.name}.weight"
                     for t in m.embedding_bag_configs()
+                    # pyre-ignore [16]
                     if not t.trainable
                 }
                 for name, param in m.named_parameters():
@@ -152,6 +153,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
                 frozen_names = {
                     f".{t.name}.weight"
                     for t in m.embedding_configs()
+                    # pyre-ignore [16]
                     if not t.trainable
                 }
                 for name, param in m.named_parameters():

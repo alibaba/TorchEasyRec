@@ -21,7 +21,7 @@ from pyarrow import dataset as ds
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
-from tzrec.utils import config_util
+from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
 
 
@@ -37,9 +37,7 @@ class RankIntegrationTest(unittest.TestCase):
         if self.success:
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
-        os.environ.pop("QUANT_EMB", None)
         os.environ.pop("INPUT_TILE", None)
-        os.environ.pop("ENABLE_TRT", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
@@ -141,6 +139,10 @@ class RankIntegrationTest(unittest.TestCase):
                 f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}",
             )
         self.assertTrue(self.success)
+        _, steps = checkpoint_util.latest_checkpoint(
+            os.path.join(self.test_dir, "2/train")
+        )
+        self.assertGreater(steps, 5)
 
     def _test_rank_with_fg(self, pipeline_config_path, comp_cpu_gpu_pred_result=False):
         self.success = utils.test_train_eval(
@@ -770,14 +772,31 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
 
-    @unittest.skip("skip trt test")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config", self.test_dir
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skip("skip trt test")
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",

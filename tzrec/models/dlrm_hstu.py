@@ -33,10 +33,10 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_infer_max_len, fx_int_item
+from tzrec.utils.fx_util import fx_int_item, fx_numel
 
-torch.fx.wrap(fx_infer_max_len)
 torch.fx.wrap(fx_int_item)
+torch.fx.wrap(fx_numel)
 
 
 @torch.fx.wrap
@@ -55,11 +55,6 @@ def _fx_construct_payload(
         results[k + "_offsets"] = v.offsets()
     results.update(payload_features)
     return results
-
-
-@torch.fx.wrap
-def _fx_mark_length_features(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor
 
 
 class DlrmHSTU(RankModel):
@@ -183,10 +178,11 @@ class DlrmHSTU(RankModel):
             kernel=self.kernel(),
         ).squeeze(-1)
         total_targets = fx_int_item(num_candidates.sum())
+        total_len = fx_numel(source_timestamps)
         candidates_user_embeddings, _ = self._hstu_transducer(
             max_uih_len=max_uih_len,
             max_targets=max_candidates,
-            total_uih_len=source_timestamps.numel() - total_targets,
+            total_uih_len=total_len - total_targets,
             total_targets=total_targets,
             seq_embeddings=uih_seq_embeddings[
                 self._model_config.uih_id_feature_name
@@ -214,7 +210,7 @@ class DlrmHSTU(RankModel):
         self,
         batch: Batch,
     ) -> Tuple[
-        Dict[str, Dict[str, JaggedTensor]],
+        Dict[str, OrderedDict[str, JaggedTensor]],
         Dict[str, torch.Tensor],
         int,
         torch.Tensor,
@@ -227,15 +223,15 @@ class DlrmHSTU(RankModel):
         sparse_features = batch.sparse_features[BASE_DATA_GROUP].to_dict()
         sequence_dense_features = batch.sequence_dense_features
 
-        num_candidates = _fx_mark_length_features(
-            sparse_features[self._model_config.candidates_id_feature_name].lengths()
-        )
-        max_num_candidates = fx_infer_max_len(num_candidates)
+        num_candidates = sparse_features[
+            self._model_config.candidates_id_feature_name
+        ].lengths()
+        max_num_candidates = fx_int_item(num_candidates.max())
 
         uih_seq_lengths = sparse_features[
             self._model_config.uih_id_feature_name
         ].lengths()
-        max_uih_len = fx_infer_max_len(uih_seq_lengths)
+        max_uih_len = fx_int_item(uih_seq_lengths.max())
 
         # prepare payload features
         payload_features: Dict[str, torch.Tensor] = {}
@@ -255,11 +251,11 @@ class DlrmHSTU(RankModel):
                 or candidate_feature_name
                 == self._model_config.candidates_watchtime_feature_name
             ):
-                total_candidates = torch.sum(num_candidates).item()
-                values_right = torch.zeros(
-                    (total_candidates, 1),  # pyre-ignore
+                values_right = torch.zeros_like(
+                    sparse_features[
+                        self._model_config.candidates_id_feature_name
+                    ].values(),
                     dtype=values_left.dtype,
-                    device=values_left.device,
                 )
             elif is_sparse:
                 values_right = (
@@ -288,7 +284,7 @@ class DlrmHSTU(RankModel):
 
     def main_forward(
         self,
-        grouped_features: Dict[str, Dict[str, JaggedTensor]],
+        grouped_features: Dict[str, OrderedDict[str, JaggedTensor]],
         payload_features: Dict[str, torch.Tensor],
         max_uih_len: int,
         uih_seq_lengths: torch.Tensor,
