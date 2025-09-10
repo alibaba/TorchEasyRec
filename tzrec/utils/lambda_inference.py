@@ -12,7 +12,7 @@
 """Lambda expression dimension inference module."""
 
 import logging
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union,Any
 
 import torch
 import torch.nn as nn
@@ -21,12 +21,12 @@ from tzrec.utils.dimension_inference import DimensionInfo
 
 
 class LambdaOutputDimInferrer:
-    """Lambda表达式输出维度推断器.
+    """Lambda expression output dimension inferer.
 
-    通过创建dummy tensor并执行lambda表达式来推断输出维度.
+    Infer the output dimensions by creating a dummy tensor and executing the lambda expression.
     """
 
-    def __init__(self):
+    def __init__(self)-> None:
         """Initialize the Lambda output dimension inferrer."""
         self.logger = logging.getLogger(__name__)
 
@@ -37,38 +37,38 @@ class LambdaOutputDimInferrer:
         dummy_batch_size: int = 2,
         dummy_seq_len: Optional[int] = None,
     ) -> DimensionInfo:
-        """推断lambda表达式的输出维度.
+        """Infer the output dimensions of a lambda expression.
 
         Args:
-            input_dim_info: 输入维度信息
-            lambda_fn_str: lambda表达式字符串，如 "lambda x: x.sum(dim=1)"
-            dummy_batch_size: 用于创建dummy tensor的batch size
-            dummy_seq_len: 用于创建dummy tensor的序列长度（可选）
+            input_dim_info: The input dimension information.
+            lambda_fn_str: The lambda expression string, such as "lambda x: x.sum".
+            dummy_batch_size: The batch size used to create a dummy tensor.
+            dummy_seq_len: The sequence length used to create a dummy tensor (optional).
 
         Returns:
-            推断出的输出维度信息
+            The inferred output dimension information.
         """
         try:
-            # 1. 创建dummy tensor
+            # 1. Create a dummy tensor
             dummy_tensor = self._create_dummy_tensor(
                 input_dim_info, dummy_batch_size, dummy_seq_len
             )
 
-            # 2. 编译lambda函数
+            # 2. Compile the Lambda function
             lambda_fn = self._compile_lambda_function(lambda_fn_str)
 
-            # 3. 执行lambda函数
-            with torch.no_grad():  # 不需要梯度计算
+            # 3. Execute the Lambda function
+            with torch.no_grad():  # No gradient computation needed
                 output_tensor = lambda_fn(dummy_tensor)
 
-            # 4. 分析输出并创建DimensionInfo
+            # 4. Parse the output and create a DimensionInfo
             return self._analyze_output(output_tensor, input_dim_info)
 
         except Exception as e:
             self.logger.error(
                 f"Failed to infer output dim for lambda '{lambda_fn_str}': {e}"
             )
-            # 出错时返回输入维度作为fallback
+            # Return the input dimension as fallback on error
             self.logger.warning("Falling back to input dimension")
             return input_dim_info
 
@@ -78,15 +78,15 @@ class LambdaOutputDimInferrer:
         batch_size: int,
         seq_len: Optional[int] = None,
     ) -> torch.Tensor:
-        """创建用于测试的dummy tensor."""
+        """Create a dummy tensor for testing."""
         if input_dim_info.shape is not None:
-            # 如果有完整的shape信息，使用它
+            # if there is full shape info, use it
             shape = input_dim_info.shape
-            # 替换第一个维度为dummy_batch_size
+            # replace the first dimension with dummy_batch_size
             if len(shape) > 0:
                 shape = (batch_size,) + shape[1:]
         else:
-            # 根据特征维度估算shape
+            # compute shape based on feature dimension
             feature_dim = input_dim_info.get_feature_dim()
 
             if seq_len is not None:
@@ -96,19 +96,15 @@ class LambdaOutputDimInferrer:
                 # 2D: (batch_size, feature_dim)
                 shape = (batch_size, feature_dim)
 
-        # 创建随机tensor
         dummy_tensor = torch.randn(shape, dtype=torch.float32)
         self.logger.debug(f"Created dummy tensor with shape: {shape}")
         return dummy_tensor
 
-    def _compile_lambda_function(self, lambda_fn_str: str) -> Callable:
-        """编译lambda函数字符串."""
+    def _compile_lambda_function(self, lambda_fn_str: str) -> Callable[..., Any]:
+        """Compile lambda function string."""
         try:
-            # 清理字符串
             lambda_fn_str = lambda_fn_str.strip()
 
-            # 移除安全检查，直接编译lambda函数
-            # 编译lambda函数 - 使用完整的全局环境
             lambda_fn = eval(lambda_fn_str)
 
             if not callable(lambda_fn):
@@ -128,13 +124,13 @@ class LambdaOutputDimInferrer:
     def _analyze_output(
         self, output_tensor: torch.Tensor, input_dim_info: DimensionInfo
     ) -> DimensionInfo:
-        """分析输出tensor并创建DimensionInfo."""
+        """Analyze the output tensor and create DimensionInfo."""
         if isinstance(output_tensor, (list, tuple)):
-            # 如果输出是list/tuple
+            # if the output is list/tuple
             if len(output_tensor) == 0:
                 return DimensionInfo(0, is_list=True)
 
-            # 分析list中每个元素的维度
+            # analyze the dimension of each element in the list
             dims = []
             shapes = []
             for item in output_tensor:
@@ -142,7 +138,7 @@ class LambdaOutputDimInferrer:
                     dims.append(item.shape[-1] if len(item.shape) > 0 else 1)
                     shapes.append(item.shape)
                 else:
-                    # 非tensor元素
+                    # not a tensor
                     dims.append(1)
                     shapes.append((1,))
 
@@ -150,13 +146,13 @@ class LambdaOutputDimInferrer:
                 dim=dims,
                 shape=shapes[0]
                 if len(set(shapes)) == 1
-                else None,  # 如果所有shape相同则保留
+                else None, 
                 is_list=True,
                 feature_dim=sum(dims),
             )
 
         elif isinstance(output_tensor, torch.Tensor):
-            # 标准tensor输出
+            # Standard tensor output
             output_shape = tuple(output_tensor.shape)
             feature_dim = output_shape[-1] if len(output_shape) > 0 else 1
 
@@ -165,26 +161,26 @@ class LambdaOutputDimInferrer:
             )
 
         else:
-            # 其他类型的输出
+            # other types of output
             self.logger.warning(f"Unexpected output type: {type(output_tensor)}")
             return DimensionInfo(1, feature_dim=1)
 
 
 class LambdaLayer(nn.Module):
-    """Lambda表达式层，提供output_dim方法."""
+    """Lambda expression layer, providing output_dim method."""
 
     def __init__(
         self,
         lambda_fn_str: str,
         input_dim_info: Optional[DimensionInfo] = None,
         name: str = "lambda_layer",
-    ):
+    )-> None:
         """Initialize the Lambda layer.
 
         Args:
-            lambda_fn_str: lambda表达式字符串
-            input_dim_info: 输入维度信息（用于推断输出维度）
-            name: 层的名称
+            lambda_fn_str: lambda expression string
+            input_dim_info: Input dimension information (used to infer output dimension)
+            name: Layer name
         """
         super().__init__()
         self.lambda_fn_str = lambda_fn_str
@@ -193,20 +189,20 @@ class LambdaLayer(nn.Module):
         self._output_dim_info = None
         self._lambda_fn = None
 
-        # 编译lambda函数
+        # compile the lambda function
         self._compile_function()
 
-        # 如果有输入维度信息，立即推断输出维度
+        # if there is input dimension info, infer output dimension immediately
         if input_dim_info is not None:
             self._infer_output_dim()
 
-    def _compile_function(self):
-        """编译lambda函数."""
+    def _compile_function(self)-> None:
+        """compile lambda function."""
         inferrer = LambdaOutputDimInferrer()
         self._lambda_fn = inferrer._compile_lambda_function(self.lambda_fn_str)
 
-    def _infer_output_dim(self):
-        """推断输出维度."""
+    def _infer_output_dim(self)-> None:
+        """infer output dimension."""
         if self._input_dim_info is None:
             raise ValueError(
                 "Cannot infer output dimension without input dimension info"
@@ -217,13 +213,13 @@ class LambdaLayer(nn.Module):
             self._input_dim_info, self.lambda_fn_str
         )
 
-    def set_input_dim_info(self, input_dim_info: DimensionInfo):
-        """设置输入维度信息并推断输出维度."""
+    def set_input_dim_info(self, input_dim_info: DimensionInfo)-> None:
+        """set input dimension info and re-infer output dimension."""
         self._input_dim_info = input_dim_info
         self._infer_output_dim()
 
     def output_dim(self) -> int:
-        """获取输出维度，类似MLP.output_dim()."""
+        """get the output feature dimension."""
         if self._output_dim_info is None:
             raise ValueError(
                 f"Output dimension not available for {self.name}. "
@@ -232,7 +228,7 @@ class LambdaLayer(nn.Module):
         return self._output_dim_info.get_feature_dim()
 
     def get_output_dim_info(self) -> DimensionInfo:
-        """获取完整的输出维度信息."""
+        """get the output dimension info."""
         if self._output_dim_info is None:
             raise ValueError(
                 f"Output dimension not available for {self.name}. "
@@ -241,31 +237,31 @@ class LambdaLayer(nn.Module):
         return self._output_dim_info
 
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, list, tuple]:
-        """前向传播."""
+        """forward."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
         return self._lambda_fn(x)
 
-    def __repr__(self):
+    def __repr__(self)-> str:
         return f"LambdaLayer(name={self.name}, lambda_fn='{self.lambda_fn_str}')"
 
 
 def create_lambda_layer_from_input_fn(
     input_fn_str: str, input_dim_info: DimensionInfo, name: str = "input_fn_layer"
 ) -> LambdaLayer:
-    """从input_fn字符串创建Lambda层.
+    """Create a Lambda layer from an input_fn string.
 
-    这个函数可以用于将backbone配置中的input_fn转换为具有output_dim方法的层.
+    Convert the input_fn in the backbone configuration 
+    into a layer with an output_dim method.
     """
     return LambdaLayer(
         lambda_fn_str=input_fn_str, input_dim_info=input_dim_info, name=name
     )
 
 
-# 便捷函数
 def infer_lambda_output_dim(
     input_dim_info: DimensionInfo, lambda_fn_str: str
 ) -> DimensionInfo:
-    """便捷函数：推断lambda表达式的输出维度."""
+    """Infer the output dimensions of a lambda expression."""
     inferrer = LambdaOutputDimInferrer()
     return inferrer.infer_output_dim(input_dim_info, lambda_fn_str)
