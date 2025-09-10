@@ -1361,10 +1361,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         )
 
         results = {}
+        sparse_query_cache: Dict[str, torch.Tensor] = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
             for info in v:
-                if info.is_sparse:
+                if info.name in sparse_query_cache:
+                    query_t = sparse_query_cache[info.name]
+                elif info.is_sparse:
                     query_jt = jt_dict[info.name]
                     if info.value_dim == 1:
                         # for single-value id feature
@@ -1378,6 +1381,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             query_t = torch.nan_to_num(query_t, nan=0.0)
                     if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
+                    sparse_query_cache[info.name] = query_t
                 else:
                     query_t = dense_t_dict[info.name]
                 query_t_list.append(query_t)
@@ -1411,6 +1415,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
 
+                # if not is_input_tile_emb(): # 加环境变量 取values
+                # jt = jt.to_padded_dense(group_sequence_length)
                 jt = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:
