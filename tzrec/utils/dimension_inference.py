@@ -12,7 +12,6 @@
 """Enhanced dimension inference utilities for backbone blocks."""
 
 import logging
-import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch.nn as nn
@@ -27,27 +26,27 @@ class DimensionInfo:
         shape: Optional[Tuple[int, ...]] = None,
         is_list: bool = False,
         feature_dim: Optional[int] = None,
-    ):
+    ) -> None:
         """Initialize DimensionInfo.
 
         Args:
             dim: Dimension information, int (single dim) or a list/tuple (multiple dim).
             shape: The complete tensor shape information (if available).
             is_list: Indicates whether the output is of a list type.
-            feature_dim: Explicitly specified feature dimension to override automatic inference.
+            feature_dim: Explicitly specified feature dime to override inference.
         """
         self.dim = dim
         self.shape = shape
         self.is_list = is_list
         self._feature_dim = feature_dim
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"DimensionInfo(dim={self.dim}, shape={self.shape}, "
             f"is_list={self.is_list}, feature_dim={self._feature_dim})"
         )
 
-    def get_feature_dim(self) -> int:
+    def get_feature_dim(self) -> Union[int, List[int], Tuple[int, ...]]:
         """Get feature dimension (last dimension)."""
         # Prefer explicitly specified feature dimensions
         if self._feature_dim is not None:
@@ -62,7 +61,7 @@ class DimensionInfo:
                 return self.dim[-1] if self.dim else 0
         return self.dim
 
-    def get_total_dim(self) -> int:
+    def get_total_dim(self) -> Union[int, List[int], Tuple[int, ...]]:
         """Get the total dimension (for operations such as concat)."""
         if isinstance(self.dim, (list, tuple)):
             return sum(self.dim)
@@ -86,12 +85,12 @@ class DimensionInfo:
     ) -> Tuple[int, ...]:
         """Estimate shape based on known information.
 
-            Args:
-                batch_size: The batch size.
-                seq_len: The sequence length (if applicable).
+        Args:
+            batch_size: The batch size.
+            seq_len: The sequence length (if applicable).
 
-            Returns:
-                The estimated shape as a tuple.
+        Returns:
+            The estimated shape as a tuple.
         """
         if self.shape is not None:
             return self.shape
@@ -112,7 +111,7 @@ class DimensionInfo:
 
 
 class DimensionInferenceEngine:
-    """Dimension inference engine, manages and infers dimension information between blocks."""
+    """Dimension inference engine, manages and infers dim information between blocks."""
 
     def __init__(self):
         self.block_input_dims: Dict[str, DimensionInfo] = {}
@@ -194,7 +193,7 @@ class DimensionInferenceEngine:
                 output_dim = layer._sequence_dim
                 return DimensionInfo(output_dim, feature_dim=output_dim)
             else:
-                # 未初始化时，尝试从输入维度推断
+                # not initialized yet, infer from input
                 if isinstance(input_dim, DimensionInfo):
                     # input is [sequence_features, query_features]concat
                     # The output dimension is equal to sequence_dim
@@ -287,7 +286,7 @@ class DimensionInferenceEngine:
     def _apply_input_slice(
         self, dim_info: DimensionInfo, input_slice: str
     ) -> DimensionInfo:
-        """use input_slice."""
+        """Use input_slice."""
         try:
             # Parsing slice expressions
             slice_expr = eval(
@@ -327,7 +326,7 @@ class DimensionInferenceEngine:
             return dim_info
 
     def _apply_input_fn(self, dim_info: DimensionInfo, input_fn: str) -> DimensionInfo:
-        """use input_fn transform - Prioritize using dummy tensor inference."""
+        """Use input_fn transform - Prioritize using dummy tensor inference."""
         try:
             # First try to use dummy tensor for inference
             try:
@@ -415,7 +414,7 @@ def create_dimension_info_from_embedding(
     try:
         total_dim = embedding_group.group_total_dim(group_name)
 
-       # Estimate shape information
+        # Estimate shape information
         if batch_size is not None:
             estimated_shape = (batch_size, total_dim)
         else:
@@ -499,7 +498,7 @@ def create_dimension_info_from_layer_output(
             # Output dimension equals sequence_dim
             total_dim = input_dim_info.get_feature_dim()
             if total_dim > 0:
-                # suppose sequence_dim = total_dim / 2 
+                # suppose sequence_dim = total_dim / 2
                 output_dim = total_dim // 2
                 logging.info(
                     f"DIN output dimension inferred as {output_dim} "

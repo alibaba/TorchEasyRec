@@ -12,7 +12,7 @@
 """Lambda expression dimension inference module."""
 
 import logging
-from typing import Callable, Optional, Union,Any
+from typing import Any, Callable, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -23,10 +23,11 @@ from tzrec.utils.dimension_inference import DimensionInfo
 class LambdaOutputDimInferrer:
     """Lambda expression output dimension inferer.
 
-    Infer the output dimensions by creating a dummy tensor and executing the lambda expression.
+    Infer the output dimensions by creating a dummy tensor and
+    executing the lambda expression.
     """
 
-    def __init__(self)-> None:
+    def __init__(self) -> None:
         """Initialize the Lambda output dimension inferrer."""
         self.logger = logging.getLogger(__name__)
 
@@ -144,9 +145,7 @@ class LambdaOutputDimInferrer:
 
             return DimensionInfo(
                 dim=dims,
-                shape=shapes[0]
-                if len(set(shapes)) == 1
-                else None, 
+                shape=shapes[0] if len(set(shapes)) == 1 else None,
                 is_list=True,
                 feature_dim=sum(dims),
             )
@@ -174,7 +173,7 @@ class LambdaLayer(nn.Module):
         lambda_fn_str: str,
         input_dim_info: Optional[DimensionInfo] = None,
         name: str = "lambda_layer",
-    )-> None:
+    ) -> None:
         """Initialize the Lambda layer.
 
         Args:
@@ -196,13 +195,13 @@ class LambdaLayer(nn.Module):
         if input_dim_info is not None:
             self._infer_output_dim()
 
-    def _compile_function(self)-> None:
-        """compile lambda function."""
+    def _compile_function(self) -> None:
+        """Compile lambda function."""
         inferrer = LambdaOutputDimInferrer()
         self._lambda_fn = inferrer._compile_lambda_function(self.lambda_fn_str)
 
-    def _infer_output_dim(self)-> None:
-        """infer output dimension."""
+    def _infer_output_dim(self) -> None:
+        """Infer output dimension."""
         if self._input_dim_info is None:
             raise ValueError(
                 "Cannot infer output dimension without input dimension info"
@@ -213,13 +212,13 @@ class LambdaLayer(nn.Module):
             self._input_dim_info, self.lambda_fn_str
         )
 
-    def set_input_dim_info(self, input_dim_info: DimensionInfo)-> None:
-        """set input dimension info and re-infer output dimension."""
+    def set_input_dim_info(self, input_dim_info: DimensionInfo) -> None:
+        """Set input dimension info and re-infer output dimension."""
         self._input_dim_info = input_dim_info
         self._infer_output_dim()
 
     def output_dim(self) -> int:
-        """get the output feature dimension."""
+        """Get the output feature dimension."""
         if self._output_dim_info is None:
             raise ValueError(
                 f"Output dimension not available for {self.name}. "
@@ -228,7 +227,7 @@ class LambdaLayer(nn.Module):
         return self._output_dim_info.get_feature_dim()
 
     def get_output_dim_info(self) -> DimensionInfo:
-        """get the output dimension info."""
+        """Get the output dimension info."""
         if self._output_dim_info is None:
             raise ValueError(
                 f"Output dimension not available for {self.name}. "
@@ -236,13 +235,15 @@ class LambdaLayer(nn.Module):
             )
         return self._output_dim_info
 
-    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, list, tuple]:
-        """forward."""
+    def forward(
+        self, x: torch.Tensor
+    ) -> Union[torch.Tensor, List[Any], tuple[Any, ...]]:
+        """Forward."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
         return self._lambda_fn(x)
 
-    def __repr__(self)-> str:
+    def __repr__(self) -> str:
         return f"LambdaLayer(name={self.name}, lambda_fn='{self.lambda_fn_str}')"
 
 
@@ -251,7 +252,7 @@ def create_lambda_layer_from_input_fn(
 ) -> LambdaLayer:
     """Create a Lambda layer from an input_fn string.
 
-    Convert the input_fn in the backbone configuration 
+    Convert the input_fn in the backbone configuration
     into a layer with an output_dim method.
     """
     return LambdaLayer(

@@ -88,7 +88,9 @@ class LambdaWrapper(nn.Module):
             logging.error(f"Failed to compile lambda function '{self.expression}': {e}")
             raise
 
-    def forward(self, x: Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
+    def forward(
+        self, x: Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]
+    ) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
         """Executing lambda expressions."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
@@ -127,7 +129,9 @@ class Package(nn.Module):
         return backbone.has_block(name)
 
     @staticmethod
-    def backbone_block_outputs(name: str) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
+    def backbone_block_outputs(
+        name: str,
+    ) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
         """Get the outputs of a backbone block by name.
 
         Args:
@@ -578,7 +582,7 @@ class Package(nn.Module):
             "%s layers: %s" % (config.name, ",".join(self._name_to_layer.keys()))
         )
 
-    def get_output_block_names(self)-> List[str]:
+    def get_output_block_names(self) -> List[str]:
         """Returns the final output block name list (prefer concat_blocks, otherwise output_blocks)."""  # NOQA
         blocks = list(getattr(self._config, "concat_blocks", []))
         if not blocks:
@@ -600,7 +604,7 @@ class Package(nn.Module):
         )
         return summary
 
-    def output_block_dims(self)-> List[int]:
+    def output_block_dims(self) -> List[int]:
         """Return a list of dimensions of the final output blocks, e.g. [160, 96]."""
         blocks = self.get_output_block_names()
         dims = []
@@ -619,7 +623,7 @@ class Package(nn.Module):
         """Return the total dimension of the final output after concatenation."""
         return sum(self.output_block_dims())
 
-    def define_layers(self, layer:str, layer_cnf:backbone_pb2.Block, name)-> None:
+    def define_layers(self, layer: str, layer_cnf: backbone_pb2.Block, name) -> None:
         """Define layers.
 
         Args:
