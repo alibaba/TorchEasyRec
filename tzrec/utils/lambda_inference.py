@@ -12,7 +12,7 @@
 """Lambda expression dimension inference module."""
 
 import logging
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union, Tuple, Iterable
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,7 @@ from tzrec.utils.dimension_inference import DimensionInfo
 class LambdaOutputDimInferrer:
     """Lambda expression output dimension inferer.
 
-    Infer the output dimensions by creating a dummy tensor and
+    Infer the output dimensions by creating a dummy tensor and 
     executing the lambda expression.
     """
 
@@ -101,7 +101,7 @@ class LambdaOutputDimInferrer:
         self.logger.debug(f"Created dummy tensor with shape: {shape}")
         return dummy_tensor
 
-    def _compile_lambda_function(self, lambda_fn_str: str) -> Callable[..., Any]:
+    def _compile_lambda_function(self, lambda_fn_str: str) -> Union[Callable[[torch.Tensor], torch.Tensor], Callable[[Iterable[torch.Tensor]], torch.Tensor]]:
         """Compile lambda function string."""
         try:
             lambda_fn_str = lambda_fn_str.strip()
@@ -171,7 +171,7 @@ class LambdaLayer(nn.Module):
     def __init__(
         self,
         lambda_fn_str: str,
-        input_dim_info: Optional[DimensionInfo] = None,
+        input_dim_info: DimensionInfo = None,
         name: str = "lambda_layer",
     ) -> None:
         """Initialize the Lambda layer.
@@ -237,7 +237,7 @@ class LambdaLayer(nn.Module):
 
     def forward(
         self, x: torch.Tensor
-    ) -> Union[torch.Tensor, List[Any], tuple[Any, ...]]:
+    ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]]:
         """Forward."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
