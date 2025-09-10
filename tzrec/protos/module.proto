@@ -253,8 +253,8 @@ message HSTU {
 }
 
 message FM {
-    optional bool use_variant = 1;
-    optional float l2_regularization = 5 [default = 1e-4];
+    // optional bool use_variant = 1;
+    // optional float l2_regularization = 5 [default = 1e-4];
 }
 
 message MMoEModule {
@@ -266,21 +266,4 @@ message MMoEModule {
     required uint32 num_task = 4;
     // mmoe gate module definition
     optional MLP gate_mlp = 2;
-}
-
-message Cross {
-    // input feature dimension (optional, can be inferred from input)
-    optional uint32 input_dim = 1;
-}
-
-message CrossNet {
-    // number of cross layers
-    required uint32 num_layers = 1;
-}
-
-message DCNv2Net {
-    // number of cross layers
-    required uint32 num_layers = 1;
-    // low rank dimension for DCN-v2
-    required uint32 low_rank = 2;
 }

@@ -11,8 +11,8 @@
 
 # from .backbone_module import FM, Add
 # from .cross import Cross, CrossNet
-from .interaction import Cross, CrossV2
 from .fm import FactorizationMachine as FM
+from .interaction import Cross, CrossV2
 from .masknet import MaskBlock, MaskNetModule
 from .mlp import MLP
 from .mmoe import MMoE

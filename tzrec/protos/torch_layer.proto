@@ -4,7 +4,6 @@ package tzrec.protos;
 import "google/protobuf/struct.proto";
 import "tzrec/protos/module.proto";
 import "tzrec/protos/seq_encoder.proto";
-// import "tzrec/protos/models/multi_task_rank.proto";
 
 message TorchLayer {
     required string class_name = 1;
@@ -15,8 +14,8 @@ message TorchLayer {
         DINEncoder din = 12;
         MMoEModule mmoe = 14;
         Cross cross = 15;
-        CrossNet cross_net = 16;
-        DCNv2Net dcnv2_net = 17;
+        CrossV2 cross_v2 = 16;
+        // DCNv2Net dcnv2_net = 17;
         MaskNetModule mask_net_module = 18;
         MaskBlock mask_block = 19;
     }
