@@ -33,17 +33,16 @@ class ModularRank(RankModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        # self.init_input()
         self._feature_dict = features
         self._backbone_output = None
         self._backbone_net = self.build_backbone_network()
 
-        # 使用backbone的最终输出维度，考虑top_mlp的影响
+        # Use the final output dimension of backbone and consider the impact of top_mlp
         output_dims = self._backbone_net.output_dim()
-        # 如果有多个 package（如 Package.__packages 里），如何拿到output_dims，暂未实现
+
         self.output_mlp = nn.Linear(output_dims, self._num_class)
 
-    def build_backbone_network(self):
+    def build_backbone_network(self) -> Backbone:
         """Build backbone."""
         wide_embedding_dim = (
             int(self.wide_embedding_dim)
@@ -55,7 +54,7 @@ class ModularRank(RankModel):
         return Backbone(
             config=self._base_model_config.rank_backbone.backbone,
             features=self._feature_dict,
-            embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
+            embedding_group=None,  # Backbone create the EmbeddingGroup itself
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
             wide_init_fn=wide_init_fn,
@@ -65,7 +64,6 @@ class ModularRank(RankModel):
         self,
         batch: Batch,
     ) -> Optional[nn.Module]:
-        # -> torch.Tensor:
         """Get backbone."""
         if self._backbone_output:
             return self._backbone_output

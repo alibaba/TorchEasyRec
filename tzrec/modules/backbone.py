@@ -11,16 +11,18 @@
 
 import inspect
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import networkx as nx
 import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
 
+from tzrec.features.feature import BaseFeature
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos import backbone_pb2
+from tzrec.protos.model_pb2 import FeatureGroupConfig
 from tzrec.utils.backbone_utils import Parameter
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.dimension_inference import (
@@ -67,14 +69,14 @@ print("[TEST] Logging configuration test complete")
 class LambdaWrapper(nn.Module):
     """Lambda expression wrapper for dimension inference and execution."""
 
-    def __init__(self, expression: str, name: str = "lambda_wrapper"):
+    def __init__(self, expression: str, name: str = "lambda_wrapper") -> None:
         super().__init__()
         self.expression = expression
         self.name = name
         self._lambda_fn = None
         self._compile_function()
 
-    def _compile_function(self):
+    def _compile_function(self) -> None:
         """Compiling Lambda Functions."""
         try:
             self._lambda_fn = eval(self.expression)
@@ -86,7 +88,7 @@ class LambdaWrapper(nn.Module):
             logging.error(f"Failed to compile lambda function '{self.expression}': {e}")
             raise
 
-    def forward(self, x):
+    def forward(self, x: Any) -> Any:
         """Executing lambda expressions."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
@@ -107,7 +109,7 @@ class LambdaWrapper(nn.Module):
             )
             return input_dim_info
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"LambdaWrapper(name={self.name}, expression='{self.expression}')"
 
 
@@ -117,7 +119,7 @@ class Package(nn.Module):
     __packages = {}
 
     @staticmethod
-    def has_backbone_block(name):
+    def has_backbone_block(name: str) -> bool:
         """Return True if the backbone block with the given name exists."""
         if "backbone" not in Package.__packages:
             return False
@@ -125,7 +127,7 @@ class Package(nn.Module):
         return backbone.has_block(name)
 
     @staticmethod
-    def backbone_block_outputs(name):
+    def backbone_block_outputs(name: str) -> Any:
         """Get the outputs of a backbone block by name.
 
         Args:
@@ -142,13 +144,13 @@ class Package(nn.Module):
 
     def __init__(
         self,
-        config,
-        features,
-        embedding_group,
-        feature_groups,
-        wide_embedding_dim=None,
-        wide_init_fn=None,
-    ):
+        config: backbone_pb2.BackboneTower,
+        features: List[BaseFeature],
+        embedding_group: Any,
+        feature_groups: List[FeatureGroupConfig],
+        wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self._config = config
         self._features = features
@@ -612,7 +614,7 @@ class Package(nn.Module):
                 raise ValueError(f"block `{block}` not in output dims")
         return dims
 
-    def total_output_dim(self):
+    def total_output_dim(self) -> int:
         """Return the total dimension of the final output after concatenation."""
         return sum(self.output_block_dims())
 
@@ -1132,7 +1134,7 @@ class Package(nn.Module):
         """
         self._package_input = pkg_input
 
-    def has_block(self, name):
+    def has_block(self, name) -> bool:
         """Check if a block with the given name exists in this package.
 
         Args:
@@ -1748,13 +1750,13 @@ class Backbone(nn.Module):
 
     def __init__(
         self,
-        config,
-        features,
-        embedding_group,
-        feature_groups,
-        wide_embedding_dim=None,
-        wide_init_fn=None,
-    ):
+        config: backbone_pb2.BackboneTower,
+        features: List[BaseFeature],
+        embedding_group: Any,
+        feature_groups: List[FeatureGroupConfig],
+        wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self._config = config
         main_pkg = backbone_pb2.BlockPackage()
