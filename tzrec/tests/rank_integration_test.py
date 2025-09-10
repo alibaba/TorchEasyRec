@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 import unittest
 
@@ -34,9 +33,9 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
+        # if self.success:
+        #     if os.path.exists(self.test_dir):
+        #         shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
@@ -214,13 +213,13 @@ class RankIntegrationTest(unittest.TestCase):
             user_id="user_id",
             item_id="item_id",
         )
-        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2"]:
+        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]:
             test_dir = os.path.join(self.test_dir, f"quant_{quant_emb.lower()}")
             if self.success:
                 self.success = utils.test_export(
                     os.path.join(self.test_dir, "pipeline.config"),
                     test_dir,
-                    env_str=f"QUANT_EMB={quant_emb}",
+                    env_str=f"QUANT_EMB={quant_emb} QUANT_EC_EMB={quant_emb}",
                 )
             if self.success:
                 self.success = utils.test_predict(

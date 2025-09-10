@@ -28,7 +28,6 @@ from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.inference.modules import quantize_embeddings
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
@@ -36,17 +35,18 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc.aot_utils import export_model_aot
+from tzrec.acc.quant_utils import quantize_embeddings
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     allow_tf32,
     export_acc_config,
     is_aot,
     is_cuda_export,
+    is_ec_quant,
     is_input_tile_emb,
     is_quant,
     is_trt,
     is_trt_predict,
-    quant_dtype,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
@@ -904,9 +904,9 @@ def _script_model(
         if is_cuda_export():
             model = model.cuda()
 
-        if is_quant():
+        if is_quant() or is_ec_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            quantize_embeddings(model, inplace=True)
             logger.info("finish quantize embeddings...")
 
         model.eval()
