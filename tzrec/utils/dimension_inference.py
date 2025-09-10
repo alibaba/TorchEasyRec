@@ -134,7 +134,7 @@ class DimensionInferenceEngine:
         """Register the layer corresponding to the block."""
         self.block_layers[block_name] = layer
 
-    def get_output_dim(self, block_name: str) -> Optional[DimensionInfo]:
+    def get_output_dim(self, block_name: str) -> DimensionInfo:
         """Get the output dimension of the block."""
         return self.block_output_dims.get(block_name)
 

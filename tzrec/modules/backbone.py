@@ -11,7 +11,7 @@
 
 import inspect
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import networkx as nx
 import torch
@@ -88,7 +88,7 @@ class LambdaWrapper(nn.Module):
             logging.error(f"Failed to compile lambda function '{self.expression}': {e}")
             raise
 
-    def forward(self, x: Any) -> Any:
+    def forward(self, x: Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
         """Executing lambda expressions."""
         if self._lambda_fn is None:
             raise ValueError("Lambda function not compiled")
@@ -127,7 +127,7 @@ class Package(nn.Module):
         return backbone.has_block(name)
 
     @staticmethod
-    def backbone_block_outputs(name: str) -> Any:
+    def backbone_block_outputs(name: str) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
         """Get the outputs of a backbone block by name.
 
         Args:
@@ -144,9 +144,9 @@ class Package(nn.Module):
 
     def __init__(
         self,
-        config: backbone_pb2.BackboneTower,
+        config: backbone_pb2.BlockPackage,
         features: List[BaseFeature],
-        embedding_group: Any,
+        embedding_group: EmbeddingGroup,
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
         wide_init_fn: Optional[str] = None,
@@ -475,6 +475,7 @@ class Package(nn.Module):
                         if input_type == "package_name":
                             # The package is the sub-DAG as the input of the Block
                             # Nested packages in sequential modules
+                            input_dim_info = self.dim_engine.get_output_dim(input_name)
                             raise NotImplementedError
                         else:  # block_name or feature_group_name
                             # Get input dimension info from dimension inference engine
@@ -577,7 +578,7 @@ class Package(nn.Module):
             "%s layers: %s" % (config.name, ",".join(self._name_to_layer.keys()))
         )
 
-    def get_output_block_names(self):
+    def get_output_block_names(self)-> List[str]:
         """Returns the final output block name list (prefer concat_blocks, otherwise output_blocks)."""  # NOQA
         blocks = list(getattr(self._config, "concat_blocks", []))
         if not blocks:
@@ -599,7 +600,7 @@ class Package(nn.Module):
         )
         return summary
 
-    def output_block_dims(self):
+    def output_block_dims(self)-> List[int]:
         """Return a list of dimensions of the final output blocks, e.g. [160, 96]."""
         blocks = self.get_output_block_names()
         dims = []
@@ -618,12 +619,12 @@ class Package(nn.Module):
         """Return the total dimension of the final output after concatenation."""
         return sum(self.output_block_dims())
 
-    def define_layers(self, layer, layer_cnf, name):
+    def define_layers(self, layer:str, layer_cnf:backbone_pb2.Block, name)-> None:
         """Define layers.
 
         Args:
             layer (str): the type of layer, e.g., 'module', 'recurrent', 'repeat'.
-            layer_cnf (backbone_pb2.LayerConfig): the configuration of the layer.
+            layer_cnf (backbone_pb2.Block): the configuration of the layer.
               class_name: "MLP" mlp {
                 hidden_units: 512
                 hidden_units: 256
