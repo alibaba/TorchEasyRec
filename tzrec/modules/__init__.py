@@ -9,8 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .backbone_module import FM, Add
-from .cross import Cross, CrossNet
+# from .backbone_module import FM, Add
+# from .cross import Cross, CrossNet
+from .interaction import Cross, CrossV2
+from .fm import FactorizationMachine as FM
 from .masknet import MaskBlock, MaskNetModule
 from .mlp import MLP
 from .mmoe import MMoE
@@ -24,7 +26,7 @@ __all__ = [
     "DIN",
     "MMoE",
     "Cross",
-    "CrossNet",
+    "CrossV2",
     "MaskNetModule",
     "MaskBlock",
 ]
