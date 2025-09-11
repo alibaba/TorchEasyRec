@@ -440,7 +440,6 @@ class Package(nn.Module):
                         )
             else:  # layer is None, e.g. sequential
                 if len(block.inputs) == 0:
-                    input_dim_info = self.dim_engine.get_output_dim(input_name)
                     # sequential block without inputs, use input_dim_info
                     raise ValueError(
                         f"Sequential block {block.name} has no input dimensions registered"  # NOQA
@@ -797,6 +796,10 @@ class Package(nn.Module):
                     if axis == -1:
                         # The output dimension of a single child layer
                         # multiplied by repeat times
+                        if last_output_dim is None:
+                            raise ValueError(
+                                f"Repeat layer {name}: last_output_dim is None, cannot infer final_output_dim"  # NOQA
+                            )
                         if isinstance(last_output_dim, int):
                             final_output_dim = last_output_dim * num_repeat
                         final_output_dim_info = DimensionInfo(final_output_dim)
@@ -822,7 +825,7 @@ class Package(nn.Module):
                     # final_output_dim, by default uses the total dimension of the list
                     # In actual use, the correct dimension information should
                     # be obtained through the dimension inference engine
-                    final_output_dim = sum(list_dims)
+                    final_output_dim = sum(list_dims)  # pyre-ignore[6]
 
                     logger.info(
                         f"Repeat layer {name} without output_concat_axis: returns list of {num_repeat} outputs, "  # NOQA
@@ -1304,9 +1307,13 @@ class Package(nn.Module):
                         # have a corresponding key, use the entire output.
                         block_outputs[block] = embedding_outputs
                     if isinstance(block_outputs[block], torch.Tensor):
-                        logger.info(f"block_outputs[{block}]shape: {block_outputs[block].shape}")
+                        logger.info(
+                            f"block_outputs[{block}]shape: {block_outputs[block].shape}"  # NOQA
+                        )
                     else:
-                        logger.info(f"block_outputs[{block}] type: {type(block_outputs[block])}")
+                        logger.info(
+                            f"block_outputs[{block}] type: {type(block_outputs[block])}"
+                        )
                 else:
                     embedding_outputs = input_fn(input_config)
                     if (

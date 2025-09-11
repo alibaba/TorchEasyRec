@@ -48,13 +48,11 @@ class Parameter(object):
     Attributes:
         params: The parameter data (dict for struct or PB message object).
         is_struct: Boolean indicating if this is a struct-type parameter.
-        _l2_reg: L2 regularization value for this parameter.
     """
 
-    def __init__(self, params, is_struct, l2_reg=None):
+    def __init__(self, params, is_struct):
         self.params = params
         self.is_struct = is_struct
-        self._l2_reg = l2_reg
 
     @staticmethod
     def make_from_pb(config):
@@ -80,31 +78,18 @@ class Parameter(object):
         assert not self.is_struct, "Struct parameter can not convert to pb config"
         return self.params
 
-    @property
-    def l2_regularizer(self):
-        """Get the L2 regularization value.
-
-        Returns:
-            The L2 regularization value or None if not set.
-        """
-        return self._l2_reg
-
-    @l2_regularizer.setter
-    def l2_regularizer(self, value):
-        self._l2_reg = value
-
     def __getattr__(self, key):
         if self.is_struct:
             if key not in self.params:
                 return None
             value = self.params[key]
             if isinstance(value, struct_pb2.Struct):
-                return Parameter(value, True, self._l2_reg)
+                return Parameter(value, True)
             else:
                 return value
         value = getattr(self.params, key)
         if is_proto_message(self.params, key):
-            return Parameter(value, False, self._l2_reg)
+            return Parameter(value, False)
         return value
 
     def __getitem__(self, key):
@@ -172,7 +157,6 @@ class Parameter(object):
             return self.params.HasField(key)
 
 
-# params_to_dict 函数，用于将 Parameter 对象转换为字典格式。
 def params_to_dict(parameter):
     """Convert Parameter object to a dictionary."""
 
@@ -203,65 +187,3 @@ def params_to_dict(parameter):
             return param
 
     return convert(parameter)
-
-
-def infer_input_dim(input_dim, input_fn=None, input_slice=None):
-    """推断经过变换后的输入维度.
-
-    Args:
-        input_dim: int 或 List[int]，原始输入维度
-        input_fn: str，lambda表达式字符串
-        input_slice: str，格式如'[1]'或'[0:2]'
-
-    Returns:
-        变换后的输入维度（int或list）
-    """
-    # 先处理input_slice
-    if input_slice is not None:
-        # 假定input_dim是list或tuple的各项维度
-        # input_slice: '[1]', '[0]', '[0:2]'
-        idx = eval(input_slice)
-        # 支持单一索引和切片
-        if isinstance(idx, int):
-            input_dim = input_dim[idx]
-        elif isinstance(idx, slice):
-            input_dim = input_dim[idx]
-        elif isinstance(idx, list):
-            input_dim = [input_dim[i] for i in idx]
-        else:
-            raise ValueError(f"input_slice({input_slice})格式无法识别")
-
-    # 再处理input_fn (只支持常见表达式)
-    if input_fn is not None:
-        # 仅支持有限的自动推断，比如sum、reshape等
-        if "sum" in input_fn:
-            # 提取dim和keepdim
-            import re
-
-            m = re.search(r"sum\(dim=(\d+)(?:, *keepdim=(True|False))?", input_fn)
-            if m:
-                dim = int(m.group(1))
-                keepdim = (m.group(2) == "True") if m.group(2) is not None else False
-                # input_dim 可以是int或tuple/list
-                # 推导后维度
-                if isinstance(input_dim, int):
-                    raise ValueError("sum运算作用在多维张量上，int维度不够信息")
-                new_dim = list(input_dim)
-                if keepdim:
-                    new_dim[dim] = 1
-                else:
-                    del new_dim[dim]
-                if len(new_dim) == 1:
-                    return new_dim[0]
-                else:
-                    return tuple(new_dim)
-
-        elif "lambda x: [x]" in input_fn or input_fn.strip() == "lambda x: [x]":
-            # 将输入打包成列表
-            return [input_dim]
-        # 其他lambda表达式很难推断，需要你补充更多分支
-        else:
-            # 不认识的表达式，保守返回原始input_dim
-            return input_dim
-
-    return input_dim

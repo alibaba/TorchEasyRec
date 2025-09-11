@@ -42,10 +42,10 @@ class ModularMultiTask(MultiTaskRank):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # 构建backbone网络
+        # build backbone network
         self._backbone_net = self.build_backbone_network()
 
-        # 构建任务塔
+        # build task towers
         self._task_towers = self.build_task_towers()
 
     def build_backbone_network(self):
@@ -61,7 +61,7 @@ class ModularMultiTask(MultiTaskRank):
         return Backbone(
             config=self._base_model_config.multi_task_backbone.backbone,
             features=self._features,
-            embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
+            embedding_group=None,
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
             wide_init_fn=wide_init_fn,
@@ -69,7 +69,7 @@ class ModularMultiTask(MultiTaskRank):
 
     def build_task_towers(self):
         """Build task towers based on backbone output dimension."""
-        # 获取backbone的最终输出维度
+        # get backbone output dimension
         backbone_output_dim = self._backbone_net.output_dim()
 
         task_towers = nn.ModuleDict()
@@ -77,7 +77,7 @@ class ModularMultiTask(MultiTaskRank):
             tower_name = task_tower_cfg.tower_name
             num_class = task_tower_cfg.num_class
 
-            # 检查是否有自定义MLP配置
+            # Check whether there is a custom MLP configuration
             if task_tower_cfg.HasField("mlp"):
                 from tzrec.modules.mlp import MLP
 
@@ -87,7 +87,7 @@ class ModularMultiTask(MultiTaskRank):
                     nn.Linear(mlp_config["hidden_units"][-1], num_class),
                 )
             else:
-                # 直接连接到输出层
+                # Connect directly to the output layer
                 task_tower = nn.Linear(backbone_output_dim, num_class)
 
             task_towers[tower_name] = task_tower
@@ -117,12 +117,14 @@ class ModularMultiTask(MultiTaskRank):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        # 获取backbone输出
+        # get backbone output
         backbone_output = self.backbone(batch)
 
-        # 处理backbone输出：可能是单个tensor或tensor列表
+        # Process backbone output: it may be 
+        # a single tensor or a list of tensors
         if isinstance(backbone_output, (list, tuple)):
-            # backbone返回列表（如MMoE模块），需要与任务塔一一对应
+            # The backbone returns a list (such as the MMoE module), 
+            # which needs to correspond one-to-one with the task tower.
             if len(backbone_output) != len(self._task_tower_cfgs):
                 raise ValueError(
                     f"The number of backbone outputs ({len(backbone_output)}) and "
@@ -130,16 +132,17 @@ class ModularMultiTask(MultiTaskRank):
                 )
             task_input_list = backbone_output
         else:
-            # backbone返回单个tensor，复制给所有任务塔
+            # Backbone returns a single tensor, 
+            # which is copied to all task towers
             task_input_list = [backbone_output] * len(self._task_tower_cfgs)
 
-        # 通过各个任务塔生成预测
+        # Generate predictions through each mission tower
         tower_outputs = {}
         for i, task_tower_cfg in enumerate(self._task_tower_cfgs):
             tower_name = task_tower_cfg.tower_name
-            task_input = task_input_list[i]  # 使用对应的输入
+            task_input = task_input_list[i]
             tower_output = self._task_towers[tower_name](task_input)
             tower_outputs[tower_name] = tower_output
 
-        # 转换为最终预测格式
+        # Convert to final prediction format
         return self._multi_task_output_to_prediction(tower_outputs)
