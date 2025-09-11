@@ -37,8 +37,8 @@ class TestLambdaDimensionInference(unittest.TestCase):
         # infer output dimension
         output_dim = lambda_wrapper.infer_output_dim(input_dim)
 
-        print(f"Output dim: {output_dim}")
-
+        self.assertEqual(output_dim.shape, (32, 16))
+        self.assertEqual(output_dim.get_total_dim(), 16)
         self.assertEqual(output_dim.get_feature_dim(), 16)
 
     def test_lambda_wrapper_sum(self):
@@ -54,9 +54,6 @@ class TestLambdaDimensionInference(unittest.TestCase):
         # infer output dimension
         output_dim = lambda_wrapper.infer_output_dim(input_dim)
 
-        print(f"Input dim: {input_dim}")
-        print(f"Output dim: {output_dim}")
-
         # sum over the sequence dimension, should get (32, 16)
         self.assertEqual(output_dim.get_feature_dim(), 16)
         self.assertEqual(output_dim.shape, (32, 16))
@@ -71,9 +68,6 @@ class TestLambdaDimensionInference(unittest.TestCase):
 
         # infer output dimension
         output_dim = lambda_wrapper.infer_output_dim(input_dim)
-
-        print(f"Input dim: {input_dim}")
-        print(f"Output dim: {output_dim}")
 
         # After conversion to list, the dimensions
         # should be maintained but marked as list type
@@ -113,11 +107,6 @@ class TestLambdaDimensionInference(unittest.TestCase):
         for lambda_expr, expected_feature_dim in test_cases:
             with self.subTest(lambda_expr=lambda_expr):
                 output_dim = inferrer.infer_output_dim(input_dim, lambda_expr)
-                print(f"Lambda: {lambda_expr}")
-                print(f"Input: {input_dim}")
-                print(f"Output: {output_dim}")
-                print(f"Expected feature dim: {expected_feature_dim}")
-                print("---")
 
                 if expected_feature_dim is not None:
                     self.assertEqual(output_dim.get_feature_dim(), expected_feature_dim)
