@@ -1415,12 +1415,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
 
-                if not need_input_tile_emb:
-                    jt = jt.to_padded_dense(group_sequence_length)
+                if need_input_tile_emb:
+                    seq_t = jt.values()
+                else:
+                    seq_t = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:
-                    jt = jt.tile(tile_size, 1, 1)
-                seq_t_list.append(jt)
+                    seq_t = seq_t.tile(tile_size, 1, 1)
+                seq_t_list.append(seq_t)
 
             if seq_t_list:
                 results[f"{group_name}.sequence"] = torch.cat(seq_t_list, dim=2)
