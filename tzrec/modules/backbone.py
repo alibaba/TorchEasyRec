@@ -131,7 +131,7 @@ class Package(nn.Module):
     @staticmethod
     def backbone_block_outputs(
         name: str,
-    ) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
+    ) -> Optional[Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]]:
         """Get the outputs of a backbone block by name.
 
         Args:
@@ -462,6 +462,7 @@ class Package(nn.Module):
                         )
             else:  # layer is None, e.g. sequential
                 if len(block.inputs) == 0:
+                    input_dim_info = self.dim_engine.get_output_dim(input_name)
                     # sequential block without inputs, use input_dim_info
                     raise ValueError(
                         f"Sequential block {block.name} has no input dimensions registered"  # NOQA
@@ -623,7 +624,9 @@ class Package(nn.Module):
         """Return the total dimension of the final output after concatenation."""
         return sum(self.output_block_dims())
 
-    def define_layers(self, layer: str, layer_cnf: backbone_pb2.Block, name) -> None:
+    def define_layers(
+        self, layer: str, layer_cnf: backbone_pb2.Block, name: str
+    ) -> None:
         """Define layers.
 
         Args:
@@ -816,7 +819,8 @@ class Package(nn.Module):
                     if axis == -1:
                         # The output dimension of a single child layer
                         # multiplied by repeat times
-                        final_output_dim = last_output_dim * num_repeat
+                        if isinstance(last_output_dim, int):
+                            final_output_dim = last_output_dim * num_repeat
                         final_output_dim_info = DimensionInfo(final_output_dim)
                         logging.info(
                             f"Repeat layer {name} with output_concat_axis={axis}: "
