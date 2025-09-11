@@ -12,7 +12,7 @@
 """Lambda expression dimension inference module."""
 
 import logging
-from typing import Any, Callable, List, Optional, Union, Tuple, Iterable
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,7 @@ from tzrec.utils.dimension_inference import DimensionInfo
 class LambdaOutputDimInferrer:
     """Lambda expression output dimension inferer.
 
-    Infer the output dimensions by creating a dummy tensor and 
+    Infer the output dimensions by creating a dummy tensor and
     executing the lambda expression.
     """
 
@@ -49,6 +49,10 @@ class LambdaOutputDimInferrer:
         Returns:
             The inferred output dimension information.
         """
+        # If the first dimension of input_dim_info.shape
+        # is not None, use it as batch_size
+        if input_dim_info.shape[0] is not None and len(input_dim_info.shape) > 0:
+            dummy_batch_size = input_dim_info.shape[0]
         try:
             # 1. Create a dummy tensor
             dummy_tensor = self._create_dummy_tensor(
@@ -101,7 +105,12 @@ class LambdaOutputDimInferrer:
         self.logger.debug(f"Created dummy tensor with shape: {shape}")
         return dummy_tensor
 
-    def _compile_lambda_function(self, lambda_fn_str: str) -> Union[Callable[[torch.Tensor], torch.Tensor], Callable[[Iterable[torch.Tensor]], torch.Tensor]]:
+    def _compile_lambda_function(
+        self, lambda_fn_str: str
+    ) -> Union[
+        Callable[[torch.Tensor], torch.Tensor],
+        Callable[[Iterable[torch.Tensor]], torch.Tensor],
+    ]:
         """Compile lambda function string."""
         try:
             lambda_fn_str = lambda_fn_str.strip()
