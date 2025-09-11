@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import OrderedDict, defaultdict
 from functools import partial  # NOQA
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
@@ -1415,7 +1416,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
 
-                if need_input_tile_emb:
+                if int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1:
                     seq_t = jt.values()
                 else:
                     seq_t = jt.to_padded_dense(group_sequence_length)
