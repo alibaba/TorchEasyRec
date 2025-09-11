@@ -51,7 +51,9 @@ class LambdaOutputDimInferrer:
         """
         # If the first dimension of input_dim_info.shape
         # is not None, use it as batch_size
-        if input_dim_info.shape[0] is not None and len(input_dim_info.shape) > 0:
+        if (
+            input_dim_info.shape[0] is not None and len(input_dim_info.shape) > 0
+        ):  # pyre-ignore[6]
             dummy_batch_size = input_dim_info.shape[0]
         try:
             # 1. Create a dummy tensor
@@ -101,7 +103,7 @@ class LambdaOutputDimInferrer:
                 # 2D: (batch_size, feature_dim)
                 shape = (batch_size, feature_dim)
 
-        dummy_tensor = torch.randn(shape, dtype=torch.float32)
+        dummy_tensor = torch.randn(shape, dtype=torch.float32)  # pyre-ignore[7]
         self.logger.debug(f"Created dummy tensor with shape: {shape}")
         return dummy_tensor
 
@@ -123,7 +125,7 @@ class LambdaOutputDimInferrer:
                     f"{lambda_fn_str}"
                 )
 
-            return lambda_fn
+            return lambda_fn  # pyre-ignore[7]
 
         except Exception as e:
             self.logger.error(
@@ -180,7 +182,7 @@ class LambdaLayer(nn.Module):
     def __init__(
         self,
         lambda_fn_str: str,
-        input_dim_info: DimensionInfo = None,
+        input_dim_info: DimensionInfo,
         name: str = "lambda_layer",
     ) -> None:
         """Initialize the Lambda layer.

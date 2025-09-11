@@ -55,7 +55,6 @@ class DimensionInferenceTest(unittest.TestCase):
 
     def test_dimension_inference(self):
         """Test dimension inference functionality."""
-
         try:
             from tzrec.modules.sequence import DINEncoder
             from tzrec.utils.dimension_inference import (

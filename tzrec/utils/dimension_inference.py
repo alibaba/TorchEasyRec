@@ -173,90 +173,90 @@ class DimensionInferenceEngine:
         # Inferring output dimensions based on layer type
         layer_type = type(layer).__name__
 
-        if layer_type == "MLP":
-            if hasattr(layer, "hidden_units") and layer.hidden_units:
-                output_dim = layer.hidden_units[-1]
-                return DimensionInfo(output_dim, feature_dim=output_dim)
-            elif hasattr(layer, "out_features"):
-                output_dim = layer.out_features
-                return DimensionInfo(output_dim, feature_dim=output_dim)
+        # if layer_type == "MLP":
+        #     if hasattr(layer, "hidden_units") and layer.hidden_units:
+        #         output_dim = layer.hidden_units[-1]
+        #         return DimensionInfo(output_dim, feature_dim=output_dim)
+        #     elif hasattr(layer, "out_features"):
+        #         output_dim = layer.out_features
+        #         return DimensionInfo(output_dim, feature_dim=output_dim)
 
-        elif layer_type in ["Linear", "LazyLinear"]:
-            if hasattr(layer, "out_features"):
-                output_dim = layer.out_features
-                return DimensionInfo(output_dim, feature_dim=output_dim)
+        # elif layer_type in ["Linear", "LazyLinear"]:
+        #     if hasattr(layer, "out_features"):
+        #         output_dim = layer.out_features
+        #         return DimensionInfo(output_dim, feature_dim=output_dim)
 
-        elif layer_type == "DIN":
-            # DIN
-            if hasattr(layer, "_sequence_dim") and layer._sequence_dim is not None:
-                # If it has been initialized, return sequence_dim directly
-                output_dim = layer._sequence_dim
-                return DimensionInfo(output_dim, feature_dim=output_dim)
-            else:
-                # not initialized yet, infer from input
-                if isinstance(input_dim, DimensionInfo):
-                    # input is [sequence_features, query_features]concat
-                    # The output dimension is equal to sequence_dim
-                    total_dim = input_dim.get_feature_dim()
-                    if total_dim > 0:
-                        sequence_dim = total_dim // 2
-                        logging.info(
-                            f"DIN output dimension inferred as {sequence_dim} "
-                            f"(half of input {total_dim})"
-                        )
-                        return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
+        # elif layer_type == "DIN":
+        #     # DIN
+        #     if hasattr(layer, "_sequence_dim") and layer._sequence_dim is not None:
+        #         # If it has been initialized, return sequence_dim directly
+        #         output_dim = layer._sequence_dim
+        #         return DimensionInfo(output_dim, feature_dim=output_dim)
+        #     else:
+        #         # not initialized yet, infer from input
+        #         if isinstance(input_dim, DimensionInfo):
+        #             # input is [sequence_features, query_features]concat
+        #             # The output dimension is equal to sequence_dim
+        #             total_dim = input_dim.get_feature_dim()
+        #             if total_dim > 0:
+        #                 sequence_dim = total_dim // 2
+        #                 logging.info(
+        #                     f"DIN output dimension inferred as {sequence_dim} "
+        #                     f"(half of input {total_dim})"
+        #                 )
+        #                 return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
 
-                # If inference cannot be made, return the input dimensions
-                logging.warning(
-                    "Cannot infer DIN output dimension, using input dimension"
-                )
-                return input_dim
+        #         # If inference cannot be made, return the input dimensions
+        #         logging.warning(
+        #             "Cannot infer DIN output dimension, using input dimension"
+        #         )
+        #         return input_dim
 
-        elif layer_type == "DINEncoder":
-            # DINEncoder
-            if hasattr(layer, "_sequence_dim") and layer._sequence_dim is not None:
-                output_dim = layer._sequence_dim
-                return DimensionInfo(output_dim, feature_dim=output_dim)
-            elif hasattr(layer, "output_dim") and callable(layer.output_dim):
-                # use output_dim method
-                try:
-                    output_dim = layer.output_dim()
-                    return DimensionInfo(output_dim, feature_dim=output_dim)
-                except Exception:
-                    pass
+        # elif layer_type == "DINEncoder":
+        #     # DINEncoder
+        #     if hasattr(layer, "_sequence_dim") and layer._sequence_dim is not None:
+        #         output_dim = layer._sequence_dim
+        #         return DimensionInfo(output_dim, feature_dim=output_dim)
+        #     elif hasattr(layer, "output_dim") and callable(layer.output_dim):
+        #         # use output_dim method
+        #         try:
+        #             output_dim = layer.output_dim()
+        #             return DimensionInfo(output_dim, feature_dim=output_dim)
+        #         except Exception:
+        #             pass
 
-            # If it cannot be obtained from the layer, infer it from the input
-            if isinstance(input_dim, DimensionInfo):
-                total_dim = input_dim.get_feature_dim()
-                if total_dim > 0:
-                    sequence_dim = total_dim // 2
-                    logging.info(
-                        f"DINEncoder output dimension inferred as {sequence_dim}"
-                    )
-                    return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
+        #     # If it cannot be obtained from the layer, infer it from the input
+        #     if isinstance(input_dim, DimensionInfo):
+        #         total_dim = input_dim.get_feature_dim()
+        #         if total_dim > 0:
+        #             sequence_dim = total_dim // 2
+        #             logging.info(
+        #                 f"DINEncoder output dimension inferred as {sequence_dim}"
+        #             )
+        #             return DimensionInfo(sequence_dim, feature_dim=sequence_dim)
 
-            # If inference cannot be made, return the input dimensions
-            logging.warning(
-                "Cannot infer DINEncoder output dimension, using input dimension"
-            )
-            return input_dim
+        #     # If inference cannot be made, return the input dimensions
+        #     logging.warning(
+        #         "Cannot infer DINEncoder output dimension, using input dimension"
+        #     )
+        #     return input_dim
 
-        elif layer_type in [
-            "BatchNorm1d",
-            "LayerNorm",
-            "Dropout",
-            "ReLU",
-            "GELU",
-            "Tanh",
-        ]:
-            # These layers do not change the dimensions
-            return input_dim
+        # elif layer_type in [
+        #     "BatchNorm1d",
+        #     "LayerNorm",
+        #     "Dropout",
+        #     "ReLU",
+        #     "GELU",
+        #     "Tanh",
+        # ]:
+        #     # These layers do not change the dimensions
+        #     return input_dim
 
-        elif layer_type == "Sequential":
-            current_dim = input_dim
-            for sublayer in layer:
-                current_dim = self.infer_layer_output_dim(sublayer, current_dim)
-            return current_dim
+        # elif layer_type == "Sequential":
+        #     current_dim = input_dim
+        #     for sublayer in layer:
+        #         current_dim = self.infer_layer_output_dim(sublayer, current_dim)
+        #     return current_dim
 
         # Default: output dimension is the same as input dimension
         logging.warning(
@@ -367,7 +367,8 @@ class DimensionInferenceEngine:
             # List mode: Keep as list
             dims = []
             for dim_info in input_dims:
-                dims.extend(dim_info.to_list())
+                if dim_info is not None:
+                    dims.extend(dim_info.to_list())
             return DimensionInfo(dims, is_list=True)
 
         elif merge_mode == "stack":
