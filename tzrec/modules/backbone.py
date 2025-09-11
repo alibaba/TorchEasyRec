@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import inspect
-import logging
 from typing import Any, Dict, List, Optional, Union
 
 import networkx as nx
@@ -32,6 +31,7 @@ from tzrec.utils.dimension_inference import (
 )
 from tzrec.utils.lambda_inference import LambdaOutputDimInferrer
 from tzrec.utils.load_class import load_torch_layer
+from tzrec.utils.logging_util import logger
 
 # Constants for auto-inferred parameters
 # Input dimension related parameters
@@ -42,28 +42,6 @@ SEQUENCE_QUERY_PARAMS = ["sequence_dim", "query_dim"]
 
 # All parameters that support automatic inference
 AUTO_INFER_PARAMS = INPUT_DIM_PARAMS + SEQUENCE_QUERY_PARAMS
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    force=True,
-)
-
-# Get the logger of the current module and set the level
-logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
-# Force the log level to display INFO level logs.
-logger.setLevel(logging.INFO)
-# set root logger
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)
-
-# Test whether the log configuration is effective
-print("[TEST] Testing logging configuration...")
-logger.info("Logger configuration test - INFO level")
-logger.debug("Logger configuration test - DEBUG level")
-logging.info("Direct logging test - INFO level")
-print("[TEST] Logging configuration test complete")
 
 
 class LambdaWrapper(nn.Module):
@@ -85,7 +63,7 @@ class LambdaWrapper(nn.Module):
                     f"Expression does not evaluate to callable: {self.expression}"
                 )
         except Exception as e:
-            logging.error(f"Failed to compile lambda function '{self.expression}': {e}")
+            logger.error(f"Failed to compile lambda function '{self.expression}': {e}")
             raise
 
     def forward(
@@ -101,12 +79,12 @@ class LambdaWrapper(nn.Module):
         try:
             inferrer = LambdaOutputDimInferrer()
             output_dim_info = inferrer.infer_output_dim(input_dim_info, self.expression)
-            logging.debug(
+            logger.debug(
                 f"Lambda wrapper {self.name} inferred output dim: {output_dim_info}"
             )
             return output_dim_info
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 f"Failed to infer output dim for lambda {self.name}: {e}, using input dim"  # NOQA
             )
             return input_dim_info
@@ -255,7 +233,7 @@ class Package(nn.Module):
                 if group in input_feature_groups:
                     # Already exists, do not register again
                     if layer == "input_layer":
-                        logging.warning(
+                        logger.warning(
                             "input `%s` already exists in other block" % group
                         )
                     elif layer == "raw_input":
@@ -296,7 +274,7 @@ class Package(nn.Module):
 
                 for input_node in block.inputs:
                     if (len(block.inputs)) > 1:
-                        logging.debug(
+                        logger.debug(
                             f"Processing multiple inputs for block {block.name}: {[getattr(n, n.WhichOneof('name')) for n in block.inputs]}"  # NOQA
                         )
                     input_type = input_node.WhichOneof("name")
@@ -325,7 +303,7 @@ class Package(nn.Module):
                                         input_name
                                     ]
                                     latest_dim_info = DimensionInfo(latest_output_dim)
-                                    logging.info(
+                                    logger.info(
                                         f"Overriding dim_engine cache for {input_layer_type} layer {input_name}: {latest_output_dim}"  # NOQA
                                     )
                                     # Updated dimension inference engine
@@ -334,7 +312,7 @@ class Package(nn.Module):
                                     )
                                     input_dim_info = latest_dim_info
                                 else:
-                                    logging.warning(
+                                    logger.warning(
                                         f"{input_layer_type} layer {input_name} not found in _name_to_output_dim"  # NOQA
                                     )
                         # Apply input_fn and input_slice transformations
@@ -387,7 +365,7 @@ class Package(nn.Module):
                     # Lambda module require dimension inference
                     if isinstance(layer_obj, LambdaWrapper):
                         output_dim_info = layer_obj.infer_output_dim(merged_input_dim)
-                        logging.info(
+                        logger.info(
                             f"Lambda layer {block.name} inferred output dim: {output_dim_info}"  # NOQA
                         )
                     else:
@@ -406,7 +384,7 @@ class Package(nn.Module):
                                     self.dim_engine.register_output_dim(
                                         block.name, output_dim_info
                                     )
-                                    logging.info(
+                                    logger.info(
                                         f"{layer.capitalize()} layer {block.name} output dim restored from compatibility field: {output_dim}"  # NOQA
                                     )
                                 else:
@@ -414,7 +392,7 @@ class Package(nn.Module):
                                         f"{layer.capitalize()} layer {block.name} missing output dimension"  # NOQA
                                     )
                             else:
-                                logging.info(
+                                logger.info(
                                     f"{layer.capitalize()} layer {block.name} output dim already set: {output_dim_info}"  # NOQA
                                 )
                         else:
@@ -428,7 +406,7 @@ class Package(nn.Module):
                         output_dim_info.get_feature_dim()
                     )
 
-                    logging.info(
+                    logger.info(
                         f"Block {block.name} output dimensions: output_dim_info={output_dim_info}, feature_dim={output_dim_info.get_feature_dim()}"  # NOQA
                     )
                 else:
@@ -442,10 +420,10 @@ class Package(nn.Module):
                             block.name
                         )
                         existing_output_dim = self._name_to_output_dim.get(block.name)
-                        print(
+                        logger.info(
                             f"[SKIP OVERRIDE] {layer_type.capitalize()} layer {block.name} - keeping existing output dim: engine={existing_output_dim_info}, compat={existing_output_dim}"  # NOQA
                         )
-                        logging.info(
+                        logger.info(
                             f"Skipping override for {layer_type} layer {block.name} - keeping existing output dimensions"  # NOQA
                         )
                     else:
@@ -457,7 +435,7 @@ class Package(nn.Module):
                             merged_input_dim.get_feature_dim()
                         )
 
-                        logging.info(
+                        logger.info(
                             f"Block {block.name} (no layer) output dimensions: output_dim_info={merged_input_dim}, feature_dim={merged_input_dim.get_feature_dim()}"  # NOQA
                         )
             else:  # layer is None, e.g. sequential
@@ -530,7 +508,7 @@ class Package(nn.Module):
                         block.name, last_output_dim_info
                     )
                     self._name_to_output_dim[block.name] = last_output_dim
-                    logging.info(
+                    logger.info(
                         f"Sequential block {block.name} output dim set to {last_output_dim}"  # NOQA
                     )
                 else:
@@ -554,7 +532,7 @@ class Package(nn.Module):
         if len(config.concat_blocks) == 0 and len(config.output_blocks) == 0:
             # Get all leaf nodes
             leaf = [node for node in self.G.nodes() if self.G.out_degree(node) == 0]
-            logging.warning(
+            logger.warning(
                 (
                     f"{config.name} has no `concat_blocks` or `output_blocks`, "
                     f"try to concat all leaf blocks: {','.join(leaf)}"
@@ -566,20 +544,20 @@ class Package(nn.Module):
 
         # Output dimension inference summary
         dim_summary = self.dim_engine.get_summary()
-        logging.info(f"{config.name} dimension inference summary: {dim_summary}")
+        logger.info(f"{config.name} dimension inference summary: {dim_summary}")
 
         # Output detailed dimension info for all blocks
-        logging.info("=== Final dimension summary ===")
+        logger.info("=== Final dimension summary ===")
         for block_name in self.topo_order_list:
             if block_name in self._name_to_input_dim:
                 input_dim = self._name_to_input_dim[block_name]
                 output_dim = self._name_to_output_dim.get(block_name, "N/A")
                 dim_engine_output = self.dim_engine.get_output_dim(block_name)
-                logging.info(
+                logger.info(
                     f"Block {block_name}: input_dim={input_dim}, output_dim={output_dim}, dim_engine={dim_engine_output}"  # NOQA
                 )
 
-        logging.info(
+        logger.info(
             "%s layers: %s" % (config.name, ",".join(self._name_to_layer.keys()))
         )
 
@@ -611,7 +589,7 @@ class Package(nn.Module):
         dims = []
         for block in blocks:
             dim_info = self.dim_engine.get_output_dim(block)
-            print(f"Output block `{block}` dimension info: {dim_info}")
+            logger.info(f"Output block `{block}` dimension info: {dim_info}")
             if dim_info is not None:
                 dims.append(dim_info.get_feature_dim())
             elif block in self._name_to_output_dim:
@@ -669,11 +647,11 @@ class Package(nn.Module):
                         fixed_dim = dims_list[fixed_input_index]
                         child_input_dim_info = DimensionInfo(fixed_dim)
                         child_input_dim = fixed_dim
-                        logging.info(
+                        logger.info(
                             f"Recurrent layer {name} using fixed_input_index={fixed_input_index}, child input_dim={fixed_dim}"  # NOQA
                         )
                     else:
-                        logging.warning(
+                        logger.warning(
                             f"fixed_input_index={fixed_input_index} out of range for input dims: {dims_list}"  # NOQA
                         )
 
@@ -728,17 +706,17 @@ class Package(nn.Module):
                 # Updates the dimension inference engine and self._name_to_output_dim
                 self.dim_engine.register_output_dim(name, last_output_dim_info)
                 self._name_to_output_dim[name] = last_output_dim
-                logging.info(
+                logger.info(
                     f"Recurrent layer {name} output dim set to {last_output_dim} (from last child layer)"  # NOQA
                 )
-                logging.info(f"  - last_output_dim_info: {last_output_dim_info}")
-                logging.info(
+                logger.info(f"  - last_output_dim_info: {last_output_dim_info}")
+                logger.info(
                     f"  - Updated _name_to_output_dim[{name}]: {self._name_to_output_dim[name]}"  # NOQA
                 )
 
                 # Verify that the update was successful
                 updated_dim_info = self.dim_engine.get_output_dim(name)
-                logging.info(
+                logger.info(
                     f"[VERIFY] Updated dim_engine output for {name}: {updated_dim_info}"
                 )
             else:
@@ -822,14 +800,14 @@ class Package(nn.Module):
                         if isinstance(last_output_dim, int):
                             final_output_dim = last_output_dim * num_repeat
                         final_output_dim_info = DimensionInfo(final_output_dim)
-                        logging.info(
+                        logger.info(
                             f"Repeat layer {name} with output_concat_axis={axis}: "
                             f"single_output_dim={last_output_dim} * num_repeat={num_repeat} = {final_output_dim}"  # NOQA
                         )
                     else:
                         # For the splicing of other axes, remain unchanged for now
                         # and require more complex dimension inference logic.
-                        logging.warning(
+                        logger.warning(
                             f"Repeat layer {name} with output_concat_axis={axis}: "
                             f"non-last axis concatenation not fully supported, using single layer output dim={last_output_dim}"  # NOQA
                         )
@@ -846,14 +824,14 @@ class Package(nn.Module):
                     # be obtained through the dimension inference engine
                     final_output_dim = sum(list_dims)
 
-                    logging.info(
+                    logger.info(
                         f"Repeat layer {name} without output_concat_axis: returns list of {num_repeat} outputs, "  # NOQA
                         f"each with dim={last_output_dim}, list_dims={list_dims}"
                     )
 
                 self.dim_engine.register_output_dim(name, final_output_dim_info)
                 self._name_to_output_dim[name] = final_output_dim
-                logging.info(
+                logger.info(
                     f"Repeat layer {name} final output dim set to {final_output_dim}"
                 )
             else:
@@ -937,7 +915,7 @@ class Package(nn.Module):
                                 # it may be multiple tensor inputs
                                 if len(forward_params) >= 2:
                                     should_use_single_dim = True
-                                    logging.info(
+                                    logger.info(
                                         f"Detected multi-tensor input module {layer_cls.__name__} with {len(forward_params)} forward parameters"  # NOQA
                                     )
                             except Exception as err:
@@ -953,7 +931,7 @@ class Package(nn.Module):
                             # use the dimensions in list format.
                             for idx, param_name in enumerate(input_dim_params_in_sig):
                                 kwargs[param_name] = input_dim_info.dim[idx]
-                                logging.info(
+                                logger.info(
                                     f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={input_dim_info.dim[idx]} from input dim list"  # NOQA
                                 )
                         else:
@@ -961,22 +939,22 @@ class Package(nn.Module):
                             feature_dim = input_dim_info.get_feature_dim()
                             for param_name in input_dim_params_in_sig:
                                 kwargs[param_name] = feature_dim
-                                logging.info(
+                                logger.info(
                                     f"Layer {name} ({layer_cls.__name__}) auto-inferred {param_name}={feature_dim} from dim_engine"  # NOQA
                                 )
                     else:
-                        logging.error(
+                        logger.error(
                             f"Layer {name} ({layer_cls.__name__}) dimension inference failed - no input_dim available"  # NOQA
                         )
-                        logging.error(
+                        logger.error(
                             f"  - input_dim_info from dim_engine: {input_dim_info}"
                         )
-                        logging.error(f"  - input_dim: {input_dim}")
-                        logging.error(
+                        logger.error(f"  - input_dim: {input_dim}")
+                        logger.error(
                             f"  - block_input_dims keys: {list(self.dim_engine.block_input_dims.keys())}"  # NOQA
                         )
                         if name in self._name_to_input_dim:
-                            logging.error(
+                            logger.error(
                                 f"  - _name_to_input_dim[{name}]: {self._name_to_input_dim[name]}"  # NOQA
                             )
                         raise ValueError(
@@ -1005,7 +983,7 @@ class Package(nn.Module):
                         kwargs[SEQUENCE_QUERY_PARAMS[0]] = sequence_dim
                     if query_dim_missing:
                         kwargs[SEQUENCE_QUERY_PARAMS[1]] = query_dim
-                    logging.info(
+                    logger.info(
                         f"Auto-inferred dimensions for {layer_cls.__name__} {name}: "  # NOQA
                         f"{SEQUENCE_QUERY_PARAMS[0]}={sequence_dim if sequence_dim_missing else 'provided'}, "  # NOQA
                         f"{SEQUENCE_QUERY_PARAMS[1]}={query_dim if query_dim_missing else 'provided'}"  # NOQA
@@ -1031,14 +1009,14 @@ class Package(nn.Module):
             )
             try:
                 kwargs = convert_to_dict(layer_conf.st_params)
-                logging.info(
+                logger.info(
                     "call %s layer with params %r" % (layer_conf.class_name, kwargs)
                 )
                 layer = layer_cls(**kwargs)
             except TypeError as e:
-                logging.warning(e)
+                logger.warning(e)
                 args = map(format_value, layer_conf.st_params.values())
-                logging.info(
+                logger.info(
                     "try to call %s layer with params %r"
                     % (layer_conf.class_name, args)
                 )
@@ -1077,7 +1055,7 @@ class Package(nn.Module):
                 dims = self._try_get_sequence_query_dims_from_group(input_name)
                 if dims:
                     sequence_dim, query_dim = dims
-                    logging.info(
+                    logger.info(
                         f"Auto-inferred dimensions from {input_name}: "
                         f"sequence_dim={sequence_dim}, query_dim={query_dim}"
                     )
@@ -1089,7 +1067,7 @@ class Package(nn.Module):
         if sequence_dim is not None and query_dim is not None:
             return sequence_dim, query_dim
         else:
-            logging.warning(
+            logger.warning(
                 f"Could not infer sequence/query dimensions for {block_name}: "
                 f"sequence_dim={sequence_dim}, query_dim={query_dim}"
             )
@@ -1106,14 +1084,14 @@ class Package(nn.Module):
         """
         # Check if group exists
         if group_name not in self._name_to_layer:
-            logging.debug(f"Group {group_name} not found in _name_to_layer")
+            logger.debug(f"Group {group_name} not found in _name_to_layer")
             return None
 
         layer = self._name_to_layer[group_name]
 
         # Check if there is a group_total_dim method
         if not hasattr(layer, "group_total_dim"):
-            logging.debug(f"Group {group_name} does not have group_total_dim method")
+            logger.debug(f"Group {group_name} does not have group_total_dim method")
             return None
 
         # Trying to get the dimensions of .sequence and .query subgroups
@@ -1125,12 +1103,12 @@ class Package(nn.Module):
             query_dim = layer.group_total_dim(query_group_name)
             return sequence_dim, query_dim
         except (KeyError, AttributeError, ValueError) as e:
-            logging.debug(
+            logger.debug(
                 f"Could not get .sequence/.query dimensions for {group_name}: {type(e).__name__}: {e}"  # NOQA
             )
             return None
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 f"Unexpected error getting dimensions for {group_name}: {type(e).__name__}: {e}"  # NOQA
             )
             return None
@@ -1248,7 +1226,7 @@ class Package(nn.Module):
                 )
             except ValueError as e:
                 msg = getattr(e, "message", str(e))
-                logging.error(f"merge inputs of block {config.name} failed: {msg}")
+                logger.error(f"merge inputs of block {config.name} failed: {msg}")
                 raise e
         # To perform additional transformations on the merged multi-channel
         # input results, you need to configure it in the format of a lambda function.
@@ -1275,7 +1253,7 @@ class Package(nn.Module):
         block_outputs = {}
         self._block_outputs = block_outputs  # reset
         blocks = self.topo_order_list
-        logging.info(self._config.name + " topological order: " + ",".join(blocks))
+        logger.info(self._config.name + " topological order: " + ",".join(blocks))
 
         for block in blocks:  # Traverse blocks
             if block not in self._name_to_blocks:
@@ -1285,7 +1263,7 @@ class Package(nn.Module):
             config = self._name_to_blocks[block]
             # Case 1: sequential layers
             if hasattr(config, "layers") and config.layers:
-                logging.info("call sequential %d layers" % len(config.layers))
+                logger.info("call sequential %d layers" % len(config.layers))
                 output = self.block_input(config, block_outputs, **kwargs)
                 for i, layer in enumerate(config.layers):
                     name_i = "%s_l%d" % (block, i)
@@ -1326,13 +1304,9 @@ class Package(nn.Module):
                         # have a corresponding key, use the entire output.
                         block_outputs[block] = embedding_outputs
                     if isinstance(block_outputs[block], torch.Tensor):
-                        print(
-                            f"block_outputs[{block}]shape: {block_outputs[block].shape}"
-                        )
+                        logger.info(f"block_outputs[{block}]shape: {block_outputs[block].shape}")
                     else:
-                        print(
-                            f"block_outputs[{block}] type: {type(block_outputs[block])}"
-                        )
+                        logger.info(f"block_outputs[{block}] type: {type(block_outputs[block])}")
                 else:
                     embedding_outputs = input_fn(input_config)
                     if (
@@ -1370,21 +1344,19 @@ class Package(nn.Module):
                 raise ValueError("No output `%s` of backbone to be concat" % output)
 
         try:
-            logging.info(f"Number of outputs to merge: {len(outputs)}")
+            logger.info(f"Number of outputs to merge: {len(outputs)}")
             # Log each output's shape
             for i, out in enumerate(outputs):
                 if isinstance(out, torch.Tensor):
-                    logging.info(f"Output {i} shape: {out.shape}")
+                    logger.info(f"Output {i} shape: {out.shape}")
                 elif isinstance(out, (list, tuple)):
-                    logging.info(
-                        f"Output {i} is a list/tuple with {len(out)} elements."
-                    )
+                    logger.info(f"Output {i} is a list/tuple with {len(out)} elements.")
                 else:
-                    logging.info(f"Output {i} is of type {type(out)}")
+                    logger.info(f"Output {i} is of type {type(out)}")
             # merge_inputs
             output = merge_inputs(outputs, msg="backbone")
         except Exception as e:
-            logging.error("merge backbone's output failed: %s", str(e))
+            logger.error("merge backbone's output failed: %s", str(e))
             raise e
         return output
 
@@ -1409,7 +1381,7 @@ class Package(nn.Module):
                 # If the forward method has multiple parameters,
                 # it may require a dictionary input
                 if len(params) > 1:
-                    logging.debug(
+                    logger.debug(
                         f"Layer {layer_obj.__class__.__name__} has multiple forward parameters: {params}"  # NOQA
                     )
                     # Check if a specific parameter name implies
@@ -1421,7 +1393,7 @@ class Package(nn.Module):
                         "batch",
                     ]
                     if any(indicator in params for indicator in dict_indicators):
-                        logging.info(
+                        logger.info(
                             f"Layer {layer_obj.__class__.__name__} likely needs dict input"  # NOQA
                         )
                         return inputs  # Return to original dictionary format
@@ -1435,7 +1407,7 @@ class Package(nn.Module):
                     "DIN",
                 ]
                 if any(seq_name in class_name for seq_name in sequence_modules):
-                    logging.info(
+                    logger.info(
                         f"Layer {class_name} is a sequence module, using dict input"
                     )
                     return inputs  # Sequence modules usually require a dictionary input
@@ -1443,7 +1415,7 @@ class Package(nn.Module):
                 # check if need dict format input
                 dict_attributes = SEQUENCE_QUERY_PARAMS + ["attention"]
                 if any(hasattr(layer_obj, attr) for attr in dict_attributes):
-                    logging.info(
+                    logger.info(
                         f"Layer {class_name} has sequence attributes, using dict input"
                     )
                     return inputs
@@ -1454,13 +1426,13 @@ class Package(nn.Module):
                     if len(inputs) == 1:
                         single_key = list(inputs.keys())[0]
                         single_value = inputs[single_key]
-                        logging.debug(
+                        logger.debug(
                             f"Extracting single tensor from dict for {layer_obj.__class__.__name__}"  # NOQA
                         )
                         return single_value
                     else:
                         # In the case of multiple values, try concatenation
-                        logging.debug(
+                        logger.debug(
                             f"Multiple values in dict, trying to concatenate for {layer_obj.__class__.__name__}"  # NOQA
                         )
                         tensor_list = list(inputs.values())
@@ -1491,12 +1463,12 @@ class Package(nn.Module):
                                             flattened_tensors.append(t)
 
                                 result = torch.cat(flattened_tensors, dim=-1)
-                                logging.debug(
+                                logger.debug(
                                     f"Successfully concatenated tensors, final shape: {result.shape}"  # NOQA
                                 )
                                 return result
                             except Exception as e:
-                                logging.debug(
+                                logger.debug(
                                     f"Failed to concatenate tensors: {e}, "
                                     f"using first tensor"
                                 )
@@ -1509,7 +1481,7 @@ class Package(nn.Module):
             return inputs
 
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 f"Error determining input format for "
                 f"{layer_obj.__class__.__name__}: {e}"
             )
@@ -1530,12 +1502,12 @@ class Package(nn.Module):
         # If that fails and the input format has been modified,
         # try the original input format
         if processed_inputs is not inputs:
-            logging.info(f"Retrying {name} with original input format")
+            logger.info(f"Retrying {name} with original input format")
             if self._try_call_layer(layer, inputs, name, cls):
-                logging.info(f"Successfully called {name} with original input format")
+                logger.info(f"Successfully called {name} with original input format")
                 return self._last_output
             else:
-                logging.error(f"Both input formats failed for {name}")
+                logger.error(f"Both input formats failed for {name}")
                 raise RuntimeError(
                     f"Layer {name} failed with both processed and original input formats"  # NOQA
                 )
@@ -1570,7 +1542,6 @@ class Package(nn.Module):
                 ]
                 if "self" in params:
                     params.remove("self")
-                print(required_params)
 
                 # If inputs is a list/tuple and the layer expects
                 # multiple arguments, try spreading it out.
@@ -1583,25 +1554,25 @@ class Package(nn.Module):
                     )
                 ):
                     self._last_output = layer(*inputs)
-                    logging.debug(
+                    logger.debug(
                         f"Layer {name} ({cls}) called successfully with {len(inputs)} separate arguments"  # NOQA
                     )
                 else:
                     # Default: single parameter passing
                     self._last_output = layer(inputs)
-                    logging.debug(
+                    logger.debug(
                         f"Layer {name} ({cls}) called successfully with input type: {type(inputs)}"  # NOQA
                     )
             else:
                 # no forward method, directly use
                 self._last_output = layer(inputs)
-                logging.debug(
+                logger.debug(
                     f"Layer {name} ({cls}) called successfully with input type: {type(inputs)}"  # NOQA
                 )
             return True
         except Exception as e:
             msg = getattr(e, "message", str(e))
-            logging.error(f"Call layer {name} ({cls}) failed: {msg}")
+            logger.error(f"Call layer {name} ({cls}) failed: {msg}")
             return False
 
     def call_layer(self, inputs, config, name, **kwargs):
@@ -1688,7 +1659,7 @@ class Package(nn.Module):
                     # without fixed input index: directly replace the entire output
                     output = output_i
             else:
-                logging.warning(f"Recurrent sub-layer {name_i} not found, skipping")
+                logger.warning(f"Recurrent sub-layer {name_i} not found, skipping")
 
         if fixed_input_index >= 0:
             # Delete the element corresponding to the fixed input index
@@ -1738,7 +1709,7 @@ class Package(nn.Module):
                 output = self.call_torch_layer(ly_inputs, name_i, **kwargs)
                 outputs.append(output)
             else:
-                logging.warning(f"Repeat sub-layer {name_i} not found, skipping")
+                logger.warning(f"Repeat sub-layer {name_i} not found, skipping")
 
         # Output format determined by configuration
         if len(outputs) == 1:
@@ -1891,13 +1862,13 @@ def merge_inputs(inputs, axis=-1, msg=""):
         return reduce(lambda x, y: x + y, inputs)
 
     if any(isinstance(x, list) for x in inputs):
-        logging.warning("%s: try to merge inputs into list" % msg)
+        logger.warning("%s: try to merge inputs into list" % msg)
         return reduce(
             lambda x, y: x + y, [e if isinstance(e, list) else [e] for e in inputs]
         )
 
     if axis != -1:
-        logging.info("concat inputs %s axis=%d" % (msg, axis))
+        logger.info("concat inputs %s axis=%d" % (msg, axis))
     return torch.cat(inputs, dim=axis)
 
 
