@@ -134,12 +134,15 @@ class OdpsDatasetTest(unittest.TestCase):
         and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
         "odps config not found",
     )
-    def test_odps_dataset(self, is_orderby_partition):
+    def _test_odps_dataset(self, is_orderby_partition=False, schema=None):
         account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        tb_prefix = ""
+        if schema is not None:
+            project = self.test_schema_project
+            tb_prefix = f"{schema}."
         self.o = ODPS(
-            account=account,
-            project=self.test_project,
-            endpoint=odps_endpoint,
+            account=account, project=project, endpoint=odps_endpoint, schema=schema
         )
         feature_cfgs = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
@@ -154,7 +157,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 odps_data_quota_name="",
             ),
             features=features,
-            input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{project}/tables/{tb_prefix}test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         self.assertEqual(len(dataset.input_fields), 9)
         self.assertEqual(
@@ -190,18 +193,35 @@ class OdpsDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
-    @parameterized.expand([["bigint"], ["string"], ["int"]])
+    @parameterized.expand([[False], [True]])
     @unittest.skipIf(
         "ODPS_CONFIG_FILE_PATH" not in os.environ
         and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
         "odps config not found",
     )
-    def test_odps_dataset_with_sampler(self, id_type):
+    def test_odps_dataset(self, is_orderby_partition=False):
+        self._test_odps_dataset(is_orderby_partition=is_orderby_partition)
+
+    @unittest.skipIf(
+        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        or (
+            "ODPS_CONFIG_FILE_PATH" not in os.environ
+            and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ
+        ),
+        "schema odps project not found",
+    )
+    def test_odps_dataset_has_schema(self):
+        self._test_odps_dataset(is_orderby_partition=False, schema="rec")
+
+    def _test_odps_dataset_with_sampler(self, id_type="bigint", schema=None):
         account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        tb_prefix = ""
+        if schema is not None:
+            project = self.test_schema_project
+            tb_prefix = f"{schema}."
         self.o = ODPS(
-            account=account,
-            project=self.test_project,
-            endpoint=odps_endpoint,
+            account=account, project=project, endpoint=odps_endpoint, schema=schema
         )
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
@@ -233,14 +253,14 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f"odps://{self.test_project}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
+                    input_path=f"odps://{project}/tables/{tb_prefix}test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",
                 ),
             ),
             features=features,
-            input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{project}/tables/{tb_prefix}test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -273,76 +293,25 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["raw_c.values"]), 8296)
             self.assertEqual(len(data_dict["raw_e.values"]), 8196)
 
+    @parameterized.expand([["bigint"], ["string"], ["int"]])
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
+    def test_odps_dataset_with_sampler(self, id_type="bigint"):
+        self._test_odps_dataset_with_sampler(id_type=id_type)
+
     @unittest.skipIf(
         "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
-        or "ODPS_CONFIG_FILE_PATH" not in os.environ,
+        or (
+            "ODPS_CONFIG_FILE_PATH" not in os.environ
+            and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ
+        ),
         "schema odps project not found",
     )
-    def test_odps_dataset_has_schema(self, is_orderby_partition=False):
-        account, odps_endpoint = _create_odps_account()
-        self.o = ODPS(
-            account=account,
-            project=self.test_schema_project,
-            endpoint=odps_endpoint,
-        )
-        schema = "rec"
-        if not self.o.exist_schema(schema):
-            self.o.create_schema(schema)
-        self.o = self.o = ODPS(
-            account=account,
-            project=self.test_schema_project,
-            endpoint=odps_endpoint,
-            schema=schema,
-        )
-
-        feature_cfgs = self._create_test_table_and_feature_cfgs()
-        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
-
-        dataset = OdpsDataset(
-            data_config=data_pb2.DataConfig(
-                batch_size=8196,
-                dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_mode=FgMode.FG_DAG,
-                label_fields=["label"],
-                is_orderby_partition=is_orderby_partition,
-                odps_data_quota_name="",
-            ),
-            features=features,
-            input_path=f"odps://{self.test_schema_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
-        )
-        self.assertEqual(len(dataset.input_fields), 9)
-        self.assertEqual(
-            len(list(dataset._reader._input_to_sess.values())[0]),
-            2 if is_orderby_partition else 1,
-        )
-        dataloader = DataLoader(
-            dataset=dataset,
-            batch_size=None,
-            num_workers=2,
-            pin_memory=True,
-            collate_fn=lambda x: x,
-        )
-        iterator = iter(dataloader)
-        for _ in range(2):
-            data = next(iterator)
-            data_dict = data.to_dict()
-            self.assertEqual(
-                sorted(data_dict.keys()),
-                [
-                    "id_a.lengths",
-                    "id_a.values",
-                    "label",
-                    "lookup_h.values",
-                    "raw_c.values",
-                    "raw_d.values",
-                    "raw_e.values",
-                    "raw_f.values",
-                    "raw_g.values",
-                    "tag_b.lengths",
-                    "tag_b.values",
-                ],
-            )
-            self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
+    def test_odps_dataset_with_sampler_has_schema(self):
+        self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
 
 
 class OdpsWriterTest(unittest.TestCase):
