@@ -15,7 +15,7 @@ from google.protobuf import struct_pb2
 from google.protobuf.descriptor import FieldDescriptor
 
 
-def is_proto_message(pb_obj, field):
+def is_proto_message(pb_obj, field) -> bool:
     """Check if a given field in a Protocol Buffer object is a message type field.
 
     This utility function is designed to handle Protocol Buffer object dynamic
@@ -125,7 +125,7 @@ class Parameter(object):
                 pass
             return def_val  # maybe not equal to the default value of msg field
 
-    def check_required(self, keys):
+    def check_required(self, keys) -> None:
         """Check that required keys are present in the struct parameters.
 
         Args:
@@ -142,7 +142,7 @@ class Parameter(object):
             if key not in self.params:
                 raise KeyError("%s must be set in params" % key)
 
-    def has_field(self, key):
+    def has_field(self, key) -> bool:
         """Check if the parameter has the specified field.
 
         Args:
@@ -157,7 +157,7 @@ class Parameter(object):
             return self.params.HasField(key)
 
 
-def params_to_dict(parameter):
+def params_to_dict(parameter) -> dict:
     """Convert Parameter object to a dictionary."""
 
     def convert(param):
@@ -171,13 +171,9 @@ def params_to_dict(parameter):
                     value = getattr(param.params, key, None)
                     if value is not None:
                         if is_proto_message(param.params, key):
-                            result[key] = convert(
-                                Parameter(value, False, param.l2_regularizer)
-                            )
+                            result[key] = convert(Parameter(value, False))
                         elif isinstance(value, struct_pb2.Struct):
-                            result[key] = convert(
-                                Parameter(value, True, param.l2_regularizer)
-                            )
+                            result[key] = convert(Parameter(value, True))
                         else:
                             result[key] = value
                 return result

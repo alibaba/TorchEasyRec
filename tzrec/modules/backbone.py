@@ -10,17 +10,18 @@
 # limitations under the License.
 
 import inspect
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 import torch
 from networkx.drawing.nx_agraph import to_agraph
 from torch import nn
 
+from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
-from tzrec.protos import backbone_pb2
+from tzrec.protos import backbone_pb2, torch_layer_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig
 from tzrec.utils.backbone_utils import Parameter
 from tzrec.utils.config_util import config_to_kwargs
@@ -845,7 +846,12 @@ class Package(nn.Module):
             self._name_to_layer[name] = lambda_layer
             self._name_to_customize[name] = True
 
-    def load_torch_layer(self, layer_conf, name, input_dim=None):
+    def load_torch_layer(
+        self,
+        layer_conf: torch_layer_pb2.TorchLayer,
+        name: str,
+        input_dim: Optional[int] = None,
+    ) -> Tuple[Optional[nn.Module], bool]:
         """Dynamically load and initialize a torch layer based on configuration.
 
         Args:
@@ -877,8 +883,8 @@ class Package(nn.Module):
                 kwargs = {}
             elif param_type == "st_params":
                 params = Parameter(layer_conf.st_params, True)
+                kwargs = config_to_kwargs(params)  # pyre-ignore[6]
                 sig = inspect.signature(layer_cls.__init__)
-                kwargs = config_to_kwargs(params)
             # If param_type points to some other field in oneof,
             # the code dynamically gets the value of that field via getattr,
             # assuming it is a Protocol Buffer message (is_struct=False).
@@ -886,7 +892,7 @@ class Package(nn.Module):
                 pb_params = getattr(layer_conf, param_type)
                 params = Parameter(pb_params, False)
                 sig = inspect.signature(layer_cls.__init__)
-                kwargs = config_to_kwargs(params)
+                kwargs = config_to_kwargs(params)  # pyre-ignore[6]
 
             # Check if you need to automatically infer the input dimension parameters
             input_dim_params_in_sig = [
@@ -1076,7 +1082,9 @@ class Package(nn.Module):
             )
             return None
 
-    def _try_get_sequence_query_dims_from_group(self, group_name):
+    def _try_get_sequence_query_dims_from_group(
+        self, group_name: str
+    ) -> Optional[Tuple[int, int]]:
         """Get the sequence and query dimensions from the embedding group.
 
         Args:
@@ -1116,7 +1124,7 @@ class Package(nn.Module):
             )
             return None
 
-    def set_package_input(self, pkg_input):
+    def set_package_input(self, pkg_input) -> None:
         """Set the package input for this package.
 
         Args:
@@ -1494,7 +1502,7 @@ class Package(nn.Module):
             )
             return inputs  # Returns the original input on error
 
-    def call_torch_layer(self, inputs, name, **kwargs):
+    def call_torch_layer(self, inputs, name:str, **kwargs): # pyre-ignore[2]
         """Call predefined torch Layer."""
         layer = self._name_to_layer[name]
         cls = layer.__class__.__name__
@@ -1679,7 +1687,7 @@ class Package(nn.Module):
 
         return output
 
-    def _call_repeat_layer(self, inputs, config, name, **kwargs):
+    def _call_repeat_layer(self, inputs, config, name:str, **kwargs): # pyre-ignore[2]
         """Call repeat layer by iterating through all repetitions.
 
         Args:
@@ -1739,7 +1747,7 @@ class Backbone(nn.Module):
         self,
         config: backbone_pb2.BackboneTower,
         features: List[BaseFeature],
-        embedding_group: Any,
+        embedding_group: EmbeddingGroup,
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
         wide_init_fn: Optional[str] = None,
@@ -1781,7 +1789,7 @@ class Backbone(nn.Module):
             kwargs = config_to_kwargs(params)
             self._top_mlp = MLP(in_features=total_output_dim, **kwargs)
 
-    def forward(self, batch=None, **kwargs):
+    def forward(self, batch: Batch = None, **kwargs):
         """Forward pass through the backbone network.
 
         Args:
@@ -1825,11 +1833,6 @@ class Backbone(nn.Module):
 
         # If there is no top_mlp, return the output dimensions of main_pkg
         return self._main_pkg.total_output_dim()
-
-    @classmethod
-    def wide_embed_dim(cls, config):
-        """Get wide embedding dimension from config."""
-        raise NotImplementedError
 
 
 def merge_inputs(inputs, axis=-1, msg=""):

@@ -12,7 +12,7 @@
 """Lambda expression dimension inference module."""
 
 import logging
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -51,10 +51,9 @@ class LambdaOutputDimInferrer:
         """
         # If the first dimension of input_dim_info.shape
         # is not None, use it as batch_size
-        if (
-            input_dim_info.shape[0] is not None and len(input_dim_info.shape) > 0
-        ):  # pyre-ignore[6]
-            dummy_batch_size = input_dim_info.shape[0]
+        shape = input_dim_info.shape
+        if shape is not None and len(shape) > 0 and shape[0] is not None:
+            dummy_batch_size = shape[0]
         try:
             # 1. Create a dummy tensor
             dummy_tensor = self._create_dummy_tensor(
@@ -86,12 +85,24 @@ class LambdaOutputDimInferrer:
         seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Create a dummy tensor for testing."""
+
+        def flatten_shape(s: Any) -> Tuple[int, ...]:  # pyre-ignore[2]
+            # Expand the nested shape and keep only int
+            result = []
+            for item in s:
+                if isinstance(item, (list, tuple)):
+                    result.extend(flatten_shape(item))
+                else:
+                    result.append(item)
+            return tuple(result)
+
         if input_dim_info.shape is not None:
             # if there is full shape info, use it
             shape = input_dim_info.shape
             # replace the first dimension with dummy_batch_size
             if len(shape) > 0:
                 shape = (batch_size,) + shape[1:]
+            shape = flatten_shape(shape)
         else:
             # compute shape based on feature dimension
             feature_dim = input_dim_info.get_feature_dim()
@@ -102,8 +113,9 @@ class LambdaOutputDimInferrer:
             else:
                 # 2D: (batch_size, feature_dim)
                 shape = (batch_size, feature_dim)
+            shape = flatten_shape(shape)
 
-        dummy_tensor = torch.randn(shape, dtype=torch.float32)  # pyre-ignore[7]
+        dummy_tensor = torch.randn(shape, dtype=torch.float32)
         self.logger.debug(f"Created dummy tensor with shape: {shape}")
         return dummy_tensor
 

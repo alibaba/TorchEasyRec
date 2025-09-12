@@ -45,44 +45,42 @@ class ModularMatch(MatchModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # 获取match_backbone配置
+        # get backbone config
         self._match_backbone_config = self._base_model_config.match_backbone
 
-        # 从model_params获取基本参数，设置默认值
+        # get model params
         model_params = getattr(self._match_backbone_config, "model_params", None)
-        self._output_dim = 64  # 默认输出维度
-        self._similarity_type = simi_pb2.INNER_PRODUCT  # 默认相似度类型
-        self._temperature = 1.0  # 默认温度参数
+        self._output_dim = 64  # default
+        self._similarity_type = simi_pb2.INNER_PRODUCT  # default
+        self._temperature = 1.0  # default temperature
 
-        # 尝试从不同来源获取参数
+        # Try getting parameters from different sources
         if model_params:
-            # 从model_params获取参数（如果有的话）
+            # Get parameters from model_paramsGet parameters from model_params (if any)
             self._output_dim = getattr(model_params, "output_dim", self._output_dim)
             if hasattr(model_params, "similarity"):
                 self._similarity_type = model_params.similarity
             if hasattr(model_params, "temperature"):
                 self._temperature = model_params.temperature
 
-        # 也可以从kwargs中获取参数（运行时传入）
-        self._output_dim = kwargs.get("output_dim", self._output_dim)
+        # Get parameters from kwargs (passed in at runtime)im", self._output_dim)
         self._similarity_type = kwargs.get("similarity", self._similarity_type)
         self._temperature = kwargs.get("temperature", self._temperature)
 
-        # 构建backbone网络
+        # build backbone network
         self._backbone_net = self.build_backbone_network()
 
-        # 获取backbone的输出配置
+        # get backbone output blocks configuration
         self._output_blocks = self._get_output_blocks()
 
-        # 根据输出blocks确定用户塔和物品塔的输入
         self._user_tower_input = self._output_blocks.get("user", None)
         self._item_tower_input = self._output_blocks.get("item", None)
 
-        # 如果没有明确指定用户塔和物品塔输入，使用默认逻辑
+        # if user/item tower input not explicitly set, setup default
         if not self._user_tower_input and not self._item_tower_input:
             self._setup_default_tower_inputs()
 
-    def build_backbone_network(self):
+    def build_backbone_network(self) -> Backbone:
         """Build backbone network."""
         wide_embedding_dim = (
             int(self.wide_embedding_dim)
@@ -95,7 +93,7 @@ class ModularMatch(MatchModel):
         return Backbone(
             config=self._match_backbone_config.backbone,
             features=self._features,
-            embedding_group=None,  # 让Backbone自己创建EmbeddingGroup
+            embedding_group=None,
             feature_groups=feature_groups,
             wide_embedding_dim=wide_embedding_dim,
             wide_init_fn=wide_init_fn,
@@ -110,18 +108,18 @@ class ModularMatch(MatchModel):
         output_blocks = {}
         backbone_config = self._match_backbone_config.backbone
 
-        # 检查是否有output_blocks配置
+        # Check if there is output_blocks configuration
         if hasattr(backbone_config, "output_blocks") and backbone_config.output_blocks:
             output_block_list = list(backbone_config.output_blocks)
 
-            # 尝试根据block名称推断用户塔和物品塔
+            # Try to infer user towers and item towers based on block names
             for block_name in output_block_list:
                 if "user" in block_name.lower():
                     output_blocks["user"] = block_name
                 elif "item" in block_name.lower() or "product" in block_name.lower():
                     output_blocks["item"] = block_name
 
-            # 如果有2个输出blocks但没有匹配到用户/物品，按顺序分配
+            # if not found, use first two blocks as user/item towers
             if len(output_block_list) == 2 and len(output_blocks) == 0:
                 output_blocks["user"] = output_block_list[0]
                 output_blocks["item"] = output_block_list[1]
@@ -130,14 +128,14 @@ class ModularMatch(MatchModel):
 
     def _setup_default_tower_inputs(self):
         """Setup default tower inputs when not explicitly configured."""
-        # 默认假设backbone输出单个tensor或两个tensor
+        # default: use first two output blocks if available
         backbone_output_names = self._backbone_net.get_output_block_names()
 
         if len(backbone_output_names) >= 2:
             self._user_tower_input = backbone_output_names[0]
             self._item_tower_input = backbone_output_names[1]
         else:
-            # 单输出情况下，用户塔和物品塔共享同一个输出
+            # single output block, use it for both towers
             self._user_tower_input = (
                 backbone_output_names[0] if backbone_output_names else "shared"
             )
@@ -176,18 +174,18 @@ class ModularMatch(MatchModel):
             torch.Tensor: Tower-specific feature tensor.
         """
         if isinstance(backbone_output, dict):
-            # 如果backbone返回字典，直接按名称获取
+            # If backbone returns a dictionary, get it directly by name
             if tower_input in backbone_output:
                 return backbone_output[tower_input]
             else:
-                # 如果找不到指定的tower_input，尝试一些通用的键名
+                # If the specified tower_input is not found
                 for key in backbone_output.keys():
                     if tower_input.lower() in key.lower():
                         return backbone_output[key]
-                # 如果都找不到，返回第一个值
+                # If none are found, return the first value.
                 return list(backbone_output.values())[0]
         elif isinstance(backbone_output, (list, tuple)):
-            # 如果backbone返回列表，需要根据tower_input确定索引
+            # If backbone returns a list, you need to determine the index based on tower_input
             if tower_input == self._user_tower_input and len(backbone_output) > 0:
                 return backbone_output[0]
             elif tower_input == self._item_tower_input and len(backbone_output) > 1:
@@ -195,7 +193,7 @@ class ModularMatch(MatchModel):
             else:
                 return backbone_output[0]
         else:
-            # 如果是单个tensor，直接返回
+            # If it is a single tensor, return directly
             return backbone_output
 
     def user_tower(self, batch: Batch) -> torch.Tensor:
@@ -211,8 +209,7 @@ class ModularMatch(MatchModel):
         user_feature = self._extract_tower_feature(
             backbone_output, self._user_tower_input
         )
-
-        # 如果特征维度与输出维度不匹配，需要投影
+        
         if user_feature.size(-1) != self._output_dim:
             if not hasattr(self, "_user_projection_layer"):
                 self._user_projection_layer = nn.Linear(
@@ -224,7 +221,6 @@ class ModularMatch(MatchModel):
         else:
             user_emb = user_feature
 
-        # 根据相似度类型决定是否归一化
         if self._similarity_type == simi_pb2.COSINE:
             user_emb = nn.functional.normalize(user_emb, p=2, dim=-1)
 
@@ -244,7 +240,6 @@ class ModularMatch(MatchModel):
             backbone_output, self._item_tower_input
         )
 
-        # 如果特征维度与输出维度不匹配，需要投影
         if item_feature.size(-1) != self._output_dim:
             if not hasattr(self, "_item_projection_layer"):
                 self._item_projection_layer = nn.Linear(
@@ -256,7 +251,6 @@ class ModularMatch(MatchModel):
         else:
             item_emb = item_feature
 
-        # 根据相似度类型决定是否归一化
         if self._similarity_type == simi_pb2.COSINE:
             item_emb = nn.functional.normalize(item_emb, p=2, dim=-1)
 
@@ -271,15 +265,13 @@ class ModularMatch(MatchModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        # 获取用户和物品的embedding
         user_emb = self.user_tower(batch)
         item_emb = self.item_tower(batch)
 
-        # 计算相似度
+        # compute similarity
         hard_neg_indices = getattr(batch, "hard_neg_indices", None)
         similarity = self.sim(user_emb, item_emb, hard_neg_indices)
 
-        # 应用温度缩放
         if self._temperature != 1.0:
             similarity = similarity / self._temperature
 
@@ -300,7 +292,6 @@ class ModularMatch(MatchModel):
                 self._output_dim = match_backbone_model._output_dim
                 self._similarity_type = match_backbone_model._similarity_type
 
-                # 复制投影层如果存在
                 if hasattr(match_backbone_model, "_user_projection_layer"):
                     self.user_projection_layer = (
                         match_backbone_model._user_projection_layer
@@ -311,7 +302,6 @@ class ModularMatch(MatchModel):
             def forward(self, batch: Batch) -> torch.Tensor:
                 backbone_output = self.backbone_net(batch=batch)
 
-                # 提取用户特征
                 if isinstance(backbone_output, dict):
                     if self._user_tower_input in backbone_output:
                         user_feature = backbone_output[self._user_tower_input]
@@ -322,13 +312,12 @@ class ModularMatch(MatchModel):
                 else:
                     user_feature = backbone_output
 
-                # 应用投影层
                 if self.user_projection_layer is not None:
                     user_emb = self.user_projection_layer(user_feature)
                 else:
                     user_emb = user_feature
 
-                # 归一化
+                # normalize if using cosine similarity
                 if self._similarity_type == simi_pb2.COSINE:
                     user_emb = nn.functional.normalize(user_emb, p=2, dim=-1)
 
@@ -351,7 +340,6 @@ class ModularMatch(MatchModel):
                 self._output_dim = match_backbone_model._output_dim
                 self._similarity_type = match_backbone_model._similarity_type
 
-                # 复制投影层如果存在
                 if hasattr(match_backbone_model, "_item_projection_layer"):
                     self.item_projection_layer = (
                         match_backbone_model._item_projection_layer
@@ -362,7 +350,6 @@ class ModularMatch(MatchModel):
             def forward(self, batch: Batch) -> torch.Tensor:
                 backbone_output = self.backbone_net(batch=batch)
 
-                # 提取物品特征
                 if isinstance(backbone_output, dict):
                     if self._item_tower_input in backbone_output:
                         item_feature = backbone_output[self._item_tower_input]
@@ -377,13 +364,12 @@ class ModularMatch(MatchModel):
                 else:
                     item_feature = backbone_output
 
-                # 应用投影层
                 if self.item_projection_layer is not None:
                     item_emb = self.item_projection_layer(item_feature)
                 else:
                     item_emb = item_feature
 
-                # 归一化
+                # normalize if using cosine similarity
                 if self._similarity_type == simi_pb2.COSINE:
                     item_emb = nn.functional.normalize(item_emb, p=2, dim=-1)
 

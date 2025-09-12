@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch.nn as nn
 
+from tzrec.modules.embedding import EmbeddingGroup
+
 
 class DimensionInfo:
     """Class representing dimension information."""
@@ -78,10 +80,10 @@ class DimensionInfo:
         feature_dim = shape[-1] if shape else self.get_feature_dim()
         return DimensionInfo(
             dim=self.dim, shape=shape, is_list=self.is_list, feature_dim=feature_dim
-        )
+        )  # pyre-ignore [7]
 
     def estimate_shape(
-        self, batch_size: int = None, seq_len: int = None
+        self, batch_size: Optional[int] = None, seq_len: Optional[int] = None
     ) -> Tuple[int, ...]:
         """Estimate shape based on known information.
 
@@ -101,10 +103,10 @@ class DimensionInfo:
         if batch_size is not None:
             if seq_len is not None:
                 # 3D (batch_size, seq_len, feature_dim)
-                return (batch_size, seq_len, feature_dim)
+                return (batch_size, seq_len, feature_dim)  # pyre-ignore [7]
             else:
                 # 2D (batch_size, feature_dim)
-                return (batch_size, feature_dim)
+                return (batch_size, feature_dim)  # pyre-ignore [7]
         else:
             # Only feature dimensions are returned
             return (feature_dim,)
@@ -113,23 +115,23 @@ class DimensionInfo:
 class DimensionInferenceEngine:
     """Dimension inference engine, manages and infers dim information between blocks."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.block_input_dims: Dict[str, DimensionInfo] = {}
         self.block_output_dims: Dict[str, DimensionInfo] = {}
         self.block_layers: Dict[str, nn.Module] = {}
         self.logger = logging.getLogger(__name__)
 
-    def register_input_dim(self, block_name: str, dim_info: DimensionInfo):
+    def register_input_dim(self, block_name: str, dim_info: DimensionInfo) -> None:
         """Register the input dimension of the block."""
         self.block_input_dims[block_name] = dim_info
         logging.debug(f"Registered input dim for {block_name}: {dim_info}")
 
-    def register_output_dim(self, block_name: str, dim_info: DimensionInfo):
+    def register_output_dim(self, block_name: str, dim_info: DimensionInfo) -> None:
         """Register the output dimension of the block."""
         self.block_output_dims[block_name] = dim_info
         logging.debug(f"Registered output dim for {block_name}: {dim_info}")
 
-    def register_layer(self, block_name: str, layer: nn.Module):
+    def register_layer(self, block_name: str, layer: nn.Module) -> None:
         """Register the layer corresponding to the block."""
         self.block_layers[block_name] = layer
 
@@ -164,11 +166,11 @@ class DimensionInferenceEngine:
                     f"Failed to call output_dim on {type(layer).__name__}: {e}"
                 )
 
-        try:
-            return create_dimension_info_from_layer_output(layer, input_dim)
-        except Exception:
-            # failed
-            pass
+        # try:
+        #     return create_dimension_info_from_layer_output(layer, input_dim)
+        # except Exception:
+        #     # failed
+        #     pass
 
         # Inferring output dimensions based on layer type
         layer_type = type(layer).__name__
@@ -400,7 +402,7 @@ class DimensionInferenceEngine:
 
 
 def create_dimension_info_from_embedding(
-    embedding_group, group_name: str, batch_size: Optional[int] = None
+    embedding_group: EmbeddingGroup, group_name: str, batch_size: Optional[int] = None
 ) -> DimensionInfo:
     """Create dimension information from an embedding group.
 
@@ -429,138 +431,3 @@ def create_dimension_info_from_embedding(
     except Exception as e:
         logging.error(f"Failed to get dimension from embedding group {group_name}: {e}")
         return DimensionInfo(0, feature_dim=0)
-
-
-def create_dimension_info_from_layer_output(
-    layer: nn.Module, input_dim_info: DimensionInfo
-) -> DimensionInfo:
-    """Creates output dimension information from layer and input dimension information.
-
-    for inferring the output dimensions of a layer.
-    """
-    layer_type = type(layer).__name__
-
-    # MLP
-    if layer_type == "MLP":
-        if hasattr(layer, "hidden_units") and layer.hidden_units:
-            output_dim = layer.hidden_units[-1]
-        elif hasattr(layer, "out_features"):
-            output_dim = layer.out_features
-        else:
-            # If the output dimension cannot be determined, use the input dimension
-            output_dim = input_dim_info.get_feature_dim()
-            logging.warning(
-                f"Cannot determine MLP output dimension, using input dim: {output_dim}"
-            )
-
-        # Estimate output shape
-        input_shape = input_dim_info.shape
-        if input_shape is not None:
-            output_shape = input_shape[:-1] + (
-                output_dim,
-            )  # Keep all dimensions except the last one
-        else:
-            output_shape = input_dim_info.estimate_shape()
-            if output_shape:
-                output_shape = output_shape[:-1] + (output_dim,)
-            else:
-                output_shape = None
-
-        return DimensionInfo(dim=output_dim, shape=output_shape, feature_dim=output_dim)
-
-    # Linear
-    elif layer_type in ["Linear", "LazyLinear"]:
-        if hasattr(layer, "out_features"):
-            output_dim = layer.out_features
-
-            # Estimate output shape
-            input_shape = input_dim_info.shape
-            if input_shape is not None:
-                output_shape = input_shape[:-1] + (output_dim,)
-            else:
-                output_shape = input_dim_info.estimate_shape()
-                if output_shape:
-                    output_shape = output_shape[:-1] + (output_dim,)
-                else:
-                    output_shape = None
-
-            return DimensionInfo(
-                dim=output_dim, shape=output_shape, feature_dim=output_dim
-            )
-
-    # DIN
-    elif layer_type == "DIN":
-        if hasattr(layer, "_sequence_dim") and layer._sequence_dim is not None:
-            # Initialized DIN, use sequence_dim directly
-            output_dim = layer._sequence_dim
-        else:
-            # Uninitialized DIN, inferred from the input dimensions
-            # [sequence_features, query_features] concatenation
-            # Output dimension equals sequence_dim
-            total_dim = input_dim_info.get_feature_dim()
-            if total_dim > 0:
-                # suppose sequence_dim = total_dim / 2
-                output_dim = total_dim // 2
-                logging.info(
-                    f"DIN output dimension inferred as {output_dim} "
-                    f"from input {total_dim}"
-                )
-            else:
-                output_dim = input_dim_info.get_feature_dim()
-                logging.warning(
-                    f"Cannot infer DIN sequence dimension, using input dim: "
-                    f"{output_dim}"
-                )
-
-        # Estimate output shape
-        input_shape = input_dim_info.shape
-        if input_shape is not None:
-            output_shape = input_shape[:-1] + (output_dim,)
-        else:
-            output_shape = input_dim_info.estimate_shape()
-            if output_shape:
-                output_shape = output_shape[:-1] + (output_dim,)
-            else:
-                output_shape = None
-
-        return DimensionInfo(dim=output_dim, shape=output_shape, feature_dim=output_dim)
-
-    # DINEncoder
-    elif layer_type == "DINEncoder":
-        if hasattr(layer, "_sequence_dim") and layer._sequence_dim is not None:
-            # Initialized DINEncoder, directly use sequence_dim
-            output_dim = layer._sequence_dim
-        elif hasattr(layer, "output_dim") and callable(layer.output_dim):
-            # DINEncoder.output_dim
-            try:
-                output_dim = layer.output_dim()
-            except Exception:
-                output_dim = input_dim_info.get_feature_dim()
-        else:
-            # Uninitialized DINEncoder, using sequence_dim
-            if hasattr(layer, "sequence_dim"):
-                output_dim = layer.sequence_dim
-            else:
-                # Inferring from input dimensions
-                total_dim = input_dim_info.get_feature_dim()
-                output_dim = total_dim // 2 if total_dim > 0 else total_dim
-                logging.info(f"DINEncoder output dimension inferred as {output_dim}")
-
-        # Estimate output shape
-        input_shape = input_dim_info.shape
-        if input_shape is not None:
-            output_shape = input_shape[:-1] + (output_dim,)
-        else:
-            output_shape = input_dim_info.estimate_shape()
-            if output_shape:
-                output_shape = output_shape[:-1] + (output_dim,)
-            else:
-                output_shape = None
-
-        return DimensionInfo(dim=output_dim, shape=output_shape, feature_dim=output_dim)
-
-    # In other cases, the default output dimension is the same as the input dimension
-    logging.warning(
-        f"Layer type {layer_type} not specifically handled, assuming output dim == input dim"  # NOQA
-    )
-    return input_dim_info

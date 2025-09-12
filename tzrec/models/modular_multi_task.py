@@ -120,10 +120,10 @@ class ModularMultiTask(MultiTaskRank):
         # get backbone output
         backbone_output = self.backbone(batch)
 
-        # Process backbone output: it may be 
+        # Process backbone output: it may be
         # a single tensor or a list of tensors
         if isinstance(backbone_output, (list, tuple)):
-            # The backbone returns a list (such as the MMoE module), 
+            # The backbone returns a list (such as the MMoE module),
             # which needs to correspond one-to-one with the task tower.
             if len(backbone_output) != len(self._task_tower_cfgs):
                 raise ValueError(
@@ -132,7 +132,7 @@ class ModularMultiTask(MultiTaskRank):
                 )
             task_input_list = backbone_output
         else:
-            # Backbone returns a single tensor, 
+            # Backbone returns a single tensor,
             # which is copied to all task towers
             task_input_list = [backbone_output] * len(self._task_tower_cfgs)
 
