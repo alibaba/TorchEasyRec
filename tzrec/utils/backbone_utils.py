@@ -50,7 +50,7 @@ class Parameter(object):
         is_struct: Boolean indicating if this is a struct-type parameter.
     """
 
-    def __init__(self, params, is_struct):
+    def __init__(self, params, is_struct) -> None:
         self.params = params
         self.is_struct = is_struct
 
@@ -160,7 +160,7 @@ class Parameter(object):
 def params_to_dict(parameter) -> dict:
     """Convert Parameter object to a dictionary."""
 
-    def convert(param):
+    def convert(param) -> dict:
         if isinstance(param, Parameter):
             if param.is_struct:
                 return {key: convert(value) for key, value in param.params.items()}

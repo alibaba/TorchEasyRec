@@ -80,7 +80,7 @@ class DimensionInfo:
         feature_dim = shape[-1] if shape else self.get_feature_dim()
         return DimensionInfo(
             dim=self.dim, shape=shape, is_list=self.is_list, feature_dim=feature_dim
-        )  # pyre-ignore [7]
+        )
 
     def estimate_shape(
         self, batch_size: Optional[int] = None, seq_len: Optional[int] = None
@@ -345,6 +345,7 @@ class DimensionInferenceEngine:
                     f"Dummy tensor inference failed for '{input_fn}': {e}, "
                     f"falling back to pattern matching"
                 )
+                return dim_info
 
         except Exception as e:
             logging.error(f"Failed to apply input_fn {input_fn}: {e}")

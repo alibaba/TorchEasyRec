@@ -31,7 +31,7 @@ from tzrec.utils.dimension_inference import (
     create_dimension_info_from_embedding,
 )
 from tzrec.utils.lambda_inference import LambdaOutputDimInferrer
-from tzrec.utils.load_class import load_torch_layer
+from tzrec.utils.load_class import load_torch_layer  # pyre ignore[21]
 from tzrec.utils.logging_util import logger
 
 # Constants for auto-inferred parameters
@@ -1032,7 +1032,7 @@ class Package(nn.Module):
                 layer = layer_cls(*args, name=name)
             return layer, customize
 
-    def reset_input_config(self, config):
+    def reset_input_config(self, config: backbone_pb2.BlockPackage) -> None:
         """Reset the input configuration for this package.
 
         Args:
@@ -1124,7 +1124,7 @@ class Package(nn.Module):
             )
             return None
 
-    def set_package_input(self, pkg_input) -> None:
+    def set_package_input(self, pkg_input:torch.Tensor ) -> None:
         """Set the package input for this package.
 
         Args:
@@ -1132,7 +1132,7 @@ class Package(nn.Module):
         """
         self._package_input = pkg_input
 
-    def has_block(self, name) -> bool:
+    def has_block(self, name: str) -> bool:
         """Check if a block with the given name exists in this package.
 
         Args:
@@ -1154,7 +1154,9 @@ class Package(nn.Module):
         """
         return self._block_outputs.get(name, None)
 
-    def block_input(self, config, block_outputs, **kwargs):
+    def block_input(
+        self, config: backbone_pb2.Block, block_outputs: dict, **kwargs: dict
+    ) -> list:
         """Process and merge inputs for a block based on its configuration.
 
         Args:
@@ -1247,7 +1249,9 @@ class Package(nn.Module):
 
         return output
 
-    def forward(self, batch=None, **kwargs):
+    def forward(
+        self, batch: Batch, **kwargs: dict
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Execute forward pass through the package DAG.
 
         Args:
@@ -1375,7 +1379,7 @@ class Package(nn.Module):
             raise e
         return output
 
-    def _determine_input_format(self, layer_obj, inputs):
+    def _determine_input_format(self, layer_obj, inputs:Union[torch.Tensor, dict])-> Union[torch.Tensor, dict]:
         """Determine the input format required by the module.
 
         Args:
@@ -1502,7 +1506,7 @@ class Package(nn.Module):
             )
             return inputs  # Returns the original input on error
 
-    def call_torch_layer(self, inputs, name:str, **kwargs): # pyre-ignore[2]
+    def call_torch_layer(self, inputs, name: str, **kwargs):  # pyre-ignore[2]
         """Call predefined torch Layer."""
         layer = self._name_to_layer[name]
         cls = layer.__class__.__name__
@@ -1531,7 +1535,9 @@ class Package(nn.Module):
             # throw an exception directly
             raise RuntimeError(f"Layer {name} ({cls}) failed to execute")
 
-    def _try_call_layer(self, layer, inputs, name, cls):
+    def _try_call_layer(
+        self, layer, inputs, name: str, cls: str
+    ) -> bool:  # pyre-ignore[2]
         """Attempt to call the layer.
 
         Args:
@@ -1590,7 +1596,13 @@ class Package(nn.Module):
             logger.error(f"Call layer {name} ({cls}) failed: {msg}")
             return False
 
-    def call_layer(self, inputs, config, name, **kwargs):
+    def call_layer(
+        self,
+        inputs: torch.Tensor,
+        config: backbone_pb2.Block,
+        name: str,
+        **kwargs: dict,
+    ) -> torch.Tensor:
         """Call a layer based on its configuration type.
 
         Args:
@@ -1625,7 +1637,13 @@ class Package(nn.Module):
                 return fn(inputs)
         raise NotImplementedError("Unsupported backbone layer:" + layer_name)
 
-    def _call_recurrent_layer(self, inputs, config, name, **kwargs):
+    def _call_recurrent_layer(
+        self,
+        inputs: torch.Tensor,
+        config: backbone_pb2.Block,
+        name: str,
+        **kwargs: dict,
+    ) -> torch.Tensor:
         """Call recurrent layer by iterating through all steps.
 
         Args:
@@ -1687,7 +1705,13 @@ class Package(nn.Module):
 
         return output
 
-    def _call_repeat_layer(self, inputs, config, name:str, **kwargs): # pyre-ignore[2]
+    def _call_repeat_layer(
+        self,
+        inputs: torch.Tensor,
+        config: backbone_pb2.Block,
+        name: str,
+        **kwargs: dict,
+    ) -> torch.Tensor:
         """Call repeat layer by iterating through all repetitions.
 
         Args:
@@ -1789,7 +1813,7 @@ class Backbone(nn.Module):
             kwargs = config_to_kwargs(params)
             self._top_mlp = MLP(in_features=total_output_dim, **kwargs)
 
-    def forward(self, batch: Batch = None, **kwargs):
+    def forward(self, batch: Batch, **kwargs: dict) -> torch.Tensor:  # pyre-ignore[2]
         """Forward pass through the backbone network.
 
         Args:
@@ -1807,7 +1831,7 @@ class Backbone(nn.Module):
             output = self._top_mlp(output)
         return output
 
-    def output_dim(self):
+    def output_dim(self) -> int:
         """Get the final output dimension, taking into account of top_mlp."""
         if hasattr(self, "_top_mlp") and self._top_mlp is not None:
             if hasattr(self._top_mlp, "output_dim"):
@@ -1835,7 +1859,9 @@ class Backbone(nn.Module):
         return self._main_pkg.total_output_dim()
 
 
-def merge_inputs(inputs, axis=-1, msg=""):
+def merge_inputs(
+    inputs: List, axis: int = -1, msg: str = ""
+) -> Union[List, torch.Tensor]:
     """Merge multiple inputs and apply different logic based on input types and count.
 
     Args:
@@ -1882,7 +1908,7 @@ def merge_inputs(inputs, axis=-1, msg=""):
     return torch.cat(inputs, dim=axis)
 
 
-def format_value(value):
+def format_value(value:Union[str,int,list,dict]) -> Union[str,int,list,dict]:
     """Format the input value based on its type.
 
     Args:
@@ -1903,7 +1929,7 @@ def format_value(value):
     return value
 
 
-def convert_to_dict(struct):
+def convert_to_dict(struct) -> dict:
     """Convert a struct_pb2.Struct object to a Python dictionary.
 
     Args:

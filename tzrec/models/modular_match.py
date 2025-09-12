@@ -185,7 +185,6 @@ class ModularMatch(MatchModel):
                 # If none are found, return the first value.
                 return list(backbone_output.values())[0]
         elif isinstance(backbone_output, (list, tuple)):
-            # If backbone returns a list, you need to determine the index based on tower_input
             if tower_input == self._user_tower_input and len(backbone_output) > 0:
                 return backbone_output[0]
             elif tower_input == self._item_tower_input and len(backbone_output) > 1:
@@ -209,7 +208,7 @@ class ModularMatch(MatchModel):
         user_feature = self._extract_tower_feature(
             backbone_output, self._user_tower_input
         )
-        
+
         if user_feature.size(-1) != self._output_dim:
             if not hasattr(self, "_user_projection_layer"):
                 self._user_projection_layer = nn.Linear(
