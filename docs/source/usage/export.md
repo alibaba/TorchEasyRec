@@ -21,9 +21,9 @@ torchrun --master_addr=localhost --master_port=32555 \
 - QUANT_EMB: 对EmebddingBagCollection（非序列特征）参数进行量化，默认开启，INT8量化在大部分场景中对AUC等指标基本无损，且能大幅提升推理性能
   - **QUANT_EMB=INT8**：启用量化，默认已启用，并且默认为INT8量化，可以支持FP32，FP16，INT8，INT4，INT2
   - **QUANT_EMB=0**：关闭量化
-- QUANT_EC_EMB: 对EmebddingCollection（序列特征）参数进行量化，默认开启，INT8量化在大部分场景中对AUC等指标基本无损，且能大幅提升推理性能
+- QUANT_EC_EMB: 对EmebddingCollection（序列特征）参数进行量化，默认关闭，INT8量化在大部分场景中对AUC等指标基本无损，且能大幅提升推理性能
   - **QUANT_EC_EMB=INT8**：启用量化，默认关闭，可以支持FP32，FP16，INT8，INT4，INT2
-- INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间。必须在fg_mode=normal下使用，并且TorchEasyRec导出时需加上此环境变量
+- INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间，默认关闭。必须在TorchEasyRec Processor的fg_mode=normal下使用
   - **INPUT_TILE=2**：user侧特征fg仅计算一次
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
 - ENABLE_AOT:
