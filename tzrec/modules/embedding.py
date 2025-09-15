@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import OrderedDict, defaultdict
 from functools import partial  # NOQA
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
@@ -1361,10 +1362,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         )
 
         results = {}
+        sparse_query_cache: Dict[str, torch.Tensor] = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
             for info in v:
-                if info.is_sparse:
+                if info.name in sparse_query_cache:
+                    query_t = sparse_query_cache[info.name]
+                elif info.is_sparse:
                     query_jt = jt_dict[info.name]
                     if info.value_dim == 1:
                         # for single-value id feature
@@ -1378,6 +1382,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             query_t = torch.nan_to_num(query_t, nan=0.0)
                     if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
+                    sparse_query_cache[info.name] = query_t
                 else:
                     query_t = dense_t_dict[info.name]
                 query_t_list.append(query_t)
@@ -1411,11 +1416,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
 
-                jt = jt.to_padded_dense(group_sequence_length)
+                if int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1:
+                    seq_t = jt.values()
+                else:
+                    seq_t = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:
-                    jt = jt.tile(tile_size, 1, 1)
-                seq_t_list.append(jt)
+                    seq_t = seq_t.tile(tile_size, 1, 1)
+                seq_t_list.append(seq_t)
 
             if seq_t_list:
                 results[f"{group_name}.sequence"] = torch.cat(seq_t_list, dim=2)

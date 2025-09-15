@@ -214,13 +214,13 @@ class RankIntegrationTest(unittest.TestCase):
             user_id="user_id",
             item_id="item_id",
         )
-        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2"]:
+        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]:
             test_dir = os.path.join(self.test_dir, f"quant_{quant_emb.lower()}")
             if self.success:
                 self.success = utils.test_export(
                     os.path.join(self.test_dir, "pipeline.config"),
                     test_dir,
-                    env_str=f"QUANT_EMB={quant_emb}",
+                    env_str=f"QUANT_EMB={quant_emb} QUANT_EC_EMB={quant_emb}",
                 )
             if self.success:
                 self.success = utils.test_predict(
