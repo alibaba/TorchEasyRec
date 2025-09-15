@@ -128,12 +128,6 @@ class OdpsDatasetTest(unittest.TestCase):
             )
         return feature_cfgs
 
-    @parameterized.expand([[False], [True]])
-    @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
-        "odps config not found",
-    )
     def _test_odps_dataset(self, is_orderby_partition=False, schema=None):
         account, odps_endpoint = _create_odps_account()
         project = self.test_project
