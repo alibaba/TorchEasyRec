@@ -27,6 +27,16 @@ def is_input_tile() -> bool:
     return False
 
 
+def is_input_tile_predict(model_path: str) -> bool:
+    """Judge is input tile or not in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    input_tile = data.get("INPUT_TILE")
+    if input_tile and (input_tile[0] == "2" or input_tile[0] == "3"):
+        return True
+    return False
+
+
 def is_input_tile_emb() -> bool:
     """Judge is input file or not.
 
@@ -47,17 +57,22 @@ def is_aot() -> bool:
         return False
 
 
+def is_aot_predict(model_path: str) -> bool:
+    """Judge is aot or not in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    is_aot = data.get("ENABLE_AOT")
+    if is_aot and is_aot[0] == "1":
+        return True
+    return False
+
+
 def is_trt() -> bool:
     """Judge is trt or not."""
     is_trt = os.environ.get("ENABLE_TRT")
     if is_trt and is_trt[0] == "1":
         return True
     return False
-
-
-def is_cuda_export() -> bool:
-    """Judge is trt/aot or not."""
-    return is_trt() or is_aot()
 
 
 def is_trt_predict(model_path: str) -> bool:
@@ -68,6 +83,11 @@ def is_trt_predict(model_path: str) -> bool:
     if is_trt and is_trt[0] == "1":
         return True
     return False
+
+
+def is_cuda_export() -> bool:
+    """Judge is trt/aot or not."""
+    return is_trt() or is_aot()
 
 
 def is_debug_trt() -> bool:
@@ -83,10 +103,10 @@ def is_debug_trt() -> bool:
 
 def is_quant() -> bool:
     """Judge is quant or not."""
-    is_quant = os.environ.get("QUANT_EMB")
-    if is_quant and is_quant[0] == "0":
-        return False
-    return True
+    is_quant = os.environ.get("QUANT_EMB", "1")
+    if is_quant and is_quant[0] == "1":
+        return True
+    return False
 
 
 def is_ec_quant() -> bool:
