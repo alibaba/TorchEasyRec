@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 from collections import OrderedDict
+from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -27,7 +28,6 @@ from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.inference.modules import quantize_embeddings
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
@@ -35,17 +35,18 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc.aot_utils import export_model_aot
+from tzrec.acc.quant_utils import quantize_embeddings
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
     allow_tf32,
     export_acc_config,
     is_aot,
     is_cuda_export,
+    is_ec_quant,
     is_input_tile_emb,
     is_quant,
     is_trt,
     is_trt_predict,
-    quant_dtype,
     write_mapping_file_for_input_tile,
 )
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
@@ -101,7 +102,14 @@ def init_process_group() -> Tuple[torch.device, str]:
     else:
         device: torch.device = torch.device("cpu")
         backend = "gloo"
-    dist.init_process_group(backend=backend)
+
+    pg_timeout = None
+    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+        pg_timeout = timedelta(
+            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
+        )
+    dist.init_process_group(backend=backend, timeout=pg_timeout)
+
     return device, backend
 
 
@@ -283,9 +291,9 @@ def _evaluate(
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
-    if global_epoch:
+    if global_epoch is not None:
         desc_suffix += f" Epoch-{global_epoch}"
-    if global_step:
+    if global_step is not None:
         desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
@@ -538,7 +546,7 @@ def _train_and_evaluate(
                 prof.step()
 
         if save_checkpoints_epochs > 0 and i_step > 0:
-            if i_epoch % save_checkpoints_epochs == 0:
+            if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
                 checkpoint_util.save_model(
                     os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -738,7 +746,7 @@ def train_and_evaluate(
     grad_scaler = None
     if train_config.HasField("grad_scaler"):
         grad_scaler = GradScaler(
-            device=device,
+            device=device.type,
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(
@@ -896,9 +904,9 @@ def _script_model(
         if is_cuda_export():
             model = model.cuda()
 
-        if is_quant():
+        if is_quant() or is_ec_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            quantize_embeddings(model, inplace=True)
             logger.info("finish quantize embeddings...")
 
         model.eval()

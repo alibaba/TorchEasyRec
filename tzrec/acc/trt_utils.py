@@ -30,7 +30,6 @@ from tzrec.utils.logging_util import logger
 
 def trt_convert(
     exp_program: torch.export.ExportedProgram,
-    # pyre-ignore [2]
     inputs: Optional[Sequence[Sequence[Any]]],
 ) -> torch.fx.GraphModule:
     """Convert model use trt.

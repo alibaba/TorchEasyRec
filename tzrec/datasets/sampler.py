@@ -26,6 +26,7 @@ from graphlearn.python.nn.pytorch.data.utils import launch_server
 from torch import distributed as dist
 from torch.utils.data import get_worker_info
 
+from tzrec.datasets.utils import HARD_NEG_INDICES
 from tzrec.protos import sampler_pb2
 from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
@@ -327,6 +328,9 @@ class BaseSampler(metaclass=_meta_cls):
         self, nodes: gl.Nodes
     ) -> Tuple[List[pa.Array], npt.NDArray]:
         features = []
+        # pyre-ignore [16]
+        if len(nodes.indices) == 0:
+            return features, nodes.indices
         int_idx = 0
         float_idx = 0
         string_idx = 0
@@ -351,7 +355,6 @@ class BaseSampler(metaclass=_meta_cls):
             feature = feature.astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
-        # pyre-ignore [16]
         return features, nodes.indices
 
     @property
@@ -600,12 +603,12 @@ class HardNegativeSampler(BaseSampler):
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
         hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
 
-        results = []
-        for i, v in enumerate(hard_neg_features):
-            results.append(pa.concat_arrays([neg_features[i], v]))
-
-        result_dict = dict(zip(self._valid_attr_names, results))
-        result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
+        result_dict = {}
+        if len(hard_neg_indices) > 0:
+            result_dict[HARD_NEG_INDICES] = pa.array(hard_neg_indices)
+            for i, v in enumerate(hard_neg_features):
+                neg_features[i] = pa.concat_arrays([neg_features[i], v])
+        result_dict.update(dict(zip(self._valid_attr_names, neg_features)))
         return result_dict
 
     @property
@@ -702,12 +705,12 @@ class HardNegativeSamplerV2(BaseSampler):
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
         hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
 
-        results = []
-        for i, v in enumerate(hard_neg_features):
-            results.append(pa.concat_arrays([neg_features[i], v]))
-
-        result_dict = dict(zip(self._valid_attr_names, results))
-        result_dict["hard_neg_indices"] = pa.array(hard_neg_indices)
+        result_dict = {}
+        if len(hard_neg_indices) > 0:
+            result_dict[HARD_NEG_INDICES] = pa.array(hard_neg_indices)
+            for i, v in enumerate(hard_neg_features):
+                neg_features[i] = pa.concat_arrays([neg_features[i], v])
+        result_dict.update(dict(zip(self._valid_attr_names, neg_features)))
         return result_dict
 
     @property
@@ -739,6 +742,10 @@ class TDMSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
+        if config.attr_fields[0] != "tree_level":
+            config.attr_fields.insert(0, "tree_level")
+        if config.attr_fields[1] != config.item_id_field:
+            config.attr_fields.insert(1, config.item_id_field)
         super().__init__(
             config,
             fields,
@@ -819,7 +826,7 @@ class TDMSampler(BaseSampler):
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         time.sleep(random.randint(0, num_workers * local_world_size))
         if use_hash_node_id():
-            self.get({self._item_id_field: pa.array(["0"], type=np.object_)})
+            self.get({self._item_id_field: pa.array(["0"], type=pa.string())})
         else:
             self.get({self._item_id_field: pa.array([0])})
 
@@ -834,15 +841,25 @@ class TDMSampler(BaseSampler):
         """
         ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
         batch_size = len(ids)
-        num_fea = len(self._valid_attr_names[1:])
+        valid_attr_names = self._valid_attr_names[1:]
+        num_fea = len(valid_attr_names)
 
         # positive node.
         pos_nodes = self._pos_sampler.get(ids).layer_nodes(1)
-
-        # the ids of non-leaf nodes is arranged in ascending order.
-        pos_non_leaf_ids = np.sort(pos_nodes.ids, axis=1)
-        pos_ids = np.concatenate((pos_non_leaf_ids, ids), axis=1)
         pos_fea_result = self._parse_nodes(pos_nodes)[1:]
+        if use_hash_node_id():
+            # pos_nodes.ids are ids after hash, so that we should get raw
+            # ids from attributes
+            pos_non_leaf_ids = (
+                pos_fea_result[valid_attr_names.index(self._item_id_field)]
+                .to_numpy(zero_copy_only=False)
+                .reshape(batch_size, -1)
+            )
+        else:
+            pos_non_leaf_ids = pos_nodes.ids
+        # the ids of non-leaf nodes is arranged in ascending order.
+        pos_non_leaf_ids = np.sort(pos_non_leaf_ids, axis=1)
+        pos_ids = np.concatenate((pos_non_leaf_ids, ids), axis=1)
 
         # randomly select layers to keep
         if self._remain_ratio < 1.0:
@@ -904,8 +921,8 @@ class TDMSampler(BaseSampler):
             for i in range(num_fea)
         ]
 
-        pos_result_dict = dict(zip(self._valid_attr_names[1:], pos_fea_result))
-        neg_result_dict = dict(zip(self._valid_attr_names[1:], neg_fea_result))
+        pos_result_dict = dict(zip(valid_attr_names, pos_fea_result))
+        neg_result_dict = dict(zip(valid_attr_names, neg_fea_result))
 
         return pos_result_dict, neg_result_dict
 
@@ -936,8 +953,18 @@ class TDMPredictSampler(BaseSampler):
         is_training: bool = True,
         multival_sep: str = chr(29),
     ) -> None:
-        fields = [pa.field("tree_level", pa.int64())] + fields
-        super().__init__(config, fields, batch_size, is_training, multival_sep)
+        if config.attr_fields[0] != "tree_level":
+            config.attr_fields.insert(0, "tree_level")
+        if config.attr_fields[1] != config.item_id_field:
+            config.attr_fields.insert(1, config.item_id_field)
+        super().__init__(
+            config,
+            fields,
+            batch_size,
+            is_training,
+            multival_sep,
+            typed_fields=[pa.field("tree_level", pa.int64())],
+        )
         self._g = (
             gl.Graph()
             .node(

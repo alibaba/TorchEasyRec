@@ -89,26 +89,48 @@ def is_quant() -> bool:
     return True
 
 
+def is_ec_quant() -> bool:
+    """Judge EmbeddingCollection is quant or not."""
+    is_ec_quant = os.environ.get("QUANT_EC_EMB", "0")
+    if is_ec_quant[0] == "0":
+        return False
+    return True
+
+
+_quant_str_to_dtype = {
+    "FP32": torch.float,
+    "FP16": torch.half,
+    "INT8": torch.qint8,
+    "INT4": torch.quint4x2,
+    "INT2": torch.quint2x4,
+}
+
+
 def quant_dtype() -> torch.dtype:
-    """Get embedding quant dtype."""
-    str_to_dtype = {
-        "FP32": torch.float,
-        "FP16": torch.half,
-        "INT8": torch.qint8,
-        "INT4": torch.quint4x2,
-        "INT2": torch.quint2x4,
-    }
+    """Get EmbeddingBagCollection quant dtype."""
     quant_dtype_str = os.environ.get("QUANT_EMB", "INT8")
     if quant_dtype_str == "1":
         # for compatible
         quant_dtype_str = "INT8"
-    if quant_dtype_str not in str_to_dtype:
+    if quant_dtype_str not in _quant_str_to_dtype:
         raise ValueError(
             f"Unknown QUANT_EMB: {quant_dtype_str},"
-            f"available types: {list(str_to_dtype.keys())}"
+            f"available types: {list(_quant_str_to_dtype.keys())}"
         )
     else:
-        return str_to_dtype[quant_dtype_str]
+        return _quant_str_to_dtype[quant_dtype_str]
+
+
+def ec_quant_dtype() -> torch.dtype:
+    """Get EmbeddingCollection quant dtype."""
+    quant_dtype_str = os.environ.get("QUANT_EC_EMB", "INT8")
+    if quant_dtype_str not in _quant_str_to_dtype:
+        raise ValueError(
+            f"Unknown QUANT_EC_EMB: {quant_dtype_str},"
+            f"available types: {list(_quant_str_to_dtype.keys())}"
+        )
+    else:
+        return _quant_str_to_dtype[quant_dtype_str]
 
 
 def write_mapping_file_for_input_tile(
@@ -128,6 +150,8 @@ def write_mapping_file_for_input_tile(
         ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
         ".ec_list_user.": ".ec_list.",
         ".mc_ec_list_user.": ".mc_ec_list.",
+        ".ec_dict_user.": ".ec_dict.",
+        ".mc_ec_dict_user.": ".mc_ec_dict.",
     }
 
     remap_str = ""

@@ -22,8 +22,6 @@ input:
 
 ### 配置说明
 
-#### 1. 内置模型
-
 ```protobuf
 model_config: {
   feature_groups: {

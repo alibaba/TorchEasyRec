@@ -414,6 +414,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 init_fn=init_fn,
                 data_type=_dtype_str_to_data_type(self.config.data_type),
             )
+            # pyre-ignore [16]
             emb_bag_config.trainable = self.config.trainable
             return emb_bag_config
         else:
@@ -435,6 +436,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 init_fn=init_fn,
                 data_type=_dtype_str_to_data_type(self.config.data_type),
             )
+            # pyre-ignore [16]
             emb_config.trainable = self.config.trainable
             return emb_config
         else:

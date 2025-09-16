@@ -46,19 +46,18 @@ class DCNV1(RankModel):
         self.group_name = self.embedding_group.group_names()[0]
         feature_dim = self.embedding_group.group_total_dim(self.group_name)
         self.cross = Cross(
-            input_dim=feature_dim, **config_to_kwargs(self._model_config.cross_tower)
+            input_dim=feature_dim, **config_to_kwargs(self._model_config.cross)
         )
         self.deep = MLP(
-            in_features=feature_dim, **config_to_kwargs(self._model_config.deep_tower)
+            in_features=feature_dim, **config_to_kwargs(self._model_config.deep)
         )
-        deep_output_dim = self._model_config.deep_tower.hidden_units[-1]
-        final_dnn_input_dim = feature_dim + deep_output_dim
+        final_dnn_input_dim = self.cross.output_dim() + self.deep.output_dim()
         self.final_dnn = MLP(
             in_features=final_dnn_input_dim,
-            **config_to_kwargs(self._model_config.final_dnn),
+            **config_to_kwargs(self._model_config.final),
         )
         self.output_linear = nn.Linear(
-            self._model_config.final_dnn.hidden_units[-1], self._num_class, bias=False
+            self.final_dnn.output_dim(), self._num_class, bias=False
         )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:

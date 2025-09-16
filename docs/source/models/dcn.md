@@ -35,13 +35,13 @@ model_config {
         group_type: DEEP
     }
     dcn_v1 {
-        cross_tower {
+        cross {
             cross_num: 3
         }
-        deep_tower {
+        deep {
             hidden_units: [256, 128]
         }
-        final_dnn {
+        final {
             hidden_units: [64, 32]
         }
     }
@@ -57,11 +57,11 @@ model_config {
 }
 ```
 
-- cross_tower
+- cross
   - cross_num: 交叉层层数，默认为3
-- deep_tower
+- deep
   - hidden_units: dnn每一层的channel数目，即神经元的数目
-- final_dnn: 整合cross_tower, deep_tower的全连接层
+- final: 整合cross层, deep层的全连接层
 
 ## 参考论文
 

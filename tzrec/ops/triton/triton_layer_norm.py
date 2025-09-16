@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
 from tzrec.ops.utils import switch_to_contiguous_if_needed
@@ -303,7 +304,7 @@ def _layer_norm_bwd_dwdb(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
-def triton_weighted_layer_norm_fwd(
+def _triton_weighted_layer_norm_fwd(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
@@ -340,7 +341,7 @@ def triton_weighted_layer_norm_fwd(
         return y, mean, rstd, BLOCK_D, num_warps
     if learnable:
         # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
+        wrap_triton(_weighted_layer_norm_fwd)[(N,)](
             x,
             y,
             weight,
@@ -359,7 +360,7 @@ def triton_weighted_layer_norm_fwd(
         )
     else:
         # pyre-ignore[28]
-        _layer_norm_fwd[(N,)](
+        wrap_triton(_layer_norm_fwd)[(N,)](
             x,
             y,
             mean,
@@ -373,7 +374,33 @@ def triton_weighted_layer_norm_fwd(
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
             num_warps=num_warps,
         )
+
     return y, mean, rstd, BLOCK_D, num_warps
+
+
+@triton_op("tzrec::triton_weighted_layer_norm_fwd", mutates_args=())
+def triton_weighted_layer_norm_fwd(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    return _triton_weighted_layer_norm_fwd(x=x, weight=weight, bias=bias, eps=eps)
+
+
+@triton_op("tzrec::triton_weighted_layer_norm_fwd_with_mean_rstd", mutates_args=())
+def triton_weighted_layer_norm_fwd_with_mean_rstd(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    eps: float,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+) -> Tuple[torch.Tensor, int, int]:
+    y, _, _, BLOCK_D, num_warps = _triton_weighted_layer_norm_fwd(
+        x=x, weight=weight, bias=bias, eps=eps, mean=mean, rstd=rstd
+    )
+    return y, BLOCK_D, num_warps
 
 
 def triton_weighted_layer_norm_bwd(
@@ -640,6 +667,45 @@ def _rms_norm_bwd_dwdb(
     tl.store(FINAL_DW + cols, sum_dw.to(FINAL_DW.dtype.element_ty), mask=cols < D)
 
 
+@triton_op("tzrec::triton_weighted_rms_norm_fwd", mutates_args=())
+def triton_weighted_rms_norm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    assert x.dim() == 2
+    x = switch_to_contiguous_if_needed(x)
+    N, D = x.shape
+    assert weight.dim() == 1
+    assert weight.numel() == D
+
+    y = torch.empty_like(x)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_D = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    if D > BLOCK_D:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+    num_warps = min(max(BLOCK_D // 256, 1), 8)
+
+    # pyre-ignore[28]
+    wrap_triton(_weighted_rms_norm_fwd)[(N,)](
+        x,
+        y,
+        weight,
+        rstd,
+        D,
+        eps,
+        x.stride(0),
+        y.stride(0),
+        BLOCK_D=BLOCK_D,
+        num_warps=num_warps,
+    )
+    return y, rstd, BLOCK_D, num_warps
+
+
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -649,35 +715,8 @@ class RMSNormFunction(torch.autograd.Function):
         weight: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
-        assert x.dim() == 2
-        x = switch_to_contiguous_if_needed(x)
-        N, D = x.shape
-        assert weight.dim() == 1
-        assert weight.numel() == D
-
-        y = torch.empty_like(x)
-        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-
-        # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x.element_size()
-        BLOCK_D = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
-        if D > BLOCK_D:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-
-        num_warps = min(max(BLOCK_D // 256, 1), 8)
-
-        # pyre-ignore[28]
-        _weighted_rms_norm_fwd[(N,)](
-            x,
-            y,
-            weight,
-            rstd,
-            D,
-            eps,
-            x.stride(0),
-            y.stride(0),
-            BLOCK_D=BLOCK_D,
-            num_warps=num_warps,
+        y, rstd, BLOCK_D, num_warps = triton_weighted_rms_norm_fwd(
+            x=x, weight=weight, eps=eps
         )
         ctx.save_for_backward(x, weight, rstd)
 
@@ -743,6 +782,54 @@ class RMSNormFunction(torch.autograd.Function):
         return dx, dweight, None
 
 
+@triton_op("tzrec::triton_swish_layer_norm_fwd", mutates_args=())
+def triton_swish_layer_norm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
+    x = switch_to_contiguous_if_needed(x)
+    N, D = x.shape
+
+    assert bias is not None and weight is not None
+    assert weight.dim() == 1
+    assert bias.dim() == 1
+    assert weight.numel() == D
+    assert bias.numel() == D
+
+    y = torch.empty_like(x)
+    mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+
+    BLOCK_D = triton.next_power_of_2(D)
+    num_warps = min(max(BLOCK_D // 256, 1), 8)
+
+    if N == 0:
+        return y, mean, rstd, BLOCK_D, num_warps
+
+    # pyre-ignore[28]
+    wrap_triton(_weighted_layer_norm_fwd)[(N,)](
+        x,
+        y,
+        weight,
+        bias,
+        mean,
+        rstd,
+        D,
+        eps,
+        x.stride(0),
+        y.stride(0),
+        IS_SWISH=True,
+        TRAINING=True,
+        BLOCK_D=BLOCK_D,
+        COMPUTE_MEAN_AND_RSTD=True,
+        num_warps=num_warps,
+    )
+    return y, mean, rstd, BLOCK_D, num_warps
+
+
 class SwishLayerNormFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -753,49 +840,13 @@ class SwishLayerNormFunction(torch.autograd.Function):
         bias: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
-        assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
-        x = switch_to_contiguous_if_needed(x)
-        N, D = x.shape
-
-        assert bias is not None and weight is not None
-        assert weight.dim() == 1
-        assert bias.dim() == 1
-        assert weight.numel() == D
-        assert bias.numel() == D
-
-        y = torch.empty_like(x)
-        mean = torch.empty((N,), dtype=torch.float32, device=x.device)
-        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-
-        BLOCK_D = triton.next_power_of_2(D)
-        num_warps = min(max(BLOCK_D // 256, 1), 8)
-
+        y, mean, rstd, BLOCK_D, num_warps = triton_swish_layer_norm_fwd(
+            x=x, weight=weight, bias=bias, eps=eps
+        )
         ctx.save_for_backward(x, weight, bias, mean, rstd)
         ctx.BLOCK_D = BLOCK_D
         ctx.num_warps = num_warps
         ctx.eps = eps
-        if N == 0:
-            return y
-
-        # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
-            x,
-            y,
-            weight,
-            bias,
-            mean,
-            rstd,
-            D,
-            eps,
-            x.stride(0),
-            y.stride(0),
-            IS_SWISH=True,
-            TRAINING=True,
-            BLOCK_D=BLOCK_D,
-            COMPUTE_MEAN_AND_RSTD=True,
-            num_warps=num_warps,
-        )
-
         return y
 
     @staticmethod
@@ -857,7 +908,6 @@ class SwishLayerNormFunction(torch.autograd.Function):
         return dx, dweight, dbias, None
 
 
-@torch.fx.wrap
 def triton_layer_norm(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -867,7 +917,6 @@ def triton_layer_norm(
     return LayerNormFunction.apply(x, weight, bias, eps)
 
 
-@torch.fx.wrap
 def triton_rms_norm(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -876,7 +925,6 @@ def triton_rms_norm(
     return RMSNormFunction.apply(x, weight, eps)
 
 
-@torch.fx.wrap
 def triton_swish_layer_norm(
     x: torch.Tensor,
     normalized_shape: List[int],

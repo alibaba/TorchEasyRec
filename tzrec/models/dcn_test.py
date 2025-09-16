@@ -56,9 +56,9 @@ class DCNV1Test(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             dcn_v1=rank_model_pb2.DCNV1(
-                cross_tower=module_pb2.Cross(cross_num=3),
-                deep_tower=module_pb2.MLP(hidden_units=[8, 4]),
-                final_dnn=module_pb2.MLP(hidden_units=[2]),
+                cross=module_pb2.Cross(cross_num=3),
+                deep=module_pb2.MLP(hidden_units=[8, 4]),
+                final=module_pb2.MLP(hidden_units=[2]),
             ),
             losses=[
                 loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())

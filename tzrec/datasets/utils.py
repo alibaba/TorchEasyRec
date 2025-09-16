@@ -183,12 +183,16 @@ class Batch(Pipelineable):
     def record_stream(self, stream: torch.Stream) -> None:
         """Record which streams have used the tensor."""
         for v in self.dense_features.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sparse_features.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sequence_mulval_lengths.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sequence_dense_features.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.labels.values():
             v.record_stream(stream)

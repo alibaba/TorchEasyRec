@@ -30,6 +30,7 @@ from tzrec.ops.triton.triton_hstu_attention import (
 from tzrec.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
     triton_weighted_layer_norm_fwd,
+    triton_weighted_layer_norm_fwd_with_mean_rstd,
 )
 
 
@@ -173,7 +174,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             num_targets = None
         if ctx.recompute_normed_x_in_backward:
-            normed_x, _, _, _, _ = triton_weighted_layer_norm_fwd(
+            normed_x, _, _ = triton_weighted_layer_norm_fwd_with_mean_rstd(
                 x=x,
                 weight=norm_weight,
                 bias=norm_bias,

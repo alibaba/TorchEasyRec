@@ -70,6 +70,9 @@ class TreeCluster:
         self.raw_attr_fields = []
         if attr_fields:
             self.attr_fields = [x.strip() for x in attr_fields.split(",")]
+            assert item_id_field not in self.attr_fields, (
+                "item_id_field do not need in attr_fields."
+            )
         if raw_attr_fields:
             self.raw_attr_fields = [x.strip() for x in raw_attr_fields.split(",")]
 
@@ -163,7 +166,6 @@ class TreeCluster:
         root = builder.build(self.leaf_nodes, save_tree)
         return root
 
-    # pyre-ignore [24]
     def _train(self, pipe: Connection, queue: mp.Queue) -> None:
         last_size = -1
         catch_time = 0

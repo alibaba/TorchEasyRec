@@ -53,6 +53,7 @@ class TZRecOptimizer(OptimizerWrapper):
         ):
             if self._grad_scaler is not None:
                 self._grad_scaler.step(self._optimizer)
+                # pyre-ignore [16]
                 self._grad_scaler.update()
             else:
                 self._optimizer.step(closure=closure)
