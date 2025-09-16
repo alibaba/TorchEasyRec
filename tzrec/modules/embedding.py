@@ -12,7 +12,7 @@
 import os
 from collections import OrderedDict, defaultdict
 from functools import partial  # NOQA
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -237,7 +237,9 @@ class EmbeddingGroup(nn.Module):
                 feature_emb = self.emb_impls[impl_key]
                 feature_dim.update(feature_emb.group_feature_dims(group_name))
                 if group_name in self._group_name_to_seq_encoders:
-                    seq_encoders = self._group_name_to_seq_encoders[group_name]
+                    seq_encoders = cast(
+                        nn.ModuleList, self._group_name_to_seq_encoders[group_name]
+                    )
                     for i, seq_encoder in enumerate(seq_encoders):
                         feature_dim[f"{group_name}_seq_encoder_{i}"] = (
                             seq_encoder.output_dim()

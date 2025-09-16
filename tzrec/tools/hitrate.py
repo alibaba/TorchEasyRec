@@ -29,7 +29,7 @@ from tzrec.utils.logging_util import logger
 
 
 def batch_hitrate(
-    src_ids: List[Any],  # pyre-ignore [2]
+    src_ids: List[Any],
     recall_ids: npt.NDArray,
     gt_items: List[List[str]],
     max_num_interests: int,

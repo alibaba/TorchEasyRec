@@ -1,5 +1,4 @@
-click<8.2.0
 hypothesis
 parameterized
 pre-commit
-pyre-check==0.9.23
+pyre-check==0.9.25

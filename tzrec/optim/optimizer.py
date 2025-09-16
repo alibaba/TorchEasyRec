@@ -44,7 +44,6 @@ class TZRecOptimizer(OptimizerWrapper):
         ):
             self._optimizer.zero_grad(set_to_none=set_to_none)
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         """Step."""
         self._step += 1
