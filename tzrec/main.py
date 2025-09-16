@@ -897,7 +897,7 @@ def _script_model(
         if acc_utils.is_cuda_export():
             model = model.cuda()
 
-        if acc_utils.is_quant():
+        if acc_utils.is_quant() or acc_utils.is_ec_quant():
             logger.info("quantize embeddings...")
             additional_qconfig_spec_keys = []
             additional_mapping = {}

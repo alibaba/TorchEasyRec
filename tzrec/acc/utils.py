@@ -103,10 +103,10 @@ def is_debug_trt() -> bool:
 
 def is_quant() -> bool:
     """Judge is quant or not."""
-    is_quant = os.environ.get("QUANT_EMB", "1")
-    if is_quant and is_quant[0] == "1":
-        return True
-    return False
+    is_quant = os.environ.get("QUANT_EMB")
+    if is_quant and is_quant[0] == "0":
+        return False
+    return True
 
 
 def is_ec_quant() -> bool:
