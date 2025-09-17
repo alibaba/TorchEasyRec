@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import glob
+import json
 import os
 from dataclasses import replace
 from typing import List, Optional, Tuple
@@ -57,14 +58,44 @@ class PartialLoadPlanner(DefaultLoadPlanner):
     def create_local_plan(self) -> LoadPlan:
         """Create local load plan."""
         requests = []
+
+        # mapping old __BASE__.ec_list.0 to new __BASE__.ec_dict.{dim}
+        ec_compat_map = {}
+        # pyre-ignore [16]
+        for k, v in self.metadata.state_dict_metadata.items():
+            if k.endswith(".weight") and isinstance(v, TensorStorageMetadata):
+                for old_pattern, new_pattern in [
+                    ("mc_ec_list", "mc_ec_dict"),
+                    ("ec_list", "ec_dict"),
+                ]:
+                    if f".{old_pattern}." in k:
+                        parts = k.split(".")
+                        pattern_idx = parts.index(old_pattern)
+                        dim = v.size[1]
+                        ec_compat_map[
+                            f"{parts[pattern_idx - 1]}.{new_pattern}.{dim}"
+                        ] = f"{parts[pattern_idx - 1]}.{old_pattern}.{parts[pattern_idx + 1]}"  # NOQA
+
         # pyre-ignore [16]
         for fqn, obj in self.state_dict.items():
             meta_fqn = fqn
+
+            fqn_remap_set = set()
             if fqn in self._ckpt_param_map:
                 meta_fqn = self._ckpt_param_map[fqn]
+                fqn_remap_set.add(fqn)
                 logger.info(f"Remap restore state [{fqn}] from [{meta_fqn}]")
 
-            # pyre-ignore [16]
+            for ec_new, ec_old in ec_compat_map.items():
+                if ec_new in meta_fqn:
+                    new_meta_fqn = meta_fqn
+                    meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
+                    fqn_remap_set.add(fqn)
+                    logger.warning(
+                        f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
+                        "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
+                    )
+
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
@@ -78,7 +109,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             else:
                 read_items = _create_read_items(meta_fqn, md, obj)
 
-            if fqn in self._ckpt_param_map:
+            if fqn in fqn_remap_set:
                 read_items = [
                     replace(x, dest_index=replace(x.dest_index, fqn=fqn))
                     for x in read_items
@@ -154,6 +185,9 @@ def restore_model(
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
         logger.info(f"Restoring checkpoint from {checkpoint_dir}...")
+    if not os.path.exists(checkpoint_dir):
+        raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
+
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
     if os.path.exists(model_ckpt_path):
@@ -166,16 +200,22 @@ def restore_model(
             planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
         )
         model.load_state_dict(state_dict)
-    if optimizer and os.path.exists(optim_ckpt_path):
-        if is_local_rank_zero:
-            logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
-        state_dict = optimizer.state_dict()
-        load(
-            state_dict,
-            checkpoint_id=optim_ckpt_path,
-            planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
-        )
-        optimizer.load_state_dict(state_dict)
+    else:
+        raise RuntimeError(f"model_ckpt_path[{model_ckpt_path}] not exists.")
+    if optimizer:
+        if os.path.exists(optim_ckpt_path):
+            if is_local_rank_zero:
+                logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
+            state_dict = optimizer.state_dict()
+            load(
+                state_dict,
+                checkpoint_id=optim_ckpt_path,
+                planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
+            )
+            optimizer.load_state_dict(state_dict)
+        else:
+            if is_local_rank_zero:
+                logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
 
 
 def save_model(
@@ -196,6 +236,20 @@ def save_model(
             optimizer.state_dict(),
             checkpoint_id=os.path.join(checkpoint_dir, "optimizer"),
         )
+    # save model plan
+    if hasattr(model, "_plan") and model._plan is not None:
+        if int(os.environ.get("RANK", 0)) == 0:
+            plan = {}
+            for module_path, module_plan in model._plan.plan.items():
+                plan[module_path] = {}
+                for param_name, param_sharding in module_plan.items():
+                    plan[module_path][param_name] = {
+                        "sharding_type": param_sharding.sharding_type,
+                        "compute_kernel": param_sharding.compute_kernel,
+                        "ranks": param_sharding.ranks,
+                    }
+            with open(os.path.join(checkpoint_dir, "plan"), "w") as f:
+                json.dump(plan, f)
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:

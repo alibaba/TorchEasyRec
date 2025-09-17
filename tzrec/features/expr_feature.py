@@ -65,9 +65,12 @@ class ExprFeature(RawFeature):
         else:
             return 1
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        return [tuple(x.split(":")) for x in self.config.variables]
+        if len(self.config.variables) > 0:
+            return [tuple(x.split(":")) for x in self.config.variables]
+        else:
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -113,6 +116,14 @@ class ExprFeature(RawFeature):
             "variables": list(self.config.variables),
             "value_type": "float",
         }
+        if self.config.separator != "\x1d":
+            fg_cfg["separator"] = self.config.separator
+        if self.config.HasField("fill_missing"):
+            fg_cfg["fill_missing"] = self.config.fill_missing
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("value_dim"):
+            fg_cfg["value_dim"] = self.config.value_dim
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]

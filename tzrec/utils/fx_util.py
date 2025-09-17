@@ -43,3 +43,37 @@ def symbolic_trace(
     if leaf_modules:
         _leaf_modules.extend(leaf_modules)
     return _symbolic_trace(root, concrete_args, _leaf_modules)
+
+
+@torch.fx.wrap
+def fx_arange(len: int, device: torch.device) -> torch.Tensor:
+    """Fx trace wrapper for arange."""
+    return torch.arange(len, device=device)
+
+
+@torch.fx.wrap
+def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    """Unwrap optional tensor for trace."""
+    assert optional is not None, "Expected optional to be non-None Tensor"
+    return optional
+
+
+@torch.fx.wrap
+def fx_int_item(x: torch.Tensor) -> int:
+    """Fx trace wrapper for `int(x.item())`."""
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        int_item = x.item()
+        torch._check_is_size(int_item)
+    else:
+        int_item = int(x.item())
+    # pyre-ignore[7]
+    return int_item
+
+
+@torch.fx.wrap
+def fx_numel(x: torch.Tensor) -> int:
+    """Fx trace wrapper for x.numel()."""
+    total_len = x.numel()
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check_is_size(total_len)
+    return total_len

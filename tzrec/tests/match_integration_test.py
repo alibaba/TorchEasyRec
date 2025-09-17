@@ -160,13 +160,126 @@ class MatchIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(
             os.path.exists(
-                os.path.join(self.test_dir, "fg_output/item_title_tokenizer.json")
+                os.path.join(
+                    self.test_dir,
+                    "fg_output/tokenizer_b2faab7921bbfb593973632993ca4c85.json",
+                )
+            )
+        )
+
+    def test_dssm_hard_negative_with_fg_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dssm_fg_hard_negative_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/item"),
+                predict_input_path=os.path.join(self.test_dir, r"item_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "item_emb"),
+                reserved_columns="item_id",
+                output_columns="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_create_faiss_index(
+                embedding_input_path=os.path.join(
+                    self.test_dir, r"item_emb/\*.parquet"
+                ),
+                index_output_dir=os.path.join(self.test_dir, "export/user"),
+                id_field="item_id",
+                embedding_field="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/user"),
+                predict_input_path=os.path.join(self.test_dir, r"user_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "user_emb"),
+                reserved_columns="user_id,click_50_seq__item_id",
+                output_columns="user_tower_emb",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_hitrate(
+                user_gt_input=os.path.join(self.test_dir, r"user_emb/\*.parquet"),
+                item_embedding_input=os.path.join(
+                    self.test_dir, r"item_emb/\*.parquet"
+                ),
+                total_hitrate_output=os.path.join(self.test_dir, "total_hitrate"),
+                hitrate_details_output=os.path.join(self.test_dir, "hitrate_details"),
+                request_id_field="user_id",
+                gt_items_field="click_50_seq__item_id",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_create_fg_json(
+                os.path.join(self.test_dir, "pipeline.config"),
+                fg_output_dir=os.path.join(self.test_dir, "fg_output"),
+                reserves="clk",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/faiss_index"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/id_mapping"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "fg_output/fg.json"))
+        )
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(
+                    self.test_dir,
+                    "fg_output/tokenizer_b2faab7921bbfb593973632993ca4c85.json",
+                )
             )
         )
 
     def test_dssm_v2_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dssm_v2_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
+
+    def test_dssm_v2_mlp_emb_with_fg_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dssm_v2_mlpemb_fg_mock.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
@@ -271,6 +384,69 @@ class MatchIntegrationTest(unittest.TestCase):
                 reserved_columns="item_id",
                 output_columns="item_tower_emb",
                 test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
+
+    def test_mind_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/mind_mock.config", self.test_dir, item_id="item_id"
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/item"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="item_id",
+                output_columns="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/user"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "user_predict_result"),
+                reserved_columns="user_id,click_50_seq__item_id_1,click_50_seq__item_id_2",
+                output_columns="user_tower_emb",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
+        )
+
+    @unittest.skip("skip hstu match test")
+    def test_hstu_with_fg_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/hstu_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+            is_hstu=True,
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
         self.assertTrue(self.success)
         self.assertTrue(

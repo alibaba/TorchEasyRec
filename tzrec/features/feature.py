@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import shutil
 from collections import OrderedDict
@@ -36,6 +37,7 @@ from torchrec.modules.mc_modules import (
     dynamic_threshold_filter,  # NOQA
     probabilistic_threshold_filter,  # NOQA
 )
+from torchrec.types import DataType
 
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
@@ -55,6 +57,7 @@ from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.logging_util import logger
 
 _FEATURE_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
@@ -67,7 +70,7 @@ def _parse_fg_encoded_sparse_feature_impl(
     feat: pa.Array,
     multival_sep: str = chr(3),
     default_value: Optional[List[int]] = None,
-    weight: Optional[pa.Array] = None,
+    is_weighted: bool = False,
 ) -> SparseData:
     """Parse fg encoded sparse feature.
 
@@ -76,35 +79,51 @@ def _parse_fg_encoded_sparse_feature_impl(
         feat (pa.Array): input feature data.
         multival_sep (str): string separator for multi-val data.
         default_value (list): default value.
-        weight (pa.Array): input feature weights data.
+        is_weighted (bool): input feature is weighted or not.
 
     Returns:
         an instance of SparseData.
     """
     weight_values = None
-    if pa.types.is_string(feat.type) or pa.types.is_list(feat.type):
-        if pa.types.is_string(feat.type):
-            # dtype = string
-            is_empty = pa.compute.equal(feat, pa.scalar(""))
-            nulls = pa.nulls(len(feat))
-            feat = pa.compute.if_else(is_empty, nulls, feat)
-            if weight:
-                weight = pa.compute.if_else(is_empty, nulls, weight)
-
-            feat = pa.compute.split_pattern(feat, multival_sep)
-            if weight:
-                weight = pa.compute.split_pattern(weight, multival_sep)
-        else:
-            # dtype = list<int> or others can cast to list<int>
-            if default_value is not None:
-                is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+    if (
+        pa.types.is_string(feat.type)
+        or pa.types.is_list(feat.type)
+        or pa.types.is_map(feat.type)
+    ):
+        weight = None
+        if pa.types.is_string(feat.type) or pa.types.is_list(feat.type):
+            if pa.types.is_string(feat.type):
+                # dtype = string
+                is_empty = pa.compute.equal(feat, pa.scalar(""))
                 nulls = pa.nulls(len(feat))
                 feat = pa.compute.if_else(is_empty, nulls, feat)
-                if weight:
-                    weight = pa.compute.if_else(is_empty, nulls, weight)
+                feat = pa.compute.split_pattern(feat, multival_sep)
+            elif pa.types.is_list(feat.type):
+                # dtype = list<int> or others can cast to list<int>
+                if default_value is not None:
+                    is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+                    nulls = pa.nulls(len(feat))
+                    feat = pa.compute.if_else(is_empty, nulls, feat)
+            if is_weighted:
+                assert pa.types.is_string(feat.values.type)
+                fw = pa.compute.split_pattern(feat.values, ":")
+                weight = pa.ListArray.from_arrays(
+                    feat.offsets, fw.values[1::2], mask=feat.is_null()
+                )
+                feat = pa.ListArray.from_arrays(
+                    feat.offsets, fw.values[::2], mask=feat.is_null()
+                )
+        else:
+            # dtype = map<int,float> or others can cast to map<int,float>
+            weight = pa.ListArray.from_arrays(
+                feat.offsets, feat.items, mask=feat.is_null()
+            )
+            feat = pa.ListArray.from_arrays(
+                feat.offsets, feat.keys, mask=feat.is_null()
+            )
 
         feat = feat.cast(pa.list_(pa.int64()), safe=False)
-        if weight:
+        if weight is not None:
             weight = weight.cast(pa.list_(pa.float32()), safe=False)
 
         if default_value is not None:
@@ -115,40 +134,22 @@ def _parse_fg_encoded_sparse_feature_impl(
         feat_values = feat.values.to_numpy()
         feat_offsets = feat.offsets.to_numpy()
         feat_lengths = feat_offsets[1:] - feat_offsets[:-1]
-        if weight:
+        if weight is not None:
             weight_values = weight.values.to_numpy()
-            weight_offsets = weight.offsets.to_numpy()
-            weight_lengths = weight_offsets[1:] - weight_offsets[:-1]
-            assert np.all(
-                feat_lengths == weight_lengths
-            ), f"{name}__values and {name}__weights length not equal"
     elif pa.types.is_integer(feat.type):
+        assert not is_weighted
         # dtype = int
         if default_value is not None:
             feat = feat.cast(pa.int64()).fill_null(default_value[0])
             feat_values = feat.to_numpy()
             feat_lengths = np.ones_like(feat_values, np.int32)
-            if weight:
-                weight = weight.fill_null(float(1.0))
-                weight_values = weight.cast(pa.float32(), safe=False).to_numpy()
-                weight_lengths = np.ones_like(weight_values, np.int32)
-                assert np.all(
-                    feat_lengths == weight_lengths
-                ), f"{name}__values and {name}__weights length not equal"
         else:
             feat_values = feat.drop_null().cast(pa.int64()).to_numpy()
             feat_lengths = 1 - feat.is_null().cast(pa.int32()).to_numpy()
-            if weight:
-                weight_values = (
-                    weight.drop_null().cast(pa.float32(), safe=False).to_numpy()
-                )
-                weight_lengths = 1 - weight.is_null().cast(pa.int32()).to_numpy()
-                assert np.all(
-                    feat_lengths == weight_lengths
-                ), f"{name}__values and {name}__weights length not equal"
     else:
         raise ValueError(
-            f"{name} only support str|int|list<int> dtype input, but get {feat.type}."
+            f"{name} only support str|int|list<int>|map<int,double> dtype input, "
+            f"but get {feat.type}."
         )
     return SparseData(name, feat_values, feat_lengths, weights=weight_values)
 
@@ -201,6 +202,25 @@ def _parse_fg_encoded_dense_feature_impl(
     return DenseData(name, feat_values)
 
 
+def _dtype_str_to_data_type(data_type_str: str) -> DataType:
+    if data_type_str == "FP32":
+        data_type = DataType.FP32
+    elif data_type_str == "FP16":
+        data_type = DataType.FP16
+    else:
+        raise ValueError(
+            "Embedding only support FP32 and FP16 now, "
+            f"[{data_type_str}] is not supported."
+        )
+    return data_type
+
+
+class InvalidFgInputError(Exception):
+    """Invalid Feature side inputs exception."""
+
+    pass
+
+
 class BaseFeature(object, metaclass=_meta_cls):
     """Base feature class.
 
@@ -230,6 +250,8 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._data_group = BASE_DATA_GROUP
         self._inputs = None
         self._side_inputs = None
+        self._vocab_list = None
+        self._vocab_dict = None
 
         self._fg_encoded_kwargs = {}
         self._fg_encoded_multival_sep = fg_encoded_multival_sep or chr(3)
@@ -383,14 +405,18 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = eval(f"partial({self.config.init_fn})")
-            return EmbeddingBagConfig(
+            emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
                 feature_names=[self.name],
                 pooling=self.pooling_type,
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
+            # pyre-ignore [16]
+            emb_bag_config.trainable = self.config.trainable
+            return emb_bag_config
         else:
             return None
 
@@ -402,13 +428,17 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = eval(f"partial({self.config.init_fn})")
-            return EmbeddingConfig(
+            emb_config = EmbeddingConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
                 feature_names=[self.name],
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
+            # pyre-ignore [16]
+            emb_config.trainable = self.config.trainable
+            return emb_config
         else:
             return None
 
@@ -489,15 +519,31 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Input field names with side."""
         if self._side_inputs is None:
             side_inputs = self._build_side_inputs()
-            for x in side_inputs:
-                assert len(x) == 2 and x[0] in ["user", "item", "context", "feature"], (
-                    f"{self.__class__.__name__}[{self.name}] must have valid fg "
-                    f"input names, e.g., item:cat_a, but got {x}."
+            if not side_inputs:
+                raise InvalidFgInputError(
+                    f"{self.__class__.__name__}[{self.name}] must have fg "
+                    f"input names, e.g., item:cat_a."
                 )
+            for x in side_inputs:
+                if not (
+                    len(x) == 2
+                    and x[0] in ["user", "item", "context", "feature", "const"]
+                ):
+                    raise InvalidFgInputError(
+                        f"{self.__class__.__name__}[{self.name}] must have valid fg "
+                        f"input names, e.g., item:cat_a, but got {x}."
+                    )
             self._side_inputs = side_inputs
         return self._side_inputs
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    @property
+    def stub_type(self) -> bool:
+        """Only used as fg dag intermediate result or not."""
+        if hasattr(self.config, "stub_type") and self.config.HasField("stub_type"):
+            return self.config.stub_type
+        return False
+
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
         return NotImplemented
 
@@ -606,6 +652,76 @@ class BaseFeature(object, metaclass=_meta_cls):
                     default_value = default_value[0]
             return default_value
 
+    @property
+    def vocab_list(self) -> List[str]:
+        """Vocab list."""
+        if self._vocab_list is None:
+            if len(self.config.vocab_list) > 0:
+                if self.config.HasField("default_bucketize_value"):
+                    # when set default_bucketize_value, we do not add additional
+                    # `default_value` and <OOV> vocab to vocab_list
+                    assert self.config.default_bucketize_value < len(
+                        self.config.vocab_list
+                    ), (
+                        "default_bucketize_value should be less than len(vocab_list) "
+                        f"in {self.__class__.__name__}[{self.name}]"
+                    )
+                    self._vocab_list = list(self.config.vocab_list)
+                else:
+                    self._vocab_list = [self.config.default_value, "<OOV>"] + list(
+                        self.config.vocab_list
+                    )
+            else:
+                self._vocab_list = []
+        return self._vocab_list
+
+    @property
+    def vocab_dict(self) -> Dict[str, int]:
+        """Vocab dict."""
+        if self._vocab_dict is None:
+            if len(self.config.vocab_dict) > 0:
+                vocab_dict = OrderedDict(self.config.vocab_dict.items())
+                if self.config.HasField("default_bucketize_value"):
+                    # when set default_bucketize_value, we do not add additional
+                    # `default_value` and <OOV> vocab to vocab_dict
+                    self._vocab_dict = vocab_dict
+                else:
+                    is_rank_zero = os.environ.get("RANK", "0") == "0"
+                    if min(list(self.config.vocab_dict.values())) <= 1 and is_rank_zero:
+                        logger.warn(
+                            "min index of vocab_dict in "
+                            f"{self.__class__.__name__}[{self.name}] should "
+                            "start from 2. index0 is default_value, index1 is <OOV>."
+                        )
+                    vocab_dict[self.config.default_value] = 0
+                    self._vocab_dict = vocab_dict
+            else:
+                self._vocab_dict = {}
+        return self._vocab_dict
+
+    @property
+    def vocab_file(self) -> str:
+        """Vocab file."""
+        if self.config.HasField("vocab_file"):
+            if not self.config.HasField("default_bucketize_value"):
+                raise ValueError(
+                    "default_bucketize_value must be set when use vocab_file."
+                )
+            vocab_file = self.config.vocab_file
+            if self.config.HasField("asset_dir"):
+                vocab_file = os.path.join(self.config.asset_dir, vocab_file)
+            return vocab_file
+        else:
+            return ""
+
+    @property
+    def default_bucketize_value(self) -> int:
+        """Default bucketize value."""
+        if self.config.HasField("default_bucketize_value"):
+            return self.config.default_bucketize_value
+        else:
+            return 1
+
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
         return {}
@@ -674,12 +790,12 @@ def create_features(
         if force_base_data_group:
             feature.data_group = BASE_DATA_GROUP
         try:
-            side_inputs = feature.side_inputs()
+            side_inputs = feature.side_inputs
             for k, _ in side_inputs:
                 if k == "feature":
                     has_dag = True
                     break
-        except Exception:
+        except InvalidFgInputError:
             pass
 
     if has_dag:
@@ -707,7 +823,10 @@ def _copy_assets(
         feature = copy(feature)
         feature.feature_config = feature_config
         for k, v in feature.assets().items():
-            fname = f"{feature.name}_{os.path.basename(v)}"
+            with open(v, "rb") as f:
+                fhash = hashlib.md5(f.read()).hexdigest()
+            fprefix, fext = os.path.splitext(os.path.basename(v))
+            fname = f"{fprefix}_{fhash}{fext}"
             fpath = os.path.join(asset_dir, fname)
             if not os.path.exists(fpath):
                 shutil.copy(v, fpath)
@@ -719,8 +838,21 @@ def _copy_assets(
     return feature
 
 
+def _remove_one_feature_bucketizer(fg_json: Dict[str, Any]) -> Dict[str, Any]:
+    fg_json.pop("hash_bucket_size", None)
+    fg_json.pop("vocab_dict", None)
+    fg_json.pop("vocab_list", None)
+    fg_json.pop("boundaries", None)
+    fg_json.pop("num_buckets", None)
+    if fg_json["feature_type"] != "tokenize_feature":
+        fg_json.pop("vocab_file", None)
+    return fg_json
+
+
 def create_fg_json(
-    features: List[BaseFeature], asset_dir: Optional[str] = None
+    features: List[BaseFeature],
+    asset_dir: Optional[str] = None,
+    remove_bucketizer: bool = False,
 ) -> Dict[str, Any]:
     """Create feature generate config for features."""
     results = []
@@ -741,10 +873,14 @@ def create_fg_json(
                 )
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             results.extend(fg_json)
     return {"features": results}
 

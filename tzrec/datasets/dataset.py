@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -25,6 +26,9 @@ from tzrec.datasets.utils import (
     C_SAMPLE_MASK,
     Batch,
     RecordBatchTensor,
+    process_hstu_neg_sample,
+    process_hstu_seq_data,
+    remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -169,6 +173,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._reserved_columns = reserved_columns or []
         self._mode = mode
         self._debug_level = debug_level
+        self._enable_hstu = data_config.enable_hstu
+        self.sampler_type = (
+            self._data_config.WhichOneof("sampler")
+            if self._data_config.HasField("sampler")
+            else None
+        )
 
         self._data_parser = DataParser(
             features=features,
@@ -178,9 +188,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sample_weights=list(data_config.sample_weight_fields)
             if self._mode != Mode.PREDICT
             else None,
-            is_training=self._mode == Mode.TRAIN,
+            mode=self._mode,
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
+            sampler_type=self.sampler_type,
         )
 
         self._input_fields = None
@@ -256,7 +267,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Init input fields info."""
         self._input_fields = []
         for field in self._reader.schema:
-            if any(map(lambda x: x == field.type, AVAILABLE_PA_TYPES)):
+            field_type = remove_nullable(field.type)
+            if any(map(lambda x: x == field_type, AVAILABLE_PA_TYPES)):
                 self._input_fields.append(field)
             else:
                 raise ValueError(
@@ -322,6 +334,44 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
+            elif self._enable_hstu:
+                seq_attr = self._sampler._item_id_field
+
+                (
+                    input_data_k_split,
+                    input_data_k_split_slice,
+                    pre_seq_filter_reshaped_joined,
+                ) = process_hstu_seq_data(
+                    input_data=input_data,
+                    seq_attr=seq_attr,
+                    seq_str_delim=self._sampler.item_id_delim,
+                )
+                if self._mode == Mode.TRAIN:
+                    # Training using all possible target items
+                    input_data[seq_attr] = input_data_k_split_slice
+                elif self._mode == Mode.EVAL:
+                    # Evaluation using the last item for previous sequence
+                    input_data[seq_attr] = input_data_k_split.values.take(
+                        pa.array(input_data_k_split.offsets.to_numpy()[1:] - 1)
+                    )
+                sampled = self._sampler.get(input_data)
+                # To keep consistent with other process, use two functions
+                for k, v in sampled.items():
+                    if k in input_data:
+                        combined = process_hstu_neg_sample(
+                            input_data,
+                            v,
+                            self._sampler._num_sample,
+                            self._sampler.item_id_delim,
+                            seq_attr,
+                        )
+                        # Combine here to make embddings of both user sequence
+                        # and target item are the same
+                        input_data[k] = pa.concat_arrays(
+                            [pre_seq_filter_reshaped_joined, combined]
+                        )
+                    else:
+                        input_data[k] = v
             else:
                 sampled = self._sampler.get(input_data)
                 for k, v in sampled.items():
@@ -381,6 +431,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
     """
 
     def __init__(
@@ -389,12 +441,16 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
         self._batch_size = batch_size
         self._selected_cols = selected_cols
         self._drop_remainder = drop_remainder
+        self._shuffle = shuffle
+        self._shuffle_buffer_size = shuffle_buffer_size
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
@@ -405,6 +461,7 @@ class BaseReader(metaclass=_reader_meta_cls):
     def _arrow_reader_iter(
         self, reader: Iterator[pa.RecordBatch]
     ) -> Iterator[Dict[str, pa.Array]]:
+        shuffle_buffer = []
         buff_data = None
         while True:
             data = None
@@ -433,10 +490,24 @@ class BaseReader(metaclass=_reader_meta_cls):
                     if isinstance(column, pa.ChunkedArray):
                         column = column.combine_chunks()
                     data_dict[name] = column
+
+                if self._shuffle:
+                    shuffle_buffer.append(data_dict)
+                    if len(shuffle_buffer) < self._shuffle_buffer_size:
+                        continue
+                    else:
+                        idx = random.randrange(len(shuffle_buffer))
+                        data_dict = shuffle_buffer.pop(idx)
+
                 yield data_dict
 
             if data is None and buff_data is None:
                 break
+
+        if len(shuffle_buffer) > 0:
+            random.shuffle(shuffle_buffer)
+            for data_dict in shuffle_buffer:
+                yield data_dict
 
 
 class BaseWriter(metaclass=_writer_meta_cls):

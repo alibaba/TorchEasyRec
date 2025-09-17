@@ -4,13 +4,20 @@ package tzrec.protos;
 import "tzrec/protos/module.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
-
+import "tzrec/protos/seq_encoder.proto";
 message Tower {
     // input feature group name
     required string input = 1;
     // mlp config
     required MLP mlp = 2;
 };
+
+message HSTUMatchTower {
+    // input feature group name
+    required string input = 1;
+    // hstu_encoder config
+    required HSTUEncoder hstu_encoder = 2;
+}
 
 message DINTower {
     // input feature group name
@@ -105,6 +112,30 @@ message InterventionTaskTower {
 };
 
 
+message FusionSubTaskConfig {
+    // task name for the task
+    required string task_name = 1;
+    // label for the task
+    required string label_name = 2;
+    // bitmask for get actual label for binary classification task
+    optional uint64 task_bitmask = 3;
+    // loss for the task
+    repeated LossConfig losses = 4;
+    // TODO: support multi-class classification loss
+    // optional uint32 num_class = 5 [default = 1];
+    // metrics for the task
+    repeated MetricConfig metrics = 6;
+}
+
+
+message FusionMTLTower {
+    // task tower mlp
+    optional MLP mlp = 1;
+    // sub task configs
+    repeated FusionSubTaskConfig task_configs = 2;
+}
+
+
 message MultiWindowDINTower {
     // time windows len
     repeated uint32 windows_len = 1;
@@ -120,4 +151,33 @@ message DATTower {
     required string augment_input = 2;
     // mlp config
     required MLP mlp = 3;
+}
+
+
+message MINDUserTower {
+    enum UserSeqCombineMethod {
+        CONCAT = 0;
+        SUM = 1;
+    }
+    // user feature group name
+    required string input = 1;
+    // user history group name
+    required string history_input = 2;
+
+    required MLP user_mlp = 3;
+    optional MLP hist_seq_mlp = 4;
+    optional UserSeqCombineMethod user_seq_combine = 5 [default=SUM];
+
+    // capsule config
+    required B2ICapsule capsule_config = 6;
+    // concat mlp config for user interests vector
+    required MLP concat_mlp = 7;
+}
+
+
+message MINDItemTower {
+    // item feature group name
+    required string input = 1;
+    // mlp config
+    required MLP mlp = 2;
 }

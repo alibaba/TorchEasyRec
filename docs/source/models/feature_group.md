@@ -78,6 +78,7 @@ model_config {
                 input: "click_50"
                 attn_mlp: {
                     hidden_units: [128, 64]
+                    activation: "Dice"
                 }
             }
         }

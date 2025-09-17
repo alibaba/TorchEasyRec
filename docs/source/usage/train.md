@@ -18,7 +18,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --eval_input_path: 评估数据的输入路径
 - --continue_train: 是否增量训练
 - --fine_tune_checkpoint: 增量训练的checkpoint路径，如experiments/multi_tower_din_taobao_local/model.ckpt-0，如果不设置，增量训练使用model_dir下最近的检查点
-- --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs\[0\].raw_feature.boundaries":\[4,5,6,7\]}
+- --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs[0].raw_feature.boundaries":[4,5,6,7]}
 
 ### 环境变量
 
@@ -61,6 +61,7 @@ LR策略可以支持按epoch更新或者按step更新
 - num_steps: 训练的步数，不能跟num_epochs同时设置
 - num_epochs: 训练的epoch数
 - save_checkpoints_steps: 保存模型的步数间隔，保存模型后会做一次评估
+- save_checkpoints_epochs: 保存模型的Epoch数间隔，保存模型后会做一次评估，与save_checkpoints_steps不能同时设置
 - fine_tune_checkpoint: 增量训练的checkpoint路径，也可以设置checkpoint目录，将会使用目录下最新的checkpoint
 - fine_tune_ckpt_var_map: 需要restore的参数列表文件路径，文件的每一行是{variable_name in current model}\\t{variable name in old model ckpt}
   - 需要设置fine_tune_ckpt_var_map的情形:
@@ -87,6 +88,20 @@ LR策略可以支持按epoch更新或者按step更新
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录下记录trace文件
 - use_tensorboard: 是否使用tensorboard，默认为true
+- tensorboard_summaries: 设置需要在tensorboard中展示的数据， 只在use_tensorboard为true时生效。 可选值为["loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"], 默认值是["loss", "learning_rate"]。 在训练数据量大， 训练时长较长时， 酌情开启"parameter"、 "gradient"、"gradient_norm", 避免出现性能问题。
+- mixed_precision: **混合精度训练**，默认不开启，可以配置'BF16'或'FP16'
+- grad_scaler: 梯度动态缩放配置，使用FP16的情况下建议配置，参考[GradScaler](https://docs.pytorch.org/docs/stable/notes/amp_examples.html#typical-mixed-precision-training)
+
+```
+grad_scaler {
+    init_scale: 65536
+    growth_factor: 2
+    backoff_factor: 0.5
+    growth_interval: 2000
+}
+```
+
+- gradient_accumulation_steps: **梯度累计**，累计gradient_accumulation_steps步梯度更新参数，适用于batch_size小的情况，默认为0，不开启
 
 ## 训练性能优化
 

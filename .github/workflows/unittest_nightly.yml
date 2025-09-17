@@ -1,0 +1,29 @@
+name: Unit Test Nightly
+
+on:
+  schedule:
+    - cron:  '0 16 * * *'
+  workflow_dispatch:
+
+jobs:
+  ci-test:
+    runs-on: tzrec-runner
+    timeout-minutes: 480
+    container:
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:0.9
+      options: --gpus all --ipc host
+    steps:
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: run_${{ github.run_id }}
+      - name: RunUnitTestNightly
+        id: run_unittest_nightly
+        env:
+          ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
+          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
+        run: |
+          cd run_${{ github.run_id }}
+          bash scripts/ci/ci_test.sh

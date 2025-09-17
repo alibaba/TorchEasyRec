@@ -23,15 +23,20 @@ import torch
 
 from tzrec.acc.utils import is_trt_predict
 from tzrec.datasets.dataset import create_reader, create_writer
-from tzrec.datasets.odps_dataset import TYPE_PA_TO_TABLE
+from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
+from tzrec.features.custom_feature import CustomFeature
 from tzrec.features.expr_feature import ExprFeature
 from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.features.id_feature import IdFeature
 from tzrec.features.lookup_feature import LookupFeature
 from tzrec.features.match_feature import MatchFeature
 from tzrec.features.raw_feature import RawFeature
-from tzrec.features.sequence_feature import SequenceIdFeature, SequenceRawFeature
+from tzrec.features.sequence_feature import (
+    SequenceCustomFeature,
+    SequenceIdFeature,
+    SequenceRawFeature,
+)
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -119,6 +124,36 @@ class IdMockInput(MockInput):
             )
             random.shuffle(data)
         return pa.array(data)
+
+
+class HSTUIdMockInput(MockInput):
+    """Mock sparse id input data class."""
+
+    def __init__(
+        self,
+        name: str,
+        is_multi: bool = False,
+        num_ids: Optional[int] = None,
+        vocab_list: Optional[List[str]] = None,
+        multival_sep: str = chr(3),
+    ) -> None:
+        super().__init__(name)
+        self.is_multi = is_multi
+        self.num_ids = num_ids
+        self.vocab_list = vocab_list
+        self.multival_sep = multival_sep
+
+    def create_data(self, num_rows: int, has_null: bool = True) -> pa.Array:
+        """Create mock data."""
+        # string
+        # num_multi_rows = random.randint(num_rows // 3, 2 * num_rows // 3)
+        num_multi_id = 3
+        data_multi = _create_random_id_data(
+            (num_rows, num_multi_id), self.num_ids, self.vocab_list
+        ).astype(str)
+        data_multi = list(map(lambda x: self.multival_sep.join(x), data_multi))
+        random.shuffle(data_multi)
+        return pa.array(data_multi)
 
 
 class SeqIdMockInput(MockInput):
@@ -260,18 +295,37 @@ class SeqMockInput(MockInput):
         self, num_rows: int, item_t: pa.Table
     ) -> Dict[str, pa.Array]:
         """Create mock data."""
+        item_t_side_infos = []
+        other_side_infos = []
+        for side_info in self.side_infos:
+            if side_info in item_t.column_names:
+                item_t_side_infos.append(side_info)
+            else:
+                other_side_infos.append(side_info)
+
         # generate random sequence id
         row_number = []
+        sequence_lengths = []
         for i in range(num_rows):
-            row_number.extend([i] * random.randint(1, self.sequence_length))
+            sequence_length = random.randint(1, self.sequence_length)
+            sequence_lengths.append(sequence_length)
+            row_number.extend([i] * sequence_length)
         row_number = pa.array(row_number)
         id_data = pa.array(
             _create_random_id_data(len(row_number), self.num_ids, self.vocab_list)
         )
-        tmp_t = pa.Table.from_arrays([row_number, id_data], names=["rn", self.item_id])
+        other_id_datas = OrderedDict()
+        for side_info in other_side_infos:
+            other_id_datas[side_info] = pa.array(
+                _create_random_id_data(len(row_number), 10)
+            )
+        tmp_t = pa.Table.from_arrays(
+            [row_number, id_data] + list(other_id_datas.values()),
+            names=["rn", self.item_id] + list(other_id_datas.keys()),
+        )
 
         # join item side info
-        selected_item_t = item_t.select(list(set([self.item_id] + self.side_infos)))
+        selected_item_t = item_t.select(list(set([self.item_id] + item_t_side_infos)))
         join_t = tmp_t.join(selected_item_t, keys=self.item_id)
 
         # group by sequence item_id and concat
@@ -290,6 +344,7 @@ class SeqMockInput(MockInput):
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
                 data[f"{self.name}__{name}"] = arr
+
         return data
 
 
@@ -539,6 +594,39 @@ def create_mock_item_gl_data(
     return data_path
 
 
+def create_mock_hard_negative(
+    edge_path: str,
+    user_path: str,
+    src_data: Dict[str, List],  # {user_id: user_t, item_id: item_t}
+    num_rows: int = 10240,
+) -> Tuple[str]:
+    """Create hard negative mock data."""
+    idx_1 = np.random.choice(
+        np.arange(len(src_data["user_id"])), num_rows, replace=False
+    )
+    idx_2 = np.random.choice(
+        np.arange(len(src_data["item_id"])), num_rows, replace=False
+    )
+    uid = np.array(src_data["user_id"])[idx_1].tolist()
+    iid = np.array(src_data["item_id"])[idx_2].tolist()
+    field_data = [uid, iid]
+    lines = []
+    lines.append("userid:int64\titemid:int64\tweight:float\n")
+    for row in zip(*field_data):
+        lines.append("\t".join([str(row[0]), str(row[1]), "1"]) + "\n")
+    with open(edge_path, "w") as f:
+        f.writelines(lines)
+
+    user_lines = []
+    user_lines.append("id:int64\tweight:float\n")
+    for u in src_data["user_id"]:
+        user_lines.append("\t".join([str(u), "1"]) + "\n")
+    with open(user_path, "w") as f:
+        f.writelines(user_lines)
+
+    return edge_path, user_path
+
+
 def build_mock_input_fg_encoded(
     features: List[BaseFeature], user_id: str = "", item_id: str = ""
 ) -> Dict[str, MockInput]:
@@ -576,8 +664,33 @@ def build_mock_input_fg_encoded(
     return inputs
 
 
+def _get_vocab_list(feature: BaseFeature) -> Optional[List[str]]:
+    config = feature.config
+    vocab_list = None
+    if len(config.vocab_list) > 0:
+        vocab_list = list(config.vocab_list)
+    elif len(config.vocab_dict) > 0:
+        vocab_dict = OrderedDict(config.vocab_dict.items())
+        length = max(vocab_dict.values()) + 1
+        vocab_list = [""] * length
+        for k, v in vocab_dict.items():
+            vocab_list[v] = k
+    elif config.HasField("vocab_file"):
+        # TODO: support dict in vocab_file, now only support list
+        vocab_list = []
+        with open(config.vocab_file) as f:
+            for line in f.readlines():
+                line = line.strip()
+                if len(line) > 0:
+                    vocab_list.append(line)
+    return vocab_list
+
+
 def build_mock_input_with_fg(
-    features: List[BaseFeature], user_id: str = "", item_id: str = ""
+    features: List[BaseFeature],
+    user_id: str = "",
+    item_id: str = "",
+    is_hstu: bool = False,
 ) -> Dict[str, MockInput]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
@@ -588,13 +701,21 @@ def build_mock_input_with_fg(
                 random.random() < 0.5 and feature.inputs[0] not in single_id_fields
             )
             side, name = feature.side_inputs[0]
-            inputs[side][name] = IdMockInput(
-                name,
-                is_multi=is_multi,
-                num_ids=feature.num_embeddings,
-                vocab_list=feature.config.vocab_list,
-                multival_sep=chr(29),
-            )
+            if feature.is_weighted:
+                inputs[side][name] = MapMockInput(
+                    name,
+                    is_sparse=feature.is_sparse,
+                    num_ids=feature.num_embeddings,
+                    vocab_list=_get_vocab_list(feature),
+                )
+            else:
+                inputs[side][name] = IdMockInput(
+                    name,
+                    is_multi=is_multi,
+                    num_ids=feature.num_embeddings,
+                    vocab_list=_get_vocab_list(feature),
+                    multival_sep=chr(29),
+                )
         elif type(feature) is RawFeature:
             side, name = feature.side_inputs[0]
             inputs[side][name] = RawMockInput(
@@ -619,7 +740,7 @@ def build_mock_input_with_fg(
                         input_name,
                         is_sparse=feature.is_sparse,
                         num_ids=feature.num_embeddings,
-                        vocab_list=feature.config.vocab_list,
+                        vocab_list=_get_vocab_list(feature),
                     )
                 else:
                     is_multi = (
@@ -653,33 +774,61 @@ def build_mock_input_with_fg(
                 num_ids=feature.num_embeddings,
                 multival_sep=" ",
             )
+        elif type(feature) is CustomFeature:
+            if feature.config.operator_name != "EditDistance":
+                raise ValueError(
+                    "Mock CustomFeature with operator_name"
+                    f"[{feature.config.operator_name}] is not supported."
+                )
+            for side, input_name in feature.side_inputs:
+                inputs[side][input_name] = IdMockInput(
+                    input_name,
+                    is_multi=True,
+                    num_ids=10,
+                    multival_sep="",
+                )
 
     for feature in features:
-        if type(feature) in [SequenceIdFeature, SequenceRawFeature]:
-            side, name = feature.side_inputs[0]
-            if feature.is_grouped_sequence:
-                side_info = name.replace(f"{feature.sequence_name}__", "")
-                if feature.sequence_name in inputs["user"]:
-                    inputs["user"][feature.sequence_name].side_infos.append(side_info)
+        if type(feature) in [
+            SequenceIdFeature,
+            SequenceRawFeature,
+            SequenceCustomFeature,
+        ]:
+            for side, input_name in feature.side_inputs:
+                if feature.is_grouped_sequence:
+                    sub_name = input_name.replace(f"{feature.sequence_name}__", "")
+                    if feature.sequence_name not in inputs["user"]:
+                        inputs["user"][feature.sequence_name] = SeqMockInput(
+                            name=feature.sequence_name,
+                            side_infos=[],
+                            item_id=item_id,
+                            num_ids=inputs["item"][item_id].num_ids,
+                            vocab_list=inputs["item"][item_id].vocab_list,
+                            sequence_length=feature.sequence_length,
+                            sequence_delim=feature.sequence_delim,
+                        )
+                    inputs["user"][feature.sequence_name].side_infos.append(sub_name)
+                    if sub_name in inputs["item"]:
+                        if isinstance(inputs[side][sub_name], IdMockInput):
+                            inputs[side][sub_name].is_multi = False
                 else:
-                    inputs["user"][feature.sequence_name] = SeqMockInput(
-                        name=feature.sequence_name,
-                        side_infos=[side_info],
-                        item_id=item_id,
-                        num_ids=inputs["item"][item_id].num_ids,
-                        vocab_list=inputs["item"][item_id].vocab_list,
-                        sequence_length=feature.sequence_length,
-                        sequence_delim=feature.sequence_delim,
-                    )
-                if isinstance(inputs[side][side_info], IdMockInput):
-                    inputs[side][side_info].is_multi = False
-            else:
-                inputs[side][name] = IdMockInput(
-                    name,
-                    is_multi=True,
-                    num_ids=feature.num_embeddings,
-                    multival_sep=feature.sequence_delim,
-                )
+                    if is_hstu:
+                        # hstu require number of sequence item is over 2
+                        inputs[side][input_name] = HSTUIdMockInput(
+                            input_name,
+                            is_multi=True,
+                            num_ids=feature.num_embeddings,
+                            multival_sep=feature.sequence_delim,
+                        )
+                    else:
+                        inputs[side][input_name] = IdMockInput(
+                            input_name,
+                            is_multi=True,
+                            num_ids=10
+                            if isinstance(feature, SequenceCustomFeature)
+                            else feature.num_embeddings,
+                            multival_sep=feature.sequence_delim,
+                        )
     return inputs["user"], inputs["item"]
 
 
@@ -689,11 +838,17 @@ def load_config_for_test(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
+    is_hstu: bool = False,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
-    data_config = pipeline_config.data_config
+    pipeline_config.model_dir = os.path.join(test_dir, "train")
+    if len(pipeline_config.train_input_path) > 0:
+        # use prepared data
+        return pipeline_config
 
+    # rewrite config with mock data
+    data_config = pipeline_config.data_config
     features = create_features(
         list(pipeline_config.feature_configs),
         fg_mode=data_config.fg_mode,
@@ -719,7 +874,9 @@ def load_config_for_test(
             num_parts=num_parts,
         )
     else:
-        user_inputs, item_inputs = build_mock_input_with_fg(features, user_id, item_id)
+        user_inputs, item_inputs = build_mock_input_with_fg(
+            features, user_id, item_id, is_hstu
+        )
         _, item_t = create_mock_data(
             os.path.join(test_dir, "item_data"),
             item_inputs,
@@ -794,8 +951,9 @@ def load_config_for_test(
                 f"--node_edge_output_file {test_dir}/init_tree "
                 f"--tree_output_dir {test_dir}/init_tree "
             )
-            p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_init_tree.txt"))
-            p.wait(600)
+            assert misc_util.run_cmd(
+                cmd_str, os.path.join(test_dir, "log_init_tree.txt"), timeout=600
+            )
 
             sampler_config.item_input_path = os.path.join(
                 test_dir, "init_tree/node_table.txt"
@@ -807,24 +965,57 @@ def load_config_for_test(
                 test_dir, "init_tree/predict_edge_table.txt"
             )
 
-        else:
+        elif sampler_type == "negative_sampler":
             item_gl_path = create_mock_item_gl_data(
                 os.path.join(test_dir, "item_gl"),
                 item_inputs,
                 item_id,
-                neg_fields=list(sampler_config.attr_fields),
+                # hstu only uses item_id as negative sample, \
+                # as sampler_config.attr_fields is sequence
+                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
-            assert (
-                sampler_type == "negative_sampler"
-            ), "now only negative_sampler supported."
+            # assert sampler_type == "negative_sampler", (
+            #     "now only negative_sampler supported."
+            # )
             sampler_config.input_path = item_gl_path
+        elif sampler_type == "hard_negative_sampler":
+            item_gl_path = create_mock_item_gl_data(
+                os.path.join(test_dir, "item_gl"),
+                item_inputs,
+                item_id,
+                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
+                attr_delimiter=sampler_config.attr_delimiter,
+                num_rows=data_config.batch_size * num_parts * 4,
+            )
+
+            hard_neg_edge_path, hard_neg_user_path = create_mock_hard_negative(
+                os.path.join(test_dir, "hard_neg_edge"),
+                os.path.join(test_dir, "hard_neg_user"),
+                {
+                    "user_id": user_t["user_id"].to_pylist(),
+                    "item_id": item_t["item_id"].to_pylist(),
+                },
+                num_rows=data_config.batch_size * 4,
+            )
+            sampler_config.hard_neg_edge_input_path = hard_neg_edge_path
+            sampler_config.user_input_path = hard_neg_user_path
+            sampler_config.item_input_path = item_gl_path
 
     data_config.dataset_type = data_pb2.ParquetDataset
-    pipeline_config.model_dir = os.path.join(test_dir, "train")
 
     return pipeline_config
+
+
+def _standalone():
+    if os.environ.get("CI", "false").lower() == "true":
+        # When using GitHub Actions, a container network is created by GitHub, and
+        # the host network cannot be utilized. This can lead to the error:
+        # [c10d] The hostname of the client socket cannot be retrieved, error code: -3.
+        return "--master_addr=localhost --master_port=#MASTER_PORT#"
+    else:
+        return "--standalone"
 
 
 def test_train_eval(
@@ -834,81 +1025,73 @@ def test_train_eval(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
+    is_hstu: bool = False,
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
-        pipeline_config_path, test_dir, user_id, item_id, cate_id
+        pipeline_config_path, test_dir, user_id, item_id, cate_id, is_hstu
     )
 
     test_config_path = os.path.join(test_dir, "pipeline.config")
     config_util.save_message(pipeline_config, test_config_path)
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_train_eval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
+    )
 
 
 def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_eval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_eval.txt"), timeout=600
+    )
 
 
 def test_export(
     pipeline_config_path: str,
     test_dir: str,
     asset_files: str = "",
-    enable_aot=False,
-    enable_trt=False,
+    env_str: str = "",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {test_dir}/export "
     )
-    if enable_aot:
-        cmd_str = "ENABLE_AOT=1 " + cmd_str
-    if enable_trt:
-        cmd_str = "ENABLE_TRT=1 " + cmd_str
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     if asset_files:
         cmd_str += f"--asset_files {asset_files}"
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_export.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=600
+    )
 
 
 def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_feature_selection")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=1 --log_dir {log_dir} "
         "-m tzrec.tools.feature_selection "
         f"--pipeline_config_path {pipeline_config_path} "
@@ -917,11 +1100,9 @@ def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
         f"--output_dir {test_dir}/output_dir"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_export.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=600
+    )
 
 
 def test_predict(
@@ -941,7 +1122,7 @@ def test_predict(
     else:
         nproc_per_node = 2
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={nproc_per_node} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/predict.py "
         f"--scripted_model_path {scripted_model_path} "
@@ -952,11 +1133,9 @@ def test_predict(
     if output_columns:
         cmd_str += f"--output_columns {output_columns}"
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_predict.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
+    )
 
 
 def test_create_faiss_index(
@@ -975,11 +1154,9 @@ def test_create_faiss_index(
         f"--embedding_field {embedding_field}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_faiss.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_faiss.txt"), timeout=600
+    )
 
 
 def test_hitrate(
@@ -994,7 +1171,7 @@ def test_hitrate(
     """Run hitrate integration test."""
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
-        "OMP_NUM_THREADS=16 PYTHONPATH=. torchrun --standalone "
+        f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "
@@ -1005,11 +1182,9 @@ def test_hitrate(
         f"--gt_items_field {gt_items_field}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_hitrate.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_hitrate.txt"), timeout=600
+    )
 
 
 def test_create_fg_json(
@@ -1026,11 +1201,9 @@ def test_create_fg_json(
         f"--reserves {reserves} "
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_create_fg_json.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_create_fg_json.txt"), timeout=600
+    )
 
 
 def create_predict_data(
@@ -1076,13 +1249,13 @@ def create_predict_data(
                 infer_arrow[name] = column.take([0] * batch_size)
                 infer_json[name] = {
                     "values": [value_list[0]],
-                    "dtype": TYPE_PA_TO_TABLE[column.type],
+                    "dtype": _type_pa_to_table(column.type),
                 }
             else:
                 infer_arrow[name] = column
                 infer_json[name] = {
                     "values": value_list,
-                    "dtype": TYPE_PA_TO_TABLE[column.type],
+                    "dtype": _type_pa_to_table(column.type),
                 }
             if name == item_id:
                 infer_json["item_ids"] = infer_json[name]
@@ -1119,7 +1292,7 @@ def test_tdm_retrieval(
     """Run tdm retrieval test."""
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
@@ -1130,11 +1303,9 @@ def test_tdm_retrieval(
         f"--n_cluster 2 "
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_tdm_retrieval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_tdm_retrieval.txt"), timeout=600
+    )
 
 
 def test_tdm_cluster_train_eval(
@@ -1180,12 +1351,9 @@ def test_tdm_cluster_train_eval(
         f"--tree_output_dir {os.path.join(test_dir, 'learnt_tree')} "
         f"--parallel 1 "
     )
-    p = misc_util.run_cmd(
-        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt")
+    assert misc_util.run_cmd(
+        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt"), timeout=600
     )
-    p.wait(600)
-    if p.returncode != 0:
-        return False
 
     sampler_config.item_input_path = os.path.join(
         test_dir, "learnt_tree/node_table.txt"
@@ -1203,14 +1371,12 @@ def test_tdm_cluster_train_eval(
 
     log_dir = os.path.join(test_dir, "log_learnt_train_eval")
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path}"
     )
 
-    p = misc_util.run_cmd(cmd_str, os.path.join(test_dir, "log_train_eval.txt"))
-    p.wait(600)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
+    )

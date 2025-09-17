@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import os
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,6 +21,7 @@ from tzrec.datasets.utils import (
     SequenceDenseData,
     SequenceSparseData,
 )
+from tzrec.features.custom_feature import CustomFeature
 from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
 from tzrec.features.id_feature import FgMode, IdFeature
 from tzrec.features.raw_feature import RawFeature
@@ -89,7 +89,7 @@ def _parse_fg_encoded_sequence_sparse_feature_impl(
     else:
         raise ValueError(
             f"{name} only support str|list<int>|list<list<int>> dtype input,"
-            f" but get {feat.dtype}."
+            f" but get {feat.type}."
         )
     return SequenceSparseData(name, feat_values, feat_lengths, seq_lengths)
 
@@ -154,7 +154,7 @@ def _parse_fg_encoded_sequence_dense_feature_impl(
     else:
         raise ValueError(
             f"{name} only support str|list<float>|list<float<float>> dtype input,"
-            f" but get {feat.dtype}."
+            f" but get {feat.type}."
         )
     return SequenceDenseData(name, feat_values, seq_lengths)
 
@@ -212,6 +212,14 @@ class SequenceIdFeature(IdFeature):
             return self.config.feature_name
 
     @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        if self.config.HasField("value_dim"):
+            return self.config.value_dim
+        else:
+            return 1
+
+    @property
     def is_sequence(self) -> bool:
         """Feature is sequence or not."""
         return True
@@ -221,13 +229,16 @@ class SequenceIdFeature(IdFeature):
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self._is_grouped_seq:
-            side, name = self.config.expression.split(":")
-            return [(side, f"{self.sequence_name}__{name}")]
+        if self.config.HasField("expression"):
+            if self._is_grouped_seq:
+                side, name = self.config.expression.split(":")
+                return [(side, f"{self.sequence_name}__{name}")]
+            else:
+                return [tuple(self.config.expression.split(":"))]
         else:
-            return [tuple(self.config.expression.split(":"))]
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -257,7 +268,7 @@ class SequenceIdFeature(IdFeature):
             parsed_feat = SequenceSparseData(
                 name=self.name,
                 values=values,
-                lengths=key_lengths,
+                key_lengths=key_lengths,
                 seq_lengths=seq_lengths,
             )
         else:
@@ -314,24 +325,21 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets
-        elif len(self.config.vocab_list) > 0:
-            fg_cfg["vocab_list"] = [self.config.default_value, "<OOV>"] + list(
-                self.config.vocab_list
-            )
-            fg_cfg["default_bucketize_value"] = 1
+        elif len(self.vocab_list) > 0:
+            fg_cfg["vocab_list"] = self.vocab_list
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         elif len(self.config.vocab_dict) > 0:
-            vocab_dict = OrderedDict(self.config.vocab_dict.items())
-            vocab_dict[self.config.default_value] = 0
-            fg_cfg["vocab_dict"] = vocab_dict
-            fg_cfg["default_bucketize_value"] = 1
+            fg_cfg["vocab_dict"] = self.vocab_dict
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
+        elif len(self.vocab_file) > 0:
+            fg_cfg["vocab_file"] = self.vocab_file
+            fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("value_dim"):
-            assert (
-                self.config.value_dim == 1
-            ), f"SequenceIdFeature {self.name} not support multi-value now."
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 1
-
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
 
@@ -402,13 +410,16 @@ class SequenceRawFeature(RawFeature):
         # TODO: support dense embedding for sequence raw feature.
         return None
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if self._is_grouped_seq:
-            side, name = self.config.expression.split(":")
-            return [(side, f"{self.sequence_name}__{name}")]
+        if self.config.HasField("expression"):
+            if self._is_grouped_seq:
+                side, name = self.config.expression.split(":")
+                return [(side, f"{self.sequence_name}__{name}")]
+            else:
+                return [tuple(self.config.expression.split(":"))]
         else:
-            return [tuple(self.config.expression.split(":"))]
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -446,7 +457,9 @@ class SequenceRawFeature(RawFeature):
                 parsed_feat = SequenceSparseData(
                     name=self.name,
                     values=values,
-                    lengths=np.array([self._fg_op.value_dimension()] * sum(lengths)),
+                    key_lengths=np.array(
+                        [self._fg_op.value_dimension()] * sum(lengths)
+                    ),
                     seq_lengths=lengths,
                 )
             else:
@@ -504,4 +517,181 @@ class SequenceRawFeature(RawFeature):
             fg_cfg["normalizer"] = self.config.normalizer
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        return [fg_cfg]
+
+
+class SequenceCustomFeature(CustomFeature):
+    """SequenceCustomFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+        sequence_name (str): sequence group name.
+        sequence_delim (str): separator for sequence feature.
+        sequence_length (int): max sequence length.
+        sequence_pk (str): sequence primary key name for serving.
+        fg_mode (FgMode): input data fg mode.
+        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        sequence_name: Optional[str] = None,
+        sequence_delim: Optional[str] = None,
+        sequence_length: Optional[int] = None,
+        sequence_pk: Optional[str] = None,
+        fg_mode: FgMode = FgMode.FG_NONE,
+        fg_encoded_multival_sep: Optional[str] = None,
+    ) -> None:
+        fc_type = feature_config.WhichOneof("feature")
+        config = getattr(feature_config, fc_type)
+        self._is_grouped_seq = False
+        self.sequence_name = None
+        self.sequence_delim = None
+        self.sequence_length = None
+        self.sequence_pk = None
+        if isinstance(config, feature_pb2.CustomFeature):
+            self._is_grouped_seq = True
+            self.sequence_name = sequence_name
+            self.sequence_delim = sequence_delim
+            self.sequence_length = sequence_length
+            if not sequence_pk:
+                self.sequence_pk = f"user:{sequence_name}"
+            else:
+                self.sequence_pk = sequence_pk
+        else:
+            self.sequence_delim = config.sequence_delim
+            self.sequence_length = config.sequence_length
+        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+
+    @property
+    def name(self) -> str:
+        """Feature name."""
+        if self._is_grouped_seq:
+            return f"{self.sequence_name}__{self.config.feature_name}"
+        else:
+            return self.config.feature_name
+
+    @property
+    def is_sequence(self) -> bool:
+        """Feature is sequence or not."""
+        return True
+
+    @property
+    def is_grouped_sequence(self) -> bool:
+        """Feature is grouped sequence or not."""
+        return self._is_grouped_seq
+
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
+        """Input field names with side."""
+        if len(self.config.expression) > 0:
+            side_inputs = []
+            if self._is_grouped_seq:
+                for expression in self.config.expression:
+                    side, name = expression.split(":")
+                    side_inputs.append((side, f"{self.sequence_name}__{name}"))
+            else:
+                for expression in self.config.expression:
+                    side_inputs.append(tuple(expression.split(":")))
+            return side_inputs
+        else:
+            return None
+
+    @property
+    def _dense_emb_type(self) -> Optional[str]:
+        return None
+
+    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
+        """Parse input data for the feature impl.
+
+        Args:
+            input_data (dict): raw input feature data.
+
+        Return:
+            parsed feature data.
+        """
+        if self.fg_mode == FgMode.FG_NONE:
+            feat = input_data[self.name]
+            if self.is_sparse:
+                parsed_feat = _parse_fg_encoded_sequence_sparse_feature_impl(
+                    self.name,
+                    feat,
+                    sequence_delim=self.sequence_delim,
+                    **self._fg_encoded_kwargs,
+                )
+            else:
+                parsed_feat = _parse_fg_encoded_sequence_dense_feature_impl(
+                    self.name,
+                    feat,
+                    sequence_delim=self.sequence_delim,
+                    value_dim=self.config.value_dim,
+                    **self._fg_encoded_kwargs,
+                )
+        elif self.fg_mode == FgMode.FG_NORMAL:
+            input_feats = []
+            for name in self.inputs:
+                x = input_data[name]
+                if pa.types.is_list(x.type):
+                    x = x.fill_null([])
+                x = x.tolist()
+                input_feats.append(x)
+            if self._fg_op.is_sparse:
+                values, key_lengths, seq_lengths = (
+                    self._fg_op.to_bucketized_jagged_tensor(input_feats)
+                )
+                parsed_feat = SequenceSparseData(
+                    name=self.name,
+                    values=values,
+                    key_lengths=key_lengths,
+                    seq_lengths=seq_lengths,
+                )
+            else:
+                values, lengths = self._fg_op.to_jagged_tensor(input_feats)
+                parsed_feat = SequenceDenseData(
+                    name=self.name,
+                    values=values,
+                    seq_lengths=lengths,
+                )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
+        return parsed_feat
+
+    def init_fg(self) -> None:
+        """Init fg op."""
+        cfgs = self.fg_json()
+        is_rank_zero = os.environ.get("RANK", "0") == "0"
+        if self._is_grouped_seq:
+            # pyre-ignore [16]
+            self._fg_op = pyfg.FeatureFactory.create(
+                cfgs[0],
+                self.sequence_name,
+                self.sequence_delim,
+                self.sequence_length,
+                is_rank_zero,
+            )
+        else:
+            # pyre-ignore [16]
+            self._fg_op = pyfg.FeatureFactory.create(
+                cfgs[0],
+                is_rank_zero,
+            )
+
+    def fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config."""
+        if self.config.default_value == "":
+            logger.warning(
+                "SequenceCustomFeature not support empty default value now. "
+                "reset to zero."
+            )
+            self.config.default_value = "0"
+
+        fg_cfg = super().fg_json()[0]
+        fg_cfg["feature_name"] = self.config.feature_name
+        fg_cfg["is_sequence"] = True
+        if not self._is_grouped_seq:
+            fg_cfg["sequence_delim"] = self.config.sequence_delim
+            fg_cfg["sequence_length"] = self.config.sequence_length
+
         return [fg_cfg]

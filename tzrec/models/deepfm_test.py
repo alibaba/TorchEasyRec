@@ -20,7 +20,8 @@ from tzrec.features.feature import create_features
 from tzrec.models.deepfm import DeepFM
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, seq_encoder_pb2
 from tzrec.protos.models import rank_model_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class DeepFMTest(unittest.TestCase):

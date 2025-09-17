@@ -54,8 +54,6 @@ class RawFeature(BaseFeature):
         """Fg value dimension of the feature."""
         if self.config.HasField("value_dim"):
             return self.config.value_dim
-        elif self._is_sparse:
-            return 0
         else:
             return 1
 
@@ -83,9 +81,12 @@ class RawFeature(BaseFeature):
     def _dense_emb_type(self) -> Optional[str]:
         return self.config.WhichOneof("dense_emb")
 
-    def _build_side_inputs(self) -> List[Tuple[str, str]]:
+    def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        return [tuple(self.config.expression.split(":"))]
+        if self.config.HasField("expression"):
+            return [tuple(self.config.expression.split(":"))]
+        else:
+            return None
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -140,4 +141,6 @@ class RawFeature(BaseFeature):
             fg_cfg["normalizer"] = self.config.normalizer
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]

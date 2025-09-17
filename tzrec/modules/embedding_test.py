@@ -13,7 +13,7 @@
 import os
 import unittest
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, List, Optional, Union
 
 import torch
 from parameterized import parameterized
@@ -21,13 +21,16 @@ from torch import nn
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
-from tzrec.features.feature import create_features
+from tzrec.features.feature import BaseFeature, create_features
 from tzrec.modules.embedding import (
+    EMPTY_KJT,
     EmbeddingGroup,
     EmbeddingGroupImpl,
+    SequenceEmbeddingGroup,
     SequenceEmbeddingGroupImpl,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
+from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -68,7 +71,7 @@ def _create_test_features(has_zch=False):
     return features
 
 
-def _create_test_sequence_features(has_zch=False):
+def _create_test_sequence_features(has_zch=False, has_mulval=False, pooling_type=None):
     cat_a_kwargs = {}
     cat_b_kwargs = {}
     if has_zch:
@@ -81,6 +84,9 @@ def _create_test_sequence_features(has_zch=False):
     else:
         cat_a_kwargs["num_buckets"] = 100
         cat_b_kwargs["num_buckets"] = 1000
+    if has_mulval:
+        cat_a_kwargs["value_dim"] = 0
+        cat_a_kwargs["pooling"] = pooling_type
     feature_cfgs = [
         feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
@@ -141,7 +147,7 @@ def _create_test_sequence_features(has_zch=False):
                             feature_name="cat_a",
                             expression="item:cat_a",
                             embedding_dim=16,
-                            **cat_b_kwargs,
+                            **cat_a_kwargs,
                         )
                     ),
                     feature_pb2.SeqFeatureConfig(
@@ -156,9 +162,6 @@ def _create_test_sequence_features(has_zch=False):
     ]
     features = create_features(feature_cfgs)
     return features
-
-
-EMPTY_KJT = KeyedJaggedTensor.empty()
 
 
 class _EGScriptWrapper(nn.Module):
@@ -190,10 +193,17 @@ class EmbeddingGroupTest(unittest.TestCase):
         os.environ.pop("INPUT_TILE", None)
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.JIT_SCRIPT, False],
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+            [TestGraphType.JIT_SCRIPT, True],
+        ]
     )
-    def test_embedding_group_impl(self, graph_type) -> None:
-        features = _create_test_features()
+    def test_embedding_group_impl(self, graph_type, has_zch=False) -> None:
+        features = _create_test_features(has_zch=has_zch)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="wide",
@@ -221,6 +231,8 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertDictEqual(
             embedding_group.group_feature_dims("deep"), deep_feature_dims
         )
+        if has_zch and graph_type != TestGraphType.NORMAL:
+            embedding_group.eval()
         embedding_group = create_test_module(embedding_group, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
@@ -241,59 +253,25 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["deep"].size(), (2, 25))
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
-    )
-    def test_zch_embedding_group_impl(self, graph_type) -> None:
-        features = _create_test_features(has_zch=True)
-        # TODO(hongsheng.jhs) zch not support wide group now.
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["cat_a", "cat_b", "int_a"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-        ]
-        embedding_group = EmbeddingGroupImpl(
-            features, feature_groups, device=torch.device("cpu")
-        )
-        self.assertEqual(embedding_group.group_dims("deep"), [16, 8, 1])
-        self.assertEqual(embedding_group.group_total_dim("deep"), 25)
-        deep_feature_dims = OrderedDict({"cat_a": 16, "cat_b": 8, "int_a": 1})
-        self.assertDictEqual(
-            embedding_group.group_feature_dims("deep"), deep_feature_dims
-        )
-
-        if graph_type != TestGraphType.NORMAL:
-            embedding_group.eval()
-        embedding_group = create_test_module(embedding_group, graph_type)
-
-        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-            keys=["cat_a", "cat_b"],
-            values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
-            lengths=torch.tensor([1, 2, 1, 3]),
-        )
-        dense_feature = KeyedTensor.from_tensor_list(
-            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
-        )
-        result = embedding_group(
-            sparse_feature,
-            dense_feature,
-            EMPTY_KJT,
-        )
-        self.assertEqual(result["deep"].size(), (2, 25))
-
-    @parameterized.expand(
         [
-            [TestGraphType.NORMAL, False],
-            [TestGraphType.FX_TRACE, False],
-            [TestGraphType.JIT_SCRIPT, False],
-            [TestGraphType.NORMAL, True],
-            [TestGraphType.FX_TRACE, True],
-            [TestGraphType.JIT_SCRIPT, True],
+            [TestGraphType.NORMAL, False, False, None],
+            [TestGraphType.FX_TRACE, False, False, None],
+            [TestGraphType.JIT_SCRIPT, False, False, None],
+            [TestGraphType.NORMAL, True, False, None],
+            [TestGraphType.FX_TRACE, True, False, None],
+            [TestGraphType.JIT_SCRIPT, True, False, None],
+            [TestGraphType.NORMAL, False, True, "sum"],
+            [TestGraphType.FX_TRACE, False, True, "sum"],
+            [TestGraphType.JIT_SCRIPT, False, True, "sum"],
+            [TestGraphType.NORMAL, False, True, "mean"],
+            [TestGraphType.FX_TRACE, False, True, "mean"],
+            [TestGraphType.JIT_SCRIPT, False, True, "mean"],
         ]
     )
-    def test_sequence_embedding_group_impl(self, graph_type, has_zch=False) -> None:
-        features = _create_test_sequence_features(has_zch)
+    def test_sequence_embedding_group_impl(
+        self, graph_type, has_zch=False, has_mulval=False, pooling_type=None
+    ) -> None:
+        features = _create_test_sequence_features(has_zch, has_mulval, pooling_type)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="click",
@@ -385,6 +363,18 @@ class EmbeddingGroupTest(unittest.TestCase):
             embedding_group = embedding_group.eval()
         embedding_group = create_test_module(embedding_group, graph_type)
 
+        if has_mulval:
+            values = torch.tensor(list(range(30)))
+            lengths = torch.tensor([2, 0, 1, 1, 4, 5, 3, 3, 3, 4, 2, 2])
+            sequence_mulval_lengths = KeyedJaggedTensor.from_lengths_sync(
+                keys=["click_seq__cat_a", "buy_seq__cat_a"],
+                values=torch.tensor([1, 0, 3, 1, 2, 2, 1, 2, 2, 2]),
+                lengths=torch.tensor([3, 3, 2, 2]),
+            )
+        else:
+            values = torch.tensor(list(range(24)))
+            lengths = torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2])
+            sequence_mulval_lengths = EMPTY_KJT
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=[
                 "cat_a",
@@ -394,8 +384,8 @@ class EmbeddingGroupTest(unittest.TestCase):
                 "buy_seq__cat_a",
                 "buy_seq__cat_b",
             ],
-            values=torch.tensor(list(range(24))),
-            lengths=torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2]),
+            values=values,
+            lengths=lengths,
         )
         dense_feature = KeyedTensor.from_tensor_list(
             keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
@@ -409,10 +399,14 @@ class EmbeddingGroupTest(unittest.TestCase):
             sparse_feature,
             dense_feature,
             sequence_dense_feature,
+            sequence_mulval_lengths,
+            EMPTY_KJT,
             EMPTY_KJT,
         )
         self.assertEqual(result["click.query"].size(), (2, 25))
+        self.assertFalse(torch.any(torch.isnan(result["click.query"])).item())
         self.assertEqual(result["click.sequence"].size(), (2, 3, 25))
+        self.assertFalse(torch.any(torch.isnan(result["click.sequence"])).item())
         self.assertEqual(result["click.sequence_length"].size(), (2,))
         self.assertEqual(result["buy.query"].size(), (2, 17))
         self.assertEqual(result["buy.sequence"].size(), (2, 2, 17))
@@ -428,10 +422,121 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["deep___click_no_query.sequence_length"].size(), (2,))
 
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            [TestGraphType.JIT_SCRIPT],
+        ]
     )
-    def test_embedding_group(self, graph_type) -> None:
+    def test_sequence_embedding_group_impl_jagged_forward(self, graph_type) -> None:
         features = _create_test_sequence_features()
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="click",
+                feature_names=[
+                    "cat_a",
+                    "cat_b",
+                    "int_a",
+                    "click_seq__cat_a",
+                    "click_seq__cat_b",
+                    "click_seq__int_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="buy",
+                feature_names=["cat_a", "int_a", "buy_seq__cat_a", "buy_seq__int_a"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+
+        class SequenceEmbeddingGroupImplJaggedForward(SequenceEmbeddingGroupImpl):
+            def __init__(
+                self,
+                features: List[BaseFeature],
+                feature_groups: List[Union[FeatureGroupConfig, SeqGroupConfig]],
+                device: Optional[torch.device] = None,
+            ):
+                super().__init__(features, feature_groups, device)
+
+            def forward(
+                self,
+                sparse_feature: KeyedJaggedTensor,
+                dense_feature: KeyedTensor,
+                sequence_dense_features: Dict[str, JaggedTensor],
+                sequence_mulval_lengths: KeyedJaggedTensor,
+            ) -> Dict[str, Dict[str, JaggedTensor]]:
+                return self.jagged_forward(
+                    sparse_feature,
+                    dense_feature,
+                    sequence_dense_features,
+                    sequence_mulval_lengths,
+                )
+
+        embedding_group = SequenceEmbeddingGroupImplJaggedForward(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertEqual(embedding_group.group_dims("click"), [16, 8, 1, 16, 8, 1])
+        self.assertEqual(embedding_group.group_dims("buy"), [16, 1, 16, 1])
+        self.assertEqual(embedding_group.group_total_dim("click"), 50)
+        self.assertEqual(embedding_group.group_total_dim("buy"), 34)
+
+        embedding_group = create_test_module(embedding_group, graph_type)
+
+        values = torch.tensor(list(range(24)))
+        lengths = torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2])
+        sequence_mulval_lengths = EMPTY_KJT
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=[
+                "cat_a",
+                "cat_b",
+                "click_seq__cat_a",
+                "click_seq__cat_b",
+                "buy_seq__cat_a",
+                "buy_seq__cat_b",
+            ],
+            values=values,
+            lengths=lengths,
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        sequence_dense_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__int_a", "buy_seq__int_a"],
+            values=torch.tensor([[x] for x in range(10)], dtype=torch.float32),
+            lengths=torch.tensor([3, 3, 2, 2]),
+        ).to_dict()
+        result = embedding_group(
+            sparse_feature,
+            dense_feature,
+            sequence_dense_feature,
+            sequence_mulval_lengths,
+        )
+        self.assertEqual(len(result["click"]), 6)
+        self.assertEqual(len(result["buy"]), 4)
+        self.assertEqual(result["click"]["cat_a"].values().size(), (2, 16))
+        self.assertEqual(result["click"]["cat_b"].values().size(), (2, 8))
+        self.assertEqual(result["click"]["int_a"].values().size(), (2, 1))
+        self.assertEqual(result["click"]["click_seq__cat_a"].values().size(), (6, 16))
+        self.assertEqual(result["click"]["click_seq__cat_b"].values().size(), (6, 8))
+        self.assertEqual(result["click"]["click_seq__int_a"].values().size(), (6, 1))
+        self.assertEqual(result["buy"]["cat_a"].values().size(), (2, 16))
+        self.assertEqual(result["buy"]["int_a"].values().size(), (2, 1))
+        self.assertEqual(result["buy"]["buy_seq__cat_a"].values().size(), (4, 16))
+        self.assertEqual(result["buy"]["buy_seq__int_a"].values().size(), (4, 1))
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.JIT_SCRIPT, False],
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+            [TestGraphType.JIT_SCRIPT, True],
+        ]
+    )
+    def test_embedding_group(self, graph_type, has_zch) -> None:
+        features = _create_test_sequence_features(has_zch)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="wide",
@@ -483,7 +588,7 @@ class EmbeddingGroupTest(unittest.TestCase):
                 group_type=model_pb2.FeatureGroupType.DEEP,
                 sequence_groups=[
                     model_pb2.SeqGroupConfig(
-                        group_name="buy_seq",
+                        group_name="only_buy_seq",
                         feature_names=[
                             "cat_a",
                             "int_a",
@@ -495,7 +600,7 @@ class EmbeddingGroupTest(unittest.TestCase):
                 sequence_encoders=[
                     seq_encoder_pb2.SeqEncoderConfig(
                         simple_attention=seq_encoder_pb2.SimpleAttention(
-                            input="buy_seq"
+                            input="only_buy_seq"
                         )
                     ),
                 ],
@@ -575,6 +680,8 @@ class EmbeddingGroupTest(unittest.TestCase):
             lengths=torch.tensor([3, 3, 2, 2]),
         ).to_dict()
 
+        if has_zch and graph_type != TestGraphType.NORMAL:
+            embedding_group = embedding_group.eval()
         if graph_type == TestGraphType.JIT_SCRIPT:
             embedding_group = create_test_module(
                 _EGScriptWrapper(embedding_group), graph_type
@@ -605,19 +712,128 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, False],
-            [TestGraphType.FX_TRACE, False],
-            [TestGraphType.JIT_SCRIPT, False],
-            [TestGraphType.NORMAL, True],
-            [TestGraphType.FX_TRACE, True],
-            [TestGraphType.JIT_SCRIPT, True],
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            [TestGraphType.JIT_SCRIPT],
+        ]
+    )
+    def test_sequence_embedding_group_jagged_forward(self, graph_type) -> None:
+        features = _create_test_sequence_features()
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="click",
+                feature_names=[
+                    "cat_a",
+                    "cat_b",
+                    "int_a",
+                    "click_seq__cat_a",
+                    "click_seq__cat_b",
+                    "click_seq__int_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="buy",
+                feature_names=["cat_a", "int_a", "buy_seq__cat_a", "buy_seq__int_a"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+
+        class SequenceEmbeddingGroupJaggedForward(SequenceEmbeddingGroup):
+            def __init__(
+                self,
+                features: List[BaseFeature],
+                feature_groups: List[Union[FeatureGroupConfig, SeqGroupConfig]],
+                device: Optional[torch.device] = None,
+            ):
+                super().__init__(features, feature_groups, device)
+
+            def forward(
+                self,
+                batch: Batch,
+            ) -> Dict[str, OrderedDict[str, JaggedTensor]]:
+                return self.jagged_forward(batch)
+
+        embedding_group = SequenceEmbeddingGroupJaggedForward(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertEqual(embedding_group.group_dims("click"), [16, 8, 1, 16, 8, 1])
+        self.assertEqual(embedding_group.group_dims("buy"), [16, 1, 16, 1])
+        self.assertEqual(embedding_group.group_total_dim("click"), 50)
+        self.assertEqual(embedding_group.group_total_dim("buy"), 34)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=[
+                "cat_a",
+                "cat_b",
+                "click_seq__cat_a",
+                "click_seq__cat_b",
+                "buy_seq__cat_a",
+                "buy_seq__cat_b",
+            ],
+            values=torch.tensor(list(range(24))),
+            lengths=torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2]),
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        sequence_dense_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__int_a", "buy_seq__int_a"],
+            values=torch.tensor([[x] for x in range(10)], dtype=torch.float32),
+            lengths=torch.tensor([3, 3, 2, 2]),
+        ).to_dict()
+
+        if graph_type == TestGraphType.JIT_SCRIPT:
+            embedding_group = create_test_module(
+                _EGScriptWrapper(embedding_group), graph_type
+            )
+            result = embedding_group(
+                sparse_features={BASE_DATA_GROUP: sparse_feature},
+                dense_features={BASE_DATA_GROUP: dense_feature},
+                sequence_dense_features=sequence_dense_feature,
+            )
+        else:
+            embedding_group = create_test_module(embedding_group, graph_type)
+            result = embedding_group(
+                Batch(
+                    sparse_features={BASE_DATA_GROUP: sparse_feature},
+                    dense_features={BASE_DATA_GROUP: dense_feature},
+                    sequence_dense_features=sequence_dense_feature,
+                )
+            )
+        self.assertEqual(len(result["click"]), 6)
+        self.assertEqual(len(result["buy"]), 4)
+        self.assertEqual(result["click"]["cat_a"].values().size(), (2, 16))
+        self.assertEqual(result["click"]["cat_b"].values().size(), (2, 8))
+        self.assertEqual(result["click"]["int_a"].values().size(), (2, 1))
+        self.assertEqual(result["click"]["click_seq__cat_a"].values().size(), (6, 16))
+        self.assertEqual(result["click"]["click_seq__cat_b"].values().size(), (6, 8))
+        self.assertEqual(result["click"]["click_seq__int_a"].values().size(), (6, 1))
+        self.assertEqual(result["buy"]["cat_a"].values().size(), (2, 16))
+        self.assertEqual(result["buy"]["int_a"].values().size(), (2, 1))
+        self.assertEqual(result["buy"]["buy_seq__cat_a"].values().size(), (4, 16))
+        self.assertEqual(result["buy"]["buy_seq__int_a"].values().size(), (4, 1))
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL, False, False],
+            [TestGraphType.FX_TRACE, False, False],
+            [TestGraphType.JIT_SCRIPT, False, False],
+            [TestGraphType.NORMAL, True, False],
+            [TestGraphType.FX_TRACE, True, False],
+            [TestGraphType.JIT_SCRIPT, True, False],
+            [TestGraphType.NORMAL, False, True],
+            [TestGraphType.FX_TRACE, False, True],
+            [TestGraphType.JIT_SCRIPT, False, True],
         ]
     )
     def test_sequence_embedding_group_impl_input_tile(
-        self, graph_type, has_zch=False
+        self, graph_type, has_zch=False, has_mulval=False
     ) -> None:
         os.environ["INPUT_TILE"] = "2"
-        features = _create_test_sequence_features(has_zch=has_zch)
+        features = _create_test_sequence_features(
+            has_zch=has_zch, has_mulval=has_mulval
+        )
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="click",
@@ -653,6 +869,18 @@ class EmbeddingGroupTest(unittest.TestCase):
             embedding_group = embedding_group.eval()
         embedding_group = create_test_module(embedding_group, graph_type)
 
+        if has_mulval:
+            values = torch.tensor(list(range(30)))
+            lengths = torch.tensor([1, 1, 1, 1, 4, 5, 3, 3, 3, 4, 2, 2])
+            sequence_mulval_lengths = KeyedJaggedTensor.from_lengths_sync(
+                keys=["click_seq__cat_a", "buy_seq__cat_a"],
+                values=torch.tensor([1, 1, 2, 1, 2, 2, 1, 2, 2, 2]),
+                lengths=torch.tensor([3, 3, 2, 2]),
+            )
+        else:
+            values = torch.tensor(list(range(24)))
+            lengths = torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2])
+            sequence_mulval_lengths = EMPTY_KJT
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=[
                 "cat_a",
@@ -662,8 +890,8 @@ class EmbeddingGroupTest(unittest.TestCase):
                 "buy_seq__cat_a",
                 "buy_seq__cat_b",
             ],
-            values=torch.tensor(list(range(24))),
-            lengths=torch.tensor([1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2]),
+            values=values,
+            lengths=lengths,
         )
         dense_feature = KeyedTensor.from_tensor_list(
             keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
@@ -677,6 +905,8 @@ class EmbeddingGroupTest(unittest.TestCase):
             sparse_feature,
             dense_feature,
             sequence_dense_feature,
+            sequence_mulval_lengths,
+            EMPTY_KJT,
             EMPTY_KJT,
             2,
         )
@@ -690,19 +920,24 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, False],
-            [TestGraphType.FX_TRACE, False],
-            [TestGraphType.JIT_SCRIPT, False],
-            [TestGraphType.NORMAL, True],
-            [TestGraphType.FX_TRACE, True],
-            [TestGraphType.JIT_SCRIPT, True],
+            [TestGraphType.NORMAL, False, False],
+            [TestGraphType.FX_TRACE, False, False],
+            [TestGraphType.JIT_SCRIPT, False, False],
+            [TestGraphType.NORMAL, True, False],
+            [TestGraphType.FX_TRACE, True, False],
+            [TestGraphType.JIT_SCRIPT, True, False],
+            [TestGraphType.NORMAL, False, True],
+            [TestGraphType.FX_TRACE, False, True],
+            [TestGraphType.JIT_SCRIPT, False, True],
         ]
     )
     def test_sequence_embedding_group_impl_input_tile_emb(
-        self, graph_type, has_zch=False
+        self, graph_type, has_zch=False, has_mulval=False
     ) -> None:
         os.environ["INPUT_TILE"] = "3"
-        features = _create_test_sequence_features(has_zch=has_zch)
+        features = _create_test_sequence_features(
+            has_zch=has_zch, has_mulval=has_mulval
+        )
         feature_groups = [
             model_pb2.FeatureGroupConfig(
                 group_name="click",
@@ -743,6 +978,18 @@ class EmbeddingGroupTest(unittest.TestCase):
             values=torch.tensor(list(range(4))),
             lengths=torch.tensor([1, 1, 1, 1]),
         )
+        if has_mulval:
+            values = torch.tensor(list(range(12)))
+            lengths = torch.tensor([4, 3, 3, 2])
+            sequence_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
+                keys=["click_seq__cat_a", "buy_seq__cat_a"],
+                values=torch.tensor([1, 1, 2, 1, 2]),
+                lengths=torch.tensor([3, 2]),
+            )
+        else:
+            values = torch.tensor(list(range(10)))
+            lengths = torch.tensor([3, 3, 2, 2])
+            sequence_mulval_lengths_user = EMPTY_KJT
         sparse_feature_user = KeyedJaggedTensor.from_lengths_sync(
             keys=[
                 "click_seq__cat_a",
@@ -750,8 +997,8 @@ class EmbeddingGroupTest(unittest.TestCase):
                 "buy_seq__cat_a",
                 "buy_seq__cat_b",
             ],
-            values=torch.tensor(list(range(10))),
-            lengths=torch.tensor([3, 3, 2, 2]),
+            values=values,
+            lengths=lengths,
         )
         dense_feature = KeyedTensor.from_tensor_list(
             keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
@@ -765,7 +1012,9 @@ class EmbeddingGroupTest(unittest.TestCase):
             sparse_feature,
             dense_feature,
             sequence_dense_feature,
+            EMPTY_KJT,
             sparse_feature_user,
+            sequence_mulval_lengths_user,
             2,
         )
 

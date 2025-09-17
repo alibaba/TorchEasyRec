@@ -68,7 +68,7 @@ class TreeClusterTest(unittest.TestCase):
                 leaf_feas.append(node.attrs + node.raw_attrs)
         if use_hash_id:
             self.assertEqual(
-                [str(x) if x < 10 else f"nonleaf#{x-10}" for x in true_ids], ids
+                [str(x) if x < 10 else f"nonleaf#{x - 10:02d}" for x in true_ids], ids
             )
         else:
             self.assertEqual(true_ids, ids)

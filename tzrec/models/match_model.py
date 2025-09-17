@@ -19,13 +19,12 @@ from tzrec.features.feature import BaseFeature
 from tzrec.metrics import recall_at_k
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.utils import div_no_nan
+from tzrec.modules.utils import BaseModule, div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
-from tzrec.protos import model_pb2, tower_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -46,7 +45,68 @@ def _update_tensor_2_dict(
     tensor_dict[key] = new_tensor
 
 
-class MatchTower(nn.Module):
+@torch.fx.wrap
+def _sim_with_sampler(
+    user_emb: torch.Tensor,
+    item_emb: torch.Tensor,
+    hard_neg_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    batch_size = user_emb.size(0)
+
+    if hard_neg_indices is None:
+        pos_item_emb = item_emb[:batch_size]
+        neg_item_emb = item_emb[batch_size:]
+        pos_ui_sim = torch.sum(
+            torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+        )
+        neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+        return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
+    else:
+        n_hard = hard_neg_indices.size(0)
+
+        # compute simple sample similarities
+        simple_item_emb = item_emb[0:-n_hard]
+        pos_item_emb = simple_item_emb[:batch_size]
+        neg_item_emb = simple_item_emb[batch_size:]
+        pos_ui_sim = torch.sum(
+            torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+        )
+        neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+
+        # compute hard sample similarities
+        hard_item_emb = item_emb[-n_hard:]  # [n_hard, d]
+        hard_user_emb = torch.index_select(
+            user_emb,
+            0,
+            hard_neg_indices[:, 0],
+        )  # [n_hard, d]
+        hard_neg_ui_sim = torch.sum(
+            torch.multiply(hard_user_emb, hard_item_emb), dim=-1, keepdim=True
+        )  # [n_hard, 1]
+
+        sparse_shape = [batch_size, int(torch.max(hard_neg_indices[:, 1]).item()) + 1]
+        hard_neg_ui_sim = torch.sparse_coo_tensor(
+            hard_neg_indices.T,
+            hard_neg_ui_sim.ravel(),
+            sparse_shape,
+            device=hard_neg_indices.device,
+        ).to_dense()
+
+        hard_neg_mask = torch.ones(
+            hard_neg_indices.size(0), device=hard_neg_indices.device
+        )
+        hard_neg_mask = torch.sparse_coo_tensor(
+            hard_neg_indices.T,
+            hard_neg_mask,
+            sparse_shape,
+            device=hard_neg_indices.device,
+        ).to_dense()
+
+        hard_neg_ui_sim = hard_neg_ui_sim - (1 - hard_neg_mask) * 1e32
+        return torch.cat([pos_ui_sim, neg_ui_sim, hard_neg_ui_sim], dim=-1)
+
+
+class MatchTower(BaseModule):
     """Base match tower.
 
     Args:
@@ -54,16 +114,21 @@ class MatchTower(nn.Module):
         output_dim (int): user/item output embedding dimension.
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
-        feature_group (FeatureGroupConfig): feature group config.
+        feature_groups(list) (FeatureGroupConfig): feature group config.
         features (list): list of features.
     """
 
     def __init__(
         self,
-        tower_config: Union[tower_pb2.Tower, tower_pb2.DATTower],
+        tower_config: Union[
+            tower_pb2.Tower,
+            tower_pb2.DATTower,
+            tower_pb2.MINDUserTower,
+            tower_pb2.MINDItemTower,
+        ],
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
+        similarity: simi_pb2.Similarity,
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
     ) -> None:
@@ -72,7 +137,7 @@ class MatchTower(nn.Module):
         self._group_name = tower_config.input
         self._output_dim = output_dim
         self._similarity = similarity
-        self._feature_group = feature_group
+        self._feature_groups = feature_groups
         self._features = features
         self._model_config = model_config
         self.embedding_group = None
@@ -81,7 +146,7 @@ class MatchTower(nn.Module):
 
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
-        self.embedding_group = EmbeddingGroup(self._features, [self._feature_group])
+        self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
 
         if self._model_config.HasField("variational_dropout"):
             self.group_variational_dropouts = nn.ModuleDict()
@@ -89,16 +154,20 @@ class MatchTower(nn.Module):
             variational_dropout_config_dict = config_to_kwargs(
                 variational_dropout_config
             )
-
-            if self._feature_group.group_type != model_pb2.SEQUENCE:
-                feature_dim = self.embedding_group.group_feature_dims(self._group_name)
-                if len(feature_dim) > 1:
-                    variational_dropout = VariationalDropout(
-                        feature_dim, self._group_name, **variational_dropout_config_dict
+            for feature_group in self._feature_groups:
+                if feature_group.group_type != model_pb2.SEQUENCE:
+                    feature_dim = self.embedding_group.group_feature_dims(
+                        feature_group.group_name
                     )
-                    self.group_variational_dropouts[self._group_name] = (
-                        variational_dropout
-                    )
+                    if len(feature_dim) > 1:
+                        variational_dropout = VariationalDropout(
+                            feature_dim,
+                            feature_group.group_name,
+                            **variational_dropout_config_dict,
+                        )
+                        self.group_variational_dropouts[feature_group.group_name] = (
+                            variational_dropout
+                        )
 
     def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Build input feature."""
@@ -109,9 +178,9 @@ class MatchTower(nn.Module):
                 variational_dropout,
             ) in self.group_variational_dropouts.items():
                 feature, variational_dropout_loss = variational_dropout(
-                    feature_dict[self._group_name]
+                    feature_dict[group_name]
                 )
-                _update_tensor_2_dict(feature_dict, feature, self._group_name)
+                _update_tensor_2_dict(feature_dict, feature, group_name)
                 _update_tensor_2_dict(
                     self.group_variational_dropout_loss,
                     variational_dropout_loss,
@@ -134,9 +203,12 @@ class MatchTowerWoEG(nn.Module):
 
     def __init__(
         self,
-        tower_config: tower_pb2.Tower,
+        tower_config: Union[
+            tower_pb2.Tower,
+            tower_pb2.HSTUMatchTower,
+        ],
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
+        similarity: simi_pb2.Similarity,
         feature_group: model_pb2.FeatureGroupConfig,
         features: List[BaseFeature],
     ) -> None:
@@ -175,49 +247,34 @@ class MatchModel(BaseModel):
         self._loss_collection = {}
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
+        self.sampler_type = kwargs.get("sampler_type", "negative_sampler")
 
     def sim(
         self,
         user_emb: torch.Tensor,
         item_emb: torch.Tensor,
-        neg_for_each_sample: bool = False,
+        hard_neg_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
         else:
-            batch_size = user_emb.size(0)
-            pos_item_emb = item_emb[:batch_size]
-            neg_item_emb = item_emb[batch_size:]
-            pos_ui_sim = torch.sum(
-                torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
-            )
-            neg_ui_sim = None
-            if not neg_for_each_sample:
-                neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
-            else:
-                # Calculate similarity for each user with corresponding negative items
-                num_neg_per_user = neg_item_emb.size(0) // batch_size
-                neg_size = batch_size * num_neg_per_user
-                neg_item_emb = neg_item_emb[:neg_size]
-                neg_item_emb = neg_item_emb.view(batch_size, num_neg_per_user, -1)
-                neg_ui_sim = torch.sum(user_emb.unsqueeze(1) * neg_item_emb, dim=-1)
-            return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
+            return _sim_with_sampler(user_emb, item_emb, hard_neg_indices)
 
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        assert (
-            loss_type == "softmax_cross_entropy"
-        ), "match model only support softmax_cross_entropy loss now."
+        assert loss_type == "softmax_cross_entropy", (
+            "match model only support softmax_cross_entropy loss now."
+        )
         reduction = "none" if self._sample_weight else "mean"
         self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
-        assert (
-            len(self._base_model_config.losses) == 1
-        ), "match model only support single loss now."
+        assert len(self._base_model_config.losses) == 1, (
+            "match model only support single loss now."
+        )
         for loss_cfg in self._base_model_config.losses:
             self._init_loss_impl(loss_cfg)
 
@@ -225,12 +282,11 @@ class MatchModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_cfg: LossConfig,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
         losses = {}
-        label = batch.labels[label_name]
         sample_weight = (
             batch.sample_weights[self._sample_weight]
             if self._sample_weight
@@ -239,9 +295,9 @@ class MatchModel(BaseModel):
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        assert (
-            loss_type == "softmax_cross_entropy"
-        ), "match model only support softmax_cross_entropy loss now."
+        assert loss_type == "softmax_cross_entropy", (
+            "match model only support softmax_cross_entropy loss now."
+        )
 
         pred = predictions["similarity" + suffix]
         if self._in_batch_negative:
@@ -264,7 +320,9 @@ class MatchModel(BaseModel):
         losses = {}
         for loss_cfg in self._base_model_config.losses:
             losses.update(
-                self._loss_impl(predictions, batch, self._label_name, loss_cfg)
+                self._loss_impl(
+                    predictions, batch, batch.labels[self._label_name], loss_cfg
+                )
             )
         losses.update(self._loss_collection)
         return losses
@@ -291,12 +349,10 @@ class MatchModel(BaseModel):
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         metric_cfg: MetricConfig,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
-
         metric_type = metric_cfg.WhichOneof("metric")
         metric_name = metric_type + suffix
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
@@ -326,10 +382,14 @@ class MatchModel(BaseModel):
             losses (dict, optional): a dict of loss.
         """
         for metric_cfg in self._base_model_config.metrics:
-            self._update_metric_impl(predictions, batch, self._label_name, metric_cfg)
+            self._update_metric_impl(
+                predictions, batch, batch.labels[self._label_name], metric_cfg
+            )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
-                self._update_loss_metric_impl(losses, batch, self._label_name, loss_cfg)
+                self._update_loss_metric_impl(
+                    losses, batch, batch.labels[self._label_name], loss_cfg
+                )
 
 
 class TowerWrapper(nn.Module):

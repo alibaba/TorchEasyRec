@@ -11,6 +11,7 @@
 
 
 import math
+import os
 import tempfile
 import unittest
 from typing import Any, Dict, Iterator, List, Optional
@@ -23,7 +24,10 @@ from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
-from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP
+from tzrec.datasets.utils import (
+    BASE_DATA_GROUP,
+    NEG_DATA_GROUP,
+)
 from tzrec.features.feature import BaseFeature, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 
@@ -61,8 +65,33 @@ class _TestReader(BaseReader):
                     data = np.random.randint(100, size=(self._batch_size,)).astype(
                         np.str_
                     )
+                elif f.type == pa.string():
+                    data = np.random.randint(100, size=(self._batch_size,)).astype(
+                        np.str_
+                    )
+                elif pa.types.is_list(f.type):
+                    if f.type.value_type == pa.string():
+                        data = [
+                            [str(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported list type: {f.type}")
+
+                elif pa.types.is_list(f.type) and pa.types.is_list(f.type.value_type):
+                    if f.type.value_type.value_type == pa.string():
+                        data = [
+                            [
+                                [str(np.random.randint(100)) for _ in range(2)],
+                                [str(np.random.randint(100)) for _ in range(2)],
+                            ]
+                            for _ in range(self._batch_size)
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported nested list type: {f.type}")
                 else:
-                    raise ValueError(f"Unknown input_type {f.input_type}")
+                    raise ValueError(f"Unknown input_type {f.type}")
+
                 input_data[f.name] = pa.array(data)
             yield input_data
 
@@ -91,13 +120,15 @@ class DatasetTest(unittest.TestCase):
         self._temp_files = []
 
     def tearDown(self):
+        os.environ.pop("INPUT_TILE", None)
         for f in self._temp_files:
             f.close()
         utils.SERVER_LAUNCHED = False
         del utils.STATS_DICT
         utils.STATS_DICT = []
 
-    def test_dataset(self):
+    @parameterized.expand([[False], [True]])
+    def test_dataset(self, need_shuffle):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),
             pa.field(name="float_b", type=pa.float64()),
@@ -124,10 +155,12 @@ class DatasetTest(unittest.TestCase):
                     dataset_type=data_pb2.DatasetType.OdpsDataset,
                     fg_mode=data_pb2.FgMode.FG_NONE,
                     label_fields=["label"],
+                    shuffle=need_shuffle,
                 ),
                 features=features,
                 input_path="",
                 input_fields=input_fields,
+                mode=Mode.TRAIN,
             ),
             batch_size=None,
             num_workers=2,
@@ -145,13 +178,24 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (8,))
         self.assertEqual(batch.labels["label"].size(), (4,))
 
-    @parameterized.expand([[False], [True]])
-    def test_dataset_with_sampler(self, force_base_data_group):
+    @parameterized.expand(
+        [
+            [False, Mode.EVAL, False],
+            [True, Mode.EVAL, False],
+            [False, Mode.PREDICT, False],
+            [True, Mode.PREDICT, False],
+            [False, Mode.PREDICT, True],
+            [True, Mode.PREDICT, True],
+        ]
+    )
+    def test_dataset_with_sampler(self, force_base_data_group, mode, input_tile):
+        if input_tile:
+            os.environ["INPUT_TILE"] = "2"
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -164,19 +208,29 @@ class DatasetTest(unittest.TestCase):
         ]
         feature_cfgs = [
             feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="int_a", expression="item:int_a", num_buckets=2000
+                )
             ),
             feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="str_c", expression="item:str_c", num_buckets=3000
+                )
             ),
             feature_pb2.FeatureConfig(
-                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="float_b", expression="item:float_b"
+                )
             ),
             feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(feature_name="int_d")
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="int_d", expression="user:int_d", num_buckets=1000
+                )
             ),
             feature_pb2.FeatureConfig(
-                raw_feature=feature_pb2.RawFeature(feature_name="float_d")
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="float_d", expression="user:float_d"
+                )
             ),
         ]
         features = create_features(
@@ -189,7 +243,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_mode=data_pb2.FgMode.FG_NONE,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
                 label_fields=["label"],
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f.name,
@@ -202,6 +256,7 @@ class DatasetTest(unittest.TestCase):
             features=features,
             input_path="",
             input_fields=input_fields,
+            mode=mode,
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -213,49 +268,162 @@ class DatasetTest(unittest.TestCase):
         )
         iterator = iter(dataloader)
         batch = next(iterator)
-        if not force_base_data_group:
-            self.assertEqual(batch.dense_features[BASE_DATA_GROUP].keys(), ["float_d"])
-            self.assertEqual(
-                batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
-            )
-            self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].keys(), ["int_d"])
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].values().size(), (4,)
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (4,)
-            )
-            self.assertEqual(batch.dense_features[NEG_DATA_GROUP].keys(), ["float_b"])
-            self.assertEqual(
-                batch.dense_features[NEG_DATA_GROUP].values().size(), (12, 1)
-            )
-            self.assertEqual(
-                batch.sparse_features[NEG_DATA_GROUP].keys(), ["int_a", "str_c"]
-            )
-            self.assertEqual(
-                batch.sparse_features[NEG_DATA_GROUP].values().size(), (24,)
-            )
-            self.assertEqual(
-                batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (24,)
-            )
+        if input_tile:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].keys(), ["float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].keys(), ["int_d"]
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].keys(), ["float_b"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].keys(), ["int_a", "str_c"]
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].keys(), ["float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].keys(), ["int_d"]
+                )
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].keys(), ["int_a", "str_c"]
+                )
         else:
-            self.assertEqual(
-                batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b", "float_d"]
-            )
-            self.assertEqual(
-                batch.dense_features[BASE_DATA_GROUP].values().size(), (12, 2)
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].keys(),
-                ["int_a", "str_c", "int_d"],
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].values().size(), (28,)
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (36,)
-            )
-        self.assertEqual(batch.labels["label"].size(), (4,))
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].keys(), ["float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].keys(), ["int_d"]
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].keys(), ["float_b"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].keys(), ["int_a", "str_c"]
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b", "float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].keys(),
+                    ["int_a", "str_c", "int_d"],
+                )
+
+        if mode == Mode.EVAL:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].values().size(), (12, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].values().size(), (24,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (24,)
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (12, 2)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (28,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (36,)
+                )
+            self.assertEqual(batch.labels["label"].size(), (4,))
+        elif input_tile:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (1, 1),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (1,),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].lengths().size(),
+                    (1,),
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].values().size(), (8,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (8,)
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (1, 1),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (1,),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].lengths().size(),
+                    (1,),
+                )
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (8,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (8,)
+                )
+        else:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].values().size(), (8,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (8,)
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 2)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (12,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (12,)
+                )
 
     def test_dataset_with_sample_mask(self):
         input_fields = [
@@ -309,7 +477,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(100):
-            f.write(f"{i}\t{1}\t{i}:{i+1000}:{i+2000}\n")
+            f.write(f"{i}\t{1}\t{i}:{i + 1000}:{i + 2000}\n")
         f.flush()
 
         input_fields = [
@@ -437,7 +605,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(node)
         node.write("id:int64\tweight:float\tattrs:string\n")
         for i in range(63):
-            node.write(f"{i}\t{1}\t{int(math.log(i+1,2))}:{i}:{i+1000}:{i*2}\n")
+            node.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:{i * 2}\n")
         node.flush()
 
         def _ancestor(code):
@@ -453,8 +621,8 @@ class DatasetTest(unittest.TestCase):
         self._temp_files.append(edge)
         edge.write("src_id:int64\tdst_id:int\tweight:float\n")
         for i in range(31, 63):
-            for anc in _ancestor(i):
-                edge.write(f"{i}\t{anc}\t{1.0}\n")
+            for ancestor in _ancestor(i):
+                edge.write(f"{i}\t{ancestor}\t{1.0}\n")
         edge.flush()
 
         def _childern(code):
@@ -544,6 +712,66 @@ class DatasetTest(unittest.TestCase):
             batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (120,)
         )
         self.assertEqual(batch.labels["label"].size(), (40,))
+
+    def test_dataset_with_list_type_not_null(self):
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="str_c", type=pa.string()),
+            pa.field(name="label", type=pa.int32()),
+            pa.field(name="list_str_d", type=pa.list_(pa.string()), nullable=False),
+            pa.field(
+                name="list_list_str_e",
+                type=pa.list_(pa.field("list_str_e", pa.string(), nullable=False)),
+                nullable=False,
+            ),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="list_str_d")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="list_list_str_e")
+            ),
+        ]
+        features = create_features(feature_cfgs)
+
+        dataloader = DataLoader(
+            dataset=_TestDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=4,
+                    dataset_type=data_pb2.DatasetType.OdpsDataset,
+                    fg_encoded=True,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path="",
+                input_fields=input_fields,
+            ),
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+        self.assertIn("list_str_d", batch.dense_features[BASE_DATA_GROUP].keys())
+        self.assertEqual(
+            batch.dense_features[BASE_DATA_GROUP]["list_str_d"].size(), (4, 1)
+        )
+        self.assertIn("list_list_str_e", batch.dense_features[BASE_DATA_GROUP].keys())
+        self.assertEqual(
+            batch.dense_features[BASE_DATA_GROUP]["list_list_str_e"].size(), (4, 1)
+        )
 
 
 if __name__ == "__main__":

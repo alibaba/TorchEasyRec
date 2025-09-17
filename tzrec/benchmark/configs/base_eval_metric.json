@@ -2,25 +2,34 @@
   "tzrec/benchmark/configs/taobao_ccp/dbmtl.config": {
     "label": {
       "auc_ctr": 0.614,
-      "auc_cvr": 0.645
+      "auc_cvr": 0.656
     },
-    "threshold": 0.005,
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.005
+    },
     "run_cnt": 3
   },
   "tzrec/benchmark/configs/taobao_ccp/mmoe.config": {
     "label": {
-      "auc_ctr": 0.614,
-      "auc_cvr": 0.642
+      "auc_ctr": 0.616,
+      "auc_cvr": 0.658
     },
-    "threshold": 0.005,
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.005
+    },
     "run_cnt": 3
   },
   "tzrec/benchmark/configs/taobao_ccp/ple.config": {
     "label": {
-      "auc_ctr": 0.618,
-      "auc_cvr": 0.647
+      "auc_ctr": 0.616,
+      "auc_cvr": 0.658
     },
-    "threshold": 0.005,
+    "threshold": {
+      "auc_ctr": 0.002,
+      "auc_cvr": 0.005
+    },
     "run_cnt": 3
   },
   "tzrec/benchmark/configs/taobao/dbmtl.config": {
@@ -28,7 +37,7 @@
       "auc_ctr": 0.634,
       "auc_cvr": 0.705,
       "grouped_auc_ctr": 0.568,
-      "grouped_auc_cvr": 0.630
+      "grouped_auc_cvr": 0.636
     },
     "threshold": {
       "auc_ctr": 0.002,
@@ -52,7 +61,7 @@
   "tzrec/benchmark/configs/taobao/dbmtl_jrc.config": {
     "label": {
       "grouped_auc_ctr": 0.567,
-      "grouped_auc_cvr": 0.719
+      "grouped_auc_cvr": 0.726
     },
     "threshold": {
       "grouped_auc_ctr": 0.002,
@@ -104,11 +113,43 @@
     },
     "run_cnt": 5
   },
+  "tzrec/benchmark/configs/taobao/dssm_taobao.config": {
+    "label": {
+      "recall@1": 0.077,
+      "recall@5": 0.172
+    },
+    "threshold": {
+      "recall@1": 0.002,
+      "recall@5": 0.005
+    },
+    "run_cnt": 5
+  },
   "tzrec/benchmark/configs/criteo/deepfm.config": {
     "label": {
       "auc": 0.784
     },
     "threshold": 0.005,
     "run_cnt": 1
+  },
+  "tzrec/benchmark/configs/criteo/dlrm.config": {
+    "label": {
+      "auc": 0.796
+    },
+    "threshold": 0.002,
+    "run_cnt": 1
+  },
+  "tzrec/benchmark/configs/criteo/rocket_launching.config": {
+    "label": {
+      "auc_light": 0.788
+    },
+    "threshold": 0.001,
+    "run_cnt": 1
+  },
+  "tzrec/benchmark/configs/kuairand/dlrm_hstu.config": {
+    "label": {
+      "auc_is_click": 0.718
+    },
+    "threshold": 0.005,
+    "run_cnt": 3
   }
 }

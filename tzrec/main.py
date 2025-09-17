@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 from collections import OrderedDict
+from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -23,38 +24,32 @@ import pyarrow as pa
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch.amp import GradScaler
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.distributed.model_parallel import (
-    DistributedModelParallel,
-)
-
-# NOQA
-from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
-from torchrec.inference.modules import quantize_embeddings
-from torchrec.inference.state_dict_transform import (
-    state_dict_gather,
-    state_dict_to_device,
-)
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
-from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc.aot_utils import export_model_aot
+from tzrec.acc.quant_utils import quantize_embeddings
 from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
 from tzrec.acc.utils import (
+    allow_tf32,
     export_acc_config,
     is_aot,
     is_cuda_export,
+    is_ec_quant,
     is_input_tile_emb,
     is_quant,
     is_trt,
     is_trt_predict,
     write_mapping_file_for_input_tile,
 )
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
+from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
@@ -73,18 +68,27 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.utils import BaseModule
+from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
+from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
+from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.dist_util import (
+    DistributedModelParallel,
+    create_train_pipeline,
+)
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
+from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -98,7 +102,14 @@ def init_process_group() -> Tuple[torch.device, str]:
     else:
         device: torch.device = torch.device("cpu")
         backend = "gloo"
-    dist.init_process_group(backend=backend)
+
+    pg_timeout = None
+    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+        pg_timeout = timedelta(
+            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
+        )
+    dist.init_process_group(backend=backend, timeout=pg_timeout)
+
     return device, backend
 
 
@@ -206,7 +217,23 @@ def _get_dataloader(
         collate_fn=lambda x: x,
         **kwargs,
     )
+    # For PyTorch versions 2.6 and above, we initialize the data iterator before
+    # beginning the training process to avoid potential CUDA-related issues following
+    # model saving.
+    iter(dataloader)
     return dataloader
+
+
+def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
+    try:
+        sampler_type = (
+            data_config.WhichOneof("sampler")
+            if data_config.HasField("sampler")
+            else None
+        )
+    except Exception:
+        sampler_type = None
+    return sampler_type
 
 
 def _create_model(
@@ -214,6 +241,7 @@ def _create_model(
     features: List[BaseFeature],
     labels: List[str],
     sample_weights: Optional[List[str]] = None,
+    sampler_type: Optional[str] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -222,7 +250,7 @@ def _create_model(
         features (list): list of features.
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
-
+        sampler_type (str): negative sampler type
     Return:
         model: a EasyRec Model.
     """
@@ -230,7 +258,16 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
-    model = model_cls(model_config, features, labels, sample_weights=sample_weights)
+    model: BaseModel = model_cls(
+        model_config,
+        features,
+        labels,
+        sample_weights=sample_weights,
+        sampler_type=sampler_type,
+    )
+
+    kernel = Kernel[KernelProto.Name(model_config.kernel)]
+    model.set_kernel(kernel)
     return model
 
 
@@ -241,26 +278,23 @@ def _evaluate(
     eval_result_filename: Optional[str] = None,
     global_step: Optional[int] = None,
     eval_summary_writer: Optional[SummaryWriter] = None,
+    global_epoch: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.eval()
-    pipeline = TrainPipelineSparseDist(
-        model,
-        # pyre-fixme [6]
-        None,
-        model.device,
-        execute_all_batches=True,
-    )
+    pipeline = create_train_pipeline(model)
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
     iterator = iter(eval_dataloader)
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
-    if global_step:
-        desc_suffix = f" model-{global_step}"
+    if global_epoch is not None:
+        desc_suffix += f" Epoch-{global_epoch}"
+    if global_step is not None:
+        desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
     plogger = None
@@ -284,6 +318,7 @@ def _evaluate(
             plogger.log(i_step)
 
     metric_result = _model.compute_metric()
+
     if is_rank_zero:
         metric_str = " ".join([f"{k}:{v:0.6f}" for k, v in metric_result.items()])
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
@@ -300,7 +335,9 @@ def _evaluate(
 def _log_train(
     step: int,
     losses: Dict[str, torch.Tensor],
+    params: Dict[str, torch.Tensor],
     param_groups: List[Dict[str, Any]],
+    tb_summaries: List[str],
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
 ) -> None:
@@ -319,11 +356,53 @@ def _log_train(
         )
     if summary_writer is not None:
         total_loss = sum(losses.values())
-        for k, v in losses.items():
-            summary_writer.add_scalar(f"loss/{k}", v, step)
-        summary_writer.add_scalar("loss/total", total_loss, step)
-        for i, g in enumerate(param_groups):
-            summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
+        if "loss" in tb_summaries:
+            for k, v in losses.items():
+                summary_writer.add_scalar(f"loss/{k}", v, step)
+            summary_writer.add_scalar("loss/total", total_loss, step)
+        if "learning_rate" in tb_summaries:
+            for i, g in enumerate(param_groups):
+                summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
+
+        if "global_gradient_norm" in tb_summaries:
+            global_grad_norm = torch.nn.utils.get_total_norm(
+                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
+            )
+            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+
+        if (
+            "gradient_norm" in tb_summaries
+            or "gradient" in tb_summaries
+            or "parameter" in tb_summaries
+        ):
+            for name, param in params.items():
+                if isinstance(param, ShardedTensor):
+                    if "parameter" in tb_summaries:
+                        # for sharded tensor, we only log the current local shard
+                        local_shard = param.local_shards()[0]
+                        # metadata.placement looks like 'rank:0/cuda:0'
+                        rank = str(local_shard.metadata.placement).split("/")[0]
+                        summary_writer.add_histogram(
+                            tag=f"{name}/{rank}",
+                            values=local_shard.tensor,
+                            global_step=step,
+                        )
+                else:
+                    if "parameter" in tb_summaries:
+                        summary_writer.add_histogram(
+                            tag=name, values=param, global_step=step
+                        )
+                    if "gradient" in tb_summaries:
+                        summary_writer.add_histogram(
+                            tag=f"{name}/gradient", values=param.grad, global_step=step
+                        )
+                    if "gradient_norm" in tb_summaries:
+                        grad_norm = torch.norm(param.grad)
+                        summary_writer.add_scalar(
+                            tag=f"{name}/gradient_norm",
+                            scalar_value=grad_norm,
+                            global_step=step,
+                        )
 
 
 def _train_and_evaluate(
@@ -353,14 +432,36 @@ def _train_and_evaluate(
     epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
+    save_checkpoints_steps, save_checkpoints_epochs = 0, 0
+    if train_config.save_checkpoints_epochs > 0:
+        save_checkpoints_epochs = train_config.save_checkpoints_epochs
+    else:
+        save_checkpoints_steps = train_config.save_checkpoints_steps
+
     plogger = None
     summary_writer = None
     eval_summary_writer = None
+    tb_summaries = list()
+    tb_summaries_set = set(["loss", "learning_rate"])
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
     if is_rank_zero and train_config.use_tensorboard:
         summary_writer = SummaryWriter(model_dir)
         eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
+        if not train_config.tensorboard_summaries:
+            tb_summaries = list(tb_summaries_set)
+        else:
+            for summary in train_config.tensorboard_summaries:
+                if summary in TENSORBOARD_SUMMARIES:
+                    tb_summaries_set.add(summary)
+                else:
+                    raise ValueError(
+                        "tensorboard_summaries should be one of [%s], you provided %s."
+                        % (", ".join(TENSORBOARD_SUMMARIES), summary)
+                    )
+            tb_summaries = list(tb_summaries_set)
+
+    eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
     if train_config.is_profiling:
         if is_rank_zero:
@@ -378,11 +479,10 @@ def _train_and_evaluate(
 
     last_ckpt_step = -1
     i_step = 0
+    i_epoch = 0
     losses = {}
     for i_epoch in epoch_iter:
-        pipeline = TrainPipelineSparseDist(
-            model, optimizer, model.device, execute_all_batches=True
-        )
+        pipeline = create_train_pipeline(model, optimizer)
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
 
@@ -408,7 +508,9 @@ def _train_and_evaluate(
                     _log_train(
                         i_step,
                         losses,
+                        params=optimizer.params,  # pyre-ignore
                         param_groups=optimizer.param_groups,
+                        tb_summaries=tb_summaries,
                         plogger=plogger,
                         summary_writer=summary_writer,
                     )
@@ -420,8 +522,9 @@ def _train_and_evaluate(
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
-            if train_config.save_checkpoints_steps > 0 and i_step > 0:
-                if i_step % train_config.save_checkpoints_steps == 0:
+
+            if save_checkpoints_steps > 0 and i_step > 0:
+                if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
                     checkpoint_util.save_model(
                         os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -433,12 +536,34 @@ def _train_and_evaluate(
                             model,
                             eval_dataloader,
                             eval_config,
+                            eval_result_filename=eval_result_filename,
                             global_step=i_step,
                             eval_summary_writer=eval_summary_writer,
+                            global_epoch=i_epoch,
                         )
                         model.train()
             if train_config.is_profiling:
                 prof.step()
+
+        if save_checkpoints_epochs > 0 and i_step > 0:
+            if (i_epoch + 1) % save_checkpoints_epochs == 0:
+                last_ckpt_step = i_step
+                checkpoint_util.save_model(
+                    os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                    model,
+                    optimizer,
+                )
+                if eval_dataloader is not None:
+                    _evaluate(
+                        model,
+                        eval_dataloader,
+                        eval_config,
+                        eval_result_filename=eval_result_filename,
+                        global_step=i_step,
+                        eval_summary_writer=eval_summary_writer,
+                        global_epoch=i_epoch,
+                    )
+                    model.train()
 
         if use_step and i_step >= train_config.num_steps - 1:
             break
@@ -450,7 +575,9 @@ def _train_and_evaluate(
     _log_train(
         i_step,
         losses,
+        params=optimizer.params,
         param_groups=optimizer.param_groups,
+        tb_summaries=tb_summaries,
         plogger=plogger,
         summary_writer=summary_writer,
     )
@@ -469,9 +596,10 @@ def _train_and_evaluate(
                 model,
                 eval_dataloader,
                 eval_config,
-                os.path.join(model_dir, eval_result_filename),
+                eval_result_filename=eval_result_filename,
                 global_step=i_step,
                 eval_summary_writer=eval_summary_writer,
+                global_epoch=i_epoch,
             )
             model.train()
 
@@ -499,8 +627,9 @@ def train_and_evaluate(
         edit_config_json (str, optional): edit pipeline config json str.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    train_config = pipeline_config.train_config
     if fine_tune_checkpoint:
-        pipeline_config.train_config.fine_tune_checkpoint = fine_tune_checkpoint
+        train_config.fine_tune_checkpoint = fine_tune_checkpoint
     if train_input_path:
         pipeline_config.train_input_path = train_input_path
     if eval_input_path:
@@ -511,9 +640,10 @@ def train_and_evaluate(
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
 
-    device, _ = init_process_group()
+    device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -535,61 +665,18 @@ def train_and_evaluate(
             gl_cluster=gl_cluster,
         )
 
-    # Build model
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-        sample_weights=list(data_config.sample_weight_fields),
-    )
-    model = TrainWrapper(model)
-
-    sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
-        pipeline_config.train_config.sparse_optimizer
-    )
-    apply_optimizer_in_backward(
-        sparse_optim_cls, model.model.sparse_parameters(), sparse_optim_kwargs
-    )
-
-    planner = create_planner(
-        device=device,
-        # pyre-ignore [16]
-        batch_size=train_dataloader.dataset.sampled_batch_size,
-    )
-
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
-    if is_rank_zero:
-        logger.info(str(plan))
-
-    model = DistributedModelParallel(
-        module=model,
-        device=device,
-        plan=plan,
-    )
-
-    dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
-        pipeline_config.train_config.dense_optimizer
-    )
-    dense_optimizer = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(model.named_parameters())),
-        lambda params: dense_optim_cls(params, **dense_optim_kwargs),
-    )
-    optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
-    sparse_lr = optimizer_builder.create_scheduler(
-        model.fused_optimizer, pipeline_config.train_config.sparse_optimizer
-    )
-    dense_lr = optimizer_builder.create_scheduler(
-        dense_optimizer, pipeline_config.train_config.dense_optimizer
-    )
-
+    # Get Restore Ckpt Path
     ckpt_path = None
     skip_steps = -1
     if pipeline_config.train_config.fine_tune_checkpoint:
         ckpt_path, _ = checkpoint_util.latest_checkpoint(
             pipeline_config.train_config.fine_tune_checkpoint
         )
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            raise RuntimeError(
+                "fine_tune_checkpoint"
+                "[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
+            )
     if os.path.exists(pipeline_config.model_dir):
         # TODO(hongsheng.jhs): save and restore dataloader state.
         latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
@@ -605,6 +692,74 @@ def train_and_evaluate(
                     "model_dir please delete dir model_dir or specify "
                     "--continue_train)"
                 )
+
+    sampler_type = _get_sampler_type(data_config)
+
+    # Build model
+    model = _create_model(
+        pipeline_config.model_config,
+        features,
+        list(data_config.label_fields),
+        sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
+    )
+    model = TrainWrapper(
+        model, device=device, mixed_precision=train_config.mixed_precision
+    )
+
+    sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
+        train_config.sparse_optimizer
+    )
+    trainable_params, frozen_params = model.model.sparse_parameters()
+    apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
+    if len(frozen_params) > 0:
+        # SGD and lr=0 for using fused kernel and freezing params
+        apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
+
+    planner = create_planner(
+        device=device,
+        # pyre-ignore [16]
+        batch_size=train_dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
+        global_constraints_cfg=train_config.global_embedding_constraints,
+    )
+
+    plan = planner.collective_plan(
+        model, get_default_sharders(), dist.GroupMember.WORLD
+    )
+    if is_rank_zero:
+        logger.info(str(plan))
+
+    model = DistributedModelParallel(
+        module=model,
+        device=device,
+        plan=plan,
+    )
+
+    dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
+        train_config.dense_optimizer
+    )
+    dense_optimizer = KeyedOptimizerWrapper(
+        dict(in_backward_optimizer_filter(model.named_parameters())),
+        lambda params: dense_optim_cls(params, **dense_optim_kwargs),
+    )
+    grad_scaler = None
+    if train_config.HasField("grad_scaler"):
+        grad_scaler = GradScaler(
+            device=device.type,
+            **config_util.config_to_kwargs(train_config.grad_scaler),
+        )
+    optimizer = TZRecOptimizer(
+        CombinedOptimizer([model.fused_optimizer, dense_optimizer]),
+        grad_scaler=grad_scaler,
+        gradient_accumulation_steps=train_config.gradient_accumulation_steps,
+    )
+    sparse_lr = optimizer_builder.create_scheduler(
+        model.fused_optimizer, train_config.sparse_optimizer
+    )
+    dense_lr = optimizer_builder.create_scheduler(
+        dense_optimizer, train_config.dense_optimizer
+    )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
     # model_dir first, other slow rank find model_dir already exists and
@@ -625,7 +780,7 @@ def train_and_evaluate(
         eval_dataloader,
         [sparse_lr, dense_lr],
         pipeline_config.model_dir,
-        train_config=pipeline_config.train_config,
+        train_config=train_config,
         eval_config=pipeline_config.eval_config,
         skip_steps=skip_steps,
         ckpt_path=ckpt_path,
@@ -652,9 +807,11 @@ def evaluate(
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
 
-    device, _ = init_process_group()
+    device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    train_config = pipeline_config.train_config
+    allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -667,19 +824,25 @@ def evaluate(
         mode=Mode.EVAL,
     )
 
+    sampler_type = _get_sampler_type(data_config)
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
     )
-    model = TrainWrapper(model)
+    model = TrainWrapper(
+        model, device=device, mixed_precision=train_config.mixed_precision
+    )
 
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
+        global_constraints_cfg=train_config.global_embedding_constraints,
     )
     plan = planner.collective_plan(
         model, get_default_sharders(), dist.GroupMember.WORLD
@@ -718,8 +881,8 @@ def evaluate(
 
 def _script_model(
     pipeline_config: EasyRecConfig,
-    model: nn.Module,
-    state_dict: Dict[str, Any],
+    model: BaseModule,
+    state_dict: Optional[Dict[str, Any]],
     dataloader: DataLoader,
     save_dir: str,
 ) -> None:
@@ -728,22 +891,23 @@ def _script_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        model = model.to_empty(device="cpu")
-        logger.info("gather states to cpu model...")
+        model.set_is_inference(True)
+        if state_dict is not None:
+            model.to_empty(device="cpu")
+            model.load_state_dict(state_dict, strict=False)
 
-    state_dict_gather(state_dict, model.state_dict())
+        # for mc modules, fix output_segments_tensor is a meta tensor.
+        fix_mch_state(model)
 
-    dist.barrier()
-
-    if is_rank_zero:
         batch = next(iter(dataloader))
 
         if is_cuda_export():
             model = model.cuda()
 
-        if is_quant():
+        if is_quant() or is_ec_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=torch.qint8, inplace=True)
+            quantize_embeddings(model, inplace=True)
+            logger.info("finish quantize embeddings...")
 
         model.eval()
 
@@ -802,11 +966,21 @@ def export(
             model specified by model_dir in pipeline_config_path.
         asset_files (str, optional): more files will be copied to export_dir.
     """
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    if not is_rank_zero:
+        logger.warning("Only first rank will be used for export now.")
+        return
+    else:
+        if os.environ.get("WORLD_SIZE") != "1":
+            logger.warning(
+                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
+            )
+            os.environ["WORLD_SIZE"] = "1"
+
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    device, _ = init_process_group()
-    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    dist.init_process_group("gloo")
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
@@ -837,20 +1011,11 @@ def export(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
+        sampler_type=None,
     )
-    model = ScriptWrapper(model)
-
-    planner = create_planner(
-        device=device,
-        batch_size=data_config.batch_size,
-    )
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
-    if is_rank_zero:
-        logger.info(str(plan))
-
-    model = DistributedModelParallel(module=model, device=device, plan=plan)
+    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    model = InferWrapper(model)
+    init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
         checkpoint_path, _ = checkpoint_util.latest_checkpoint(
@@ -873,22 +1038,8 @@ def export(
     else:
         raise ValueError("checkpoint path should be specified.")
 
-    checkpoint_pg = dist.new_group(backend="gloo")
-    if is_rank_zero:
-        logger.info("copy sharded state_dict to cpu...")
-    cpu_state_dict = state_dict_to_device(
-        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
-    )
-
-    cpu_model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-    )
-
-    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
-    if isinstance(cpu_model, MatchModel):
-        for name, module in cpu_model.named_children():
+    if isinstance(model.model, MatchModel):
+        for name, module in model.model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
@@ -898,28 +1049,28 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    cpu_state_dict,
+                    model.state_dict(),
                     dataloader,
                     tower_export_dir,
                 )
                 for asset in assets:
                     shutil.copy(asset, tower_export_dir)
-    elif isinstance(cpu_model, TDM):
-        for name, module in cpu_model.named_children():
+    elif isinstance(model.model, TDM):
+        for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
                 _script_model(
                     ori_pipeline_config,
                     emb_module,
-                    cpu_state_dict,
+                    model.state_dict(),
                     dataloader,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
         _script_model(
             ori_pipeline_config,
-            InferWrapper(cpu_model),
-            cpu_state_dict,
+            model,
+            None,
             dataloader,
             os.path.join(export_dir, "model"),
         )
@@ -928,8 +1079,8 @@ def export(
     else:
         _script_model(
             ori_pipeline_config,
-            InferWrapper(cpu_model),
-            cpu_state_dict,
+            model,
+            None,
             dataloader,
             export_dir,
         )

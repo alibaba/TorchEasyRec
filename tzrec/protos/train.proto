@@ -2,6 +2,21 @@ syntax = "proto2";
 package tzrec.protos;
 
 import "tzrec/protos/optimizer.proto";
+import "tzrec/protos/feature.proto";
+
+message GradScaler {
+    // Initial scale factor
+    optional float init_scale = 1 [default = 65536];
+    // Factor by which the scale is multiplied during update
+    // if no inf/NaN gradients occur for ``growth_interval`` consecutive iterations.
+    optional float growth_factor = 2 [default = 2];
+    // Factor by which the scale is multiplied during update
+    // if inf/NaN gradients occur in an iteration.
+    optional float backoff_factor = 3 [default = 0.5];
+    // Number of consecutive iterations without inf/NaN gradients
+    // that must occur for the scale to be multiplied by ``growth_factor``.
+    optional uint32 growth_interval = 4 [default = 2000];
+}
 
 message TrainConfig {
     // embedding part optimizer
@@ -24,5 +39,23 @@ message TrainConfig {
     optional bool is_profiling = 9 [default = false];
     // use tensorboard or not.
     optional bool use_tensorboard = 10 [default = true];
+    // epoch interval for saving checkpoint
+    optional uint32 save_checkpoints_epochs = 11;
+    // the summaries to be saved in tensorboard, activated only when use_tensorboard=true,
+    // possible values are: "loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"
+    // default values are ["loss", "learning_rate"]
+    repeated string tensorboard_summaries = 12;
+    // where to use torch.backends.cudnn.allow_tf32
+    optional bool cudnn_allow_tf32 = 13 [default = true];
+    // where to use torch.backends.cuda.matmul.allow_tf32
+    optional bool cuda_matmul_allow_tf32 = 14 [default = false];
+    // global embedding param constraints
+    optional ParameterConstraints global_embedding_constraints = 15;
+    // mixed precision dtype.
+    optional string mixed_precision = 16;
+    // grad_scaler dynamically estimates the scale factor each iteration.
+    optional GradScaler grad_scaler = 17;
+    // gradient accumulation steps
+    optional uint32 gradient_accumulation_steps = 18;
     // TBD: qcomm config
 }

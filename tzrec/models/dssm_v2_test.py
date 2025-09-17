@@ -20,7 +20,8 @@ from tzrec.features.feature import create_features
 from tzrec.models.dssm_v2 import DSSMV2
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class DSSMV2Test(unittest.TestCase):
@@ -74,7 +75,12 @@ class DSSMV2Test(unittest.TestCase):
                 )
             ],
         )
-        dssm = DSSMV2(model_config=model_config, features=features, labels=["label"])
+        dssm = DSSMV2(
+            model_config=model_config,
+            features=features,
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
         init_parameters(dssm, device=torch.device("cpu"))
         dssm = create_test_model(dssm, graph_type)
 

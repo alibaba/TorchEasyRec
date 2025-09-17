@@ -14,11 +14,17 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **init_fn**: 特征嵌入初始化方式，默认不需要设置，如需自定义，可以设置任意的torch内置初始化函数，如`nn.init.uniform_,a=-0.01,b=0.01`
 
-- **default_value**: 特征默认值。如果默认值为""，则没有默认值，后续模型中对于空特征的嵌入为零向量。注意: 该默认值为`bucktize`前的默认值。`bucktize`的配置包括`hash_bucket_size`/`vocab_list`/`boundaries`
+- **default_value**: 特征默认值。如果默认值为""，则没有默认值，后续模型中对于空特征的嵌入为零向量。注意: 该默认值为`bucketize`前的默认值。`bucketize`的配置包括`num_buckets`/`hash_bucket_size`/`vocab_list`/`vocab_dict`/`vocab_file`/`boundaries`
 
 - **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`。更建议用数组（ARRAY）类型来表示多值，训练和推理性能更好
 
 - **fg_encoded_default_value**: FG编码后的数据的默认值，当fg_encoded=true并且不是用pai-fg编码数据时，可以设置该参数填充空值
+
+- **trainable**: Embedding Variable是否可训练，默认为true
+
+- **stub_type**: 是否只作为FG的中间结果，不作为FG的输出特征，默认为false。注意: 不能在fg_mode=FG_NORMAL模式下使用。
+
+- **data_type**: 训练的EmbeddingTable的数据类型，支持FP32和FP16，默认为FP32。
 
 ## IdFeature: 类别型特征
 
@@ -74,7 +80,12 @@ feature_configs {
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 
-  - `input_side`可以取值为`user`/`item`/`context`，用于指导推荐模型服务从哪里获取相关特征，`user`表示这个特征是用户侧特征，从请求中获取，`item`表示是物品侧特征，可以从模型服务内存Cache中获取，`context`表示是需从请求里传递的物品侧特征，如召回名等
+  - `input_side`一共支持五种 \[`user`, `item`, `context`, `feature`, `const`\]
+    - `user`: 用户侧特征输入，线上推理时从请求中传入
+    - `item`: 物品侧特征输入，线上推理时会从实时缓存在内存中的特征表里获取
+    - `context`: 由上下文产生物品侧特征输入，线上推理时从请求中传入，如`recall_name`等
+    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果
+    - `const`: 输入为常量
   - `input_name`为来源字段的实际名称
 
 - **hash_bucket_size**: hash bucket的大小。为减少hash冲突，建议设置
@@ -82,15 +93,22 @@ feature_configs {
 
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 
-- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等
+- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
 
 - **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+
+- **vocab_file**: 指定词表或字典形式词表的文件路径，适合取值比较多兵可以枚举的特征，编码未预留，必须设置**default_bucketize_value**参数
+
+  - 词表形式：一行一个词
+  - 字典词表形式：一行一个词和编号，词和编号间用空格分隔
 
 - **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
+
+- **default_bucketize_value**: （可选）指定超出词表的词的编码。当配置了default_bucketize_value时，vocab_list和vocab_dict将不会预留编码给默认值和超出词表的词，用户可完全自主控制vocab_list或vocab_dict
 
 - NOTE: hash_bucket_size, num_buckets, vocab_list, 只能指定其中之一，不能同时指定
 
@@ -105,7 +123,7 @@ feature_configs {
 }
 ```
 
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为`user`/`item`/`context`，`input_name`为来源字段的名称
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为\[`user`, `item`, `context`, `feature`, `const`\]，`input_name`为来源字段的名称
 
 - **normalizer**: 指定连续值特征的变换方式，支持4种，默认不变换
 
@@ -190,7 +208,7 @@ feature_configs: {
 ```
 
 - **separator**: FG多值分隔符，默认为`\x1d`
-- **value_dim**: 指定Embedding特征的输入维度
+- **value_dim**: 默认值为1， 指定Embedding特征的输入维度
 
 ## ComboFeature: 组合特征
 
@@ -238,21 +256,13 @@ feature_configs: {
 
 如果Map的值为离散值 或 `need_key=true`，可设置:
 
-- **hash_bucket_size**: hash bucket的大小。
-- **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
-- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
-- **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
-- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
-- **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
+- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
+- 其余配置同IdFeature
 
 如果Map的值为连续值，可设置:
 
-- **boundaries**: 分箱/分桶的值。
-- **normalizer**: 连续值特征的变换方式，同RawFeature
 - **value_dim**: 默认值是1，连续值输出维度
-- **value_separator**: 连续值分隔符
-- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
+- 其余配置同RawFeature
 
 ## MatchFeature: 主从键字典查询特征
 
@@ -281,20 +291,13 @@ feature_configs: {
 
 如果Map的值为离散值 或 `show_pkey=true` 或 `show_skey=true`，可设置:
 
-- **hash_bucket_size**: hash bucket的大小。
-- **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
-- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征。
-- **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
-- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
-- **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
+- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
+- 其余配置同IdFeature
 
 如果Map的值为连续值，可设置:
 
-- **boundaries**: 分箱/分桶的值。
-- **normalizer**: 连续值特征的变换方式，同RawFeature
 - **value_dim**: 目前只支持value_dim=1
-- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
+- 其余配置同RawFeature
 
 ## ExprFeature: 表达式特征
 
@@ -316,39 +319,70 @@ feature_configs: {
 
 - **expression**: 表达式本身
 
-- **内置函数**:
+- **value_dim**: 默认值是0，value_dim=0时支持多值ID输出
 
-  | 函数名      | 参数数量 | 解释                                   |
-  | ----------- | -------- | -------------------------------------- |
-  | sin         | 1        | sine function                          |
-  | cos         | 1        | cosine function                        |
-  | tan         | 1        | tangens function                       |
-  | asin        | 1        | arcus sine function                    |
-  | acos        | 1        | arcus cosine function                  |
-  | atan        | 1        | arcus tangens function                 |
-  | sinh        | 1        | hyperbolic sine function               |
-  | cosh        | 1        | hyperbolic cosine                      |
-  | tanh        | 1        | hyperbolic tangens function            |
-  | asinh       | 1        | hyperbolic arcus sine function         |
-  | acosh       | 1        | hyperbolic arcus tangens function      |
-  | atanh       | 1        | hyperbolic arcur tangens function      |
-  | log2        | 1        | logarithm to the base 2                |
-  | log10       | 1        | logarithm to the base 10               |
-  | log         | 1        | logarithm to base e (2.71828...)       |
-  | ln          | 1        | logarithm to base e (2.71828...)       |
-  | exp         | 1        | e raised to the power of x             |
-  | sqrt        | 1        | square root of a value                 |
-  | sign        | 1        | sign function -1 if x\<0; 1 if x>0     |
-  | rint        | 1        | round to nearest integer               |
-  | abs         | 1        | absolute value                         |
-  | sigmoid     | 1        | sigmoid function                       |
-  | l2_norm     | 1        | l2 normalize of a vector               |
-  | dot         | 2        | dot product of two vectors             |
-  | euclid_dist | 2        | euclidean distance between two vectors |
-  | min         | var.     | min of all arguments                   |
-  | max         | var.     | max of all arguments                   |
-  | sum         | var.     | sum of all arguments                   |
-  | avg         | var.     | mean value of all arguments            |
+- **内置函数**: 详见[表达式文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/built-in-feature-operator?#1d09c2da3aajb)
+
+  | 函数名      | 参数数量 | 解释                                                                    |
+  | ----------- | -------- | ----------------------------------------------------------------------- |
+  | rnd         | 0        | Generate a random number between 0 and 1                                |
+  | sin         | 1        | sine function                                                           |
+  | cos         | 1        | cosine function                                                         |
+  | tan         | 1        | tangens function                                                        |
+  | asin        | 1        | arcus sine function                                                     |
+  | acos        | 1        | arcus cosine function                                                   |
+  | atan        | 1        | arcus tangens function                                                  |
+  | sinh        | 1        | hyperbolic sine function                                                |
+  | cosh        | 1        | hyperbolic cosine                                                       |
+  | tanh        | 1        | hyperbolic tangens function                                             |
+  | asinh       | 1        | hyperbolic arcus sine function                                          |
+  | acosh       | 1        | hyperbolic arcus tangens function                                       |
+  | atanh       | 1        | hyperbolic arcur tangens function                                       |
+  | log2        | 1        | logarithm to the base 2                                                 |
+  | log10       | 1        | logarithm to the base 10                                                |
+  | log         | 1        | logarithm to base e (2.71828...)                                        |
+  | ln          | 1        | logarithm to base e (2.71828...)                                        |
+  | exp         | 1        | e raised to the power of x                                              |
+  | sqrt        | 1        | square root of a value                                                  |
+  | sign        | 1        | sign function -1 if x\<0; 1 if x>0                                      |
+  | abs         | 1        | absolute value                                                          |
+  | rint        | 1        | round to nearest integer                                                |
+  | floor       | 1        | 向下取整                                                                |
+  | ceil        | 1        | 向上取整                                                                |
+  | trunc       | 1        | 截断取整（直接去掉小数部分）                                            |
+  | round       | 1        | 四舍五入，总是使用"远离零"的舍入方式（round half away from zero）       |
+  | roundp      | 2        | 自定义精度取整函数, e.g. roundp(3.14159,2)=3.14                         |
+  | sigmoid     | 1        | sigmoid function                                                        |
+  | sphere_dist | 4        | sphere distance between two gps points, args(lng1, lat1, lng2, lat2)    |
+  | haversine   | 4        | haversine distance between two gps points, args(lng1, lat1, lng2, lat2) |
+  | sigmoid     | 1        | sigmoid function                                                        |
+  | min         | var.     | min of all arguments                                                    |
+  | max         | var.     | max of all arguments                                                    |
+  | sum         | var.     | sum of all arguments                                                    |
+  | avg         | var.     | mean value of all arguments                                             |
+
+备注：上述内置函数支持批量计算和广播机制
+
+- **内置向量函数**:
+
+  | 函数名       | 参数数量 | 解释                                                  |
+  | ------------ | -------- | ----------------------------------------------------- |
+  | len          | 1        | the length of a vector                                |
+  | l2_norm      | 1        | l2 normalize of a vector                              |
+  | squared_norm | 1        | squared normalize of a vector                         |
+  | dot          | 2        | dot product of two vectors                            |
+  | euclid_dist  | 2        | euclidean distance between two vectors                |
+  | std_dev      | 1        | standard deviation of a vector, divide n              |
+  | pop_std_dev  | 1        | population standard deviation of a vector, divide n-1 |
+  | variance     | 1        | sample variance of a vector, divide n                 |
+  | pop_variance | 1        | population variance of a vector, divide n-1           |
+  | reduce_min   | 1        | reduce min of a vector                                |
+  | reduce_max   | 1        | reduce max of a vector                                |
+  | reduce_sum   | 1        | reduce sum of a vector                                |
+  | reduce_mean  | 1        | reduce mean of a vector                               |
+  | reduce_prod  | 1        | reduce product of a vector                            |
+
+备注：当表达式包含上述内置向量函数时，非向量函数参数的其他变量只能是单值类型(scalar)。
 
 - **内置二元操作符**:
 
@@ -408,12 +442,17 @@ feature_configs: {
 
 - **method**: 重合计算方式，可选 query_common_ratio | title_common_ratio | is_contain | is_equal
 
-  | 方式               | 描述                                          | 备注                           |
-  | ------------------ | --------------------------------------------- | ------------------------------ |
-  | query_common_ratio | 计算query与title间重复term数占query中term比例 | 取值为\[0,1\]                  |
-  | title_common_ratio | 计算query与title间重复term数占title中term比例 | 取值为\[0,1\]                  |
-  | is_contain         | 计算query是否全部包含在title中，保持顺序      | 0表示未包含，1表示包含         |
-  | is_equal           | 计算query是否与title完全相同                  | 0表示不完全相同，1表示完全相同 |
+  | 方式                | 描述                                                        | 备注                                                          |
+  | ------------------- | ----------------------------------------------------------- | ------------------------------------------------------------- |
+  | query_common_ratio  | 计算query与title间重复term数占query中term比例               | 取值为[0,1]                                                   |
+  | title_common_ratio  | 计算query与title间重复term数占title中term比例               | 取值为[0,1]                                                   |
+  | is_contain          | 计算query是否全部包含在title中，保持顺序                    | 0表示未包含，1表示包含                                        |
+  | is_equal            | 计算query是否与title完全相同                                | 0表示不完全相同，1表示完全相同                                |
+  | index_of            | 计算query作为整体第一次出现在title中的位置                  | 没有出现返回-1.0                                              |
+  | proximity_min_cover | 计算query term在title中的邻近度                             | 取值为[0, length(title)], 0表示存在不能匹配的term             |
+  | proximity_min_dist  | 计算query term在title中的邻近度 (minimum pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
+  | proximity_max_dist  | 计算query term在title中的邻近度 (maximum pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
+  | proximity_avg_dist  | 计算query term在title中的邻近度 (average pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
 
 - 其余配置同RawFeature
 
@@ -456,6 +495,43 @@ feature_configs: {
   | TEXT_SPLITCHRS    | 中文拆成单字(空格分隔) |
   | TEXT_REMOVE_SPACE | 去除空格               |
 
+## CustomFeature: 自定义特征
+
+自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
+
+```
+feature_configs: {
+    custom_feature {
+        feature_name: "edit_distance"
+        operator_name: "EditDistance"
+        operator_lib_file: "pyfg/lib/libedit_distance.so"
+        expression: ["user:query", "item:title"]
+        operator_params {
+            fields {
+                key: "encoding"
+                value {
+                    string_value: "utf-8"
+                }
+            }
+        }
+    }
+}
+```
+
+- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
+
+- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+
+- expression: 特征FG所依赖组合字段的来源
+
+- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
+
+| 算子名称     | 算子功能 | 算子动态库                   | 算子参数                                                                         |
+| ------------ | -------- | ---------------------------- | -------------------------------------------------------------------------------- |
+| EditDistance | 编辑距离 | pyfg/lib/libedit_distance.so | • encoding: 输入文本的编码，可选：utf-8, latin，默认值为latin                    |
+| RegexReplace | 正则替换 | pyfg/lib/libregex_replace.so | • regex_patten: 正则表达式，匹配的文本片段将会被替换 <br>• replacement: 替换文本 |
+|              |          |                              |                                                                                  |
+
 ## SequenceIdFeature：类别型序列特征
 
 类别型序列特征，支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；支持ARRAY<string>或ARRAY<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）
@@ -476,7 +552,7 @@ feature_configs: {
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列特征分隔符
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- **value_dim**: 目前只支持value_dim=1，不支持多值ID序列
+- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
 - 其余配置同IdFeature
 
 ## SequenceRawFeature：数值型序列特征
@@ -498,6 +574,57 @@ feature_configs: {
 - **sequence_delim**: 序列特征分隔符
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 - 其余配置同RawFeature
+
+## SequenceCustomFeature: 自定义序列特征
+
+自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
+
+```
+feature_configs: {
+    sequence_custom_feature {
+        feature_name: "seq_expr_1"
+        operator_name: "SeqExpr"
+        operator_lib_file: "pyfg/lib/libseq_expr.so"
+        expression: ["user:cur_time", "item:clk_time_seq"]
+        operator_params {
+            fields {
+                key: "formula"
+                value {
+                    string_value: "cur_time-clk_time_seq"
+                }
+            }
+        }
+    }
+}
+feature_configs: {
+    sequence_custom_feature {
+        feature_name: "seq_expr_2"
+        operator_name: "SeqExpr"
+        operator_lib_file: "pyfg/lib/libseq_expr.so"
+        expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+        operator_params {
+            fields {
+                key: "formula"
+                value {
+                    string_value: "spherical_distance"
+                }
+            }
+        }
+    }
+}
+```
+
+- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
+
+- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+
+- expression: 特征FG所依赖组合字段的来源
+
+- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
+
+| 算子名称 | 算子功能   | 算子动态库              | 算子参数                                                                                                                                                 |
+| -------- | ---------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SeqExpr  | 序列表达式 | pyfg/lib/libseq_expr.so | • formula: 表达式。如果值为spherical_distance， 计算两个经纬度坐标的距离，参数为[lng1_seq, lat1_seq, lng2, lat2]，前两个参数是序列，后两个参数是标量值。 |
 
 ## SequenceFeature：分组序列特征
 
@@ -536,6 +663,18 @@ feature_configs: {
                 expression: "user:ts"
             }
         }
+        features {
+            custom_feature {
+                feature_name: "seq_expr"
+                operator_name: "SeqExpr"
+                operator_lib_file: "pyfg/lib/libseq_expr.so"
+                expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+                operator_params {
+                    key: "formula"
+                    string_value: "spherical_distance"
+                }
+            }
+        }
     }
 }
 ```
@@ -544,8 +683,8 @@ feature_configs: {
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列特征分隔符
 - **sequence_pk**: 序列特征主键，一般为ItemId列表，主要用于线上模型服务，线上模型服务会使用该ItemId列表从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。而行为属性相关子序列（如行为时间序列`ts1;ts2;ts3`）跟用户相关，则仍需从请求从传递。
-- **features**: 序列特征子特征，配置同IdFeature和RawFeature
+- **features**: 序列特征子特征，配置同IdFeature和RawFeature和SequenceCustomFeature
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
   - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。在输入样本数据中列名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，`expression`为`item:iid`，输入样本数据中列名应为`click_seq__iid`。在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
   - 其中当类型为IdFeature时
-    - **value_dim**: 目前只支持value_dim=1，不支持多值ID序列
+    - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出

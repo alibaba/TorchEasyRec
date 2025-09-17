@@ -10,7 +10,7 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
-from itertools import chain
+from collections import OrderedDict
 from queue import Queue
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -25,15 +25,16 @@ from torchrec.modules.embedding_modules import (
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
-from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils.load_class import get_register_class_meta
 
 _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
 
 
-class BaseModel(nn.Module, metaclass=_meta_cls):
+class BaseModel(BaseModule, metaclass=_meta_cls):
     """TorchEasyRec base model.
 
     Args:
@@ -125,21 +126,46 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
             metric.reset()
         return metric_results
 
-    def sparse_parameters(self) -> Iterable[nn.Parameter]:
+    def sparse_parameters(
+        self,
+    ) -> Tuple[Iterable[nn.Parameter], Iterable[nn.Parameter]]:
         """Get an iterator over sparse parameters of the module."""
         q = Queue()
         q.put(self)
-        parameters_list = []
+        trainable_parameters_list = []
+        frozen_parameters_list = []
         while not q.empty():
             m = q.get()
-            if isinstance(m, EmbeddingBagCollectionInterface) or isinstance(
-                m, EmbeddingCollectionInterface
-            ):
-                parameters_list.append(m.parameters())
+            if isinstance(m, EmbeddingBagCollectionInterface):
+                frozen_names = {
+                    f".{t.name}.weight"
+                    for t in m.embedding_bag_configs()
+                    # pyre-ignore [16]
+                    if not t.trainable
+                }
+                for name, param in m.named_parameters():
+                    frozen = any(map(lambda x: name.endswith(x), frozen_names))
+                    if frozen:
+                        frozen_parameters_list.append(param)
+                    else:
+                        trainable_parameters_list.append(param)
+            elif isinstance(m, EmbeddingCollectionInterface):
+                frozen_names = {
+                    f".{t.name}.weight"
+                    for t in m.embedding_configs()
+                    # pyre-ignore [16]
+                    if not t.trainable
+                }
+                for name, param in m.named_parameters():
+                    frozen = any(map(lambda x: name.endswith(x), frozen_names))
+                    if frozen:
+                        frozen_parameters_list.append(param)
+                    else:
+                        trainable_parameters_list.append(param)
             else:
                 for child in m.children():
                     q.put(child)
-        return chain.from_iterable(parameters_list)
+        return trainable_parameters_list, frozen_parameters_list
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model."""
@@ -154,29 +180,61 @@ class BaseModel(nn.Module, metaclass=_meta_cls):
         self,
         losses: Dict[str, torch.Tensor],
         batch: Batch,
-        label_name: str,
+        label: torch.Tensor,
         loss_cfg: LossConfig,
         suffix: str = "",
     ) -> None:
-        label = batch.labels[label_name]
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
         loss = losses[loss_name]
         self._metric_modules[loss_name].update(loss, loss.new_tensor(label.size(0)))
+
+    def get_features_in_feature_groups(
+        self, feature_groups: List[FeatureGroupConfig]
+    ) -> List[BaseFeature]:
+        """Select features order by feature groups."""
+        name_to_feature = {x.name: x for x in self._features}
+        grouped_features = OrderedDict()
+        for feature_group in feature_groups:
+            for x in feature_group.feature_names:
+                grouped_features[x] = name_to_feature[x]
+            for sequence_group in feature_group.sequence_groups:
+                for x in sequence_group.feature_names:
+                    grouped_features[x] = name_to_feature[x]
+        return list(grouped_features.values())
 
 
 TRAIN_OUT_TYPE = Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Batch]
 TRAIN_FWD_TYPE = Tuple[torch.Tensor, TRAIN_OUT_TYPE]
 
 
-class TrainWrapper(nn.Module):
+class TrainWrapper(BaseModule):
     """Model train wrapper for pipeline."""
 
-    def __init__(self, module: nn.Module) -> None:
+    def __init__(
+        self,
+        module: nn.Module,
+        device: Optional[torch.device] = None,
+        mixed_precision: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.model = module
         self.model.init_loss()
         self.model.init_metric()
+        self._device = device
+        self._device_type = "cpu"
+        if device is not None:
+            self._device_type = device.type
+        if mixed_precision is None or len(mixed_precision) == 0:
+            self._mixed_dtype = None
+        elif mixed_precision == "FP16":
+            self._mixed_dtype = torch.float16
+        elif mixed_precision == "BF16":
+            self._mixed_dtype = torch.bfloat16
+        else:
+            raise ValueError(
+                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
+            )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -190,23 +248,33 @@ class TrainWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
         """
-        predictions = self.model.predict(batch)
-        losses = self.model.loss(predictions, batch)
-        total_loss = torch.stack(list(losses.values())).sum()
+        with torch.amp.autocast(
+            device_type=self._device_type,
+            dtype=self._mixed_dtype,
+            enabled=self._mixed_dtype is not None,
+        ):
+            predictions = self.model.predict(batch)
+            losses = self.model.loss(predictions, batch)
+            total_loss = torch.stack(list(losses.values())).sum()
 
         losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}
         return total_loss, (losses, predictions, batch)
 
 
-class ScriptWrapper(nn.Module):
+class ScriptWrapper(BaseModule):
     """Model inference wrapper for jit.script."""
 
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
         self._features = self.model._features
-        self._data_parser = DataParser(self._features)
+        self._data_parser = DataParser(
+            self._features,
+            sampler_type=str(module.sampler_type)
+            if hasattr(module, "sampler_type")
+            else None,
+        )
 
     def get_batch(
         self,

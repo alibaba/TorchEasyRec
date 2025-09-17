@@ -18,6 +18,8 @@ message NegativeSampler {
     optional uint32 num_eval_sample = 6 [default=0];
     // field delimiter of input data
     optional string field_delimiter = 7;
+    // item id delimiter
+    optional string item_id_delim = 8 [default=";"];
 }
 
 

@@ -102,8 +102,6 @@ class MultiTaskRank(RankModel):
                         batch.labels[label_name].device
                     )
 
-                loss_weight *= task_tower_cfg.weight
-
                 if task_tower_cfg.HasField("task_space_indicator_label"):
                     in_task_space = (
                         batch.labels[task_tower_cfg.task_space_indicator_label] > 0
@@ -114,6 +112,8 @@ class MultiTaskRank(RankModel):
                     )
 
                 loss_weight = div_no_nan(loss_weight, torch.mean(loss_weight))
+
+                loss_weight *= task_tower_cfg.weight
             else:
                 loss_weight = None
 
@@ -122,7 +122,7 @@ class MultiTaskRank(RankModel):
                     self._loss_impl(
                         predictions,
                         batch,
-                        label_name,
+                        batch.labels[label_name],
                         loss_weight,
                         loss_cfg,
                         num_class=task_tower_cfg.num_class,
@@ -165,7 +165,7 @@ class MultiTaskRank(RankModel):
                 self._update_metric_impl(
                     predictions,
                     batch,
-                    label_name,
+                    batch.labels[label_name],
                     metric_cfg,
                     num_class=task_tower_cfg.num_class,
                     suffix=f"_{tower_name}",
@@ -175,7 +175,7 @@ class MultiTaskRank(RankModel):
                     self._update_loss_metric_impl(
                         losses,
                         batch,
-                        label_name,
+                        batch.labels[label_name],
                         loss_cfg,
                         suffix=f"_{tower_name}",
                     )

@@ -28,26 +28,17 @@ sample_weight_fields: 'col_name'
 - OdpsDataset: 输入数据为MaxCompute表
 
   - **前置条件**:
+
     - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
-    - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/perform-access-control-based-on-tenant-level-roles#section-mt7-tmu-f49)文档，编写如下Policy，精细授予用户Quota的使用权限
-    ```
-    {
-        "Version": "1",
-        "Statement": [
-            {
-                "Action": "odps:Usage",
-                "Effect": "Allow",
-                "Resource": [
-                    "acs:odps:*:regions/*/quotas/pay-as-you-go"
-                ]
-            }
-        ]
-    }
-    ```
+    - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
+
   - input_path: 按如下格式设置
+
     - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
     - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
+
   - 运行训练/评估/导出/预测等命令时
+
     - **本地环境**：
       - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
       ```bash
@@ -55,7 +46,7 @@ sample_weight_fields: 'col_name'
       project_name=${PROJECT_NAME}
       access_id=${ACCESS_ID}
       access_key=${ACCESS_KEY}
-      end_point=http://service.{region}.maxcompute.aliyun-inc.com/api
+      end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
       EOF
 
       ODPS_CONFIG_FILE_PATH=odps_conf \
@@ -67,19 +58,22 @@ sample_weight_fields: 'col_name'
     - **PAI-DLC/PAI-DSW环境**：
       - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
       ```bash
-      ODPS_ENDPOINT=http://service.{region}.maxcompute.aliyun-inc.com/api \
+      ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
       torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
       --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
       -m tzrec.train_eval \
       --pipeline_config_path ${PIPELINE_CONFIG}
       ```
-  - 如果是预付费Quota，可通过`odps_data_quota_name`传入购买的Quota名
+
+  - 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
+
+  - 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
 
 - ParquetDataset: 输入数据为parquet格式
 
   - input_path: 按如下格式设置
     - `${PATH_TO_DATA_DIR}/*.parquet`
-  - 注意: 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等
+  - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
 - CsvDataset: 输入数据为csv格式
 
@@ -87,7 +81,7 @@ sample_weight_fields: 'col_name'
     - `${PATH_TO_DATA_DIR}/*.csv`
   - 需设置`delimiter`来指名列分隔符，默认为`,`
   - 注意:
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量基本相等
+    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
     - 暂不支持没有header的csv文件
     - csv格式数据读性能有瓶颈
 
@@ -109,11 +103,12 @@ sample_weight_fields: 'col_name'
   }
   ```
 
-  - 特征输入的side一共支持四种 \[`user`, `item`, `context`, `feature`\]，上述`lookup_feat`中的`cate_map`则是属于`user`side
+  - 特征输入的side一共支持五种 \[`user`, `item`, `context`, `feature`, `const`\]，上述`lookup_feat`中的`cate_map`则是属于`user`side
     - `user`: 用户侧特征输入，线上推理时从请求中传入
     - `item`: 物品侧特征输入，线上推理时会从实时缓存在内存中的特征表里获取
     - `context`: 由上下文产生物品侧特征输入，线上推理时从请求中传入，如`recall_name`等
-    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果。
+    - `feature`: 来自其他特征FG的输出，如下述`lookup_age_feat`的输入`age_binning`来自于RawFeature `age`的分箱结果
+    - `const`: 输入为常量
     ```
     feature_configs {
         raw_feature {
@@ -132,6 +127,15 @@ sample_weight_fields: 'col_name'
             boundaries: [0, 1, 2, 3, 4]
         }
     }
+    feature_configs {
+        lookup_feature {
+            feature_name: "lookup_age_feat"
+            map: "item:age_map"
+            key: "const:age1"
+            embedding_dim: 16
+            boundaries: [0, 1, 2, 3, 4]
+        }
+    }
     ```
 
 #### fg_mode=FG_DAG
@@ -142,7 +146,7 @@ sample_weight_fields: 'col_name'
 
 #### fg_mode=FG_NORMAL
 
-- 训练时会在Dataset中执行FG，但不是以DAG方式运行。因此特征的输入中如果有`feature` side的输入，也需要在输入表中。目前更建议使用`FG_DAG`模式
+- 训练时会在Dataset中执行FG，但不是以DAG方式运行。因此特征的输入中如果有`feature`,`const`side的输入，也需要在输入表中。目前更建议使用`FG_DAG`模式
 
 #### fg_mode=FG_NONE
 
@@ -151,21 +155,33 @@ sample_weight_fields: 'col_name'
 - 该模式训练速度最佳，但需提前对数据提前进行FG编码，目前仅提供MaxCompute方式，步骤如下：
   - 在DLC/DSW/Local环境中生成fg json配置，上传至DataWorks的资源中，如果fg_output_dir中有vocab_file等其他文件，也需要上传至资源中
     ```shell
+    cat <<EOF>> odps_conf
+    access_id=${ACCESS_ID}
+    access_key=${ACCESS_KEY}
+    end_point=http://service.${region}-vpc.maxcompute.aliyun-inc.com/api
+    EOF
+
+    ODPS_CONFIG_FILE_PATH=odps_conf \
     python -m tzrec.tools.create_fg_json \
         --pipeline_config_path ${PIPELINE_CONFIG_PATH} \
         --fg_output_dir fg_output \
-        --reserves ${COLS_YOU_WANT_RESERVE}
+        --reserves ${COLS_YOU_WANT_RESERVE} \
+        --fg_resource_name ${FG_RESOURCE_NAME} \
+        --odps_project_name ${PROJECT_NAME}
     ```
     - --pipeline_config_path: 模型配置文件。
     - --fg_output_dir: fg json的输出文件夹。
     - --reserves: 需要透传到输出表的列，列名用逗号分隔。一般需要保留Label列，也可以保留request_id，user_id，item_id列，注意：如果模型的feature_config中有user_id，item_id作为特征，feature_name需避免与样本中的user_id，item_id列名冲突。
+    - --fg_resource_name: 可选，fg json在MaxCompute中的资源名，默认为fg.json
+    - --odps_project_name: 可选，将fg json文件上传到MaxCompute项目名，该参数必须配合参数fg_resource_name和环境变量ODPS_CONFIG_FILE_PATH一起使用
+    - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg039-0.3.9-cp37-cp37m-linux_x86_64.whl
+    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg073-0.7.3-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg039 import offline_pyfg
+    from pyfg073 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",
@@ -222,6 +238,14 @@ sample_weight_fields: 'col_name'
 
 - 每个`proc`上的读数据并发度，`nproc-per-node * num_workers`建议小于单机CPU核数
 - 如果`num_workers==0`，数据进程和训练进程将会在一个进程中，便于调试
+
+### shuffle
+
+- 是否训练时打散数据，默认为false
+
+### shuffle_buffer_size
+
+- 最多缓存多少个batch用于打散数据，默认为32
 
 ### fg_encoded_multival_sep
 

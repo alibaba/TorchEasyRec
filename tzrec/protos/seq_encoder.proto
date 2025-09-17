@@ -10,6 +10,8 @@ message DINEncoder {
     required string input = 2;
     // mlp config for target attention score
     required MLP attn_mlp = 3;
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
 }
 
 message SimpleAttention {
@@ -17,6 +19,8 @@ message SimpleAttention {
     optional string name = 1;
     // sequence feature name
     required string input = 2;
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
 }
 
 message PoolingEncoder {
@@ -26,6 +30,23 @@ message PoolingEncoder {
     required string input = 2;
     // pooling type, sum or mean
     optional string pooling_type = 3 [default = 'mean'];
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
+}
+
+message SelfAttentionEncoder {
+    // seq encoder name
+    optional string name = 1;
+    // sequence feature name
+    required string input = 2;
+    // multihead_attn_dim must be divisible by num_heads
+    optional int32 multihead_attn_dim = 3 [default = 512];
+    // self attention num heads
+    optional int32 num_heads = 4 [default = 8];
+    // dropout for attn_output_weights
+    optional float dropout = 5 [default = 0.0];
+    // maximum sequence length
+    optional int32 max_seq_length = 6 [default = 0];
 }
 
 message MultiWindowDINEncoder {
@@ -51,7 +72,7 @@ message HSTUEncoder {
     // linear dimension
     optional int32 linear_dim = 5 [default = 64];
     // maximum sequence length
-    optional int32 max_seq_length = 6;
+    optional int32 max_seq_length = 6 [default = 0];
     // dropout rate for positional embeddings
     optional float pos_dropout_rate = 7 [default = 0.2];
     // dropout rate for linear layers
@@ -81,5 +102,6 @@ message SeqEncoderConfig {
         PoolingEncoder pooling_encoder = 3;
         MultiWindowDINEncoder multi_window_din_encoder = 4;
         HSTUEncoder hstu_encoder = 5;
+        SelfAttentionEncoder self_attention_encoder = 6;
     }
 }

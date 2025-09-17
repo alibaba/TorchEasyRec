@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -17,12 +16,11 @@ import torch.nn.functional as F
 from torch import nn
 from torch._tensor import Tensor
 
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import HARD_NEG_INDICES, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTower
 from tzrec.modules.mlp import MLP
-from tzrec.protos import model_pb2, tower_pb2
-from tzrec.protos.models import match_model_pb2
+from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
@@ -45,7 +43,7 @@ class DSSMTower(MatchTower):
         output_dim (int): user/item output embedding dimension.
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
-        feature_group (FeatureGroupConfig): feature group config.
+        feature_groups (list[FeatureGroupConfig]): feature group configs.
         features (list): list of features.
     """
 
@@ -53,13 +51,13 @@ class DSSMTower(MatchTower):
         self,
         tower_config: tower_pb2.Tower,
         output_dim: int,
-        similarity: match_model_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
+        similarity: simi_pb2.Similarity,
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         model_config: model_pb2.ModelConfig,
     ) -> None:
         super().__init__(
-            tower_config, output_dim, similarity, feature_group, features, model_config
+            tower_config, output_dim, similarity, feature_groups, features, model_config
         )
         self.init_input()
         tower_feature_in = self.embedding_group.group_total_dim(self._group_name)
@@ -74,13 +72,13 @@ class DSSMTower(MatchTower):
             batch (Batch): input batch data.
 
         Return:
-            embedding (dict): tower output embedding.
+            embedding (Tensor): tower output embedding.
         """
         grouped_features = self.build_input(batch)
         output = self.mlp(grouped_features[self._group_name])
         if self._output_dim > 0:
             output = self.output(output)
-        if self._similarity == match_model_pb2.Similarity.COSINE:
+        if self._similarity == simi_pb2.Similarity.COSINE:
             output = F.normalize(output, p=2.0, dim=1)
         return output
 
@@ -107,22 +105,15 @@ class DSSM(MatchModel):
 
         user_group = name_to_feature_group[self._model_config.user_tower.input]
         item_group = name_to_feature_group[self._model_config.item_tower.input]
-
-        name_to_feature = {x.name: x for x in features}
-        user_features = OrderedDict(
-            [(x, name_to_feature[x]) for x in user_group.feature_names]
-        )
-        for sequence_group in user_group.sequence_groups:
-            for x in sequence_group.feature_names:
-                user_features[x] = name_to_feature[x]
-        item_features = [name_to_feature[x] for x in item_group.feature_names]
+        user_features = self.get_features_in_feature_groups([user_group])
+        item_features = self.get_features_in_feature_groups([item_group])
 
         self.user_tower = DSSMTower(
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
-            list(user_features.values()),
+            [user_group],
+            user_features,
             model_config,
         )
 
@@ -130,7 +121,7 @@ class DSSM(MatchModel):
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            item_group,
+            [item_group],
             item_features,
             model_config,
         )
@@ -154,6 +145,11 @@ class DSSM(MatchModel):
         )
 
         ui_sim = (
-            self.sim(user_tower_emb, item_tower_emb) / self._model_config.temperature
+            self.sim(
+                user_tower_emb,
+                item_tower_emb,
+                batch.additional_infos.get(HARD_NEG_INDICES, None),
+            )
+            / self._model_config.temperature
         )
         return {"similarity": ui_sim}

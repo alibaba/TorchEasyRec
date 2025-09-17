@@ -31,7 +31,7 @@ def get_version():
     with codecs.open(version_file, "r") as f:
         exec(compile(f.read(), version_file, "exec"))
     if "NIGHTLY_VERSION" in os.environ:
-        return f'{locals()["__version__"]}+{os.environ["NIGHTLY_VERSION"]}'
+        return f"{locals()['__version__']}+{os.environ['NIGHTLY_VERSION']}"
     else:
         return locals()["__version__"]
 
@@ -79,5 +79,6 @@ setup(
         "all": parse_requirements("requirements.txt"),
         "tests": parse_requirements("requirements/test.txt"),
         "gpu": parse_requirements("requirements/gpu.txt"),
+        "cpu": parse_requirements("requirements/cpu.txt"),
     },
 )

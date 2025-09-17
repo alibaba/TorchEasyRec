@@ -15,6 +15,7 @@ import os
 import time
 from typing import Any, Dict, List, Tuple
 
+from tzrec.tests.utils import _standalone
 from tzrec.utils import config_util, misc_util
 
 TEXT_RESET = "\033[0m"
@@ -55,31 +56,65 @@ def print_balance(*args, **kwargs):
     print(f"{TEXT_BOLD_YELLOW}[BALANCE]{TEXT_RESET}", *args, **kwargs)
 
 
-def _get_odps_config() -> Dict[str, str]:
-    """Get ODPS config."""
-    odps_config = {}
+def _get_benchmark_project() -> str:
+    """Get ODPS project for benchmark."""
+    project = os.environ.get("CI_ODPS_PROJECT_NAME", "")
     if "ODPS_CONFIG_FILE_PATH" in os.environ:
         with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
             for line in f.readlines():
                 values = line.split("=", 1)
-                if len(values) == 2:
-                    odps_config[values[0]] = values[1].strip()
-    return odps_config
+                if len(values) == 2 and values[0] == "project_name":
+                    project = values[1].strip()
+    return project
 
 
 def _modify_pipline_config(
     pipeline_config_path: str,
     model_path: str,
     run_config_path: str,
-    odps_config: Dict[str, str],
 ) -> None:
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     pipeline_config.model_dir = model_path
-    project = odps_config["project_name"]
+    project = _get_benchmark_project()
     train_input_path = pipeline_config.train_input_path.format(PROJECT=project)
     pipeline_config.train_input_path = train_input_path
     eval_input_path = pipeline_config.eval_input_path.format(PROJECT=project)
     pipeline_config.eval_input_path = eval_input_path
+
+    if pipeline_config.data_config.HasField("negative_sampler"):
+        sampler = pipeline_config.data_config.negative_sampler
+        sampler.input_path = sampler.input_path.format(PROJECT=project)
+    elif pipeline_config.data_config.HasField("negative_sampler_v2"):
+        sampler = pipeline_config.data_config.negative_sampler_v2
+        sampler.user_input_path = sampler.user_input_path.format(PROJECT=project)
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.pos_edge_input_path = sampler.pos_edge_input_path.format(
+            PROJECT=project
+        )
+    elif pipeline_config.data_config.HasField("hard_negative_sampler"):
+        sampler = pipeline_config.data_config.hard_negative_sampler
+        sampler.user_input_path = sampler.user_input_path.format(PROJECT=project)
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.hard_neg_edge_input_path = sampler.hard_neg_edge_input_path.format(
+            PROJECT=project
+        )
+    elif pipeline_config.data_config.HasField("hard_negative_sampler_v2"):
+        sampler = pipeline_config.data_config.hard_negative_sampler_v2
+        sampler.user_input_path = sampler.user_input_path.format(PROJECT=project)
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.pos_edge_input_path = sampler.pos_edge_input_path.format(
+            PROJECT=project
+        )
+        sampler.hard_neg_edge_input_path = sampler.hard_neg_edge_input_path.format(
+            PROJECT=project
+        )
+    elif pipeline_config.data_config.HasField("tdm_sampler"):
+        sampler = pipeline_config.data_config.tdm_sampler
+        sampler.item_input_path = sampler.item_input_path.format(PROJECT=project)
+        sampler.edge_input_path = sampler.edge_input_path.format(PROJECT=project)
+        sampler.predict_edge_input_path = sampler.predict_edge_input_path.format(
+            PROJECT=project
+        )
     config_util.save_message(pipeline_config, run_config_path)
 
 
@@ -89,16 +124,12 @@ def _benchmark_train_eval(
 ) -> bool:
     """Run train_eval for benchmark."""
     cmd_str = (
-        "PYTHONPATH=. torchrun --standalone "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         "--nnodes=1 --nproc-per-node=2 "
         f"--log_dir {log_path} -r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {run_config_path}"
     )
-    p = misc_util.run_cmd(cmd_str, log_path + ".log")
-    p.wait(6000)
-    if p.returncode != 0:
-        return False
-    return True
+    return misc_util.run_cmd(cmd_str, log_path + ".log", timeout=20000)
 
 
 def _get_config_paths(pipeline_config_paths: str) -> List[str]:
@@ -216,7 +247,6 @@ def main(
     base_metric_path: str = "tzrec/benchmark/configs/base_eval_metric.json",
 ) -> None:
     """Run benchmarks."""
-    odps_config = _get_odps_config()
     train_config_paths = _get_config_paths(pipeline_config_paths)
     f = open(base_metric_path)
     base_eval_metrics = json.load(f)
@@ -243,9 +273,7 @@ def main(
             new_config_path = os.path.join(configs_path, file_path + ".config")
             model_path = os.path.join(models_path, file_path)
             log_path = os.path.join(logs_path, file_path)
-            _modify_pipline_config(
-                old_config_path, model_path, new_config_path, odps_config
-            )
+            _modify_pipline_config(old_config_path, model_path, new_config_path)
             success = _benchmark_train_eval(new_config_path, log_path)
             if success:
                 train_metric = _get_train_metrics(model_path)

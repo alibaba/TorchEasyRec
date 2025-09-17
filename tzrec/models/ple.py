@@ -77,11 +77,11 @@ class PLE(MultiTaskRank):
             in_extraction_networks = output_dims[:-1]
             in_shared_expert = output_dims[-1]
         self._task_tower = nn.ModuleList()
-        for i, tower_cgf in enumerate(self._task_tower_cfgs):
-            tower_cgf = config_to_kwargs(tower_cgf)
-            mlp = tower_cgf["mlp"] if "mlp" in tower_cgf else None
+        for i, tower_cfg in enumerate(self._task_tower_cfgs):
+            tower_cfg = config_to_kwargs(tower_cfg)
+            mlp = tower_cfg["mlp"] if "mlp" in tower_cfg else None
             self._task_tower.append(
-                TaskTower(in_extraction_networks[i], tower_cgf["num_class"], mlp=mlp)
+                TaskTower(in_extraction_networks[i], tower_cfg["num_class"], mlp=mlp)
             )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:

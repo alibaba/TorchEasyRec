@@ -8,7 +8,7 @@ RUN sed -i "s@http://archive.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/so
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates \
-        ccache cmake gcc git vim watchman wget curl && \
+        ccache cmake gcc git vim watchman wget curl sudo iproute2 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/libidn11_1.33-2.2ubuntu2_amd64.deb && \
@@ -26,25 +26,43 @@ ENV PATH /opt/conda/bin:$PATH
 
 ARG DEVICE
 RUN case ${DEVICE} in \
-        "cu121") pip install torch==2.5.0 fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cu121 && \
-                 pip uninstall -y nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
-                 sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python3.11/site-packages/torch-2.5.0+cu121.dist-info/METADATA && \
-                 pip install torchmetrics==1.0.3 torch_tensorrt==2.5.0 && \
-                 pip install torchrec==1.0.0 --index-url https://download.pytorch.org/whl/cu121 ;; \
-        * )      pip install torch==2.5.0 fbgemm-gpu==1.0.0 --index-url https://download.pytorch.org/whl/cpu && \
-                 pip install torchmetrics==1.0.3 && \
-                 pip install torchrec==1.0.0 --index-url https://download.pytorch.org/whl/cpu ;; \
+        "cu126") wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+                 dpkg -i cuda-keyring_1.1-1_all.deb && \
+                 apt-get update && \
+                 apt-get install -y cuda-toolkit-12-6 cuda-compat-12-6 && \
+                 rm -f /usr/local/cuda && \
+                 rm -rf /var/lib/apt/lists/* ;; \
+    esac
+RUN case ${DEVICE} in \
+        "cu126") pip install torch==2.8.0 fbgemm-gpu==1.3.0 --index-url https://download.pytorch.org/whl/cu126 && \
+                 pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
+                 sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python3.11/site-packages/torch-2.8.0+cu126.dist-info/METADATA && \
+                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchrec==1.3.0 && \
+                 pip cache purge ;; \
+        * )      pip install torch==2.8.0 fbgemm-gpu==1.3.0 --index-url https://download.pytorch.org/whl/cpu && \
+                 pip install torchmetrics==1.0.3 tensordict && \
+                 pip install torchrec==1.3.0 && \
+                 pip cache purge ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
 
 ENV NVIDIA_VISIBLE_DEVICES all
 ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
+ARG LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 
-ADD requirements.txt /root/requirements.txt
 ADD requirements /root/requirements
-RUN cd /root && pip install -r requirements.txt && rm requirements.txt
+ADD requirements.txt /root/requirements.txt
+ADD requirements-cpu.txt /root/requirements-cpu.txt
+ADD requirements-gpu.txt /root/requirements-gpu.txt
+RUN cd /root && \
+    case ${DEVICE} in \
+        "cu126") pip install -r requirements-gpu.txt ;; \
+        * )      pip install -r requirements-cpu.txt ;; \
+    esac && \
+    rm -rf requirements requirements.txt requirements-cpu.txt requirements-gpu.txt && \
+    /opt/conda/bin/conda clean -ya
 
 RUN mkdir -p /home/pai/bin && \
     wget -O /home/pai/bin/prepare_dlc_environment https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pai/prepare_dlc_environment.sh && \

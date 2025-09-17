@@ -55,7 +55,7 @@ class TokenizeFeature(IdFeature):
     @property
     def num_embeddings(self) -> int:
         """Get embedding row count."""
-        if self.config.HasField("vocab_file"):
+        if len(self.vocab_file) > 0:
             if self._tok_fg_op is None:
                 self.init_fg()
             num_embeddings = self._tok_fg_op.vocab_size()
@@ -69,6 +69,31 @@ class TokenizeFeature(IdFeature):
     def value_dim(self) -> int:
         """Fg value dimension of the feature."""
         return 0
+
+    @property
+    def vocab_file(self) -> str:
+        """Vocab file."""
+        if self.config.HasField("vocab_file"):
+            # for tokenize feature, tokenize info already in vocab model,
+            # we do not need check default_bucketize_value
+            vocab_file = self.config.vocab_file
+            if self.config.HasField("asset_dir"):
+                vocab_file = os.path.join(self.config.asset_dir, vocab_file)
+            return vocab_file
+        else:
+            return ""
+
+    @property
+    def stop_char_file(self) -> str:
+        """Stop char file."""
+        stop_char_file = ""
+        if self.config.HasField("text_normalizer"):
+            norm_cfg = self.config.text_normalizer
+            if norm_cfg.HasField("stop_char_file"):
+                stop_char_file = norm_cfg.stop_char_file
+                if self.config.HasField("asset_dir"):
+                    stop_char_file = os.path.join(self.config.asset_dir, stop_char_file)
+        return stop_char_file
 
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse input data for the feature impl.
@@ -137,11 +162,8 @@ class TokenizeFeature(IdFeature):
             }
             if norm_cfg.HasField("max_length"):
                 norm_fg_cfg["max_length"] = norm_cfg.max_length
-            if norm_cfg.HasField("stop_char_file"):
-                stop_char_file = norm_cfg.stop_char_file
-                if self.config.HasField("asset_dir"):
-                    stop_char_file = os.path.join(self.config.asset_dir, stop_char_file)
-                norm_fg_cfg["stop_char_file"] = stop_char_file
+            if len(self.stop_char_file) > 0:
+                norm_fg_cfg["stop_char_file"] = self.stop_char_file
             if len(norm_cfg.norm_options) > 0:
                 parameter = 0
                 for norm_option in norm_cfg.norm_options:
@@ -152,10 +174,6 @@ class TokenizeFeature(IdFeature):
                 norm_fg_cfg["parameter"] = parameter
             fg_cfgs.append(norm_fg_cfg)
 
-        vocab_file = self.config.vocab_file
-        if self.config.HasField("asset_dir"):
-            vocab_file = os.path.join(self.config.asset_dir, vocab_file)
-
         assert self.config.tokenizer_type in [
             "bpe",
             "sentencepiece",
@@ -164,20 +182,20 @@ class TokenizeFeature(IdFeature):
             "feature_type": "tokenize_feature",
             "feature_name": self.name,
             "default_value": self.config.default_value,
-            "vocab_file": vocab_file,
+            "vocab_file": self.vocab_file,
             "expression": expression,
             "tokenizer_type": self.config.tokenizer_type,
             "output_type": "word_id",
             "output_delim": self._fg_encoded_multival_sep,
         }
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         fg_cfgs.append(fg_cfg)
         return fg_cfgs
 
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
-        assets = {"vocab_file": self.config.vocab_file}
-        if self.config.HasField("text_normalizer"):
-            norm_cfg = self.config.text_normalizer
-            if norm_cfg.HasField("stop_char_file"):
-                assets["text_normalizer.stop_char_file"] = norm_cfg.stop_char_file
+        assets = {"vocab_file": self.vocab_file}
+        if len(self.stop_char_file) > 0:
+            assets["text_normalizer.stop_char_file"] = self.stop_char_file
         return assets

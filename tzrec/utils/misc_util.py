@@ -16,6 +16,8 @@ import string
 import subprocess
 from datetime import datetime
 
+RUN_CMD_RETRY_NUM = 3
+
 
 def random_name(length: int = 8) -> str:
     """Generate a random name with ascii_letters and digits."""
@@ -26,18 +28,33 @@ def random_name(length: int = 8) -> str:
 
 
 # pyre-ignore [2, 3]
-def run_cmd(cmd_str, log_file, env=None):
+def run_cmd(cmd_str, log_file, env=None, timeout=None):
     """Run a shell cmd."""
     cmd_str = cmd_str.replace("\r", " ").replace("\n", " ")
     log_dir = os.path.dirname(log_file)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-    print("RUNCMD: %s > %s 2>&1 " % (cmd_str, log_file))
-    with open(log_file, "w") as lfile:
-        proc = subprocess.Popen(
-            cmd_str, stdout=lfile, stderr=subprocess.STDOUT, shell=True, env=env
-        )
-        return proc
+
+    for _ in range(RUN_CMD_RETRY_NUM):
+        if "#MASTER_PORT#" in cmd_str:
+            run_cmd_str = cmd_str.replace("#MASTER_PORT#", str(get_free_port()))
+        else:
+            run_cmd_str = cmd_str
+        print("RUNCMD: %s > %s 2>&1 " % (run_cmd_str, log_file))
+        with open(log_file, "w") as lfile:
+            proc = subprocess.Popen(
+                run_cmd_str, stdout=lfile, stderr=subprocess.STDOUT, shell=True, env=env
+            )
+        proc.wait(timeout)
+        if proc.returncode == 0:
+            return True
+        else:
+            with open(log_file) as lfile:
+                if "The server socket has failed to listen" in lfile.read():
+                    continue
+                else:
+                    return False
+    return False
 
 
 def get_free_port(host: str = "127.0.0.1") -> int:

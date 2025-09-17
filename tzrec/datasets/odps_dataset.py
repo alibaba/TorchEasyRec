@@ -12,6 +12,7 @@
 
 import os
 import random
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -21,12 +22,13 @@ import urllib3
 from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
 from odps.accounts import (
-    AliyunAccount,
     BaseAccount,
+    CloudAccount,
     CredentialProviderAccount,
 )
 from odps.apis.storage_api import (
     ArrowReader,
+    Compression,
     ReadRowsRequest,
     SessionRequest,
     SessionStatus,
@@ -42,9 +44,13 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.utils import calc_slice_position, remove_nullable
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+from tzrec.utils.logging_util import logger
+
+ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
@@ -78,7 +84,31 @@ TYPE_TABLE_TO_PA = {
     "MAP<INT,STRING>": pa.map_(pa.int32(), pa.string()),
     "MAP<INT,INT>": pa.map_(pa.int32(), pa.int32()),
 }
-TYPE_PA_TO_TABLE = {v: k for k, v in TYPE_TABLE_TO_PA.items()}
+
+
+def _get_compression_type(compression_name: str) -> Compression:
+    type_names = [x.name for x in Compression]
+    if compression_name in type_names:
+        return Compression[compression_name]
+    else:
+        raise ValueError(
+            f"Unknown compression type: {compression_name}, available {type_names}"
+        )
+
+
+def _type_pa_to_table(pa_type: pa.DataType) -> str:
+    """PyArrow type to MaxCompute Table type."""
+    mc_type = None
+    pa_type = remove_nullable(pa_type)
+    for k, v in TYPE_TABLE_TO_PA.items():
+        # list<element: int64> and list<item: int64> is equal
+        if v == pa_type:
+            mc_type = k
+            break
+    if mc_type:
+        return mc_type
+    else:
+        raise RuntimeError(f"{pa_type} is not supported now.")
 
 
 def _parse_odps_config_file(odps_config_path: str) -> Tuple[str, str, str]:
@@ -112,8 +142,13 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.environ["ODPS_CONFIG_FILE_PATH"]
         )
-        account = AliyunAccount(account_id, account_key)
-    elif "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ:
+        account = CloudAccount(account_id, account_key)
+    elif (
+        "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
+        or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
+        or "ALIBABA_CLOUD_CREDENTIALS_FILE" in os.environ
+        or "ALIBABA_CLOUD_ECS_METADATA" in os.environ
+    ):
         credentials_client = CredClient()
         # prevent too much request to credential server after forked
         credential = credentials_client.get_credential()
@@ -131,7 +166,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.path.join(os.getenv("HOME", "/home/admin"), ".odps_config.ini")
         )
-        account = AliyunAccount(account_id, account_key)
+        account = CloudAccount(account_id, account_key)
 
     # prevent graph-learn parse odps config hang
     os.environ["ACCESS_ID"] = account_id
@@ -143,7 +178,9 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
     return account, odps_endpoint
 
 
-def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str]]]:
+def _parse_table_path(
+    odps_table_path: str,
+) -> Tuple[str, str, Optional[List[str]], Optional[str]]:
     """Method that parse odps table path."""
     str_list = odps_table_path.split("/")
     if len(str_list) < 5 or str_list[3] != "tables":
@@ -157,66 +194,12 @@ def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str
         table_partitions = None
     else:
         table_partitions = table_partition.split("&")
-    return str_list[2], str_list[4], table_partitions
 
-
-def _calc_slice_position(
-    row_count: int,
-    slice_id: int,
-    slice_count: int,
-    batch_size: int,
-    drop_redundant_bs_eq_one: bool,
-    pre_total_remain: int = 0,
-) -> Tuple[int, int, int]:
-    """Calc table read position according to the slice information.
-
-    Args:
-        row_count (int): table total row count.
-        slice_id (int): worker id.
-        slice_count (int): total worker number.
-        batch_size (int): batch_size.
-        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
-        pre_total_remain (int): remaining total count in pre-table is
-            insufficient to meet the batch_size requirement for each worker.
-
-    Return:
-        start (int): start row position in table.
-        end (int): start row position in table.
-        total_remain (int): remaining total count in curr-table is
-            insufficient to meet the batch_size requirement for each worker.
-    """
-    pre_remain_size = int(pre_total_remain / slice_count)
-    pre_remain_split_point = pre_total_remain % slice_count
-
-    size = int((row_count + pre_total_remain) / slice_count)
-    split_point = (row_count + pre_total_remain) % slice_count
-    if slice_id < split_point:
-        start = slice_id * (size + 1)
-        end = start + (size + 1)
-    else:
-        start = split_point * (size + 1) + (slice_id - split_point) * size
-        end = start + size
-
-    real_start = (
-        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
-    )
-    real_end = (
-        end
-        - pre_remain_size * (slice_id + 1)
-        - min(pre_remain_split_point, slice_id + 1)
-    )
-    # when (end - start) % bz = 1 on some workers and
-    # (end - start) % bz = 0 on other workers, train_eval will hang
-    if (
-        drop_redundant_bs_eq_one
-        and split_point != 0
-        and (end - start) % batch_size == 1
-        and size % batch_size == 0
-    ):
-        real_end = real_end - 1
-        split_point = 0
-    return real_start, real_end, (size % batch_size) * slice_count + split_point
+    table_name = str_list[4]
+    schema = None
+    if "." in table_name:
+        table_name, schema = table_name.split(".")[1], table_name.split(".")[0]
+    return str_list[2], table_name, table_partitions, schema
 
 
 def _read_rows_arrow_with_retry(
@@ -245,6 +228,7 @@ def _reader_iter(
     num_workers: int,
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
+    compression: Compression,
 ) -> Iterator[pa.RecordBatch]:
     num_sess = len(sess_reqs)
     remain_row_count = 0
@@ -255,7 +239,7 @@ def _reader_iter(
                 time.sleep(1)
                 continue
             break
-        start, end, remain_row_count = _calc_slice_position(
+        start, end, remain_row_count = calc_slice_position(
             # pyre-ignore [6]
             scan_resp.record_count,
             worker_id,
@@ -274,13 +258,16 @@ def _reader_iter(
             row_index=start,
             row_count=end - start,
             max_batch_rows=min(batch_size, 20000),
+            compression=compression,
         )
         reader = _read_rows_arrow_with_retry(client, read_req)
         max_retry_count = 5
         while True:
             try:
                 read_data = reader.read()
-            except urllib3.exceptions.HTTPError as e:
+                retry_cnt = 0
+            # pyre-ignore [66]
+            except (urllib3.exceptions.HTTPError, pa.lib.ArrowInvalid) as e:
                 if retry_cnt >= max_retry_count:
                     raise e
                 retry_cnt += 1
@@ -289,6 +276,7 @@ def _reader_iter(
                     row_index=start + offset,
                     row_count=end - start - offset,
                     max_batch_rows=min(batch_size, 20000),
+                    compression=compression,
                 )
                 reader = _read_rows_arrow_with_retry(client, read_req)
                 continue
@@ -298,6 +286,17 @@ def _reader_iter(
                 retry_cnt = 0
                 offset += len(read_data)
             yield read_data
+
+
+def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
+            for session_id, client in sess_id_to_cli.items():
+                logger.info(f"refresh session: {session_id}")
+                client.get_read_session(SessionRequest(session_id, refresh=True))
+            start_time = time.time()
+        time.sleep(5)
 
 
 class OdpsDataset(BaseDataset):
@@ -316,10 +315,6 @@ class OdpsDataset(BaseDataset):
         input_path: str,
         **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert (
-                dist.is_initialized()
-            ), "You should initialize distribute group first."
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
         self._reader = OdpsReader(
@@ -330,6 +325,7 @@ class OdpsDataset(BaseDataset):
             is_orderby_partition=self._data_config.is_orderby_partition,
             quota_name=self._data_config.odps_data_quota_name,
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
+            compression=self._data_config.odps_data_compression,
         )
         self._init_input_fields()
 
@@ -342,10 +338,13 @@ class OdpsReader(BaseReader):
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch less than batch_size.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
         is_orderby_partition (bool): read data order by table partitions or not.
         quota_name (str): storage api quota name.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
+        compression (str):  storage api data compression name.
     """
 
     def __init__(
@@ -354,14 +353,26 @@ class OdpsReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
+        compression: str = "LZ4_FRAME",
         **kwargs: Any,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols, drop_remainder)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
+        )
+        self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
+        self._compression = _get_compression_type(compression)
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
@@ -373,7 +384,7 @@ class OdpsReader(BaseReader):
 
         self.schema = []
         self._ordered_cols = []
-        _, table_name, _ = _parse_table_path(self._input_path.split(",")[0])
+        _, table_name, _, _ = _parse_table_path(self._input_path.split(",")[0])
         table = self._table_to_cli[table_name].table
         for column in table.schema.simple_columns:
             if not self._selected_cols or column.name in self._selected_cols:
@@ -392,12 +403,13 @@ class OdpsReader(BaseReader):
     def _init_client(self) -> None:
         """Init storage api client."""
         for input_path in self._input_path.split(","):
-            project, table_name, _ = _parse_table_path(input_path)
+            project, table_name, _, schema = _parse_table_path(input_path)
             if project not in self._proj_to_o:
                 self._proj_to_o[project] = ODPS(
                     account=self._account,
                     project=project,
                     endpoint=self._odps_endpoint,
+                    schema=schema,
                 )
             if table_name not in self._table_to_cli:
                 o = self._proj_to_o[project]
@@ -407,9 +419,10 @@ class OdpsReader(BaseReader):
 
     def _init_session(self) -> None:
         """Init table scan session."""
+        sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             session_ids = []
-            _, table_name, partitions = _parse_table_path(input_path)
+            _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
             if self._is_orderby_partition and partitions is not None:
                 splited_partitions = [[x] for x in partitions]
@@ -424,18 +437,28 @@ class OdpsReader(BaseReader):
                     )
                     scan_resp = client.create_read_session(scan_req)
                     session_ids.append(scan_resp.session_id)
+                    sess_id_to_cli[scan_resp.session_id] = client
                 else:
                     session_ids.append(None)
-            if dist.is_initialized():
-                dist.broadcast_object_list(session_ids)
+
+            if self._pg is not None:
+                dist.broadcast_object_list(session_ids, group=self._pg)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
+        # refresh session
+        if int(os.environ.get("RANK", 0)) == 0:
+            t = threading.Thread(
+                target=_refresh_sessions_daemon,
+                args=(sess_id_to_cli,),
+                daemon=True,
+            )
+            t.start()
 
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
-        _, table_name, _ = _parse_table_path(input_path)
+        _, table_name, _, _ = _parse_table_path(input_path)
         client = self._table_to_cli[table_name]
 
         sess_reqs = self._input_to_sess[input_path]
@@ -446,6 +469,7 @@ class OdpsReader(BaseReader):
             num_workers,
             self._batch_size,
             self._drop_redundant_bs_eq_one,
+            self._compression,
         )
         yield from self._arrow_reader_iter(iterator)
 
@@ -463,21 +487,25 @@ class OdpsWriter(BaseWriter):
     Args:
         output_path (str): data output path.
         quota_name (str): storage api quota name.
+        world_size (int, optional): number of ranks, each rank has a writer.
     """
 
     def __init__(
-        self, output_path: str, quota_name: str = "pay-as-you-go", **kwargs: Any
+        self,
+        output_path: str,
+        quota_name: str = "pay-as-you-go",
+        world_size: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert (
-                dist.is_initialized()
-            ), "You should initialize distribute group first."
         super().__init__(output_path)
+        self._pg = dist_util.get_dist_object_pg(world_size)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
 
-        self._project, self._table_name, partitions = _parse_table_path(output_path)
+        self._project, self._table_name, partitions, schema = _parse_table_path(
+            output_path
+        )
         if partitions is None:
             self._partition_spec = None
         else:
@@ -486,33 +514,28 @@ class OdpsWriter(BaseWriter):
             account=self._account,
             project=self._project,
             endpoint=self._odps_endpoint,
+            schema=schema,
         )
         self._client = None
         self._sess_req = None
         self._writer = None
-        if self._o.exist_table(self._table_name):
-            if int(os.environ.get("RANK", 0)) == 0:
-                self._create_partition()
-            else:
-                self._wait_init_table()
-            self._init_writer()
-            self._lazy_inited = True
 
     def _create_table(self, output_dict: OrderedDict[str, pa.Array]) -> None:
         """Create output table."""
-        schemas = []
-        for k, v in output_dict.items():
-            schemas.append(f"{k} {TYPE_PA_TO_TABLE[v.type]}")
-        schema = ",".join(schemas)
-        if self._partition_spec:
-            pt_schemas = []
-            for pt_spec in self._partition_spec.split("/"):
-                pt_name = pt_spec.split("=")[0]
-                pt_schemas.append(f"{pt_name} STRING")
-            schema = (schema, ",".join(pt_schemas))
-        self._o.create_table(
-            self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
-        )
+        if not self._o.exist_table(self._table_name):
+            schemas = []
+            for k, v in output_dict.items():
+                schemas.append(f"{k} {_type_pa_to_table(v.type)}")
+            schema = ",".join(schemas)
+            if self._partition_spec:
+                pt_schemas = []
+                for pt_spec in self._partition_spec.split("/"):
+                    pt_name = pt_spec.split("=")[0]
+                    pt_schemas.append(f"{pt_name} STRING")
+                schema = (schema, ",".join(pt_schemas))
+            self._o.create_table(
+                self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
+            )
 
     def _create_partition(self) -> None:
         """Create output partition."""
@@ -536,8 +559,12 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
-        if dist.is_initialized():
-            session_id = dist_util.broadcast_string(session_id)
+            object_list = [session_id]
+        else:
+            object_list = [None]
+        if self._pg is not None:
+            dist.broadcast_object_list(object_list, group=self._pg)
+        session_id = object_list[0]
         self._sess_req = SessionRequest(session_id=session_id)
         while True:
             sess_resp = self._client.get_write_session(self._sess_req)
@@ -584,8 +611,12 @@ class OdpsWriter(BaseWriter):
         """Close and commit data."""
         if self._writer is not None:
             commit_msg, _ = self._writer.finish()
-            if dist.is_initialized():
-                commit_msgs = dist_util.gather_strings(commit_msg)
+            if self._pg is not None:
+                if int(os.environ.get("RANK", 0)) == 0:
+                    commit_msgs = [None for _ in range(self._pg.size())]
+                else:
+                    commit_msgs = None
+                dist.gather_object(commit_msg, commit_msgs, group=self._pg)
             else:
                 commit_msgs = [commit_msg]
             if int(os.environ.get("RANK", 0)) == 0:
@@ -597,4 +628,9 @@ class OdpsWriter(BaseWriter):
                     raise RuntimeError(
                         f"Fail to commit write session: {self._sess_req.session_id}"
                     )
+        elif self._pg is not None:
+            raise RuntimeError(
+                f"Writer on Rank[{os.environ.get('RANK', 0)}] has no "
+                "data, please check your input data."
+            )
         super().close()

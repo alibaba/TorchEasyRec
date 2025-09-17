@@ -27,14 +27,22 @@ from tzrec.protos import (
     tower_pb2,
 )
 from tzrec.protos.models import multi_task_rank_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class DBMTLTest(unittest.TestCase):
     @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+        [
+            [TestGraphType.NORMAL, False],
+            [TestGraphType.FX_TRACE, False],
+            [TestGraphType.JIT_SCRIPT, False],
+            [TestGraphType.NORMAL, True],
+            [TestGraphType.FX_TRACE, True],
+            [TestGraphType.JIT_SCRIPT, True],
+        ]
     )
-    def test_dbmtl(self, graph_type) -> None:
+    def test_dbmtl(self, graph_type, use_mask_net) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -62,7 +70,6 @@ class DBMTLTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             dbmtl=multi_task_rank_pb2.DBMTL(
-                bottom_mlp=module_pb2.MLP(hidden_units=[16, 8]),
                 expert_mlp=module_pb2.MLP(hidden_units=[16, 8]),
                 num_expert=6,
                 gate_mlp=module_pb2.MLP(hidden_units=[4]),
@@ -100,6 +107,20 @@ class DBMTLTest(unittest.TestCase):
                 ],
             ),
         )
+        if use_mask_net:
+            model_config.dbmtl.mask_net.CopyFrom(
+                module_pb2.MaskNetModule(
+                    n_mask_blocks=3,
+                    mask_block=module_pb2.MaskBlock(
+                        reduction_ratio=2.0,
+                        hidden_dim=16,
+                    ),
+                    top_mlp=module_pb2.MLP(hidden_units=[16, 8]),
+                    use_parallel=True,
+                )
+            )
+        else:
+            model_config.dbmtl.bottom_mlp.CopyFrom(module_pb2.MLP(hidden_units=[16, 8]))
         dbmtl = DBMTL(
             model_config=model_config,
             features=features,
@@ -130,7 +151,7 @@ class DBMTLTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
         self.assertEqual(predictions["probs_is_buy"].size(), (2,))
-        self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
+        self.assertEqual(predictions["y_cost_price"].size(), (2,))
 
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
@@ -329,7 +350,7 @@ class DBMTLTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
         self.assertEqual(predictions["probs_is_buy"].size(), (2,))
-        self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
+        self.assertEqual(predictions["y_cost_price"].size(), (2,))
 
 
 if __name__ == "__main__":

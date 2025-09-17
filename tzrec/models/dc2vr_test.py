@@ -27,7 +27,8 @@ from tzrec.protos import (
     tower_pb2,
 )
 from tzrec.protos.models import multi_task_rank_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_model, init_parameters
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class DC2VRTest(unittest.TestCase):
@@ -132,7 +133,7 @@ class DC2VRTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
         self.assertEqual(predictions["probs_is_buy"].size(), (2,))
-        self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
+        self.assertEqual(predictions["y_cost_price"].size(), (2,))
 
     @parameterized.expand(
         [
@@ -333,7 +334,7 @@ class DC2VRTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_click"].size(), (2,))
         self.assertEqual(predictions["logits_is_buy"].size(), (2,))
         self.assertEqual(predictions["probs_is_buy"].size(), (2,))
-        self.assertEqual(predictions["y_cost_price"].size(), (2, 1))
+        self.assertEqual(predictions["y_cost_price"].size(), (2,))
 
 
 if __name__ == "__main__":

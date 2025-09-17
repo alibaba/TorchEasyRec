@@ -155,12 +155,14 @@ class TreeSearch(object):
                     if first_node:
                         ids.append("-1" if use_hash_node_id() else -1)
                         weight.append(1.0)
-                        features.append(",".join(["-1"] + list(map(str, fea[1:]))))
+                        features.append(
+                            attr_delimiter.join(["-1"] + list(map(str, fea[1:])))
+                        )
                         first_node = False
 
                     ids.append(node.item_id)
                     weight.append(1.0)
-                    features.append(",".join(map(str, fea)))
+                    features.append(attr_delimiter.join(map(str, fea)))
 
             node_table_dict = OrderedDict()
             node_table_dict["id"] = pa.array(ids)
@@ -217,9 +219,13 @@ class TreeSearch(object):
                             )
                         # add a node with id -1 for graph-learn to get root node
                         if first_node:
-                            f.write(f"-1\t1.0\t-1,{','.join(map(str, fea[1:]))}\n")
+                            f.write(
+                                f"-1\t1.0\t-1{attr_delimiter}{attr_delimiter.join(map(str, fea[1:]))}\n"  # NOQA
+                            )
                             first_node = False
-                        f.write(f"{node.item_id}\t1.0\t{','.join(map(str, fea))}\n")
+                        f.write(
+                            f"{node.item_id}\t1.0\t{attr_delimiter.join(map(str, fea))}\n"  # NOQA
+                        )
 
             with open(os.path.join(self.output_file, "edge_table.txt"), "w") as f:
                 id_type = "string" if use_hash_node_id() else "int64"
@@ -227,7 +233,7 @@ class TreeSearch(object):
                 for travel in self.travel_list:
                     # do not include edge from leaf to root
                     for i in range(self.max_level - 1):
-                        f.write(f"{travel[0]}\t{travel[i+1]}\t{1.0}\n")
+                        f.write(f"{travel[0]}\t{travel[i + 1]}\t{1.0}\n")
 
     def save_predict_edge(self) -> None:
         """Save edge info for prediction."""
@@ -266,7 +272,10 @@ class TreeSearch(object):
                             f.write(f"{node.item_id}\t{child.item_id}\t{1.0}\n")
 
     def save_node_feature(
-        self, attr_fields: Optional[str] = None, raw_attr_fields: Optional[str] = None
+        self,
+        item_id_field: str,
+        attr_fields: Optional[str] = None,
+        raw_attr_fields: Optional[str] = None,
     ) -> None:
         """Save feature of tree node for serving."""
         if self.output_file.startswith("odps://"):
@@ -285,7 +294,7 @@ class TreeSearch(object):
         raw_attr_field_names = (
             [x.strip() for x in raw_attr_fields.split(",")] if raw_attr_fields else []
         )
-        attr_names = ["item_id"] + attr_field_names + raw_attr_field_names
+        attr_names = [item_id_field] + attr_field_names + raw_attr_field_names
         attr_values = [[] for _ in range(len(attr_names))]
         for _, nodes in enumerate(self.level_code):
             for node in nodes:
