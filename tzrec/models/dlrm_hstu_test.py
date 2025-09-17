@@ -9,7 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import shutil
+import tempfile
 import unittest
+from collections import OrderedDict
 
 import torch
 from parameterized import parameterized
@@ -28,10 +32,17 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, gpu_unavailable
+from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
 
 
 class DlrmHSTUTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = None
+
+    def tearDown(self):
+        if self.test_dir is not None and os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
     @parameterized.expand(
         [
             [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH],
@@ -39,7 +50,7 @@ class DlrmHSTUTest(unittest.TestCase):
             [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH],
             [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON],
             [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON],
-            [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.TRITON],
+            [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON],
         ]
     )
     @unittest.skipIf(*gpu_unavailable)
@@ -229,11 +240,8 @@ class DlrmHSTUTest(unittest.TestCase):
             labels=["item_action_weight", "item_target_watchtime"],
         )
         dlrm_hstu.set_kernel(kernel)
-        if graph_type == TestGraphType.JIT_SCRIPT:
-            dlrm_hstu.set_is_inference(True)
         init_parameters(dlrm_hstu, device=device)
         dlrm_hstu.to(device)
-        # dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=[
@@ -270,16 +278,26 @@ class DlrmHSTUTest(unittest.TestCase):
 
         export_pm(CudaExportWrapper(dlrm_hstu), batch.to_dict(), "tmp")
 
-        # if graph_type == TestGraphType.JIT_SCRIPT:
-        #     predictions = dlrm_hstu(batch.to_dict(), device)
-        # else:
-        #     predictions = dlrm_hstu(batch)
-        # self.assertEqual(predictions["logits_is_click"].size(), (6,))
-        # self.assertEqual(predictions["probs_is_click"].size(), (6,))
-        # self.assertEqual(predictions["logits_is_like"].size(), (6,))
-        # self.assertEqual(predictions["probs_is_like"].size(), (6,))
-        # self.assertEqual(predictions["logits_is_comment"].size(), (6,))
-        # self.assertEqual(predictions["probs_is_comment"].size(), (6,))
+        if graph_type == TestGraphType.JIT_SCRIPT:
+            dlrm_hstu.set_is_inference(True)
+            dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
+            predictions = dlrm_hstu(batch.to_dict(), device)
+        elif graph_type == TestGraphType.AOT_INDUCTOR:
+            data = batch.to_dict()
+            data = OrderedDict(sorted(data.items()))
+            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            dlrm_hstu.set_is_inference(True)
+            dlrm_hstu = create_test_model(dlrm_hstu, graph_type, data, self.test_dir)
+            predictions = dlrm_hstu(data)
+        else:
+            dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
+            predictions = dlrm_hstu(batch)
+        self.assertEqual(predictions["logits_is_click"].size(), (6,))
+        self.assertEqual(predictions["probs_is_click"].size(), (6,))
+        self.assertEqual(predictions["logits_is_like"].size(), (6,))
+        self.assertEqual(predictions["probs_is_like"].size(), (6,))
+        self.assertEqual(predictions["logits_is_comment"].size(), (6,))
+        self.assertEqual(predictions["probs_is_comment"].size(), (6,))
 
 
 if __name__ == "__main__":

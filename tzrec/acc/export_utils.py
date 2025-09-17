@@ -89,8 +89,8 @@ def export_pm(
     for _, keys in model._data_parser.dense_keys.items():
         dense_keys_list.extend(keys)
 
-    batch = Dim("batch", min=1)
-    batch_tile = Dim("batch_tile", min=1)
+    batch = Dim("batch", min=1, max=499999999)
+    batch_tile = Dim("batch_tile", min=1, max=499999999)
     dynamic_shapes = {}
     for key in data:
         if key == "hard_neg_indices":
