@@ -273,11 +273,6 @@ class DlrmHSTUTest(unittest.TestCase):
             labels={},
         ).to(device)
 
-        from tzrec.acc.export_utils import export_pm
-        from tzrec.models.model import CudaExportWrapper
-
-        export_pm(CudaExportWrapper(dlrm_hstu), batch.to_dict(), "tmp")
-
         if graph_type == TestGraphType.JIT_SCRIPT:
             dlrm_hstu.set_is_inference(True)
             dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
