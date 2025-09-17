@@ -15,7 +15,7 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.interaction import Cross, InputSENet, InteractionArch
+from tzrec.modules.interaction import CIN, Cross, CrossV2, InputSENet, InteractionArch
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -55,6 +55,30 @@ class CrossModuleTest(unittest.TestCase):
         input_data = torch.randn((10, 16))
         result = cross_layer(input_data)
         self.assertEqual(result.size(), (10, 16))
+
+
+class CrossV2Test(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_cross_net_v2(self, graph_type) -> None:
+        cross_layer = CrossV2(32, 6, 2)
+        cross_layer = create_test_module(cross_layer, graph_type)
+        features = torch.randn([10, 32])
+        result = cross_layer(features)
+        self.assertEqual(result.size(), (10, 32))
+
+
+class CINTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_cin(self, graph_type) -> None:
+        cin = CIN(feature_num=9, cin_layer_size=[10, 15, 20])
+        cin = create_test_module(cin, graph_type)
+        features = torch.randn([5, 9, 16])
+        result = cin(features)
+        self.assertEqual(result.size(), (5, 45))
 
 
 if __name__ == "__main__":

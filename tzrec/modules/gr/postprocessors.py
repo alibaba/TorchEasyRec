@@ -60,7 +60,7 @@ class L2NormPostprocessor(OutputPostprocessor):
         is_inference (bool): whether to run in inference mode.
     """
 
-    def __init__(self, is_inference: bool = False, **kwargs) -> None:
+    def __init__(self, is_inference: bool = False, **kwargs: Any) -> None:
         super().__init__(is_inference=is_inference)
 
     def forward(
@@ -98,7 +98,7 @@ class LayerNormPostprocessor(OutputPostprocessor):
         embedding_dim: int,
         eps: float = 1e-5,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
 
@@ -154,7 +154,7 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         time_duration_units_per_period: List[int],
         eps: float = 1e-5,
         is_inference: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
 
@@ -232,7 +232,8 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
 
 
 def create_output_postprocessor(
-    postprocessor_cfg: Union[module_pb2.GROutputPostprocessor, Dict[str, Any]], **kwargs
+    postprocessor_cfg: Union[module_pb2.GROutputPostprocessor, Dict[str, Any]],
+    **kwargs: Any,
 ) -> OutputPostprocessor:
     """Create OutputPostprocessor."""
     if isinstance(postprocessor_cfg, module_pb2.GROutputPostprocessor):

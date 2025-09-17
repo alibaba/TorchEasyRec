@@ -22,6 +22,7 @@ except Exception:
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
+from tzrec.acc.export_utils import get_max_export_batch_size
 from tzrec.acc.utils import is_debug_trt
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
@@ -30,7 +31,6 @@ from tzrec.utils.logging_util import logger
 
 def trt_convert(
     exp_program: torch.export.ExportedProgram,
-    # pyre-ignore [2]
     inputs: Optional[Sequence[Sequence[Any]]],
 ) -> torch.fx.GraphModule:
     """Convert model use trt.
@@ -145,15 +145,6 @@ class ScriptWrapperTRT(nn.Module):
         return y
 
 
-def get_trt_max_batch_size() -> int:
-    """Get trt max batch size.
-
-    Returns:
-        int: max_batch_size
-    """
-    return int(os.environ.get("TRT_MAX_BATCH_SIZE", 2048))
-
-
 def get_trt_max_seq_len() -> int:
     """Get trt max seq len.
 
@@ -180,7 +171,7 @@ def export_model_trt(
     emb_trace_gpu = torch.jit.script(emb_trace_gpu)
 
     # dynamic shapes
-    max_batch_size = get_trt_max_batch_size()
+    max_batch_size = get_max_export_batch_size()
     max_seq_len = get_trt_max_seq_len()
     batch = torch.export.Dim("batch", min=1, max=max_batch_size)
     dynamic_shapes_list = []

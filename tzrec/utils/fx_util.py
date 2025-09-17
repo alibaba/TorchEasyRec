@@ -66,6 +66,7 @@ def fx_int_item(x: torch.Tensor) -> int:
         torch._check_is_size(int_item)
     else:
         int_item = int(x.item())
+    # pyre-ignore[7]
     return int_item
 
 

@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -121,7 +121,7 @@ class ExtractionNet(nn.Module):
         cgc_layer_outs = []
         for i, task_layers in enumerate(self._task_layers):
             task_experts = self._experts_layer_forward(
-                extraction_network_fea[i], task_layers
+                extraction_network_fea[i], cast(nn.ModuleList, task_layers)
             )
             cgc_task_out = self._gate_forward(
                 extraction_network_fea[i],

@@ -98,6 +98,7 @@ class TreeBuilder:
             assert leaf_item_id is not None
             if not use_hash_node_id():
                 max_item_id = max(leaf_item_id, max_item_id)
+        max_code_len = len(str(max_code))
 
         tree_nodes: List[Optional[TDMTreeNode]] = [None for _ in range(max_code + 1)]
         logger.info("start gen code_list")
@@ -121,9 +122,13 @@ class TreeBuilder:
             if node.item_id is None:
                 node.attrs = self._column_modes(node.attrs_list)
                 node.raw_attrs = self._column_means(node.raw_attrs_list)
+                # we should use fixed length code when use_hash_node_id
+                # because we need sort ids in TDMSampler
                 node.item_id = (
+                    f"nonleaf#{code:0{max_code_len}d}"
+                    if use_hash_node_id()
                     # pyre-ignore [58]
-                    f"nonleaf#{code}" if use_hash_node_id() else max_item_id + code + 1
+                    else max_item_id + code + 1
                 )
 
             if code > 0:

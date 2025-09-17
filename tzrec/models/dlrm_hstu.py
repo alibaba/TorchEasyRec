@@ -210,7 +210,7 @@ class DlrmHSTU(RankModel):
         self,
         batch: Batch,
     ) -> Tuple[
-        Dict[str, Dict[str, JaggedTensor]],
+        Dict[str, OrderedDict[str, JaggedTensor]],
         Dict[str, torch.Tensor],
         int,
         torch.Tensor,
@@ -284,7 +284,7 @@ class DlrmHSTU(RankModel):
 
     def main_forward(
         self,
-        grouped_features: Dict[str, Dict[str, JaggedTensor]],
+        grouped_features: Dict[str, OrderedDict[str, JaggedTensor]],
         payload_features: Dict[str, torch.Tensor],
         max_uih_len: int,
         uih_seq_lengths: torch.Tensor,

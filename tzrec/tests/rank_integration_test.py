@@ -21,7 +21,7 @@ from pyarrow import dataset as ds
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
-from tzrec.utils import config_util
+from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
 
 
@@ -66,48 +66,6 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_aot_export(self):
-        pipeline_config_path = "tzrec/tests/configs/multi_tower_din_fg_mock.config"
-        self.success = utils.test_train_eval(
-            pipeline_config_path, self.test_dir, user_id="user_id", item_id="item_id"
-        )
-        if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-            )
-
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"),
-                self.test_dir,
-                env_str="ENABLE_AOT=1",
-            )
-        input_tile_dir = os.path.join(self.test_dir, "input_tile")
-        input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"),
-                input_tile_dir,
-                env_str="INPUT_TILE=2 ENABLE_AOT=1",
-            )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"),
-                input_tile_dir_emb,
-                env_str="INPUT_TILE=3 ENABLE_AOT=1",
-            )
-        self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
-        )
-
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
         self._test_rank_nofg(
             "tzrec/tests/configs/multi_tower_din_mock.config",
@@ -148,6 +106,10 @@ class RankIntegrationTest(unittest.TestCase):
                 f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}",
             )
         self.assertTrue(self.success)
+        _, steps = checkpoint_util.latest_checkpoint(
+            os.path.join(self.test_dir, "2/train")
+        )
+        self.assertGreater(steps, 5)
 
     def _test_rank_with_fg(self, pipeline_config_path, comp_cpu_gpu_pred_result=False):
         self.success = utils.test_train_eval(
@@ -219,13 +181,13 @@ class RankIntegrationTest(unittest.TestCase):
             user_id="user_id",
             item_id="item_id",
         )
-        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2"]:
+        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]:
             test_dir = os.path.join(self.test_dir, f"quant_{quant_emb.lower()}")
             if self.success:
                 self.success = utils.test_export(
                     os.path.join(self.test_dir, "pipeline.config"),
                     test_dir,
-                    env_str=f"QUANT_EMB={quant_emb}",
+                    env_str=f"QUANT_EMB={quant_emb} QUANT_EC_EMB={quant_emb}",
                 )
             if self.success:
                 self.success = utils.test_predict(
@@ -471,6 +433,90 @@ class RankIntegrationTest(unittest.TestCase):
                 torch.testing.assert_close(
                     result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
                 )
+
+    def _test_rank_with_fg_aot_input_tile(self, pipeline_config_path):
+        self.success = utils.test_train_eval(
+            pipeline_config_path, self.test_dir, user_id="user_id", item_id="item_id"
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+
+        input_tile_dir = os.path.join(self.test_dir, "input_tile")
+        input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
+        pred_output = os.path.join(self.test_dir, "predict_result")
+        tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
+        tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
+
+        # export quant and no-input-tile
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                # inductor generate a lot of triton kernel, may result in triton cache
+                #  conflict, so that we set TRITON_HOME in tests.
+                env_str=f"ENABLE_AOT=1",  # NOQA
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=pred_output,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=self.test_dir,
+            )
+
+        # export quant and input-tile
+        if self.success:
+            # when INPUT_TILE=2,
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir,
+                env_str="QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT=1",
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_dir, "export"),
+                predict_input_path=os.path.join(
+                    self.test_dir, r"eval_data/part-0.parquet"
+                ),
+                predict_output_path=tile_pred_output,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_dir,
+            )
+
+        # export quant and input-tile emb
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir_emb,
+                env_str="QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT=1",
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
+                predict_input_path=os.path.join(
+                    self.test_dir, r"eval_data/part-0.parquet"
+                ),
+                predict_output_path=tile_pred_output_emb,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=input_tile_dir_emb,
+            )
+
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
+        )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
         self.success = utils.test_train_eval(
@@ -747,6 +793,12 @@ class RankIntegrationTest(unittest.TestCase):
     def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_multi_tower_din_with_fg_train_eval_aot_export_input_tile(self):
+        self._test_rank_with_fg_aot_input_tile(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         )
 
     def test_dbmtl_has_sequence_variational_dropout_train_eval_export(self):

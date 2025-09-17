@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 from collections import OrderedDict
+from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -28,26 +29,20 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.inference.modules import quantize_embeddings
+from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
-
-from tzrec.acc.aot_utils import export_model_aot
-from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
-from tzrec.acc.utils import (
-    allow_tf32,
-    export_acc_config,
-    is_aot,
-    is_cuda_export,
-    is_input_tile_emb,
-    is_quant,
-    is_trt,
-    is_trt_predict,
-    quant_dtype,
-    write_mapping_file_for_input_tile,
+from torchrec.quant.embedding_modules import (
+    EmbeddingCollection as QuantEmbeddingCollection,
 )
+
+from tzrec.acc import utils as acc_utils
+from tzrec.acc.aot_utils import export_model_aot
+from tzrec.acc.export_utils import get_max_export_batch_size
+from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
@@ -101,7 +96,14 @@ def init_process_group() -> Tuple[torch.device, str]:
     else:
         device: torch.device = torch.device("cpu")
         backend = "gloo"
-    dist.init_process_group(backend=backend)
+
+    pg_timeout = None
+    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+        pg_timeout = timedelta(
+            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
+        )
+    dist.init_process_group(backend=backend, timeout=pg_timeout)
+
     return device, backend
 
 
@@ -283,9 +285,9 @@ def _evaluate(
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
-    if global_epoch:
+    if global_epoch is not None:
         desc_suffix += f" Epoch-{global_epoch}"
-    if global_step:
+    if global_step is not None:
         desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
@@ -538,7 +540,7 @@ def _train_and_evaluate(
                 prof.step()
 
         if save_checkpoints_epochs > 0 and i_step > 0:
-            if i_epoch % save_checkpoints_epochs == 0:
+            if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
                 checkpoint_util.save_model(
                     os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -635,7 +637,7 @@ def train_and_evaluate(
     device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
-    allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -738,7 +740,7 @@ def train_and_evaluate(
     grad_scaler = None
     if train_config.HasField("grad_scaler"):
         grad_scaler = GradScaler(
-            device=device,
+            device=device.type,
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(
@@ -803,7 +805,7 @@ def evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     train_config = pipeline_config.train_config
-    allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -879,7 +881,6 @@ def _script_model(
     save_dir: str,
 ) -> None:
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    is_trt_convert = is_trt()
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -893,29 +894,41 @@ def _script_model(
 
         batch = next(iter(dataloader))
 
-        if is_cuda_export():
+        if acc_utils.is_cuda_export():
             model = model.cuda()
 
-        if is_quant():
+        if acc_utils.is_quant() or acc_utils.is_ec_quant():
             logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
+            additional_qconfig_spec_keys = []
+            additional_mapping = {}
+            if acc_utils.is_ec_quant():
+                additional_qconfig_spec_keys.append(EmbeddingCollection)
+                additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
+            quantize_embeddings(
+                model,
+                dtype=acc_utils.quant_dtype(),
+                inplace=True,
+                additional_qconfig_spec_keys=additional_qconfig_spec_keys,
+                additional_mapping=additional_mapping,
+            )
             logger.info("finish quantize embeddings...")
 
         model.eval()
 
-        if is_trt_convert:
-            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda, "cuda:0")
+        data = batch.to_dict(sparse_dtype=torch.int64)
+        if acc_utils.is_trt():
+            data = OrderedDict(sorted(data.items()))
+            result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            export_model_trt(model, data_cuda, save_dir)
-
-        elif is_aot():
-            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda)
-            export_model_aot(model, data_cuda, save_dir)
+            export_model_trt(model, data, save_dir)
+        elif acc_utils.is_aot():
+            data = OrderedDict(sorted(data.items()))
+            result = model(data)
+            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+            logger.info(f"Model Outputs: {result_info}")
+            export_model_aot(model, data, save_dir)
         else:
-            data = batch.to_dict(sparse_dtype=torch.int64)
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
@@ -940,7 +953,7 @@ def _script_model(
         with open(os.path.join(save_dir, "fg.json"), "w") as f:
             json.dump(fg_json, f, indent=4)
         with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(export_acc_config(), f, indent=4)
+            json.dump(acc_utils.export_acc_config(), f, indent=4)
 
 
 def export(
@@ -982,12 +995,11 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
-    is_trt_convert = is_trt()
-    if is_trt_convert:
-        # export batch_size too large may OOM in trt convert phase
-        max_batch_size = get_trt_max_batch_size()
+    if acc_utils.is_cuda_export():
+        # export batch_size too large may OOM in compile phase
+        max_batch_size = get_max_export_batch_size()
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in trt export", data_config.batch_size)
+        logger.info("using new batch_size: %s in export", data_config.batch_size)
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
@@ -1005,7 +1017,7 @@ def export(
         list(data_config.label_fields),
         sampler_type=None,
     )
-    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    InferWrapper = CudaExportWrapper if acc_utils.is_aot() else ScriptWrapper
     model = InferWrapper(model)
     init_parameters(model, torch.device("cpu"))
 
@@ -1014,12 +1026,14 @@ def export(
             pipeline_config.model_dir
         )
     if checkpoint_path:
-        if is_input_tile_emb():
+        if acc_utils.is_input_tile_emb():
             remap_file_path = os.path.join(export_dir, "emb_ckpt_mapping.txt")
             if is_rank_zero:
                 if not os.path.exists(export_dir):
                     os.makedirs(export_dir)
-                write_mapping_file_for_input_tile(model.state_dict(), remap_file_path)
+                acc_utils.write_mapping_file_for_input_tile(
+                    model.state_dict(), remap_file_path
+                )
 
             dist.barrier()
             checkpoint_util.restore_model(
@@ -1093,6 +1107,7 @@ def predict(
     predict_threads: Optional[int] = None,
     writer_type: Optional[str] = None,
     edit_config_json: Optional[str] = None,
+    predict_steps: Optional[int] = None,
 ) -> None:
     """Evaluate a EasyRec model.
 
@@ -1111,6 +1126,7 @@ def predict(
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
+        predict_steps (int, optional): total predict steps limit.
     """
     reserved_cols: Optional[List[str]] = None
     output_cols: Optional[List[str]] = None
@@ -1125,10 +1141,13 @@ def predict(
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
 
-    is_trt_convert: bool = is_trt_predict(scripted_model_path)
-    if is_trt_convert:
+    is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
+    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
+    is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
+
+    if is_trt:
         # predict batch_size too large may out of range
-        max_batch_size = get_trt_max_batch_size()
+        max_batch_size = get_max_export_batch_size()
         pipeline_config.data_config.batch_size = min(
             pipeline_config.data_config.batch_size, max_batch_size
         )
@@ -1136,6 +1155,10 @@ def predict(
             "using new batch_size: %s in trt predict",
             pipeline_config.data_config.batch_size,
         )
+    elif is_aot:
+        # AOTInductor may hang when predict_threads > 1
+        predict_threads = 1
+        logger.info("using new predict_threads: 1 when use aot")
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1174,14 +1197,21 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    # disable jit compile， as it compile too slow now.
-    if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-        os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-
-    model: torch.jit.ScriptModule = torch.jit.load(
-        os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-    )
-    model.eval()
+    if is_aot:
+        model: torch.export.pt2_archive._package.AOTICompiledModel = (
+            torch._inductor.aoti_load_package(
+                os.path.join(scripted_model_path, "aoti_model.pt2"),
+                device_index=device.index,
+            )
+        )
+    else:
+        # disable jit compile， as it compile too slow now.
+        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
+            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+        model: torch.jit.ScriptModule = torch.jit.load(
+            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
+        )
+        model.eval()
 
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
@@ -1210,10 +1240,12 @@ def predict(
     def _forward(batch: Batch) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
             parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-            # when predicting with a model exported using INPUT_TILE,
-            #  we set the batch size tensor to 1 to disable tiling.
-            parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if is_trt_convert:
+            if is_input_tile:
+                # when predicting with a model exported using INPUT_TILE,
+                #  we set the batch size tensor to 1 to disable tiling.
+                parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
+            if is_trt or is_aot:
+                parsed_inputs = OrderedDict(sorted(parsed_inputs.items()))
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
@@ -1282,6 +1314,8 @@ def predict(
             if is_profiling:
                 prof.step()
             i_step += 1
+            if predict_steps is not None and i_step >= predict_steps:
+                break
         except StopIteration:
             break
 

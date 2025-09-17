@@ -9,9 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import OrderedDict, defaultdict
 from functools import partial  # NOQA
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -236,7 +237,9 @@ class EmbeddingGroup(nn.Module):
                 feature_emb = self.emb_impls[impl_key]
                 feature_dim.update(feature_emb.group_feature_dims(group_name))
                 if group_name in self._group_name_to_seq_encoders:
-                    seq_encoders = self._group_name_to_seq_encoders[group_name]
+                    seq_encoders = cast(
+                        nn.ModuleList, self._group_name_to_seq_encoders[group_name]
+                    )
                     for i, seq_encoder in enumerate(seq_encoders):
                         feature_dim[f"{group_name}_seq_encoder_{i}"] = (
                             seq_encoder.output_dim()
@@ -1188,37 +1191,35 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self._group_output_dims[f"{group_name}.sequence"] = sequence_dims
             self._group_output_dims[group_name] = output_dims
 
-        self.ec_list = nn.ModuleList()
-        for _, emb_configs in dim_to_emb_configs.items():
-            self.ec_list.append(
-                EmbeddingCollection(list(emb_configs.values()), device=device)
+        self.ec_dict = nn.ModuleDict()
+        for k, emb_configs in dim_to_emb_configs.items():
+            self.ec_dict[str(k)] = EmbeddingCollection(
+                list(emb_configs.values()), device=device
             )
 
-        self.mc_ec_list = nn.ModuleList()
+        self.mc_ec_dict = nn.ModuleDict()
         for k, emb_configs in dim_to_mc_emb_configs.items():
-            self.mc_ec_list.append(
-                ManagedCollisionEmbeddingCollection(
+            self.mc_ec_dict[str(k)] = ManagedCollisionEmbeddingCollection(
+                EmbeddingCollection(list(emb_configs.values()), device=device),
+                ManagedCollisionCollection(
+                    dim_to_mc_modules[k], list(emb_configs.values())
+                ),
+            )
+
+        if need_input_tile_emb:
+            self.ec_dict_user = nn.ModuleDict()
+            for k, emb_configs in dim_to_emb_configs_user.items():
+                self.ec_dict_user[str(k)] = EmbeddingCollection(
+                    list(emb_configs.values()), device=device
+                )
+
+            self.mc_ec_dict_user = nn.ModuleDict()
+            for k, emb_configs in dim_to_mc_emb_configs_user.items():
+                self.mc_ec_dict_user[str(k)] = ManagedCollisionEmbeddingCollection(
                     EmbeddingCollection(list(emb_configs.values()), device=device),
                     ManagedCollisionCollection(
-                        dim_to_mc_modules[k], list(emb_configs.values())
+                        dim_to_mc_modules_user[k], list(emb_configs.values())
                     ),
-                )
-            )
-        if need_input_tile_emb:
-            self.ec_list_user = nn.ModuleList()
-            for _, emb_configs in dim_to_emb_configs_user.items():
-                self.ec_list_user.append(
-                    EmbeddingCollection(list(emb_configs.values()), device=device)
-                )
-            self.mc_ec_list_user = nn.ModuleList()
-            for k, emb_configs in dim_to_mc_emb_configs_user.items():
-                self.mc_ec_list_user.append(
-                    ManagedCollisionEmbeddingCollection(
-                        EmbeddingCollection(list(emb_configs.values()), device=device),
-                        ManagedCollisionCollection(
-                            dim_to_mc_modules_user[k], list(emb_configs.values())
-                        ),
-                    )
                 )
 
     def group_dims(self, group_name: str) -> List[int]:
@@ -1258,22 +1259,22 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
-            for ec in self.ec_list:
+            for ec in self.ec_dict.values():
                 sparse_jt_dict_list.append(ec(sparse_feature))
 
         if self.has_mc_sparse:
-            for ec in self.mc_ec_list:
+            for ec in self.mc_ec_dict.values():
                 sparse_jt_dict_list.append(ec(sparse_feature)[0])
 
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
         if self.has_sparse_user:
-            for ec in self.ec_list_user:
+            for ec in self.ec_dict_user.values():
                 sparse_jt_dict_list.append(ec(sparse_feature_user))
 
         if self.has_mc_sparse_user:
-            for ec in self.mc_ec_list_user:
+            for ec in self.mc_ec_dict_user.values():
                 sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
         if self.has_mulval_seq_user:
@@ -1363,10 +1364,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         )
 
         results = {}
+        sparse_query_cache: Dict[str, torch.Tensor] = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
             for info in v:
-                if info.is_sparse:
+                if info.name in sparse_query_cache:
+                    query_t = sparse_query_cache[info.name]
+                elif info.is_sparse:
                     query_jt = jt_dict[info.name]
                     if info.value_dim == 1:
                         # for single-value id feature
@@ -1380,6 +1384,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             query_t = torch.nan_to_num(query_t, nan=0.0)
                     if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
+                    sparse_query_cache[info.name] = query_t
                 else:
                     query_t = dense_t_dict[info.name]
                 query_t_list.append(query_t)
@@ -1413,11 +1418,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     else:
                         results[f"{group_name}.sequence_length"] = sequence_length
 
-                jt = jt.to_padded_dense(group_sequence_length)
+                if int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1:
+                    seq_t = jt.values()
+                else:
+                    seq_t = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:
-                    jt = jt.tile(tile_size, 1, 1)
-                seq_t_list.append(jt)
+                    seq_t = seq_t.tile(tile_size, 1, 1)
+                seq_t_list.append(seq_t)
 
             if seq_t_list:
                 results[f"{group_name}.sequence"] = torch.cat(seq_t_list, dim=2)

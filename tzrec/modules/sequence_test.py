@@ -19,6 +19,7 @@ from tzrec.modules.sequence import (
     HSTUEncoder,
     MultiWindowDINEncoder,
     PoolingEncoder,
+    SelfAttentionEncoder,
     SimpleAttention,
     create_seq_encoder,
 )
@@ -225,6 +226,27 @@ class PoolingEncoderTest(unittest.TestCase):
         torch.testing.assert_close(
             result, torch.ones(4, 16) * sequence_length.unsqueeze(1)
         )
+
+
+class SelfAttentionEncoderTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_self_attention_encoder(self, graph_type) -> None:
+        encoder = SelfAttentionEncoder(
+            sequence_dim=16,
+            input="click_seq",
+            multihead_attn_dim=32,
+            num_heads=4,
+        )
+        self.assertEqual(encoder.output_dim(), 32)
+        encoder = create_test_module(encoder, graph_type)
+        embedded = {
+            "click_seq.sequence": torch.randn(4, 10, 16),
+            "click_seq.sequence_length": torch.tensor([2, 3, 4, 5]),
+        }
+        result = encoder(embedded)
+        self.assertEqual(result.size(), (4, 32))
 
 
 class MultiWindowDINEncoderTest(unittest.TestCase):

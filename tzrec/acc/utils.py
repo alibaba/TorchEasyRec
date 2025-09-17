@@ -27,6 +27,16 @@ def is_input_tile() -> bool:
     return False
 
 
+def is_input_tile_predict(model_path: str) -> bool:
+    """Judge is input tile or not in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    input_tile = data.get("INPUT_TILE")
+    if input_tile and (input_tile[0] == "2" or input_tile[0] == "3"):
+        return True
+    return False
+
+
 def is_input_tile_emb() -> bool:
     """Judge is input file or not.
 
@@ -47,17 +57,22 @@ def is_aot() -> bool:
         return False
 
 
+def is_aot_predict(model_path: str) -> bool:
+    """Judge is aot or not in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    is_aot = data.get("ENABLE_AOT")
+    if is_aot and is_aot[0] == "1":
+        return True
+    return False
+
+
 def is_trt() -> bool:
     """Judge is trt or not."""
     is_trt = os.environ.get("ENABLE_TRT")
     if is_trt and is_trt[0] == "1":
         return True
     return False
-
-
-def is_cuda_export() -> bool:
-    """Judge is trt/aot or not."""
-    return is_trt() or is_aot()
 
 
 def is_trt_predict(model_path: str) -> bool:
@@ -68,6 +83,11 @@ def is_trt_predict(model_path: str) -> bool:
     if is_trt and is_trt[0] == "1":
         return True
     return False
+
+
+def is_cuda_export() -> bool:
+    """Judge is trt/aot or not."""
+    return is_trt() or is_aot()
 
 
 def is_debug_trt() -> bool:
@@ -89,26 +109,48 @@ def is_quant() -> bool:
     return True
 
 
+def is_ec_quant() -> bool:
+    """Judge EmbeddingCollection is quant or not."""
+    is_ec_quant = os.environ.get("QUANT_EC_EMB", "0")
+    if is_ec_quant[0] == "0":
+        return False
+    return True
+
+
+_quant_str_to_dtype = {
+    "FP32": torch.float,
+    "FP16": torch.half,
+    "INT8": torch.qint8,
+    "INT4": torch.quint4x2,
+    "INT2": torch.quint2x4,
+}
+
+
 def quant_dtype() -> torch.dtype:
-    """Get embedding quant dtype."""
-    str_to_dtype = {
-        "FP32": torch.float,
-        "FP16": torch.half,
-        "INT8": torch.qint8,
-        "INT4": torch.quint4x2,
-        "INT2": torch.quint2x4,
-    }
+    """Get EmbeddingBagCollection quant dtype."""
     quant_dtype_str = os.environ.get("QUANT_EMB", "INT8")
     if quant_dtype_str == "1":
         # for compatible
         quant_dtype_str = "INT8"
-    if quant_dtype_str not in str_to_dtype:
+    if quant_dtype_str not in _quant_str_to_dtype:
         raise ValueError(
             f"Unknown QUANT_EMB: {quant_dtype_str},"
-            f"available types: {list(str_to_dtype.keys())}"
+            f"available types: {list(_quant_str_to_dtype.keys())}"
         )
     else:
-        return str_to_dtype[quant_dtype_str]
+        return _quant_str_to_dtype[quant_dtype_str]
+
+
+def ec_quant_dtype() -> torch.dtype:
+    """Get EmbeddingCollection quant dtype."""
+    quant_dtype_str = os.environ.get("QUANT_EC_EMB", "INT8")
+    if quant_dtype_str not in _quant_str_to_dtype:
+        raise ValueError(
+            f"Unknown QUANT_EC_EMB: {quant_dtype_str},"
+            f"available types: {list(_quant_str_to_dtype.keys())}"
+        )
+    else:
+        return _quant_str_to_dtype[quant_dtype_str]
 
 
 def write_mapping_file_for_input_tile(
@@ -128,6 +170,8 @@ def write_mapping_file_for_input_tile(
         ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
         ".ec_list_user.": ".ec_list.",
         ".mc_ec_list_user.": ".mc_ec_list.",
+        ".ec_dict_user.": ".ec_dict.",
+        ".mc_ec_dict_user.": ".mc_ec_dict.",
     }
 
     remap_str = ""
