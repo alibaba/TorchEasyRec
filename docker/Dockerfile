@@ -69,4 +69,7 @@ RUN mkdir -p /home/pai/bin && \
     chmod +x /home/pai/bin/prepare_dlc_environment && \
     apt-get update && apt-get install -y --no-install-recommends openssh-server && rm -rf /var/lib/apt/lists/* && service ssh start
 ENV PATH $PATH:/home/pai/bin
+
 ENV SHELL=/bin/bash
+RUN echo "dash dash/sh boolean false" | debconf-set-selections \
+    && DEBIAN_FRONTEND=noninteractive dpkg-reconfigure dash
