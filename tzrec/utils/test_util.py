@@ -76,6 +76,7 @@ def create_test_model(
     """Create model with graph type for tests."""
     if graph_type == TestGraphType.AOT_INDUCTOR:
         model = CudaExportWrapper(model)
+        assert data is not None
         package_path = export_model_aot(model, data, test_dir)
         model = torch._inductor.aoti_load_package(package_path)
         return model

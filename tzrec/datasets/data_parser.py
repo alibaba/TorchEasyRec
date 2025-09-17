@@ -48,6 +48,7 @@ def _tile_size(x: torch.Tensor) -> int:
         # check tile_size = 1 to make dynamo check size happy,
         # because in DataParser.parse, we always set tile_size = 1.
         torch._check(tile_size == 1)
+    # pyre-ignore [7]
     return tile_size
 
 
@@ -428,7 +429,6 @@ class DataParser:
             sequence_dense_features=sequence_dense_features,
             labels=labels,
             sample_weights=sample_weights,
-            # pyre-ignore [6]
             tile_size=tile_size,
             additional_infos=additional_infos,
         )
@@ -621,17 +621,13 @@ class DataParser:
                         key_length.float(), "sum", lengths=seq_length
                     ).to(length.dtype)
                     if key in self.user_feats:
-                        # pyre-ignore [6]
                         seq_length = seq_length.tile(tile_size)
-                        # pyre-ignore [6]
                         key_length = key_length.tile(tile_size)
                     mulval_keys.append(key)
                     mulval_seq_lengths.append(seq_length)
                     mulval_key_lengths.append(key_length)
                 if key in self.user_feats:
-                    # pyre-ignore [6]
                     value = value.tile(tile_size)
-                    # pyre-ignore [6]
                     length = length.tile(tile_size)
 
                 values.append(value)
@@ -645,7 +641,6 @@ class DataParser:
                             input_data[f"{key}.values"], dtype=torch.float32
                         )
                     if key in self.user_feats:
-                        # pyre-ignore [6]
                         weight = weight.tile(tile_size)
                     weights.append(weight)
 

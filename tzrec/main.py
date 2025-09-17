@@ -1198,9 +1198,11 @@ def predict(
     )
 
     if is_aot:
-        model = torch._inductor.aoti_load_package(
-            os.path.join(scripted_model_path, "aoti_model.pt2"),
-            device_index=device.index,
+        model: torch.export.pt2_archive._package.AOTICompiledModel = (
+            torch._inductor.aoti_load_package(
+                os.path.join(scripted_model_path, "aoti_model.pt2"),
+                device_index=device.index,
+            )
         )
     else:
         # disable jit compile， as it compile too slow now.
