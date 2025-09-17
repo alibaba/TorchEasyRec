@@ -52,6 +52,19 @@ def _softmax(x: torch.Tensor, dim: int, half_to_float: bool) -> torch.Tensor:
     return result
 
 
+def get_max_export_batch_size() -> int:
+    """Get max export batch size.
+
+    Returns:
+        int: max_batch_size
+    """
+    batch_size = int(os.environ.get("MAX_EXPORT_BATCH_SIZE", 512))
+    # compact with old trt batch size config
+    if "TRT_MAX_BATCH_SIZE" in os.environ:
+        batch_size = int(os.environ.get("TRT_MAX_BATCH_SIZE"))
+    return batch_size
+
+
 def export_pm(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> Tuple[torch.export.ExportedProgram, Dict[str, torch.Tensor]]:
@@ -69,10 +82,15 @@ def export_pm(
     gm = symbolic_trace(model)
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(gm.code)
-
     gm = gm.cuda()
 
-    batch = Dim("batch")
+    # get dense keys list
+    dense_keys_list = []
+    for _, keys in model._data_parser.dense_keys.items():
+        dense_keys_list.extend(keys)
+
+    batch = Dim("batch", min=1)
+    batch_tile = Dim("batch_tile", min=1)
     dynamic_shapes = {}
     for key in data:
         if key == "hard_neg_indices":
@@ -82,11 +100,10 @@ def export_pm(
         if key.endswith(".lengths"):
             # user feats
             if key.split(".")[0] in model._data_parser.user_feats:
-                assert data[key].shape[0] == 1
                 logger.info(
-                    "uniq user length fea %s length=%s" % (key, data[key].shape)
+                    "tile user length fea %s length=%s" % (key, data[key].shape)
                 )
-                dynamic_shapes[key] = {}
+                dynamic_shapes[key] = {0: batch_tile}
             else:
                 logger.info("batch length fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
@@ -94,12 +111,11 @@ def export_pm(
             dynamic_shapes[key] = {}
 
         # dense values
-        elif key.split(".")[0] in model._data_parser.dense_keys_list:
+        elif key.split(".")[0] in dense_keys_list:
             # user feats
             if key.split(".")[0] in model._data_parser.user_feats:
-                assert data[key].shape[0] == 1
-                logger.info("uniq user dense_fea=%s shape=%s" % (key, data[key].shape))
-                dynamic_shapes[key] = {}
+                logger.info("tile user dense_fea=%s shape=%s" % (key, data[key].shape))
+                dynamic_shapes[key] = {0: batch_tile}
             else:
                 logger.info("batch dense_fea=%s shape=%s" % (key, data[key].shape))
                 dynamic_shapes[key] = {0: batch}
@@ -112,7 +128,10 @@ def export_pm(
                     [0, 0] * (len(data[key].shape) - 1) + [0, 2],
                     mode="constant",
                 )
-                data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
+                if key.split(".")[0] + ".key_lengths" in data:
+                    data[key.split(".")[0] + ".key_lengths"][0] = data[key].shape[0]
+                else:
+                    data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
             logger.info("sparse or seq dense fea=%s shape=%s" % (key, data[key].shape))
             tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
             dynamic_shapes[key] = {0: tmp_val_dim}
@@ -122,6 +141,7 @@ def export_pm(
             data[key] = data[key].contiguous()
 
     logger.info("dynamic shapes=%s" % dynamic_shapes)
+
     exported_pg = torch.export.export(
         gm, args=(data,), dynamic_shapes=(dynamic_shapes,)
     )
