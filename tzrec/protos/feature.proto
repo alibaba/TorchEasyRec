@@ -552,6 +552,58 @@ message TokenizeFeature {
     // TODO: constrains
 }
 
+
+message KvDotProduct {
+    // feature name, e.g. kv_os_click_count
+    required string feature_name = 1;
+    // query, e.g. ["a:0.5", "b:0.5"]
+    required string query = 2;
+    // document, e,g. ["d:0.5", "b:0.5"]
+    required string document = 3;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 4;
+    // embedding dimension
+    optional uint32 embedding_dim = 5;
+    // boundaries for bucktize numeric expr value
+    repeated float boundaries = 6;
+    // fg multi-value separator
+    optional string separator = 7 [default = "\x1d"];
+    // fg kv separator, default is :.
+    optional float kv_delimiter = 8;
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 9;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = "0"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 12;
+    // mask value in training progress
+    optional bool use_mask = 13;
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
+}
+
 message CustomFeature {
     // feature name.
     required string feature_name = 1;
@@ -839,6 +891,7 @@ message FeatureConfig {
         SequenceRawFeature sequence_raw_feature = 11;
         CustomFeature custom_feature = 12;
         SequenceCustomFeature sequence_custom_feature = 13;
+        KvDotProduct kv_dot_product = 14;
     }
 }
 

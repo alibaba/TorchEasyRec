@@ -28,8 +28,8 @@ from tzrec.features.raw_feature import RawFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
 
 
-class ExprFeature(RawFeature):
-    """ExprFeature class.
+class KvDotProduct(RawFeature):
+    """KvDotProduct class.
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
@@ -52,10 +52,25 @@ class ExprFeature(RawFeature):
         self._is_neg = value
         self._data_group = CROSS_NEG_DATA_GROUP
 
+    @property
+    def value_dim(self) -> int:
+        """Fg value dimension of the feature."""
+        return 1
+
+    @property
+    def output_dim(self) -> int:
+        """Output dimension of the feature after embedding."""
+        if self.has_embedding:
+            return self._embedding_dim
+        else:
+            return 1
+
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
-        if len(self.config.variables) > 0:
-            return [tuple(x.split(":")) for x in self.config.variables]
+        if self.config.HasField("query") and self.config.HasField("document"):
+            return [
+                tuple(x.split(":")) for x in [self.config.query, self.config.document]
+            ]
         else:
             return None
 
@@ -85,11 +100,18 @@ class ExprFeature(RawFeature):
                 x = input_data[name]
                 if pa.types.is_list(x.type):
                     x = x.fill_null([])
-                input_feats.append(x.tolist())
+                    x = x.tolist()
+                elif pa.types.is_map(x.type):
+                    x = x.fill_null({})
+                    x = list(map(dict, x.tolist()))
+                else:
+                    x = x.tolist()
+                input_feats.append(x)
             if self.is_sparse:
                 values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
                 parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
             else:
+                print(input_feats)
                 values = self._fg_op.transform(input_feats)
                 parsed_feat = DenseData(name=self.name, values=values)
         else:
@@ -101,21 +123,18 @@ class ExprFeature(RawFeature):
     def fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config."""
         fg_cfg = {
-            "feature_type": "expr_feature",
+            "feature_type": "kv_dot_product",
             "feature_name": self.name,
             "default_value": self.config.default_value,
-            "expression": self.config.expression,
-            "variables": list(self.config.variables),
-            "value_type": "float",
+            "query": self.config.query,
+            "document": self.config.document,
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("fill_missing"):
-            fg_cfg["fill_missing"] = self.config.fill_missing
+        if self.config.HasField("kv_delimiter"):
+            fg_cfg["kv_delimiter"] = self.config.kv_delimiter
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
-        if self.config.HasField("value_dim"):
-            fg_cfg["value_dim"] = self.config.value_dim
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
