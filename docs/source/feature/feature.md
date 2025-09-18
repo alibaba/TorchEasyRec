@@ -495,6 +495,42 @@ feature_configs: {
   | TEXT_SPLITCHRS    | 中文拆成单字(空格分隔) |
   | TEXT_REMOVE_SPACE | 去除空格               |
 
+## KvDotProduct: KeyValue点积特征
+
+计算两个key-value索引的向量的点积，或两个集合的交集的大小。
+
+```
+feature_configs: {
+    kv_dot_product {
+        feature_name: "query_doc_sim"
+        query: "user:query"
+        document: "item:title"
+        separator: "|"
+        default_value: "0"
+    }
+}
+```
+
+- **query**: 描述该feature所依赖的query字段来源
+
+- **document**: 描述该feature所依赖的document字段来源
+
+示例
+
+| query              | document           | output |
+| ------------------ | ------------------ | ------ |
+| "a:0.5\|b:0.5"     | "d:0.5\|b:0.5"     | 0.25   |
+| ["a:0.5", "b:0.5"] | ["d:0.5", "b:0.5"] | 0.25   |
+| {"a":0.5, "b":0.5} | {"d":0.5, "b":0.5} | 0.25   |
+| ["a:0.5", "b:0.5"] | {"d":0.5, "b":0.5} | 0.25   |
+| ["a", "b", "c"]    | ["a", "b", "d"]    | 2.0    |
+| ["a", "b", "c"]    | "a\|b\|d"          | 2.0    |
+| ["a", "b", "c"]    | {"a":0.5, "b":0.5} | 1.0    |
+
+- **kv_delimiter**: 可选项，指定输入特征中的kv对之间的分隔符，默认为 ":"，只能是单个符号
+
+- 其余配置同RawFeature
+
 ## CustomFeature: 自定义特征
 
 自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)

@@ -63,7 +63,7 @@ class RawFeature(BaseFeature):
         if self.has_embedding:
             return self.config.embedding_dim
         else:
-            return self.config.value_dim
+            return self.value_dim
 
     @property
     def is_sparse(self) -> bool:
