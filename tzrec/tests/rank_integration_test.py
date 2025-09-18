@@ -18,6 +18,7 @@ import unittest
 import torch
 from pyarrow import dataset as ds
 
+from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
@@ -846,14 +847,18 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(
+        gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
+    )
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(
+        gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
+    )
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",
