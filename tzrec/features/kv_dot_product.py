@@ -111,7 +111,6 @@ class KvDotProduct(RawFeature):
                 values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
                 parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
             else:
-                print(input_feats)
                 values = self._fg_op.transform(input_feats)
                 parsed_feat = DenseData(name=self.name, values=values)
         else:

@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyfg
 import torch
 from torch import nn  # NOQA
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -542,6 +543,11 @@ class BaseFeature(object, metaclass=_meta_cls):
         if hasattr(self.config, "stub_type") and self.config.HasField("stub_type"):
             return self.config.stub_type
         return False
+
+    @property
+    def parameter_constraints() -> ParameterConstraints:
+        """Embedding parameter constraints."""
+        pass
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
