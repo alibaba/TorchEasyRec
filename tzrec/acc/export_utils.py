@@ -89,8 +89,8 @@ def export_pm(
     for _, keys in model._data_parser.dense_keys.items():
         dense_keys_list.extend(keys)
 
-    batch = Dim("batch", min=1)
-    batch_tile = Dim("batch_tile", min=1)
+    batch = Dim("batch", min=1, max=499999999)
+    batch_tile = Dim("batch_tile", min=1, max=499999999)
     dynamic_shapes = {}
     for key in data:
         if key == "hard_neg_indices":
@@ -133,7 +133,7 @@ def export_pm(
                 else:
                     data[key.split(".")[0] + ".lengths"][0] = data[key].shape[0]
             logger.info("sparse or seq dense fea=%s shape=%s" % (key, data[key].shape))
-            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0)
+            tmp_val_dim = Dim(key.replace(".", "__") + "__batch", min=0, max=999999993)
             dynamic_shapes[key] = {0: tmp_val_dim}
 
         # trt need contiguous format
