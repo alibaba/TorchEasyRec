@@ -444,9 +444,9 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
 
-        # input_tile_dir = os.path.join(self.test_dir, "input_tile")
-        # input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
-        pred_output = os.path.join(self.test_dir, "predict_result")
+        input_tile_dir = os.path.join(self.test_dir, "input_tile")
+        input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
+        # pred_output = os.path.join(self.test_dir, "predict_result")
         # tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
         # tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
 
@@ -457,23 +457,23 @@ class RankIntegrationTest(unittest.TestCase):
                 self.test_dir,
                 env_str="ENABLE_AOT=1",
             )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
-                predict_output_path=pred_output,
-                reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
-                test_dir=self.test_dir,
-            )
-
-        # # export quant and input-tile
         # if self.success:
-        #     self.success = utils.test_export(
-        #         os.path.join(self.test_dir, "pipeline.config"),
-        #         input_tile_dir,
-        #         env_str="QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT=1",
+        #     self.success = utils.test_predict(
+        #         scripted_model_path=os.path.join(self.test_dir, "export"),
+        #         predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),  # NOQA
+        #         predict_output_path=pred_output,
+        #         reserved_columns="user_id,item_id,clk",
+        #         output_columns="probs",
+        #         test_dir=self.test_dir,
         #     )
+
+        # export quant and input-tile
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir,
+                env_str="QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT=1",
+            )
         # if self.success:
         #     self.success = utils.test_predict(
         #         scripted_model_path=os.path.join(input_tile_dir, "export"),
@@ -486,13 +486,13 @@ class RankIntegrationTest(unittest.TestCase):
         #         test_dir=input_tile_dir,
         #     )
 
-        # # export quant and input-tile emb
-        # if self.success:
-        #     self.success = utils.test_export(
-        #         os.path.join(self.test_dir, "pipeline.config"),
-        #         input_tile_dir_emb,
-        #         env_str="QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT=1",
-        #     )
+        # export quant and input-tile emb
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                input_tile_dir_emb,
+                env_str="QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT=1",
+            )
         # if self.success:
         #     self.success = utils.test_predict(
         #         scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
@@ -509,12 +509,12 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
         )
-        # self.assertTrue(
-        #     os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
-        # )
-        # self.assertTrue(
-        #     os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
-        # )
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
+        )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
         self.success = utils.test_train_eval(
