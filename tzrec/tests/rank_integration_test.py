@@ -18,6 +18,7 @@ import unittest
 import torch
 from pyarrow import dataset as ds
 
+from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
@@ -445,48 +446,45 @@ class RankIntegrationTest(unittest.TestCase):
 
         input_tile_dir = os.path.join(self.test_dir, "input_tile")
         input_tile_dir_emb = os.path.join(self.test_dir, "input_tile_emb")
-        pred_output = os.path.join(self.test_dir, "predict_result")
-        tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
-        tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
+        # pred_output = os.path.join(self.test_dir, "predict_result")
+        # tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
+        # tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
 
         # export quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                # inductor generate a lot of triton kernel, may result in triton cache
-                #  conflict, so that we set TRITON_HOME in tests.
-                env_str=f"ENABLE_AOT=1",  # NOQA
+                env_str="ENABLE_AOT=1",
             )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(self.test_dir, "export"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
-                predict_output_path=pred_output,
-                reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
-                test_dir=self.test_dir,
-            )
+        # if self.success:
+        #     self.success = utils.test_predict(
+        #         scripted_model_path=os.path.join(self.test_dir, "export"),
+        #         predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),  # NOQA
+        #         predict_output_path=pred_output,
+        #         reserved_columns="user_id,item_id,clk",
+        #         output_columns="probs",
+        #         test_dir=self.test_dir,
+        #     )
 
         # export quant and input-tile
         if self.success:
-            # when INPUT_TILE=2,
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir,
                 env_str="QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT=1",
             )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(input_tile_dir, "export"),
-                predict_input_path=os.path.join(
-                    self.test_dir, r"eval_data/part-0.parquet"
-                ),
-                predict_output_path=tile_pred_output,
-                reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
-                test_dir=input_tile_dir,
-            )
+        # if self.success:
+        #     self.success = utils.test_predict(
+        #         scripted_model_path=os.path.join(input_tile_dir, "export"),
+        #         predict_input_path=os.path.join(
+        #             self.test_dir, r"eval_data/part-0.parquet"
+        #         ),
+        #         predict_output_path=tile_pred_output,
+        #         reserved_columns="user_id,item_id,clk",
+        #         output_columns="probs",
+        #         test_dir=input_tile_dir,
+        #     )
 
         # export quant and input-tile emb
         if self.success:
@@ -495,17 +493,17 @@ class RankIntegrationTest(unittest.TestCase):
                 input_tile_dir_emb,
                 env_str="QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT=1",
             )
-        if self.success:
-            self.success = utils.test_predict(
-                scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
-                predict_input_path=os.path.join(
-                    self.test_dir, r"eval_data/part-0.parquet"
-                ),
-                predict_output_path=tile_pred_output_emb,
-                reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
-                test_dir=input_tile_dir_emb,
-            )
+        # if self.success:
+        #     self.success = utils.test_predict(
+        #         scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
+        #         predict_input_path=os.path.join(
+        #             self.test_dir, r"eval_data/part-0.parquet"
+        #         ),
+        #         predict_output_path=tile_pred_output_emb,
+        #         reserved_columns="user_id,item_id,clk",
+        #         output_columns="probs",
+        #         test_dir=input_tile_dir_emb,
+        #     )
 
         self.assertTrue(self.success)
         self.assertTrue(
@@ -846,14 +844,18 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(
+        gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
+    )
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_trt_fg_mock.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(
+        gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
+    )
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",

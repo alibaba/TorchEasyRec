@@ -80,6 +80,10 @@ def _modify_pipline_config(
     pipeline_config.train_input_path = train_input_path
     eval_input_path = pipeline_config.eval_input_path.format(PROJECT=project)
     pipeline_config.eval_input_path = eval_input_path
+    if "ODPS_DATA_QUOTA_NAME" in os.environ:
+        pipeline_config.data_config.odps_data_quota_name = os.environ[
+            "ODPS_DATA_QUOTA_NAME"
+        ]
 
     if pipeline_config.data_config.HasField("negative_sampler"):
         sampler = pipeline_config.data_config.negative_sampler

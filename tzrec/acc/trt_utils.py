@@ -13,12 +13,6 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
-
-# cpu image has no torch_tensorrt
-try:
-    import torch_tensorrt
-except Exception:
-    pass
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
@@ -27,6 +21,15 @@ from tzrec.acc.utils import is_debug_trt
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
+
+# cpu image has no torch_tensorrt
+has_tensorrt = False
+try:
+    import torch_tensorrt
+
+    has_tensorrt = True
+except Exception:
+    pass
 
 
 def trt_convert(
