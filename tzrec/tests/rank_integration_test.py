@@ -460,7 +460,7 @@ class RankIntegrationTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(self.test_dir, "export"),
-                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),  # NOQA
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=pred_output,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
