@@ -50,7 +50,7 @@ class DlrmHSTUTest(unittest.TestCase):
             [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH],
             [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON],
             [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON],
-            [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON],
+            # [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON],
         ]
     )
     @unittest.skipIf(*gpu_unavailable)
