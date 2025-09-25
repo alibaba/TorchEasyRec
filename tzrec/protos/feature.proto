@@ -92,7 +92,7 @@ message DynamicEmbedding {
     // percentage of embedding rows caching on gpu
     optional float cache_load_factor = 6 [default = 0.2];
     // init number of capacity
-    optional uint64 init_capacity_per_rank = 7
+    optional uint64 init_capacity_per_rank = 7;
 }
 
 message IdFeature {
