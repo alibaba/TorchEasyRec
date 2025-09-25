@@ -57,6 +57,42 @@ message AutoDisEmbedding {
 message MLPEmbedding {
 }
 
+
+message DynamicEmbInitializerArgs {
+    // the mode of initialization. NORMAL | TRUNCATED_NORMAL | UNIFORM | CONSTANT
+    optional string mode = 1;
+    // the mean value for (truncated) normal distributions
+    optional float mean = 2 [default = 0.0];
+    // the standard deviation for (truncated) normal distributions.
+    // default is sqrt(1 / embedding_dim)
+    optional float std_dev = 3;
+    // the lower bound for uniform/truncated_normal distribution.
+    // default is -sqrt(1 / embedding_dim)
+    optional float lower = 4;
+    // the upper bound for uniform/truncated_normal distribution.
+    // default is sqrt(1 / embedding_dim)
+    optional float upper = 5;
+    // the constant value for constant initialization.
+    optional float value = 6 [default = 0.0];
+}
+
+message DynamicEmbedding {
+    // arguments for initializing dynamic embedding vector values.
+    // default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / embedding_dim).
+    optional DynamicEmbInitializerArgs initializer_args = 1;
+    // the initializer args for evaluation mode. default is
+    // default is constant initialization with value 0.0.
+    optional DynamicEmbInitializerArgs eval_initializer_args = 2;
+    // strategy used for evicting entries when the table exceeds its capacity. LRU | LFU | EPOCH_LRU | EPOCH_LFU
+    optional string evict_strategy = 3 [default = "LRU"];
+    // strategy to set the score for each indices in forward and backward per table. TIMESTAMP | STEP | CUSTOMIZED
+    optional string score_strategy = 4 [default = "TIMESTAMP"];
+    // max number of embedding rows
+    required uint64 max_capacity = 5;
+    // percentage of embedding rows caching on gpu
+    optional float cache_load_factor = 6 [default = 0.2];
+}
+
 message IdFeature {
     // feature name, e.g. item_id
     required string feature_name = 1;
@@ -95,6 +131,8 @@ message IdFeature {
     optional string vocab_file = 17;
     // vocab file relative directory
     optional string asset_dir = 18;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 19;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -114,7 +152,8 @@ message IdFeature {
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message RawFeature {
@@ -165,7 +204,8 @@ message RawFeature {
         MLPEmbedding mlp = 41;
     }
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message ComboFeature {
@@ -201,6 +241,8 @@ message ComboFeature {
     optional string vocab_file = 16;
     // vocab file relative directory
     optional string asset_dir = 17;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 18;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -217,7 +259,8 @@ message ComboFeature {
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message LookupFeature {
@@ -274,6 +317,8 @@ message LookupFeature {
     optional string vocab_file = 23;
     // vocab file relative directory
     optional string asset_dir = 24;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 25;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -301,7 +346,9 @@ message LookupFeature {
     }
 
     // TODO: optional string kv_separator = 13 [default = ":"];
-    // TODO: constrains
+
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message MatchFeature {
@@ -360,6 +407,8 @@ message MatchFeature {
     optional string vocab_file = 23;
     // vocab file relative directory
     optional string asset_dir = 24;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 25;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -385,6 +434,8 @@ message MatchFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message ExprFeature {
@@ -432,6 +483,8 @@ message ExprFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message OverlapFeature {
@@ -483,6 +536,8 @@ message OverlapFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 
@@ -549,7 +604,8 @@ message TokenizeFeature {
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 
@@ -602,6 +658,8 @@ message KvDotProduct {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message CustomFeature {
@@ -655,6 +713,8 @@ message CustomFeature {
     optional string vocab_file = 22;
     // vocab file relative directory
     optional string asset_dir = 23;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 24;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -677,8 +737,8 @@ message CustomFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
-
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message SequenceIdFeature {
@@ -720,6 +780,8 @@ message SequenceIdFeature {
     optional string vocab_file = 18;
     // vocab file relative directory
     optional string asset_dir = 19;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 20;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -735,8 +797,8 @@ message SequenceIdFeature {
     optional bool stub_type = 34 [default = false];
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
-
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message SequenceRawFeature {
@@ -783,8 +845,8 @@ message SequenceRawFeature {
     optional bool stub_type = 34 [default = false];
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
-
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 
@@ -843,6 +905,8 @@ message SequenceCustomFeature {
     optional string vocab_file = 24;
     // vocab file relative directory
     optional string asset_dir = 25;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 26;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -858,8 +922,8 @@ message SequenceCustomFeature {
     optional bool stub_type = 34 [default = false];
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
-
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message SequenceFeature {

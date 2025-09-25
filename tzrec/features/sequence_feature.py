@@ -319,7 +319,7 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["sequence_length"] = self.config.sequence_length
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("zch"):
+        if self.config.HasField("zch") or self.config.HasField("dynamicemb"):
             fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
         elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size

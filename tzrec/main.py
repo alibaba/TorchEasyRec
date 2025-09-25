@@ -716,17 +716,18 @@ def train_and_evaluate(
         batch_size=train_dataloader.dataset.sampled_batch_size,
         ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
         global_constraints_cfg=train_config.global_embedding_constraints,
+        model=model,
     )
 
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
+    sharders = get_default_sharders()
+    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
     if is_rank_zero:
         logger.info(str(plan))
 
     model = DistributedModelParallel(
         module=model,
         device=device,
+        sharders=sharders,
         plan=plan,
     )
 
@@ -837,14 +838,16 @@ def evaluate(
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
         global_constraints_cfg=train_config.global_embedding_constraints,
+        model=model,
     )
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
+    sharders = get_default_sharders()
+    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
     if is_rank_zero:
         logger.info(str(plan))
 
-    model = DistributedModelParallel(module=model, device=device, plan=plan)
+    model = DistributedModelParallel(
+        module=model, sharders=sharders, device=device, plan=plan
+    )
 
     global_step = None
     if not checkpoint_path:

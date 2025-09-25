@@ -12,7 +12,8 @@
 import json
 import os
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple, Union
+from queue import Queue
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -20,6 +21,7 @@ from torch import distributed as dist
 from torch import nn
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.planner import EmbeddingShardingPlanner
+from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.enumerators import (
     GUARDED_COMPUTE_KERNELS,
     EmbeddingComputeKernel,
@@ -28,8 +30,6 @@ from torchrec.distributed.planner.enumerators import (
     ParameterConstraints,
     Shard,
     ShardEstimator,
-    ShardingType,
-    _extract_constraints_for_param,
     _get_tower_index,
     calculate_shard_sizes_and_offsets,
     get_partition_by_type,
@@ -52,10 +52,16 @@ from torchrec.distributed.sharding_plan import (
     get_default_sharders as _get_default_sharders,
 )
 from torchrec.distributed.types import (
+    BoundsCheckMode,
+    CacheParams,
+    KeyValueParams,
     ModuleSharder,
+    ShardingType,
 )
+from torchrec.modules.embedding_configs import DataType
 
 from tzrec.protos import feature_pb2
+from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
@@ -68,6 +74,7 @@ def create_planner(
     batch_size: int,
     ckpt_plan_path: Optional[str] = None,
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
+    model: Optional[nn.Module] = None,
 ) -> EmbeddingShardingPlanner:
     """Create EmbeddingShardingPlanner."""
     local_world_size = get_local_size()
@@ -101,11 +108,23 @@ def create_planner(
         percentage=storage_reserve_percent
     )
 
+    fqn_constraints = {}
+
+    # add parameter constraints for each embedding parameter.
+    q = Queue()
+    q.put(("", model))
+    while not q.empty():
+        path, m = q.get()
+        if hasattr(m, "parameter_constraints"):
+            fqn_constraints.update(m.parameter_constraints(path))
+        else:
+            for name, child in m.named_children():
+                q.put((f"{path}{name}.", child))
+
     # the optimizer state key names differ when using data_parallel for
     # embedding sharding compared to when using row_wise and table_wise
     # https://github.com/pytorch/torchrec/issues/2394. So that, we
     # add constraints for params with data_parallel plan in ckpt.
-    fqn_constraints = {}
     if ckpt_plan_path is not None and os.path.exists(ckpt_plan_path):
         with open(ckpt_plan_path, "r") as f:
             ckpt_plan = json.load(f)
@@ -152,7 +171,21 @@ def create_planner(
 def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
     """Get embedding module default sharder."""
     if torch.cuda.is_available():
-        return _get_default_sharders()
+        sharders = _get_default_sharders()
+        if has_dynamicemb:
+            from dynamicemb.shard import (
+                DynamicEmbeddingBagCollectionSharder,
+                DynamicEmbeddingCollectionSharder,
+            )
+
+            sharders.extend(
+                [
+                    DynamicEmbeddingBagCollectionSharder(),
+                    DynamicEmbeddingCollectionSharder(),
+                ]
+            )
+        print(sharders)
+        return sharders
     else:
         # ShardedEmbeddingCollection is not supported yet.
         sharders = []
@@ -363,6 +396,67 @@ class DynamicProgrammingProposer(Proposer):
                 self._current_proposal = -1
 
 
+def _extract_constraints_for_param(
+    constraints: Optional[Dict[str, ParameterConstraints]], name: str
+) -> Tuple[
+    List[float],
+    Optional[int],
+    Optional[CacheParams],
+    Optional[bool],
+    Optional[bool],
+    Optional[BoundsCheckMode],
+    Optional[List[str]],
+    Optional[DataType],
+    Optional[str],
+    Optional[KeyValueParams],
+    bool,
+    Any,
+]:
+    input_lengths = [POOLING_FACTOR]
+    col_wise_shard_dim = None
+    cache_params = None
+    enforce_hbm = None
+    stochastic_rounding = None
+    bounds_check_mode = None
+    feature_names = None
+    output_dtype = None
+    device_group = None
+    key_value_params = None
+    use_dynamicemb = False
+    dynamicemb_options = None
+
+    if constraints and constraints.get(name):
+        input_lengths = constraints[name].pooling_factors
+        col_wise_shard_dim = constraints[name].min_partition
+        cache_params = constraints[name].cache_params
+        enforce_hbm = constraints[name].enforce_hbm
+        stochastic_rounding = constraints[name].stochastic_rounding
+        bounds_check_mode = constraints[name].bounds_check_mode
+        feature_names = constraints[name].feature_names
+        output_dtype = constraints[name].output_dtype
+        device_group = constraints[name].device_group
+        key_value_params = constraints[name].key_value_params
+        if hasattr(constraints[name], "use_dynamicemb"):
+            use_dynamicemb = constraints[name].use_dynamicemb
+        if hasattr(constraints[name], "dynamicemb_options"):
+            dynamicemb_options = constraints[name].dynamicemb_options
+
+    return (
+        input_lengths,
+        col_wise_shard_dim,
+        cache_params,
+        enforce_hbm,
+        stochastic_rounding,
+        bounds_check_mode,
+        feature_names,
+        output_dtype,
+        device_group,
+        key_value_params,
+        use_dynamicemb,
+        dynamicemb_options,
+    )
+
+
 class EmbeddingEnumerator(_EmbeddingEnumerator):
     """Generates embedding sharding options for given `nn.Module` with constraints.
 
@@ -454,6 +548,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             is_pooled = ShardingOption.module_pooled(child_module, child_path)
 
             for name, param in sharder.shardable_parameters(child_module).items():
+                _constraints, key = self._get_constraints(child_path, name)
                 (
                     input_lengths,
                     col_wise_shard_dim,
@@ -465,7 +560,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                     output_dtype,
                     device_group,
                     key_value_params,
-                ) = _extract_constraints_for_param(self._constraints, name)
+                    use_dynamicemb,
+                    dynamicemb_options,
+                ) = _extract_constraints_for_param(_constraints, key)
 
                 # skip for other device groups
                 if device_group and device_group != self._compute_device:
@@ -499,31 +596,35 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                         elif isinstance(child_module, EmbeddingTowerCollection):
                             tower_index = _get_tower_index(name, child_module)
                             dependency = child_path + ".tower_" + str(tower_index)
-                        sharding_options_per_table.append(
-                            ShardingOption(
-                                name=name,
-                                tensor=param,
-                                module=(child_path, child_module),
-                                input_lengths=input_lengths,
-                                batch_size=self._batch_size,
-                                compute_kernel=compute_kernel,
-                                sharding_type=sharding_type,
-                                partition_by=get_partition_by_type(sharding_type),
-                                shards=[
-                                    Shard(size=size, offset=offset)
-                                    for size, offset in zip(shard_sizes, shard_offsets)
-                                ],
-                                cache_params=cache_params,
-                                enforce_hbm=enforce_hbm,
-                                stochastic_rounding=stochastic_rounding,
-                                bounds_check_mode=bounds_check_mode,
-                                dependency=dependency,
-                                is_pooled=is_pooled,
-                                feature_names=feature_names,
-                                output_dtype=output_dtype,
-                                key_value_params=key_value_params,
-                            )
+                        sharding_option = ShardingOption(
+                            name=name,
+                            tensor=param,
+                            module=(child_path, child_module),
+                            input_lengths=input_lengths,
+                            batch_size=self._batch_size,
+                            compute_kernel=compute_kernel,
+                            sharding_type=sharding_type,
+                            partition_by=get_partition_by_type(sharding_type),
+                            shards=[
+                                Shard(size=size, offset=offset)
+                                for size, offset in zip(shard_sizes, shard_offsets)
+                            ],
+                            cache_params=cache_params,
+                            enforce_hbm=enforce_hbm,
+                            stochastic_rounding=stochastic_rounding,
+                            bounds_check_mode=bounds_check_mode,
+                            dependency=dependency,
+                            is_pooled=is_pooled,
+                            feature_names=feature_names,
+                            output_dtype=output_dtype,
+                            key_value_params=key_value_params,
                         )
+                        # hack sharding option for dynamicemb
+                        if use_dynamicemb:
+                            sharding_option.use_dynamicemb = use_dynamicemb
+                            sharding_option.dynamicemb_options = dynamicemb_options
+                        sharding_options_per_table.append(sharding_option)
+
                 if not sharding_options_per_table:
                     raise RuntimeError(
                         "No available sharding type and compute kernel combination "
