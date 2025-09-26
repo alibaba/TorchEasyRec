@@ -13,7 +13,7 @@ import json
 import os
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import psutil
 import torch
@@ -180,8 +180,10 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
 
             sharders.extend(
                 [
-                    DynamicEmbeddingBagCollectionSharder(),
-                    DynamicEmbeddingCollectionSharder(),
+                    cast(
+                        ModuleSharder[nn.Module], DynamicEmbeddingBagCollectionSharder()
+                    ),
+                    cast(ModuleSharder[nn.Module], DynamicEmbeddingCollectionSharder()),
                 ]
             )
         print(sharders)
@@ -437,8 +439,10 @@ def _extract_constraints_for_param(
         device_group = constraints[name].device_group
         key_value_params = constraints[name].key_value_params
         if hasattr(constraints[name], "use_dynamicemb"):
+            # pyre-ignore [16]
             use_dynamicemb = constraints[name].use_dynamicemb
         if hasattr(constraints[name], "dynamicemb_options"):
+            # pyre-ignore [16]
             dynamicemb_options = constraints[name].dynamicemb_options
 
     return (
@@ -621,7 +625,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                         )
                         # hack sharding option for dynamicemb
                         if use_dynamicemb:
+                            # pyre-ignore [16]
                             sharding_option.use_dynamicemb = use_dynamicemb
+                            # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
                         sharding_options_per_table.append(sharding_option)
 

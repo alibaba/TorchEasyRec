@@ -10,10 +10,8 @@
 # limitations under the License.
 
 import math
-from functools import partial  # NOQA
 from typing import List, Optional, cast
 
-from torch import nn  # NOQA
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import planners
 from torchrec.distributed.planner.types import (
@@ -32,11 +30,6 @@ from torchrec.distributed.types import (
     ShardMetadata,
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
-from torchrec.modules.mc_modules import (
-    average_threshold_filter,  # NOQA
-    dynamic_threshold_filter,  # NOQA
-    probabilistic_threshold_filter,  # NOQA
-)
 
 from tzrec.protos import feature_pb2
 
@@ -60,7 +53,7 @@ except Exception:
     pass
 
 
-def _next_power_of_2(n):
+def _next_power_of_2(n: int) -> int:
     # Handle the case where n is 0
     if n == 0:
         return 1
@@ -162,13 +155,13 @@ def build_dynamicemb_constraints(
             f"but got {dynamicemb_cfg.score_strategy}."
         )
 
+    init_capacity = None
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
-        dynamicemb_cfg.init_capacity = _next_power_of_2(
-            dynamicemb_cfg.init_capacity_per_rank
-        )
+        init_capacity = _next_power_of_2(dynamicemb_cfg.init_capacity_per_rank)
 
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
         max_capacity=dynamicemb_cfg.max_capacity,
+        init_capacity=init_capacity,
         # TODO: convert eb_config.init_fn to dynamicemb initializer
         initializer_args=_build_dynamicemb_initializer(
             dynamicemb_cfg.initializer_args, num_embeddings, embedding_dim
@@ -187,7 +180,7 @@ def build_dynamicemb_constraints(
         use_dynamicemb=True,
         sharding_types=[ShardingType.ROW_WISE.value],
         compute_kernels=[
-            EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value
+            EmbeddingComputeKernel.FUSED_UVM_CACHING.value
         ],  # workaround for ShardingPlan estimator
         cache_params=CacheParams(
             load_factor=dynamicemb_cfg.cache_load_factor
@@ -232,16 +225,19 @@ if has_dynamicemb:
             )
 
             if (
+                # pyre-ignore [16]
                 hasattr(sharding_option, "use_dynamicemb")
+                # pyre-ignore [16]
                 and sharding_option.use_dynamicemb
             ):
                 # only support row-wise now
                 dynamicemb_options = sharding_option.dynamicemb_options
 
+                shard_storage = sharding_option.shards[0].storage
+                assert shard_storage is not None
+                dynamicemb_options.local_hbm_for_values = shard_storage.hbm
+
                 # align to next_power_of_2
-                dynamicemb_options.local_hbm_for_values = sharding_option.shards[
-                    0
-                ].storage.hbm
                 num_embeddings_per_shard = shards[0].size[0]
                 num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
                 if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
@@ -276,4 +272,5 @@ if has_dynamicemb:
                 plan[sharding_option.path] = module_plan
         return ShardingPlan(plan)
 
+    # pyre-ignore [9]
     planners.to_sharding_plan = _to_sharding_plan

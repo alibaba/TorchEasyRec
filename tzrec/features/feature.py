@@ -569,6 +569,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             return build_embedding_constraints(self.config.embedding_constraints)
         elif hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb"):
             emb_config = emb_config if emb_config is not None else self.emb_config
+            assert emb_config is not None
             return dynamicemb_util.build_dynamicemb_constraints(
                 self.config.dynamicemb, emb_config
             )
