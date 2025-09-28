@@ -73,3 +73,12 @@ ENV PATH $PATH:/home/pai/bin
 ENV SHELL=/bin/bash
 RUN echo "dash dash/sh boolean false" | debconf-set-selections \
     && DEBIAN_FRONTEND=noninteractive dpkg-reconfigure dash
+
+RUN case ${DEVICE} in \
+        "cu126") cd /tmp && \
+                 wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/rdma/MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz && \
+                 tar -xvf MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz && \
+                 cd MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64 && \
+                 ./mlnxofedinstall --user-space-only --without-ksys --without-fw-update --force && \
+                 rm -rf /tmp/* ;; \
+    esac
