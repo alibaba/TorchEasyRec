@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import os
 from collections import OrderedDict
@@ -629,7 +630,20 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_option.use_dynamicemb = use_dynamicemb
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
-                        sharding_options_per_table.append(sharding_option)
+                            if sharding_option.cache_params.load_factor is None:
+                                # add cache_load_factor automatic search space
+                                for load_factor in range(10):
+                                    sharding_option_copy = copy.copy(sharding_option)
+                                    sharding_option_copy.cache_params.load_factor = (
+                                        load_factor + 1
+                                    ) / 10
+                                    sharding_options_per_table.append(
+                                        sharding_option_copy
+                                    )
+                            else:
+                                sharding_options_per_table.append(sharding_option)
+                        else:
+                            sharding_options_per_table.append(sharding_option)
 
                 if not sharding_options_per_table:
                     raise RuntimeError(

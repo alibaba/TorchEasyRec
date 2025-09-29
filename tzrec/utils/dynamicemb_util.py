@@ -176,16 +176,21 @@ def build_dynamicemb_constraints(
         score_strategy=score_strategy,
     )
 
+    constraints_kwargs = {}
+    if dynamicemb_cfg.HasField("cache_load_factor"):
+        # for ShardingPlan estimator hdm storage
+        constraints_kwargs["cache_params"] = (
+            CacheParams(load_factor=dynamicemb_cfg.cache_load_factor),
+        )
+
     constraints = DynamicEmbParameterConstraints(
         use_dynamicemb=True,
         sharding_types=[ShardingType.ROW_WISE.value],
         compute_kernels=[
             EmbeddingComputeKernel.FUSED_UVM_CACHING.value
         ],  # workaround for ShardingPlan estimator
-        cache_params=CacheParams(
-            load_factor=dynamicemb_cfg.cache_load_factor
-        ),  # for ShardingPlan estimator hdm storage
         dynamicemb_options=dynamicemb_options,
+        **constraints_kwargs,
     )
     return constraints
 

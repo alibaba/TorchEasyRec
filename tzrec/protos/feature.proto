@@ -90,7 +90,7 @@ message DynamicEmbedding {
     // max number of embedding rows
     required uint64 max_capacity = 5;
     // percentage of embedding rows caching on gpu
-    optional float cache_load_factor = 6 [default = 0.2];
+    optional float cache_load_factor = 6;
     // init number of capacity
     optional uint64 init_capacity_per_rank = 7;
 }
