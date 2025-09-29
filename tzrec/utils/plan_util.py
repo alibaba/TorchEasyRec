@@ -187,7 +187,6 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
                     cast(ModuleSharder[nn.Module], DynamicEmbeddingCollectionSharder()),
                 ]
             )
-        print(sharders)
         return sharders
     else:
         # ShardedEmbeddingCollection is not supported yet.
