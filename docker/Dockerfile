@@ -75,10 +75,19 @@ RUN echo "dash dash/sh boolean false" | debconf-set-selections \
     && DEBIAN_FRONTEND=noninteractive dpkg-reconfigure dash
 
 RUN case ${DEVICE} in \
-        "cu126") cd /tmp && \
-                 wget https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/rdma/MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz && \
-                 tar -xvf MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz && \
-                 cd MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64 && \
-                 ./mlnxofedinstall --user-space-only --without-ksys --without-fw-update --force && \
-                 rm -rf /tmp/* ;; \
+        "cu126") apt-get update && \
+                 apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
+                 libnl-3-dev libnl-route-3-dev libnl-3-200 libnl-route-3-200 udev dmidecode ethtool && \
+                 apt-get clean && \
+                 rm -rf /var/lib/apt/lists/* ;; \
     esac
+RUN case ${DEVICE} in \
+        "cu126") cd /tmp/ && \
+                 wget http://pythonrun.oss-cn-zhangjiakou.aliyuncs.com/rdma/nic-libs-mellanox-rdma-5.2-2/nic-lib-rdma-core-installer-ubuntu.tar.gz && \
+                 tar xzvf nic-lib-rdma-core-installer-ubuntu.tar.gz && \
+                 cd nic-lib-rdma-core-installer-ubuntu && \
+                 echo Y | /bin/bash install.sh && \
+                 cd .. && \
+                 rm -rf nic-lib-rdma-core-installer-ubuntu && \
+                 rm -f nic-lib-rdma-core-installer-ubuntu.tar.gz ;; \
+esac
