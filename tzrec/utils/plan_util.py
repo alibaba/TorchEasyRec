@@ -629,13 +629,13 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_option.use_dynamicemb = use_dynamicemb
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
-                            if sharding_option.cache_params.load_factor is None:
+                            if sharding_option.cache_params is None:
                                 # add cache_load_factor automatic search space
-                                for load_factor in range(10):
+                                for load_factor_step in range(10):
                                     sharding_option_copy = copy.copy(sharding_option)
-                                    sharding_option_copy.cache_params.load_factor = (
-                                        load_factor + 1
-                                    ) / 10
+                                    sharding_option_copy.cache_params = CacheParams(
+                                        load_factor=(load_factor_step + 1) / 10
+                                    )
                                     sharding_options_per_table.append(
                                         sharding_option_copy
                                     )
