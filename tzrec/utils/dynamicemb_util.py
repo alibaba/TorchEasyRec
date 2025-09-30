@@ -323,18 +323,15 @@ if has_dynamicemb:
                 # pyre-ignore [16]
                 dynamicemb_options = sharding_option.dynamicemb_options
 
-                tensor = sharding_option.tensor
-                # align to next_power_of_2
-                num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
-
                 # calc local_hbm_for_values
+                tensor = sharding_option.tensor
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
                 optimizer_multipler = shard_estimators._get_optimizer_multipler(
                     optimizer_class, tensor.shape
                 )
                 dynamicemb_options.local_hbm_for_values = (
                     _calculate_dynamicemb_table_storage_specific_size(
-                        [num_aligned_embedding_per_rank, shards[0].size[1]],
+                        shards[0].size,
                         tensor.element_size(),
                         optimizer_multipler,
                         sharding_option.cache_load_factor,
@@ -343,9 +340,11 @@ if has_dynamicemb:
                     )
                 )
 
+                # align to next_power_of_2
+                num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
+                num_embeddings_per_shard = shards[0].size[0]
                 if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
                     num_aligned_embedding_per_rank = dynamicemb_options.bucket_capacity
-                num_embeddings_per_shard = shards[0].size[0]
                 if num_embeddings_per_shard != num_aligned_embedding_per_rank:
                     dynamicemb_options.num_aligned_embedding_per_rank = (
                         num_aligned_embedding_per_rank
