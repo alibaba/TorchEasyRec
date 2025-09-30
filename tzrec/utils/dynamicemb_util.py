@@ -249,14 +249,25 @@ if has_dynamicemb:
     def _round_up(a: int, b: int) -> int:
         return int((a + b - 1) // b) * b
 
-    def _dynamicemb_memory_usage(
+    def _calculate_dynamicemb_table_storage_specific_size(
         size: List[int],
         element_size: int,
         optimizer_multipler: float = 0.0,
-        cache_ratio: float = 1.0,
+        cache_ratio: Optional[float] = None,
         is_hbm: bool = True,
         only_values: bool = False,
-    ):
+    ) -> int:
+        """Calculate dynamic embedding table storage.
+
+        total_value_memory = max_capacity x aligned16(embedding+optimizer states)
+        num_buckets = max_capacity/bucket_capacity
+        hbm_budget = min(global_hbm_for_values//world_size, total_value_memory) +
+            max_capacity x (key<8byte> + score<8byte> + digest<1byte>) +
+            num_buckets x (bucket_size<4byte> + 4 x pointer<8byte>)
+        ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
+        """
+        if cache_ratio is None:
+            cache_ratio = 1.0
         # TODO: get bucket_capacity from DynamicEmbTableOptions
         bucket_capacity = 128
         return math.ceil(
@@ -321,13 +332,15 @@ if has_dynamicemb:
                 optimizer_multipler = shard_estimators._get_optimizer_multipler(
                     optimizer_class, tensor.shape
                 )
-                dynamicemb_options.local_hbm_for_values = _dynamicemb_memory_usage(
-                    [num_aligned_embedding_per_rank, shards[0].size[1]],
-                    tensor.element_size(),
-                    optimizer_multipler,
-                    sharding_option.cache_load_factor,
-                    is_hbm=True,
-                    only_values=True,
+                dynamicemb_options.local_hbm_for_values = (
+                    _calculate_dynamicemb_table_storage_specific_size(
+                        [num_aligned_embedding_per_rank, shards[0].size[1]],
+                        tensor.element_size(),
+                        optimizer_multipler,
+                        sharding_option.cache_load_factor,
+                        is_hbm=True,
+                        only_values=True,
+                    )
                 )
 
                 if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
@@ -417,15 +430,7 @@ if has_dynamicemb:
         cache_ratio: float = 1.0,
         is_inference: bool = False,
     ) -> Tuple[List[int], List[int]]:
-        """Calculate storage for dynamicemb.
-
-        total_value_memory = max_capacity x aligned16(embedding+optimizer states)
-        num_buckets = max_capacity/bucket_capacity
-        hbm_budget = min(global_hbm_for_values//world_size, total_value_memory) +
-            max_capacity x (key<8byte> + score<8byte> + digest<1byte>) +
-            num_buckets x (bucket_size<4byte> + 4 x pointer<8byte>)
-        ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
-        """
+        """Calculate storage for dynamicemb."""
         optimizer_multipler = 0.0
         optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
         if not is_inference:
@@ -434,7 +439,7 @@ if has_dynamicemb:
             )
 
         hdm_value_sizes = [
-            _dynamicemb_memory_usage(
+            _calculate_dynamicemb_table_storage_specific_size(
                 size,
                 tensor.element_size(),
                 optimizer_multipler,
@@ -445,7 +450,7 @@ if has_dynamicemb:
         ]
 
         ddr_value_sizes = [
-            _dynamicemb_memory_usage(
+            _calculate_dynamicemb_table_storage_specific_size(
                 size,
                 tensor.element_size(),
                 optimizer_multipler,
@@ -617,13 +622,15 @@ if has_dynamicemb:
     )
 
     def _get_dynamicemb_options_per_table(
-        local_row,
-        local_col,
+        local_row: int,
+        local_col: int,
         data_type: DataType,
         optimizer: dynamicemb.EmbOptimType,
         table: ShardedEmbeddingTable,
     ) -> dynamicemb.DynamicEmbTableOptions:
+        # pyre-ignore [16]
         dynamicemb_options = table.fused_params["dynamicemb_options"]
+        bak_local_hbm_for_values = None
         if dynamicemb_options.num_aligned_embedding_per_rank is not None:
             bak_local_hbm_for_values = dynamicemb_options.local_hbm_for_values
 
@@ -636,11 +643,12 @@ if has_dynamicemb:
         )
 
         # do not improve the HBM budget, already aligned in planner.
-        if dynamicemb_options.num_aligned_embedding_per_rank is not None:
+        if bak_local_hbm_for_values is not None:
             dynamicemb_options.local_hbm_for_values = bak_local_hbm_for_values
 
         return dynamicemb_options
 
+    # pyre-ignore [9]
     batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table = (
         _get_dynamicemb_options_per_table
     )
