@@ -22,7 +22,7 @@ from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.main import _create_features, _get_dataloader
 from tzrec.tests import utils
-from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
 from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
 
 
@@ -843,6 +843,26 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
+
+    @unittest.skipIf(
+        gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
+        "dynamicemb not available.",
+    )
+    def test_multi_tower_din_with_dynamicemb_train_eval(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        # if self.success:
+        #     self.success = utils.test_export(
+        #         os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+        #     )
 
     @unittest.skipIf(
         gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."

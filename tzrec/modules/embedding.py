@@ -16,6 +16,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -589,6 +590,7 @@ class EmbeddingGroupImpl(nn.Module):
         mc_emb_bag_configs = OrderedDict()
         mc_modules = OrderedDict()
         dense_embedding_configs = []
+        self._emb_bag_constraints = OrderedDict()
         self.has_sparse = False
         self.has_mc_sparse = False
         self.has_dense = False
@@ -598,6 +600,7 @@ class EmbeddingGroupImpl(nn.Module):
         emb_bag_configs_user = OrderedDict()
         mc_emb_bag_configs_user = OrderedDict()
         mc_modules_user = OrderedDict()
+        self._emb_bag_constraints_user = OrderedDict()
         self.has_sparse_user = False
         self.has_mc_sparse_user = False
 
@@ -655,6 +658,7 @@ class EmbeddingGroupImpl(nn.Module):
                             emb_bag_config.init_fn = eval(f"partial({wide_init_fn})")
                     # we may modify ebc name at feat_to_group_to_emb_name, e.g., wide
                     emb_bag_config.name = feat_to_group_to_emb_name[name][group_name]
+                    const = feature.parameter_constraints(emb_bag_config)
 
                     if need_input_tile_emb and feature.is_user_feat:
                         _add_embedding_bag_config(
@@ -668,8 +672,13 @@ class EmbeddingGroupImpl(nn.Module):
                                 mc_modules_user, emb_bag_config.name, mc_module
                             )
                             self.has_mc_sparse_user = True
+                            # mc module not support const now
                         else:
                             self.has_sparse_user = True
+                            if const is not None:
+                                self._emb_bag_constraints_user[emb_bag_config.name] = (
+                                    const
+                                )
                     else:
                         _add_embedding_bag_config(
                             emb_bag_configs=mc_emb_bag_configs
@@ -680,8 +689,11 @@ class EmbeddingGroupImpl(nn.Module):
                         if mc_module:
                             _add_mc_module(mc_modules, emb_bag_config.name, mc_module)
                             self.has_mc_sparse = True
+                            # mc module not support const now
                         else:
                             self.has_sparse = True
+                            if const is not None:
+                                self._emb_bag_constraints[emb_bag_config.name] = const
 
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_bag_config.name
@@ -753,6 +765,17 @@ class EmbeddingGroupImpl(nn.Module):
     def group_total_dim(self, group_name: str) -> int:
         """Total output dimension of a feature group."""
         return self._group_total_dim[group_name]
+
+    def parameter_constraints(
+        self, prefix: str = ""
+    ) -> Dict[str, ParameterConstraints]:
+        """Embedding parameter constraint."""
+        constraints = {}
+        for k, v in self._emb_bag_constraints.items():
+            constraints[f"{prefix}ebc.{k}"] = v
+        for k, v in self._emb_bag_constraints_user.items():
+            constraints[f"{prefix}ebc_user.{k}"] = v
+        return constraints
 
     def forward(
         self,
@@ -1047,6 +1070,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dim_to_emb_configs = defaultdict(OrderedDict)
         dim_to_mc_emb_configs = defaultdict(OrderedDict)
         dim_to_mc_modules = defaultdict(OrderedDict)
+        self._dim_to_emb_constraints = defaultdict(OrderedDict)
         self.has_sparse = False
         self.has_mc_sparse = False
         self.has_dense = False
@@ -1057,6 +1081,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dim_to_emb_configs_user = defaultdict(OrderedDict)
         dim_to_mc_emb_configs_user = defaultdict(OrderedDict)
         dim_to_mc_modules_user = defaultdict(OrderedDict)
+        self._dim_to_emb_constraints_user = defaultdict(OrderedDict)
         self.has_sparse_user = False
         self.has_mc_sparse_user = False
         self.has_mulval_seq_user = False
@@ -1108,6 +1133,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     # we may/could modify ec name at feat_to_group_to_emb_name
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
                     embedding_dim = emb_config.embedding_dim
+                    const = feature.parameter_constraints(emb_config)
 
                     if need_input_tile_emb and feature.is_user_feat:
                         emb_configs = (
@@ -1126,8 +1152,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 mc_module,
                             )
                             self.has_mc_sparse_user = True
+                            # mc module not support const now
                         else:
                             self.has_sparse_user = True
+                            if const is not None:
+                                self._dim_to_emb_constraints_user[embedding_dim][
+                                    emb_config.name
+                                ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq_user = True
                     else:
@@ -1147,8 +1178,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 mc_module,
                             )
                             self.has_mc_sparse = True
+                            # mc module not support const now
                         else:
                             self.has_sparse = True
+                            if const is not None:
+                                self._dim_to_emb_constraints[embedding_dim][
+                                    emb_config.name
+                                ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq = True
 
@@ -1239,6 +1275,19 @@ class SequenceEmbeddingGroupImpl(nn.Module):
     def all_group_total_dim(self) -> Dict[str, int]:
         """Total output dimension of all feature group."""
         return self._group_total_dim
+
+    def parameter_constraints(
+        self, prefix: str = ""
+    ) -> Dict[str, ParameterConstraints]:
+        """Embedding parameter constraints."""
+        constraints = {}
+        for dim, emb_constraints in self._dim_to_emb_constraints.items():
+            for k, v in emb_constraints.items():
+                constraints[f"{prefix}ec_dict.{dim}.{k}"] = v
+        for dim, emb_constraints in self._dim_to_emb_constraints_user.items():
+            for k, v in emb_constraints.items():
+                constraints[f"{prefix}ec_dict_user.{dim}.{k}"] = v
+        return constraints
 
     def has_group(self, group_name: str) -> bool:
         """Check the feature group exist or not."""
