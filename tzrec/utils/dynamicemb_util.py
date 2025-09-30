@@ -246,6 +246,31 @@ if has_dynamicemb:
     DynamicEmbeddingBagCollectionSharder.compute_kernels = _ebc_compute_kernels
     DynamicEmbeddingCollectionSharder.compute_kernels = _ec_compute_kernels
 
+    def _round_up(a: int, b: int) -> int:
+        return int((a + b - 1) // b) * b
+
+    def _dynamicemb_memory_usage(
+        size: List[int],
+        element_size: int,
+        optimizer_multipler: float = 0.0,
+        cache_ratio: float = 1.0,
+        is_hbm: bool = True,
+        only_values: bool = False,
+    ):
+        # TODO: get bucket_capacity from DynamicEmbTableOptions
+        bucket_capacity = 128
+        return math.ceil(
+            _next_power_of_2(size[0])
+            * (
+                _round_up(
+                    math.ceil(size[1] * (1 + optimizer_multipler) * element_size),
+                    16,
+                )
+                * (cache_ratio if is_hbm else 1 - cache_ratio)
+                + (8 + 8 + 1 + (4 + 4) / bucket_capacity) * (is_hbm and not only_values)
+            )
+        )
+
     def _to_sharding_plan(
         sharding_options: List[ShardingOption],
         topology: Topology,
@@ -289,28 +314,25 @@ if has_dynamicemb:
 
                 tensor = sharding_option.tensor
                 # align to next_power_of_2
-                num_embeddings_per_shard = shards[0].size[0]
                 num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
 
+                # calc local_hbm_for_values
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
                 optimizer_multipler = shard_estimators._get_optimizer_multipler(
                     optimizer_class, tensor.shape
                 )
-                dynamicemb_options.local_hbm_for_values = math.ceil(
-                    num_aligned_embedding_per_rank
-                    * _round_up(
-                        math.ceil(
-                            shards[0].size[1]
-                            * (1 + optimizer_multipler)
-                            * tensor.element_size()
-                        ),
-                        16,
-                    )
-                    * sharding_option.cache_load_factor
+                dynamicemb_options.local_hbm_for_values = _dynamicemb_memory_usage(
+                    [num_aligned_embedding_per_rank, shards[0].size[1]],
+                    tensor.element_size(),
+                    optimizer_multipler,
+                    sharding_option.cache_load_factor,
+                    is_hbm=True,
+                    only_values=True,
                 )
 
                 if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
                     num_aligned_embedding_per_rank = dynamicemb_options.bucket_capacity
+                num_embeddings_per_shard = shards[0].size[0]
                 if num_embeddings_per_shard != num_aligned_embedding_per_rank:
                     dynamicemb_options.num_aligned_embedding_per_rank = (
                         num_aligned_embedding_per_rank
@@ -388,9 +410,6 @@ if has_dynamicemb:
     # pyre-ignore [9]
     shard_estimators.kernel_bw_lookup = _kernel_bw_lookup
 
-    def _round_up(a: int, b: int) -> int:
-        return int((a + b - 1) // b) * b
-
     def _calculate_dynamicemb_storage_specific_sizes(
         tensor: torch.Tensor,
         shard_sizes: List[List[int]],
@@ -414,40 +433,24 @@ if has_dynamicemb:
                 optimizer_class, tensor.shape
             )
 
-        # TODO: get bucket_capacity from DynamicEmbTableOptions
-        bucket_capacity = 128
         hdm_value_sizes = [
-            math.ceil(
-                _next_power_of_2(size[0])
-                * (
-                    _round_up(
-                        math.ceil(
-                            size[1] * (1 + optimizer_multipler) * tensor.element_size()
-                        ),
-                        16,
-                    )
-                    * cache_ratio
-                    + 8
-                    + 8
-                    + 1
-                    + (4 + 4) / bucket_capacity
-                )
+            _dynamicemb_memory_usage(
+                size,
+                tensor.element_size(),
+                optimizer_multipler,
+                cache_ratio,
+                is_hbm=True,
             )
             for size in shard_sizes
         ]
 
         ddr_value_sizes = [
-            math.ceil(
-                _next_power_of_2(size[0])
-                * (
-                    _round_up(
-                        math.ceil(
-                            size[1] * (1 + optimizer_multipler) * tensor.element_size()
-                        ),
-                        16,
-                    )
-                    * (1 - cache_ratio)
-                )
+            _dynamicemb_memory_usage(
+                size,
+                tensor.element_size(),
+                optimizer_multipler,
+                cache_ratio,
+                is_hbm=False,
             )
             for size in shard_sizes
         ]
