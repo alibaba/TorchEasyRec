@@ -715,7 +715,9 @@ def train_and_evaluate(
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
         ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
-        global_constraints_cfg=train_config.global_embedding_constraints,
+        global_constraints_cfg=train_config.global_embedding_constraints
+        if train_config.HasField("global_embedding_constraints")
+        else None,
         model=model,
     )
 
@@ -837,7 +839,9 @@ def evaluate(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
-        global_constraints_cfg=train_config.global_embedding_constraints,
+        global_constraints_cfg=train_config.global_embedding_constraints
+        if train_config.HasField("global_embedding_constraints")
+        else None,
         model=model,
     )
     sharders = get_default_sharders()

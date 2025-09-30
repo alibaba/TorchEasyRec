@@ -632,7 +632,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             if sharding_option.cache_params is None:
                                 # add cache_load_factor automatic search space
                                 for load_factor_step in range(10):
-                                    sharding_option_copy = copy.copy(sharding_option)
+                                    sharding_option_copy = copy.deepcopy(
+                                        sharding_option
+                                    )
                                     sharding_option_copy.cache_params = CacheParams(
                                         load_factor=(load_factor_step + 1) / 10
                                     )
