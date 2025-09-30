@@ -14,7 +14,10 @@ from typing import List, Optional, Tuple, Type, cast
 
 import torch
 from torch import nn
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.planner import (
     constants,
     enumerators,
@@ -40,7 +43,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig, DataType
 
 from tzrec.protos import feature_pb2
 
@@ -52,6 +55,7 @@ try:
         DynamicEmbInitializerArgs,
         DynamicEmbInitializerMode,
         DynamicEmbScoreStrategy,
+        batched_dynamicemb_compute_kernel,
     )
     from dynamicemb.dynamicemb_config import DynamicEmbKernel
     from dynamicemb.planner import (
@@ -214,10 +218,11 @@ if has_dynamicemb:
     enumerators.GUARDED_COMPUTE_KERNELS.add(EmbeddingComputeKernel.CUSTOMIZED_KERNEL)
 
     def _ebc_compute_kernels(
-        self,
+        self,  # pyre-ignore [2]
         sharding_type: str,
         compute_device_type: str,
     ) -> List[str]:
+        # pyre-ignore [16]
         compute_kernels = super(
             DynamicEmbeddingBagCollectionSharder, self
         ).compute_kernels(sharding_type, compute_device_type)
@@ -226,10 +231,11 @@ if has_dynamicemb:
         return compute_kernels
 
     def _ec_compute_kernels(
-        self,
+        self,  # pyre-ignore [2]
         sharding_type: str,
         compute_device_type: str,
     ) -> List[str]:
+        # pyre-ignore [16]
         compute_kernels = super(
             DynamicEmbeddingCollectionSharder, self
         ).compute_kernels(sharding_type, compute_device_type)
@@ -273,21 +279,36 @@ if has_dynamicemb:
             )
 
             if (
-                # pyre-ignore [16]
                 hasattr(sharding_option, "use_dynamicemb")
                 # pyre-ignore [16]
                 and sharding_option.use_dynamicemb
             ):
                 # only support row-wise now
+                # pyre-ignore [16]
                 dynamicemb_options = sharding_option.dynamicemb_options
 
-                shard_storage = sharding_option.shards[0].storage
-                assert shard_storage is not None
-                dynamicemb_options.local_hbm_for_values = shard_storage.hbm
-
+                tensor = sharding_option.tensor
                 # align to next_power_of_2
                 num_embeddings_per_shard = shards[0].size[0]
                 num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
+
+                optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+                optimizer_multipler = shard_estimators._get_optimizer_multipler(
+                    optimizer_class, tensor.shape
+                )
+                dynamicemb_options.local_hbm_for_values = math.ceil(
+                    num_aligned_embedding_per_rank
+                    * _round_up(
+                        math.ceil(
+                            shards[0].size[1]
+                            * (1 + optimizer_multipler)
+                            * tensor.element_size()
+                        ),
+                        16,
+                    )
+                    * sharding_option.cache_load_factor
+                )
+
                 if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
                     num_aligned_embedding_per_rank = dynamicemb_options.bucket_capacity
                 if num_embeddings_per_shard != num_aligned_embedding_per_rank:
@@ -371,7 +392,7 @@ if has_dynamicemb:
         return int((a + b - 1) // b) * b
 
     def _calculate_dynamicemb_storage_specific_sizes(
-        shape: torch.Size,
+        tensor: torch.Tensor,
         shard_sizes: List[List[int]],
         optimizer_class: Optional[Type[torch.optim.Optimizer]] = None,
         cache_ratio: float = 1.0,
@@ -387,9 +408,10 @@ if has_dynamicemb:
         ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
         """
         optimizer_multipler = 0.0
+        optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
         if not is_inference:
             optimizer_multipler = shard_estimators._get_optimizer_multipler(
-                optimizer_class, shape
+                optimizer_class, tensor.shape
             )
 
         # TODO: get bucket_capacity from DynamicEmbTableOptions
@@ -398,7 +420,12 @@ if has_dynamicemb:
             math.ceil(
                 _next_power_of_2(size[0])
                 * (
-                    _round_up(math.ceil(size[1] * (1 + optimizer_multipler)), 16)
+                    _round_up(
+                        math.ceil(
+                            size[1] * (1 + optimizer_multipler) * tensor.element_size()
+                        ),
+                        16,
+                    )
                     * cache_ratio
                     + 8
                     + 8
@@ -413,7 +440,12 @@ if has_dynamicemb:
             math.ceil(
                 _next_power_of_2(size[0])
                 * (
-                    _round_up(math.ceil(size[1] * (1 + optimizer_multipler)), 16)
+                    _round_up(
+                        math.ceil(
+                            size[1] * (1 + optimizer_multipler) * tensor.element_size()
+                        ),
+                        16,
+                    )
                     * (1 - cache_ratio)
                 )
             )
@@ -500,12 +532,10 @@ if has_dynamicemb:
                 is_pooled=is_pooled,
             )
 
-            optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
             hbm_specific_sizes, ddr_specific_sizes = (
                 _calculate_dynamicemb_storage_specific_sizes(
-                    shape=tensor.shape,
+                    tensor=tensor,
                     shard_sizes=shard_sizes,
-                    optimizer_class=optimizer_class,
                     cache_ratio=caching_ratio if caching_ratio else 1.0,
                     is_inference=is_inference,
                 )
@@ -576,4 +606,38 @@ if has_dynamicemb:
                 kv_cache_load_factor=kv_cache_load_factor,
             )
 
+    # pyre-ignore [9]
     shard_estimators.calculate_shard_storages = _calculate_shard_storages
+
+    _dynamicemb_get_dynamicemb_options_per_table = (
+        batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table
+    )
+
+    def _get_dynamicemb_options_per_table(
+        local_row,
+        local_col,
+        data_type: DataType,
+        optimizer: dynamicemb.EmbOptimType,
+        table: ShardedEmbeddingTable,
+    ) -> dynamicemb.DynamicEmbTableOptions:
+        dynamicemb_options = table.fused_params["dynamicemb_options"]
+        if dynamicemb_options.num_aligned_embedding_per_rank is not None:
+            bak_local_hbm_for_values = dynamicemb_options.local_hbm_for_values
+
+        dynamicemb_options = _dynamicemb_get_dynamicemb_options_per_table(
+            local_row=local_row,
+            local_col=local_col,
+            data_type=data_type,
+            optimizer=optimizer,
+            table=table,
+        )
+
+        # do not improve the HBM budget, already aligned in planner.
+        if dynamicemb_options.num_aligned_embedding_per_rank is not None:
+            dynamicemb_options.local_hbm_for_values = bak_local_hbm_for_values
+
+        return dynamicemb_options
+
+    batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table = (
+        _get_dynamicemb_options_per_table
+    )
