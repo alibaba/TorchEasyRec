@@ -29,6 +29,7 @@ from torch.distributed.checkpoint.default_planner import (
     _create_read_items,
 )
 
+from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
@@ -216,6 +217,16 @@ def restore_model(
         else:
             if is_local_rank_zero:
                 logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
+    if has_dynamicemb:
+        from dynamicemb.dump_load import DynamicEmbLoad
+
+        logger.info(f"{os.environ.get('RANK', 0)} restoring dynamic embedding...")
+        DynamicEmbLoad(
+            os.path.join(checkpoint_dir, "dynamicemb"),
+            model,
+            optim=True,  # optimizer is not None,
+        )
+        logger.info(f"{os.environ.get('RANK', 0)} restore dynamic embedding finished.")
 
 
 def save_model(
@@ -235,6 +246,14 @@ def save_model(
         save(
             optimizer.state_dict(),
             checkpoint_id=os.path.join(checkpoint_dir, "optimizer"),
+        )
+    if has_dynamicemb:
+        from dynamicemb.dump_load import DynamicEmbDump
+
+        DynamicEmbDump(
+            os.path.join(checkpoint_dir, "dynamicemb"),
+            model,
+            optim=optimizer is not None,
         )
     # save model plan
     if hasattr(model, "_plan") and model._plan is not None:

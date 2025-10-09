@@ -22,7 +22,7 @@ from tzrec.datasets.utils import (
     SequenceSparseData,
 )
 from tzrec.features.custom_feature import CustomFeature
-from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
+from tzrec.features.feature import DYNAMICEMB_HASH_BUCKET_SIZE, ZCH_HASH_BUCKET_SIZE
 from tzrec.features.id_feature import FgMode, IdFeature
 from tzrec.features.raw_feature import RawFeature
 from tzrec.protos import feature_pb2
@@ -320,7 +320,9 @@ class SequenceIdFeature(IdFeature):
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("zch"):
-            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+            fg_cfg["hash_bucket_size"] = ZCH_HASH_BUCKET_SIZE
+        elif self.config.HasField("dynamicemb"):
+            fg_cfg["hash_bucket_size"] = DYNAMICEMB_HASH_BUCKET_SIZE
         elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):

@@ -19,7 +19,8 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import (
-    MAX_HASH_BUCKET_SIZE,
+    DYNAMICEMB_HASH_BUCKET_SIZE,
+    ZCH_HASH_BUCKET_SIZE,
     FgMode,
     _parse_fg_encoded_sparse_feature_impl,
 )
@@ -56,6 +57,8 @@ class ComboFeature(IdFeature):
         """Get embedding row count."""
         if self.config.HasField("zch"):
             num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("dynamicemb"):
+            num_embeddings = self.config.dynamicemb.max_capacity
         elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif len(self.vocab_list) > 0:
@@ -123,7 +126,9 @@ class ComboFeature(IdFeature):
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("zch"):
-            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+            fg_cfg["hash_bucket_size"] = ZCH_HASH_BUCKET_SIZE
+        elif self.config.HasField("dynamicemb"):
+            fg_cfg["hash_bucket_size"] = DYNAMICEMB_HASH_BUCKET_SIZE
         elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
         elif len(self.vocab_list) > 0:

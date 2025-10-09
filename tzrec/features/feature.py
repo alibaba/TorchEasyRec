@@ -22,7 +22,9 @@ import pyarrow as pa
 import pyfg
 import torch
 from torch import nn  # NOQA
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import (
+    BaseEmbeddingConfig,
     EmbeddingBagConfig,
     EmbeddingConfig,
     PoolingType,
@@ -53,16 +55,22 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingConfig,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.protos import feature_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
-from tzrec.utils import config_util
+from tzrec.utils import config_util, dynamicemb_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
 _FEATURE_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
 
-MAX_HASH_BUCKET_SIZE = 2**63 - 1
+# 0xFFFFFFFFFFFFFFFF are reserved for MCZCH
+ZCH_HASH_BUCKET_SIZE = 2**63 - 1
+
+# the keys of 0xFFFFFFFFFFFFFFFD, 0xFFFFFFFFFFFFFFFE, and 0xFFFFFFFFFFFFFFFF are
+# reserved for dynamicemb internal using. when hkv options.reserved_key_start_bit=0
+DYNAMICEMB_HASH_BUCKET_SIZE = 2**63 - 3
 
 
 def _parse_fg_encoded_sparse_feature_impl(
@@ -213,6 +221,21 @@ def _dtype_str_to_data_type(data_type_str: str) -> DataType:
             f"[{data_type_str}] is not supported."
         )
     return data_type
+
+
+def build_embedding_constraints(
+    constraints_cfg: feature_pb2.ParameterConstraints,
+) -> ParameterConstraints:
+    """Build ParameterConstraints for embedding parameter."""
+    constraints = ParameterConstraints(
+        sharding_types=list(constraints_cfg.sharding_types)
+        if len(constraints_cfg.sharding_types) > 0
+        else None,
+        compute_kernels=list(constraints_cfg.compute_kernels)
+        if len(constraints_cfg.compute_kernels) > 0
+        else None,
+    )
+    return constraints
 
 
 class InvalidFgInputError(Exception):
@@ -542,6 +565,21 @@ class BaseFeature(object, metaclass=_meta_cls):
         if hasattr(self.config, "stub_type") and self.config.HasField("stub_type"):
             return self.config.stub_type
         return False
+
+    def parameter_constraints(
+        self, emb_config: Optional[BaseEmbeddingConfig]
+    ) -> Optional[ParameterConstraints]:
+        """Embedding parameter constraints."""
+        if self.config.HasField("embedding_constraints"):
+            return build_embedding_constraints(self.config.embedding_constraints)
+        elif hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb"):
+            emb_config = emb_config if emb_config is not None else self.emb_config
+            assert emb_config is not None
+            return dynamicemb_util.build_dynamicemb_constraints(
+                self.config.dynamicemb, emb_config
+            )
+        else:
+            return None
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""

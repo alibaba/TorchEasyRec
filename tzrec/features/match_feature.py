@@ -21,7 +21,8 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import (
-    MAX_HASH_BUCKET_SIZE,
+    DYNAMICEMB_HASH_BUCKET_SIZE,
+    ZCH_HASH_BUCKET_SIZE,
     BaseFeature,
     FgMode,
     _parse_fg_encoded_dense_feature_impl,
@@ -97,6 +98,8 @@ class MatchFeature(BaseFeature):
         """Get embedding row count."""
         if self.config.HasField("zch"):
             num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("dynamicemb"):
+            num_embeddings = self.config.dynamicemb.max_capacity
         elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
@@ -197,7 +200,11 @@ class MatchFeature(BaseFeature):
         if self.config.HasField("normalizer"):
             fg_cfg["normalizer"] = self.config.normalizer
         if self.config.HasField("zch"):
-            fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
+            fg_cfg["hash_bucket_size"] = ZCH_HASH_BUCKET_SIZE
+            fg_cfg["value_type"] = "string"
+            fg_cfg["needDiscrete"] = True
+        elif self.config.HasField("dynamicemb"):
+            fg_cfg["hash_bucket_size"] = DYNAMICEMB_HASH_BUCKET_SIZE
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
         elif self.config.HasField("hash_bucket_size"):
