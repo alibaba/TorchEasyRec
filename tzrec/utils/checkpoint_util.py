@@ -220,11 +220,13 @@ def restore_model(
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
+        logger.info(f"{os.environ.get('RANK', 0)} restoring dynamic embedding...")
         DynamicEmbLoad(
             os.path.join(checkpoint_dir, "dynamicemb"),
             model,
-            optim=optimizer is not None,
+            optim=True,  # optimizer is not None,
         )
+        logger.info(f"{os.environ.get('RANK', 0)} restore dynamic embedding finished.")
 
 
 def save_model(
