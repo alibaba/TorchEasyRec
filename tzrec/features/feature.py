@@ -65,12 +65,8 @@ from tzrec.utils.logging_util import logger
 _FEATURE_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
 
-# 0xFFFFFFFFFFFFFFFF are reserved for MCZCH
-ZCH_HASH_BUCKET_SIZE = 2**63 - 1
 
-# the keys of 0xFFFFFFFFFFFFFFFD, 0xFFFFFFFFFFFFFFFE, and 0xFFFFFFFFFFFFFFFF are
-# reserved for dynamicemb internal using. when hkv options.reserved_key_start_bit=0
-DYNAMICEMB_HASH_BUCKET_SIZE = 2**63 - 3
+MAX_HASH_BUCKET_SIZE = 2**63 - 1
 
 
 def _parse_fg_encoded_sparse_feature_impl(
