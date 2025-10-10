@@ -382,7 +382,7 @@ class OdpsReader(BaseReader):
         self._input_to_sess = {}
         self._init_client()
 
-        self.schema = []
+        fields = []
         self._ordered_cols = []
         _, table_name, _, _ = _parse_table_path(self._input_path.split(",")[0])
         table = self._table_to_cli[table_name].table
@@ -394,11 +394,17 @@ class OdpsReader(BaseReader):
                         f"column [{column.name}] with dtype {column.type} "
                         "is not supported now."
                     )
-                self.schema.append(
+                fields.append(
                     pa.field(column.name, TYPE_TABLE_TO_PA[str(column.type).upper()])
                 )
                 self._ordered_cols.append(column.name)
+        self._schema = pa.schema(fields)
         self._init_session()
+
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        return self._schema
 
     def _init_client(self) -> None:
         """Init storage api client."""

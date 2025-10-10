@@ -159,7 +159,6 @@ class ParquetReader(BaseReader):
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
         self._ordered_cols = None
-        self.schema = []
         self._input_files = []
         for input_path in self._input_path.split(","):
             self._input_files.extend(glob.glob(input_path))
@@ -168,14 +167,16 @@ class ParquetReader(BaseReader):
 
         parquet_file = parquet.ParquetFile(self._input_files[0])
         if self._selected_cols:
+            fields = []
             self._ordered_cols = []
             for field in parquet_file.schema_arrow:
                 # pyre-ignore [58]
                 if field.name in selected_cols:
-                    self.schema.append(field)
+                    fields.append(field)
                     self._ordered_cols.append(field.name)
+            self._schema = pa.schema(fields)
         else:
-            self.schema = parquet_file.schema_arrow
+            self._schema = parquet_file.schema_arrow
         parquet_file.close()
 
         rank = int(os.environ.get("RANK", 0))
@@ -200,6 +201,11 @@ class ParquetReader(BaseReader):
         self._num_rows = []
         for input_file in self._input_files:
             self._num_rows.append(self._parquet_metas[input_file].num_rows)
+
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        return self._schema
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1

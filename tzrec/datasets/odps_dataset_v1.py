@@ -137,16 +137,23 @@ class OdpsReaderV1(BaseReader):
             shuffle,
             shuffle_buffer_size,
         )
-        self.schema = []
+
         reader = common_io.table.TableReader(
             self._input_path.split(",")[0], selected_cols=",".join(selected_cols or [])
         )
         self._ordered_cols = []
+        fields = []
         for field in reader.get_schema():
             if not selected_cols or field["colname"] in selected_cols:
-                self.schema.append(field)
+                fields.append(field)
                 self._ordered_cols.append(field["colname"])
+        self.schema = pa.schema(fields)
         reader.close()
+
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        return self._schema
 
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
