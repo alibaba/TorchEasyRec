@@ -55,7 +55,6 @@ has_dynamicemb = False
 try:
     import dynamicemb
     from dynamicemb import (
-        DynamicEmbEvictStrategy,
         DynamicEmbInitializerArgs,
         DynamicEmbInitializerMode,
         DynamicEmbScoreStrategy,
@@ -159,15 +158,6 @@ def build_dynamicemb_constraints(
     embedding_dim = emb_config.embedding_dim
     num_embeddings = emb_config.num_embeddings
 
-    evict_strategy = None
-    if dynamicemb_cfg.evict_strategy in DynamicEmbEvictStrategy.__members__.keys():
-        evict_strategy = DynamicEmbEvictStrategy[dynamicemb_cfg.evict_strategy]
-    else:
-        raise ValueError(
-            "DynamicEmbEvictStrategy support: "
-            f"{DynamicEmbEvictStrategy.__members__.keys()}, "
-            "but got {dynamicemb_cfg.evict_strategy}."
-        )
     score_strategy = None
     if dynamicemb_cfg.score_strategy in DynamicEmbScoreStrategy.__members__.keys():
         score_strategy = DynamicEmbScoreStrategy[dynamicemb_cfg.score_strategy]
@@ -195,7 +185,6 @@ def build_dynamicemb_constraints(
             embedding_dim,
             is_eval=True,
         ),
-        evict_strategy=evict_strategy,
         score_strategy=score_strategy,
     )
 
