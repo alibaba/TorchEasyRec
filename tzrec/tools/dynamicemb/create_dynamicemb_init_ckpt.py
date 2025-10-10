@@ -17,9 +17,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
+import numpy.typing as npt
 import pyfg
 from dynamicemb import dump_load
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
@@ -49,12 +50,15 @@ class DynamicEmbTableInitInfo:
     separator: str
 
 
+_DYN_EMB_QUEUE_TYPE = Queue[Tuple[Optional[npt.NDArray], Optional[npt.NDArray]]]
+
+
 def _read_loop(
     table_path: str,
     embedding_dim: int,
     separator: str,
     world_size: int,
-    output_queues: List[Queue],
+    output_queues: List[_DYN_EMB_QUEUE_TYPE],
     reader_type: Optional[str],
     odps_data_quota_name: Optional[str],
 ) -> None:
@@ -85,6 +89,7 @@ def _read_loop(
             "separator": separator,
         },
     ]
+    # pyre-ignore [16]
     fg_handler = pyfg.FgArrowHandler({"features": fg_json}, 2)
     for data in reader.to_batches():
         fg_output, status = fg_handler.process_arrow(data)
@@ -105,7 +110,7 @@ def _read_loop(
 
 
 def _write_loop(
-    input_queue: Queue,
+    input_queue: _DYN_EMB_QUEUE_TYPE,
     emb_name: str,
     rank: int,
     world_size: int,
@@ -143,7 +148,7 @@ def _write_loop(
 
     while True:
         keys, embs = input_queue.get()
-        if keys is None:
+        if keys is None or embs is None:
             break
         for fkey in fkeys:
             fkey.write(keys.astype(np.int64).tobytes())

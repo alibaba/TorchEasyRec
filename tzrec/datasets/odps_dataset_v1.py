@@ -147,7 +147,7 @@ class OdpsReaderV1(BaseReader):
             if not selected_cols or field["colname"] in selected_cols:
                 fields.append(field)
                 self._ordered_cols.append(field["colname"])
-        self.schema = pa.schema(fields)
+        self._schema = pa.schema(fields)
         reader.close()
 
     @property

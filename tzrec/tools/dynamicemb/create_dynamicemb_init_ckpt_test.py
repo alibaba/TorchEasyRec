@@ -19,7 +19,8 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 
 from tzrec.tests import utils
-from tzrec.utils import config_util, misc_util
+from tzrec.utils import config_util, dynamicemb_util, misc_util
+from tzrec.utils.test_util import gpu_unavailable
 
 
 class CreateDynamicEmbInitCkptTest(unittest.TestCase):
@@ -34,6 +35,10 @@ class CreateDynamicEmbInitCkptTest(unittest.TestCase):
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
 
+    @unittest.skipIf(
+        gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
+        "dynamicemb not available.",
+    )
     def test_create_dynamicemb_init_ckpt(self):
         pipeline_config = config_util.load_pipeline_config(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config"
