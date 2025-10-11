@@ -20,7 +20,7 @@ import zipfile
 from collections import OrderedDict
 
 import requests
-from google.protobuf import descriptor_pool, symbol_database, text_format
+from google.protobuf import descriptor_pool, struct_pb2, symbol_database, text_format
 
 from tzrec.constant import EASYREC_VERSION
 from tzrec.protos import feature_pb2 as tzrec_feature_pb2
@@ -96,6 +96,7 @@ class ConvertConfig(object):
         easyrec_config_path,
         output_tzrec_config_path,
         fg_json_path=None,
+        use_old_fg=False,
         easyrec_package_path=None,
     ):
         if "easyrec_pipeline_pb2" not in globals():
@@ -107,8 +108,9 @@ class ConvertConfig(object):
         self.sub_sequence_to_group = {}
         self.sequence_feature_to_fg = {}
         if fg_json_path is not None:
-            fg_json = self.load_easyrec_fg_json(fg_json_path)
-            self.analyse_fg(fg_json)
+            self.fg_json = self.load_easyrec_fg_json(fg_json_path)
+            self.analyse_fg(self.fg_json)
+        self.use_old_fg = use_old_fg
 
     def analyse_fg(self, fg_json):
         """Analysis fg.json."""
@@ -180,6 +182,190 @@ class ConvertConfig(object):
         pipeline_config.data_config.dataset_type = DatasetType.OdpsDataset
         pipeline_config.data_config.label_fields.extend(label_fields)
         pipeline_config.data_config.num_workers = 8
+        return pipeline_config
+
+    def _easyrec_feature_2_tzrec(self, tzrec_feature, easyrec_feature=None):
+        if easyrec_feature:
+            if easyrec_feature.HasField("embedding_dim"):
+                tzrec_feature.embedding_dim = easyrec_feature.embedding_dim
+            if (
+                hasattr(easyrec_feature, "hash_bucket_size")
+                and easyrec_feature.hash_bucket_size > 0
+                and hasattr(tzrec_feature, "hash_bucket_size")
+            ):
+                tzrec_feature.hash_bucket_size = easyrec_feature.hash_bucket_size
+            if (
+                hasattr(easyrec_feature, "boundaries")
+                and len(list(easyrec_feature.boundaries)) > 0
+                and hasattr(tzrec_feature, "boundaries")
+            ):
+                boundaries = list(easyrec_feature.boundaries)
+                tzrec_feature.boundaries.extend(boundaries)
+            if (
+                hasattr(easyrec_feature, "num_buckets")
+                and easyrec_feature.num_buckets > 0
+                and hasattr(easyrec_feature, "num_buckets")
+            ):
+                tzrec_feature.num_buckets = easyrec_feature.num_buckets
+
+    def _search_easyrec_config(self, feature_name):
+        for cfg in self.easyrec_config.feature_configs:
+            if cfg.feature_name:
+                easy_feature_name = cfg.feature_name
+            else:
+                easy_feature_name = list(cfg.input_names)[0]
+            if feature_name == easy_feature_name:
+                return cfg
+        return None
+
+    def _fg_info_convert_feature(self, feature, fg_json):
+        pyfg_key_2_feat_cfg_key = {
+            "feature_name": "feature_name",
+            "expression": "expression",
+            "default_value": "default_value",
+            "need_prefix": "need_prefix",
+            "separator": "separator",
+            "hash_bucket_size": "hash_bucket_size",
+            "vocab_list": "vocab_list",
+            "vocab_dict": "vocab_dict",
+            "vocab_file": "vocab_file",
+            "value_dim": "value_dim",
+            "value_dimension": "value_dim",
+            "default_bucketize_value": "default_bucketize_value",
+            "stub_type": "stub_type",
+            "operator_name": "operator_name",
+            "operator_lib_file": "operator_lib_file",
+            "is_op_thread_safe": "is_op_thread_safe",
+            "normalizer": "normalizer",
+            "boundaries": "boundaries",
+            "variables": "variables",
+            "num_buckets": "num_buckets",
+            "weighted": "weighted",
+            "kv_delimiter": "kv_delimiter",
+            "query": "query",
+            "document": "document",
+            "needDiscrete": "need_discrete",
+            "combiner": "combiner",
+            "user": "nested_map",
+            "category": "pkey",
+            "item": "skey",
+            "show_category": "show_pkey",
+            "show_item": "show_skey",
+            "title": "title",
+            "method": "method",
+            "tokenizer_type": "tokenizer_type",
+        }
+        filter_fg = {}
+        for fg_k, ft_k in pyfg_key_2_feat_cfg_key.items():
+            if fg_k in fg_json and hasattr(feature, ft_k):
+                if isinstance(fg_json[fg_k], list):
+                    attr = getattr(feature, ft_k)
+                    attr.extend(fg_json[fg_k])
+                else:
+                    setattr(feature, ft_k, fg_json[fg_k])
+            elif fg_k in fg_json:
+                filter_fg[fg_k] = fg_json[fg_k]
+        return feature, filter_fg
+
+    def _create_feature_config_use_pyfg(self, pipeline_config):
+        easyrec_feature_config = easyrec_feature_config_pb2.FeatureConfig()  # NOQA
+        for fg_json in self.fg_json["features"]:
+            feature_config = tzrec_feature_pb2.FeatureConfig()
+            feature_config.ClearField("feature")
+            if "feature_type" in fg_json:
+                feature_type = fg_json["feature_type"]
+                feature_name = fg_json["feature_name"]
+                cfg = self._search_easyrec_config(feature_name)
+                if feature_type == "combo_feature":
+                    feature = tzrec_feature_pb2.ComboFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.combo_feature.CopyFrom(feature)
+                elif feature_type == "custom_feature":
+                    feature = tzrec_feature_pb2.CustomFeature()
+                    feature, params = self._fg_info_convert_feature(feature, fg_json)
+                    if len(params) > 0:
+                        struct = struct_pb2.Struct()
+                        struct.update(params)
+                        feature.operator_params.CopyFrom(struct)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.custom_feature.CopyFrom(feature)
+                elif feature_type == "expr_feature":
+                    feature = tzrec_feature_pb2.ExprFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.expr_feature.CopyFrom(feature)
+                elif feature_type == "id_feature":
+                    feature = tzrec_feature_pb2.IdFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    if "combiner" in fg_json:
+                        feature.pooling = fg_json["combiner"]
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.id_feature.CopyFrom(feature)
+                elif feature_type == "kv_dot_product":
+                    feature = tzrec_feature_pb2.KvDotProduct()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.kv_dot_product.CopyFrom(feature)
+                elif feature_type == "lookup_feature":
+                    feature = tzrec_feature_pb2.LookupFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.lookup_feature.CopyFrom(feature)
+                elif feature_type == "match_feature":
+                    feature = tzrec_feature_pb2.MatchFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.match_feature.CopyFrom(feature)
+                elif feature_type == "overlap_feature":
+                    feature = tzrec_feature_pb2.OverlapFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.overlap_feature.CopyFrom(feature)
+                elif feature_type == "raw_feature":
+                    feature = tzrec_feature_pb2.RawFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.raw_feature.CopyFrom(feature)
+                elif feature_type == "tokenize_feature":
+                    feature = tzrec_feature_pb2.TokenizeFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.tokenize_feature.CopyFrom(feature)
+                else:
+                    logger.error(f"{feature_name} can't converted")
+                    continue
+                pipeline_config.feature_configs.append(feature_config)
+            elif "sequence_name" in fg_json:
+                seq_feature = tzrec_feature_pb2.SequenceFeature()
+                seq_feature.sequence_name = fg_json["sequence_name"]
+                seq_feature.sequence_length = fg_json["sequence_length"]
+                seq_feature.sequence_delim = fg_json["sequence_delim"]
+                seq_feature.sequence_pk = fg_json["sequence_pk"]
+                for sub_fg_json in fg_json["features"]:
+                    sub_feature_name = (
+                        fg_json["sequence_name"] + "__" + sub_fg_json["feature_name"]
+                    )
+                    cfg = self._search_easyrec_config(sub_feature_name)
+                    feature_type = sub_fg_json["feature_type"]
+                    sub_feature_config = tzrec_feature_pb2.SeqFeatureConfig()
+                    if feature_type == "id_feature":
+                        feature = tzrec_feature_pb2.IdFeature()
+                        feature, _ = self._fg_info_convert_feature(feature, sub_fg_json)
+                        self._easyrec_feature_2_tzrec(feature, cfg)
+                        if "combiner" in sub_fg_json:
+                            feature.pooling = sub_fg_json["combiner"]
+                        sub_feature_config.ClearField("feature")
+                        sub_feature_config.id_feature.CopyFrom(feature)
+                    else:
+                        feature = tzrec_feature_pb2.RawFeature()
+                        feature, _ = self._fg_info_convert_feature(feature, sub_fg_json)
+                        self._easyrec_feature_2_tzrec(feature, cfg)
+                        sub_feature_config.ClearField("feature")
+                        sub_feature_config.raw_feature.CopyFrom(feature)
+                    seq_feature.features.append(sub_feature_config)
+                feature_config.sequence_feature.CopyFrom(seq_feature)
+                pipeline_config.feature_configs.append(feature_config)
         return pipeline_config
 
     def _create_feature_config(self, pipeline_config):
@@ -743,7 +929,10 @@ class ConvertConfig(object):
         tzrec_config = self._create_eval_config(tzrec_config)
         tzrec_config = self._create_data_config(tzrec_config)
         if len(self.feature_to_fg):
-            tzrec_config = self._create_feature_config(tzrec_config)
+            if self.use_old_fg:
+                tzrec_config = self._create_feature_config(tzrec_config)
+            else:
+                tzrec_config = self._create_feature_config_use_pyfg(tzrec_config)
         else:
             tzrec_config = self._create_feature_config_no_fg(tzrec_config)
         tzrec_config = self._create_model_config(tzrec_config)
@@ -764,6 +953,12 @@ if __name__ == "__main__":
         "--fg_json_path", type=str, default=None, help="easyrec use fg.json path"
     )
     parser.add_argument(
+        "--use_old_fg",
+        action="store_true",
+        default=False,
+        help="if true will create tzrec based on easyrec or based on pyfg",
+    )
+    parser.add_argument(
         "--output_tzrec_config_path",
         type=str,
         default=None,
@@ -780,6 +975,7 @@ if __name__ == "__main__":
         args.easyrec_config_path,
         args.output_tzrec_config_path,
         args.fg_json_path,
+        args.use_old_fg,
         args.easyrec_package_path,
     )
     fs.build()
