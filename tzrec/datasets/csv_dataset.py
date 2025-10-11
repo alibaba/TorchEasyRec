@@ -121,17 +121,23 @@ class CsvReader(BaseReader):
         if len(self._input_files) == 0:
             raise RuntimeError(f"No csv files exist in {self._input_path}.")
         dataset = ds.dataset(self._input_files[0], format=self._csv_fmt)
-        self.schema = []
         self._ordered_cols = None
         if self._selected_cols is not None:
+            fields = []
             self._ordered_cols = []
             for field in dataset.schema:
                 # pyre-ignore [58]
                 if field.name in self._selected_cols:
-                    self.schema.append(field)
+                    fields.append(field)
                     self._ordered_cols.append(field.name)
+            self._schema = pa.schema(fields)
         else:
-            self.schema = dataset.schema
+            self._schema = dataset.schema
+
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        return self._schema
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1

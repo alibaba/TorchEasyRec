@@ -452,6 +452,11 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._shuffle = shuffle
         self._shuffle_buffer_size = shuffle_buffer_size
 
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        raise NotImplementedError
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:

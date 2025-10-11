@@ -189,9 +189,18 @@ def restore_model(
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
 
+    meta_path = os.path.join(checkpoint_dir, "meta")
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
-    if os.path.exists(model_ckpt_path):
+
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+    if not meta.get("load_model", True):
+        pass
+    elif os.path.exists(model_ckpt_path):
         if is_local_rank_zero:
             logger.info(f"Restoring model state from {model_ckpt_path}...")
         state_dict = model.state_dict()
@@ -203,8 +212,11 @@ def restore_model(
         model.load_state_dict(state_dict)
     else:
         raise RuntimeError(f"model_ckpt_path[{model_ckpt_path}] not exists.")
+
     if optimizer:
-        if os.path.exists(optim_ckpt_path):
+        if not meta.get("load_optim", True):
+            pass
+        elif os.path.exists(optim_ckpt_path):
             if is_local_rank_zero:
                 logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
             state_dict = optimizer.state_dict()
@@ -217,6 +229,7 @@ def restore_model(
         else:
             if is_local_rank_zero:
                 logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
+
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
@@ -224,7 +237,8 @@ def restore_model(
         DynamicEmbLoad(
             os.path.join(checkpoint_dir, "dynamicemb"),
             model,
-            optim=True,  # optimizer is not None,
+            table_names=meta.get("dynamicemb_load_table_names", None),
+            optim=meta.get("dynamicemb_load_optim", True),
         )
         logger.info(f"{os.environ.get('RANK', 0)} restore dynamic embedding finished.")
 

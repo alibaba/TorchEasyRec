@@ -91,6 +91,8 @@ message DynamicEmbedding {
     optional float cache_load_factor = 6;
     // init number of capacity
     optional uint64 init_capacity_per_rank = 7;
+    // init table path
+    optional string init_table = 8;
 }
 
 message IdFeature {

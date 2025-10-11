@@ -198,9 +198,7 @@ def build_dynamicemb_constraints(
     constraints = DynamicEmbParameterConstraints(
         use_dynamicemb=True,
         sharding_types=[ShardingType.ROW_WISE.value],
-        compute_kernels=[
-            EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
-        ],  # workaround for ShardingPlan estimator
+        compute_kernels=[EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value],
         dynamicemb_options=dynamicemb_options,
         **constraints_kwargs,
     )

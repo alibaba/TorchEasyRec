@@ -25,6 +25,7 @@ IGNORE_PATTERNS = [
     "Annotation `pa.DataType` is not defined as a type",
     "Annotation `pa.RecordBatch` is not defined as a type",
     "Annotation `pa.Scalar` is not defined as a type",
+    "Annotation `pa.Schema` is not defined as a type",
     "Annotation `parquet.FileMetaData` is not defined as a type",
     "Annotation `faiss.Index` is not defined as a type.",
     "Annotation `struct_pb2.Struct` is not defined as a type.",
