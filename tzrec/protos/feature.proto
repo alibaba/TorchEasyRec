@@ -67,10 +67,10 @@ message DynamicEmbInitializerArgs {
     // default is sqrt(1 / embedding_dim)
     optional float std_dev = 3;
     // the lower bound for uniform/truncated_normal distribution.
-    // default is -sqrt(1 / embedding_dim)
+    // default is -sqrt(1 / max_capacity)
     optional float lower = 4;
     // the upper bound for uniform/truncated_normal distribution.
-    // default is sqrt(1 / embedding_dim)
+    // default is sqrt(1 / max_capacity)
     optional float upper = 5;
     // the constant value for constant initialization.
     optional float value = 6 [default = 0.0];
