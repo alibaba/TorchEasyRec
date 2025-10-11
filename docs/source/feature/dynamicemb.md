@@ -1,6 +1,6 @@
 # Dynamic Embedding
 
-DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它使用\[HKV\](https://github.com/NVIDIA-Merlin/HierarchicalKV）作为Hash表的后端，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
+DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding使用[HierarchicalKV](https://github.com/NVIDIA-Merlin/HierarchicalKV) 作为Hash表的后端，相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
 注：目前使用DynamicEmbedding不包含在官方提供的镜像环境中，需要额外安装包
 
