@@ -531,6 +531,32 @@ feature_configs: {
 
 - 其余配置同RawFeature
 
+## BoolMaskFeature
+
+通过布尔值过滤元素，类似tf.boolean_mask(tensor, mask).
+
+```
+feature_configs: {
+    bool_mask_feature {
+        feature_name: "query_doc_sim"
+        expression: ["user:click_items", "item:is_valid"]
+        separator: ","
+    }
+}
+```
+
+- **expression**:该feature所依赖的字段来源,第一个字段表示字段的取值, 第二个字段表示对第一个字段的取值进行Mask
+- 其余配置同IdFeature
+
+示例
+
+| 输入            | mask                    | 未进行bucketize的输出 |
+| --------------- | ----------------------- | --------------------- |
+| "123,456,90,80" | "true,false,true,false" | ["123", "90"]         |
+| "123,456,90,80" | [1, 0, 1, 0]            | ["123", "90"]         |
+| [1, 2, 3, 4]    | [1, 0, 1, 0]            | [1, 3]                |
+| [1, 2, 3, 4]    | "true,false,true,false" | [1, 3]                |
+
 ## CustomFeature: 自定义特征
 
 自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
