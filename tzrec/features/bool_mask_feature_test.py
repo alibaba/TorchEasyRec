@@ -24,17 +24,23 @@ from tzrec.protos import feature_pb2
 class BoolMaskFeatureTest(unittest.TestCase):
     @parameterized.expand(
         [
-            [[["1,2,3,4"], ["true,false,true,false"]], "0", [1, 3], [1, 1]],
+            [[["1,2,3,4"], ["true,false,true,false"]], "0", [1, 3], [2]],
             [
                 [["1", "2", "3", "4"], ["true", "false", "true", "false"]],
                 "0",
                 [1, 3],
-                [1, 1],
+                [1, 0, 1, 0],
             ],
-            [[["1", "2", None], ["true", "false", "true"]], "3", [1, 3], [1, 1]],
+            [[["1", "2", None], ["true", "false", "true"]], "3", [1], [1, 0, 0]],
+            [
+                [["1,2", "3,4,5"], ["true,false", "true,false,true"]],
+                "0",
+                [1, 3, 5],
+                [1, 2],
+            ],
         ]
     )
-    def test_fg_encoded_bool_mask_feature_with_num_buckets(
+    def test_bool_mask_feature_with_num_buckets(
         self, input_feat, default_value, expected_values, expected_lengths
     ):
         bool_mask_feature = feature_pb2.BoolMaskFeature(
@@ -66,17 +72,23 @@ class BoolMaskFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [[["1,2,3,4"], ["true,false,true,false"]], "0", [1, 3], [5, 1]],
+            [[["1,2,3,4"], ["true,false,true,false"]], "0", [5, 3], [2]],
             [
                 [["1", "2", "3", "4"], ["true", "false", "true", "false"]],
                 "0",
                 [5, 3],
-                [1, 1],
+                [1, 0, 1, 0],
             ],
-            [[["1", "2", None], ["true", "false", "true"]], "3", [5, 3], [1, 1]],
+            [[["1", "2", None], ["true", "false", "true"]], "3", [5], [1, 0, 0]],
+            [
+                [["1,2", "3,4,5"], ["true,false", "true,false,true"]],
+                "0",
+                [5, 3, 9],
+                [1, 2],
+            ],
         ]
     )
-    def test_fg_encoded_bool_mask_feature_with_hash_bucket_size(
+    def test_bool_mask_feature_with_hash_bucket_size(
         self, input_feat, default_value, expected_values, expected_lengths
     ):
         bool_mask_feature = feature_pb2.BoolMaskFeature(

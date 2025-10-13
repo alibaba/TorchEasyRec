@@ -81,7 +81,7 @@ class BoolMaskFeature(IdFeature):
                 if pa.types.is_list(x.type):
                     x = x.fill_null([])
                 input_feats.append(x.tolist())
-            values, lengths, _ = self._fg_op.to_bucketized_jagged_tensor(input_feats)
+            values, _, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
             parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
         else:
             raise ValueError(
