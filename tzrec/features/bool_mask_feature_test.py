@@ -31,7 +31,7 @@ class BoolMaskFeatureTest(unittest.TestCase):
                 [1, 3],
                 [1, 1],
             ],
-            [[1, 2, None], "3", [1, 3], [1, 1]],
+            [[["1", "2", None], ["true", "false", "true"]], "3", [1, 3], [1, 1]],
         ]
     )
     def test_fg_encoded_bool_mask_feature_with_num_buckets(
@@ -73,7 +73,7 @@ class BoolMaskFeatureTest(unittest.TestCase):
                 [5, 3],
                 [1, 1],
             ],
-            [[1, 2, None], "3", [5, 3], [1, 1]],
+            [[["1", "2", None], ["true", "false", "true"]], "3", [5, 3], [1, 1]],
         ]
     )
     def test_fg_encoded_bool_mask_feature_with_hash_bucket_size(
