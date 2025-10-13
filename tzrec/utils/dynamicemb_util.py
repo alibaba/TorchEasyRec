@@ -44,12 +44,8 @@ from torchrec.distributed.types import (
     ShardMetadata,
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, DataType
-from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
-from torchrec.optim.optimizers import SGD
 
-from tzrec.optim import optimizer_builder
 from tzrec.protos import feature_pb2
-from tzrec.protos.train_pb2 import TrainConfig
 
 has_dynamicemb = False
 try:
@@ -203,29 +199,6 @@ def build_dynamicemb_constraints(
         **constraints_kwargs,
     )
     return constraints
-
-
-def _patch_dynamicemb_eval_model(model: nn.Module, train_config: TrainConfig) -> None:
-    """Patch model with optimizer when eval.
-
-    because DynamicEmbedding Eval need optimizer now.
-    """
-    if has_dynamicemb:
-        with_dynamicemb_feature = False
-        for feature in model.model._features:
-            if hasattr(feature.config, "dynamicemb") and feature.config.HasField(
-                "dynamicemb"
-            ):
-                with_dynamicemb_feature = True
-                break
-        if with_dynamicemb_feature:
-            sparse_optim_cls, _ = optimizer_builder.create_sparse_optimizer(
-                train_config.sparse_optimizer
-            )
-            trainable_params, frozen_params = model.model.sparse_parameters()
-            apply_optimizer_in_backward(sparse_optim_cls, trainable_params, {"lr": 0.0})
-            if len(frozen_params) > 0:
-                apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
 
 
 if has_dynamicemb:
