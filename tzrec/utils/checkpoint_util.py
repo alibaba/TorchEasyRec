@@ -238,7 +238,7 @@ def restore_model(
             os.path.join(checkpoint_dir, "dynamicemb"),
             model,
             table_names=meta.get("dynamicemb_load_table_names", None),
-            optim=meta.get("dynamicemb_load_optim", True),
+            optim=meta.get("dynamicemb_load_optim", optimizer is not None),
         )
         logger.info(f"{os.environ.get('RANK', 0)} restore dynamic embedding finished.")
 
