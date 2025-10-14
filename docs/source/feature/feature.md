@@ -18,7 +18,7 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`。更建议用数组（ARRAY）类型来表示多值，训练和推理性能更好
 
-- **fg_encoded_default_value**: FG编码后的数据的默认值，当fg_encoded=true并且不是用pai-fg编码数据时，可以设置该参数填充空值
+- **fg_encoded_default_value**: FG编码后的数据的默认值，当fg_mode=FG_NONE并且不是用pai-fg编码数据时，可以设置该参数填充空值
 
 - **trainable**: Embedding Variable是否可训练，默认为true
 
@@ -34,7 +34,7 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 feature_configs {
     id_feature {
         feature_name: "uid"
-        # fg_encoded=true的情况下，expression可以不写
+        # fg_mode=FG_NONE 数据已经被FG编号好的情况下，expression可以不写
         expression: "user:uid"
         embedding_dim: 32
         hash_bucket_size: 100000

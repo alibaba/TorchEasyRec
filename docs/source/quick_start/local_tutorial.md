@@ -147,8 +147,8 @@ data_config {
     batch_size: 8192
     # 输入数据类型，还可以支持 CsvDataset | OdpsDataset 等
     dataset_type: ParquetDataset
-    # 数据是否已经进行FG编码，如果为false，将会进行训练时FG
-    fg_encoded: false
+    # 数据在训练时是否运行FG，fg_mode=FG_DAG时将会进行训练时FG
+    fg_mode: FG_DAG
     # Label的名称
     label_fields: "clk"
     # 每个proc上的读数据并行度
