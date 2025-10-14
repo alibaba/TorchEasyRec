@@ -514,6 +514,10 @@ class BaseReader(metaclass=_reader_meta_cls):
             for data_dict in shuffle_buffer:
                 yield data_dict
 
+    def num_files(self) -> Optional[int]:
+        """Get number of files in the dataset."""
+        return None
+
 
 class BaseWriter(metaclass=_writer_meta_cls):
     """Writer base class.

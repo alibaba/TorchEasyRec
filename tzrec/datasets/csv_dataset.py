@@ -153,7 +153,7 @@ class CsvReader(BaseReader):
             )
             yield from self._arrow_reader_iter(reader)
 
-    def num_files(self) -> int:
+    def num_files(self) -> Optional[int]:
         """Get number of files in the dataset."""
         return len(self._input_files)
 

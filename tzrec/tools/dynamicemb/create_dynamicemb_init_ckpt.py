@@ -14,19 +14,17 @@ import json
 import multiprocessing as mp
 import os
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue
-from typing import List, Optional, Tuple
+from typing import List
 
 import numpy as np
-import numpy.typing as npt
 import pyfg
 from dynamicemb import dump_load
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 from dynamicemb.planner import DynamicEmbParameterConstraints
 
-from tzrec.datasets.dataset import create_reader
+from tzrec.datasets.dataset import BaseReader, create_reader
 from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
 from tzrec.main import _create_features, _create_model
 from tzrec.models.model import TrainWrapper
@@ -50,24 +48,15 @@ class DynamicEmbTableInitInfo:
     separator: str
 
 
-_DYN_EMB_QUEUE_TYPE = Queue[Tuple[Optional[npt.NDArray], Optional[npt.NDArray]]]
-
-
 def _read_loop(
-    table_path: str,
+    reader: BaseReader,
     embedding_dim: int,
     separator: str,
     world_size: int,
-    output_queues: List[_DYN_EMB_QUEUE_TYPE],
-    reader_type: Optional[str],
-    odps_data_quota_name: Optional[str],
+    output_queues: List[mp.Queue],
+    worker_id: int,
+    worker_num: int,
 ) -> None:
-    reader = create_reader(
-        table_path,
-        batch_size=20000,
-        reader_type=reader_type,
-        quota_name=odps_data_quota_name,
-    )
     id_field, embedding_field = reader.schema[0].name, reader.schema[1].name
     fg_json = [
         {
@@ -91,7 +80,9 @@ def _read_loop(
     ]
     # pyre-ignore [16]
     fg_handler = pyfg.FgArrowHandler({"features": fg_json}, 2)
-    for data in reader.to_batches():
+
+    read_rows = 0
+    for i_batch, data in enumerate(reader.to_batches(worker_id, worker_num)):
         fg_output, status = fg_handler.process_arrow(data)
         assert status.ok(), status.message()
         keys = fg_output[id_field].np_values
@@ -105,17 +96,22 @@ def _read_loop(
                 mask_embs = embs[mask]
                 output_queues[i].put((mask_keys, mask_embs))
 
+        read_rows += len(keys)
+        if i_batch % 1000 == 0 and i_batch > 0:
+            logger.info(f"reader worker [{worker_id}] finish {read_rows} rows.")
+
     for i in range(world_size):
         output_queues[i].put((None, None))
 
 
 def _write_loop(
-    input_queue: _DYN_EMB_QUEUE_TYPE,
+    input_queue: mp.Queue,
     emb_name: str,
     rank: int,
     world_size: int,
     save_paths: List[str],
     need_dump_scores: List[bool],
+    reader_worker_num: int,
 ) -> None:
     assert len(save_paths) == len(need_dump_scores)
     fkeys = []
@@ -146,10 +142,16 @@ def _write_loop(
         else:
             fscores.append(None)
 
+    exit_cnt = 0
+    prev_logger_rows = 0
+    write_rows = 0
     while True:
         keys, embs = input_queue.get()
         if keys is None or embs is None:
-            break
+            exit_cnt += 1
+            if exit_cnt == reader_worker_num:
+                break
+            continue
         for fkey in fkeys:
             fkey.write(keys.astype(np.int64).tobytes())
         for fvalue in fvalues:
@@ -157,6 +159,10 @@ def _write_loop(
         for fscore in fscores:
             if fscore is not None:
                 fscore.write(np.zeros((len(keys),), dtype=np.uint64).tobytes())
+        write_rows += len(keys)
+        if write_rows - prev_logger_rows >= 1000000:
+            prev_logger_rows = write_rows
+            logger.info(f"writer worker [{rank}] finish {write_rows} rows.")
 
     for fkey in fkeys:
         fkey.close()
@@ -171,39 +177,65 @@ def _init_one_emb(
     emb_name: str,
     init_info: DynamicEmbTableInitInfo,
     world_size: int,
+    reader_worker_num: int,
     reader_type: str,
     odps_data_quota_name: str,
 ) -> None:
-    q_list = [Queue(maxsize=3) for _ in range(args.world_size)]
+    q_list = [mp.Queue(maxsize=3) for _ in range(args.world_size)]
 
-    future_list = []
-    with ThreadPoolExecutor(max_workers=1 + world_size) as executor:
-        future_list.append(
-            executor.submit(
-                _read_loop,
-                table_path=init_info.table_path,
-                embedding_dim=init_info.embedding_dim,
-                separator=init_info.separator,
-                world_size=world_size,
-                output_queues=q_list,
-                reader_type=reader_type,
-                odps_data_quota_name=odps_data_quota_name,
-            )
+    read_p_list = []
+    reader = create_reader(
+        init_info.table_path,
+        batch_size=20000,
+        reader_type=reader_type,
+        quota_name=odps_data_quota_name,
+        compression="ZSTD",
+    )
+    num_files = reader.num_files()
+    if num_files is not None:
+        if reader_worker_num > num_files:
+            reader_worker_num = num_files
+    for i in range(reader_worker_num):
+        p = mp.Process(
+            target=_read_loop,
+            args=(
+                reader,
+                init_info.embedding_dim,
+                init_info.separator,
+                world_size,
+                q_list,
+                i,
+                reader_worker_num,
+            ),
         )
-        for i in range(args.world_size):
-            future_list.append(
-                executor.submit(
-                    _write_loop,
-                    input_queue=q_list[i],
-                    emb_name=emb_name,
-                    rank=i,
-                    world_size=world_size,
-                    save_paths=init_info.save_paths,
-                    need_dump_scores=init_info.need_dump_scores,
-                )
-            )
-        for future in future_list:
-            future.result()
+        p.start()
+        read_p_list.append(p)
+
+    write_p_list = []
+    for i in range(args.world_size):
+        write_p = mp.Process(
+            target=_write_loop,
+            args=(
+                q_list[i],
+                emb_name,
+                i,
+                world_size,
+                init_info.save_paths,
+                init_info.need_dump_scores,
+                reader_worker_num,
+            ),
+        )
+        write_p.start()
+        write_p_list.append(write_p)
+
+    for i, p in enumerate(read_p_list):
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"reader worker[{i}] for embedding [{emb_name}] failed.")
+    for i, p in enumerate(write_p_list):
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"writer worker[{i}] for embedding [{emb_name}] failed.")
 
 
 if __name__ == "__main__":
@@ -223,6 +255,12 @@ if __name__ == "__main__":
         help="training world size.",
     )
     parser.add_argument(
+        "--reader_worker_num",
+        type=int,
+        default=os.cpu_count(),
+        help="reader worker number, default is cpu count.",
+    )
+    parser.add_argument(
         "--reader_type",
         type=str,
         default=None,
@@ -238,7 +276,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--odps_data_quota_name",
         type=str,
-        default="pay-as-you-go",
+        default="",
         help="maxcompute storage api/tunnel data quota name.",
     )
     args, extra_args = parser.parse_known_args()
@@ -308,26 +346,16 @@ if __name__ == "__main__":
                     separator=args.separator,
                 )
 
-    init_p_dict = {}
     for emb_name, init_info in dyemb_name_to_init_info.items():
-        p = mp.Process(
-            target=_init_one_emb,
-            args=(
-                emb_name,
-                init_info,
-                args.world_size,
-                args.reader_type,
-                args.odps_data_quota_name,
-            ),
-        )
-        p.start()
         logger.info(f"Start init embedding [{emb_name}].")
-        init_p_dict[emb_name] = p
-
-    for emb_name, p in init_p_dict.items():
-        p.join()
-        if p.exitcode != 0:
-            raise RuntimeError(f"init worker for embedding [{emb_name}] failed.")
+        _init_one_emb(
+            emb_name,
+            init_info,
+            args.world_size,
+            args.reader_worker_num,
+            args.reader_type,
+            args.odps_data_quota_name or data_config.odps_data_quota_name,
+        )
         logger.info(f"Finish init embedding [{emb_name}].")
 
     with open(os.path.join(ckpt_dir, "meta"), "w") as f:
