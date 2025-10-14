@@ -332,6 +332,11 @@ class ConvertConfig(object):
                     feature, _ = self._fg_info_convert_feature(feature, fg_json)
                     self._easyrec_feature_2_tzrec(feature, cfg)
                     feature_config.tokenize_feature.CopyFrom(feature)
+                elif feature_type == "bool_mask_feature":
+                    feature = tzrec_feature_pb2.BoolMaskFeature()
+                    feature, _ = self._fg_info_convert_feature(feature, fg_json)
+                    self._easyrec_feature_2_tzrec(feature, cfg)
+                    feature_config.bool_mask_feature.CopyFrom(feature)
                 else:
                     logger.error(f"{feature_name} can't converted")
                     continue
