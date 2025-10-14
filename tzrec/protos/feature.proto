@@ -67,10 +67,10 @@ message DynamicEmbInitializerArgs {
     // default is sqrt(1 / embedding_dim)
     optional float std_dev = 3;
     // the lower bound for uniform/truncated_normal distribution.
-    // default is -sqrt(1 / embedding_dim)
+    // default is -sqrt(1 / max_capacity)
     optional float lower = 4;
     // the upper bound for uniform/truncated_normal distribution.
-    // default is sqrt(1 / embedding_dim)
+    // default is sqrt(1 / max_capacity)
     optional float upper = 5;
     // the constant value for constant initialization.
     optional float value = 6 [default = 0.0];
@@ -743,6 +743,67 @@ message CustomFeature {
     optional ParameterConstraints embedding_constraints = 50;
 }
 
+message BoolMaskFeature {
+    // feature name.
+    required string feature_name = 1;
+    // feature input, e.g. item:item_id
+    repeated string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    required uint32 embedding_dim = 4;
+    // number of hash size
+    optional uint64 hash_bucket_size = 5;
+    // number of id enumerators
+    optional uint64 num_buckets = 6;
+    // id vocabulary list
+    repeated string vocab_list = 7;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 8;
+    // id value dimensions, default = 0, when use in seq, default = 1
+    // if value_dim = 0, it supports id with multi-value
+    optional uint32 value_dim = 9;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value, default value before bucktize
+    optional string default_value = 11 [default = ""];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 14;
+    // mask value in training progress
+    optional bool use_mask =  15;
+    // zero collision hash
+    optional ZeroCollisionHash zch = 16;
+    // id vocabulary file path
+    optional string vocab_file = 17;
+    // vocab file relative directory
+    optional string asset_dir = 18;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 19;
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
+    // value_type after fg before bucketize, you can specify it for better performance.
+    // e.g. fg_value_type = int64 when use num_buckets
+    optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
+}
+
 message SequenceIdFeature {
     // feature name, e.g. item_cat_seq
     required string feature_name = 1;
@@ -958,6 +1019,7 @@ message FeatureConfig {
         CustomFeature custom_feature = 12;
         SequenceCustomFeature sequence_custom_feature = 13;
         KvDotProduct kv_dot_product = 14;
+        BoolMaskFeature bool_mask_feature = 15;
     }
 }
 

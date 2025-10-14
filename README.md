@@ -43,7 +43,7 @@ TorchEasyRec implements state of the art deep learning models used in common rec
 
 ### A variety of features & models
 
-- IdFeature / RawFeature / ComboFeature / LookupFeature / MatchFeature / ExprFeature / OverlapFeature / TokenizeFeature / SequenceIdFeature / SequenceRawFeature / SequenceFeature
+- IdFeature / RawFeature / ComboFeature / LookupFeature / MatchFeature / ExprFeature / KvDotProduct / BoolMaskFeature / OverlapFeature / TokenizeFeature / SequenceIdFeature / SequenceRawFeature / SequenceFeature
 - Match: [DSSM](docs/source/models/dssm.md) / [TDM](docs/source/models/tdm.md) / [DAT](docs/source/models/dat.md) / [MIND](docs/source/models/mind.md)
 - Rank: [WideAndDeep](docs/source/models/wide_and_deep.md) / [DeepFM](docs/source/models/deepfm.md) / [MultiTower](docs/source/models/multi_tower.md) / [DIN](docs/source/models/din.md) / [RocketLaunching](docs/source/models/rocket_launching.md) / [DLRM](docs/source/models/dlrm.md) / [MaskNet](docs/source/models/masknet.md) / [DCN](docs/source/models/dcn.md) / [DCNv2](docs/source/models/dcn_v2.md) / [xDeepFM](docs/source/models/xdeepfm.md)
 - Multi-Task: [MMoE](docs/source/models/mmoe.md) / [DBMTL](docs/source/models/dbmtl.md) / [PLE](docs/source/models/ple.md)

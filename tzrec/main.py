@@ -74,7 +74,7 @@ from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
-from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
+from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     create_train_pipeline,
@@ -835,8 +835,6 @@ def evaluate(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
 
-    # TODO: remove it when DynamicEmbedding support eval without optimizer
-    dynamicemb_util._patch_dynamicemb_eval_model(model, pipeline_config.train_config)
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
