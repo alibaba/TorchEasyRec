@@ -65,7 +65,7 @@ feature_configs {
     - --pipeline_config_path: 训练配置文件
     - --world_size: 训练进程数，一般情况下为训练的torchrun命令中的 nnodes\*nproc-per-node
     - --save_dir: 初始化模型保存目录
-    - --reader_worker_num:（可选）读worker数目，默认为cpu核数
+    - --reader_worker_num:（可选）读worker数目，默认为自动根据cpu核数设置
     - --separator: (可选) embedding数据类型如果为string的情况下的分隔符
 
   - 使用初始化的ckpt训练模型

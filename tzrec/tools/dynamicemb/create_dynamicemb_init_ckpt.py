@@ -16,7 +16,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Queue
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pyfg
@@ -177,7 +177,7 @@ def _init_one_emb(
     emb_name: str,
     init_info: DynamicEmbTableInitInfo,
     world_size: int,
-    reader_worker_num: int,
+    reader_worker_num: Optional[int],
     reader_type: str,
     odps_data_quota_name: str,
 ) -> None:
@@ -192,10 +192,12 @@ def _init_one_emb(
         compression="ZSTD",
         rebalance=False,  # we do not rebalance parquet file for each worker
     )
+    if reader_worker_num is None:
+        reader_worker_num = max(os.cpu_count() - world_size, world_size)
     num_files = reader.num_files()
     if num_files is not None:
-        if reader_worker_num > num_files:
-            reader_worker_num = num_files
+        reader_worker_num = min(reader_worker_num, num_files)
+
     for i in range(reader_worker_num):
         p = mp.Process(
             target=_read_loop,
@@ -258,7 +260,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reader_worker_num",
         type=int,
-        default=os.cpu_count(),
+        default=None,
         help="reader worker number, default is cpu count.",
     )
     parser.add_argument(
