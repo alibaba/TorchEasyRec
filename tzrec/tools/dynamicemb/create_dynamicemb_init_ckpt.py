@@ -276,7 +276,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--odps_data_quota_name",
         type=str,
-        default="",
+        default=None,
         help="maxcompute storage api/tunnel data quota name.",
     )
     args, extra_args = parser.parse_known_args()
