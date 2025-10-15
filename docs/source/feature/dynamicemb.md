@@ -52,31 +52,28 @@ feature_configs {
 - **init_table**: （可选）初始化表的路径，支持Odps/Parquet/Csv格式，表的第一列为id值，第二列为embedding值。
 
   - 注意: init_table 参数不能再训练任务中直接生效，需要前置一个使用init_table构建初始化ckpt的任务，具体步骤如下
+
   - 使用init_table构建初始化ckpt
 
-  ```bash
-  python -m tzrec.tools.dynamicemb.create_dynamicemb_init_ckpt \
-  --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
-  --world_size $WORLD_SIZE*$NPROC_PER_NODE \
-  --save_dir {INIT_CKPT_PATH}
-  ```
+    ```bash
+    python -m tzrec.tools.dynamicemb.create_dynamicemb_init_ckpt \
+    --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
+    --world_size $WORLD_SIZE*$NPROC_PER_NODE \
+    --save_dir {INIT_CKPT_PATH}
+    ```
 
-  - pipeline_config_path: 训练配置文件
-
-  - world_size: 训练进程数，一般情况下为训练的torchrun命令中的 nnodes\*nproc-per-node
-
-  - save_dir: 初始化模型保存目录
-
-  - reader_worker_num:（可选）读worker数目，默认为cpu核数
-
-  - separator: (可选) embedding数据类型如果为string的情况下的分隔符
+    - --pipeline_config_path: 训练配置文件
+    - --world_size: 训练进程数，一般情况下为训练的torchrun命令中的 nnodes\*nproc-per-node
+    - --save_dir: 初始化模型保存目录
+    - --reader_worker_num:（可选）读worker数目，默认为cpu核数
+    - --separator: (可选) embedding数据类型如果为string的情况下的分隔符
 
   - 使用初始化的ckpt训练模型
 
-  ```bash
-  torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-  --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-  -m tzrec.train_eval \
-  --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
-  --fine_tune_checkpoint {INIT_CKPT_PATH}/model.ckpt-0
-  ```
+    ```bash
+    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
+    --fine_tune_checkpoint {INIT_CKPT_PATH}/model.ckpt-0
+    ```
