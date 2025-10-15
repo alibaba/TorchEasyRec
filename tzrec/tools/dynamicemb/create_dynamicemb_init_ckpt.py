@@ -190,6 +190,7 @@ def _init_one_emb(
         reader_type=reader_type,
         quota_name=odps_data_quota_name,
         compression="ZSTD",
+        rebalance=False,  # we do not rebalance parquet file for each worker
     )
     num_files = reader.num_files()
     if num_files is not None:

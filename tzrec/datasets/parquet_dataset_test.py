@@ -19,11 +19,14 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 from parameterized import parameterized
+from pyarrow import parquet
+from torch import distributed as dist
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetWriter
+from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.utils import misc_util
 
 
 class ParquetDatasetTest(unittest.TestCase):
@@ -98,6 +101,71 @@ class ParquetDatasetTest(unittest.TestCase):
                     "tag_b.values",
                 ],
             )
+
+
+class ParquetReaderTest(unittest.TestCase):
+    def setUp(self):
+        if not os.path.exists("./tmp"):
+            os.makedirs("./tmp")
+        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+
+    def tearDown(self):
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    @parameterized.expand([[True], [False]])
+    def test_parquet_reader(self, rebalance):
+        def _reader_worker(rank, port):
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(2)
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(port)
+            dist.init_process_group(backend="gloo")
+            reader = ParquetReader(
+                os.path.join(self.test_dir, "*.parquet"),
+                batch_size=8192,
+                rebalance=rebalance,
+            )
+            total_cnt = 0
+            for batch in reader.to_batches(rank, 2):
+                total_cnt += len(batch["id_a"])
+            if rank == 0:
+                assert total_cnt == 3000 if rebalance else 5000
+            else:
+                assert total_cnt == 3000 if rebalance else 1000
+
+        for i, num_rows in enumerate([5000, 1000]):
+            t = pa.Table.from_arrays(
+                [
+                    pa.array(["unused"] * num_rows),
+                    pa.array(["1"] * num_rows),
+                    pa.array(["2\x033"] * num_rows),
+                    pa.array([4] * num_rows),
+                    pa.array([[5.0, 6.0]] * num_rows, type=pa.list_(pa.float32())),
+                    pa.array([0] * num_rows),
+                ],
+                names=["unused", "id_a", "tag_b", "raw_c", "raw_d", "label"],
+            )
+            writer = parquet.ParquetWriter(
+                os.path.join(self.test_dir, f"part-{i}.parquet"), schema=t.schema
+            )
+            writer.write_table(t)
+            writer.close()
+
+        world_size = 2
+        port = misc_util.get_free_port()
+        procs = []
+        for rank in range(world_size):
+            p = mp.Process(
+                target=_reader_worker,
+                args=(rank, port),
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"reader worker-{i} failed.")
 
 
 class ParquetWriterTest(unittest.TestCase):
