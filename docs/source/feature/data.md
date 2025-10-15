@@ -6,13 +6,13 @@ TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute�
 
 **一个最简单的data config的配置**
 
-这个配置里面，读取MaxCompute的表作为输入数据（OdpsDataset），并且输入数据已经编码好（fg_encoded），每个worker上以8192的batch_size，并行度为8来读取数据
+这个配置里面，读取MaxCompute的表作为输入数据（OdpsDataset），并且输入数据已经编码好，每个worker上以8192的batch_size，并行度为8来读取数据
 
 ```
 data_config {
     batch_size: 8192
     dataset_type: OdpsDataset
-    fg_encoded: true
+    fg_mode: FG_NONE
     label_fields: "clk"
     num_workers: 8
 }
@@ -249,7 +249,7 @@ sample_weight_fields: 'col_name'
 
 ### fg_encoded_multival_sep
 
-- fg_encoded=true时，数据的多值分割符，默认为chr(3)
+- fg_mode=FG_NONE 数据已经被FG编码好 时，数据的多值分割符，默认为chr(3)
 
 ### input_fields
 
