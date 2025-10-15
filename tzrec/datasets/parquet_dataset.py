@@ -245,7 +245,8 @@ class ParquetReader(BaseReader):
     def num_files(self) -> Optional[int]:
         """Get number of files in the dataset."""
         if self._rebalance:
-            # we
+            # we will rebalance parquet file to num_worker parts,
+            # so that, num_worker is
             return None
         else:
             return len(self._input_files)
