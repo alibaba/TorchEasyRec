@@ -18,3 +18,4 @@ python -m tzrec.tools.convert_easyrec_config_to_tzrec_config \
 - --fg_json_path: easyrec训练和推理使用的fg.json路径
 - --output_tzrec_config_path: 生成tzrec的config路径
 - --easyrec_package_path: 自定义的EasyRec whl或tar包路径或者http url
+- --use_old_fg: 如果使用的fg不是pyfg,则设置该参数
