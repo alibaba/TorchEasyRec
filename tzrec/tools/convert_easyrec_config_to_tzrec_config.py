@@ -96,7 +96,7 @@ class ConvertConfig(object):
         easyrec_config_path,
         output_tzrec_config_path,
         fg_json_path=None,
-        use_old_fg=False,
+        use_old_fg=True,
         easyrec_package_path=None,
     ):
         if "easyrec_pipeline_pb2" not in globals():
@@ -254,18 +254,30 @@ class ConvertConfig(object):
             "title": "title",
             "method": "method",
             "tokenizer_type": "tokenizer_type",
+            "map": "map",
+            "key": "key",
         }
         filter_fg = {}
-        for fg_k, ft_k in pyfg_key_2_feat_cfg_key.items():
-            if fg_k in fg_json and hasattr(feature, ft_k):
-                if isinstance(fg_json[fg_k], list):
-                    attr = getattr(feature, ft_k)
-                    attr.extend(fg_json[fg_k])
+        for fg_k in fg_json:
+            if fg_k in pyfg_key_2_feat_cfg_key:
+                ft_k = pyfg_key_2_feat_cfg_key[fg_k]
+                if hasattr(feature, ft_k):
+                    if isinstance(fg_json[fg_k], list):
+                        attr = getattr(feature, ft_k)
+                        attr.extend(fg_json[fg_k])
+                    else:
+                        setattr(feature, ft_k, fg_json[fg_k])
                 else:
-                    setattr(feature, ft_k, fg_json[fg_k])
-            elif fg_k in fg_json:
+                    filter_fg[fg_k] = fg_json[fg_k]
+            else:
                 filter_fg[fg_k] = fg_json[fg_k]
         return feature, filter_fg
+
+    def _nomarl_params(self, params):
+        keys = ["feature_type"]
+        for key in keys:
+            if key in params:
+                del params[key]
 
     def _create_feature_config_use_pyfg(self, pipeline_config):
         easyrec_feature_config = easyrec_feature_config_pb2.FeatureConfig()  # NOQA
@@ -284,6 +296,7 @@ class ConvertConfig(object):
                 elif feature_type == "custom_feature":
                     feature = tzrec_feature_pb2.CustomFeature()
                     feature, params = self._fg_info_convert_feature(feature, fg_json)
+                    self._nomarl_params(params)
                     if len(params) > 0:
                         struct = struct_pb2.Struct()
                         struct.update(params)

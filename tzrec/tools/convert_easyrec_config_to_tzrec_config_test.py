@@ -1645,6 +1645,360 @@ MODEL_CONFIG_DSSM = """model_config {
 }
 """
 
+PYFG_JSON = {
+    "features": [
+        {
+            "feature_name": "user_id",
+            "feature_type": "id_feature",
+            "value_type": "String",
+            "expression": "user:user_id",
+            "default_value": "-1024",
+            "combiner": "mean",
+            "need_prefix": False,
+            "is_multi": False,
+        },
+        {
+            "feature_name": "item_id",
+            "feature_type": "id_feature",
+            "value_type": "String",
+            "expression": "item:item_id",
+            "default_value": "-1024",
+            "combiner": "mean",
+            "need_prefix": False,
+            "is_multi": False,
+        },
+        {
+            "feature_name": "hotel_price",
+            "feature_type": "raw_feature",
+            "value_type": "Double",
+            "expression": "context:hotel_price",
+            "default_value": "-1999999",
+            "combiner": "mean",
+            "need_prefix": False,
+        },
+        {
+            "feature_name": "item__kv_user_blue_level_exposure_cnt_7d",
+            "feature_type": "lookup_feature",
+            "value_type": "Double",
+            "map": "item:item__kv_user_blue_level_exposure_cnt_7d",
+            "key": "user:user_blue_level",
+            "needDiscrete": False,
+            "needWeighting": False,
+            "needKey": False,
+            "default_value": "0",
+            "combiner": "mean",
+            "need_prefix": False,
+        },
+        {
+            "feature_name": "item__kv_user_blue_level_click_focus_cnt_7d",
+            "feature_type": "match_feature",
+            "value_type": "float",
+            "item": "item:item__kv_user_blue_level_click_focus_cnt_7d",
+            "user": "user:user_blue_level",
+            "category": "ALL",
+            "match_type": "hit",
+            "need_discrete": False,
+        },
+        {
+            "feature_type": "combo_feature",
+            "feature_name": "weekday_level",
+            "expression": ["feature:weekday", "user:memberlevel"],
+            "need_prefix": False,
+            "separator": "\u001d",
+            "default_value": "",
+            "stub_type": True,
+        },
+        {
+            "feature_name": "user_hotel_distance",
+            "feature_type": "custom_feature",
+            "operator_name": "BucketOp",
+            "operator_lib_file": "libbucket_op.so",
+            "expression": ["feature:tmp_hotel_distance"],
+            "value_type": "double",
+            "default_value": "0",
+            "value_dimension": 1,
+            "bucket_threshold": "0.001:1000:3000:5000:10000:1000000000",
+            "bucket_bins": "3.5:5:4:3:2:1",
+        },
+        {
+            "feature_name": "click_100_seq_filter_bool",
+            "feature_type": "expr_feature",
+            "expression": "click_100_seq__hotel_price> 0",
+            "value_type": "int32",
+            "variables": ["feature:click_100_seq__hotel_price"],
+            "default_value": "",
+            "separator": ";",
+            "stub_type": True,
+        },
+        {
+            "feature_name": "click_100_seq__hotel_price_filter",
+            "feature_type": "bool_mask_feature",
+            "value_type": "double",
+            "expression": [
+                "feature:click_100_seq__hotel_price",
+                "feature:click_100_seq_filter_bool",
+            ],
+            "separator": ";",
+            "stub_type": True,
+        },
+        {
+            "feature_type": "overlap_feature",
+            "feature_name": "hit_impr_hotel",
+            "query": "item:hotel_id",
+            "title": "feature:expr_100_seq__hotel_id_filter",
+            "method": "is_contain",
+            "separator": ";",
+            "normalizer": "",
+        },
+        {
+            "feature_type": "kv_dot_product",
+            "feature_name": "uh_tag_hit",
+            "query": "user:user_tag2_dict",
+            "value_dimension": 1,
+            "document": "item:hotel_tag2_dict",
+            "separator": ",",
+            "default_value": "0",
+        },
+        {
+            "sequence_name": "click_100_seq",
+            "sequence_column": "click_100_seq",
+            "sequence_length": 100,
+            "sequence_delim": ";",
+            "attribute_delim": "#",
+            "sequence_table": "item",
+            "sequence_pk": "user:click_100_seq",
+            "features": [
+                {
+                    "feature_name": "hotel_id",
+                    "feature_type": "id_feature",
+                    "value_type": "String",
+                    "expression": "item:hotel_id",
+                    "default_value": "-1024",
+                    "combiner": "mean",
+                    "need_prefix": True,
+                    "value_dimension": 1,
+                    "group": "click_100_seq_feature",
+                },
+                {
+                    "feature_name": "hotel_price",
+                    "feature_type": "raw_feature",
+                    "value_type": "Double",
+                    "expression": "user:hotel_price",
+                    "default_value": "-1024",
+                    "combiner": "mean",
+                    "need_prefix": True,
+                    "value_dimension": 1,
+                    "group": "click_100_seq_feature",
+                    "stub_type": True,
+                },
+                {
+                    "feature_name": "ts",
+                    "feature_type": "raw_feature",
+                    "value_type": "Double",
+                    "expression": "user:ts",
+                    "default_value": "-1024",
+                    "combiner": "mean",
+                    "need_prefix": False,
+                    "value_dimension": 1,
+                    "group": "click_100_seq_feature",
+                },
+            ],
+        },
+    ],
+    "reserves": ["is_click_cover", "is_click_video"],
+}
+
+PYFG_FEATURE_CONFIG = """feature_configs {
+  id_feature {
+    feature_name: "user_id"
+    expression: "user:user_id"
+    embedding_dim: 4
+    hash_bucket_size: 1000
+    pooling: "mean"
+    default_value: "-1024"
+  }
+}
+feature_configs {
+  id_feature {
+    feature_name: "item_id"
+    expression: "item:item_id"
+    embedding_dim: 24
+    hash_bucket_size: 1500000
+    pooling: "mean"
+    default_value: "-1024"
+  }
+}
+feature_configs {
+  raw_feature {
+    feature_name: "hotel_price"
+    expression: "context:hotel_price"
+    default_value: "-1999999"
+  }
+}
+feature_configs {
+  lookup_feature {
+    feature_name: "item__kv_user_blue_level_exposure_cnt_7d"
+    map: "item:item__kv_user_blue_level_exposure_cnt_7d"
+    key: "user:user_blue_level"
+    embedding_dim: 4
+    boundaries: 1e-08
+    boundaries: 47.0
+    boundaries: 285.0
+    boundaries: 672.0
+    boundaries: 1186.0
+    boundaries: 1853.0
+    boundaries: 2716.0
+    boundaries: 3861.0
+    boundaries: 5459.0
+    boundaries: 7817.0
+    boundaries: 11722.0
+    boundaries: 19513.0
+    boundaries: 43334.0
+    combiner: "mean"
+    default_value: "0"
+    need_discrete: false
+  }
+}
+feature_configs {
+  match_feature {
+    feature_name: "item__kv_user_blue_level_click_focus_cnt_7d"
+    nested_map: "user:user_blue_level"
+    pkey: "ALL"
+    skey: "item:item__kv_user_blue_level_click_focus_cnt_7d"
+    embedding_dim: 4
+    boundaries: 1e-08
+    boundaries: 1.0
+    boundaries: 2.0
+    boundaries: 5.0
+    boundaries: 8.0
+    boundaries: 13.0
+    boundaries: 19.0
+    boundaries: 28.0
+    boundaries: 42.0
+    boundaries: 67.0
+    boundaries: 123.0
+    boundaries: 298.0
+  }
+}
+feature_configs {
+  combo_feature {
+    feature_name: "weekday_level"
+    expression: "feature:weekday"
+    expression: "user:memberlevel"
+    default_value: ""
+    separator: ""
+    stub_type: true
+  }
+}
+feature_configs {
+  custom_feature {
+    feature_name: "user_hotel_distance"
+    operator_name: "BucketOp"
+    operator_lib_file: "libbucket_op.so"
+    operator_params {
+      fields {
+        key: "bucket_bins"
+        value {
+          string_value: "3.5:5:4:3:2:1"
+        }
+      }
+      fields {
+        key: "bucket_threshold"
+        value {
+          string_value: "0.001:1000:3000:5000:10000:1000000000"
+        }
+      }
+      fields {
+        key: "value_type"
+        value {
+          string_value: "double"
+        }
+      }
+    }
+    expression: "feature:tmp_hotel_distance"
+    default_value: "0"
+    value_dim: 1
+  }
+}
+feature_configs {
+  expr_feature {
+    feature_name: "click_100_seq_filter_bool"
+    expression: "click_100_seq__hotel_price> 0"
+    variables: "feature:click_100_seq__hotel_price"
+    separator: ";"
+    default_value: ""
+    stub_type: true
+  }
+}
+feature_configs {
+  bool_mask_feature {
+    feature_name: "click_100_seq__hotel_price_filter"
+    expression: "feature:click_100_seq__hotel_price"
+    expression: "feature:click_100_seq_filter_bool"
+    separator: ";"
+    stub_type: true
+  }
+}
+feature_configs {
+  overlap_feature {
+    feature_name: "hit_impr_hotel"
+    query: "item:hotel_id"
+    title: "feature:expr_100_seq__hotel_id_filter"
+    method: "is_contain"
+    normalizer: ""
+    separator: ";"
+  }
+}
+feature_configs {
+  kv_dot_product {
+    feature_name: "uh_tag_hit"
+    query: "user:user_tag2_dict"
+    document: "item:hotel_tag2_dict"
+    separator: ","
+    default_value: "0"
+  }
+}
+feature_configs {
+  sequence_feature {
+    sequence_name: "click_100_seq"
+    sequence_length: 100
+    sequence_delim: ";"
+    sequence_pk: "user:click_100_seq"
+    features {
+      id_feature {
+        feature_name: "hotel_id"
+        expression: "item:hotel_id"
+        value_dim: 1
+        pooling: "mean"
+        default_value: "-1024"
+      }
+    }
+    features {
+      raw_feature {
+        feature_name: "hotel_price"
+        expression: "user:hotel_price"
+        value_dim: 1
+        default_value: "-1024"
+        stub_type: true
+      }
+    }
+    features {
+      raw_feature {
+        feature_name: "ts"
+        expression: "user:ts"
+        embedding_dim: 4
+        boundaries: 1e-08
+        boundaries: 3.0
+        boundaries: 25.0
+        boundaries: 70.0
+        value_dim: 1
+        default_value: "-1024"
+      }
+    }
+  }
+}
+"""
+
 
 class ConvertConfigTest(unittest.TestCase):
     def setUp(self):
@@ -1659,6 +2013,10 @@ class ConvertConfigTest(unittest.TestCase):
             f.write(EASYREC_CONFIG)
         f = open(self.fg_path, "w", encoding="utf-8")
         json.dump(FG_JSON, f)
+        f.close()
+        self.pyfg_path = os.path.join(self.test_dir, "pyfg.json")
+        f = open(self.pyfg_path, "w", encoding="utf-8")
+        json.dump(PYFG_JSON, f)
         f.close()
 
     def tearDown(self):
@@ -1692,6 +2050,15 @@ class ConvertConfigTest(unittest.TestCase):
         config = convert._create_feature_config_no_fg(config)
         config_text = text_format.MessageToString(config, as_utf8=True)
         self.assertEqual(config_text, FEATURE_CONFIG_NO_FG)
+
+    def test_create_feature_config_use_pyfg(self):
+        convert = ConvertConfig(
+            self.easyrec_path, self.tzrec_path, self.pyfg_path, use_old_fg=False
+        )
+        config = tzrec_pipeline_pb2.EasyRecConfig()
+        config = convert._create_feature_config_use_pyfg(config)
+        config_text = text_format.MessageToString(config, as_utf8=True)
+        self.assertEqual(config_text, PYFG_FEATURE_CONFIG)
 
     def test_create_model_config(self):
         convert = ConvertConfig(self.easyrec_path, self.tzrec_path, self.fg_path)
