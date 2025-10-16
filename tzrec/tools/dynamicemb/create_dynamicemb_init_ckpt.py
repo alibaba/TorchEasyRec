@@ -193,7 +193,10 @@ def _init_one_emb(
         rebalance=False,  # we do not rebalance parquet file for each worker
     )
     if reader_worker_num is None:
-        reader_worker_num = max(os.cpu_count() - world_size, world_size)
+        reader_worker_num = world_size
+        cpu_count = os.cpu_count()
+        if cpu_count is not None:
+            reader_worker_num = max(cpu_count - world_size, reader_worker_num)
     num_files = reader.num_files()
     if num_files is not None:
         reader_worker_num = min(reader_worker_num, num_files)
