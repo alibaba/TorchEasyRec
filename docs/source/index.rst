@@ -15,6 +15,7 @@ Welcome to TorchEasyRec's documentation!
    feature/data
    feature/feature
    feature/zch
+   feature/dynamicemb
    feature/autodis
 
 .. toctree::

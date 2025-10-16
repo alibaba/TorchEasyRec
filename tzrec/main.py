@@ -170,8 +170,8 @@ def _get_dataloader(
     else:
         num_workers = data_config.num_workers
         # check number of files is valid or not for file based dataset.
-        if hasattr(dataset._reader, "num_files"):
-            num_files = dataset._reader.num_files()
+        num_files = dataset._reader.num_files()
+        if num_files is not None:
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             if num_files >= world_size:
                 num_files_per_worker = num_files // world_size
