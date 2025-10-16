@@ -65,7 +65,7 @@ message DlrmHSTU {
     // user history action weight feature name
     required string uih_action_weight_feature_name = 3;
     // user history watch time feature name
-    required string uih_watchtime_feature_name = 4;
+    optional string uih_watchtime_feature_name = 4;
     // candidate item id feature name
     required string candidates_id_feature_name = 5;
     // candidate item query time feature name
@@ -73,7 +73,7 @@ message DlrmHSTU {
     // candidate item action weight feature name
     required string candidates_action_weight_feature_name = 7;
     // candidate item watch time feature name
-    required string candidates_watchtime_feature_name = 8;
+    optional string candidates_watchtime_feature_name = 8;
     // hstu config
     required HSTU hstu = 9;
     // multi task tower config
