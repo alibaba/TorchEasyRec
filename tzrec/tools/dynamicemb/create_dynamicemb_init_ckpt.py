@@ -20,7 +20,10 @@ from typing import List, Optional
 
 import numpy as np
 import pyfg
-from dynamicemb.batched_dynamicemb_tables import encode_checkpoint_file_path
+from dynamicemb.batched_dynamicemb_tables import (
+    encode_checkpoint_file_path,
+    encode_meta_json_file_path,
+)
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 from dynamicemb.planner import DynamicEmbParameterConstraints
 
@@ -339,6 +342,10 @@ if __name__ == "__main__":
                     dynamicemb_load_table_names[mod_path].append(emb_config.name)
                     save_path = os.path.join(ckpt_dir, "dynamicemb", mod_path)
                     os.makedirs(save_path, exist_ok=True)
+                    with open(
+                        encode_meta_json_file_path(save_path, emb_config.name), "w"
+                    ) as f:
+                        f.write(json.dumps({}))
                     save_paths.append(save_path)
                     need_dump_scores.append(
                         options.score_strategy != DynamicEmbScoreStrategy.TIMESTAMP
