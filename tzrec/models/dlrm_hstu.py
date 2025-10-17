@@ -112,12 +112,18 @@ class DlrmHSTU(RankModel):
                 self._model_config.candidates_action_weight_feature_name,
                 True,
             ),
-            (
-                self._model_config.uih_watchtime_feature_name,
-                self._model_config.candidates_watchtime_feature_name,
-                False,
-            ),
         ]
+        if (
+            len(self._model_config.uih_watchtime_feature_name) > 0
+            and len(self._model_config.candidates_watchtime_feature_name) > 0
+        ):
+            self._merge_uih_candidate_payload_mapping.append(
+                (
+                    self._model_config.uih_watchtime_feature_name,
+                    self._model_config.candidates_watchtime_feature_name,
+                    False,
+                ),
+            )
 
         self._task_configs = self._model_config.fusion_mtl_tower.task_configs
         action_weights = []
