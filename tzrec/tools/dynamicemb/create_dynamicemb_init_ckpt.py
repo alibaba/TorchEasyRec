@@ -20,7 +20,10 @@ from typing import List, Optional
 
 import numpy as np
 import pyfg
-from dynamicemb import dump_load
+from dynamicemb.batched_dynamicemb_tables import (
+    encode_checkpoint_file_path,
+    encode_meta_json_file_path,
+)
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 from dynamicemb.planner import DynamicEmbParameterConstraints
 
@@ -120,21 +123,25 @@ def _write_loop(
     for save_dir, need_dump_score in zip(save_paths, need_dump_scores):
         fkeys.append(
             open(
-                dump_load.encode_key_file_path(save_dir, emb_name, rank, world_size),
+                encode_checkpoint_file_path(
+                    save_dir, emb_name, rank, world_size, "keys"
+                ),
                 "wb",
             )
         )
         fvalues.append(
             open(
-                dump_load.encode_value_file_path(save_dir, emb_name, rank, world_size),
+                encode_checkpoint_file_path(
+                    save_dir, emb_name, rank, world_size, "values"
+                ),
                 "wb",
             )
         )
         if need_dump_score:
             fscores.append(
                 open(
-                    dump_load.encode_score_file_path(
-                        save_dir, emb_name, rank, world_size
+                    encode_checkpoint_file_path(
+                        save_dir, emb_name, rank, world_size, "scores"
                     ),
                     "wb",
                 )
@@ -332,13 +339,13 @@ if __name__ == "__main__":
                 save_paths = []
                 need_dump_scores = []
                 for mod_path, options in dyemb_name_to_mod_options[emb_config.name]:
-                    # TODO: use mod_path as dynamicemb_load_table_names key,
-                    # when dynamicemb support it.
-                    dynamicemb_load_table_names[mod_path.rsplit(".", 1)[1]].append(
-                        emb_config.name
-                    )
+                    dynamicemb_load_table_names[mod_path].append(emb_config.name)
                     save_path = os.path.join(ckpt_dir, "dynamicemb", mod_path)
                     os.makedirs(save_path, exist_ok=True)
+                    with open(
+                        encode_meta_json_file_path(save_path, emb_config.name), "w"
+                    ) as f:
+                        f.write(json.dumps({}))
                     save_paths.append(save_path)
                     need_dump_scores.append(
                         options.score_strategy != DynamicEmbScoreStrategy.TIMESTAMP
