@@ -517,6 +517,8 @@ class SequenceRawFeature(RawFeature):
             fg_cfg["normalizer"] = self.config.normalizer
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
 
