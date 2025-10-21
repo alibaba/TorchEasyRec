@@ -20,7 +20,8 @@ from pyarrow import dataset as ds
 
 from tzrec.acc import trt_utils
 from tzrec.constant import Mode
-from tzrec.main import _create_features, create_dataloader
+from tzrec.datasets.dataset import create_dataloader
+from tzrec.main import _create_features
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
 from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
