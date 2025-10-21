@@ -29,7 +29,7 @@ from torch.distributed.checkpoint.default_planner import (
     _create_read_items,
 )
 
-from tzrec.constant import EVAL_RESULT_FILENAME
+from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
@@ -174,7 +174,7 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
 def best_checkpoint(
     model_dir: str,
     export_config: export_pb2.ExportConfig,
-    eval_result_filename: str = EVAL_RESULT_FILENAME,
+    eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
 ) -> Tuple[Optional[str], int]:
     """Find best checkpoint under a directory.
 
@@ -188,26 +188,20 @@ def best_checkpoint(
         latest_step: step of the latest checkpoint
     """
     eval_path = os.path.join(model_dir, eval_result_filename)
-    metric_name = ""
+    metric_name = None
     if export_config.HasField("best_exporter_metric"):
         metric_name = export_config.best_exporter_metric
-    if export_config.HasField("tower_name"):
-        metric_name = f"{export_config.tower_name}_{export_config}"
     if os.path.isfile(eval_path):
         step_metric = {}
         with open(eval_path, "r") as f:
             for line in f:
                 if line:
-                    step = int(line.split("step:")[0].strip())
-                    metric = json.loads(line.split("step:")[-1].strip())
-                    if len(metric) == 1:
+                    metric = json.loads(line.strip())
+                    step = metric["global_step"]
+                    del metric["global_step"]
+                    if len(metric) == 1 and metric_name is None:
                         step_metric[step] = metric.values()[0]
                     else:
-                        if metric_name == "_" or metric_name == "":
-                            raise ValueError(
-                                f"please set export_config best_exporter_metric "
-                                f"and tower_name, has mertic name: {metric.keys()}"
-                            )
                         if metric_name not in metric:
                             raise ValueError(
                                 f"checkpoint {eval_result_filename}"
@@ -220,7 +214,14 @@ def best_checkpoint(
                 f"will search latest checkpoint"
             )
             return latest_checkpoint(model_dir)
-        sorted_mertic = sorted(step_metric.items(), key=lambda x: x[1], reverse=True)
+        if export_config.metric_larger_is_better:
+            sorted_mertic = sorted(
+                step_metric.items(), key=lambda x: x[1], reverse=True
+            )
+        else:
+            sorted_mertic = sorted(
+                step_metric.items(), key=lambda x: x[1], reverse=False
+            )
         max_metric_step = sorted_mertic[0][0]
         best_ckpt_path = os.path.join(model_dir, f"model.ckpt-{max_metric_step}")
         if os.path.exists(best_ckpt_path):

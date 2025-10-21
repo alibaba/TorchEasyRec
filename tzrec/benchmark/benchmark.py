@@ -15,7 +15,7 @@ import os
 import time
 from typing import Any, Dict, List, Tuple
 
-from tzrec.constant import EVAL_RESULT_FILENAME
+from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.tests.utils import _standalone
 from tzrec.utils import config_util, misc_util
 
@@ -161,12 +161,12 @@ def _create_directory(path: str) -> str:
 
 def _get_train_metrics(path: str) -> Dict[str, Any]:
     """From model path we get eval metrics."""
-    eval_file = os.path.join(path, EVAL_RESULT_FILENAME)
+    eval_file = os.path.join(path, TRAIN_EVAL_RESULT_FILENAME)
     with open(eval_file, "r") as f:
         for line in f:
-            last_eval_result = line
-    metrics = last_eval_result.split("step:")[-1].strip()
-    metrics = json.loads(metrics)
+            if line.strip():
+                last_eval_result = line.strip()
+    metrics = json.loads(last_eval_result)
     return metrics
 
 
