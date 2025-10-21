@@ -17,7 +17,7 @@ from collections import OrderedDict
 from typing import List, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch import distributed as dist
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.quant.embedding_modules import (
@@ -27,6 +27,10 @@ from torchrec.quant.embedding_modules import (
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt
+from tzrec.constant import Mode
+from tzrec.datasets.dataset import (
+    create_dataloader,
+)
 from tzrec.features.feature import (
     create_feature_configs,
     create_fg_json,
@@ -43,13 +47,52 @@ def export_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     checkpoint_path: str,
-    dataloader: DataLoader,
     save_dir: str,
-    ckpt_param_map_path: Optional[str] = None,
     assets: Optional[List] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    if not is_rank_zero:
+        logger.warning("Only first rank will be used for export now.")
+        return
+    else:
+        if os.environ.get("WORLD_SIZE") != "1":
+            logger.warning(
+                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
+            )
+            os.environ["WORLD_SIZE"] = "1"
+
+    if not dist.is_initialized():
+        dist.init_process_group("gloo")
+
+    # make dataparser to get user feats before create model
+    data_config = pipeline_config.data_config
+    features = model._features
+    if acc_utils.is_cuda_export():
+        # export batch_size too large may OOM in compile phase
+        max_batch_size = acc_utils.get_max_export_batch_size()
+        data_config.batch_size = min(data_config.batch_size, max_batch_size)
+        logger.info("using new batch_size: %s in export", data_config.batch_size)
+    data_config.num_workers = 1
+    dataloader = create_dataloader(
+        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
+    )
+
+    ckpt_param_map_path = None
+    if checkpoint_path:
+        if acc_utils.is_input_tile_emb():
+            # generate embedding name mapping file
+            ckpt_param_map_path = os.path.join(save_dir, "emb_ckpt_mapping.txt")
+            if is_rank_zero:
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                acc_utils.write_mapping_file_for_input_tile(
+                    model.state_dict(), ckpt_param_map_path
+                )
+                dist.barrier()
+    else:
+        raise ValueError("checkpoint path should be specified.")
+
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -110,7 +153,6 @@ def export_model(
             scripted_model = torch.jit.script(gm)
             scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        features = model._features
         feature_configs = create_feature_configs(features, asset_dir=save_dir)
         pipeline_config = copy.copy(pipeline_config)
         pipeline_config.ClearField("feature_configs")

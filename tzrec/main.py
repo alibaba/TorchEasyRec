@@ -17,7 +17,7 @@ from collections import OrderedDict
 from datetime import timedelta
 from queue import Queue
 from threading import Thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import torch
@@ -34,9 +34,12 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc import utils as acc_utils
-from tzrec.acc.pt2_utils import get_max_export_batch_size
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
-from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
+from tzrec.datasets.dataset import (
+    BaseWriter,
+    create_dataloader,
+    create_writer,
+)
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
@@ -113,96 +116,6 @@ def _create_features(
         force_base_data_group=data_config.force_base_data_group,
     )
     return features
-
-
-def _get_dataloader(
-    data_config: DataConfig,
-    features: List[BaseFeature],
-    input_path: str,
-    reserved_columns: Optional[List[str]] = None,
-    mode: Mode = Mode.TRAIN,
-    gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
-    debug_level: int = 0,
-) -> DataLoader:
-    """Build dataloader.
-
-    Args:
-        data_config (DataConfig): dataloader config.
-        features (list): list of feature.
-        input_path (str): input data path.
-        reserved_columns (list): reserved columns in predict mode.
-        mode (Mode): train or eval or predict.
-        gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
-        debug_level (int): dataset debug level, when mode=predict and
-            debug_level > 0, will dump fg encoded data to debug_str
-
-    Return:
-        dataloader (dataloader): a DataLoader.
-    """
-    dataset_name = DatasetType.Name(data_config.dataset_type)
-    # pyre-ignore [16]
-    dataset_cls = BaseDataset.create_class(dataset_name)
-    dataset = dataset_cls(
-        data_config=data_config,
-        features=features,
-        input_path=input_path,
-        reserved_columns=reserved_columns,
-        mode=mode,
-        debug_level=debug_level,
-    )
-
-    kwargs = {}
-    if data_config.num_workers < 1:
-        num_workers = 1
-    else:
-        num_workers = data_config.num_workers
-        # check number of files is valid or not for file based dataset.
-        num_files = dataset._reader.num_files()
-        if num_files is not None:
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            if num_files >= world_size:
-                num_files_per_worker = num_files // world_size
-                if num_files_per_worker < num_workers:
-                    logger.info(
-                        f"data_config.num_workers reset to {num_files_per_worker}"
-                    )
-                    num_workers = num_files_per_worker
-            else:
-                raise ValueError(
-                    f"Number of files in the dataset[{input_path}] must greater "
-                    f"than world_size: {world_size}, but got {num_files}"
-                )
-
-        kwargs["num_workers"] = num_workers
-        kwargs["persistent_workers"] = True
-
-    if mode == Mode.TRAIN:
-        # When in train_and_eval mode, use 2x worker in gl cluster
-        # for train_dataloader and eval_dataloader
-        dataset.launch_sampler_cluster(num_client_per_rank=num_workers * 2)
-    else:
-        if gl_cluster:
-            # Reuse the gl cluster for eval_dataloader
-            dataset.launch_sampler_cluster(
-                num_client_per_rank=num_workers * 2,
-                client_id_bias=num_workers,
-                cluster=gl_cluster,
-            )
-        else:
-            dataset.launch_sampler_cluster(num_client_per_rank=num_workers)
-
-    dataloader = DataLoader(
-        dataset=dataset,
-        batch_size=None,
-        pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
-        collate_fn=lambda x: x,
-        **kwargs,
-    )
-    # For PyTorch versions 2.6 and above, we initialize the data iterator before
-    # beginning the training process to avoid potential CUDA-related issues following
-    # model saving.
-    iter(dataloader)
-    return dataloader
 
 
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
@@ -631,14 +544,14 @@ def train_and_evaluate(
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
     # Build dataloader
-    train_dataloader = _get_dataloader(
+    train_dataloader = create_dataloader(
         data_config, features, pipeline_config.train_input_path, mode=Mode.TRAIN
     )
     eval_dataloader = None
     if pipeline_config.eval_input_path:
         # pyre-ignore [16]
         gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = _get_dataloader(
+        eval_dataloader = create_dataloader(
             data_config,
             features,
             pipeline_config.eval_input_path,
@@ -801,7 +714,7 @@ def evaluate(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    eval_dataloader = _get_dataloader(
+    eval_dataloader = create_dataloader(
         data_config,
         features,
         eval_input_path or pipeline_config.eval_input_path,
@@ -883,20 +796,10 @@ def export(
         asset_files (str, optional): more files will be copied to export_dir.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    if not is_rank_zero:
-        logger.warning("Only first rank will be used for export now.")
-        return
-    else:
-        if os.environ.get("WORLD_SIZE") != "1":
-            logger.warning(
-                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
-            )
-            os.environ["WORLD_SIZE"] = "1"
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    dist.init_process_group("gloo")
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
@@ -906,20 +809,9 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
-    if acc_utils.is_cuda_export():
-        # export batch_size too large may OOM in compile phase
-        max_batch_size = get_max_export_batch_size()
-        data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in export", data_config.batch_size)
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-
-    # make dataparser to get user feats before create model
-    data_config.num_workers = 1
-    dataloader = _get_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
 
     # Build model
     model = _create_model(
@@ -935,19 +827,6 @@ def export(
         checkpoint_path, _ = checkpoint_util.latest_checkpoint(
             pipeline_config.model_dir
         )
-    ckpt_param_map_path = None
-    if checkpoint_path:
-        if acc_utils.is_input_tile_emb():
-            ckpt_param_map_path = os.path.join(export_dir, "emb_ckpt_mapping.txt")
-            if is_rank_zero:
-                if not os.path.exists(export_dir):
-                    os.makedirs(export_dir)
-                acc_utils.write_mapping_file_for_input_tile(
-                    model.state_dict(), ckpt_param_map_path
-                )
-            dist.barrier()
-    else:
-        raise ValueError("checkpoint path should be specified.")
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():
@@ -961,9 +840,7 @@ def export(
                     ori_pipeline_config,
                     tower,
                     checkpoint_path,
-                    dataloader,
                     tower_export_dir,
-                    ckpt_param_map_path=ckpt_param_map_path,
                     assets=assets,
                 )
     elif isinstance(model.model, TDM):
@@ -974,18 +851,14 @@ def export(
                     ori_pipeline_config,
                     emb_module,
                     checkpoint_path,
-                    dataloader,
                     os.path.join(export_dir, "embedding"),
-                    ckpt_param_map_path=ckpt_param_map_path,
                 )
                 break
         export_model(
             ori_pipeline_config,
             model,
             checkpoint_path,
-            dataloader,
             os.path.join(export_dir, "model"),
-            ckpt_param_map_path=ckpt_param_map_path,
             assets=assets,
         )
     else:
@@ -993,9 +866,7 @@ def export(
             ori_pipeline_config,
             model,
             checkpoint_path,
-            dataloader,
             export_dir,
-            ckpt_param_map_path=ckpt_param_map_path,
             assets=assets,
         )
 
@@ -1053,7 +924,7 @@ def predict(
 
     if is_trt:
         # predict batch_size too large may out of range
-        max_batch_size = get_max_export_batch_size()
+        max_batch_size = acc_utils.get_max_export_batch_size()
         pipeline_config.data_config.batch_size = min(
             pipeline_config.data_config.batch_size, max_batch_size
         )
@@ -1083,7 +954,7 @@ def predict(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    infer_dataloader = _get_dataloader(
+    infer_dataloader = create_dataloader(
         data_config,
         features,
         predict_input_path,

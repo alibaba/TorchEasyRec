@@ -16,8 +16,7 @@ import torch
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from tzrec.acc.pt2_utils import get_max_export_batch_size
-from tzrec.acc.utils import is_debug_trt
+from tzrec.acc.utils import get_max_export_batch_size, is_debug_trt
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger

@@ -202,6 +202,19 @@ def export_acc_config() -> Dict[str, str]:
     return acc_config
 
 
+def get_max_export_batch_size() -> int:
+    """Get max export batch size.
+
+    Returns:
+        int: max_batch_size
+    """
+    batch_size = int(os.environ.get("MAX_EXPORT_BATCH_SIZE", 512))
+    # compact with old trt batch size config
+    if "TRT_MAX_BATCH_SIZE" in os.environ:
+        batch_size = int(os.environ.get("TRT_MAX_BATCH_SIZE"))
+    return batch_size
+
+
 def allow_tf32(train_config: TrainConfig, backend: str) -> None:
     """Set allow_tf32 flag for cudnn and cuda matmul."""
     if backend == "nccl":
