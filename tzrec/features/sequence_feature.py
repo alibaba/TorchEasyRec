@@ -519,8 +519,6 @@ class SequenceRawFeature(RawFeature):
             fg_cfg["boundaries"] = list(self.config.boundaries)
         if self.config.HasField("value_dim"):
             fg_cfg["value_dim"] = self.config.value_dim
-        else:
-            fg_cfg["value_dim"] = 1
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
