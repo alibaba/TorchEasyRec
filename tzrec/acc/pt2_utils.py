@@ -52,19 +52,6 @@ def _softmax(x: torch.Tensor, dim: int, half_to_float: bool) -> torch.Tensor:
     return result
 
 
-def get_max_export_batch_size() -> int:
-    """Get max export batch size.
-
-    Returns:
-        int: max_batch_size
-    """
-    batch_size = int(os.environ.get("MAX_EXPORT_BATCH_SIZE", 512))
-    # compact with old trt batch size config
-    if "TRT_MAX_BATCH_SIZE" in os.environ:
-        batch_size = int(os.environ.get("TRT_MAX_BATCH_SIZE"))
-    return batch_size
-
-
 def export_pm(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
 ) -> Tuple[torch.export.ExportedProgram, Dict[str, torch.Tensor]]:

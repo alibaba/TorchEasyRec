@@ -16,7 +16,7 @@ from typing import Dict
 import torch
 from torch import nn
 
-from tzrec.acc.export_utils import export_pm
+from tzrec.acc.pt2_utils import export_pm
 
 
 def export_model_aot(

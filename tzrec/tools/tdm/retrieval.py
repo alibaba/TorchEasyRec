@@ -30,7 +30,7 @@ from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.dataset import BaseWriter, create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
 from tzrec.datasets.utils import Batch, RecordBatchTensor
-from tzrec.main import _create_features, _get_dataloader, init_process_group
+from tzrec.main import _create_features, create_dataloader, init_process_group
 from tzrec.protos.data_pb2 import DatasetType
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import ProgressLogger, logger
@@ -175,7 +175,7 @@ def tdm_retrieval(
 
     infer_data_config = copy.copy(data_config)
     infer_data_config.num_workers = 1
-    infer_dataloader = _get_dataloader(
+    infer_dataloader = create_dataloader(
         infer_data_config,
         features,
         predict_input_path,

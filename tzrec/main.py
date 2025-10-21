@@ -13,12 +13,11 @@ import copy
 import itertools
 import json
 import os
-import shutil
 from collections import OrderedDict
 from datetime import timedelta
 from queue import Queue
 from threading import Thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import torch
@@ -28,29 +27,23 @@ from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchrec.inference.modules import quantize_embeddings
-from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
-from torchrec.quant.embedding_modules import (
-    EmbeddingCollection as QuantEmbeddingCollection,
-)
 
 from tzrec.acc import utils as acc_utils
-from tzrec.acc.aot_utils import export_model_aot
-from tzrec.acc.export_utils import get_max_export_batch_size
-from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
-from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
+from tzrec.datasets.dataset import (
+    BaseWriter,
+    create_dataloader,
+    create_writer,
+)
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
-    create_feature_configs,
     create_features,
-    create_fg_json,
 )
 from tzrec.models.match_model import (
     MatchModel,
@@ -62,7 +55,6 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
@@ -72,17 +64,15 @@ from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     create_train_pipeline,
 )
-from tzrec.utils.fx_util import symbolic_trace
+from tzrec.utils.export_util import export_model
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 from tzrec.version import __version__ as tzrec_version
 
 
@@ -126,96 +116,6 @@ def _create_features(
         force_base_data_group=data_config.force_base_data_group,
     )
     return features
-
-
-def _get_dataloader(
-    data_config: DataConfig,
-    features: List[BaseFeature],
-    input_path: str,
-    reserved_columns: Optional[List[str]] = None,
-    mode: Mode = Mode.TRAIN,
-    gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
-    debug_level: int = 0,
-) -> DataLoader:
-    """Build dataloader.
-
-    Args:
-        data_config (DataConfig): dataloader config.
-        features (list): list of feature.
-        input_path (str): input data path.
-        reserved_columns (list): reserved columns in predict mode.
-        mode (Mode): train or eval or predict.
-        gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
-        debug_level (int): dataset debug level, when mode=predict and
-            debug_level > 0, will dump fg encoded data to debug_str
-
-    Return:
-        dataloader (dataloader): a DataLoader.
-    """
-    dataset_name = DatasetType.Name(data_config.dataset_type)
-    # pyre-ignore [16]
-    dataset_cls = BaseDataset.create_class(dataset_name)
-    dataset = dataset_cls(
-        data_config=data_config,
-        features=features,
-        input_path=input_path,
-        reserved_columns=reserved_columns,
-        mode=mode,
-        debug_level=debug_level,
-    )
-
-    kwargs = {}
-    if data_config.num_workers < 1:
-        num_workers = 1
-    else:
-        num_workers = data_config.num_workers
-        # check number of files is valid or not for file based dataset.
-        num_files = dataset._reader.num_files()
-        if num_files is not None:
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            if num_files >= world_size:
-                num_files_per_worker = num_files // world_size
-                if num_files_per_worker < num_workers:
-                    logger.info(
-                        f"data_config.num_workers reset to {num_files_per_worker}"
-                    )
-                    num_workers = num_files_per_worker
-            else:
-                raise ValueError(
-                    f"Number of files in the dataset[{input_path}] must greater "
-                    f"than world_size: {world_size}, but got {num_files}"
-                )
-
-        kwargs["num_workers"] = num_workers
-        kwargs["persistent_workers"] = True
-
-    if mode == Mode.TRAIN:
-        # When in train_and_eval mode, use 2x worker in gl cluster
-        # for train_dataloader and eval_dataloader
-        dataset.launch_sampler_cluster(num_client_per_rank=num_workers * 2)
-    else:
-        if gl_cluster:
-            # Reuse the gl cluster for eval_dataloader
-            dataset.launch_sampler_cluster(
-                num_client_per_rank=num_workers * 2,
-                client_id_bias=num_workers,
-                cluster=gl_cluster,
-            )
-        else:
-            dataset.launch_sampler_cluster(num_client_per_rank=num_workers)
-
-    dataloader = DataLoader(
-        dataset=dataset,
-        batch_size=None,
-        pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
-        collate_fn=lambda x: x,
-        **kwargs,
-    )
-    # For PyTorch versions 2.6 and above, we initialize the data iterator before
-    # beginning the training process to avoid potential CUDA-related issues following
-    # model saving.
-    iter(dataloader)
-    return dataloader
 
 
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
@@ -644,14 +544,14 @@ def train_and_evaluate(
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
     # Build dataloader
-    train_dataloader = _get_dataloader(
+    train_dataloader = create_dataloader(
         data_config, features, pipeline_config.train_input_path, mode=Mode.TRAIN
     )
     eval_dataloader = None
     if pipeline_config.eval_input_path:
         # pyre-ignore [16]
         gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = _get_dataloader(
+        eval_dataloader = create_dataloader(
             data_config,
             features,
             pipeline_config.eval_input_path,
@@ -814,7 +714,7 @@ def evaluate(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    eval_dataloader = _get_dataloader(
+    eval_dataloader = create_dataloader(
         data_config,
         features,
         eval_input_path or pipeline_config.eval_input_path,
@@ -880,89 +780,6 @@ def evaluate(
         logger.info("Evaluate Finished.")
 
 
-def _script_model(
-    pipeline_config: EasyRecConfig,
-    model: BaseModule,
-    state_dict: Optional[Dict[str, Any]],
-    dataloader: DataLoader,
-    save_dir: str,
-) -> None:
-    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    if is_rank_zero:
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        model.set_is_inference(True)
-        if state_dict is not None:
-            model.to_empty(device="cpu")
-            model.load_state_dict(state_dict, strict=False)
-
-        # for mc modules, fix output_segments_tensor is a meta tensor.
-        fix_mch_state(model)
-
-        batch = next(iter(dataloader))
-
-        if acc_utils.is_cuda_export():
-            model = model.cuda()
-
-        if acc_utils.is_quant() or acc_utils.is_ec_quant():
-            logger.info("quantize embeddings...")
-            additional_qconfig_spec_keys = []
-            additional_mapping = {}
-            if acc_utils.is_ec_quant():
-                additional_qconfig_spec_keys.append(EmbeddingCollection)
-                additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
-            quantize_embeddings(
-                model,
-                dtype=acc_utils.quant_dtype(),
-                inplace=True,
-                additional_qconfig_spec_keys=additional_qconfig_spec_keys,
-                additional_mapping=additional_mapping,
-            )
-            logger.info("finish quantize embeddings...")
-
-        model.eval()
-
-        data = batch.to_dict(sparse_dtype=torch.int64)
-        if acc_utils.is_trt():
-            data = OrderedDict(sorted(data.items()))
-            result = model(data, "cuda:0")
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            export_model_trt(model, data, save_dir)
-        elif acc_utils.is_aot():
-            data = OrderedDict(sorted(data.items()))
-            result = model(data)
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            export_model_aot(model, data, save_dir)
-        else:
-            result = model(data)
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-
-            gm = symbolic_trace(model)
-            with open(os.path.join(save_dir, "gm.code"), "w") as f:
-                f.write(gm.code)
-
-            scripted_model = torch.jit.script(gm)
-            scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
-
-        features = model._features
-        feature_configs = create_feature_configs(features, asset_dir=save_dir)
-        pipeline_config = copy.copy(pipeline_config)
-        pipeline_config.ClearField("feature_configs")
-        pipeline_config.feature_configs.extend(feature_configs)
-        config_util.save_message(
-            pipeline_config, os.path.join(save_dir, "pipeline.config")
-        )
-        logger.info("saving fg json...")
-        fg_json = create_fg_json(features, asset_dir=save_dir)
-        with open(os.path.join(save_dir, "fg.json"), "w") as f:
-            json.dump(fg_json, f, indent=4)
-        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(acc_utils.export_acc_config(), f, indent=4)
-
-
 def export(
     pipeline_config_path: str,
     export_dir: str,
@@ -979,20 +796,10 @@ def export(
         asset_files (str, optional): more files will be copied to export_dir.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    if not is_rank_zero:
-        logger.warning("Only first rank will be used for export now.")
-        return
-    else:
-        if os.environ.get("WORLD_SIZE") != "1":
-            logger.warning(
-                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
-            )
-            os.environ["WORLD_SIZE"] = "1"
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    dist.init_process_group("gloo")
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
@@ -1002,20 +809,9 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
-    if acc_utils.is_cuda_export():
-        # export batch_size too large may OOM in compile phase
-        max_batch_size = get_max_export_batch_size()
-        data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in export", data_config.batch_size)
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-
-    # make dataparser to get user feats before create model
-    data_config.num_workers = 1
-    dataloader = _get_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
 
     # Build model
     model = _create_model(
@@ -1026,30 +822,11 @@ def export(
     )
     InferWrapper = CudaExportWrapper if acc_utils.is_aot() else ScriptWrapper
     model = InferWrapper(model)
-    init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
         checkpoint_path, _ = checkpoint_util.latest_checkpoint(
             pipeline_config.model_dir
         )
-    if checkpoint_path:
-        if acc_utils.is_input_tile_emb():
-            remap_file_path = os.path.join(export_dir, "emb_ckpt_mapping.txt")
-            if is_rank_zero:
-                if not os.path.exists(export_dir):
-                    os.makedirs(export_dir)
-                acc_utils.write_mapping_file_for_input_tile(
-                    model.state_dict(), remap_file_path
-                )
-
-            dist.barrier()
-            checkpoint_util.restore_model(
-                checkpoint_path, model, ckpt_param_map_path=remap_file_path
-            )
-        else:
-            checkpoint_util.restore_model(checkpoint_path, model)
-    else:
-        raise ValueError("checkpoint path should be specified.")
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():
@@ -1059,46 +836,39 @@ def export(
                 )
                 tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
-                _script_model(
+                export_model(
                     ori_pipeline_config,
                     tower,
-                    model.state_dict(),
-                    dataloader,
+                    checkpoint_path,
                     tower_export_dir,
+                    assets=assets,
                 )
-                for asset in assets:
-                    shutil.copy(asset, tower_export_dir)
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
-                _script_model(
+                export_model(
                     ori_pipeline_config,
                     emb_module,
-                    model.state_dict(),
-                    dataloader,
+                    checkpoint_path,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
-        _script_model(
+        export_model(
             ori_pipeline_config,
             model,
-            None,
-            dataloader,
+            checkpoint_path,
             os.path.join(export_dir, "model"),
+            assets=assets,
         )
-        for asset in assets:
-            shutil.copy(asset, os.path.join(export_dir, "model"))
     else:
-        _script_model(
+        export_model(
             ori_pipeline_config,
             model,
-            None,
-            dataloader,
+            checkpoint_path,
             export_dir,
+            assets=assets,
         )
-        for asset in assets:
-            shutil.copy(asset, export_dir)
 
 
 def predict(
@@ -1154,7 +924,7 @@ def predict(
 
     if is_trt:
         # predict batch_size too large may out of range
-        max_batch_size = get_max_export_batch_size()
+        max_batch_size = acc_utils.get_max_export_batch_size()
         pipeline_config.data_config.batch_size = min(
             pipeline_config.data_config.batch_size, max_batch_size
         )
@@ -1184,7 +954,7 @@ def predict(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    infer_dataloader = _get_dataloader(
+    infer_dataloader = create_dataloader(
         data_config,
         features,
         predict_input_path,
