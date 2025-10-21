@@ -452,13 +452,15 @@ class DataParserTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [FgMode.FG_NORMAL, False],
-            [FgMode.FG_DAG, False],
-            [FgMode.FG_NORMAL, True],
-            [FgMode.FG_DAG, True],
+            [FgMode.FG_NORMAL, False, False],
+            [FgMode.FG_DAG, False, False],
+            [FgMode.FG_NORMAL, True, False],
+            [FgMode.FG_DAG, True, False],
+            [FgMode.FG_NORMAL, False, True],
+            [FgMode.FG_DAG, False, True],
         ]
     )
-    def test_fg(self, fg_mode, weigted_id):
+    def test_fg(self, fg_mode, weigted_id, complex_type=False):
         feature_cfgs = self._create_test_fg_feature_cfgs(
             tag_b_weighted=weigted_id, tag_b_seq=True
         )
@@ -477,9 +479,38 @@ class DataParserTest(unittest.TestCase):
                 "tag_b",
             ],
         )
-
-        data = data_parser.parse(
-            input_data={
+        if complex_type:
+            input_data = {
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(
+                    [{4: 0.1, 5: 0.2}, {}, {6: 0.3}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                )
+                if weigted_id
+                else pa.array([[4, 5], [], [6]], type=pa.list_(pa.int64())),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(
+                    [[27, 37], [28, 38], [29, 39]], type=pa.list_(pa.float32())
+                ),
+                "map_a": pa.array(
+                    [{"1": 0.1, "3": 0.2}, {}, {"1": 0.1, "3": 0.2}],
+                    type=pa.map_(pa.string(), pa.float32()),
+                ),
+                "click_seq__cat_a": pa.array(
+                    [[10, 11, 12], [13], []], type=pa.list_(pa.int64())
+                ),
+                "click_seq__int_a": pa.array(
+                    [[14, 15, 16], [17], []], type=pa.list_(pa.float32())
+                ),
+                "click_seq__tag_b": pa.array(
+                    [[[17, 18], [19], [20, 21]], [[22]], [[]]],
+                    type=pa.list_(pa.list_((pa.int64()))),
+                ),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
+            }
+        else:
+            input_data = {
                 "cat_a": pa.array([1, 2, 3]),
                 "tag_b": pa.array(["4:0.1\x1d5:0.2", "", "6:0.3"])
                 if weigted_id
@@ -493,7 +524,8 @@ class DataParserTest(unittest.TestCase):
                 "label": pa.array([0, 0, 1], pa.int32()),
                 "__SAMPLE_MASK__": pa.array([True, False, False]),
             }
-        )
+
+        data = data_parser.parse(input_data=input_data)
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
