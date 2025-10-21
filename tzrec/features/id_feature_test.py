@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import os
 import unittest
 from functools import partial
 
@@ -32,6 +33,9 @@ from tzrec.utils import test_util
 
 
 class IdFeatureTest(unittest.TestCase):
+    def tearDown(self):
+        return os.environ.pop("USE_FARM_HASH_TO_BUCKETIZE", None)
+
     @parameterized.expand(
         [
             [["1\x032", "", None, "3"], "", [1, 2, 3], [2, 0, 0, 1]],
@@ -244,11 +248,26 @@ class IdFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], None],
-            ["xyz", ["abc\x1defg", None, "hij"], [33, 44, 13, 66], [2, 1, 1], 13],
-            ["xyz", [["abc", "efg"], None, ["hij"]], [33, 44, 13, 66], [2, 1, 1], 13],
-            ["", [1, 2, None, 3], [95, 70, 13], [1, 1, 0, 1], None],
-            ["4", [1, 2, None, 3], [95, 70, 56, 13], [1, 1, 1, 1], 56],
+            ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], None, False],
+            [
+                "xyz",
+                ["abc\x1defg", None, "hij"],
+                [33, 44, 13, 66],
+                [2, 1, 1],
+                13,
+                False,
+            ],
+            [
+                "xyz",
+                [["abc", "efg"], None, ["hij"]],
+                [33, 44, 13, 66],
+                [2, 1, 1],
+                13,
+                False,
+            ],
+            ["", [1, 2, None, 3], [95, 70, 13], [1, 1, 0, 1], None, False],
+            ["4", [1, 2, None, 3], [95, 70, 56, 13], [1, 1, 1, 1], 56, False],
+            ["", [1, 2, None, 3], [49, 59, 21], [1, 1, 0, 1], None, True],
         ],
         name_func=test_util.parameterized_name_func,
     )
@@ -259,7 +278,10 @@ class IdFeatureTest(unittest.TestCase):
         expected_values,
         expected_lengths,
         expected_fg_default,
+        use_farm_hash=False,
     ):
+        if use_farm_hash:
+            os.environ["USE_FARM_HASH_TO_BUCKETIZE"] = "true"
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="id_feat",
