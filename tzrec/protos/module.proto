@@ -146,6 +146,9 @@ message GRContextualPreprocessor {
     optional GRContextualizedMLP action_mlp = 4;
     // content embedding mlp config
     required GRContextualizedMLP content_mlp = 5;
+    // a mapping from contextual feature to maximum pooling type.
+    // pooling type: sum | mean | min | max
+    map<string, string> contextual_feature_to_pooling = 6;
 }
 
 message GRContextualInterleavePreprocessor {
@@ -164,6 +167,9 @@ message GRContextualInterleavePreprocessor {
     required GRContentEncoder content_encoder = 6;
     // content embedding mlp config
     required GRContextualizedMLP content_mlp = 7;
+    // a mapping from contextual feature to maximum pooling type.
+    // pooling type: sum | mean | min | max
+    map<string, string> contextual_feature_to_pooling = 8;
 }
 
 message GRInputPreprocessor {

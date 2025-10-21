@@ -107,10 +107,11 @@ def _get_contextual_input_embeddings(
     seq_payloads: Dict[str, torch.Tensor],
     contextual_feature_to_max_length: Dict[str, int],
     contextual_feature_to_min_uih_length: Dict[str, int],
+    contextual_feature_to_pooling: Dict[str, str],
     dtype: torch.dtype,
 ) -> torch.Tensor:
     padded_values: List[torch.Tensor] = []
-    for key, max_len in contextual_feature_to_max_length.items():
+    for key, max_len in sorted(contextual_feature_to_max_length.items()):
         v = torch.flatten(
             torch.ops.fbgemm.jagged_to_padded_dense(
                 values=seq_payloads[key].to(dtype),
@@ -125,6 +126,13 @@ def _get_contextual_input_embeddings(
         if min_uih_length > 0:
             v = v * (seq_lengths.view(-1, 1) >= min_uih_length)
         padded_values.append(v)
+    for key, pooling in sorted(contextual_feature_to_pooling.items()):
+        v = torch.segment_reduce(
+            seq_payloads[key].to(dtype), pooling, offsets=seq_payloads[key + "_offsets"]
+        )
+        if pooling == "mean":
+            v = torch.nan_to_num(v, nan=0.0)
+        padded_values.append(v)
     return torch.cat(padded_values, dim=1)
 
 
@@ -134,6 +142,9 @@ class ContextualPreprocessor(InputPreprocessor):
     Args:
         input_embedding_dim (int): The dimension of the sequence embeddings.
         output_embedding_dim (int): The dimension of the sequence embeddings.
+        content_mlp (Dict[str, Any]): content MLP module params.
+        action_encoder (Dict[str, Any]): ActionEncoder module params.
+        action_mlp (Dict[str, Any]): action MLP module params.
         contextual_feature_to_max_length (Dict[str, int]): A mapping from contextual
             feature to maximum padding length.
         contextual_feature_to_min_uih_length (Dict[str, int]): A mapping from contextual
@@ -141,9 +152,6 @@ class ContextualPreprocessor(InputPreprocessor):
             contextual feature.
         contextual_feature_to_pooling (Dict[str, str]): A mapping from contextual
             feature to pooling type.
-        content_mlp (Dict[str, Any]): content MLP module params.
-        action_encoder (Dict[str, Any]): ActionEncoder module params.
-        action_mlp (Dict[str, Any]): action MLP module params.
         is_inference (bool): whether to run in inference mode.
     """
 
@@ -151,12 +159,12 @@ class ContextualPreprocessor(InputPreprocessor):
         self,
         input_embedding_dim: int,
         output_embedding_dim: int,
-        contextual_feature_to_max_length: Dict[str, int],
-        contextual_feature_to_min_uih_length: Dict[str, int],
-        contextual_feature_to_pooling: Dict[str, str],
         content_mlp: Dict[str, Any],
         action_encoder: Optional[Dict[str, Any]] = None,
         action_mlp: Optional[Dict[str, Any]] = None,
+        contextual_feature_to_max_length: Optional[Dict[str, int]] = None,
+        contextual_feature_to_min_uih_length: Optional[Dict[str, int]] = None,
+        contextual_feature_to_pooling: Optional[Dict[str, str]] = None,
         is_inference: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -164,14 +172,25 @@ class ContextualPreprocessor(InputPreprocessor):
         self._output_embedding_dim: int = output_embedding_dim
         self._input_embedding_dim: int = input_embedding_dim
         self._contextual_feature_to_max_length: Dict[str, int] = (
-            contextual_feature_to_max_length
-        )
-        self._max_contextual_seq_len: int = sum(
-            contextual_feature_to_max_length.values()
+            contextual_feature_to_max_length or dict()
         )
         self._contextual_feature_to_min_uih_length: Dict[str, int] = (
-            contextual_feature_to_min_uih_length
+            contextual_feature_to_min_uih_length or dict()
         )
+        self._contextual_feature_to_pooling: Dict[str, str] = (
+            contextual_feature_to_pooling or dict()
+        )
+        contextual_feature_intersect = set(
+            self._contextual_feature_to_max_length.keys()
+        ) & set(self._contextual_feature_to_pooling.keys())
+        assert len(contextual_feature_intersect) == 0, (
+            "contextual_feature_to_max_length and contextual_feature_to_pooling "
+            f"should not share same features [{contextual_feature_intersect}]."
+        )
+        self._max_contextual_seq_len: int = sum(
+            self._contextual_feature_to_max_length.values()
+        ) + len(self._contextual_feature_to_pooling)
+
         if self._max_contextual_seq_len > 0:
             std = 1.0 * sqrt(
                 2.0 / float(input_embedding_dim + self._output_embedding_dim)
@@ -194,8 +213,12 @@ class ContextualPreprocessor(InputPreprocessor):
                     ).fill_(0.0)
                 )
             )
+        contextual_embedding_dim: int = (
+            self._max_contextual_seq_len * input_embedding_dim
+        )
         self._content_embedding_mlp: torch.nn.Module = create_contextualized_mlp(
             content_mlp,
+            contextual_embedding_dim=contextual_embedding_dim,
             sequential_input_dim=self._input_embedding_dim,
             sequential_output_dim=self._output_embedding_dim,
             is_inference=is_inference,
@@ -210,6 +233,7 @@ class ContextualPreprocessor(InputPreprocessor):
             assert action_mlp is not None
             self._action_embedding_mlp: torch.nn.Module = create_contextualized_mlp(
                 action_mlp,
+                contextual_embedding_dim=contextual_embedding_dim,
                 sequential_input_dim=self._action_encoder.output_dim,
                 sequential_output_dim=self._output_embedding_dim,
                 is_inference=is_inference,
@@ -269,6 +293,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 seq_payloads=seq_payloads,
                 contextual_feature_to_max_length=self._contextual_feature_to_max_length,
                 contextual_feature_to_min_uih_length=self._contextual_feature_to_min_uih_length,
+                contextual_feature_to_pooling=self._contextual_feature_to_pooling,
                 dtype=seq_embeddings.dtype,
             )
             contextual_embeddings = torch.baddbmm(
@@ -373,15 +398,17 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
     Args:
         input_embedding_dim (int): The dimension of the sequence embeddings.
         output_embedding_dim (int): The dimension of the sequence embeddings.
+        content_encoder (Dict[str, Any]): ContentEncoder module params.
+        content_mlp (Dict[str, Any]): content MLP module params.
+        action_encoder (Dict[str, Any]): ActionEncoder module params.
+        action_mlp (Dict[str, Any]): action MLP module params.
         contextual_feature_to_max_length (Dict[str, int]): A mapping from contextual
             feature to maximum padding length.
         contextual_feature_to_min_uih_length (Dict[str, int]): A mapping from contextual
             feature to uih length, if uih length < min_uih_length, will mask the
             contextual feature.
-        content_encoder (Dict[str, Any]): ContentEncoder module params.
-        content_mlp (Dict[str, Any]): content MLP module params.
-        action_encoder (Dict[str, Any]): ActionEncoder module params.
-        action_mlp (Dict[str, Any]): action MLP module params.
+        contextual_feature_to_pooling (Dict[str, str]): A mapping from contextual
+            feature to pooling type.
         enable_interleaving (bool): enable interleaving target or not.
         is_inference (bool): whether to run in inference mode.
     """
@@ -390,12 +417,13 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         self,
         input_embedding_dim: int,
         output_embedding_dim: int,
-        contextual_feature_to_max_length: Dict[str, int],
-        contextual_feature_to_min_uih_length: Dict[str, int],
         content_encoder: Dict[str, Any],
         content_mlp: Dict[str, Any],
         action_encoder: Dict[str, Any],
         action_mlp: Dict[str, Any],
+        contextual_feature_to_max_length: Optional[Dict[str, int]] = None,
+        contextual_feature_to_min_uih_length: Optional[Dict[str, int]] = None,
+        contextual_feature_to_pooling: Optional[Dict[str, str]] = None,
         enable_interleaving: bool = True,
         is_inference: bool = False,
         **kwargs: Any,
@@ -404,14 +432,25 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         self._input_embedding_dim: int = input_embedding_dim
         self._output_embedding_dim: int = output_embedding_dim
         self._contextual_feature_to_max_length: Dict[str, int] = (
-            contextual_feature_to_max_length
-        )
-        self._max_contextual_seq_len: int = sum(
-            contextual_feature_to_max_length.values()
+            contextual_feature_to_max_length or dict()
         )
         self._contextual_feature_to_min_uih_length: Dict[str, int] = (
-            contextual_feature_to_min_uih_length
+            contextual_feature_to_min_uih_length or dict()
         )
+        self._contextual_feature_to_pooling: Dict[str, str] = (
+            contextual_feature_to_pooling or dict()
+        )
+        contextual_feature_intersect = set(
+            self._contextual_feature_to_max_length.keys()
+        ) & set(self._contextual_feature_to_pooling.keys())
+        assert len(contextual_feature_intersect) == 0, (
+            "contextual_feature_to_max_length and contextual_feature_to_pooling "
+            f"should not share same features [{contextual_feature_intersect}]."
+        )
+        self._max_contextual_seq_len: int = sum(
+            self._contextual_feature_to_max_length.values()
+        ) + len(self._contextual_feature_to_pooling)
+
         std = 1.0 * sqrt(2.0 / float(input_embedding_dim + output_embedding_dim))
         self._batched_contextual_linear_weights = torch.nn.Parameter(
             torch.empty(
@@ -632,6 +671,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
                 seq_payloads=seq_payloads,
                 contextual_feature_to_max_length=self._contextual_feature_to_max_length,
                 contextual_feature_to_min_uih_length=self._contextual_feature_to_min_uih_length,
+                contextual_feature_to_pooling=self._contextual_feature_to_pooling,
                 dtype=seq_embeddings.dtype,
             )
             contextual_embeddings = torch.baddbmm(
