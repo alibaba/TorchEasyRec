@@ -1,5 +1,13 @@
 syntax = "proto2";
 package tzrec.protos;
 
+enum EXPORTERTYPE {
+    FINAL = 0;
+    BEST = 1;
+}
+
 message ExportConfig {
+    optional EXPORTERTYPE exporter_type = 1 [default = FINAL];
+    optional string best_exporter_metric = 2 [default = 'auc'];
+    optional string tower_name = 3;
 }

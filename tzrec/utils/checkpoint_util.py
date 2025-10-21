@@ -29,6 +29,8 @@ from torch.distributed.checkpoint.default_planner import (
     _create_read_items,
 )
 
+from tzrec.constant import EVAL_RESULT_FILENAME
+from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -167,6 +169,71 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
     else:
         latest_ckpt_path = model_dir
     return latest_ckpt_path, _get_checkpoint_step(latest_ckpt_path)
+
+
+def best_checkpoint(
+    model_dir: str,
+    export_config: export_pb2.ExportConfig,
+    eval_result_filename: str = EVAL_RESULT_FILENAME,
+) -> Tuple[Optional[str], int]:
+    """Find best checkpoint under a directory.
+
+    Args:
+        model_dir: model directory
+        export_config: export_pb2.ExportConfig
+        eval_result_filename: evaluation result filename
+
+    Return:
+        latest_ckpt_path: latest checkpoint path.
+        latest_step: step of the latest checkpoint
+    """
+    eval_path = os.path.join(model_dir, eval_result_filename)
+    metric_name = ""
+    if export_config.HasField("best_exporter_metric"):
+        metric_name = export_config.best_exporter_metric
+    if export_config.HasField("tower_name"):
+        metric_name = f"{export_config.tower_name}_{export_config}"
+    if os.path.isfile(eval_path):
+        step_metric = {}
+        with open(eval_path, "r") as f:
+            for line in f:
+                if line:
+                    step = int(line.split("step:")[0].strip())
+                    metric = json.loads(line.split("step:")[-1].strip())
+                    if len(metric) == 1:
+                        step_metric[step] = metric.values()[0]
+                    else:
+                        if metric_name == "_" or metric_name == "":
+                            raise ValueError(
+                                f"please set export_config best_exporter_metric "
+                                f"and tower_name, has mertic name: {metric.keys()}"
+                            )
+                        if metric_name not in metric:
+                            raise ValueError(
+                                f"checkpoint {eval_result_filename}"
+                                f" not find {metric_name} metric."
+                            )
+                        step_metric[step] = metric[metric_name]
+        if len(step_metric) < 1:
+            logger.info(
+                f"not find eval result in {eval_result_filename}, "
+                f"will search latest checkpoint"
+            )
+            return latest_checkpoint(model_dir)
+        sorted_mertic = sorted(step_metric.items(), key=lambda x: x[1], reverse=True)
+        max_metric_step = sorted_mertic[0][0]
+        best_ckpt_path = os.path.join(model_dir, f"model.ckpt-{max_metric_step}")
+        if os.path.exists(best_ckpt_path):
+            logger.info(f"find best checkpoint is {best_ckpt_path}")
+            return best_ckpt_path, max_metric_step
+        else:
+            raise ValueError(
+                f"find best metric is {max_metric_step} step,"
+                f"but not find {best_ckpt_path}."
+            )
+    else:
+        logger.info(f"not find {eval_result_filename}, will search latest checkpoint")
+        return latest_checkpoint(model_dir)
 
 
 def restore_model(

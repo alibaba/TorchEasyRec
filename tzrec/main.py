@@ -43,7 +43,12 @@ from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.export_utils import get_max_export_batch_size
 from tzrec.acc.trt_utils import export_model_trt
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
+from tzrec.constant import (
+    EVAL_RESULT_FILENAME,
+    PREDICT_QUEUE_TIMEOUT,
+    TENSORBOARD_SUMMARIES,
+    Mode,
+)
 from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
@@ -69,6 +74,7 @@ from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
+from tzrec.protos.export_pb2 import EXPORTERTYPE
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
@@ -318,8 +324,8 @@ def _evaluate(
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
         metric_result = {k: v.item() for k, v in metric_result.items()}
         if eval_result_filename:
-            with open(eval_result_filename, "w") as f:
-                json.dump(metric_result, f, indent=4)
+            with open(eval_result_filename, "a") as f:
+                f.write(f"{global_step} step: " + json.dumps(metric_result) + "\n")
         if eval_summary_writer:
             for k, v in metric_result.items():
                 eval_summary_writer.add_scalar(f"metric/{k}", v, global_step or 0)
@@ -410,7 +416,7 @@ def _train_and_evaluate(
     eval_config: EvalConfig,
     skip_steps: int = -1,
     ckpt_path: Optional[str] = None,
-    eval_result_filename: str = "train_eval_result.txt",
+    eval_result_filename: str = EVAL_RESULT_FILENAME,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -1029,9 +1035,18 @@ def export(
     init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
-        checkpoint_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == EXPORTERTYPE.BEST
+        ):
+            checkpoint_path, _ = checkpoint_util.best_checkpoint(
+                pipeline_config.model_dir, pipeline_config.export_config
+            )
+        else:
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
+            )
+
     if checkpoint_path:
         if acc_utils.is_input_tile_emb():
             remap_file_path = os.path.join(export_dir, "emb_ckpt_mapping.txt")
