@@ -211,6 +211,7 @@ def get_max_export_batch_size() -> int:
     batch_size = int(os.environ.get("MAX_EXPORT_BATCH_SIZE", 512))
     # compact with old trt batch size config
     if "TRT_MAX_BATCH_SIZE" in os.environ:
+        # pyre-ignore [6]
         batch_size = int(os.environ.get("TRT_MAX_BATCH_SIZE"))
     return batch_size
 

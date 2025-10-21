@@ -14,7 +14,7 @@ import json
 import os
 import shutil
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 from torch import distributed as dist
@@ -32,6 +32,7 @@ from tzrec.datasets.dataset import (
     create_dataloader,
 )
 from tzrec.features.feature import (
+    BaseFeature,
     create_feature_configs,
     create_fg_json,
 )
@@ -46,9 +47,9 @@ from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 def export_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
-    checkpoint_path: str,
+    checkpoint_path: Optional[str],
     save_dir: str,
-    assets: Optional[List] = None,
+    assets: Optional[List[str]] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -67,7 +68,7 @@ def export_model(
 
     # make dataparser to get user feats before create model
     data_config = pipeline_config.data_config
-    features = model._features
+    features = cast(List[BaseFeature], model._features)
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
