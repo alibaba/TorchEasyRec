@@ -139,6 +139,8 @@ class ContextualPreprocessor(InputPreprocessor):
         contextual_feature_to_min_uih_length (Dict[str, int]): A mapping from contextual
             feature to uih length, if uih length < min_uih_length, will mask the
             contextual feature.
+        contextual_feature_to_pooling (Dict[str, str]): A mapping from contextual
+            feature to pooling type.
         content_mlp (Dict[str, Any]): content MLP module params.
         action_encoder (Dict[str, Any]): ActionEncoder module params.
         action_mlp (Dict[str, Any]): action MLP module params.
@@ -151,6 +153,7 @@ class ContextualPreprocessor(InputPreprocessor):
         output_embedding_dim: int,
         contextual_feature_to_max_length: Dict[str, int],
         contextual_feature_to_min_uih_length: Dict[str, int],
+        contextual_feature_to_pooling: Dict[str, str],
         content_mlp: Dict[str, Any],
         action_encoder: Optional[Dict[str, Any]] = None,
         action_mlp: Optional[Dict[str, Any]] = None,
