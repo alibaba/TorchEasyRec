@@ -175,8 +175,8 @@ def _get_dataloader(
     else:
         num_workers = data_config.num_workers
         # check number of files is valid or not for file based dataset.
-        if hasattr(dataset._reader, "num_files"):
-            num_files = dataset._reader.num_files()
+        num_files = dataset._reader.num_files()
+        if num_files is not None:
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             if num_files >= world_size:
                 num_files_per_worker = num_files // world_size
@@ -677,7 +677,7 @@ def train_and_evaluate(
         if ckpt_path is None or not os.path.exists(ckpt_path):
             raise RuntimeError(
                 "fine_tune_checkpoint"
-                "[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
+                f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
     if os.path.exists(pipeline_config.model_dir):
         # TODO(hongsheng.jhs): save and restore dataloader state.

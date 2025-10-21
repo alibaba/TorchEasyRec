@@ -45,16 +45,17 @@ class DlrmHSTUTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH],
-            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH],
-            [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH],
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON],
-            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, True],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, False],
+            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH, True],
+            [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH, True],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON, True],
+            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON, True],
             # [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON],
         ]
     )
     @unittest.skipIf(*gpu_unavailable)
-    def test_dlrm_hstu(self, graph_type, device, kernel) -> None:
+    def test_dlrm_hstu(self, graph_type, device, kernel, has_watchtime) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -140,17 +141,61 @@ class DlrmHSTUTest(unittest.TestCase):
             ),
         ]
 
+        task_configs = [
+            tower_pb2.FusionSubTaskConfig(
+                task_name="is_click",
+                label_name="item_action_weight",
+                task_bitmask=1,
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            ),
+            tower_pb2.FusionSubTaskConfig(
+                task_name="is_like",
+                label_name="item_action_weight",
+                task_bitmask=2,
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            ),
+            tower_pb2.FusionSubTaskConfig(
+                task_name="is_comment",
+                label_name="item_action_weight",
+                task_bitmask=4,
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            ),
+        ]
+        labels = ["item_action_weight"]
+        if has_watchtime:
+            task_configs.append(
+                tower_pb2.FusionSubTaskConfig(
+                    task_name="watchtime",
+                    label_name="item_target_watchtime",
+                    losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
+                )
+            )
+            labels.append("item_target_watchtime")
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             dlrm_hstu=multi_task_rank_pb2.DlrmHSTU(
                 uih_id_feature_name="video_id",
                 uih_action_time_feature_name="action_timestamp",
                 uih_action_weight_feature_name="action_weight",
-                uih_watchtime_feature_name="watch_time",
+                uih_watchtime_feature_name="watch_time" if has_watchtime else "",
                 candidates_id_feature_name="item_video_id",
                 candidates_query_time_feature_name="item_query_time",
                 candidates_action_weight_feature_name="item_action_weight",
-                candidates_watchtime_feature_name="item_target_watchtime",
+                candidates_watchtime_feature_name="item_target_watchtime"
+                if has_watchtime
+                else "",
                 hstu=module_pb2.HSTU(
                     stu=module_pb2.STU(
                         embedding_dim=512,
@@ -193,43 +238,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 ),
                 fusion_mtl_tower=tower_pb2.FusionMTLTower(
                     mlp=module_pb2.MLP(hidden_units=[512], activation="nn.SiLU"),
-                    task_configs=[
-                        tower_pb2.FusionSubTaskConfig(
-                            task_name="is_click",
-                            label_name="item_action_weight",
-                            task_bitmask=1,
-                            losses=[
-                                loss_pb2.LossConfig(
-                                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
-                                )
-                            ],
-                        ),
-                        tower_pb2.FusionSubTaskConfig(
-                            task_name="is_like",
-                            label_name="item_action_weight",
-                            task_bitmask=2,
-                            losses=[
-                                loss_pb2.LossConfig(
-                                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
-                                )
-                            ],
-                        ),
-                        tower_pb2.FusionSubTaskConfig(
-                            task_name="is_comment",
-                            label_name="item_action_weight",
-                            task_bitmask=4,
-                            losses=[
-                                loss_pb2.LossConfig(
-                                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
-                                )
-                            ],
-                        ),
-                        tower_pb2.FusionSubTaskConfig(
-                            task_name="watchtime",
-                            label_name="item_target_watchtime",
-                            losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
-                        ),
-                    ],
+                    task_configs=task_configs,
                 ),
                 max_seq_len=100,
             ),
@@ -237,7 +246,7 @@ class DlrmHSTUTest(unittest.TestCase):
         dlrm_hstu = DlrmHSTU(
             model_config=model_config,
             features=features,
-            labels=["item_action_weight", "item_target_watchtime"],
+            labels=labels,
         )
         dlrm_hstu.set_kernel(kernel)
         init_parameters(dlrm_hstu, device=device)
