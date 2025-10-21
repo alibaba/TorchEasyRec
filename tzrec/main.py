@@ -13,7 +13,6 @@ import copy
 import itertools
 import json
 import os
-import shutil
 from collections import OrderedDict
 from datetime import timedelta
 from queue import Queue
@@ -964,10 +963,9 @@ def export(
                     checkpoint_path,
                     dataloader,
                     tower_export_dir,
-                    ckpt_param_map_path,
+                    ckpt_param_map_path=ckpt_param_map_path,
+                    assets=assets,
                 )
-                for asset in assets:
-                    shutil.copy(asset, tower_export_dir)
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
@@ -978,7 +976,7 @@ def export(
                     checkpoint_path,
                     dataloader,
                     os.path.join(export_dir, "embedding"),
-                    ckpt_param_map_path,
+                    ckpt_param_map_path=ckpt_param_map_path,
                 )
                 break
         export_model(
@@ -987,10 +985,9 @@ def export(
             checkpoint_path,
             dataloader,
             os.path.join(export_dir, "model"),
-            ckpt_param_map_path,
+            ckpt_param_map_path=ckpt_param_map_path,
+            assets=assets,
         )
-        for asset in assets:
-            shutil.copy(asset, os.path.join(export_dir, "model"))
     else:
         export_model(
             ori_pipeline_config,
@@ -998,10 +995,9 @@ def export(
             checkpoint_path,
             dataloader,
             export_dir,
-            ckpt_param_map_path,
+            ckpt_param_map_path=ckpt_param_map_path,
+            assets=assets,
         )
-        for asset in assets:
-            shutil.copy(asset, export_dir)
 
 
 def predict(
