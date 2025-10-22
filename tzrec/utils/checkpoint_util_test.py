@@ -32,6 +32,8 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
+from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
 
 
@@ -186,6 +188,23 @@ class CheckpointUtilTest(unittest.TestCase):
         ckpt_path, step = checkpoint_util.latest_checkpoint(
             os.path.join(self.test_dir, "model.ckpt-0")
         )
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-0"))
+        self.assertEqual(step, 0)
+
+    def test_best_checkpoint_model_dir(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-20"))
+        with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w+") as f:
+            f.write('{"global_step":0, "auc": 0.633, "grouped_auc": 0.565}\n')
+            f.write('{"global_step":10, "auc": 0.632, "grouped_auc": 0.570}\n')
+            f.write('{"global_step":20, "auc": 0.631, "grouped_auc": 0.567}\n')
+        config = ExportConfig(exporter_type="best", best_exporter_metric="grouped_auc")
+        ckpt_path, step = checkpoint_util.best_checkpoint(self.test_dir, config)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-10"))
+        self.assertEqual(step, 10)
+        config.metric_larger_is_better = False
+        ckpt_path, step = checkpoint_util.best_checkpoint(self.test_dir, config)
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-0"))
         self.assertEqual(step, 0)
 
