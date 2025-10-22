@@ -24,6 +24,7 @@ message DenseOptimizer {
         SGDOptimizer sgd_optimizer = 1;
         AdagradOptimizer adagrad_optimizer = 2;
         AdamOptimizer adam_optimizer = 3;
+        AdamWOptimizer adamw_optimizer = 4;
     }
     oneof learning_rate {
         ConstantLR constant_learning_rate = 101;
@@ -36,6 +37,13 @@ enum WeightDecayMode {
     NONE = 0;
     L2 = 1;
     DECOUPLE = 2;
+}
+
+message AdamWOptimizer {
+  optional LearningRate learning_rate = 1;
+  optional float weight_decay = 2 [default = 1e-6];
+  optional float beta1 = 3 [default = 0.9];
+  optional float beta2 = 4 [default = 0.999];
 }
 
 message FusedSGDOptimizer {

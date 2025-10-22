@@ -88,6 +88,11 @@ def create_dense_optimizer(
         beta2 = optimizer_kwargs.pop("beta2")
         optimizer_kwargs["betas"] = (beta1, beta2)
         return torch.optim.Adam, optimizer_kwargs
+    elif optimizer_type == "adamw_optimizer":
+        beta1 = optimizer_kwargs.pop("beta1")
+        beta2 = optimizer_kwargs.pop("beta2")
+        optimizer_kwargs["betas"] = (beta1, beta2)
+        return torch.optim.AdamW, optimizer_kwargs
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
