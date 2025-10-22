@@ -14,6 +14,8 @@ import os
 from collections import OrderedDict
 from typing import Dict, Optional
 
+from tzrec.utils.dist_util import init_process_group
+
 try:
     # pyre-ignore [21]
     import matplotlib.pyplot as plt
@@ -22,7 +24,7 @@ except Exception:
 import pandas as pd
 from torch.distributed.checkpoint import load
 
-from tzrec.main import _create_features, _create_model, init_process_group
+from tzrec.main import _create_features, _create_model
 from tzrec.models.model import ScriptWrapper
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.utils import checkpoint_util, config_util
