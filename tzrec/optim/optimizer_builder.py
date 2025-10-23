@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import re
+from functools import partial
 from typing import Any, Dict, List, Tuple, Type, Union
 
 import torch
@@ -214,7 +215,11 @@ def build_param_optimizers(
 
             optimizer = KeyedOptimizerWrapper(
                 param,
-                lambda params: optim_cls(params, **kwargs),  # noqa: B023
+                partial(
+                    lambda params, optim_cls, kwargs: optim_cls(params, **kwargs),
+                    optim_cls=optim_cls,
+                    kwargs=kwargs,
+                ),
             )
             param_optimizers.append(optimizer)
             logger.info(
