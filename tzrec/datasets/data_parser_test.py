@@ -503,9 +503,8 @@ class DataParserTest(unittest.TestCase):
                     [[14, 15, 16], [17], []], type=pa.list_(pa.float32())
                 ),
                 "click_seq__tag_b": pa.array(
-                    # array<array<int64>> is not supported now.
-                    [["17\x1d18", "19", "20\x1d21"], ["22"], []],
-                    type=pa.list_(pa.string()),
+                    [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [[]]],
+                    type=pa.list_(pa.list_(pa.string())),
                 ),
                 "label": pa.array([0, 0, 1], pa.int32()),
                 "__SAMPLE_MASK__": pa.array([True, False, False]),
