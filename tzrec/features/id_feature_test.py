@@ -16,6 +16,7 @@ from functools import partial
 
 import numpy as np
 import pyarrow as pa
+import pyfg
 import torch
 from parameterized import parameterized
 from torch import nn
@@ -34,7 +35,9 @@ from tzrec.utils import test_util
 
 class IdFeatureTest(unittest.TestCase):
     def tearDown(self):
-        return os.environ.pop("USE_FARM_HASH_TO_BUCKETIZE", None)
+        if "USE_FARM_HASH_TO_BUCKETIZE" in os.environ:
+            os.environ.pop("USE_FARM_HASH_TO_BUCKETIZE")
+            pyfg.unset_env("USE_FARM_HASH_TO_BUCKETIZE")
 
     @parameterized.expand(
         [
@@ -282,6 +285,7 @@ class IdFeatureTest(unittest.TestCase):
     ):
         if use_farm_hash:
             os.environ["USE_FARM_HASH_TO_BUCKETIZE"] = "true"
+            pyfg.set_env("USE_FARM_HASH_TO_BUCKETIZE", "true")
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="id_feat",
