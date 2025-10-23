@@ -190,9 +190,7 @@ class DlrmHSTU(RankModel):
             max_targets=max_candidates,
             total_uih_len=total_len - total_targets,
             total_targets=total_targets,
-            seq_embeddings=uih_seq_embeddings[
-                self._model_config.uih_id_feature_name
-            ].values(),
+            seq_embeddings=_fx_odict_jt_vcat(uih_seq_embeddings),
             seq_lengths=source_lengths,
             seq_timestamps=source_timestamps,
             seq_payloads=_fx_construct_payload(
