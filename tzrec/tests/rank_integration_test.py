@@ -884,6 +884,25 @@ class RankIntegrationTest(unittest.TestCase):
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
+    def test_multi_tower_din_rtp_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_fg_rtp_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="USE_RTP=1",
+            )
+        self.assertTrue(self.success)
+
 
 if __name__ == "__main__":
     unittest.main()

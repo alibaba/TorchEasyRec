@@ -56,7 +56,6 @@ from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.fx_util import fx_mark_keyed_tensor, fx_mark_tensor, symbolic_trace
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.rtp.ExportTorchFxTool import ExportTorchFxTool
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 
@@ -68,8 +67,8 @@ def export_model(
     assets: Optional[List[str]] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
-    is_rtp = os.environ.get("IS_RTP", "0") == "1"
-    impl = export_rtp_model if is_rtp else export_model_normal
+    use_rtp = os.environ.get("USE_RTP", "0") == "1"
+    impl = export_rtp_model if use_rtp else export_model_normal
     return impl(
         pipeline_config=pipeline_config,
         model=model,
@@ -354,14 +353,25 @@ RTP_INVALID_BUCKET_KEYS = ["vocab_dict", "vocab_list", "vocab_file"]
 
 
 def _adjust_one_feature_for_rtp(
-    feature: Dict[str, Any], embedding_info: BaseEmbeddingConfig
+    feature: Dict[str, Any], embedding_info: Optional[BaseEmbeddingConfig]
 ) -> None:
-    feature["shared_name"] = embedding_info.name
-    feature["embedding_dimension"] = embedding_info.embedding_dim
+    assert feature["feature_type"] in [
+        "id_feature",
+        "raw_feature",
+        "combo_feature",
+        "match_feature",
+        "lookup_feature",
+        "overlap_feature",
+    ]
+    if embedding_info is not None:
+        feature["shared_name"] = embedding_info.name
+        feature["embedding_dimension"] = embedding_info.embedding_dim
     if "value_dim" in feature:
         feature["value_dimension"] = feature["value_dim"]
+        feature.pop("value_dim")
     if "need_discrete" in feature:
         feature["needDiscrete"] = feature["need_discrete"]
+        feature.pop("need_discrete")
     if "boundaries" in feature:
         feature["gen_key_type"] = "boundary"
         feature["gen_val_type"] = "lookup"
@@ -382,16 +392,19 @@ def _adjust_fg_json_for_rtp(
     """Adjust fg json to rtp style."""
     for feature in fg_json["features"]:
         if "features" not in feature:
-            feature_name = feature["feature_name"]
-            embedding_info = feature_to_embedding_info[feature_name]
+            try:
+                feature_name = feature["feature_name"]
+            except Exception:
+                breakpoint()
+            embedding_info = feature_to_embedding_info.get(feature_name, None)
             _adjust_one_feature_for_rtp(feature, embedding_info)
         else:
             sequence_name = feature["sequence_name"]
             for sub_feature in feature["features"]:
-                feature_name = feature["feature_name"]
-                embedding_info = feature_to_embedding_info[
-                    f"{sequence_name}__{feature_name}"
-                ]
+                feature_name = sub_feature["feature_name"]
+                embedding_info = feature_to_embedding_info.get(
+                    f"{sequence_name}__{feature_name}", None
+                )
                 _adjust_one_feature_for_rtp(sub_feature, embedding_info)
 
 
@@ -403,7 +416,14 @@ def export_rtp_model(
     assets: Optional[List[str]] = None,
 ) -> None:
     """Export a EasyRec model on RTP."""
-    device, backend = init_process_group()
+    try:
+        from torch_fx_tool import ExportTorchFxTool
+    except Exception as e:
+        raise RuntimeError(
+            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251023.aba1d83-py3-none-any.whl"
+        ) from e
+
+    device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_rank_zero = rank == 0
@@ -415,6 +435,8 @@ def export_rtp_model(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
+        if not os.path.exists(graph_dir):
+            os.makedirs(graph_dir)
     dist.barrier()
 
     if not checkpoint_path:
@@ -466,6 +488,7 @@ def export_rtp_model(
             f.write(str(full_graph))
 
     # Extract Sparse Model
+    logger.info("exporting sparse model...")
     graph = copy.deepcopy(full_graph)
     for node in graph.nodes:
         if node.op == "output":
@@ -504,6 +527,7 @@ def export_rtp_model(
     checkpoint_util.restore_model(checkpoint_path, sparse_model)
     sparse_output, sparse_attrs = sparse_model(data, device=device)
     # Save Sparse Parameters
+    logger.info("saving sparse parameters...")
     local_tensor, meta = _get_rtp_embedding_tensor(sparse_model)
     save_file(
         local_tensor,
@@ -515,6 +539,7 @@ def export_rtp_model(
         json.dump(meta, f, indent=4)
 
     # Extract Dense Model
+    logger.info("exporting dense model...")
     additional_fg = []
     seqname_mapping = {}
     for feature in features:
@@ -573,7 +598,7 @@ def export_rtp_model(
                     # add sequence_length into fg
                     additional_fg.append(
                         {
-                            "feature_name:": name,
+                            "feature_name": name,
                             "feature_type": "raw_feature",
                             "expression": f"user:{name}",
                         }
@@ -610,8 +635,6 @@ def export_rtp_model(
             logger.info("saving fg json...")
             fg_json = create_fg_json(features, asset_dir=save_dir)
             fg_json["features"].extend(additional_fg)
-            fg_json = _adjust_fg_json_for_rtp(
-                fg_json["features"], feature_to_embedding_info
-            )
+            _adjust_fg_json_for_rtp(fg_json, feature_to_embedding_info)
             with open(os.path.join(save_dir, "fg.json"), "w") as f:
                 json.dump(fg_json, f, indent=4)
