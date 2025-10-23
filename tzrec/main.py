@@ -33,7 +33,12 @@ from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
 from tzrec.acc import utils as acc_utils
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
+from tzrec.constant import (
+    PREDICT_QUEUE_TIMEOUT,
+    TENSORBOARD_SUMMARIES,
+    TRAIN_EVAL_RESULT_FILENAME,
+    Mode,
+)
 from tzrec.datasets.dataset import (
     BaseWriter,
     create_dataloader,
@@ -197,8 +202,11 @@ def _evaluate(
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
         metric_result = {k: v.item() for k, v in metric_result.items()}
         if eval_result_filename:
-            with open(eval_result_filename, "w") as f:
-                json.dump(metric_result, f, indent=4)
+            with open(eval_result_filename, "a") as f:
+                metric_json = OrderedDict(
+                    [("global_step", global_step)] + sorted(metric_result.items())
+                )
+                f.write(json.dumps(metric_json) + "\n")
         if eval_summary_writer:
             for k, v in metric_result.items():
                 eval_summary_writer.add_scalar(f"metric/{k}", v, global_step or 0)
@@ -289,7 +297,7 @@ def _train_and_evaluate(
     eval_config: EvalConfig,
     skip_steps: int = -1,
     ckpt_path: Optional[str] = None,
-    eval_result_filename: str = "train_eval_result.txt",
+    eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -803,9 +811,17 @@ def export(
     model = InferWrapper(model)
 
     if not checkpoint_path:
-        checkpoint_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == "best"
+        ):
+            checkpoint_path, _ = checkpoint_util.best_checkpoint(
+                pipeline_config.model_dir, pipeline_config.export_config
+            )
+        else:
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
+            )
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():
