@@ -91,6 +91,8 @@ feature_configs {
 - **hash_bucket_size**: hash bucket的大小。为减少hash冲突，建议设置
   `hash_bucket_size  = number_ids*ratio, ratio in [5,10]`
 
+  - 如果需要跟tensorflow的hash保持一致，可以设置环境变量 USE_FARM_HASH_TO_BUCKETIZE=true
+
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
