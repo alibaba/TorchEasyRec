@@ -19,7 +19,7 @@ from odps import ODPS
 
 from tzrec.datasets.odps_dataset import _create_odps_account
 from tzrec.features.feature import create_fg_json
-from tzrec.main import _create_features, _get_dataloader
+from tzrec.main import _create_features, create_dataloader
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
 
@@ -88,7 +88,7 @@ if __name__ == "__main__":
 
     if args.debug:
         pipeline_config.data_config.num_workers = 1
-        dataloader = _get_dataloader(
+        dataloader = create_dataloader(
             pipeline_config.data_config, features, pipeline_config.train_input_path
         )
         iterator = iter(dataloader)

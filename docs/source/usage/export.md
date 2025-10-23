@@ -1,5 +1,20 @@
 # 导出
 
+## export_config
+
+模型导出任务依赖pipeline.config中的export_config 配置
+
+```protobuf
+export_config {
+}
+```
+
+- exporter_type: 导出类型, latest | best ，默认latest
+  - latest 导出最新的模型
+  - best 导出最好的模型
+- best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
+- metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
+
 ## 导出命令
 
 ```bash

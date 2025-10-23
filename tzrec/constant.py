@@ -23,6 +23,8 @@ class Mode(Enum):
 
 EASYREC_VERSION = "0.7.5"
 
+TRAIN_EVAL_RESULT_FILENAME = "train_eval_result_v2.txt"
+
 PREDICT_QUEUE_TIMEOUT = int(os.environ.get("PREDICT_QUEUE_TIMEOUT") or 600)
 
 TENSORBOARD_SUMMARIES = [
