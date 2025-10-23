@@ -636,9 +636,22 @@ def train_and_evaluate(
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
         train_config.dense_optimizer
     )
+    param_optim_cls, param_optim_kwargs, param_optim_regex_patterns = (
+        optimizer_builder.create_param_optimizer(train_config.dense_optimizer)
+    )
+    remaining_params, param_optim_params = (
+        optimizer_builder.group_param_by_regex_pattern(
+            dict(in_backward_optimizer_filter(model.named_parameters())),
+            param_optim_regex_patterns,
+        )
+    )
+    logger.info("remaining_params:" + str(list(remaining_params.keys())))
     dense_optimizer = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(model.named_parameters())),
+        remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
+    )
+    param_optimizers, param_optim_index = optimizer_builder.build_param_optimizers(
+        param_optim_cls, param_optim_kwargs, param_optim_params
     )
     grad_scaler = None
     if train_config.HasField("grad_scaler"):
@@ -647,7 +660,7 @@ def train_and_evaluate(
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(
-        CombinedOptimizer([model.fused_optimizer, dense_optimizer]),
+        CombinedOptimizer([model.fused_optimizer, dense_optimizer, *param_optimizers]),
         grad_scaler=grad_scaler,
         gradient_accumulation_steps=train_config.gradient_accumulation_steps,
     )
@@ -656,6 +669,9 @@ def train_and_evaluate(
     )
     dense_lr = optimizer_builder.create_scheduler(
         dense_optimizer, train_config.dense_optimizer
+    )
+    param_lrs = optimizer_builder.create_param_schedulers(
+        param_optimizers, train_config.dense_optimizer, param_optim_index
     )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
@@ -675,7 +691,7 @@ def train_and_evaluate(
         optimizer,
         train_dataloader,
         eval_dataloader,
-        [sparse_lr, dense_lr],
+        [sparse_lr, dense_lr, *param_lrs],
         pipeline_config.model_dir,
         train_config=train_config,
         eval_config=pipeline_config.eval_config,

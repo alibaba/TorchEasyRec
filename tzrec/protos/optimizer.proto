@@ -20,6 +20,7 @@ message SparseOptimizer {
 }
 
 message DenseOptimizer {
+    repeated ParamOptimizer param_optimizers = 201;
     oneof optimizer {
         SGDOptimizer sgd_optimizer = 1;
         AdagradOptimizer adagrad_optimizer = 2;
@@ -33,17 +34,30 @@ message DenseOptimizer {
     }
 }
 
+message ParamOptimizer {
+    oneof optimizer {
+        SGDOptimizer sgd_optimizer = 1;
+        AdagradOptimizer adagrad_optimizer = 2;
+        AdamOptimizer adam_optimizer = 3;
+        AdamWOptimizer adamw_optimizer = 4;
+    }
+    required string regex_pattern = 5;
+    optional ParamLearningRate param_learning_rate = 6;
+}
+
+message ParamLearningRate {
+    oneof learning_rate {
+        ConstantLR constant_learning_rate = 1;
+        ExponentialDecayLR exponential_decay_learning_rate = 2;
+        ManualStepLR manual_step_learning_rate = 3;
+    }
+}
+
+
 enum WeightDecayMode {
     NONE = 0;
     L2 = 1;
     DECOUPLE = 2;
-}
-
-message AdamWOptimizer {
-  optional LearningRate learning_rate = 1;
-  optional float weight_decay = 2 [default = 1e-6];
-  optional float beta1 = 3 [default = 0.9];
-  optional float beta2 = 4 [default = 0.999];
 }
 
 message FusedSGDOptimizer {
@@ -126,6 +140,13 @@ message AdamOptimizer {
     optional float beta1 = 2 [default = 0.9];
     optional float beta2 = 3 [default = 0.999];
     optional float weight_decay = 4 [default = 0.0];
+}
+
+message AdamWOptimizer {
+  required float lr = 1 [default = 0.002];
+  optional float beta1 = 2 [default = 0.9];
+  optional float beta2 = 3 [default = 0.999];
+  optional float weight_decay = 4 [default = 0.0];
 }
 
 message ConstantLR {
