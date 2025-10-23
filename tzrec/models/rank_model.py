@@ -194,7 +194,8 @@ class RankModel(BaseModel):
             )
         elif loss_type == "softmax_cross_entropy":
             self._loss_modules[loss_name] = nn.CrossEntropyLoss(
-                reduction=reduction, label_smoothing=loss_cfg.label_smoothing
+                reduction=reduction,
+                label_smoothing=loss_cfg.softmax_cross_entropy.label_smoothing,
             )
         elif loss_type == "jrc_loss":
             assert num_class == 2, f"num_class must be 2 when loss type is {loss_type}"
