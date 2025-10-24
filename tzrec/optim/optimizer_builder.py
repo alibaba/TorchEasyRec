@@ -68,7 +68,7 @@ def create_sparse_optimizer(
 
 
 def create_dense_optimizer(
-    optimizer_config: Union[optimizer_pb2.DenseOptimizer, optimizer_pb2.ParamOptimizer],
+    optimizer_config: Union[optimizer_pb2.DenseOptimizer, optimizer_pb2.PartOptimizer],
 ) -> Tuple[Type[Optimizer], Dict[str, Any]]:
     """Create optimizer for dense module.
 
@@ -102,19 +102,19 @@ def create_dense_optimizer(
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
 
-def create_param_optimizer(
+def create_part_optimizer(
     optimizer_config: optimizer_pb2.DenseOptimizer,
 ) -> Tuple[List[Type[Optimizer]], List[Dict[str, Any]], List[str]]:
     """Create optimizer class for some param."""
-    optimizers = []
-    optimizer_kwargs = []
-    optimizer_regex_patterns = []
-    for param_optimizer in optimizer_config.param_optimizers:
-        optim, kwargs = create_dense_optimizer(param_optimizer)
-        optimizers.append(optim)
-        optimizer_kwargs.append(kwargs)
-        optimizer_regex_patterns.append(param_optimizer.regex_pattern)
-    return optimizers, optimizer_kwargs, optimizer_regex_patterns
+    part_optimizers = []
+    part_optimizer_kwargs = []
+    part_regex_patterns = []
+    for part_optimizer in optimizer_config.part_optimizers:
+        optim, kwargs = create_dense_optimizer(part_optimizer)
+        part_optimizers.append(optim)
+        part_optimizer_kwargs.append(kwargs)
+        part_regex_patterns.append(part_optimizer.regex_pattern)
+    return part_optimizers, part_optimizer_kwargs, part_regex_patterns
 
 
 def create_scheduler(
@@ -142,43 +142,44 @@ def create_scheduler(
     return BaseLR.create_class(lr_cls_name)(**lr_kwargs)
 
 
-def create_param_schedulers(
-    optimizers: List[Optimizer],
+def create_part_optim_schedulers(
+    part_optimizers: List[Optimizer],
     optimizer_config: optimizer_pb2.DenseOptimizer,
-    optim_indexs: List[int],
+    part_optim_indices: List[int],
 ) -> List[BaseLR]:
     """Create optimizer for dense module.
 
     Args:
-        optimizers (list[Optimizer]): an list instance of Optimizer.
+        part_optimizers (list[Optimizer]): an list instance of Optimizer.
         optimizer_config (optimizer_pb2.SparseOptimizer|optimizer_pb2.DenseOptimizer):
             an instance of Optimizer config.
-        optim_indexs (list[int]): optimizers index in optimizer_config.param_optimizers
+        part_optim_indices (list[int]): optimizers index in
+            optimizer_config.part_optimizers.
 
     Returns:
-        lr (list(BaseLR)): a list lr scheduler.
+        part_lrs (list(BaseLR)): a list lr scheduler.
     """
     lr_type = optimizer_config.WhichOneof("learning_rate")
     oneof_lr_config = getattr(optimizer_config, lr_type)
     lr_cls_name = oneof_lr_config.__class__.__name__
     lr_kwargs = config_to_kwargs(oneof_lr_config)
 
-    param_lrs = []
-    param_optim_configs = list(optimizer_config.param_optimizers)
-    for optimizer, index in zip(optimizers, optim_indexs):
-        param_optim_config = param_optim_configs[index]
-        if param_optim_config.HasField("param_learning_rate"):
-            param_lr_config = param_optim_config.param_learning_rate
-            param_lr_type = param_lr_config.WhichOneof("learning_rate")
-            param_oneof_lr_config = getattr(param_lr_config, param_lr_type)
-            param_lr_cls_name = param_oneof_lr_config.__class__.__name__
-            param_lr_kwargs = config_to_kwargs(param_oneof_lr_config)
+    part_lrs = []
+    part_optim_configs = list(optimizer_config.part_optimizers)
+    for optimizer, index in zip(part_optimizers, part_optim_indices):
+        part_optim_config = part_optim_configs[index]
+        if part_optim_config.WhichOneof("learning_rate") is not None:
+            part_lr_type = part_optim_config.WhichOneof("learning_rate")
+            part_oneof_lr_config = getattr(part_optim_config, part_lr_type)
+            part_lr_cls_name = part_oneof_lr_config.__class__.__name__
+            part_lr_kwargs = config_to_kwargs(part_oneof_lr_config)
         else:
-            param_lr_cls_name = lr_cls_name
-            param_lr_kwargs = lr_kwargs
-        param_lr_kwargs["optimizer"] = optimizer
-        param_lrs.append(BaseLR.create_class(param_lr_cls_name)(**param_lr_kwargs))
-    return param_lrs
+            part_lr_cls_name = lr_cls_name
+            part_lr_kwargs = lr_kwargs
+        part_lr_kwargs["optimizer"] = optimizer
+        # pyre-ignore [16]
+        part_lrs.append(BaseLR.create_class(part_lr_cls_name)(**part_lr_kwargs))
+    return part_lrs
 
 
 def group_param_by_regex_pattern(
@@ -186,43 +187,41 @@ def group_param_by_regex_pattern(
 ) -> Tuple[Dict[str, nn.Parameter], List[Dict[str, nn.Parameter]]]:
     """Group params by regex."""
     remaining_params = dict()
-    param_optim_params = [dict() for _ in range(len(regex_patterns))]
+    part_optim_params = [dict() for _ in range(len(regex_patterns))]
     for name, param in params.items():
         logger.info("parameter name: {}".format(name))
         for i, regex_pattern in enumerate(regex_patterns):
             if re.fullmatch(re.compile(regex_pattern), name):
-                param_optim_params[i][name] = param
+                part_optim_params[i][name] = param
                 break
         else:
             remaining_params[name] = param
-    return remaining_params, param_optim_params
+    return remaining_params, part_optim_params
 
 
-def build_param_optimizers(
-    param_optim_cls: List[Type[Optimizer]],
-    param_optim_kwargs: List[Dict[str, any]],
-    param_optim_params: List[Dict[str, nn.Parameter]],
+def build_part_optimizers(
+    part_optim_cls: List[Type[Optimizer]],
+    part_optim_kwargs: List[Dict[str, Any]],
+    part_optim_params: List[Dict[str, nn.Parameter]],
 ) -> Tuple[List[KeyedOptimizerWrapper], List[int]]:
     """Build param optimizer."""
-    param_optimizers = []
-    valid_index = []
-    for i in range(len(param_optim_kwargs)):
-        if len(param_optim_params[i]) > 0:
-            valid_index.append(i)
-            param = param_optim_params[i]
-            optim_cls = param_optim_cls[i]
-            kwargs = param_optim_kwargs[i]
-
+    part_optimizers = []
+    valid_indices = []
+    for i in range(len(part_optim_kwargs)):
+        if len(part_optim_params[i]) > 0:
+            valid_indices.append(i)
             optimizer = KeyedOptimizerWrapper(
-                param,
+                part_optim_params[i],
                 partial(
                     lambda params, optim_cls, kwargs: optim_cls(params, **kwargs),
-                    optim_cls=optim_cls,
-                    kwargs=kwargs,
+                    optim_cls=part_optim_cls[i],
+                    kwargs=part_optim_kwargs[i],
                 ),
             )
-            param_optimizers.append(optimizer)
+            part_optimizers.append(optimizer)
             logger.info(
-                "param optimizer index: {}, params key:{}".format(i, list(param.keys()))
+                "part optimizer index: {}, params key:{}".format(
+                    i, list(part_optim_params[i].keys())
+                )
             )
-    return param_optimizers, valid_index
+    return part_optimizers, valid_indices

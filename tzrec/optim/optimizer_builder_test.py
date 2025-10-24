@@ -20,7 +20,7 @@ from tzrec.protos import optimizer_pb2
 
 
 class OpimizerBuilderTest(unittest.TestCase):
-    def test_create_param_optimizer(self):
+    def test_create_part_optimizer(self):
         pattern1 = "model.dbmtl.task(.*)"
         pattern2 = "model.dbmtl.mmoe(.*)"
         config = optimizer_pb2.DenseOptimizer(
@@ -28,26 +28,22 @@ class OpimizerBuilderTest(unittest.TestCase):
             exponential_decay_learning_rate=optimizer_pb2.ExponentialDecayLR(
                 decay_size=500
             ),
-            param_optimizers=[
-                optimizer_pb2.ParamOptimizer(
+            part_optimizers=[
+                optimizer_pb2.PartOptimizer(
                     adam_optimizer=optimizer_pb2.AdamOptimizer(lr=0.01),
                     regex_pattern=pattern1,
-                    param_learning_rate=optimizer_pb2.ParamLearningRate(
-                        exponential_decay_learning_rate=optimizer_pb2.ExponentialDecayLR(
-                            decay_size=1000
-                        )
+                    exponential_decay_learning_rate=optimizer_pb2.ExponentialDecayLR(
+                        decay_size=1000
                     ),
                 ),
-                optimizer_pb2.ParamOptimizer(
+                optimizer_pb2.PartOptimizer(
                     sgd_optimizer=optimizer_pb2.SGDOptimizer(lr=0.01),
                     regex_pattern=pattern2,
-                    param_learning_rate=optimizer_pb2.ParamLearningRate(
-                        constant_learning_rate=optimizer_pb2.ConstantLR()
-                    ),
+                    constant_learning_rate=optimizer_pb2.ConstantLR(),
                 ),
             ],
         )
-        clss, kwargs, regex_patterns = optimizer_builder.create_param_optimizer(config)
+        clss, kwargs, regex_patterns = optimizer_builder.create_part_optimizer(config)
         self.assertEqual(clss, [torch.optim.Adam, torch.optim.SGD])
         self.assertEqual(regex_patterns, [pattern1, pattern2])
 
@@ -61,46 +57,42 @@ class OpimizerBuilderTest(unittest.TestCase):
             "dbmtl.bottom_mlp": nn.Parameter(Tensor([4.0])),
         }
         patterns = ["dbmtl.task(.*)", "dbmtl.mmoe(.*)", "dbmtl.bottom_mlp"]
-        remaining_params, param_optim_params = (
+        remaining_params, part_optim_params = (
             optimizer_builder.group_param_by_regex_pattern(params, patterns)
         )
         self.assertEqual(sorted(remaining_params.keys()), ["dbmtl.mask_net.mlp"])
         self.assertEqual(
-            sorted(param_optim_params[0].keys()), ["dbmtl.task_mlp", "dbmtl.task_tower"]
+            sorted(part_optim_params[0].keys()), ["dbmtl.task_mlp", "dbmtl.task_tower"]
         )
         self.assertEqual(
-            sorted(param_optim_params[1].keys()),
+            sorted(part_optim_params[1].keys()),
             ["dbmtl.mmoe.expert", "dbmtl.mmoe.gate"],
         )
-        self.assertEqual(sorted(param_optim_params[2].keys()), ["dbmtl.bottom_mlp"])
+        self.assertEqual(sorted(part_optim_params[2].keys()), ["dbmtl.bottom_mlp"])
 
-    def test_create_param_schedulers(self):
+    def test_create_part_optim_schedulers(self):
         pattern1 = "model.dbmtl.task(.*)"
         pattern2 = "model.dbmtl.mmoe(.*)"
         pattern3 = "model.dbmtl.bottom(.*)"
         config = optimizer_pb2.DenseOptimizer(
             adam_optimizer=optimizer_pb2.AdamOptimizer(lr=0.001),
-            exponential_decay_learning_rate=optimizer_pb2.ExponentialDecayLR(
-                decay_size=500
+            manual_step_learning_rate=optimizer_pb2.ManualStepLR(
+                learning_rates=[0.001], schedule_sizes=[10]
             ),
-            param_optimizers=[
-                optimizer_pb2.ParamOptimizer(
+            part_optimizers=[
+                optimizer_pb2.PartOptimizer(
                     adam_optimizer=optimizer_pb2.AdamOptimizer(lr=0.01),
                     regex_pattern=pattern1,
-                    param_learning_rate=optimizer_pb2.ParamLearningRate(
-                        constant_learning_rate=optimizer_pb2.ConstantLR()
-                    ),
+                    constant_learning_rate=optimizer_pb2.ConstantLR(),
                 ),
-                optimizer_pb2.ParamOptimizer(
+                optimizer_pb2.PartOptimizer(
                     sgd_optimizer=optimizer_pb2.SGDOptimizer(lr=0.01),
                     regex_pattern=pattern2,
-                    param_learning_rate=optimizer_pb2.ParamLearningRate(
-                        exponential_decay_learning_rate=optimizer_pb2.ExponentialDecayLR(
-                            decay_size=1000
-                        )
+                    exponential_decay_learning_rate=optimizer_pb2.ExponentialDecayLR(
+                        decay_size=1000
                     ),
                 ),
-                optimizer_pb2.ParamOptimizer(
+                optimizer_pb2.PartOptimizer(
                     adamw_optimizer=optimizer_pb2.AdamWOptimizer(lr=0.01),
                     regex_pattern=pattern3,
                 ),
@@ -110,13 +102,13 @@ class OpimizerBuilderTest(unittest.TestCase):
         kwarg = {"lr": 0.01}
         optimizers = [Optimizer(params, kwarg), Optimizer(params, kwarg)]
         optim_indexs = [0, 2]
-        schedulers = optimizer_builder.create_param_schedulers(
+        schedulers = optimizer_builder.create_part_optim_schedulers(
             optimizers, config, optim_indexs
         )
         scheduler_class = [x.__class__.__name__ for x in schedulers]
-        self.assertEqual(scheduler_class, ["ConstantLR", "ExponentialDecayLR"])
+        self.assertEqual(scheduler_class, ["ConstantLR", "ManualStepLR"])
 
-    def test_build_param_optimizers(self):
+    def test_build_part_optimizers(self):
         param_optim_cls = [torch.optim.Adam, torch.optim.SGD, torch.optim.AdamW]
         param_optim_kwargs = [
             {"lr": 0.01, "betas": (0.9, 0.999)},
@@ -128,7 +120,7 @@ class OpimizerBuilderTest(unittest.TestCase):
             {},
             {"mlp": nn.Parameter(Tensor([2.0]))},
         ]
-        optimizers, indices = optimizer_builder.build_param_optimizers(
+        optimizers, indices = optimizer_builder.build_part_optimizers(
             param_optim_cls, param_optim_kwargs, optim_params
         )
         opt_cls = [opt._optimizer.__class__.__name__ for opt in optimizers]

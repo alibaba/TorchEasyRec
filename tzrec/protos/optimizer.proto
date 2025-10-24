@@ -20,7 +20,6 @@ message SparseOptimizer {
 }
 
 message DenseOptimizer {
-    repeated ParamOptimizer param_optimizers = 201;
     oneof optimizer {
         SGDOptimizer sgd_optimizer = 1;
         AdagradOptimizer adagrad_optimizer = 2;
@@ -32,9 +31,10 @@ message DenseOptimizer {
         ExponentialDecayLR exponential_decay_learning_rate = 102;
         ManualStepLR manual_step_learning_rate = 103;
     }
+    repeated PartOptimizer part_optimizers = 201;
 }
 
-message ParamOptimizer {
+message PartOptimizer {
     oneof optimizer {
         SGDOptimizer sgd_optimizer = 1;
         AdagradOptimizer adagrad_optimizer = 2;
@@ -42,17 +42,12 @@ message ParamOptimizer {
         AdamWOptimizer adamw_optimizer = 4;
     }
     required string regex_pattern = 5;
-    optional ParamLearningRate param_learning_rate = 6;
-}
-
-message ParamLearningRate {
     oneof learning_rate {
-        ConstantLR constant_learning_rate = 1;
-        ExponentialDecayLR exponential_decay_learning_rate = 2;
-        ManualStepLR manual_step_learning_rate = 3;
+        ConstantLR constant_learning_rate = 101;
+        ExponentialDecayLR exponential_decay_learning_rate = 102;
+        ManualStepLR manual_step_learning_rate = 103;
     }
 }
-
 
 enum WeightDecayMode {
     NONE = 0;
