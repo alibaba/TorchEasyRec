@@ -10,6 +10,17 @@
 # limitations under the License.
 
 import os as _os
+import warnings as _warnings
+
+# TODO(hongsheng.jhs): remove the warning filter when fbgemm team fix it.
+_warnings.filterwarnings(
+    "ignore",
+    message=".*fbgemm::jagged_to_padded_dense: an autograd kernel was not registered.*",
+)
+_warnings.filterwarnings(
+    "ignore",
+    message=".*fbgemm::dense_embedding_codegen_lookup_function: an autograd kernel was not registered.*",  # NOQA
+)
 
 if "OMP_NUM_THREADS" not in _os.environ:
     _os.environ["OMP_NUM_THREADS"] = "1"

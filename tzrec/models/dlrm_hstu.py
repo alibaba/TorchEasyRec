@@ -113,6 +113,16 @@ class DlrmHSTU(RankModel):
                 True,
             ),
         ]
+        contextual_feature_dims = [
+            name_to_feature[c_feat_name].output_dim
+            for c_feat_name in name_to_feature_group["contextual"].feature_names
+        ]
+        if len(set(contextual_feature_dims)) > 1:
+            raise ValueError(
+                "output_dim of features in contextual features_group must be same, "
+                f"but now {set(contextual_feature_dims)}."
+            )
+
         if (
             len(self._model_config.uih_watchtime_feature_name) > 0
             and len(self._model_config.candidates_watchtime_feature_name) > 0
