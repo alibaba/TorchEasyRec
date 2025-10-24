@@ -23,8 +23,8 @@ from numpy.linalg import norm
 from torch import distributed as dist
 
 from tzrec.datasets.dataset import create_reader, create_writer
-from tzrec.main import init_process_group
 from tzrec.utils import faiss_util
+from tzrec.utils.dist_util import init_process_group
 from tzrec.utils.logging_util import logger
 
 
