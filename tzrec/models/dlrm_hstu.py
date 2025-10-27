@@ -48,11 +48,14 @@ def _fx_odict_jt_vcat(odict_jt: Dict[str, JaggedTensor]) -> torch.Tensor:
 def _fx_construct_payload(
     payload_features: Dict[str, torch.Tensor],
     contextual_seq_embeddings: Dict[str, JaggedTensor],
+    uih_seq_embeddings: Dict[str, JaggedTensor],
 ) -> Dict[str, torch.Tensor]:
     results: Dict[str, torch.Tensor] = {}
     for k, v in contextual_seq_embeddings.items():
         results[k] = v.values()
         results[k + "_offsets"] = v.offsets()
+    for k, v in uih_seq_embeddings.items():
+        results[k] = v.values()
     results.update(payload_features)
     return results
 
@@ -210,6 +213,7 @@ class DlrmHSTU(RankModel):
             seq_payloads=_fx_construct_payload(
                 payload_features=payload_features,
                 contextual_seq_embeddings=contextual_seq_embeddings,
+                uih_seq_embeddings=uih_seq_embeddings,
             ),
             num_targets=num_candidates,
         )
