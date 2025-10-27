@@ -145,6 +145,8 @@ class ContextualPreprocessor(InputPreprocessor):
         content_mlp (Dict[str, Any]): content MLP module params.
         action_encoder (Dict[str, Any]): ActionEncoder module params.
         action_mlp (Dict[str, Any]): action MLP module params.
+        contextual_feature_dim (int): contextual feature dimension,
+            default is equal to input_embedding_dim.
         contextual_feature_to_max_length (Dict[str, int]): A mapping from contextual
             feature to maximum padding length.
         contextual_feature_to_min_uih_length (Dict[str, int]): A mapping from contextual
@@ -162,6 +164,7 @@ class ContextualPreprocessor(InputPreprocessor):
         content_mlp: Dict[str, Any],
         action_encoder: Optional[Dict[str, Any]] = None,
         action_mlp: Optional[Dict[str, Any]] = None,
+        contextual_feature_dim: Optional[int] = None,
         contextual_feature_to_max_length: Optional[Dict[str, int]] = None,
         contextual_feature_to_min_uih_length: Optional[Dict[str, int]] = None,
         contextual_feature_to_pooling: Optional[Dict[str, str]] = None,
@@ -171,6 +174,9 @@ class ContextualPreprocessor(InputPreprocessor):
         super().__init__(is_inference=is_inference)
         self._output_embedding_dim: int = output_embedding_dim
         self._input_embedding_dim: int = input_embedding_dim
+        self._contextual_feature_dim: int = (
+            contextual_feature_dim or input_embedding_dim
+        )
         self._contextual_feature_to_max_length: Dict[str, int] = (
             contextual_feature_to_max_length or dict()
         )
@@ -193,14 +199,14 @@ class ContextualPreprocessor(InputPreprocessor):
 
         if self._max_contextual_seq_len > 0:
             std = 1.0 * sqrt(
-                2.0 / float(input_embedding_dim + self._output_embedding_dim)
+                2.0 / float(self._contextual_feature_dim + self._output_embedding_dim)
             )
             self._batched_contextual_linear_weights: torch.nn.Parameter = (
                 torch.nn.Parameter(
                     torch.empty(
                         (
                             self._max_contextual_seq_len,
-                            input_embedding_dim,
+                            self._contextual_feature_dim,
                             self._output_embedding_dim,
                         )
                     ).normal_(0.0, std)
@@ -214,7 +220,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 )
             )
         contextual_embedding_dim: int = (
-            self._max_contextual_seq_len * input_embedding_dim
+            self._max_contextual_seq_len * self._contextual_feature_dim
         )
         self._content_embedding_mlp: torch.nn.Module = create_contextualized_mlp(
             content_mlp,
@@ -301,7 +307,7 @@ class ContextualPreprocessor(InputPreprocessor):
                     contextual_input_embeddings.dtype
                 ).unsqueeze(1),
                 contextual_input_embeddings.view(
-                    -1, self._max_contextual_seq_len, self._input_embedding_dim
+                    -1, self._max_contextual_seq_len, self._contextual_feature_dim
                 ).transpose(0, 1),
                 self._batched_contextual_linear_weights.to(
                     contextual_input_embeddings.dtype
@@ -402,6 +408,8 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         content_mlp (Dict[str, Any]): content MLP module params.
         action_encoder (Dict[str, Any]): ActionEncoder module params.
         action_mlp (Dict[str, Any]): action MLP module params.
+        contextual_feature_dim (int): contextual feature dimension,
+            default is equal to input_embedding_dim.
         contextual_feature_to_max_length (Dict[str, int]): A mapping from contextual
             feature to maximum padding length.
         contextual_feature_to_min_uih_length (Dict[str, int]): A mapping from contextual
@@ -421,6 +429,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         content_mlp: Dict[str, Any],
         action_encoder: Dict[str, Any],
         action_mlp: Dict[str, Any],
+        contextual_feature_dim: Optional[int] = None,
         contextual_feature_to_max_length: Optional[Dict[str, int]] = None,
         contextual_feature_to_min_uih_length: Optional[Dict[str, int]] = None,
         contextual_feature_to_pooling: Optional[Dict[str, str]] = None,
@@ -431,6 +440,9 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         super().__init__(is_inference=is_inference)
         self._input_embedding_dim: int = input_embedding_dim
         self._output_embedding_dim: int = output_embedding_dim
+        self._contextual_feature_dim: int = (
+            contextual_feature_dim or input_embedding_dim
+        )
         self._contextual_feature_to_max_length: Dict[str, int] = (
             contextual_feature_to_max_length or dict()
         )
@@ -451,12 +463,14 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             self._contextual_feature_to_max_length.values()
         ) + len(self._contextual_feature_to_pooling)
 
-        std = 1.0 * sqrt(2.0 / float(input_embedding_dim + output_embedding_dim))
+        std = 1.0 * sqrt(
+            2.0 / float(self._contextual_feature_dim + output_embedding_dim)
+        )
         self._batched_contextual_linear_weights = torch.nn.Parameter(
             torch.empty(
                 (
                     self._max_contextual_seq_len,
-                    input_embedding_dim,
+                    self._contextual_feature_dim,
                     output_embedding_dim,
                 )
             ).normal_(0.0, std)
@@ -467,7 +481,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             )
         )
         contextual_embedding_dim: int = (
-            self._max_contextual_seq_len * input_embedding_dim
+            self._max_contextual_seq_len * self._contextual_feature_dim
         )
         self._content_encoder: ContentEncoder = ContentEncoder(
             input_embedding_dim=input_embedding_dim,
@@ -679,7 +693,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
                     contextual_input_embeddings.dtype
                 ),
                 contextual_input_embeddings.view(
-                    -1, self._max_contextual_seq_len, self._input_embedding_dim
+                    -1, self._max_contextual_seq_len, self._contextual_feature_dim
                 ).transpose(0, 1),
                 self._batched_contextual_linear_weights.to(
                     contextual_input_embeddings.dtype

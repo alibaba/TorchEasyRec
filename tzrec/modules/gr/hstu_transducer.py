@@ -53,6 +53,7 @@ class HSTUTransducer(BaseModule):
         output_postprocessor (dict): OutputPostprocessor config.
         input_dropout_ratio (float): dropout ratio after input_preprocessor.
         positional_encoder (dict): HSTUPositionalEncoder config.
+        contextual_feature_dim (int): contextual feature input dimension.
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
@@ -67,6 +68,7 @@ class HSTUTransducer(BaseModule):
         output_postprocessor: Dict[str, Any],
         input_dropout_ratio: float = 0.0,
         positional_encoder: Optional[Dict[str, Any]] = None,
+        contextual_feature_dim: Optional[int] = None,
         is_inference: bool = True,
         return_full_embeddings: bool = False,
         listwise: bool = False,
@@ -78,6 +80,7 @@ class HSTUTransducer(BaseModule):
         self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
             input_preprocessor,
             input_embedding_dim=input_embedding_dim,
+            contextual_feature_dim=contextual_feature_dim,
             output_embedding_dim=stu["embedding_dim"],
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
