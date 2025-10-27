@@ -23,12 +23,14 @@ class PreprocessorTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
+        contextual_feature_dim=st.sampled_from([32, 64]),
         enable_pmlp=st.sampled_from([True, False]),
         is_train=st.sampled_from([True, False]),
     )
     @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_contextual_preprocessor(
         self,
+        contextual_feature_dim: int,
         enable_pmlp: bool,
         is_train: bool,
     ) -> None:
@@ -51,6 +53,7 @@ class PreprocessorTest(unittest.TestCase):
         preprocessor = ContextualPreprocessor(
             input_embedding_dim=input_embedding_dim,
             output_embedding_dim=output_embedding_dim,
+            contextual_feature_dim=contextual_feature_dim,
             contextual_feature_to_max_length={"c_1": 2},
             contextual_feature_to_min_uih_length={"c_1": 4},
             contextual_feature_to_pooling={"c_0": "sum"},
@@ -109,9 +112,9 @@ class PreprocessorTest(unittest.TestCase):
             seq_embeddings=seq_embeddings,
             seq_payloads={
                 # contextual
-                "c_0": torch.rand((2, input_embedding_dim), device=device),
+                "c_0": torch.rand((2, contextual_feature_dim), device=device),
                 "c_0_offsets": torch.tensor([0, 1, 1], device=device),
-                "c_1": torch.rand((4, input_embedding_dim), device=device),
+                "c_1": torch.rand((4, contextual_feature_dim), device=device),
                 "c_1_offsets": torch.tensor([0, 2, 3], device=device),
                 # action
                 "watchtimes": torch.tensor(watchtimes, device=device),
@@ -178,6 +181,7 @@ class PreprocessorTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
+        contextual_feature_dim=st.sampled_from([32, 64]),
         enable_interleaving=st.sampled_from([True, False]),
         enable_pmlp=st.sampled_from([True, False]),
         is_train=st.sampled_from([True, False]),
@@ -185,6 +189,7 @@ class PreprocessorTest(unittest.TestCase):
     @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_contextual_interleave_preprocessor(
         self,
+        contextual_feature_dim: int,
         enable_interleaving: bool,
         enable_pmlp: bool,
         is_train: bool,
@@ -208,6 +213,7 @@ class PreprocessorTest(unittest.TestCase):
         preprocessor = ContextualInterleavePreprocessor(
             input_embedding_dim=input_embedding_dim,
             output_embedding_dim=output_embedding_dim,
+            contextual_feature_dim=contextual_feature_dim,
             contextual_feature_to_max_length={"c_0": 1, "c_1": 2},
             contextual_feature_to_min_uih_length={"c_1": 4},
             content_encoder=dict(
@@ -276,9 +282,9 @@ class PreprocessorTest(unittest.TestCase):
             seq_embeddings=seq_embeddings,
             seq_payloads={
                 # contextual
-                "c_0": torch.rand((2, input_embedding_dim), device=device),
+                "c_0": torch.rand((2, contextual_feature_dim), device=device),
                 "c_0_offsets": torch.tensor([0, 1, 1], device=device),
-                "c_1": torch.rand((4, input_embedding_dim), device=device),
+                "c_1": torch.rand((4, contextual_feature_dim), device=device),
                 "c_1_offsets": torch.tensor([0, 2, 3], device=device),
                 # action
                 "watchtimes": torch.tensor(watchtimes, device=device),

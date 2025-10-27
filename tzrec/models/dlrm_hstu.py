@@ -122,6 +122,7 @@ class DlrmHSTU(RankModel):
                 "output_dim of features in contextual features_group must be same, "
                 f"but now {set(contextual_feature_dims)}."
             )
+        contextual_feature_dim = contextual_feature_dims[0]
 
         if (
             len(self._model_config.uih_watchtime_feature_name) > 0
@@ -144,6 +145,7 @@ class DlrmHSTU(RankModel):
         # construct HSTU
         self._hstu_transducer: HSTUTransducer = HSTUTransducer(
             input_embedding_dim=hstu_embedding_table_dim,
+            contextual_feature_dim=contextual_feature_dim,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
             listwise=False,
