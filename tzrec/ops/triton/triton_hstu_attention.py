@@ -267,12 +267,12 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
     if not CAUSAL:
         offs_m_minus_n = tl.where(offs_m_minus_n > 0, offs_m_minus_n, -offs_m_minus_n)
-    invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    invalid_mask = invalid_mask | (offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
-        invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+        invalid_mask = invalid_mask & (offs_m_minus_n <= max_attn_len)
     if HAS_CONTEXTUAL_SEQ_LEN:
-        invalid_mask = invalid_mask or (
-            offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+        invalid_mask = invalid_mask | (
+            (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
         )
     # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
     silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
@@ -642,12 +642,12 @@ def _hstu_attn_bwd_one_block(  # noqa C901
         pos_offs_m_minus_n = tl.where(
             pos_offs_m_minus_n > 0, pos_offs_m_minus_n, -pos_offs_m_minus_n
         )
-    invalid_mask_trans = invalid_mask_trans or (pos_offs_m_minus_n > 0)
+    invalid_mask_trans = invalid_mask_trans | (pos_offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
-        invalid_mask_trans = invalid_mask_trans and pos_offs_m_minus_n <= max_attn_len
+        invalid_mask_trans = invalid_mask_trans & (pos_offs_m_minus_n <= max_attn_len)
     if HAS_CONTEXTUAL_SEQ_LEN:
-        invalid_mask_trans = invalid_mask_trans or (
-            pos_offs_m[None, :] == 0 and pos_offs_n[:, None] < max_ids
+        invalid_mask_trans = invalid_mask_trans | (
+            (pos_offs_m[None, :] == 0) & (pos_offs_n[:, None] < max_ids)
         )
     silu_trans = tl.where(invalid_mask_trans, silu_trans, 0)
     silu_trans = silu_trans.to(k.dtype)
