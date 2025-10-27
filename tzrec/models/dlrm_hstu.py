@@ -49,12 +49,15 @@ def _fx_construct_payload(
     payload_features: Dict[str, torch.Tensor],
     contextual_seq_embeddings: Dict[str, JaggedTensor],
     uih_seq_embeddings: Dict[str, JaggedTensor],
+    candidate_seq_embeddings: Dict[str, JaggedTensor],
 ) -> Dict[str, torch.Tensor]:
     results: Dict[str, torch.Tensor] = {}
     for k, v in contextual_seq_embeddings.items():
         results[k] = v.values()
         results[k + "_offsets"] = v.offsets()
     for k, v in uih_seq_embeddings.items():
+        results[k] = v.values()
+    for k, v in candidate_seq_embeddings.items():
         results[k] = v.values()
     results.update(payload_features)
     return results
@@ -180,6 +183,7 @@ class DlrmHSTU(RankModel):
         payload_features: Dict[str, torch.Tensor],
         uih_seq_embeddings: OrderedDict[str, JaggedTensor],
         contextual_seq_embeddings: OrderedDict[str, JaggedTensor],
+        candidate_seq_embeddings: OrderedDict[str, JaggedTensor],
         num_candidates: torch.Tensor,
     ) -> torch.Tensor:
         source_lengths = uih_seq_embeddings[
@@ -214,6 +218,7 @@ class DlrmHSTU(RankModel):
                 payload_features=payload_features,
                 contextual_seq_embeddings=contextual_seq_embeddings,
                 uih_seq_embeddings=uih_seq_embeddings,
+                candidate_seq_embeddings=candidate_seq_embeddings,
             ),
             num_targets=num_candidates,
         )
@@ -351,6 +356,7 @@ class DlrmHSTU(RankModel):
                 payload_features=payload_features,
                 uih_seq_embeddings=uih_seq_embeddings,
                 contextual_seq_embeddings=grouped_features["contextual"],
+                candidate_seq_embeddings=candidate_seq_embeddings,
                 num_candidates=num_candidates,
             )
         with record_function("## multitask_module ##"):
