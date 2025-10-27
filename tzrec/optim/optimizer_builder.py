@@ -105,7 +105,7 @@ def create_dense_optimizer(
 def create_part_optimizer(
     optimizer_config: optimizer_pb2.DenseOptimizer,
 ) -> Tuple[List[Type[Optimizer]], List[Dict[str, Any]], List[str]]:
-    """Create optimizer class for some param."""
+    """Create optimizer for part of module parameters."""
     part_optimizers = []
     part_optimizer_kwargs = []
     part_regex_patterns = []
@@ -123,7 +123,7 @@ def create_scheduler(
         optimizer_pb2.SparseOptimizer, optimizer_pb2.DenseOptimizer
     ],
 ) -> BaseLR:
-    """Create optimizer for dense module.
+    """Create scheduler for dense module.
 
     Args:
         optimizer (Optimizer): an instance of Optimizer.
@@ -147,13 +147,13 @@ def create_part_optim_schedulers(
     optimizer_config: optimizer_pb2.DenseOptimizer,
     part_optim_indices: List[int],
 ) -> List[BaseLR]:
-    """Create optimizer for dense module.
+    """Create scheduler for part of module parameters.
 
     Args:
         part_optimizers (list[Optimizer]): an list instance of Optimizer.
         optimizer_config (optimizer_pb2.SparseOptimizer|optimizer_pb2.DenseOptimizer):
             an instance of Optimizer config.
-        part_optim_indices (list[int]): optimizers index in
+        part_optim_indices (list[int]): valid optimizers index in
             optimizer_config.part_optimizers.
 
     Returns:
@@ -189,13 +189,15 @@ def group_param_by_regex_pattern(
     remaining_params = dict()
     part_optim_params = [dict() for _ in range(len(regex_patterns))]
     for name, param in params.items():
-        logger.info("parameter name: {}".format(name))
         for i, regex_pattern in enumerate(regex_patterns):
             if re.fullmatch(re.compile(regex_pattern), name):
                 part_optim_params[i][name] = param
                 break
         else:
             remaining_params[name] = param
+    for i, part_optim_param in enumerate(part_optim_params):
+        logger.info(f"part_optim_params{i}:" + str(list(part_optim_param.keys())))
+    logger.info("remaining_params:" + str(list(remaining_params.keys())))
     return remaining_params, part_optim_params
 
 
@@ -219,9 +221,4 @@ def build_part_optimizers(
                 ),
             )
             part_optimizers.append(optimizer)
-            logger.info(
-                "part optimizer index: {}, params key:{}".format(
-                    i, list(part_optim_params[i].keys())
-                )
-            )
     return part_optimizers, valid_indices

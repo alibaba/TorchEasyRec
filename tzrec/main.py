@@ -645,7 +645,6 @@ def train_and_evaluate(
             part_optim_regex_patterns,
         )
     )
-    logger.info("remaining_params:" + str(list(remaining_params.keys())))
     dense_optimizer = KeyedOptimizerWrapper(
         remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
