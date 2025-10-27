@@ -143,7 +143,7 @@ def create_scheduler(
 
 
 def create_part_optim_schedulers(
-    part_optimizers: List[Optimizer],
+    part_optimizers: List[KeyedOptimizerWrapper],
     optimizer_config: optimizer_pb2.DenseOptimizer,
     part_optim_indices: List[int],
 ) -> List[BaseLR]:

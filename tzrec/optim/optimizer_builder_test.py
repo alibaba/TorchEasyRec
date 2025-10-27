@@ -14,6 +14,7 @@ import unittest
 import torch
 from torch import Tensor, nn
 from torch.optim import Optimizer
+from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim import optimizer_builder
 from tzrec.protos import optimizer_pb2
@@ -98,9 +99,12 @@ class OpimizerBuilderTest(unittest.TestCase):
                 ),
             ],
         )
-        params = [Tensor([1.0])]
+        param = {"mlp": Tensor([1.0])}
         kwarg = {"lr": 0.01}
-        optimizers = [Optimizer(params, kwarg), Optimizer(params, kwarg)]
+        optimizers = [
+            KeyedOptimizerWrapper(param, lambda params: Optimizer(params, kwarg)),
+            KeyedOptimizerWrapper(param, lambda params: Optimizer(params, kwarg)),
+        ]
         optim_indexs = [0, 2]
         schedulers = optimizer_builder.create_part_optim_schedulers(
             optimizers, config, optim_indexs
