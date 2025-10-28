@@ -197,7 +197,9 @@ def group_param_by_regex_pattern(
             remaining_params[name] = param
     for i, part_optim_param in enumerate(part_optim_params):
         logger.info(f"part_optim_params{i}:" + str(list(part_optim_param.keys())))
-    logger.info("remaining_params:" + str(list(remaining_params.keys())))
+
+    if len(part_optim_params) > 0:
+        logger.info("remaining_params:" + str(list(remaining_params.keys())))
     return remaining_params, part_optim_params
 
 

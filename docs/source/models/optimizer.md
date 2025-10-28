@@ -2,7 +2,7 @@
 
 ## 简介
 
-TorchEasyRec除了像tzrec一样拥有sparse_optimizer和dense_optimizer,在dense_optimize中实现了part_optimizers 即：参数优化器。对于模型参数优先part_optimizer的正则项和参数名称匹配，如果能匹配上则该参数使用对应的part_optimizer，如果最后无法匹配上，则使用全局的dense_optimizer。
+TorchEasyRec的优化器分为sparse_optimizer和dense_optimizer两个部分，sparse_optimizer负责embedding部分稀疏参数，dense_optimizer负责nn部分稠密参数。在dense_optimizer中，TorchEasyRec还支持part_optimizers，可以通过正则表示支持对部分参数设置单独的优化器。
 
 ## 样例配置
 
@@ -42,8 +42,18 @@ train_config {
 }
 ```
 
-如上，在train_config.dense_optimizer中的part_optimizers是参数优化器
+- sparse_optimizer
+  - optimizer: 优化器类型，具体见sparse optimize的[配置文档](../reference.html)
+  - learning_rate: sparse_optimizer的学习率计划器,具体见sparse_optimizer中的learning_rate的[配置文档](../reference.html)
+- dense_optimizer
+  - optimizer: 优化器类型，具体见dense optimize的[配置文档](../reference.html)
 
-- optimizer: 和dense_optimizer可配置项一样，具体见proto的定义
-- regex_pattern: 必须配置，可优化的模型参数名称正则表达式。对于某参数名称可以被多个参数优化器正则项可以匹配，则会匹配到第一个参数优化器。
-- learning_rate: 学习率计划器，和dense_optimizer的学习率可配置项一样，如果不配则使用dense_optimizer的学习率计划器，具体见proto的定义。
+  - learning_rate: dense_optimizer的学习率计划器,具体见dense_optimizer中的learning_rate的[配置文档](../reference.html)
+
+  - part_optimizers:
+
+    在train_config.dense_optimizer中可以通过part_optimizers针对部分稠密参数配置单独的优化器
+
+    - optimizer: 和dense_optimizer可配置项一样，具体见optimize的[配置文档](../reference.html)
+    - regex_pattern: 必须配置，可优化的模型参数名称正则表达式。对于某参数名称可以被多个参数优化器正则项可以匹配，则会匹配到第一个参数优化器。不能匹配上则使用dense_optimizer。
+    - learning_rate: 学习率计划器，和dense_optimizer的学习率可配置项一样，如果不配则使用dense_optimizer的学习率计划器，具体见learning_rate的[配置文档](../reference.html)。
