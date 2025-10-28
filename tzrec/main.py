@@ -644,9 +644,21 @@ def train_and_evaluate(
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
         train_config.dense_optimizer
     )
+    part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
+        optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
+    )
+    remaining_params, part_optim_params = (
+        optimizer_builder.group_param_by_regex_pattern(
+            dict(in_backward_optimizer_filter(model.named_parameters())),
+            part_optim_regex_patterns,
+        )
+    )
     dense_optimizer = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(model.named_parameters())),
+        remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
+    )
+    part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
+        part_optim_cls, part_optim_kwargs, part_optim_params
     )
     grad_scaler = None
     if train_config.HasField("grad_scaler"):
@@ -655,7 +667,7 @@ def train_and_evaluate(
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
     optimizer = TZRecOptimizer(
-        CombinedOptimizer([model.fused_optimizer, dense_optimizer]),
+        CombinedOptimizer([model.fused_optimizer, dense_optimizer, *part_optimizers]),
         grad_scaler=grad_scaler,
         gradient_accumulation_steps=train_config.gradient_accumulation_steps,
     )
@@ -664,6 +676,9 @@ def train_and_evaluate(
     )
     dense_lr = optimizer_builder.create_scheduler(
         dense_optimizer, train_config.dense_optimizer
+    )
+    part_lrs = optimizer_builder.create_part_optim_schedulers(
+        part_optimizers, train_config.dense_optimizer, part_optim_indices
     )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
@@ -683,7 +698,7 @@ def train_and_evaluate(
         optimizer,
         train_dataloader,
         eval_dataloader,
-        [sparse_lr, dense_lr],
+        [sparse_lr, dense_lr, *part_lrs],
         pipeline_config.model_dir,
         train_config=train_config,
         eval_config=pipeline_config.eval_config,
