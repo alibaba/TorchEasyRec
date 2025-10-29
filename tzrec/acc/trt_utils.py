@@ -157,7 +157,10 @@ def get_trt_max_seq_len() -> int:
 
 
 def export_model_trt(
-    model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
+    sparse_model: nn.Module, 
+    dense_model: nn.Module,
+    data: Dict[str, torch.Tensor], 
+    save_dir: str
 ) -> None:
     """Export trt model.
 
@@ -167,9 +170,9 @@ def export_model_trt(
         save_dir (str): model save dir
     """
     # ScriptWrapperList for trace the ScriptWrapperTRT(emb_trace_gpu, dense_layer_trt)
-    emb_trace_gpu = ScriptWrapperList(model.model.embedding_group)
-    emb_res = emb_trace_gpu(data, "cuda:0")
-    emb_trace_gpu = symbolic_trace(emb_trace_gpu)
+    # emb_trace_gpu = ScriptWrapperList(sparse_model)
+    emb_res = sparse_model(data, "cuda:0")
+    emb_trace_gpu = symbolic_trace(sparse_model)
     emb_trace_gpu = torch.jit.script(emb_trace_gpu)
 
     # dynamic shapes
@@ -179,7 +182,9 @@ def export_model_trt(
     dynamic_shapes_list = []
     values_list_cuda = []
     for i, value in enumerate(emb_res):
-        v = value.detach().to("cuda:0")
+        if i > 0:
+            break
+        v = list(value.values())[0].detach().to("cuda:0")
         dict_dy = {0: batch}
         if v.dim() == 3:
             # workaround -> 0/1 specialization
@@ -191,16 +196,24 @@ def export_model_trt(
             v = torch.zeros((2,) + v.size()[1:], device="cuda:0", dtype=v.dtype)
         values_list_cuda.append(v)
         dynamic_shapes_list.append(dict_dy)
+        
 
     # convert dense
-    dense = model.model.dense
-    logger.info("dense res: %s", dense(values_list_cuda))
-    dense_layer = symbolic_trace(dense)
+    #logger.info("dense res: %s", dense_model(values_list_cuda))
+    logger.info("dense res: %s", dense_model({'all_features__ebc': values_list_cuda[0]}))
+    
+    dense_layer = symbolic_trace(dense_model)
     dynamic_shapes = {"args": dynamic_shapes_list}
+    # exp_program = torch.export.export(
+    #     dense_layer, 
+    #     (values_list_cuda,), 
+    #     dynamic_shapes=dynamic_shapes
+    # )
     exp_program = torch.export.export(
-        dense_layer, (values_list_cuda,), dynamic_shapes=dynamic_shapes
+        dense_layer, 
+        ({'all_features__ebc': values_list_cuda[0]},)
     )
-    dense_layer_trt = trt_convert(exp_program, values_list_cuda)
+    dense_layer_trt = trt_convert(exp_program, ({'all_features__ebc': values_list_cuda[0]},))
     dict_res = dense_layer_trt(values_list_cuda)
     logger.info("dense trt res: %s", dict_res)
 
@@ -214,7 +227,7 @@ def export_model_trt(
     )
     scripted_model = torch.jit.script(combined_model)
     # pyre-ignore [16]
-    scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+    scripted_model.save(os.path.join(save_dir, "scripted_model_trt.pt"))
 
     if is_debug_trt():
         with profile(
@@ -222,7 +235,7 @@ def export_model_trt(
             record_shapes=True,
         ) as prof:
             with record_function("model_inference_dense"):
-                dict_res = dense(values_list_cuda)
+                dict_res = dense_model(values_list_cuda)
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
         with profile(
