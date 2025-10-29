@@ -10,9 +10,10 @@
 # limitations under the License.
 
 import os
+from datetime import timedelta
 from queue import Queue
 from typing import List, Optional, Tuple
-from datetime import timedelta
+
 import torch
 from torch import distributed as dist
 from torch import nn
@@ -45,6 +46,7 @@ from torchrec.distributed.types import (
     ShardingPlan,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
 
 def init_process_group() -> Tuple[torch.device, str]:
     """Init process_group, device, rank, backend."""

@@ -51,7 +51,6 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
-from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.fx_util import fx_mark_keyed_tensor, fx_mark_tensor, symbolic_trace
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -168,7 +167,9 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense = split_model(pipeline_config, model, checkpoint_path, save_dir)
+            sparse, dense = split_model(
+                pipeline_config, model, checkpoint_path, save_dir
+            )
             export_model_trt(sparse, dense, data, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
@@ -413,12 +414,11 @@ def split_model(
     model: BaseModule,
     checkpoint_path: Optional[str],
     save_dir: str,
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), 
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     rank=0,
     assets: Optional[List[str]] = None,
 ) -> None:
     """Export a EasyRec model on RTP."""
-
     # device, _ = init_process_group()
     # rank = int(os.environ.get("RANK", 0))
     # world_size = int(os.environ.get("WORLD_SIZE", 1))

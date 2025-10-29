@@ -157,10 +157,10 @@ def get_trt_max_seq_len() -> int:
 
 
 def export_model_trt(
-    sparse_model: nn.Module, 
+    sparse_model: nn.Module,
     dense_model: nn.Module,
-    data: Dict[str, torch.Tensor], 
-    save_dir: str
+    data: Dict[str, torch.Tensor],
+    save_dir: str,
 ) -> None:
     """Export trt model.
 
@@ -196,24 +196,26 @@ def export_model_trt(
             v = torch.zeros((2,) + v.size()[1:], device="cuda:0", dtype=v.dtype)
         values_list_cuda.append(v)
         dynamic_shapes_list.append(dict_dy)
-        
 
     # convert dense
-    #logger.info("dense res: %s", dense_model(values_list_cuda))
-    logger.info("dense res: %s", dense_model({'all_features__ebc': values_list_cuda[0]}))
-    
+    # logger.info("dense res: %s", dense_model(values_list_cuda))
+    logger.info(
+        "dense res: %s", dense_model({"all_features__ebc": values_list_cuda[0]})
+    )
+
     dense_layer = symbolic_trace(dense_model)
     dynamic_shapes = {"args": dynamic_shapes_list}
     # exp_program = torch.export.export(
-    #     dense_layer, 
-    #     (values_list_cuda,), 
+    #     dense_layer,
+    #     (values_list_cuda,),
     #     dynamic_shapes=dynamic_shapes
     # )
     exp_program = torch.export.export(
-        dense_layer, 
-        ({'all_features__ebc': values_list_cuda[0]},)
+        dense_layer, ({"all_features__ebc": values_list_cuda[0]},)
     )
-    dense_layer_trt = trt_convert(exp_program, ({'all_features__ebc': values_list_cuda[0]},))
+    dense_layer_trt = trt_convert(
+        exp_program, ({"all_features__ebc": values_list_cuda[0]},)
+    )
     dict_res = dense_layer_trt(values_list_cuda)
     logger.info("dense trt res: %s", dict_res)
 
