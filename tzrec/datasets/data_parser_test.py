@@ -452,13 +452,15 @@ class DataParserTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [FgMode.FG_NORMAL, False],
-            [FgMode.FG_DAG, False],
-            [FgMode.FG_NORMAL, True],
-            [FgMode.FG_DAG, True],
+            [FgMode.FG_NORMAL, False, False],
+            [FgMode.FG_DAG, False, False],
+            [FgMode.FG_NORMAL, True, False],
+            [FgMode.FG_DAG, True, False],
+            [FgMode.FG_NORMAL, False, True],
+            [FgMode.FG_DAG, False, True],
         ]
     )
-    def test_fg(self, fg_mode, weigted_id):
+    def test_fg(self, fg_mode, weigted_id, complex_type=False):
         feature_cfgs = self._create_test_fg_feature_cfgs(
             tag_b_weighted=weigted_id, tag_b_seq=True
         )
@@ -477,9 +479,38 @@ class DataParserTest(unittest.TestCase):
                 "tag_b",
             ],
         )
-
-        data = data_parser.parse(
-            input_data={
+        if complex_type:
+            input_data = {
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(
+                    [{4: 0.1, 5: 0.2}, {}, {6: 0.3}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                )
+                if weigted_id
+                else pa.array([[4, 5], [], [6]], type=pa.list_(pa.int64())),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(
+                    [[27, 37], [28, 38], [29, 39]], type=pa.list_(pa.float32())
+                ),
+                "map_a": pa.array(
+                    [{"1": 0.1, "3": 0.2}, {}, {"1": 0.1, "3": 0.2}],
+                    type=pa.map_(pa.string(), pa.float32()),
+                ),
+                "click_seq__cat_a": pa.array(
+                    [[10, 11, 12], [13], []], type=pa.list_(pa.int64())
+                ),
+                "click_seq__int_a": pa.array(
+                    [[14, 15, 16], [17], []], type=pa.list_(pa.float32())
+                ),
+                "click_seq__tag_b": pa.array(
+                    [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [[]]],
+                    type=pa.list_(pa.list_(pa.string())),
+                ),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
+            }
+        else:
+            input_data = {
                 "cat_a": pa.array([1, 2, 3]),
                 "tag_b": pa.array(["4:0.1\x1d5:0.2", "", "6:0.3"])
                 if weigted_id
@@ -493,7 +524,8 @@ class DataParserTest(unittest.TestCase):
                 "label": pa.array([0, 0, 1], pa.int32()),
                 "__SAMPLE_MASK__": pa.array([True, False, False]),
             }
-        )
+
+        data = data_parser.parse(input_data=input_data)
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
@@ -870,7 +902,7 @@ class DataParserTest(unittest.TestCase):
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
     def test_fg_bucketize_only(self):
-        feature_cfgs = self._create_test_fg_feature_cfgs()
+        feature_cfgs = self._create_test_fg_feature_cfgs(tag_b_seq=True)
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_BUCKETIZE)
         data_parser = DataParser(features=features, labels=["label"])
         self.assertEqual(
@@ -878,6 +910,7 @@ class DataParserTest(unittest.TestCase):
             [
                 "click_seq__f_cat_a",
                 "click_seq__f_int_a",
+                "click_seq__f_tag_b",
                 "f_cat_a",
                 "f_int_a",
                 "f_int_b",
@@ -897,6 +930,9 @@ class DataParserTest(unittest.TestCase):
                 "f_lookup_a": pa.array([0.1, 0.0, 0.2], type=pa.float32()),
                 "click_seq__f_cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
                 "click_seq__f_int_a": pa.array([["14", "15", "16"], ["17"], ["0"]]),
+                "click_seq__f_tag_b": pa.array(
+                    [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [["0"]]]
+                ),
                 "label": pa.array([0, 0, 1], pa.int32()),
             }
         )
@@ -918,6 +954,13 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
+        expected_seq_tag_b_values = torch.tensor(
+            [17, 18, 19, 20, 21, 22, 0], dtype=torch.int64
+        )
+        expected_seq_tag_b_key_lengths = torch.tensor(
+            [2, 1, 2, 1, 1], dtype=torch.int32
+        )
+        expected_seq_tag_b_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["f_cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["f_cat_a.lengths"], expected_cat_a_lengths)
@@ -937,6 +980,15 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(
             data["click_seq__f_int_a.lengths"], expected_seq_int_a_seq_lengths
+        )
+        torch.testing.assert_close(
+            data["click_seq__f_tag_b.values"], expected_seq_tag_b_values
+        )
+        torch.testing.assert_close(
+            data["click_seq__f_tag_b.key_lengths"], expected_seq_tag_b_key_lengths
+        )
+        torch.testing.assert_close(
+            data["click_seq__f_tag_b.lengths"], expected_seq_tag_b_seq_lengths
         )
         torch.testing.assert_close(data["label"], expected_label)
 

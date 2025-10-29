@@ -15,6 +15,7 @@ message BinaryCrossEntropy {
 }
 
 message SoftmaxCrossEntropy {
+    optional float label_smoothing=1 [default = 0.0];
 }
 
 message L2Loss {

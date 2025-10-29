@@ -332,10 +332,14 @@ if __name__ == "__main__":
     dyemb_name_to_init_info = {}
     dynamicemb_load_table_names = defaultdict(list)
     for feature in features:
-        emb_config = feature.emb_config
         # not support WIDE embedding now.
-        if emb_config is not None and emb_config.name in dyemb_name_to_mod_options:
+        if feature.config.HasField("dynamicemb"):
             if feature.config.dynamicemb.HasField("init_table"):
+                emb_config = feature.emb_config
+                assert (
+                    emb_config is not None
+                    and emb_config.name in dyemb_name_to_mod_options
+                )
                 save_paths = []
                 need_dump_scores = []
                 for mod_path, options in dyemb_name_to_mod_options[emb_config.name]:

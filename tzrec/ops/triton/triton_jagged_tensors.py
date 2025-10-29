@@ -222,12 +222,12 @@ def jagged_dense_bmm_broadcast_add_kernel(
         jg = tl.load(
             jg_ptrs,
             # pyre-fixme[16]: `int` has no attribute `__getitem__`.
-            mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
+            mask=(offs_m[:, None] < seq_len) & ((k + offs_k)[None, :] < K),
             other=0.0,
         )
         dn = tl.load(
             dn_ptrs,
-            mask=((k + offs_k)[:, None] < K) and (offs_n[None, :] < N),
+            mask=((k + offs_k)[:, None] < K) & (offs_n[None, :] < N),
             other=0.0,
         )
         accumulator += tl.dot(jg, dn, allow_tf32=ALLOW_TF32)
@@ -321,12 +321,12 @@ def _jagged_jagged_bmm_reduce_sum(
         jg_a = tl.load(
             jg_a_ptrs,
             # pyre-fixme[16]: `int` has no attribute `__getitem__`.
-            mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
+            mask=(offs_m[:, None] < M) & ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )
         jg_b = tl.load(
             jg_b_ptrs,
-            mask=(offs_n[None, :] < N) and ((k + offs_k)[:, None] < seq_len),
+            mask=(offs_n[None, :] < N) & ((k + offs_k)[:, None] < seq_len),
             other=0.0,
         )
 
