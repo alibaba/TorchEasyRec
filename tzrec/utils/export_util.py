@@ -366,6 +366,10 @@ def _adjust_one_feature_for_rtp(
     if embedding_info is not None:
         feature["shared_name"] = embedding_info.name
         feature["embedding_dimension"] = embedding_info.embedding_dim
+        feature["gen_val_type"] = "lookup"
+    else:
+        feature["gen_val_type"] = "idle"
+
     if "value_dim" in feature:
         feature["value_dimension"] = feature["value_dim"]
         feature.pop("value_dim")
@@ -373,17 +377,15 @@ def _adjust_one_feature_for_rtp(
         feature["needDiscrete"] = feature["need_discrete"]
         feature.pop("need_discrete")
     if "boundaries" in feature:
+        feature["boundaries"] = ",".join(map(str, feature["boundaries"]))
         feature["gen_key_type"] = "boundary"
-        feature["gen_val_type"] = "lookup"
     elif "hash_bucket_size" in feature:
         feature["gen_key_type"] = "hash"
-        feature["gen_val_type"] = "lookup"
     else:
         for k in RTP_INVALID_BUCKET_KEYS:
             if k in feature:
                 raise ValueError(f"{k} is not supported when use rtp.")
         feature["gen_key_type"] = "idle"
-        feature["gen_val_type"] = "idle"
 
 
 def _adjust_fg_json_for_rtp(
@@ -422,6 +424,10 @@ def export_rtp_model(
         raise RuntimeError(
             "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251023.aba1d83-py3-none-any.whl"
         ) from e
+    assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
+        "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
+        "train/eval/export when use rtp for online inference."
+    )
 
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
@@ -619,7 +625,7 @@ def export_rtp_model(
         _ = gm(sparse_output)
 
         # Save Dense Model
-        fx_tool = ExportTorchFxTool(save_dir)
+        fx_tool = ExportTorchFxTool(os.path.join(save_dir, "fx_user_model"))
         fx_tool.set_output_nodes_name(output_keys)
         fx_tool.export_fx_model(gm, sparse_output, mc_config)
 

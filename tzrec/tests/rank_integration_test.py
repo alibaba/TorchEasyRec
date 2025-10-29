@@ -890,16 +890,19 @@ class RankIntegrationTest(unittest.TestCase):
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
+            env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
         )
         if self.success:
             self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
             )
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="USE_RTP=1",
+                env_str="USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",
             )
         self.assertTrue(self.success)
 
