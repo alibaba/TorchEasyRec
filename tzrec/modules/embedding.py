@@ -42,7 +42,12 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
-from tzrec.utils.fx_util import fx_int_item, fx_mark_keyed_tensor, fx_mark_tensor
+from tzrec.utils.fx_util import (
+    fx_int_item,
+    fx_mark_keyed_tensor,
+    fx_mark_seq_len,
+    fx_mark_tensor,
+)
 
 EMPTY_KJT = KeyedJaggedTensor.empty()
 
@@ -50,6 +55,7 @@ EMPTY_KJT = KeyedJaggedTensor.empty()
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_mark_keyed_tensor)
 torch.fx.wrap(fx_mark_tensor)
+torch.fx.wrap(fx_mark_seq_len)
 
 
 @torch.fx.wrap
@@ -1477,7 +1483,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
                     if need_tile:
                         sequence_length = sequence_length.tile(tile_size)
-                    fx_mark_tensor(f"{group_name}__sequence_length", sequence_length)
+                    fx_mark_seq_len(f"{group_name}__sequence_length", sequence_length)
                     results[f"{group_name}.sequence_length"] = sequence_length
 
                 if int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1:

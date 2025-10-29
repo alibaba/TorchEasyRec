@@ -53,7 +53,12 @@ from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
-from tzrec.utils.fx_util import fx_mark_keyed_tensor, fx_mark_tensor, symbolic_trace
+from tzrec.utils.fx_util import (
+    fx_mark_keyed_tensor,
+    fx_mark_seq_len,
+    fx_mark_tensor,
+    symbolic_trace,
+)
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
@@ -402,6 +407,8 @@ def _adjust_fg_json_for_rtp(
             _adjust_one_feature_for_rtp(feature, embedding_info)
         else:
             sequence_name = feature["sequence_name"]
+            if "sequence_table" not in feature:
+                feature["sequence_table"] = "item"
             for sub_feature in feature["features"]:
                 feature_name = sub_feature["feature_name"]
                 embedding_info = feature_to_embedding_info.get(
@@ -514,9 +521,18 @@ def export_rtp_model(
                     "keys", args=(node_kt,)
                 )
         elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # sequence or query name
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence length
+            name = node.args[0]
+            t = node.args[1]
+            with graph.inserting_after(t):
+                # RTP do not support rank=1 tensor
+                unsqueeze_t = graph.call_function(torch.unsqueeze, args=(t, 1))
+                outputs[name] = unsqueeze_t
     graph.output(tuple([outputs, output_attrs]))
     gm = torch.fx.GraphModule(unwrap_model, graph)
     gm.graph.eliminate_dead_code()
@@ -586,30 +602,38 @@ def export_rtp_model(
                 mc_config[name] = new_node.kwargs["keys"]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # sequence or query name
             name = node.args[0]
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                if "keys" in node.kwargs:
-                    # sequence or query name
-                    keys = [
-                        seqname_mapping[k] if k in seqname_mapping else k
-                        for k in node.kwargs["keys"]
-                    ]
-                else:
-                    # sequence_length
-                    keys = [name]
-                    # add sequence_length into fg
-                    additional_fg.append(
-                        {
-                            "feature_name": name,
-                            "feature_type": "raw_feature",
-                            "expression": f"user:{name}",
-                        }
-                    )
+                keys = [
+                    seqname_mapping[k] if k in seqname_mapping else k
+                    for k in node.kwargs["keys"]
+                ]
                 mc_config[name] = keys
+            node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                # rtp do not support RANK=1 tensor
+                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
+                # add sequence_length into fg
+                additional_fg.append(
+                    {
+                        "feature_name": name,
+                        "feature_type": "raw_feature",
+                        "expression": f"user:{name}",
+                    }
+                )
+                mc_config[name] = [name]
             node_t.replace_all_uses_with(new_node)
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
