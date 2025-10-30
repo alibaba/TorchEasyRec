@@ -25,7 +25,7 @@ from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 from torchrec import KeyedTensor
-from torchrec.distributed.train_pipeline.tracing import Tracer, _get_leaf_module_names
+from torchrec.distributed.train_pipeline.utils import Tracer, _get_leaf_module_names
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.embedding_modules import (
@@ -36,6 +36,7 @@ from torchrec.modules.embedding_modules import (
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
 )
+from torchrec.sparse import jagged_tensor
 
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
@@ -442,6 +443,14 @@ def export_rtp_model(
     is_rank_zero = rank == 0
     train_config = pipeline_config.train_config
 
+    # RTP do not support fbgemm now. patch kt.regroup to slow path
+    def _all_keys_used_once(
+        keyed_tensors: List["KeyedTensor"], groups: List[List["str"]]
+    ) -> bool:
+        return False
+
+    jagged_tensor._all_keys_used_once = _all_keys_used_once
+
     feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
 
     graph_dir = os.path.join(save_dir, "graph")
@@ -464,6 +473,9 @@ def export_rtp_model(
     )
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+    if os.environ["RANK"] == "0":
+        breakpoint()
+        print(data)
 
     model.set_is_inference(True)
     model.eval()
