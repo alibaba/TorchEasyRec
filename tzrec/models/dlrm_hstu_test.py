@@ -79,9 +79,25 @@ class DlrmHSTUTest(unittest.TestCase):
             ),
             feature_pb2.FeatureConfig(
                 sequence_id_feature=feature_pb2.SequenceIdFeature(
+                    feature_name="video_id_cat",
+                    embedding_dim=16,
+                    embedding_name="video_id_cat_emb",
+                    num_buckets=1000,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.SequenceIdFeature(
                     feature_name="item_video_id",
                     embedding_dim=16,
                     embedding_name="video_id_emb",
+                    num_buckets=1000,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                    feature_name="item_video_id_cat",
+                    embedding_dim=16,
+                    embedding_name="video_id_cat_emb",
                     num_buckets=1000,
                 )
             ),
@@ -129,14 +145,13 @@ class DlrmHSTUTest(unittest.TestCase):
                 group_name="uih",
                 feature_names=[
                     "video_id",
+                    "video_id_cat",
                 ],
                 group_type=model_pb2.FeatureGroupType.SEQUENCE,
             ),
             model_pb2.FeatureGroupConfig(
                 group_name="candidate",
-                feature_names=[
-                    "item_video_id",
-                ],
+                feature_names=["item_video_id", "item_video_id_cat"],
                 group_type=model_pb2.FeatureGroupType.SEQUENCE,
             ),
         ]
@@ -262,9 +277,13 @@ class DlrmHSTUTest(unittest.TestCase):
                 "item_action_weight",
                 "action_timestamp",
                 "item_query_time",
+                "video_id_cat",
+                "item_video_id_cat",
             ],
-            values=torch.tensor(list(range(37))),
-            lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4, 2, 3, 2, 4]),
+            values=torch.tensor(list(range(48))),
+            lengths=torch.tensor(
+                [1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4, 2, 3, 2, 4, 2, 3, 2, 4]
+            ),
         )
         sequence_dense_features = {
             "watch_time": JaggedTensor(
