@@ -884,7 +884,7 @@ class RankIntegrationTest(unittest.TestCase):
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
-    @unittest.skipIf(gpu_unavailable)
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_rtp_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_rtp_mock.config",
