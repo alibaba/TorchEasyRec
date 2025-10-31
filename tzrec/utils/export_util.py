@@ -387,6 +387,11 @@ def _adjust_one_feature_for_rtp(
         feature["gen_key_type"] = "boundary"
     elif "hash_bucket_size" in feature:
         feature["gen_key_type"] = "hash"
+    elif "num_buckets" in feature:
+        # in RTP, hash_bucket_size and gen_key_type=idle equal to num_buckets
+        feature["gen_key_type"] = "idle"
+        feature["hash_bucket_size"] = feature["num_buckets"]
+        feature.pop("num_buckets")
     else:
         for k in RTP_INVALID_BUCKET_KEYS:
             if k in feature:
@@ -473,9 +478,6 @@ def export_rtp_model(
     )
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
-    if os.environ["RANK"] == "0":
-        breakpoint()
-        print(data)
 
     model.set_is_inference(True)
     model.eval()
