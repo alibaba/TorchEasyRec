@@ -14,7 +14,6 @@ import itertools
 import json
 import os
 from collections import OrderedDict
-from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
@@ -74,32 +73,12 @@ from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     create_train_pipeline,
+    init_process_group,
 )
 from tzrec.utils.export_util import export_model
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
-
-
-def init_process_group() -> Tuple[torch.device, str]:
-    """Init process_group, device, rank, backend."""
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        device: torch.device = torch.device(f"cuda:{rank}")
-        backend = "nccl"
-        torch.cuda.set_device(device)
-    else:
-        device: torch.device = torch.device("cpu")
-        backend = "gloo"
-
-    pg_timeout = None
-    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
-        pg_timeout = timedelta(
-            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
-        )
-    dist.init_process_group(backend=backend, timeout=pg_timeout)
-
-    return device, backend
 
 
 def _create_features(

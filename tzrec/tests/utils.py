@@ -1026,6 +1026,7 @@ def test_train_eval(
     item_id: str = "",
     cate_id: str = "",
     is_hstu: bool = False,
+    env_str: str = "",
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
@@ -1041,13 +1042,18 @@ def test_train_eval(
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
-
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
     )
 
 
-def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
+def test_eval(
+    pipeline_config_path: str,
+    test_dir: str,
+    env_str: str = "",
+) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
@@ -1056,7 +1062,8 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
-
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_eval.txt"), timeout=600
     )

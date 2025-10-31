@@ -13,6 +13,7 @@ pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-0.7.4-cp312-cp
 pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-0.7.4-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
 pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-0.7.4-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 pyodps>=0.12.4
+safetensors
 scikit-learn
 tensorboard
 torch==2.8.0

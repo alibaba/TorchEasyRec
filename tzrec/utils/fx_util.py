@@ -12,6 +12,7 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+from torchrec import KeyedTensor
 from torchrec.fx import symbolic_trace as _symbolic_trace
 
 
@@ -77,3 +78,31 @@ def fx_numel(x: torch.Tensor) -> int:
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         torch._check_is_size(total_len)
     return total_len
+
+
+@torch.fx.wrap
+def fx_mark_keyed_tensor(name: str, x: KeyedTensor) -> None:
+    """Mark a KeyedTensor in fx.graph.
+
+    Used in EmbeddingGroup for split sparse part model when export.
+    KeyedTensor.values() will be sparse part output and dense part input.
+    """
+    return
+
+
+@torch.fx.wrap
+def fx_mark_tensor(
+    name: str, x: torch.Tensor, keys: Optional[List[str]] = None
+) -> None:
+    """Mark a Tensor in fx.graph.
+
+    Used in EmbeddingGroup for split sparse part model when export.
+    Tensor will be sparse part output and dense part input.
+    """
+    return
+
+
+@torch.fx.wrap
+def fx_mark_seq_len(name: str, x: torch.Tensor) -> None:
+    """Mark a sequence length Tensor in fx.graph."""
+    return
