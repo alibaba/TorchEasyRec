@@ -435,7 +435,7 @@ def export_rtp_model(
         from torch_fx_tool import ExportTorchFxTool
     except Exception as e:
         raise RuntimeError(
-            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251023.aba1d83-py3-none-any.whl"
+            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251031.376cedb-py3-none-any.whl"
         ) from e
     assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
         "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
