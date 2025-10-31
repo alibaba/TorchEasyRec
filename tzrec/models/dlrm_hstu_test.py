@@ -311,12 +311,10 @@ class DlrmHSTUTest(unittest.TestCase):
             dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
             predictions = dlrm_hstu(batch)
         else:
-            dlrm_hstu = TrainWrapper(dlrm_hstu)
-            total_loss, (losses, predictions, batch) = dlrm_hstu(batch)
-            print(total_loss, losses)
+            dlrm_hstu = TrainWrapper(dlrm_hstu, device=device).to(device)
+            _, (_, predictions, batch) = dlrm_hstu(batch)
             dlrm_hstu.model.update_metric(predictions, batch)
-            metric_result = dlrm_hstu.model.compute_metric()
-            print(metric_result)
+            _ = dlrm_hstu.model.compute_metric()
 
         self.assertEqual(predictions["logits_is_click"].size(), (6,))
         self.assertEqual(predictions["probs_is_click"].size(), (6,))

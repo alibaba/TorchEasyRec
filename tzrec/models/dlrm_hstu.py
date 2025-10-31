@@ -410,8 +410,8 @@ class DlrmHSTU(RankModel):
             label = batch.sparse_features[BASE_DATA_GROUP][label_name]
             label_values = label.values()
         else:
-            label = batch.sequence_dense_features[label_name].values()
-            label_values = label.values()
+            label = batch.sequence_dense_features[label_name]
+            label_values = label.values().squeeze(1)
         if task_cfg.HasField("task_bitmask"):
             label_values = (
                 torch.bitwise_and(label_values, task_cfg.task_bitmask) > 0
