@@ -19,7 +19,11 @@ from torchrec import JaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.rank_model import RankModel, _is_classification_loss
+from tzrec.models.rank_model import (
+    TRAGET_REPEAT_INTERLEAVE_KEY,
+    RankModel,
+    _is_classification_loss,
+)
 from tzrec.modules.embedding import SequenceEmbeddingGroup
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
 from tzrec.modules.norm import LayerNorm, SwishLayerNorm
@@ -407,18 +411,22 @@ class DlrmHSTU(RankModel):
                 num_candidates=num_candidates,
             )
 
-    def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
+    def _get_label(
+        self, batch: Batch, task_cfg: FusionSubTaskConfig
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         label_name = task_cfg.label_name
         is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
         if is_sparse_label:
-            label = batch.sparse_features[BASE_DATA_GROUP][label_name].values()
+            label = batch.sparse_features[BASE_DATA_GROUP][label_name]
+            label_values = label.values()
         else:
-            label = batch.dense_features[BASE_DATA_GROUP][label_name]
+            label = batch.sequence_dense_features[label_name]
+            label_values = label.values().squeeze(1)
         if task_cfg.HasField("task_bitmask"):
-            label = (torch.bitwise_and(label, task_cfg.task_bitmask) > 0).to(
-                label.dtype
-            )
-        return label
+            label_values = (
+                torch.bitwise_and(label_values, task_cfg.task_bitmask) > 0
+            ).to(label_values.dtype)
+        return label_values, label.lengths()
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
@@ -434,7 +442,8 @@ class DlrmHSTU(RankModel):
         losses = {}
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label = self._get_label(batch, task_cfg)
+            label, label_lengths = self._get_label(batch, task_cfg)
+            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
 
             for loss_cfg in task_cfg.losses:
                 losses.update(
@@ -477,7 +486,8 @@ class DlrmHSTU(RankModel):
         """
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label = self._get_label(batch, task_cfg)
+            label, label_lengths = self._get_label(batch, task_cfg)
+            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
 
             for metric_cfg in task_cfg.metrics:
                 self._update_metric_impl(

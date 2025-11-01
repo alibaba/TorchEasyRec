@@ -22,10 +22,12 @@ from torchrec import JaggedTensor, KeyedJaggedTensor
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.dlrm_hstu import DlrmHSTU
+from tzrec.models.model import TrainWrapper
 from tzrec.ops import Kernel
 from tzrec.protos import (
     feature_pb2,
     loss_pb2,
+    metric_pb2,
     model_pb2,
     module_pb2,
     tower_pb2,
@@ -151,6 +153,7 @@ class DlrmHSTUTest(unittest.TestCase):
                         binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
                     )
                 ],
+                metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
             ),
             tower_pb2.FusionSubTaskConfig(
                 task_name="is_like",
@@ -159,6 +162,11 @@ class DlrmHSTUTest(unittest.TestCase):
                 losses=[
                     loss_pb2.LossConfig(
                         binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+                metrics=[
+                    metric_pb2.MetricConfig(
+                        grouped_auc=metric_pb2.GroupedAUC(grouping_key="user_id")
                     )
                 ],
             ),
@@ -171,6 +179,7 @@ class DlrmHSTUTest(unittest.TestCase):
                         binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
                     )
                 ],
+                metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
             ),
         ]
         labels = ["item_action_weight"]
@@ -180,6 +189,11 @@ class DlrmHSTUTest(unittest.TestCase):
                     task_name="watchtime",
                     label_name="item_target_watchtime",
                     losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
+                    metrics=[
+                        metric_pb2.MetricConfig(
+                            mean_absolute_error=metric_pb2.MeanAbsoluteError()
+                        )
+                    ],
                 )
             )
             labels.append("item_target_watchtime")
@@ -293,9 +307,15 @@ class DlrmHSTUTest(unittest.TestCase):
             dlrm_hstu.set_is_inference(True)
             dlrm_hstu = create_test_model(dlrm_hstu, graph_type, data, self.test_dir)
             predictions = dlrm_hstu(data)
-        else:
+        elif graph_type == TestGraphType.FX_TRACE:
             dlrm_hstu = create_test_model(dlrm_hstu, graph_type)
             predictions = dlrm_hstu(batch)
+        else:
+            dlrm_hstu = TrainWrapper(dlrm_hstu, device=device).to(device)
+            _, (_, predictions, batch) = dlrm_hstu(batch)
+            dlrm_hstu.model.update_metric(predictions, batch)
+            _ = dlrm_hstu.model.compute_metric()
+
         self.assertEqual(predictions["logits_is_click"].size(), (6,))
         self.assertEqual(predictions["probs_is_click"].size(), (6,))
         self.assertEqual(predictions["logits_is_like"].size(), (6,))

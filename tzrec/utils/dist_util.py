@@ -10,8 +10,9 @@
 # limitations under the License.
 
 import os
+from datetime import timedelta
 from queue import Queue
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import distributed as dist
@@ -45,6 +46,27 @@ from torchrec.distributed.types import (
     ShardingPlan,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+
+def init_process_group() -> Tuple[torch.device, str]:
+    """Init process_group, device, rank, backend."""
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        device: torch.device = torch.device(f"cuda:{rank}")
+        backend = "nccl"
+        torch.cuda.set_device(device)
+    else:
+        device: torch.device = torch.device("cpu")
+        backend = "gloo"
+
+    pg_timeout = None
+    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+        pg_timeout = timedelta(
+            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
+        )
+    dist.init_process_group(backend=backend, timeout=pg_timeout)
+
+    return device, backend
 
 
 def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.ProcessGroup]:

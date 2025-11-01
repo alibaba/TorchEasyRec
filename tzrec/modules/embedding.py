@@ -42,12 +42,20 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
-from tzrec.utils.fx_util import fx_int_item
+from tzrec.utils.fx_util import (
+    fx_int_item,
+    fx_mark_keyed_tensor,
+    fx_mark_seq_len,
+    fx_mark_tensor,
+)
 
 EMPTY_KJT = KeyedJaggedTensor.empty()
 
 
 torch.fx.wrap(fx_int_item)
+torch.fx.wrap(fx_mark_keyed_tensor)
+torch.fx.wrap(fx_mark_tensor)
+torch.fx.wrap(fx_mark_seq_len)
 
 
 @torch.fx.wrap
@@ -722,6 +730,7 @@ class EmbeddingGroupImpl(nn.Module):
                 self._group_to_shared_feature_names[group_name] = shared_feature_names
             self._group_total_dim[group_name] = total_dim
             self._group_feature_output_dims[group_name] = feature_output_dims
+        self._all_group_str = "__".join(self._group_to_feature_names.keys())
 
         self.ebc = EmbeddingBagCollection(list(emb_bag_configs.values()), device=device)
         if self.has_mc_sparse:
@@ -798,34 +807,41 @@ class EmbeddingGroupImpl(nn.Module):
         """
         kts: List[KeyedTensor] = []
         if self.has_sparse:
-            kts.append(self.ebc(sparse_feature))
+            kt = self.ebc(sparse_feature)
+            fx_mark_keyed_tensor(self._all_group_str + "__ebc", kt)
+            kts.append(kt)
 
         if self.has_mc_sparse:
-            kts.append(self.mc_ebc(sparse_feature)[0])
+            kt = self.mc_ebc(sparse_feature)[0]
+            fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc", kt)
+            kts.append(kt)
 
         # do user-side embedding input-tile
         if self.has_sparse_user:
             keyed_tensor_user = self.ebc_user(sparse_feature_user)
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
-            keyed_tensor_user_tile = KeyedTensor(
+            kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            kts.append(keyed_tensor_user_tile)
+            fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", kt)
+            kts.append(kt)
 
         # do user-side mc embedding input-tile
         if self.has_mc_sparse_user:
             keyed_tensor_user = self.mc_ebc_user(sparse_feature_user)[0]
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
-            keyed_tensor_user_tile = KeyedTensor(
+            kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            kts.append(keyed_tensor_user_tile)
+            fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc_user", kt)
+            kts.append(kt)
 
         if self.has_dense:
+            fx_mark_keyed_tensor(self._all_group_str + "__dense", dense_feature)
             if self.has_dense_embedding:
                 kts.append(self.dense_ec(dense_feature))
             else:
@@ -1416,6 +1432,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sparse_query_cache: Dict[str, torch.Tensor] = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
+            query_t_keys = []
             for info in v:
                 if info.name in sparse_query_cache:
                     query_t = sparse_query_cache[info.name]
@@ -1437,11 +1454,15 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 else:
                     query_t = dense_t_dict[info.name]
                 query_t_list.append(query_t)
+                query_t_keys.append(info.name)
             if len(query_t_list) > 0:
-                results[f"{group_name}.query"] = torch.cat(query_t_list, dim=1)
+                query_cat_t = torch.cat(query_t_list, dim=1)
+                fx_mark_tensor(f"{group_name}__query", query_cat_t, keys=query_t_keys)
+                results[f"{group_name}.query"] = query_cat_t
 
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
+            seq_t_keys = []
 
             group_sequence_length = 1
             for i, info in enumerate(v):
@@ -1461,11 +1482,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     group_sequence_length = fx_int_item(torch.max(sequence_length))
 
                     if need_tile:
-                        results[f"{group_name}.sequence_length"] = sequence_length.tile(
-                            tile_size
-                        )
-                    else:
-                        results[f"{group_name}.sequence_length"] = sequence_length
+                        sequence_length = sequence_length.tile(tile_size)
+                    fx_mark_seq_len(f"{group_name}__sequence_length", sequence_length)
+                    results[f"{group_name}.sequence_length"] = sequence_length
 
                 if int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1:
                     seq_t = jt.values()
@@ -1475,9 +1494,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 if need_tile:
                     seq_t = seq_t.tile(tile_size, 1, 1)
                 seq_t_list.append(seq_t)
+                seq_t_keys.append(info.name)
 
             if seq_t_list:
-                results[f"{group_name}.sequence"] = torch.cat(seq_t_list, dim=2)
+                seq_cat_t = torch.cat(seq_t_list, dim=2)
+                fx_mark_tensor(f"{group_name}__sequence", seq_cat_t, keys=seq_t_keys)
+                results[f"{group_name}.sequence"] = seq_cat_t
 
         return results
 
