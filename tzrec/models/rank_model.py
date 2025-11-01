@@ -31,6 +31,9 @@ from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig
 from tzrec.utils.config_util import config_to_kwargs
 
+# repeat interleave session_id or grouping key for one-to-many rank sample
+TRAGET_REPEAT_INTERLEAVE_KEY = "__TRAGET_REPEAT_INTERLEAVE_KEY__"
+
 
 @torch.fx.wrap
 def _update_tensor_dict(
@@ -239,7 +242,11 @@ class RankModel(BaseModel):
             pred = predictions["logits" + suffix]
             session_id = batch.sparse_features[BASE_DATA_GROUP][
                 loss_cfg.jrc_loss.session_name
-            ].values()
+            ].to_padded_dense(1)[:, 0]
+            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                session_id = session_id.repeat_interleave(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
             losses[loss_name] = self._loss_modules[loss_name](pred, label, session_id)
         elif loss_type == "l2_loss":
             pred = predictions["y" + suffix]
@@ -370,6 +377,10 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
+            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                grouping_key = grouping_key.repeat_interleave(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         elif metric_type == "xauc":
             pred = predictions["y" + suffix]
@@ -379,6 +390,10 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
+            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                grouping_key = grouping_key.repeat_interleave(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
