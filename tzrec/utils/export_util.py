@@ -388,8 +388,8 @@ def _adjust_one_feature_for_rtp(
     elif "hash_bucket_size" in feature:
         feature["gen_key_type"] = "hash"
     elif "num_buckets" in feature:
-        # in RTP, hash_bucket_size and gen_key_type=idle equal to num_buckets
-        feature["gen_key_type"] = "idle"
+        # in RTP, hash_bucket_size and gen_key_type=mod equal to num_buckets
+        feature["gen_key_type"] = "mod"
         feature["hash_bucket_size"] = feature["num_buckets"]
         feature.pop("num_buckets")
     else:
