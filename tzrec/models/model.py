@@ -66,6 +66,9 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         if sample_weights:
             self._sample_weights = sample_weights
 
+        self._train_metrics = nn.ParameterDict()
+        self._train_metrics_step_decay_rate = nn.ParameterDict()
+
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
 

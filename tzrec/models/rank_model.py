@@ -323,6 +323,9 @@ class RankModel(BaseModel):
             )
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
+        self._train_metrics_step_decay_rate[metric_name] = nn.Parameter(
+            torch.tensor(metric_cfg.step_decay_rate), requires_grad=False
+        )
 
     def init_metric(self) -> None:
         """Initialize metric modules."""
@@ -424,3 +427,34 @@ class RankModel(BaseModel):
                 self._update_loss_metric_impl(
                     losses, batch, batch.labels[self._label_name], loss_cfg
                 )
+
+    def train_update_and_compute_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> Dict[str, torch.Tensor]:
+        """Update and compute metric when in training mode.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        self.update_metric(predictions, batch)
+        step_metric_results = self.compute_metric()
+        for metric_name, metric_value in step_metric_results.items():
+            if torch.isnan(metric_value):
+                continue
+            decay_rate = self._train_metrics_step_decay_rate[metric_name]
+            if metric_name in self._train_metrics.keys():
+                old_metric_value = self._train_metrics.get(metric_name)
+                new_metric_value = (
+                    decay_rate * old_metric_value + (1 - decay_rate) * metric_value
+                )
+            else:
+                new_metric_value = nn.Parameter(metric_value, requires_grad=False)
+
+            self._train_metrics[metric_name] = new_metric_value
+        metric_results = {}
+        for k, v in self._train_metrics.items():
+            metric_results[k] = v.data
+        return metric_results

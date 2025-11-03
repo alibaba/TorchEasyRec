@@ -57,4 +57,5 @@ message MetricConfig {
         XAUC xauc = 8;
         GroupedXAUC grouped_xauc = 9;
     }
+    optional float step_decay_rate = 100 [default=0.90];
 }
