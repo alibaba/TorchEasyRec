@@ -442,18 +442,17 @@ class RankModel(BaseModel):
         self.update_metric(predictions, batch)
         step_metric_results = self.compute_metric()
         for metric_name, metric_value in step_metric_results.items():
-            if torch.isnan(metric_value):
-                continue
-            decay_rate = self._train_metrics_step_decay_rate[metric_name]
-            if metric_name in self._train_metrics.keys():
-                old_metric_value = self._train_metrics.get(metric_name)
-                new_metric_value = (
-                    decay_rate * old_metric_value + (1 - decay_rate) * metric_value
-                )
-            else:
-                new_metric_value = nn.Parameter(metric_value, requires_grad=False)
+            if metric_name in self._train_metrics_step_decay_rate.keys():
+                decay_rate = self._train_metrics_step_decay_rate[metric_name]
+                if metric_name in self._train_metrics.keys():
+                    old_metric_value = self._train_metrics.get(metric_name)
+                    new_metric_value = (
+                        decay_rate * old_metric_value + (1 - decay_rate) * metric_value
+                    )
+                else:
+                    new_metric_value = nn.Parameter(metric_value, requires_grad=False)
 
-            self._train_metrics[metric_name] = new_metric_value
+                self._train_metrics[metric_name] = new_metric_value
         metric_results = {}
         for k, v in self._train_metrics.items():
             metric_results[k] = v.data
