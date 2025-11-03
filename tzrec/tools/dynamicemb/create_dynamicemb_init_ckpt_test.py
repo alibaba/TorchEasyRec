@@ -90,7 +90,7 @@ class CreateDynamicEmbInitCkptTest(unittest.TestCase):
                 user_id="user_id",
                 item_id="item_id",
             )
-        # self.assertTrue(self.success)
+        self.assertTrue(self.success)
 
 
 if __name__ == "__main__":
