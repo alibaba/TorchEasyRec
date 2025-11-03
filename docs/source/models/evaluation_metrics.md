@@ -101,7 +101,7 @@ pai -name=evaluate -project=algo_public
 
 ## XAUC
 
-**分组 XAUC** 是 GroupedAUC 的变体，用于评估在连续值目标的分组维度下的排序能力
+**XAUC** 是 GroupedAUC 的变体，用于评估在连续值目标的分组维度下的排序能力
 
 | 字段名         | 类型   | 是否可选 | 描述 |
 |----------------|--------|----------|------|
@@ -115,7 +115,7 @@ pai -name=evaluate -project=algo_public
 
 ## GroupedXAUC
 
-**交叉分组 AUC（Grouped XAUC）** 是 GroupedAUC 的变体，用于评估在连续值目标的分组维度下的排序能力。
+**GroupedXAUC** 是 GroupedAUC 的变体，用于评估在连续值目标的分组维度下的排序能力。
 
 | 字段名                  | 类型   | 是否可选 | 描述 |
 |-------------------------|--------|----------|------|
