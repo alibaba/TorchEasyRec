@@ -30,6 +30,7 @@ Welcome to TorchEasyRec's documentation!
    models/feature_group
    models/loss
    models/optimizer
+   models/evaluation_metrics
 
 .. toctree::
    :maxdepth: 2
