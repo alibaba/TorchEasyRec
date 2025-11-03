@@ -83,7 +83,7 @@ class CreateDynamicEmbInitCkptTest(unittest.TestCase):
             timeout=600,
         )
         if self.success:
-            self.success = utils.test_train_eval(
+            utils.test_train_eval(
                 new_config_path,
                 self.test_dir,
                 f"--fine_tune_checkpoint {os.path.join(save_dir, 'model.ckpt-0')}",
