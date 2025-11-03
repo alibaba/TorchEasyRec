@@ -29,6 +29,8 @@ CROSS_NEG_DATA_GROUP = "__CNEG__"
 C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
+HARD_NEG_INDICES = "hard_neg_indices"
+
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
     FieldType.INT64: pa.int64(),
@@ -141,6 +143,8 @@ class Batch(Pipelineable):
     # sample_weight
     sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
 
+    additional_infos: Dict[str, torch.Tensor] = field(default_factory=dict)
+
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
         return Batch(
@@ -170,21 +174,31 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.sample_weights.items()
             },
+            additional_infos={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.additional_infos.items()
+            },
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
         """Record which streams have used the tensor."""
         for v in self.dense_features.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sparse_features.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sequence_mulval_lengths.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sequence_dense_features.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.labels.values():
             v.record_stream(stream)
         for v in self.sample_weights.values():
+            v.record_stream(stream)
+        for v in self.additional_infos.values():
             v.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
@@ -222,6 +236,9 @@ class Batch(Pipelineable):
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
+            additional_infos={
+                k: v.pin_memory() for k, v in self.additional_infos.items()
+            },
         )
 
     def to_dict(
@@ -264,6 +281,10 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}"] = v
         if self.tile_size > 0:
             tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
+
+        for k, v in self.additional_infos.items():
+            tensor_dict[f"{k}"] = v
+
         return tensor_dict
 
 

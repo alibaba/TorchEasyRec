@@ -97,6 +97,8 @@ class MatchFeature(BaseFeature):
         """Get embedding row count."""
         if self.config.HasField("zch"):
             num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("dynamicemb"):
+            num_embeddings = self.config.dynamicemb.max_capacity
         elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
@@ -196,7 +198,7 @@ class MatchFeature(BaseFeature):
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("normalizer"):
             fg_cfg["normalizer"] = self.config.normalizer
-        if self.config.HasField("zch"):
+        if self.config.HasField("zch") or self.config.HasField("dynamicemb"):
             fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
             fg_cfg["value_type"] = "string"
             fg_cfg["needDiscrete"] = True
@@ -231,6 +233,8 @@ class MatchFeature(BaseFeature):
             fg_cfg["value_dim"] = self.value_dim
         if self.config.HasField("fg_value_type"):
             fg_cfg["value_type"] = self.config.fg_value_type
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         #     del fg_cfg["combiner"]
         return [fg_cfg]
 

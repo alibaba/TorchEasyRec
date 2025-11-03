@@ -33,6 +33,7 @@ class OdpsDatasetTest(unittest.TestCase):
     def setUp(self):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
+        self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -127,18 +128,15 @@ class OdpsDatasetTest(unittest.TestCase):
             )
         return feature_cfgs
 
-    @parameterized.expand([[False], [True]])
-    @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
-        "odps config not found",
-    )
-    def test_odps_dataset(self, is_orderby_partition):
+    def _test_odps_dataset(self, is_orderby_partition=False, schema=None):
         account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        tb_prefix = ""
+        if schema is not None:
+            project = self.test_schema_project
+            tb_prefix = f"{schema}."
         self.o = ODPS(
-            account=account,
-            project=self.test_project,
-            endpoint=odps_endpoint,
+            account=account, project=project, endpoint=odps_endpoint, schema=schema
         )
         feature_cfgs = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
@@ -153,7 +151,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 odps_data_quota_name="",
             ),
             features=features,
-            input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{project}/tables/{tb_prefix}test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         self.assertEqual(len(dataset.input_fields), 9)
         self.assertEqual(
@@ -189,18 +187,35 @@ class OdpsDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
-    @parameterized.expand([["bigint"], ["string"]])
+    @parameterized.expand([[False], [True]])
     @unittest.skipIf(
         "ODPS_CONFIG_FILE_PATH" not in os.environ
         and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
         "odps config not found",
     )
-    def test_odps_dataset_with_sampler(self, id_type):
+    def test_odps_dataset(self, is_orderby_partition=False):
+        self._test_odps_dataset(is_orderby_partition=is_orderby_partition)
+
+    @unittest.skipIf(
+        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        or (
+            "ODPS_CONFIG_FILE_PATH" not in os.environ
+            and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ
+        ),
+        "schema odps project not found",
+    )
+    def test_odps_dataset_has_schema(self):
+        self._test_odps_dataset(is_orderby_partition=False, schema="rec")
+
+    def _test_odps_dataset_with_sampler(self, id_type="bigint", schema=None):
         account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        tb_prefix = ""
+        if schema is not None:
+            project = self.test_schema_project
+            tb_prefix = f"{schema}."
         self.o = ODPS(
-            account=account,
-            project=self.test_project,
-            endpoint=odps_endpoint,
+            account=account, project=project, endpoint=odps_endpoint, schema=schema
         )
         if id_type == "string":
             os.environ["USE_HASH_NODE_ID"] = "1"
@@ -232,14 +247,14 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 odps_data_quota_name="",
                 negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f"odps://{self.test_project}/tables/test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
+                    input_path=f"odps://{project}/tables/{tb_prefix}test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
                     attr_fields=["id_a", "raw_c", "raw_d"],
                     item_id_field="id_a",
                 ),
             ),
             features=features,
-            input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
+            input_path=f"odps://{project}/tables/{tb_prefix}test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -272,11 +287,32 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["raw_c.values"]), 8296)
             self.assertEqual(len(data_dict["raw_e.values"]), 8196)
 
+    @parameterized.expand([["bigint"], ["string"], ["int"]])
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
+    def test_odps_dataset_with_sampler(self, id_type="bigint"):
+        self._test_odps_dataset_with_sampler(id_type=id_type)
+
+    @unittest.skipIf(
+        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        or (
+            "ODPS_CONFIG_FILE_PATH" not in os.environ
+            and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ
+        ),
+        "schema odps project not found",
+    )
+    def test_odps_dataset_with_sampler_has_schema(self):
+        self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
+
 
 class OdpsWriterTest(unittest.TestCase):
     def setUp(self):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
+        self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -291,7 +327,7 @@ class OdpsWriterTest(unittest.TestCase):
         self.o = None
 
     @parameterized.expand(
-        [[""], ["/dt=20240401"]],
+        [["", 2, 2], ["/dt=20240401", 2, 2], ["/dt=20240401", 2, 1]],
         name_func=test_util.parameterized_name_func,
     )
     @unittest.skipIf(
@@ -299,7 +335,7 @@ class OdpsWriterTest(unittest.TestCase):
         and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
         "odps config not found",
     )
-    def test_odps_writer(self, partition_spec):
+    def test_odps_writer(self, partition_spec, default_world_size, writer_world_size):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
             account=account,
@@ -307,9 +343,9 @@ class OdpsWriterTest(unittest.TestCase):
             endpoint=odps_endpoint,
         )
 
-        def _writer_worker(rank, world_size, port):
+        def _writer_worker(rank, port):
             os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
+            os.environ["WORLD_SIZE"] = str(default_world_size)
             os.environ["MASTER_ADDR"] = "127.0.0.1"
             os.environ["MASTER_PORT"] = str(port)
             dist.init_process_group(backend="gloo")
@@ -317,6 +353,7 @@ class OdpsWriterTest(unittest.TestCase):
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
                 quota_name="",
+                world_size=writer_world_size,
             )
             for _ in range(5):
                 writer.write(
@@ -327,13 +364,82 @@ class OdpsWriterTest(unittest.TestCase):
                 )
             writer.close()
 
-        world_size = 2
+        writer_world_size = 2
         port = get_free_port()
         procs = []
-        for rank in range(world_size):
+        for rank in range(writer_world_size):
             p = mp.Process(
                 target=_writer_worker,
-                args=(rank, world_size, port),
+                args=(rank, port),
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"writer worker-{i} failed.")
+
+        t = self.o.get_table(f"test_odps_dataset_{self.test_suffix}")
+        if partition_spec:
+            partition = ",".join(partition_spec.strip("/").split("/"))
+        else:
+            partition = None
+        with t.open_reader(partition=partition) as reader:
+            self.assertEqual(reader.count, 1280)
+
+    @unittest.skipIf(
+        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        or "ODPS_CONFIG_FILE_PATH" not in os.environ,
+        "schema odps project not found",
+    )
+    def test_odps_writer_has_schema(self):
+        partition_spec = "/dt=20240401"
+        default_world_size = 2
+        writer_world_size = 2
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account,
+            project=self.test_schema_project,
+            endpoint=odps_endpoint,
+        )
+        schema = "rec"
+        if not self.o.exist_schema(schema):
+            self.o.create_schema(schema)
+        self.o = ODPS(
+            account=account,
+            project=self.test_schema_project,
+            endpoint=odps_endpoint,
+            schema=schema,
+        )
+
+        def _writer_worker(rank, port):
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(default_world_size)
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(port)
+            dist.init_process_group(backend="gloo")
+            time.sleep(rank)  # prevent get credential failed
+            writer = OdpsWriter(
+                f"odps://{self.test_schema_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}{partition_spec}",
+                quota_name="",
+                world_size=writer_world_size,
+            )
+            for _ in range(5):
+                writer.write(
+                    {
+                        "int_a": pa.array(np.random.randint(0, 100, 128)),
+                        "float_b": pa.array(np.random.random(128)),
+                    }
+                )
+            writer.close()
+
+        writer_world_size = 2
+        port = get_free_port()
+        procs = []
+        for rank in range(writer_world_size):
+            p = mp.Process(
+                target=_writer_worker,
+                args=(rank, port),
             )
             p.start()
             procs.append(p)

@@ -15,6 +15,7 @@ Welcome to TorchEasyRec's documentation!
    feature/data
    feature/feature
    feature/zch
+   feature/dynamicemb
    feature/autodis
 
 .. toctree::
@@ -24,9 +25,11 @@ Welcome to TorchEasyRec's documentation!
    models/recall
    models/rank
    models/multi_target
+   models/generative
    models/user_define
    models/feature_group
    models/loss
+   models/optimizer
 
 .. toctree::
    :maxdepth: 2

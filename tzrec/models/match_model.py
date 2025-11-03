@@ -45,6 +45,67 @@ def _update_tensor_2_dict(
     tensor_dict[key] = new_tensor
 
 
+@torch.fx.wrap
+def _sim_with_sampler(
+    user_emb: torch.Tensor,
+    item_emb: torch.Tensor,
+    hard_neg_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    batch_size = user_emb.size(0)
+
+    if hard_neg_indices is None:
+        pos_item_emb = item_emb[:batch_size]
+        neg_item_emb = item_emb[batch_size:]
+        pos_ui_sim = torch.sum(
+            torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+        )
+        neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+        return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
+    else:
+        n_hard = hard_neg_indices.size(0)
+
+        # compute simple sample similarities
+        simple_item_emb = item_emb[0:-n_hard]
+        pos_item_emb = simple_item_emb[:batch_size]
+        neg_item_emb = simple_item_emb[batch_size:]
+        pos_ui_sim = torch.sum(
+            torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
+        )
+        neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
+
+        # compute hard sample similarities
+        hard_item_emb = item_emb[-n_hard:]  # [n_hard, d]
+        hard_user_emb = torch.index_select(
+            user_emb,
+            0,
+            hard_neg_indices[:, 0],
+        )  # [n_hard, d]
+        hard_neg_ui_sim = torch.sum(
+            torch.multiply(hard_user_emb, hard_item_emb), dim=-1, keepdim=True
+        )  # [n_hard, 1]
+
+        sparse_shape = [batch_size, int(torch.max(hard_neg_indices[:, 1]).item()) + 1]
+        hard_neg_ui_sim = torch.sparse_coo_tensor(
+            hard_neg_indices.T,
+            hard_neg_ui_sim.ravel(),
+            sparse_shape,
+            device=hard_neg_indices.device,
+        ).to_dense()
+
+        hard_neg_mask = torch.ones(
+            hard_neg_indices.size(0), device=hard_neg_indices.device
+        )
+        hard_neg_mask = torch.sparse_coo_tensor(
+            hard_neg_indices.T,
+            hard_neg_mask,
+            sparse_shape,
+            device=hard_neg_indices.device,
+        ).to_dense()
+
+        hard_neg_ui_sim = hard_neg_ui_sim - (1 - hard_neg_mask) * 1e32
+        return torch.cat([pos_ui_sim, neg_ui_sim, hard_neg_ui_sim], dim=-1)
+
+
 class MatchTower(BaseModule):
     """Base match tower.
 
@@ -186,20 +247,19 @@ class MatchModel(BaseModel):
         self._loss_collection = {}
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):
             self._in_batch_negative = self._model_config.in_batch_negative
+        self.sampler_type = kwargs.get("sampler_type", "negative_sampler")
 
-    def sim(self, user_emb: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
+    def sim(
+        self,
+        user_emb: torch.Tensor,
+        item_emb: torch.Tensor,
+        hard_neg_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Calculate user and item embedding similarity."""
         if self._in_batch_negative:
             return torch.mm(user_emb, item_emb.T)
         else:
-            batch_size = user_emb.size(0)
-            pos_item_emb = item_emb[:batch_size]
-            neg_item_emb = item_emb[batch_size:]
-            pos_ui_sim = torch.sum(
-                torch.multiply(user_emb, pos_item_emb), dim=-1, keepdim=True
-            )
-            neg_ui_sim = torch.matmul(user_emb, neg_item_emb.transpose(0, 1))
-            return torch.cat([pos_ui_sim, neg_ui_sim], dim=-1)
+            return _sim_with_sampler(user_emb, item_emb, hard_neg_indices)
 
     def _init_loss_impl(self, loss_cfg: LossConfig, suffix: str = "") -> None:
         loss_type = loss_cfg.WhichOneof("loss")

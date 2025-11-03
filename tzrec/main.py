@@ -13,50 +13,41 @@ import copy
 import itertools
 import json
 import os
-import shutil
 from collections import OrderedDict
 from queue import Queue
 from threading import Thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-
-# NOQA
-from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
-from torchrec.inference.modules import quantize_embeddings
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
-from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
-from tzrec.acc.aot_utils import export_model_aot
-from tzrec.acc.trt_utils import export_model_trt, get_trt_max_batch_size
-from tzrec.acc.utils import (
-    export_acc_config,
-    is_aot,
-    is_cuda_export,
-    is_input_tile_emb,
-    is_quant,
-    is_trt,
-    is_trt_predict,
-    quant_dtype,
-    write_mapping_file_for_input_tile,
+from tzrec.acc import utils as acc_utils
+from tzrec.constant import (
+    PREDICT_QUEUE_TIMEOUT,
+    TENSORBOARD_SUMMARIES,
+    TRAIN_EVAL_RESULT_FILENAME,
+    Mode,
 )
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, TENSORBOARD_SUMMARIES, Mode
-from tzrec.datasets.dataset import BaseDataset, BaseWriter, create_writer
+from tzrec.datasets.dataset import (
+    BaseWriter,
+    create_dataloader,
+    create_writer,
+)
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
-    create_feature_configs,
     create_features,
-    create_fg_json,
 )
 from tzrec.models.match_model import (
     MatchModel,
@@ -68,38 +59,26 @@ from tzrec.models.match_model import (
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
+from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
-from tzrec.utils.dist_util import DistributedModelParallel
-from tzrec.utils.fx_util import symbolic_trace
+from tzrec.utils.dist_util import (
+    DistributedModelParallel,
+    create_train_pipeline,
+    init_process_group,
+)
+from tzrec.utils.export_util import export_model
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
-from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 from tzrec.version import __version__ as tzrec_version
-
-
-def init_process_group() -> Tuple[torch.device, str]:
-    """Init process_group, device, rank, backend."""
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        device: torch.device = torch.device(f"cuda:{rank}")
-        backend = "nccl"
-        torch.cuda.set_device(device)
-    else:
-        device: torch.device = torch.device("cpu")
-        backend = "gloo"
-    dist.init_process_group(backend=backend)
-    return device, backend
 
 
 def _create_features(
@@ -123,94 +102,16 @@ def _create_features(
     return features
 
 
-def _get_dataloader(
-    data_config: DataConfig,
-    features: List[BaseFeature],
-    input_path: str,
-    reserved_columns: Optional[List[str]] = None,
-    mode: Mode = Mode.TRAIN,
-    gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
-    debug_level: int = 0,
-) -> DataLoader:
-    """Build dataloader.
-
-    Args:
-        data_config (DataConfig): dataloader config.
-        features (list): list of feature.
-        input_path (str): input data path.
-        reserved_columns (list): reserved columns in predict mode.
-        mode (Mode): train or eval or predict.
-        gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
-        debug_level (int): dataset debug level, when mode=predict and
-            debug_level > 0, will dump fg encoded data to debug_str
-
-    Return:
-        dataloader (dataloader): a DataLoader.
-    """
-    dataset_name = DatasetType.Name(data_config.dataset_type)
-    # pyre-ignore [16]
-    dataset_cls = BaseDataset.create_class(dataset_name)
-    dataset = dataset_cls(
-        data_config=data_config,
-        features=features,
-        input_path=input_path,
-        reserved_columns=reserved_columns,
-        mode=mode,
-        debug_level=debug_level,
-    )
-
-    kwargs = {}
-    if data_config.num_workers < 1:
-        num_workers = 1
-    else:
-        num_workers = data_config.num_workers
-        # check number of files is valid or not for file based dataset.
-        if hasattr(dataset._reader, "num_files"):
-            num_files = dataset._reader.num_files()
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            if num_files >= world_size:
-                num_files_per_worker = num_files // world_size
-                if num_files_per_worker < num_workers:
-                    logger.info(
-                        f"data_config.num_workers reset to {num_files_per_worker}"
-                    )
-                    num_workers = num_files_per_worker
-            else:
-                raise ValueError(
-                    f"Number of files in the dataset[{input_path}] must greater "
-                    f"than world_size: {world_size}, but got {num_files}"
-                )
-
-        kwargs["num_workers"] = num_workers
-        kwargs["persistent_workers"] = True
-
-    if mode == Mode.TRAIN:
-        # When in train_and_eval mode, use 2x worker in gl cluster
-        # for train_dataloader and eval_dataloader
-        dataset.launch_sampler_cluster(num_client_per_rank=num_workers * 2)
-    else:
-        if gl_cluster:
-            # Reuse the gl cluster for eval_dataloader
-            dataset.launch_sampler_cluster(
-                num_client_per_rank=num_workers * 2,
-                client_id_bias=num_workers,
-                cluster=gl_cluster,
-            )
-        else:
-            dataset.launch_sampler_cluster(num_client_per_rank=num_workers)
-
-    dataloader = DataLoader(
-        dataset=dataset,
-        batch_size=None,
-        pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
-        collate_fn=lambda x: x,
-        **kwargs,
-    )
-    # For PyTorch versions 2.6 and above, we initialize the data iterator before
-    # beginning the training process to avoid potential CUDA-related issues following
-    # model saving.
-    iter(dataloader)
-    return dataloader
+def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
+    try:
+        sampler_type = (
+            data_config.WhichOneof("sampler")
+            if data_config.HasField("sampler")
+            else None
+        )
+    except Exception:
+        sampler_type = None
+    return sampler_type
 
 
 def _create_model(
@@ -218,6 +119,7 @@ def _create_model(
     features: List[BaseFeature],
     labels: List[str],
     sample_weights: Optional[List[str]] = None,
+    sampler_type: Optional[str] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -226,7 +128,7 @@ def _create_model(
         features (list): list of features.
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
-
+        sampler_type (str): negative sampler type
     Return:
         model: a EasyRec Model.
     """
@@ -235,7 +137,11 @@ def _create_model(
     model_cls = BaseModel.create_class(model_cls_name)
 
     model: BaseModel = model_cls(
-        model_config, features, labels, sample_weights=sample_weights
+        model_config,
+        features,
+        labels,
+        sample_weights=sample_weights,
+        sampler_type=sampler_type,
     )
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
@@ -256,22 +162,16 @@ def _evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.eval()
-    pipeline = TrainPipelineSparseDist(
-        model,
-        # pyre-fixme [6]
-        None,
-        model.device,
-        execute_all_batches=True,
-    )
+    pipeline = create_train_pipeline(model)
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
     iterator = iter(eval_dataloader)
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
-    if global_epoch:
+    if global_epoch is not None:
         desc_suffix += f" Epoch-{global_epoch}"
-    if global_step:
+    if global_step is not None:
         desc_suffix += f" model-{global_step}"
     _model = model.module.model
 
@@ -302,8 +202,11 @@ def _evaluate(
         logger.info(f"Eval Result{desc_suffix}: {metric_str}")
         metric_result = {k: v.item() for k, v in metric_result.items()}
         if eval_result_filename:
-            with open(eval_result_filename, "w") as f:
-                json.dump(metric_result, f, indent=4)
+            with open(eval_result_filename, "a") as f:
+                metric_json = OrderedDict(
+                    [("global_step", global_step)] + sorted(metric_result.items())
+                )
+                f.write(json.dumps(metric_json) + "\n")
         if eval_summary_writer:
             for k, v in metric_result.items():
                 eval_summary_writer.add_scalar(f"metric/{k}", v, global_step or 0)
@@ -394,7 +297,7 @@ def _train_and_evaluate(
     eval_config: EvalConfig,
     skip_steps: int = -1,
     ckpt_path: Optional[str] = None,
-    eval_result_filename: str = "train_eval_result.txt",
+    eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -460,9 +363,7 @@ def _train_and_evaluate(
     i_epoch = 0
     losses = {}
     for i_epoch in epoch_iter:
-        pipeline = TrainPipelineSparseDist(
-            model, optimizer, model.device, execute_all_batches=True
-        )
+        pipeline = create_train_pipeline(model, optimizer)
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
 
@@ -526,7 +427,7 @@ def _train_and_evaluate(
                 prof.step()
 
         if save_checkpoints_epochs > 0 and i_step > 0:
-            if i_epoch % save_checkpoints_epochs == 0:
+            if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
                 checkpoint_util.save_model(
                     os.path.join(model_dir, f"model.ckpt-{i_step}"),
@@ -607,8 +508,9 @@ def train_and_evaluate(
         edit_config_json (str, optional): edit pipeline config json str.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    train_config = pipeline_config.train_config
     if fine_tune_checkpoint:
-        pipeline_config.train_config.fine_tune_checkpoint = fine_tune_checkpoint
+        train_config.fine_tune_checkpoint = fine_tune_checkpoint
     if train_input_path:
         pipeline_config.train_input_path = train_input_path
     if eval_input_path:
@@ -619,23 +521,24 @@ def train_and_evaluate(
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
 
-    device, _ = init_process_group()
+    device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    acc_utils.allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
     # Build dataloader
-    train_dataloader = _get_dataloader(
+    train_dataloader = create_dataloader(
         data_config, features, pipeline_config.train_input_path, mode=Mode.TRAIN
     )
     eval_dataloader = None
     if pipeline_config.eval_input_path:
         # pyre-ignore [16]
         gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = _get_dataloader(
+        eval_dataloader = create_dataloader(
             data_config,
             features,
             pipeline_config.eval_input_path,
@@ -653,7 +556,7 @@ def train_and_evaluate(
         if ckpt_path is None or not os.path.exists(ckpt_path):
             raise RuntimeError(
                 "fine_tune_checkpoint"
-                "[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
+                f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
     if os.path.exists(pipeline_config.model_dir):
         # TODO(hongsheng.jhs): save and restore dataloader state.
@@ -671,54 +574,90 @@ def train_and_evaluate(
                     "--continue_train)"
                 )
 
+    sampler_type = _get_sampler_type(data_config)
+
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
     )
-    model = TrainWrapper(model)
+    model = TrainWrapper(
+        model, device=device, mixed_precision=train_config.mixed_precision
+    )
 
     sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
-        pipeline_config.train_config.sparse_optimizer
+        train_config.sparse_optimizer
     )
-    apply_optimizer_in_backward(
-        sparse_optim_cls, model.model.sparse_parameters(), sparse_optim_kwargs
-    )
+    trainable_params, frozen_params = model.model.sparse_parameters()
+    apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
+    if len(frozen_params) > 0:
+        # SGD and lr=0 for using fused kernel and freezing params
+        apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
 
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=train_dataloader.dataset.sampled_batch_size,
         ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
+        global_constraints_cfg=train_config.global_embedding_constraints
+        if train_config.HasField("global_embedding_constraints")
+        else None,
+        model=model,
     )
 
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
+    sharders = get_default_sharders()
+    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
     if is_rank_zero:
         logger.info(str(plan))
 
     model = DistributedModelParallel(
         module=model,
         device=device,
+        sharders=sharders,
         plan=plan,
     )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
-        pipeline_config.train_config.dense_optimizer
+        train_config.dense_optimizer
+    )
+    part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
+        optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
+    )
+    remaining_params, part_optim_params = (
+        optimizer_builder.group_param_by_regex_pattern(
+            dict(in_backward_optimizer_filter(model.named_parameters())),
+            part_optim_regex_patterns,
+        )
     )
     dense_optimizer = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(model.named_parameters())),
+        remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
     )
-    optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
+    part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
+        part_optim_cls, part_optim_kwargs, part_optim_params
+    )
+    grad_scaler = None
+    if train_config.HasField("grad_scaler"):
+        grad_scaler = GradScaler(
+            device=device.type,
+            **config_util.config_to_kwargs(train_config.grad_scaler),
+        )
+    optimizer = TZRecOptimizer(
+        CombinedOptimizer([model.fused_optimizer, dense_optimizer, *part_optimizers]),
+        grad_scaler=grad_scaler,
+        gradient_accumulation_steps=train_config.gradient_accumulation_steps,
+    )
     sparse_lr = optimizer_builder.create_scheduler(
-        model.fused_optimizer, pipeline_config.train_config.sparse_optimizer
+        model.fused_optimizer, train_config.sparse_optimizer
     )
     dense_lr = optimizer_builder.create_scheduler(
-        dense_optimizer, pipeline_config.train_config.dense_optimizer
+        dense_optimizer, train_config.dense_optimizer
+    )
+    part_lrs = optimizer_builder.create_part_optim_schedulers(
+        part_optimizers, train_config.dense_optimizer, part_optim_indices
     )
 
     # use barrier to sync all workers, prevent rank zero save_message and create
@@ -738,9 +677,9 @@ def train_and_evaluate(
         optimizer,
         train_dataloader,
         eval_dataloader,
-        [sparse_lr, dense_lr],
+        [sparse_lr, dense_lr, *part_lrs],
         pipeline_config.model_dir,
-        train_config=pipeline_config.train_config,
+        train_config=train_config,
         eval_config=pipeline_config.eval_config,
         skip_steps=skip_steps,
         ckpt_path=ckpt_path,
@@ -767,20 +706,24 @@ def evaluate(
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
 
-    device, _ = init_process_group()
+    device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    train_config = pipeline_config.train_config
+    acc_utils.allow_tf32(train_config, backend)
 
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    eval_dataloader = _get_dataloader(
+    eval_dataloader = create_dataloader(
         data_config,
         features,
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
     )
+
+    sampler_type = _get_sampler_type(data_config)
 
     # Build model
     model = _create_model(
@@ -788,21 +731,29 @@ def evaluate(
         features,
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
+        sampler_type=sampler_type,
     )
-    model = TrainWrapper(model)
+    model = TrainWrapper(
+        model, device=device, mixed_precision=train_config.mixed_precision
+    )
 
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
+        global_constraints_cfg=train_config.global_embedding_constraints
+        if train_config.HasField("global_embedding_constraints")
+        else None,
+        model=model,
     )
-    plan = planner.collective_plan(
-        model, get_default_sharders(), dist.GroupMember.WORLD
-    )
+    sharders = get_default_sharders()
+    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
     if is_rank_zero:
         logger.info(str(plan))
 
-    model = DistributedModelParallel(module=model, device=device, plan=plan)
+    model = DistributedModelParallel(
+        module=model, sharders=sharders, device=device, plan=plan
+    )
 
     global_step = None
     if not checkpoint_path:
@@ -831,78 +782,6 @@ def evaluate(
         logger.info("Evaluate Finished.")
 
 
-def _script_model(
-    pipeline_config: EasyRecConfig,
-    model: BaseModule,
-    state_dict: Optional[Dict[str, Any]],
-    dataloader: DataLoader,
-    save_dir: str,
-) -> None:
-    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    is_trt_convert = is_trt()
-    if is_rank_zero:
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        model.set_is_inference(True)
-        if state_dict is not None:
-            model.to_empty(device="cpu")
-            model.load_state_dict(state_dict, strict=False)
-
-        # for mc modules, fix output_segments_tensor is a meta tensor.
-        fix_mch_state(model)
-
-        batch = next(iter(dataloader))
-
-        if is_cuda_export():
-            model = model.cuda()
-
-        if is_quant():
-            logger.info("quantize embeddings...")
-            quantize_embeddings(model, dtype=quant_dtype(), inplace=True)
-            logger.info("finish quantize embeddings...")
-
-        model.eval()
-
-        if is_trt_convert:
-            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda, "cuda:0")
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            export_model_trt(model, data_cuda, save_dir)
-
-        elif is_aot():
-            data_cuda = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data_cuda)
-            export_model_aot(model, data_cuda, save_dir)
-        else:
-            data = batch.to_dict(sparse_dtype=torch.int64)
-            result = model(data)
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-
-            gm = symbolic_trace(model)
-            with open(os.path.join(save_dir, "gm.code"), "w") as f:
-                f.write(gm.code)
-
-            scripted_model = torch.jit.script(gm)
-            scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
-
-        features = model._features
-        feature_configs = create_feature_configs(features, asset_dir=save_dir)
-        pipeline_config = copy.copy(pipeline_config)
-        pipeline_config.ClearField("feature_configs")
-        pipeline_config.feature_configs.extend(feature_configs)
-        config_util.save_message(
-            pipeline_config, os.path.join(save_dir, "pipeline.config")
-        )
-        logger.info("saving fg json...")
-        fg_json = create_fg_json(features, asset_dir=save_dir)
-        with open(os.path.join(save_dir, "fg.json"), "w") as f:
-            json.dump(fg_json, f, indent=4)
-        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(export_acc_config(), f, indent=4)
-
-
 def export(
     pipeline_config_path: str,
     export_dir: str,
@@ -919,20 +798,10 @@ def export(
         asset_files (str, optional): more files will be copied to export_dir.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
-    if not is_rank_zero:
-        logger.warning("Only first rank will be used for export now.")
-        return
-    else:
-        if os.environ.get("WORLD_SIZE") != "1":
-            logger.warning(
-                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
-            )
-            os.environ["WORLD_SIZE"] = "1"
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    dist.init_process_group("gloo")
     if is_rank_zero:
         if os.path.exists(export_dir):
             raise RuntimeError(f"directory {export_dir} already exist.")
@@ -942,52 +811,32 @@ def export(
         assets = asset_files.split(",")
 
     data_config = pipeline_config.data_config
-    is_trt_convert = is_trt()
-    if is_trt_convert:
-        # export batch_size too large may OOM in trt convert phase
-        max_batch_size = get_trt_max_batch_size()
-        data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in trt export", data_config.batch_size)
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-
-    # make dataparser to get user feats before create model
-    data_config.num_workers = 1
-    dataloader = _get_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
 
     # Build model
     model = _create_model(
         pipeline_config.model_config,
         features,
         list(data_config.label_fields),
+        sampler_type=None,
     )
-    InferWrapper = CudaExportWrapper if is_aot() else ScriptWrapper
+    InferWrapper = CudaExportWrapper if acc_utils.is_aot() else ScriptWrapper
     model = InferWrapper(model)
-    init_parameters(model, torch.device("cpu"))
 
     if not checkpoint_path:
-        checkpoint_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
-    if checkpoint_path:
-        if is_input_tile_emb():
-            remap_file_path = os.path.join(export_dir, "emb_ckpt_mapping.txt")
-            if is_rank_zero:
-                if not os.path.exists(export_dir):
-                    os.makedirs(export_dir)
-                write_mapping_file_for_input_tile(model.state_dict(), remap_file_path)
-
-            dist.barrier()
-            checkpoint_util.restore_model(
-                checkpoint_path, model, ckpt_param_map_path=remap_file_path
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == "best"
+        ):
+            checkpoint_path, _ = checkpoint_util.best_checkpoint(
+                pipeline_config.model_dir, pipeline_config.export_config
             )
         else:
-            checkpoint_util.restore_model(checkpoint_path, model)
-    else:
-        raise ValueError("checkpoint path should be specified.")
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
+            )
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():
@@ -997,46 +846,39 @@ def export(
                 )
                 tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
-                _script_model(
+                export_model(
                     ori_pipeline_config,
                     tower,
-                    model.state_dict(),
-                    dataloader,
+                    checkpoint_path,
                     tower_export_dir,
+                    assets=assets,
                 )
-                for asset in assets:
-                    shutil.copy(asset, tower_export_dir)
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
                 emb_module = InferWrapper(TDMEmbedding(module, name))
-                _script_model(
+                export_model(
                     ori_pipeline_config,
                     emb_module,
-                    model.state_dict(),
-                    dataloader,
+                    checkpoint_path,
                     os.path.join(export_dir, "embedding"),
                 )
                 break
-        _script_model(
+        export_model(
             ori_pipeline_config,
             model,
-            None,
-            dataloader,
+            checkpoint_path,
             os.path.join(export_dir, "model"),
+            assets=assets,
         )
-        for asset in assets:
-            shutil.copy(asset, os.path.join(export_dir, "model"))
     else:
-        _script_model(
+        export_model(
             ori_pipeline_config,
             model,
-            None,
-            dataloader,
+            checkpoint_path,
             export_dir,
+            assets=assets,
         )
-        for asset in assets:
-            shutil.copy(asset, export_dir)
 
 
 def predict(
@@ -1052,6 +894,7 @@ def predict(
     predict_threads: Optional[int] = None,
     writer_type: Optional[str] = None,
     edit_config_json: Optional[str] = None,
+    predict_steps: Optional[int] = None,
 ) -> None:
     """Evaluate a EasyRec model.
 
@@ -1070,6 +913,7 @@ def predict(
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
+        predict_steps (int, optional): total predict steps limit.
     """
     reserved_cols: Optional[List[str]] = None
     output_cols: Optional[List[str]] = None
@@ -1084,10 +928,13 @@ def predict(
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
 
-    is_trt_convert: bool = is_trt_predict(scripted_model_path)
-    if is_trt_convert:
+    is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
+    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
+    is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
+
+    if is_trt:
         # predict batch_size too large may out of range
-        max_batch_size = get_trt_max_batch_size()
+        max_batch_size = acc_utils.get_max_export_batch_size()
         pipeline_config.data_config.batch_size = min(
             pipeline_config.data_config.batch_size, max_batch_size
         )
@@ -1095,6 +942,10 @@ def predict(
             "using new batch_size: %s in trt predict",
             pipeline_config.data_config.batch_size,
         )
+    elif is_aot:
+        # AOTInductor may hang when predict_threads > 1
+        predict_threads = 1
+        logger.info("using new predict_threads: 1 when use aot")
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1113,7 +964,7 @@ def predict(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    infer_dataloader = _get_dataloader(
+    infer_dataloader = create_dataloader(
         data_config,
         features,
         predict_input_path,
@@ -1133,14 +984,21 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    # disable jit compile， as it compile too slow now.
-    if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-        os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-
-    model: torch.jit.ScriptModule = torch.jit.load(
-        os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-    )
-    model.eval()
+    if is_aot:
+        model: torch.export.pt2_archive._package.AOTICompiledModel = (
+            torch._inductor.aoti_load_package(
+                os.path.join(scripted_model_path, "aoti_model.pt2"),
+                device_index=device.index,
+            )
+        )
+    else:
+        # disable jit compile， as it compile too slow now.
+        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
+            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+        model: torch.jit.ScriptModule = torch.jit.load(
+            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
+        )
+        model.eval()
 
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
@@ -1169,10 +1027,12 @@ def predict(
     def _forward(batch: Batch) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
             parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-            # when predicting with a model exported using INPUT_TILE,
-            #  we set the batch size tensor to 1 to disable tiling.
-            parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if is_trt_convert:
+            if is_input_tile:
+                # when predicting with a model exported using INPUT_TILE,
+                #  we set the batch size tensor to 1 to disable tiling.
+                parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
+            if is_trt or is_aot:
+                parsed_inputs = OrderedDict(sorted(parsed_inputs.items()))
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
@@ -1241,6 +1101,8 @@ def predict(
             if is_profiling:
                 prof.step()
             i_step += 1
+            if predict_steps is not None and i_step >= predict_steps:
+                break
         except StopIteration:
             break
 

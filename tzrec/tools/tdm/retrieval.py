@@ -30,9 +30,10 @@ from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.dataset import BaseWriter, create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
 from tzrec.datasets.utils import Batch, RecordBatchTensor
-from tzrec.main import _create_features, _get_dataloader, init_process_group
+from tzrec.main import _create_features, create_dataloader
 from tzrec.protos.data_pb2 import DatasetType
 from tzrec.utils import config_util
+from tzrec.utils.dist_util import init_process_group
 from tzrec.utils.logging_util import ProgressLogger, logger
 
 
@@ -175,7 +176,7 @@ def tdm_retrieval(
 
     infer_data_config = copy.copy(data_config)
     infer_data_config.num_workers = 1
-    infer_dataloader = _get_dataloader(
+    infer_dataloader = create_dataloader(
         infer_data_config,
         features,
         predict_input_path,
@@ -242,6 +243,9 @@ def tdm_retrieval(
     num_class = pipeline_config.model_config.num_class
     pos_prob_name: str = "probs1" if num_class == 2 else "probs"
 
+    total = 0
+    recall = 0
+
     def _forward(
         batch: Batch,
         record_batch_t: RecordBatchTensor,
@@ -303,39 +307,39 @@ def tdm_retrieval(
             pred = _forward(batch, record_batch_t, node_ids, layer_id)
             pred_queue.put(pred, timeout=PREDICT_QUEUE_TIMEOUT)
 
-    def _write_loop(pred_queue: Queue, metric_queue: Queue) -> None:
-        total = 0
-        recall = 0
+    def _write(record_batch_t: RecordBatchTensor, node_ids: pa.Array) -> None:
+        nonlocal total
+        nonlocal recall
+        output_dict = OrderedDict()
+        reserve_batch_record = record_batch_t.get()
+        gt_node_ids = reserve_batch_record[item_id_field]
+        cur_batch_size = len(gt_node_ids)
+        if reserved_cols is not None:
+            for c in reserved_cols:
+                output_dict[c] = reserve_batch_record[c]
+        output_dict["recall_ids"] = node_ids
+        writer.write(output_dict)
+
+        # calculate precision and recall
+        retrieval_result = np.any(
+            np.equal(
+                gt_node_ids.to_numpy(zero_copy_only=False)[:, None],
+                np.array(node_ids.to_pylist()),
+            ),
+            axis=1,
+        )
+        total += cur_batch_size
+        recall += np.sum(retrieval_result)
+
+    def _write_loop(pred_queue: Queue) -> None:
         while True:
             record_batch_t, node_ids = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
             if record_batch_t is None:
                 break
-
-            output_dict = OrderedDict()
-            reserve_batch_record = record_batch_t.get()
-            gt_node_ids = reserve_batch_record[item_id_field]
-            cur_batch_size = len(gt_node_ids)
-            if reserved_cols is not None:
-                for c in reserved_cols:
-                    output_dict[c] = reserve_batch_record[c]
-            output_dict["recall_ids"] = node_ids
-            writer.write(output_dict)
-
-            # calculate precision and recall
-            retrieval_result = np.any(
-                np.equal(
-                    gt_node_ids.to_numpy(zero_copy_only=False)[:, None],
-                    np.array(node_ids.to_pylist()),
-                ),
-                axis=1,
-            )
-            total += cur_batch_size
-            recall += np.sum(retrieval_result)
-        metric_queue.put((total, recall), timeout=PREDICT_QUEUE_TIMEOUT)
+            _write(record_batch_t, node_ids)
 
     in_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer + 1)]
     out_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer)]
-    metric_queue = Queue(maxsize=1)
 
     data_p_list = []
     for i in range(max_level - first_recall_layer):
@@ -365,16 +369,20 @@ def tdm_retrieval(
         t.start()
         forward_t_list.append(t)
 
-    write_t = Thread(
-        target=_write_loop, args=(in_queues[len(in_queues) - 1], metric_queue)
-    )
-    write_t.start()
-
+    write_t = None
     i_step = 0
     while True:
         try:
             batch = next(infer_iterator)
             in_queues[0].put((batch.reserves, None), timeout=PREDICT_QUEUE_TIMEOUT)
+            if i_step == 0:
+                # lazy init writer and create write thread
+                record_batch_t, node_ids = in_queues[-1].get(
+                    timeout=PREDICT_QUEUE_TIMEOUT
+                )
+                _write(record_batch_t, node_ids)
+                write_t = Thread(target=_write_loop, args=(in_queues[-1],))
+                write_t.start()
             if is_local_rank_zero:
                 plogger.log(i_step)
             if is_profiling:
@@ -389,10 +397,10 @@ def tdm_retrieval(
         p.join()
     for t in forward_t_list:
         t.join()
+    assert write_t is not None
     write_t.join()
     writer.close()
 
-    total, recall = metric_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
     total_t = torch.tensor(total, device=device)
     recall_t = torch.tensor(recall, device=device)
     dist.all_reduce(total_t, op=ReduceOp.SUM)
@@ -457,6 +465,12 @@ if __name__ == "__main__":
         help="dataset type, default will use dataset type in config.",
     )
     parser.add_argument(
+        "--writer_type",
+        type=str,
+        default=None,
+        help="data writer type, default will be same as dataset_type in data_config.",
+    )
+    parser.add_argument(
         "--recall_num", type=int, default=200, help="recall item num per user."
     )
     parser.add_argument("--n_cluster", type=int, default=2, help="tree cluster num.")
@@ -479,5 +493,6 @@ if __name__ == "__main__":
         is_profiling=args.is_profiling,
         debug_level=args.debug_level,
         dataset_type=args.dataset_type,
+        writer_type=args.writer_type,
         num_worker_per_level=args.num_worker_per_level,
     )

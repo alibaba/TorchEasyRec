@@ -9,9 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import argparse
-import copy
 import json
 import os
 import shutil
@@ -21,7 +19,7 @@ from odps import ODPS
 
 from tzrec.datasets.odps_dataset import _create_odps_account
 from tzrec.features.feature import create_fg_json
-from tzrec.main import _create_features, _get_dataloader
+from tzrec.main import _create_features, create_dataloader
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
 
@@ -47,6 +45,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--odps_project_name",
+        type=str,
+        default=None,
+        help="odps project name.",
+    )
+    parser.add_argument(
+        "--odps_schema_name",
         type=str,
         default=None,
         help="odps project name.",
@@ -84,24 +88,16 @@ if __name__ == "__main__":
 
     if args.debug:
         pipeline_config.data_config.num_workers = 1
-        dataloader = _get_dataloader(
+        dataloader = create_dataloader(
             pipeline_config.data_config, features, pipeline_config.train_input_path
         )
         iterator = iter(dataloader)
         _ = next(iterator)
 
     tmp_dir = tempfile.mkdtemp(prefix="tzrec_")
-    fg_json = create_fg_json(features, asset_dir=tmp_dir)
-    if args.remove_bucketizer:
-        fg_json = copy.copy(fg_json)
-        for feature in fg_json["features"]:
-            feature.pop("hash_bucket_size", None)
-            feature.pop("vocab_dict", None)
-            feature.pop("vocab_list", None)
-            feature.pop("boundaries", None)
-            feature.pop("num_buckets", None)
-            if feature["feature_type"] != "tokenize_feature":
-                feature.pop("vocab_file", None)
+    fg_json = create_fg_json(
+        features, asset_dir=tmp_dir, remove_bucketizer=args.remove_bucketizer
+    )
 
     if args.reserves is not None:
         reserves = []
@@ -125,6 +121,7 @@ if __name__ == "__main__":
             account=account,
             project=project,
             endpoint=odps_endpoint,
+            schema=args.odps_schema_name if args.odps_schema_name else None,
         )
         for fname in os.listdir(tmp_dir):
             fpath = os.path.join(tmp_dir, fname)
@@ -136,6 +133,12 @@ if __name__ == "__main__":
                     )
                     resource = o.create_resource(
                         fname, "file", file_obj=open(fpath, "rb")
+                    )
+                else:
+                    raise ValueError(
+                        f"{fname} already existed in the {project}. "
+                        f"You can add '--force_update_resource' in the command "
+                        f"to force update."
                     )
             else:
                 logger.info(f"uploading resource [{fname}].")

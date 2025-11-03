@@ -9,18 +9,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple
+import os
+from datetime import timedelta
+from queue import Queue
+from typing import List, Optional, Tuple
 
 import torch
 from torch import distributed as dist
 from torch import nn
 from torch.autograd.profiler import record_function
-from torchrec.distributed import embeddingbag
 from torchrec.distributed.embedding_types import (
     KJTList,
 )
 from torchrec.distributed.embeddingbag import (
     ShardedEmbeddingBagCollection,
+    _create_mean_pooling_divisor,
 )
 from torchrec.distributed.mc_embedding_modules import (
     BaseShardedManagedCollisionEmbeddingCollection,
@@ -30,155 +33,53 @@ from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel as _DistributedModelParallel,
 )
+from torchrec.distributed.train_pipeline import TrainPipeline
+from torchrec.distributed.train_pipeline import TrainPipelineBase as _TrainPipelineBase
+from torchrec.distributed.train_pipeline import (
+    TrainPipelineSparseDist as _TrainPipelineSparseDist,
+)
 from torchrec.distributed.types import (
     Awaitable,
     ModuleSharder,
+    ShardedModule,
     ShardingEnv,
     ShardingPlan,
 )
-from torchrec.distributed.utils import none_throws
-from torchrec.modules.embedding_configs import PoolingType
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, _to_offsets
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
-def broadcast_string(s: str, src: int = 0) -> str:
-    """Broadcasts a string from the source rank to all other ranks."""
-    if dist.get_rank() == src:
-        s_tensor = torch.ByteTensor(bytearray(s, "utf-8"))
-        length = torch.tensor([len(s_tensor)])
+def init_process_group() -> Tuple[torch.device, str]:
+    """Init process_group, device, rank, backend."""
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        device: torch.device = torch.device(f"cuda:{rank}")
+        backend = "nccl"
+        torch.cuda.set_device(device)
     else:
-        length = torch.tensor([0], dtype=torch.long)
+        device: torch.device = torch.device("cpu")
+        backend = "gloo"
 
-    if dist.get_backend() == dist.Backend.NCCL:
-        length = length.cuda()
-    dist.broadcast(length, src)
-
-    if dist.get_rank() != src:
-        s_tensor = torch.ByteTensor(length.item())
-
-    if dist.get_backend() == dist.Backend.NCCL:
-        s_tensor = s_tensor.cuda()
-    # pyre-ignore [61]
-    dist.broadcast(s_tensor, src)
-
-    s_recv = s_tensor.cpu().numpy().tobytes().decode("utf-8")
-    return s_recv
-
-
-def gather_strings(s: str, dst: int = 0) -> List[str]:
-    """Gather strings from all ranks to the destination rank."""
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    s_tensor = torch.ByteTensor(bytearray(s, "utf-8"))
-
-    max_len = torch.tensor([len(s_tensor)], dtype=torch.long)
-    max_len_list = [torch.tensor([0], dtype=torch.long) for _ in range(world_size)]
-    if dist.get_backend() == dist.Backend.NCCL:
-        max_len = max_len.cuda()
-        max_len_list = [x.cuda() for x in max_len_list]
-    dist.all_gather(max_len_list, max_len)
-
-    # pyre-ignore [6]
-    max_len = max(max_len_list).item()
-    padded_s_tensor = torch.cat(
-        (s_tensor, torch.zeros(max_len - len(s_tensor), dtype=torch.uint8))
-    )
-    if rank == dst:
-        gather_list = [
-            torch.zeros(max_len, dtype=torch.uint8) for _ in range(world_size)
-        ]
-    else:
-        gather_list = []
-    if dist.get_backend() == dist.Backend.NCCL:
-        padded_s_tensor = padded_s_tensor.cuda()
-        gather_list = [x.cuda() for x in gather_list]
-    dist.gather(padded_s_tensor, gather_list, dst)
-
-    gathered_strings = []
-    if rank == dst:
-        for tensor in gather_list:
-            string = tensor.cpu().numpy().tobytes().decode("utf-8").rstrip("\x00")
-            gathered_strings.append(string)
-
-    return gathered_strings
-
-
-# lengths of kjt will be modified by create_mean_pooling_divisor, we fix it
-# with lengths = lengths.clone() temporarily.
-def _create_mean_pooling_divisor(
-    lengths: torch.Tensor,
-    keys: List[str],
-    offsets: torch.Tensor,
-    stride: int,
-    stride_per_key: List[int],
-    dim_per_key: torch.Tensor,
-    pooling_type_to_rs_features: Dict[str, List[str]],
-    embedding_names: List[str],
-    embedding_dims: List[int],
-    variable_batch_per_feature: bool,
-    kjt_inverse_order: torch.Tensor,
-    kjt_key_indices: Dict[str, int],
-    kt_key_ordering: torch.Tensor,
-    inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None,
-    weights: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    with record_function("## ebc create mean pooling callback ##"):
-        batch_size = (
-            none_throws(inverse_indices)[1].size(dim=1)
-            if variable_batch_per_feature
-            else stride
+    pg_timeout = None
+    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+        pg_timeout = timedelta(
+            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
         )
+    dist.init_process_group(backend=backend, timeout=pg_timeout)
 
-        if weights is not None:
-            # if we have weights, lengths is the sum of weights by offsets for feature
-            lengths = torch.ops.fbgemm.segment_sum_csr(1, offsets.int(), weights)
-
-        if variable_batch_per_feature:
-            inverse_indices = none_throws(inverse_indices)
-            device = inverse_indices[1].device
-            inverse_indices_t = inverse_indices[1]
-            if len(keys) != len(inverse_indices[0]):
-                inverse_indices_t = torch.index_select(
-                    inverse_indices[1], 0, kjt_inverse_order
-                )
-            offsets = _to_offsets(torch.tensor(stride_per_key, device=device))[
-                :-1
-            ].unsqueeze(-1)
-            indices = (inverse_indices_t + offsets).flatten()
-            lengths = torch.index_select(input=lengths, dim=0, index=indices)
-
-        # only convert the sum pooling features to be 1 lengths
-        lengths = lengths.clone()
-        for feature in pooling_type_to_rs_features[PoolingType.SUM.value]:
-            feature_index = kjt_key_indices[feature]
-            feature_index = feature_index * batch_size
-            lengths[feature_index : feature_index + batch_size] = 1
-
-        if len(embedding_names) != len(keys):
-            lengths = torch.index_select(
-                lengths.reshape(-1, batch_size),
-                0,
-                kt_key_ordering,
-            ).reshape(-1)
-
-        # transpose to align features with keyed tensor dim_per_key
-        lengths = lengths.reshape(-1, batch_size).T  # [batch_size, num_features]
-        output_size = sum(embedding_dims)
-
-        divisor = torch.repeat_interleave(
-            input=lengths,
-            repeats=dim_per_key,
-            dim=1,
-            output_size=output_size,
-        )
-        eps = 1e-6  # used to safe guard against 0 division
-        divisor = divisor + eps
-        return divisor.detach()
+    return device, backend
 
 
-# pyre-ignore [9]
-embeddingbag._create_mean_pooling_divisor = _create_mean_pooling_divisor
+def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.ProcessGroup]:
+    """New ProcessGroup used for broadcast_object or gather_object."""
+    pg = None
+    world_size = world_size or int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        # pyre-ignore [16]
+        if dist.is_initialized() and dist.GroupMember.WORLD.size() == world_size:
+            pg = dist.GroupMember.WORLD
+        else:
+            pg = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    return pg
 
 
 # fix missing create_mean_pooling_callback of mc-ebc input_dist
@@ -278,3 +179,72 @@ def DistributedModelParallel(
         if hasattr(m, "_has_uninitialized_input_dist"):
             m._has_uninitialized_input_dist = True
     return model
+
+
+def _pipeline_backward(losses: torch.Tensor, optimizer: torch.optim.Optimizer) -> None:
+    with record_function("## backward ##"):
+        loss = torch.sum(losses, dim=0)
+        if (
+            hasattr(optimizer, "_gradient_accumulation_steps")
+            # pyre-ignore [16]
+            and optimizer._gradient_accumulation_steps > 1
+        ):
+            loss = loss / optimizer._gradient_accumulation_steps
+        # pyre-ignore [16]
+        if hasattr(optimizer, "_grad_scaler") and optimizer._grad_scaler is not None:
+            optimizer._grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+
+class TrainPipelineBase(_TrainPipelineBase):
+    """TorchEasyRec's TrainPipelineBase, make backward support grad scaler."""
+
+    def _backward(self, losses: torch.Tensor) -> None:
+        _pipeline_backward(losses, self._optimizer)
+
+
+class TrainPipelineSparseDist(_TrainPipelineSparseDist):
+    """TorchEasyRec's TrainPipelineSparseDist, make backward support grad scaler."""
+
+    def _backward(self, losses: torch.Tensor) -> None:
+        _pipeline_backward(losses, self._optimizer)
+
+
+def create_train_pipeline(
+    model: nn.Module, optimizer: Optional[torch.optim.Optimizer] = None
+) -> TrainPipeline:
+    """Create TrainPipeline.
+
+    Args:
+        model (nn.Module): a DMP model.
+        optimizer (torch.optim.Optimizer): a KeyedOptimizer.
+
+    Return:
+        a TrainPipeline.
+    """
+    has_sparse_module = False
+
+    q = Queue()
+    q.put(model.module)
+    while not q.empty():
+        m = q.get()
+        if isinstance(m, ShardedModule):
+            has_sparse_module = True
+            break
+        else:
+            for child in m.children():
+                q.put(child)
+
+    if not has_sparse_module:
+        # use TrainPipelineBase when model do not have sparse parameters.
+        # pyre-ignore [6]
+        return TrainPipelineBase(model, optimizer, model.device)
+    else:
+        return TrainPipelineSparseDist(
+            model,
+            # pyre-ignore [6]
+            optimizer,
+            model.device,
+            execute_all_batches=True,
+        )

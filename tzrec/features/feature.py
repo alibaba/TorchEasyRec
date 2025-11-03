@@ -22,7 +22,9 @@ import pyarrow as pa
 import pyfg
 import torch
 from torch import nn  # NOQA
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import (
+    BaseEmbeddingConfig,
     EmbeddingBagConfig,
     EmbeddingConfig,
     PoolingType,
@@ -37,6 +39,7 @@ from torchrec.modules.mc_modules import (
     dynamic_threshold_filter,  # NOQA
     probabilistic_threshold_filter,  # NOQA
 )
+from torchrec.types import DataType
 
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
@@ -52,14 +55,16 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingConfig,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.protos import feature_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
-from tzrec.utils import config_util
+from tzrec.utils import config_util, dynamicemb_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
 _FEATURE_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
+
 
 MAX_HASH_BUCKET_SIZE = 2**63 - 1
 
@@ -199,6 +204,34 @@ def _parse_fg_encoded_dense_feature_impl(
             f" but get {feat.type}."
         )
     return DenseData(name, feat_values)
+
+
+def _dtype_str_to_data_type(data_type_str: str) -> DataType:
+    if data_type_str == "FP32":
+        data_type = DataType.FP32
+    elif data_type_str == "FP16":
+        data_type = DataType.FP16
+    else:
+        raise ValueError(
+            "Embedding only support FP32 and FP16 now, "
+            f"[{data_type_str}] is not supported."
+        )
+    return data_type
+
+
+def build_embedding_constraints(
+    constraints_cfg: feature_pb2.ParameterConstraints,
+) -> ParameterConstraints:
+    """Build ParameterConstraints for embedding parameter."""
+    constraints = ParameterConstraints(
+        sharding_types=list(constraints_cfg.sharding_types)
+        if len(constraints_cfg.sharding_types) > 0
+        else None,
+        compute_kernels=list(constraints_cfg.compute_kernels)
+        if len(constraints_cfg.compute_kernels) > 0
+        else None,
+    )
+    return constraints
 
 
 class InvalidFgInputError(Exception):
@@ -391,14 +424,18 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = eval(f"partial({self.config.init_fn})")
-            return EmbeddingBagConfig(
+            emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
                 feature_names=[self.name],
                 pooling=self.pooling_type,
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
+            # pyre-ignore [16]
+            emb_bag_config.trainable = self.config.trainable
+            return emb_bag_config
         else:
             return None
 
@@ -410,13 +447,17 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = eval(f"partial({self.config.init_fn})")
-            return EmbeddingConfig(
+            emb_config = EmbeddingConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
                 feature_names=[self.name],
                 init_fn=init_fn,
+                data_type=_dtype_str_to_data_type(self.config.data_type),
             )
+            # pyre-ignore [16]
+            emb_config.trainable = self.config.trainable
+            return emb_config
         else:
             return None
 
@@ -503,13 +544,38 @@ class BaseFeature(object, metaclass=_meta_cls):
                     f"input names, e.g., item:cat_a."
                 )
             for x in side_inputs:
-                if not (len(x) == 2 and x[0] in ["user", "item", "context", "feature"]):
+                if not (
+                    len(x) == 2
+                    and x[0] in ["user", "item", "context", "feature", "const"]
+                ):
                     raise InvalidFgInputError(
                         f"{self.__class__.__name__}[{self.name}] must have valid fg "
                         f"input names, e.g., item:cat_a, but got {x}."
                     )
             self._side_inputs = side_inputs
         return self._side_inputs
+
+    @property
+    def stub_type(self) -> bool:
+        """Only used as fg dag intermediate result or not."""
+        if hasattr(self.config, "stub_type") and self.config.HasField("stub_type"):
+            return self.config.stub_type
+        return False
+
+    def parameter_constraints(
+        self, emb_config: Optional[BaseEmbeddingConfig]
+    ) -> Optional[ParameterConstraints]:
+        """Embedding parameter constraints."""
+        if self.config.HasField("embedding_constraints"):
+            return build_embedding_constraints(self.config.embedding_constraints)
+        elif hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb"):
+            emb_config = emb_config if emb_config is not None else self.emb_config
+            assert emb_config is not None
+            return dynamicemb_util.build_dynamicemb_constraints(
+                self.config.dynamicemb, emb_config
+            )
+        else:
+            return None
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
@@ -806,8 +872,21 @@ def _copy_assets(
     return feature
 
 
+def _remove_one_feature_bucketizer(fg_json: Dict[str, Any]) -> Dict[str, Any]:
+    fg_json.pop("hash_bucket_size", None)
+    fg_json.pop("vocab_dict", None)
+    fg_json.pop("vocab_list", None)
+    fg_json.pop("boundaries", None)
+    fg_json.pop("num_buckets", None)
+    if fg_json["feature_type"] != "tokenize_feature":
+        fg_json.pop("vocab_file", None)
+    return fg_json
+
+
 def create_fg_json(
-    features: List[BaseFeature], asset_dir: Optional[str] = None
+    features: List[BaseFeature],
+    asset_dir: Optional[str] = None,
+    remove_bucketizer: bool = False,
 ) -> Dict[str, Any]:
     """Create feature generate config for features."""
     results = []
@@ -828,10 +907,14 @@ def create_fg_json(
                 )
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
             fg_json = feature.fg_json()
+            if remove_bucketizer:
+                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
             results.extend(fg_json)
     return {"features": results}
 

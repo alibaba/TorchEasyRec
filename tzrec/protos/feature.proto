@@ -3,6 +3,15 @@ package tzrec.protos;
 
 import "google/protobuf/struct.proto";
 
+message ParameterConstraints {
+    // embedding sharding type constraints
+    // data_parallel | table_wise | column_wise | row_wise | table_row_wise | table_column_wise | grid_shard
+    repeated string sharding_types = 1;
+    // embedding compute kernel constraints
+    // dense | fused | fused_uvm | fused_uvm_caching | key_value
+    repeated string compute_kernels = 2;
+}
+
 // LFU: evict_score = access_cnt
 message LFU_EvictionPolicy {
 }
@@ -48,6 +57,44 @@ message AutoDisEmbedding {
 message MLPEmbedding {
 }
 
+
+message DynamicEmbInitializerArgs {
+    // the mode of initialization. NORMAL | TRUNCATED_NORMAL | UNIFORM | CONSTANT
+    optional string mode = 1;
+    // the mean value for (truncated) normal distributions
+    optional float mean = 2 [default = 0.0];
+    // the standard deviation for (truncated) normal distributions.
+    // default is sqrt(1 / embedding_dim)
+    optional float std_dev = 3;
+    // the lower bound for uniform/truncated_normal distribution.
+    // default is -sqrt(1 / max_capacity)
+    optional float lower = 4;
+    // the upper bound for uniform/truncated_normal distribution.
+    // default is sqrt(1 / max_capacity)
+    optional float upper = 5;
+    // the constant value for constant initialization.
+    optional float value = 6 [default = 0.0];
+}
+
+message DynamicEmbedding {
+    // arguments for initializing dynamic embedding vector values.
+    // default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / embedding_dim).
+    optional DynamicEmbInitializerArgs initializer_args = 1;
+    // the initializer args for evaluation mode. default is
+    // default is constant initialization with value 0.0.
+    optional DynamicEmbInitializerArgs eval_initializer_args = 2;
+    // strategy to set the score for each indices in forward and backward per table. TIMESTAMP | STEP | CUSTOMIZED | LFU
+    optional string score_strategy = 4 [default = "STEP"];
+    // max number of embedding rows
+    required uint64 max_capacity = 5;
+    // percentage of embedding rows caching on gpu
+    optional float cache_load_factor = 6;
+    // init number of capacity
+    optional uint64 init_capacity_per_rank = 7;
+    // init table path
+    optional string init_table = 8;
+}
+
 message IdFeature {
     // feature name, e.g. item_id
     required string feature_name = 1;
@@ -86,6 +133,8 @@ message IdFeature {
     optional string vocab_file = 17;
     // vocab file relative directory
     optional string asset_dir = 18;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 19;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -98,8 +147,15 @@ message IdFeature {
     // value_type after fg before bucketize, you can specify it for better performance.
     // e.g. fg_value_type = int64 when use num_buckets
     optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message RawFeature {
@@ -136,6 +192,12 @@ message RawFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
     oneof dense_emb {
         // autodis embedding
@@ -144,7 +206,8 @@ message RawFeature {
         MLPEmbedding mlp = 41;
     }
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message ComboFeature {
@@ -180,6 +243,8 @@ message ComboFeature {
     optional string vocab_file = 16;
     // vocab file relative directory
     optional string asset_dir = 17;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 18;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -189,8 +254,15 @@ message ComboFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message LookupFeature {
@@ -247,6 +319,8 @@ message LookupFeature {
     optional string vocab_file = 23;
     // vocab file relative directory
     optional string asset_dir = 24;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 25;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -259,6 +333,12 @@ message LookupFeature {
     // value_type after fg before bucketize, you can specify it for better performance.
     // e.g. fg_value_type = int64 when use num_buckets
     optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
     oneof dense_emb {
         // autodis embedding
@@ -268,7 +348,9 @@ message LookupFeature {
     }
 
     // TODO: optional string kv_separator = 13 [default = ":"];
-    // TODO: constrains
+
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message MatchFeature {
@@ -327,6 +409,8 @@ message MatchFeature {
     optional string vocab_file = 23;
     // vocab file relative directory
     optional string asset_dir = 24;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 25;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -339,6 +423,12 @@ message MatchFeature {
     // value_type after fg before bucketize, you can specify it for better performance.
     // e.g. fg_value_type = int64 when use num_buckets
     optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
     oneof dense_emb {
         // autodis embedding
@@ -346,6 +436,8 @@ message MatchFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message ExprFeature {
@@ -361,6 +453,10 @@ message ExprFeature {
     optional uint32 embedding_dim = 5;
     // boundaries for bucktize numeric expr value
     repeated float boundaries = 6;
+    // fg multi-value separator
+    optional string separator = 7 [default = "\x1d"];
+    // fill value when vector length mismatch, default is NaN.
+    optional float fill_missing = 8;
     // embedding pooling type, available is {sum | mean}
     optional string pooling = 10 [default = "sum"];
     // fg default value
@@ -369,11 +465,19 @@ message ExprFeature {
     optional string init_fn = 12;
     // mask value in training progress
     optional bool use_mask =  13;
+    // if value_dim = 0, it supports multi-value
+    optional uint32 value_dim = 14 [default = 0];
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
     oneof dense_emb {
         // autodis embedding
@@ -381,6 +485,8 @@ message ExprFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message OverlapFeature {
@@ -419,6 +525,12 @@ message OverlapFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
     oneof dense_emb {
         // autodis embedding
@@ -426,6 +538,8 @@ message OverlapFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 
@@ -485,8 +599,69 @@ message TokenizeFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
-    // TODO: constrains
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
+}
+
+
+message KvDotProduct {
+    // feature name, e.g. kv_os_click_count
+    required string feature_name = 1;
+    // query, e.g. ["a:0.5", "b:0.5"]
+    required string query = 2;
+    // document, e,g. ["d:0.5", "b:0.5"]
+    required string document = 3;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 4;
+    // embedding dimension
+    optional uint32 embedding_dim = 5;
+    // boundaries for bucktize numeric expr value
+    repeated float boundaries = 6;
+    // fg multi-value separator
+    optional string separator = 7 [default = "\x1d"];
+    // fg kv separator, default is :.
+    optional float kv_delimiter = 8;
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 9;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = "0"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 12;
+    // mask value in training progress
+    optional bool use_mask = 13;
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message CustomFeature {
@@ -540,6 +715,8 @@ message CustomFeature {
     optional string vocab_file = 22;
     // vocab file relative directory
     optional string asset_dir = 23;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 24;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -549,6 +726,12 @@ message CustomFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
 
     oneof dense_emb {
         // autodis embedding
@@ -556,8 +739,69 @@ message CustomFeature {
         // mlp embedding
         MLPEmbedding mlp = 41;
     }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
+}
 
-    // TODO: constrains
+message BoolMaskFeature {
+    // feature name.
+    required string feature_name = 1;
+    // feature input, e.g. item:item_id
+    repeated string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    required uint32 embedding_dim = 4;
+    // number of hash size
+    optional uint64 hash_bucket_size = 5;
+    // number of id enumerators
+    optional uint64 num_buckets = 6;
+    // id vocabulary list
+    repeated string vocab_list = 7;
+    // id vocabulary dict
+    map<string, uint64> vocab_dict = 8;
+    // id value dimensions, default = 0, when use in seq, default = 1
+    // if value_dim = 0, it supports id with multi-value
+    optional uint32 value_dim = 9;
+    // embedding pooling type, available is {sum | mean}
+    optional string pooling = 10 [default = "sum"];
+    // fg default value, default value before bucktize
+    optional string default_value = 11 [default = ""];
+    // fg multi-value separator
+    optional string separator = 12 [default = "\x1d"];
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 14;
+    // mask value in training progress
+    optional bool use_mask =  15;
+    // zero collision hash
+    optional ZeroCollisionHash zch = 16;
+    // id vocabulary file path
+    optional string vocab_file = 17;
+    // vocab file relative directory
+    optional string asset_dir = 18;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 19;
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
+    // when use default_bucketize_value, we will not add additional bucketize_value of
+    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
+    optional uint64 default_bucketize_value = 31;
+    // value_type after fg before bucketize, you can specify it for better performance.
+    // e.g. fg_value_type = int64 when use num_buckets
+    optional string fg_value_type = 32;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message SequenceIdFeature {
@@ -599,6 +843,8 @@ message SequenceIdFeature {
     optional string vocab_file = 18;
     // vocab file relative directory
     optional string asset_dir = 19;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 20;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -608,8 +854,14 @@ message SequenceIdFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
-
-    // TODO: constrains
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message SequenceRawFeature {
@@ -650,7 +902,14 @@ message SequenceRawFeature {
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
-    // TODO: constrains
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 
@@ -709,6 +968,8 @@ message SequenceCustomFeature {
     optional string vocab_file = 24;
     // vocab file relative directory
     optional string asset_dir = 25;
+    // dynamic embedding
+    optional DynamicEmbedding dynamicemb = 26;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
@@ -718,8 +979,14 @@ message SequenceCustomFeature {
     // when use default_bucketize_value, we will not add additional bucketize_value of
     // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
     optional uint64 default_bucketize_value = 31;
-
-    // TODO: constrains
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
 }
 
 message SequenceFeature {
@@ -751,6 +1018,8 @@ message FeatureConfig {
         SequenceRawFeature sequence_raw_feature = 11;
         CustomFeature custom_feature = 12;
         SequenceCustomFeature sequence_custom_feature = 13;
+        KvDotProduct kv_dot_product = 14;
+        BoolMaskFeature bool_mask_feature = 15;
     }
 }
 

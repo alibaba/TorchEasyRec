@@ -10,7 +10,7 @@
 # limitations under the License.
 
 import unittest
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import torch
 from parameterized import parameterized
@@ -32,14 +32,19 @@ class _TestMatchModel(MatchModel):
         features: List[BaseFeature],
         labels: List[str],
         in_batch_negative: bool = False,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, **kwargs)
         self._in_batch_negative = in_batch_negative
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         dense_feat_kt = batch.dense_features[BASE_DATA_GROUP]
         dense_neg_kt = batch.dense_features[NEG_DATA_GROUP]
-        simi = self.sim(dense_feat_kt.values(), dense_neg_kt.values())
+        simi = self.sim(
+            dense_feat_kt.values(),
+            dense_neg_kt.values(),
+            hard_neg_indices=None,
+        )
         return {"similarity": simi}
 
 
@@ -68,6 +73,7 @@ class MatchModelTest(unittest.TestCase):
             features=[],
             labels=["label"],
             in_batch_negative=in_batch_neg,
+            sampler_type="negative_sampler",
         )
         model = TrainWrapper(model)
         model = create_test_model(model, graph_type)

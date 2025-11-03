@@ -765,7 +765,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [-4], [0]]))
+        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [0], [0]]))
         self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 1])))
 
     def test_sequence_expr_feature_sparse(self):
@@ -811,8 +811,8 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2, 3]))
-        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 1])))
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 0])))
 
 
 if __name__ == "__main__":

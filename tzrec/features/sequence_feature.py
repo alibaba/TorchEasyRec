@@ -89,7 +89,7 @@ def _parse_fg_encoded_sequence_sparse_feature_impl(
     else:
         raise ValueError(
             f"{name} only support str|list<int>|list<list<int>> dtype input,"
-            f" but get {feat.dtype}."
+            f" but get {feat.type}."
         )
     return SequenceSparseData(name, feat_values, feat_lengths, seq_lengths)
 
@@ -154,7 +154,7 @@ def _parse_fg_encoded_sequence_dense_feature_impl(
     else:
         raise ValueError(
             f"{name} only support str|list<float>|list<float<float>> dtype input,"
-            f" but get {feat.dtype}."
+            f" but get {feat.type}."
         )
     return SequenceDenseData(name, feat_values, seq_lengths)
 
@@ -319,7 +319,7 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["sequence_length"] = self.config.sequence_length
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("zch"):
+        if self.config.HasField("zch") or self.config.HasField("dynamicemb"):
             fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
         elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
@@ -338,7 +338,8 @@ class SequenceIdFeature(IdFeature):
             fg_cfg["value_dim"] = self.config.value_dim
         else:
             fg_cfg["value_dim"] = 1
-
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
 
@@ -516,6 +517,10 @@ class SequenceRawFeature(RawFeature):
             fg_cfg["normalizer"] = self.config.normalizer
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("value_dim"):
+            fg_cfg["value_dim"] = self.config.value_dim
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
 

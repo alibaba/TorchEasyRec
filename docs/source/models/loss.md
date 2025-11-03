@@ -19,6 +19,28 @@ model_config {
 }
 ```
 
+## binary_focal_loss
+
+二分类focal loss， 对应的任务num_class是1。
+
+配置如下
+
+```
+model_config {
+    losses {
+        binary_focal_loss {
+            gamma: 2.0
+            alpha: 0.5
+        }
+    }
+}
+```
+
+参数说明：
+
+1. gamma: focal loss的指数，默认值2.0
+1. alpha: 调节样本权重的类别平衡参数，建议根据正负样本比例来配置alpha，即 alpha / (1-alpha) = #Neg / #Pos, 默认值0.5
+
 ## softmax_cross_entropy
 
 多分类损失函数，其对应的任务num_class大于1

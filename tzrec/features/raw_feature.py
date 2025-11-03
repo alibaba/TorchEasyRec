@@ -63,7 +63,7 @@ class RawFeature(BaseFeature):
         if self.has_embedding:
             return self.config.embedding_dim
         else:
-            return self.config.value_dim
+            return self.value_dim
 
     @property
     def is_sparse(self) -> bool:
@@ -141,4 +141,6 @@ class RawFeature(BaseFeature):
             fg_cfg["normalizer"] = self.config.normalizer
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]

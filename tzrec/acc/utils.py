@@ -12,17 +12,26 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import torch
-from torch import Tensor, nn
-from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
-from torchrec.quant import embedding_modules
+
+from tzrec.protos.train_pb2 import TrainConfig
 
 
 def is_input_tile() -> bool:
     """Judge is input file or not."""
     input_tile = os.environ.get("INPUT_TILE")
+    if input_tile and (input_tile[0] == "2" or input_tile[0] == "3"):
+        return True
+    return False
+
+
+def is_input_tile_predict(model_path: str) -> bool:
+    """Judge is input tile or not in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    input_tile = data.get("INPUT_TILE")
     if input_tile and (input_tile[0] == "2" or input_tile[0] == "3"):
         return True
     return False
@@ -48,17 +57,22 @@ def is_aot() -> bool:
         return False
 
 
+def is_aot_predict(model_path: str) -> bool:
+    """Judge is aot or not in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    is_aot = data.get("ENABLE_AOT")
+    if is_aot and is_aot[0] == "1":
+        return True
+    return False
+
+
 def is_trt() -> bool:
     """Judge is trt or not."""
     is_trt = os.environ.get("ENABLE_TRT")
     if is_trt and is_trt[0] == "1":
         return True
     return False
-
-
-def is_cuda_export() -> bool:
-    """Judge is trt/aot or not."""
-    return is_trt() or is_aot()
 
 
 def is_trt_predict(model_path: str) -> bool:
@@ -69,6 +83,11 @@ def is_trt_predict(model_path: str) -> bool:
     if is_trt and is_trt[0] == "1":
         return True
     return False
+
+
+def is_cuda_export() -> bool:
+    """Judge is trt/aot or not."""
+    return is_trt() or is_aot()
 
 
 def is_debug_trt() -> bool:
@@ -90,26 +109,48 @@ def is_quant() -> bool:
     return True
 
 
+def is_ec_quant() -> bool:
+    """Judge EmbeddingCollection is quant or not."""
+    is_ec_quant = os.environ.get("QUANT_EC_EMB", "0")
+    if is_ec_quant[0] == "0":
+        return False
+    return True
+
+
+_quant_str_to_dtype = {
+    "FP32": torch.float,
+    "FP16": torch.half,
+    "INT8": torch.qint8,
+    "INT4": torch.quint4x2,
+    "INT2": torch.quint2x4,
+}
+
+
 def quant_dtype() -> torch.dtype:
-    """Get embedding quant dtype."""
-    str_to_dtype = {
-        "FP32": torch.float,
-        "FP16": torch.half,
-        "INT8": torch.qint8,
-        "INT4": torch.quint4x2,
-        "INT2": torch.quint2x4,
-    }
+    """Get EmbeddingBagCollection quant dtype."""
     quant_dtype_str = os.environ.get("QUANT_EMB", "INT8")
     if quant_dtype_str == "1":
         # for compatible
         quant_dtype_str = "INT8"
-    if quant_dtype_str not in str_to_dtype:
+    if quant_dtype_str not in _quant_str_to_dtype:
         raise ValueError(
             f"Unknown QUANT_EMB: {quant_dtype_str},"
-            f"available types: {list(str_to_dtype.keys())}"
+            f"available types: {list(_quant_str_to_dtype.keys())}"
         )
     else:
-        return str_to_dtype[quant_dtype_str]
+        return _quant_str_to_dtype[quant_dtype_str]
+
+
+def ec_quant_dtype() -> torch.dtype:
+    """Get EmbeddingCollection quant dtype."""
+    quant_dtype_str = os.environ.get("QUANT_EC_EMB", "INT8")
+    if quant_dtype_str not in _quant_str_to_dtype:
+        raise ValueError(
+            f"Unknown QUANT_EC_EMB: {quant_dtype_str},"
+            f"available types: {list(_quant_str_to_dtype.keys())}"
+        )
+    else:
+        return _quant_str_to_dtype[quant_dtype_str]
 
 
 def write_mapping_file_for_input_tile(
@@ -129,6 +170,8 @@ def write_mapping_file_for_input_tile(
         ".mc_ebc_user._managed_collision_collection.": ".mc_ebc._managed_collision_collection.",  # NOQA
         ".ec_list_user.": ".ec_list.",
         ".mc_ec_list_user.": ".mc_ec_list.",
+        ".ec_dict_user.": ".ec_dict.",
+        ".mc_ec_dict_user.": ".mc_ec_dict.",
     }
 
     remap_str = ""
@@ -159,84 +202,24 @@ def export_acc_config() -> Dict[str, str]:
     return acc_config
 
 
-# fix fp32 quantize
-def _quantize_state_dict(
-    module: nn.Module,
-    table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]],
-    table_name_to_data_type: Dict[str, DataType],
-    table_name_to_num_embeddings_post_pruning: Optional[Dict[str, int]] = None,
-) -> torch.device:
-    device = torch.device("cpu")
-    if not table_name_to_num_embeddings_post_pruning:
-        table_name_to_num_embeddings_post_pruning = {}
+def get_max_export_batch_size() -> int:
+    """Get max export batch size.
 
-    for key, tensor in module.state_dict().items():
-        # Extract table name from state dict key.
-        # e.g. ebc.embedding_bags.t1.weight
-        splits = key.split(".")
-        assert splits[-1] == "weight"
-        table_name = splits[-2]
-        data_type = table_name_to_data_type[table_name]
-        num_rows = tensor.shape[0]
-
-        if table_name in table_name_to_num_embeddings_post_pruning:
-            num_rows = table_name_to_num_embeddings_post_pruning[table_name]
-
-        device = tensor.device
-        num_bits = DATA_TYPE_NUM_BITS[data_type]
-
-        if tensor.is_meta:
-            quant_weight = torch.empty(
-                (num_rows, (tensor.shape[1] * num_bits) // 8),
-                device="meta",
-                dtype=torch.uint8,
-            )
-            if (
-                data_type == DataType.INT8
-                or data_type == DataType.INT4
-                or data_type == DataType.INT2
-            ):
-                scale_shift = torch.empty(
-                    (num_rows, 4),
-                    device="meta",
-                    dtype=torch.uint8,
-                )
-            else:
-                scale_shift = None
-        else:
-            if num_rows != tensor.shape[0]:
-                tensor = tensor[:num_rows, :]
-            if tensor.dtype == torch.float or tensor.dtype == torch.float16:
-                if data_type == DataType.FP16:
-                    if tensor.dtype == torch.float:
-                        tensor = tensor.half()
-                    quant_res = tensor.view(torch.uint8)
-                elif data_type == DataType.FP32:
-                    if tensor.dtype == torch.float16:
-                        tensor = tensor.float()
-                    quant_res = tensor.view(torch.uint8)
-                else:
-                    quant_res = (
-                        torch.ops.fbgemm.FloatOrHalfToFusedNBitRowwiseQuantizedSBHalf(
-                            tensor, num_bits
-                        )
-                    )
-            else:
-                raise Exception("Unsupported dtype: {tensor.dtype}")
-            if (
-                data_type == DataType.INT8
-                or data_type == DataType.INT4
-                or data_type == DataType.INT2
-            ):
-                quant_weight, scale_shift = (
-                    quant_res[:, :-4],
-                    quant_res[:, -4:],
-                )
-            else:
-                quant_weight, scale_shift = quant_res, None
-        table_name_to_quantized_weights[table_name] = (quant_weight, scale_shift)
-    return device
+    Returns:
+        int: max_batch_size
+    """
+    batch_size = int(os.environ.get("MAX_EXPORT_BATCH_SIZE", 512))
+    # compact with old trt batch size config
+    if "TRT_MAX_BATCH_SIZE" in os.environ:
+        # pyre-ignore [6]
+        batch_size = int(os.environ.get("TRT_MAX_BATCH_SIZE"))
+    return batch_size
 
 
-# pyre-ignore [9]
-embedding_modules.quantize_state_dict = _quantize_state_dict
+def allow_tf32(train_config: TrainConfig, backend: str) -> None:
+    """Set allow_tf32 flag for cudnn and cuda matmul."""
+    if backend == "nccl":
+        if train_config.HasField("cudnn_allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = train_config.cudnn_allow_tf32
+        if train_config.HasField("cuda_matmul_allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = train_config.cuda_matmul_allow_tf32

@@ -11,7 +11,6 @@
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from collections import OrderedDict
-from itertools import chain
 from queue import Queue
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -127,21 +126,46 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric.reset()
         return metric_results
 
-    def sparse_parameters(self) -> Iterable[nn.Parameter]:
+    def sparse_parameters(
+        self,
+    ) -> Tuple[Iterable[nn.Parameter], Iterable[nn.Parameter]]:
         """Get an iterator over sparse parameters of the module."""
         q = Queue()
         q.put(self)
-        parameters_list = []
+        trainable_parameters_list = []
+        frozen_parameters_list = []
         while not q.empty():
             m = q.get()
-            if isinstance(m, EmbeddingBagCollectionInterface) or isinstance(
-                m, EmbeddingCollectionInterface
-            ):
-                parameters_list.append(m.parameters())
+            if isinstance(m, EmbeddingBagCollectionInterface):
+                frozen_names = {
+                    f".{t.name}.weight"
+                    for t in m.embedding_bag_configs()
+                    # pyre-ignore [16]
+                    if not t.trainable
+                }
+                for name, param in m.named_parameters():
+                    frozen = any(map(lambda x: name.endswith(x), frozen_names))
+                    if frozen:
+                        frozen_parameters_list.append(param)
+                    else:
+                        trainable_parameters_list.append(param)
+            elif isinstance(m, EmbeddingCollectionInterface):
+                frozen_names = {
+                    f".{t.name}.weight"
+                    for t in m.embedding_configs()
+                    # pyre-ignore [16]
+                    if not t.trainable
+                }
+                for name, param in m.named_parameters():
+                    frozen = any(map(lambda x: name.endswith(x), frozen_names))
+                    if frozen:
+                        frozen_parameters_list.append(param)
+                    else:
+                        trainable_parameters_list.append(param)
             else:
                 for child in m.children():
                     q.put(child)
-        return chain.from_iterable(parameters_list)
+        return trainable_parameters_list, frozen_parameters_list
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model."""
@@ -187,11 +211,30 @@ TRAIN_FWD_TYPE = Tuple[torch.Tensor, TRAIN_OUT_TYPE]
 class TrainWrapper(BaseModule):
     """Model train wrapper for pipeline."""
 
-    def __init__(self, module: nn.Module) -> None:
+    def __init__(
+        self,
+        module: nn.Module,
+        device: Optional[torch.device] = None,
+        mixed_precision: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.model = module
         self.model.init_loss()
         self.model.init_metric()
+        self._device = device
+        self._device_type = "cpu"
+        if device is not None:
+            self._device_type = device.type
+        if mixed_precision is None or len(mixed_precision) == 0:
+            self._mixed_dtype = None
+        elif mixed_precision == "FP16":
+            self._mixed_dtype = torch.float16
+        elif mixed_precision == "BF16":
+            self._mixed_dtype = torch.bfloat16
+        else:
+            raise ValueError(
+                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
+            )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -205,9 +248,14 @@ class TrainWrapper(BaseModule):
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
         """
-        predictions = self.model.predict(batch)
-        losses = self.model.loss(predictions, batch)
-        total_loss = torch.stack(list(losses.values())).sum()
+        with torch.amp.autocast(
+            device_type=self._device_type,
+            dtype=self._mixed_dtype,
+            enabled=self._mixed_dtype is not None,
+        ):
+            predictions = self.model.predict(batch)
+            losses = self.model.loss(predictions, batch)
+            total_loss = torch.stack(list(losses.values())).sum()
 
         losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}
@@ -221,7 +269,12 @@ class ScriptWrapper(BaseModule):
         super().__init__()
         self.model = module
         self._features = self.model._features
-        self._data_parser = DataParser(self._features)
+        self._data_parser = DataParser(
+            self._features,
+            sampler_type=str(module.sampler_type)
+            if hasattr(module, "sampler_type")
+            else None,
+        )
 
     def get_batch(
         self,

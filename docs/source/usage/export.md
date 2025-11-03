@@ -1,5 +1,20 @@
 # 导出
 
+## export_config
+
+模型导出任务依赖pipeline.config中的export_config 配置
+
+```protobuf
+export_config {
+}
+```
+
+- exporter_type: 导出类型, latest | best ，默认latest
+  - latest 导出最新的模型
+  - best 导出最好的模型
+- best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
+- metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
+
 ## 导出命令
 
 ```bash
@@ -18,10 +33,12 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
-- QUANT_EMB: 对Emebdding参数进行量化，默认开启，INT8量化在大部分场景中对AUC等指标基本无损，且能大幅提升推理性能
+- QUANT_EMB: 对EmebddingBagCollection（非序列特征）参数进行量化，默认开启，INT8量化在大部分场景中对AUC等指标基本无损，且能大幅提升推理性能
   - **QUANT_EMB=INT8**：启用量化，默认已启用，并且默认为INT8量化，可以支持FP32，FP16，INT8，INT4，INT2
   - **QUANT_EMB=0**：关闭量化
-- INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间。必须在fg_mode=normal下使用，并且TorchEasyRec导出时需加上此环境变量
+- QUANT_EC_EMB: 对EmebddingCollection（序列特征）参数进行量化，默认关闭，INT8量化在大部分场景中对AUC等指标基本无损，且能大幅提升推理性能
+  - **QUANT_EC_EMB=INT8**：启用量化，默认关闭，可以支持FP32，FP16，INT8，INT4，INT2
+- INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间，默认关闭。必须在TorchEasyRec Processor的fg_mode=normal下使用
   - **INPUT_TILE=2**：user侧特征fg仅计算一次
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
 - ENABLE_AOT:

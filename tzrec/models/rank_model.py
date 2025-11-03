@@ -17,8 +17,11 @@ from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.grouped_auc import GroupedAUC
+from tzrec.metrics.grouped_xauc import GroupedXAUC
+from tzrec.metrics.xauc import XAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import div_no_nan
@@ -28,12 +31,25 @@ from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig
 from tzrec.utils.config_util import config_to_kwargs
 
+# repeat interleave session_id or grouping key for one-to-many rank sample
+TRAGET_REPEAT_INTERLEAVE_KEY = "__TRAGET_REPEAT_INTERLEAVE_KEY__"
+
 
 @torch.fx.wrap
 def _update_tensor_dict(
     tensor_dict: Dict[str, torch.Tensor], new_tensor: torch.Tensor, key: str
 ) -> None:
     tensor_dict[key] = new_tensor
+
+
+def _is_classification_loss(loss_cfg: LossConfig) -> bool:
+    loss_type = loss_cfg.WhichOneof("loss")
+    return loss_type in [
+        "binary_cross_entropy",
+        "softmax_cross_entropy",
+        "jrc_loss",
+        "binary_focal_loss",
+    ]
 
 
 class RankModel(BaseModel):
@@ -56,7 +72,7 @@ class RankModel(BaseModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
-        self._label_name = labels[0]
+        self._label_name = labels[0] if len(labels) > 0 else ""
         self._sample_weight_name = (
             sample_weights[0] if sample_weights else sample_weights
         )
@@ -67,7 +83,14 @@ class RankModel(BaseModel):
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(
-            self._features, list(self._base_model_config.feature_groups)
+            self._features,
+            list(self._base_model_config.feature_groups),
+            wide_embedding_dim=int(self.wide_embedding_dim)
+            if hasattr(self, "wide_embedding_dim")
+            else None,
+            wide_init_fn=str(self.wide_init_fn)
+            if hasattr(self, "wide_init_fn")
+            else None,
         )
 
         if self._base_model_config.HasField("variational_dropout"):
@@ -116,7 +139,7 @@ class RankModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         predictions = {}
         loss_type = loss_cfg.WhichOneof("loss")
-        if loss_type == "binary_cross_entropy":
+        if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
             assert num_class == 1, f"num_class must be 1 when loss type is {loss_type}"
             output = torch.squeeze(output, dim=1)
             predictions["logits" + suffix] = output
@@ -166,8 +189,17 @@ class RankModel(BaseModel):
         loss_name = loss_type + suffix
         if loss_type == "binary_cross_entropy":
             self._loss_modules[loss_name] = nn.BCEWithLogitsLoss(reduction=reduction)
+        elif loss_type == "binary_focal_loss":
+            self._loss_modules[loss_name] = BinaryFocalLoss(
+                gamma=loss_cfg.binary_focal_loss.gamma,
+                alpha=loss_cfg.binary_focal_loss.alpha,
+                reduction=reduction,
+            )
         elif loss_type == "softmax_cross_entropy":
-            self._loss_modules[loss_name] = nn.CrossEntropyLoss(reduction=reduction)
+            self._loss_modules[loss_name] = nn.CrossEntropyLoss(
+                reduction=reduction,
+                label_smoothing=loss_cfg.softmax_cross_entropy.label_smoothing,
+            )
         elif loss_type == "jrc_loss":
             assert num_class == 2, f"num_class must be 2 when loss type is {loss_type}"
             self._loss_modules[loss_name] = JRCLoss(
@@ -198,7 +230,7 @@ class RankModel(BaseModel):
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
-        if loss_type == "binary_cross_entropy":
+        if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
             pred = predictions["logits" + suffix]
             label = label.to(torch.float32)
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
@@ -210,7 +242,11 @@ class RankModel(BaseModel):
             pred = predictions["logits" + suffix]
             session_id = batch.sparse_features[BASE_DATA_GROUP][
                 loss_cfg.jrc_loss.session_name
-            ].values()
+            ].to_padded_dense(1)[:, 0]
+            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                session_id = session_id.repeat_interleave(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
             losses[loss_name] = self._loss_modules[loss_name](pred, label, session_id)
         elif loss_type == "l2_loss":
             pred = predictions["y" + suffix]
@@ -279,6 +315,12 @@ class RankModel(BaseModel):
                 f"num_class must less than 2 when metric type is {metric_type}"
             )
             self._metric_modules[metric_name] = GroupedAUC()
+        elif metric_type == "xauc":
+            self._metric_modules[metric_name] = XAUC(**metric_kwargs)
+        elif metric_type == "grouped_xauc":
+            self._metric_modules[metric_name] = GroupedXAUC(
+                metric_kwargs["max_pairs_per_group"]
+            )
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
@@ -303,7 +345,7 @@ class RankModel(BaseModel):
         metric_name = metric_type + suffix
 
         base_sparse_feat = None
-        if metric_type in ["grouped_auc"]:
+        if metric_type in ["grouped_auc", "grouped_xauc"]:
             base_sparse_feat = batch.sparse_features[BASE_DATA_GROUP].to_dict()
 
         if metric_type == "auc":
@@ -335,6 +377,23 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
+            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                grouping_key = grouping_key.repeat_interleave(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
+            self._metric_modules[metric_name].update(pred, label, grouping_key)
+        elif metric_type == "xauc":
+            pred = predictions["y" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
+        elif metric_type == "grouped_xauc":
+            pred = predictions["y" + suffix]
+            grouping_key = base_sparse_feat[
+                oneof_metric_cfg.grouping_key
+            ].to_padded_dense(1)[:, 0]
+            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                grouping_key = grouping_key.repeat_interleave(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         else:
             raise ValueError(f"{metric_type} is not supported for this model")

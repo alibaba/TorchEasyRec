@@ -29,6 +29,9 @@ from torch.distributed.checkpoint.default_planner import (
     _create_read_items,
 )
 
+from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
+from tzrec.protos import export_pb2
+from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
@@ -58,14 +61,44 @@ class PartialLoadPlanner(DefaultLoadPlanner):
     def create_local_plan(self) -> LoadPlan:
         """Create local load plan."""
         requests = []
+
+        # mapping old __BASE__.ec_list.0 to new __BASE__.ec_dict.{dim}
+        ec_compat_map = {}
+        # pyre-ignore [16]
+        for k, v in self.metadata.state_dict_metadata.items():
+            if k.endswith(".weight") and isinstance(v, TensorStorageMetadata):
+                for old_pattern, new_pattern in [
+                    ("mc_ec_list", "mc_ec_dict"),
+                    ("ec_list", "ec_dict"),
+                ]:
+                    if f".{old_pattern}." in k:
+                        parts = k.split(".")
+                        pattern_idx = parts.index(old_pattern)
+                        dim = v.size[1]
+                        ec_compat_map[
+                            f"{parts[pattern_idx - 1]}.{new_pattern}.{dim}"
+                        ] = f"{parts[pattern_idx - 1]}.{old_pattern}.{parts[pattern_idx + 1]}"  # NOQA
+
         # pyre-ignore [16]
         for fqn, obj in self.state_dict.items():
             meta_fqn = fqn
+
+            fqn_remap_set = set()
             if fqn in self._ckpt_param_map:
                 meta_fqn = self._ckpt_param_map[fqn]
+                fqn_remap_set.add(fqn)
                 logger.info(f"Remap restore state [{fqn}] from [{meta_fqn}]")
 
-            # pyre-ignore [16]
+            for ec_new, ec_old in ec_compat_map.items():
+                if ec_new in meta_fqn:
+                    new_meta_fqn = meta_fqn
+                    meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
+                    fqn_remap_set.add(fqn)
+                    logger.warning(
+                        f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
+                        "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
+                    )
+
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
@@ -79,7 +112,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             else:
                 read_items = _create_read_items(meta_fqn, md, obj)
 
-            if fqn in self._ckpt_param_map:
+            if fqn in fqn_remap_set:
                 read_items = [
                     replace(x, dest_index=replace(x.dest_index, fqn=fqn))
                     for x in read_items
@@ -138,6 +171,72 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
     return latest_ckpt_path, _get_checkpoint_step(latest_ckpt_path)
 
 
+def best_checkpoint(
+    model_dir: str,
+    export_config: export_pb2.ExportConfig,
+    eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+) -> Tuple[Optional[str], int]:
+    """Find best checkpoint under a directory.
+
+    Args:
+        model_dir: model directory
+        export_config: export_pb2.ExportConfig
+        eval_result_filename: evaluation result filename
+
+    Return:
+        latest_ckpt_path: latest checkpoint path.
+        latest_step: step of the latest checkpoint
+    """
+    eval_path = os.path.join(model_dir, eval_result_filename)
+    metric_name = None
+    if export_config.HasField("best_exporter_metric"):
+        metric_name = export_config.best_exporter_metric
+    if os.path.isfile(eval_path):
+        step_metric = {}
+        with open(eval_path, "r") as f:
+            for line in f:
+                if line:
+                    metric = json.loads(line.strip())
+                    step = metric["global_step"]
+                    del metric["global_step"]
+                    if len(metric) == 1 and metric_name is None:
+                        step_metric[step] = metric.values()[0]
+                    else:
+                        if metric_name not in metric:
+                            raise ValueError(
+                                f"checkpoint {eval_result_filename}"
+                                f" not find {metric_name} metric."
+                            )
+                        step_metric[step] = metric[metric_name]
+        if len(step_metric) < 1:
+            logger.info(
+                f"not find eval result in {eval_result_filename}, "
+                f"will search latest checkpoint"
+            )
+            return latest_checkpoint(model_dir)
+        if export_config.metric_larger_is_better:
+            sorted_mertic = sorted(
+                step_metric.items(), key=lambda x: x[1], reverse=True
+            )
+        else:
+            sorted_mertic = sorted(
+                step_metric.items(), key=lambda x: x[1], reverse=False
+            )
+        max_metric_step = sorted_mertic[0][0]
+        best_ckpt_path = os.path.join(model_dir, f"model.ckpt-{max_metric_step}")
+        if os.path.exists(best_ckpt_path):
+            logger.info(f"find best checkpoint is {best_ckpt_path}")
+            return best_ckpt_path, max_metric_step
+        else:
+            raise ValueError(
+                f"find best metric is {max_metric_step} step,"
+                f"but not find {best_ckpt_path}."
+            )
+    else:
+        logger.info(f"not find {eval_result_filename}, will search latest checkpoint")
+        return latest_checkpoint(model_dir)
+
+
 def restore_model(
     checkpoint_dir: str,
     model: nn.Module,
@@ -157,9 +256,19 @@ def restore_model(
         logger.info(f"Restoring checkpoint from {checkpoint_dir}...")
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
+
+    meta_path = os.path.join(checkpoint_dir, "meta")
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
-    if os.path.exists(model_ckpt_path):
+
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+    if not meta.get("load_model", True):
+        pass
+    elif os.path.exists(model_ckpt_path):
         if is_local_rank_zero:
             logger.info(f"Restoring model state from {model_ckpt_path}...")
         state_dict = model.state_dict()
@@ -169,16 +278,39 @@ def restore_model(
             planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
         )
         model.load_state_dict(state_dict)
-    if optimizer and os.path.exists(optim_ckpt_path):
-        if is_local_rank_zero:
-            logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
-        state_dict = optimizer.state_dict()
-        load(
-            state_dict,
-            checkpoint_id=optim_ckpt_path,
-            planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
+    else:
+        raise RuntimeError(f"model_ckpt_path[{model_ckpt_path}] not exists.")
+
+    if optimizer:
+        if not meta.get("load_optim", True):
+            pass
+        elif os.path.exists(optim_ckpt_path):
+            if is_local_rank_zero:
+                logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
+            state_dict = optimizer.state_dict()
+            load(
+                state_dict,
+                checkpoint_id=optim_ckpt_path,
+                planner=PartialLoadPlanner(ckpt_param_map_path=ckpt_param_map_path),
+            )
+            optimizer.load_state_dict(state_dict)
+        else:
+            if is_local_rank_zero:
+                logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
+
+    if has_dynamicemb:
+        from dynamicemb.dump_load import DynamicEmbLoad
+
+        logger.info(f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding...")
+        DynamicEmbLoad(
+            os.path.join(checkpoint_dir, "dynamicemb"),
+            model,
+            table_names=meta.get("dynamicemb_load_table_names", None),
+            optim=meta.get("dynamicemb_load_optim", optimizer is not None),
         )
-        optimizer.load_state_dict(state_dict)
+        logger.info(
+            f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
+        )
 
 
 def save_model(
@@ -198,6 +330,14 @@ def save_model(
         save(
             optimizer.state_dict(),
             checkpoint_id=os.path.join(checkpoint_dir, "optimizer"),
+        )
+    if has_dynamicemb:
+        from dynamicemb.dump_load import DynamicEmbDump
+
+        DynamicEmbDump(
+            os.path.join(checkpoint_dir, "dynamicemb"),
+            model,
+            optim=optimizer is not None,
         )
     # save model plan
     if hasattr(model, "_plan") and model._plan is not None:

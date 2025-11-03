@@ -11,6 +11,7 @@
 
 
 import math
+import os
 import tempfile
 import unittest
 from typing import Any, Dict, Iterator, List, Optional
@@ -119,6 +120,7 @@ class DatasetTest(unittest.TestCase):
         self._temp_files = []
 
     def tearDown(self):
+        os.environ.pop("INPUT_TILE", None)
         for f in self._temp_files:
             f.close()
         utils.SERVER_LAUNCHED = False
@@ -176,8 +178,19 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (8,))
         self.assertEqual(batch.labels["label"].size(), (4,))
 
-    @parameterized.expand([[False], [True]])
-    def test_dataset_with_sampler(self, force_base_data_group):
+    @parameterized.expand(
+        [
+            [False, Mode.EVAL, False],
+            [True, Mode.EVAL, False],
+            [False, Mode.PREDICT, False],
+            [True, Mode.PREDICT, False],
+            [False, Mode.PREDICT, True],
+            [True, Mode.PREDICT, True],
+        ]
+    )
+    def test_dataset_with_sampler(self, force_base_data_group, mode, input_tile):
+        if input_tile:
+            os.environ["INPUT_TILE"] = "2"
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
         f.write("id:int64\tweight:float\tattrs:string\n")
@@ -195,19 +208,29 @@ class DatasetTest(unittest.TestCase):
         ]
         feature_cfgs = [
             feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="int_a", expression="item:int_a", num_buckets=2000
+                )
             ),
             feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="str_c", expression="item:str_c", num_buckets=3000
+                )
             ),
             feature_pb2.FeatureConfig(
-                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="float_b", expression="item:float_b"
+                )
             ),
             feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(feature_name="int_d")
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="int_d", expression="user:int_d", num_buckets=1000
+                )
             ),
             feature_pb2.FeatureConfig(
-                raw_feature=feature_pb2.RawFeature(feature_name="float_d")
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="float_d", expression="user:float_d"
+                )
             ),
         ]
         features = create_features(
@@ -220,7 +243,7 @@ class DatasetTest(unittest.TestCase):
             data_config=data_pb2.DataConfig(
                 batch_size=4,
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_mode=data_pb2.FgMode.FG_NONE,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
                 label_fields=["label"],
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f.name,
@@ -233,6 +256,7 @@ class DatasetTest(unittest.TestCase):
             features=features,
             input_path="",
             input_fields=input_fields,
+            mode=mode,
         )
         dataset.launch_sampler_cluster(2)
         dataloader = DataLoader(
@@ -244,49 +268,162 @@ class DatasetTest(unittest.TestCase):
         )
         iterator = iter(dataloader)
         batch = next(iterator)
-        if not force_base_data_group:
-            self.assertEqual(batch.dense_features[BASE_DATA_GROUP].keys(), ["float_d"])
-            self.assertEqual(
-                batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
-            )
-            self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].keys(), ["int_d"])
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].values().size(), (4,)
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (4,)
-            )
-            self.assertEqual(batch.dense_features[NEG_DATA_GROUP].keys(), ["float_b"])
-            self.assertEqual(
-                batch.dense_features[NEG_DATA_GROUP].values().size(), (12, 1)
-            )
-            self.assertEqual(
-                batch.sparse_features[NEG_DATA_GROUP].keys(), ["int_a", "str_c"]
-            )
-            self.assertEqual(
-                batch.sparse_features[NEG_DATA_GROUP].values().size(), (24,)
-            )
-            self.assertEqual(
-                batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (24,)
-            )
+        if input_tile:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].keys(), ["float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].keys(), ["int_d"]
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].keys(), ["float_b"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].keys(), ["int_a", "str_c"]
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].keys(), ["float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].keys(), ["int_d"]
+                )
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].keys(), ["int_a", "str_c"]
+                )
         else:
-            self.assertEqual(
-                batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b", "float_d"]
-            )
-            self.assertEqual(
-                batch.dense_features[BASE_DATA_GROUP].values().size(), (12, 2)
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].keys(),
-                ["int_a", "str_c", "int_d"],
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].values().size(), (28,)
-            )
-            self.assertEqual(
-                batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (36,)
-            )
-        self.assertEqual(batch.labels["label"].size(), (4,))
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].keys(), ["float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].keys(), ["int_d"]
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].keys(), ["float_b"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].keys(), ["int_a", "str_c"]
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].keys(), ["float_b", "float_d"]
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].keys(),
+                    ["int_a", "str_c", "int_d"],
+                )
+
+        if mode == Mode.EVAL:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].values().size(), (12, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].values().size(), (24,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (24,)
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (12, 2)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (28,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (36,)
+                )
+            self.assertEqual(batch.labels["label"].size(), (4,))
+        elif input_tile:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (4, 1),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (4,),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].lengths().size(),
+                    (4,),
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].values().size(), (8,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (8,)
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (4, 1),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].values().size(),
+                    (4,),
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP + "_user"].lengths().size(),
+                    (4,),
+                )
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (8,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (8,)
+                )
+        else:
+            if not force_base_data_group:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (4,)
+                )
+                self.assertEqual(
+                    batch.dense_features[NEG_DATA_GROUP].values().size(), (4, 1)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].values().size(), (8,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[NEG_DATA_GROUP].lengths().size(), (8,)
+                )
+            else:
+                self.assertEqual(
+                    batch.dense_features[BASE_DATA_GROUP].values().size(), (4, 2)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].values().size(), (12,)
+                )
+                self.assertEqual(
+                    batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (12,)
+                )
 
     def test_dataset_with_sample_mask(self):
         input_fields = [

@@ -15,6 +15,7 @@ import os
 import time
 from typing import Any, Dict, List, Tuple
 
+from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.tests.utils import _standalone
 from tzrec.utils import config_util, misc_util
 
@@ -80,6 +81,10 @@ def _modify_pipline_config(
     pipeline_config.train_input_path = train_input_path
     eval_input_path = pipeline_config.eval_input_path.format(PROJECT=project)
     pipeline_config.eval_input_path = eval_input_path
+    if "ODPS_DATA_QUOTA_NAME" in os.environ:
+        pipeline_config.data_config.odps_data_quota_name = os.environ[
+            "ODPS_DATA_QUOTA_NAME"
+        ]
 
     if pipeline_config.data_config.HasField("negative_sampler"):
         sampler = pipeline_config.data_config.negative_sampler
@@ -129,7 +134,7 @@ def _benchmark_train_eval(
         f"--log_dir {log_path} -r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {run_config_path}"
     )
-    return misc_util.run_cmd(cmd_str, log_path + ".log", timeout=6000)
+    return misc_util.run_cmd(cmd_str, log_path + ".log", timeout=20000)
 
 
 def _get_config_paths(pipeline_config_paths: str) -> List[str]:
@@ -156,9 +161,15 @@ def _create_directory(path: str) -> str:
 
 def _get_train_metrics(path: str) -> Dict[str, Any]:
     """From model path we get eval metrics."""
-    eval_file = os.path.join(path, "train_eval_result.txt")
-    f = open(eval_file)
-    metrics = json.load(f)
+    eval_file = os.path.join(path, TRAIN_EVAL_RESULT_FILENAME)
+    last_eval_result = None
+    with open(eval_file, "r") as f:
+        for line in f:
+            if line.strip():
+                last_eval_result = line.strip()
+    if last_eval_result is None:
+        return {}
+    metrics = json.loads(last_eval_result)
     return metrics
 
 

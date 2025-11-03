@@ -33,6 +33,17 @@ message GroupedAUC {
     required string grouping_key = 1;
 }
 
+message XAUC {
+    optional float sample_ratio = 1 [default = 1e-3];
+    optional uint64 max_pairs = 2;
+    optional bool in_batch = 3 [default = false];
+}
+
+message GroupedXAUC {
+    required string grouping_key = 1;
+    optional uint64 max_pairs_per_group = 2 [default = 100];
+
+}
 
 message MetricConfig {
     oneof metric {
@@ -43,5 +54,7 @@ message MetricConfig {
         MeanSquaredError mean_squared_error = 5;
         Accuracy accuracy = 6;
         GroupedAUC grouped_auc = 7;
+        XAUC xauc = 8;
+        GroupedXAUC grouped_xauc = 9;
     }
 }

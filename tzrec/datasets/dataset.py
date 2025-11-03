@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -16,7 +17,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import pyarrow as pa
 from torch import distributed as dist
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
@@ -174,6 +175,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._mode = mode
         self._debug_level = debug_level
         self._enable_hstu = data_config.enable_hstu
+        self.sampler_type = (
+            self._data_config.WhichOneof("sampler")
+            if self._data_config.HasField("sampler")
+            else None
+        )
 
         self._data_parser = DataParser(
             features=features,
@@ -183,9 +189,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sample_weights=list(data_config.sample_weight_fields)
             if self._mode != Mode.PREDICT
             else None,
-            is_training=self._mode == Mode.TRAIN,
+            mode=self._mode,
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
+            sampler_type=self.sampler_type,
         )
 
         self._input_fields = None
@@ -446,6 +453,11 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._shuffle = shuffle
         self._shuffle_buffer_size = shuffle_buffer_size
 
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        raise NotImplementedError
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
@@ -502,6 +514,10 @@ class BaseReader(metaclass=_reader_meta_cls):
             random.shuffle(shuffle_buffer)
             for data_dict in shuffle_buffer:
                 yield data_dict
+
+    def num_files(self) -> Optional[int]:
+        """Get number of files in the dataset."""
+        return None
 
 
 class BaseWriter(metaclass=_writer_meta_cls):
@@ -591,3 +607,93 @@ def create_writer(
     # pyre-ignore [16]
     writer = BaseWriter.create_class(writer_cls_name)(output_path=output_path, **kwargs)
     return writer
+
+
+def create_dataloader(
+    data_config: data_pb2.DataConfig,
+    features: List[BaseFeature],
+    input_path: str,
+    reserved_columns: Optional[List[str]] = None,
+    mode: Mode = Mode.TRAIN,
+    gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
+    debug_level: int = 0,
+) -> DataLoader:
+    """Build dataloader.
+
+    Args:
+        data_config (DataConfig): dataloader config.
+        features (list): list of feature.
+        input_path (str): input data path.
+        reserved_columns (list): reserved columns in predict mode.
+        mode (Mode): train or eval or predict.
+        gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
+        debug_level (int): dataset debug level, when mode=predict and
+            debug_level > 0, will dump fg encoded data to debug_str
+
+    Return:
+        dataloader (dataloader): a DataLoader.
+    """
+    dataset_name = data_pb2.DatasetType.Name(data_config.dataset_type)
+    # pyre-ignore [16]
+    dataset_cls = BaseDataset.create_class(dataset_name)
+    dataset = dataset_cls(
+        data_config=data_config,
+        features=features,
+        input_path=input_path,
+        reserved_columns=reserved_columns,
+        mode=mode,
+        debug_level=debug_level,
+    )
+
+    kwargs = {}
+    if data_config.num_workers < 1:
+        num_workers = 1
+    else:
+        num_workers = data_config.num_workers
+        # check number of files is valid or not for file based dataset.
+        num_files = dataset._reader.num_files()
+        if num_files is not None:
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            if num_files >= world_size:
+                num_files_per_worker = num_files // world_size
+                if num_files_per_worker < num_workers:
+                    logger.info(
+                        f"data_config.num_workers reset to {num_files_per_worker}"
+                    )
+                    num_workers = num_files_per_worker
+            else:
+                raise ValueError(
+                    f"Number of files in the dataset[{input_path}] must greater "
+                    f"than world_size: {world_size}, but got {num_files}"
+                )
+
+        kwargs["num_workers"] = num_workers
+        kwargs["persistent_workers"] = True
+
+    if mode == Mode.TRAIN:
+        # When in train_and_eval mode, use 2x worker in gl cluster
+        # for train_dataloader and eval_dataloader
+        dataset.launch_sampler_cluster(num_client_per_rank=num_workers * 2)
+    else:
+        if gl_cluster:
+            # Reuse the gl cluster for eval_dataloader
+            dataset.launch_sampler_cluster(
+                num_client_per_rank=num_workers * 2,
+                client_id_bias=num_workers,
+                cluster=gl_cluster,
+            )
+        else:
+            dataset.launch_sampler_cluster(num_client_per_rank=num_workers)
+
+    dataloader = DataLoader(
+        dataset=dataset,
+        batch_size=None,
+        pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
+        collate_fn=lambda x: x,
+        **kwargs,
+    )
+    # For PyTorch versions 2.6 and above, we initialize the data iterator before
+    # beginning the training process to avoid potential CUDA-related issues following
+    # model saving.
+    iter(dataloader)
+    return dataloader

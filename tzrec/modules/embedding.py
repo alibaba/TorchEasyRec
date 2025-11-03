@@ -9,11 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from functools import partial  # NOQA
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -39,12 +42,20 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
-from tzrec.utils.fx_util import fx_int_item
+from tzrec.utils.fx_util import (
+    fx_int_item,
+    fx_mark_keyed_tensor,
+    fx_mark_seq_len,
+    fx_mark_tensor,
+)
 
 EMPTY_KJT = KeyedJaggedTensor.empty()
 
 
 torch.fx.wrap(fx_int_item)
+torch.fx.wrap(fx_mark_keyed_tensor)
+torch.fx.wrap(fx_mark_tensor)
+torch.fx.wrap(fx_mark_seq_len)
 
 
 @torch.fx.wrap
@@ -130,6 +141,7 @@ class EmbeddingGroup(nn.Module):
         features (list): list of features.
         feature_groups (list): list of feature group config.
         wide_embedding_dim (int, optional): wide group feature embedding dim.
+        wide_init_fn (str, optional): wide embedding table init function.
         device (torch.device): embedding device, default is meta.
     """
 
@@ -138,6 +150,7 @@ class EmbeddingGroup(nn.Module):
         features: List[BaseFeature],
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -201,6 +214,7 @@ class EmbeddingGroup(nn.Module):
                 features,
                 feature_groups=v,
                 wide_embedding_dim=wide_embedding_dim,
+                wide_init_fn=wide_init_fn,
                 device=device,
             )
 
@@ -232,7 +246,9 @@ class EmbeddingGroup(nn.Module):
                 feature_emb = self.emb_impls[impl_key]
                 feature_dim.update(feature_emb.group_feature_dims(group_name))
                 if group_name in self._group_name_to_seq_encoders:
-                    seq_encoders = self._group_name_to_seq_encoders[group_name]
+                    seq_encoders = cast(
+                        nn.ModuleList, self._group_name_to_seq_encoders[group_name]
+                    )
                     for i, seq_encoder in enumerate(seq_encoders):
                         feature_dim[f"{group_name}_seq_encoder_{i}"] = (
                             seq_encoder.output_dim()
@@ -559,6 +575,7 @@ class EmbeddingGroupImpl(nn.Module):
         features (list): list of features.
         feature_groups (list): list of feature group config.
         wide_embedding_dim (int, optional): wide group feature embedding dim.
+        wide_init_fn (str, optional): wide embedding table init function.
         device (torch.device): embedding device, default is meta.
     """
 
@@ -567,6 +584,7 @@ class EmbeddingGroupImpl(nn.Module):
         features: List[BaseFeature],
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -580,6 +598,7 @@ class EmbeddingGroupImpl(nn.Module):
         mc_emb_bag_configs = OrderedDict()
         mc_modules = OrderedDict()
         dense_embedding_configs = []
+        self._emb_bag_constraints = OrderedDict()
         self.has_sparse = False
         self.has_mc_sparse = False
         self.has_dense = False
@@ -589,6 +608,7 @@ class EmbeddingGroupImpl(nn.Module):
         emb_bag_configs_user = OrderedDict()
         mc_emb_bag_configs_user = OrderedDict()
         mc_modules_user = OrderedDict()
+        self._emb_bag_constraints_user = OrderedDict()
         self.has_sparse_user = False
         self.has_mc_sparse_user = False
 
@@ -642,8 +662,11 @@ class EmbeddingGroupImpl(nn.Module):
                         emb_bag_config.embedding_dim = output_dim = (
                             wide_embedding_dim or 4
                         )
+                        if wide_init_fn:
+                            emb_bag_config.init_fn = eval(f"partial({wide_init_fn})")
                     # we may modify ebc name at feat_to_group_to_emb_name, e.g., wide
                     emb_bag_config.name = feat_to_group_to_emb_name[name][group_name]
+                    const = feature.parameter_constraints(emb_bag_config)
 
                     if need_input_tile_emb and feature.is_user_feat:
                         _add_embedding_bag_config(
@@ -657,8 +680,13 @@ class EmbeddingGroupImpl(nn.Module):
                                 mc_modules_user, emb_bag_config.name, mc_module
                             )
                             self.has_mc_sparse_user = True
+                            # mc module not support const now
                         else:
                             self.has_sparse_user = True
+                            if const is not None:
+                                self._emb_bag_constraints_user[emb_bag_config.name] = (
+                                    const
+                                )
                     else:
                         _add_embedding_bag_config(
                             emb_bag_configs=mc_emb_bag_configs
@@ -669,8 +697,11 @@ class EmbeddingGroupImpl(nn.Module):
                         if mc_module:
                             _add_mc_module(mc_modules, emb_bag_config.name, mc_module)
                             self.has_mc_sparse = True
+                            # mc module not support const now
                         else:
                             self.has_sparse = True
+                            if const is not None:
+                                self._emb_bag_constraints[emb_bag_config.name] = const
 
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_bag_config.name
@@ -699,6 +730,7 @@ class EmbeddingGroupImpl(nn.Module):
                 self._group_to_shared_feature_names[group_name] = shared_feature_names
             self._group_total_dim[group_name] = total_dim
             self._group_feature_output_dims[group_name] = feature_output_dims
+        self._all_group_str = "__".join(self._group_to_feature_names.keys())
 
         self.ebc = EmbeddingBagCollection(list(emb_bag_configs.values()), device=device)
         if self.has_mc_sparse:
@@ -743,6 +775,17 @@ class EmbeddingGroupImpl(nn.Module):
         """Total output dimension of a feature group."""
         return self._group_total_dim[group_name]
 
+    def parameter_constraints(
+        self, prefix: str = ""
+    ) -> Dict[str, ParameterConstraints]:
+        """Embedding parameter constraint."""
+        constraints = {}
+        for k, v in self._emb_bag_constraints.items():
+            constraints[f"{prefix}ebc.{k}"] = v
+        for k, v in self._emb_bag_constraints_user.items():
+            constraints[f"{prefix}ebc_user.{k}"] = v
+        return constraints
+
     def forward(
         self,
         sparse_feature: KeyedJaggedTensor,
@@ -764,34 +807,41 @@ class EmbeddingGroupImpl(nn.Module):
         """
         kts: List[KeyedTensor] = []
         if self.has_sparse:
-            kts.append(self.ebc(sparse_feature))
+            kt = self.ebc(sparse_feature)
+            fx_mark_keyed_tensor(self._all_group_str + "__ebc", kt)
+            kts.append(kt)
 
         if self.has_mc_sparse:
-            kts.append(self.mc_ebc(sparse_feature)[0])
+            kt = self.mc_ebc(sparse_feature)[0]
+            fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc", kt)
+            kts.append(kt)
 
         # do user-side embedding input-tile
         if self.has_sparse_user:
             keyed_tensor_user = self.ebc_user(sparse_feature_user)
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
-            keyed_tensor_user_tile = KeyedTensor(
+            kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            kts.append(keyed_tensor_user_tile)
+            fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", kt)
+            kts.append(kt)
 
         # do user-side mc embedding input-tile
         if self.has_mc_sparse_user:
             keyed_tensor_user = self.mc_ebc_user(sparse_feature_user)[0]
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
-            keyed_tensor_user_tile = KeyedTensor(
+            kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            kts.append(keyed_tensor_user_tile)
+            fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc_user", kt)
+            kts.append(kt)
 
         if self.has_dense:
+            fx_mark_keyed_tensor(self._all_group_str + "__dense", dense_feature)
             if self.has_dense_embedding:
                 kts.append(self.dense_ec(dense_feature))
             else:
@@ -1036,6 +1086,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dim_to_emb_configs = defaultdict(OrderedDict)
         dim_to_mc_emb_configs = defaultdict(OrderedDict)
         dim_to_mc_modules = defaultdict(OrderedDict)
+        self._dim_to_emb_constraints = defaultdict(OrderedDict)
         self.has_sparse = False
         self.has_mc_sparse = False
         self.has_dense = False
@@ -1046,6 +1097,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dim_to_emb_configs_user = defaultdict(OrderedDict)
         dim_to_mc_emb_configs_user = defaultdict(OrderedDict)
         dim_to_mc_modules_user = defaultdict(OrderedDict)
+        self._dim_to_emb_constraints_user = defaultdict(OrderedDict)
         self.has_sparse_user = False
         self.has_mc_sparse_user = False
         self.has_mulval_seq_user = False
@@ -1097,6 +1149,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     # we may/could modify ec name at feat_to_group_to_emb_name
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
                     embedding_dim = emb_config.embedding_dim
+                    const = feature.parameter_constraints(emb_config)
 
                     if need_input_tile_emb and feature.is_user_feat:
                         emb_configs = (
@@ -1115,8 +1168,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 mc_module,
                             )
                             self.has_mc_sparse_user = True
+                            # mc module not support const now
                         else:
                             self.has_sparse_user = True
+                            if const is not None:
+                                self._dim_to_emb_constraints_user[embedding_dim][
+                                    emb_config.name
+                                ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq_user = True
                     else:
@@ -1136,8 +1194,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 mc_module,
                             )
                             self.has_mc_sparse = True
+                            # mc module not support const now
                         else:
                             self.has_sparse = True
+                            if const is not None:
+                                self._dim_to_emb_constraints[embedding_dim][
+                                    emb_config.name
+                                ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq = True
 
@@ -1180,37 +1243,35 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self._group_output_dims[f"{group_name}.sequence"] = sequence_dims
             self._group_output_dims[group_name] = output_dims
 
-        self.ec_list = nn.ModuleList()
-        for _, emb_configs in dim_to_emb_configs.items():
-            self.ec_list.append(
-                EmbeddingCollection(list(emb_configs.values()), device=device)
+        self.ec_dict = nn.ModuleDict()
+        for k, emb_configs in dim_to_emb_configs.items():
+            self.ec_dict[str(k)] = EmbeddingCollection(
+                list(emb_configs.values()), device=device
             )
 
-        self.mc_ec_list = nn.ModuleList()
+        self.mc_ec_dict = nn.ModuleDict()
         for k, emb_configs in dim_to_mc_emb_configs.items():
-            self.mc_ec_list.append(
-                ManagedCollisionEmbeddingCollection(
+            self.mc_ec_dict[str(k)] = ManagedCollisionEmbeddingCollection(
+                EmbeddingCollection(list(emb_configs.values()), device=device),
+                ManagedCollisionCollection(
+                    dim_to_mc_modules[k], list(emb_configs.values())
+                ),
+            )
+
+        if need_input_tile_emb:
+            self.ec_dict_user = nn.ModuleDict()
+            for k, emb_configs in dim_to_emb_configs_user.items():
+                self.ec_dict_user[str(k)] = EmbeddingCollection(
+                    list(emb_configs.values()), device=device
+                )
+
+            self.mc_ec_dict_user = nn.ModuleDict()
+            for k, emb_configs in dim_to_mc_emb_configs_user.items():
+                self.mc_ec_dict_user[str(k)] = ManagedCollisionEmbeddingCollection(
                     EmbeddingCollection(list(emb_configs.values()), device=device),
                     ManagedCollisionCollection(
-                        dim_to_mc_modules[k], list(emb_configs.values())
+                        dim_to_mc_modules_user[k], list(emb_configs.values())
                     ),
-                )
-            )
-        if need_input_tile_emb:
-            self.ec_list_user = nn.ModuleList()
-            for _, emb_configs in dim_to_emb_configs_user.items():
-                self.ec_list_user.append(
-                    EmbeddingCollection(list(emb_configs.values()), device=device)
-                )
-            self.mc_ec_list_user = nn.ModuleList()
-            for k, emb_configs in dim_to_mc_emb_configs_user.items():
-                self.mc_ec_list_user.append(
-                    ManagedCollisionEmbeddingCollection(
-                        EmbeddingCollection(list(emb_configs.values()), device=device),
-                        ManagedCollisionCollection(
-                            dim_to_mc_modules_user[k], list(emb_configs.values())
-                        ),
-                    )
                 )
 
     def group_dims(self, group_name: str) -> List[int]:
@@ -1231,6 +1292,19 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         """Total output dimension of all feature group."""
         return self._group_total_dim
 
+    def parameter_constraints(
+        self, prefix: str = ""
+    ) -> Dict[str, ParameterConstraints]:
+        """Embedding parameter constraints."""
+        constraints = {}
+        for dim, emb_constraints in self._dim_to_emb_constraints.items():
+            for k, v in emb_constraints.items():
+                constraints[f"{prefix}ec_dict.{dim}.{k}"] = v
+        for dim, emb_constraints in self._dim_to_emb_constraints_user.items():
+            for k, v in emb_constraints.items():
+                constraints[f"{prefix}ec_dict_user.{dim}.{k}"] = v
+        return constraints
+
     def has_group(self, group_name: str) -> bool:
         """Check the feature group exist or not."""
         true_name = group_name.split(".")[0] if "." in group_name else group_name
@@ -1250,22 +1324,22 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
-            for ec in self.ec_list:
+            for ec in self.ec_dict.values():
                 sparse_jt_dict_list.append(ec(sparse_feature))
 
         if self.has_mc_sparse:
-            for ec in self.mc_ec_list:
+            for ec in self.mc_ec_dict.values():
                 sparse_jt_dict_list.append(ec(sparse_feature)[0])
 
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
         if self.has_sparse_user:
-            for ec in self.ec_list_user:
+            for ec in self.ec_dict_user.values():
                 sparse_jt_dict_list.append(ec(sparse_feature_user))
 
         if self.has_mc_sparse_user:
-            for ec in self.mc_ec_list_user:
+            for ec in self.mc_ec_dict_user.values():
                 sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
 
         if self.has_mulval_seq_user:
@@ -1355,10 +1429,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         )
 
         results = {}
+        sparse_query_cache: Dict[str, torch.Tensor] = {}
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
+            query_t_keys = []
             for info in v:
-                if info.is_sparse:
+                if info.name in sparse_query_cache:
+                    query_t = sparse_query_cache[info.name]
+                elif info.is_sparse:
                     query_jt = jt_dict[info.name]
                     if info.value_dim == 1:
                         # for single-value id feature
@@ -1372,14 +1450,19 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             query_t = torch.nan_to_num(query_t, nan=0.0)
                     if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
+                    sparse_query_cache[info.name] = query_t
                 else:
                     query_t = dense_t_dict[info.name]
                 query_t_list.append(query_t)
+                query_t_keys.append(info.name)
             if len(query_t_list) > 0:
-                results[f"{group_name}.query"] = torch.cat(query_t_list, dim=1)
+                query_cat_t = torch.cat(query_t_list, dim=1)
+                fx_mark_tensor(f"{group_name}__query", query_cat_t, keys=query_t_keys)
+                results[f"{group_name}.query"] = query_cat_t
 
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
+            seq_t_keys = []
 
             group_sequence_length = 1
             for i, info in enumerate(v):
@@ -1399,20 +1482,24 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     group_sequence_length = fx_int_item(torch.max(sequence_length))
 
                     if need_tile:
-                        results[f"{group_name}.sequence_length"] = sequence_length.tile(
-                            tile_size
-                        )
-                    else:
-                        results[f"{group_name}.sequence_length"] = sequence_length
+                        sequence_length = sequence_length.tile(tile_size)
+                    fx_mark_seq_len(f"{group_name}__sequence_length", sequence_length)
+                    results[f"{group_name}.sequence_length"] = sequence_length
 
-                jt = jt.to_padded_dense(group_sequence_length)
+                if int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1:
+                    seq_t = jt.values()
+                else:
+                    seq_t = jt.to_padded_dense(group_sequence_length)
 
                 if need_tile:
-                    jt = jt.tile(tile_size, 1, 1)
-                seq_t_list.append(jt)
+                    seq_t = seq_t.tile(tile_size, 1, 1)
+                seq_t_list.append(seq_t)
+                seq_t_keys.append(info.name)
 
             if seq_t_list:
-                results[f"{group_name}.sequence"] = torch.cat(seq_t_list, dim=2)
+                seq_cat_t = torch.cat(seq_t_list, dim=2)
+                fx_mark_tensor(f"{group_name}__sequence", seq_cat_t, keys=seq_t_keys)
+                results[f"{group_name}.sequence"] = seq_cat_t
 
         return results
 

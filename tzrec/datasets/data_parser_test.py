@@ -346,7 +346,13 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
-    def _create_test_fg_feature_cfgs(self, tag_b_weighted=False, tag_b_seq=False):
+    def _create_test_fg_feature_cfgs(
+        self,
+        tag_b_weighted=False,
+        tag_b_seq=False,
+        with_const=False,
+        with_stub_feat=False,
+    ):
         seq_sub_feas = [
             feature_pb2.SeqFeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -373,6 +379,16 @@ class DataParserTest(unittest.TestCase):
                         value_dim=0,
                     )
                 ),
+            )
+        if with_stub_feat:
+            seq_sub_feas.append(
+                feature_pb2.SeqFeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="f_cat_a_stub",
+                        expression="item:cat_a",
+                        stub_type=True,
+                    )
+                )
             )
         feature_cfgs = [
             feature_pb2.FeatureConfig(
@@ -414,17 +430,37 @@ class DataParserTest(unittest.TestCase):
                 )
             ),
         ]
+        if with_const:
+            feature_cfgs.append(
+                feature_pb2.FeatureConfig(
+                    lookup_feature=feature_pb2.LookupFeature(
+                        feature_name="f_lookup_b", map="user:map_a", key="const:1"
+                    )
+                ),
+            )
+        if with_stub_feat:
+            feature_cfgs.append(
+                feature_pb2.FeatureConfig(
+                    combo_feature=feature_pb2.ComboFeature(
+                        feature_name="f_combo_a",
+                        expression=["feature:click_seq__f_cat_a_stub", "item:cat_a"],
+                        hash_bucket_size=100,
+                    )
+                ),
+            )
         return feature_cfgs
 
     @parameterized.expand(
         [
-            [FgMode.FG_NORMAL, False],
-            [FgMode.FG_DAG, False],
-            [FgMode.FG_NORMAL, True],
-            [FgMode.FG_DAG, True],
+            [FgMode.FG_NORMAL, False, False],
+            [FgMode.FG_DAG, False, False],
+            [FgMode.FG_NORMAL, True, False],
+            [FgMode.FG_DAG, True, False],
+            [FgMode.FG_NORMAL, False, True],
+            [FgMode.FG_DAG, False, True],
         ]
     )
-    def test_fg(self, fg_mode, weigted_id):
+    def test_fg(self, fg_mode, weigted_id, complex_type=False):
         feature_cfgs = self._create_test_fg_feature_cfgs(
             tag_b_weighted=weigted_id, tag_b_seq=True
         )
@@ -443,9 +479,38 @@ class DataParserTest(unittest.TestCase):
                 "tag_b",
             ],
         )
-
-        data = data_parser.parse(
-            input_data={
+        if complex_type:
+            input_data = {
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(
+                    [{4: 0.1, 5: 0.2}, {}, {6: 0.3}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                )
+                if weigted_id
+                else pa.array([[4, 5], [], [6]], type=pa.list_(pa.int64())),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(
+                    [[27, 37], [28, 38], [29, 39]], type=pa.list_(pa.float32())
+                ),
+                "map_a": pa.array(
+                    [{"1": 0.1, "3": 0.2}, {}, {"1": 0.1, "3": 0.2}],
+                    type=pa.map_(pa.string(), pa.float32()),
+                ),
+                "click_seq__cat_a": pa.array(
+                    [[10, 11, 12], [13], []], type=pa.list_(pa.int64())
+                ),
+                "click_seq__int_a": pa.array(
+                    [[14, 15, 16], [17], []], type=pa.list_(pa.float32())
+                ),
+                "click_seq__tag_b": pa.array(
+                    [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [[]]],
+                    type=pa.list_(pa.list_(pa.string())),
+                ),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
+            }
+        else:
+            input_data = {
                 "cat_a": pa.array([1, 2, 3]),
                 "tag_b": pa.array(["4:0.1\x1d5:0.2", "", "6:0.3"])
                 if weigted_id
@@ -459,7 +524,8 @@ class DataParserTest(unittest.TestCase):
                 "label": pa.array([0, 0, 1], pa.int32()),
                 "__SAMPLE_MASK__": pa.array([True, False, False]),
             }
-        )
+
+        data = data_parser.parse(input_data=input_data)
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
@@ -636,8 +702,207 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
+    def test_fg_with_const(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs(
+            tag_b_seq=True, with_const=True
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        data_parser = DataParser(features=features, labels=["label"])
+        self.assertEqual(
+            sorted(list(data_parser.feature_input_names)),
+            [
+                "cat_a",
+                "click_seq__cat_a",
+                "click_seq__int_a",
+                "click_seq__tag_b",
+                "int_a",
+                "int_b",
+                "map_a",
+                "tag_b",
+            ],
+        )
+
+        data = data_parser.parse(
+            input_data={
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(["4\x1d5", "", "6"]),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+                "map_a": pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"]),
+                "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
+                "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
+                "click_seq__tag_b": pa.array(["17\x1d18;19;20\x1d21", "22", ""]),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
+            }
+        )
+        batch = data_parser.to_batch(data)
+
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
+        expected_dense_feat = KeyedTensor(
+            keys=["f_int_a", "f_int_b", "f_lookup_a", "f_lookup_b"],
+            length_per_key=[1, 2, 1],
+            values=torch.tensor(
+                [[7, 27, 37, 0.1, 0.1], [8, 28, 38, 0.0, 0.0], [9, 29, 39, 0.2, 0.1]],
+                dtype=torch.float32,
+            ),
+        )
+        expected_sparse_feat = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f_cat_a", "f_tag_b", "click_seq__f_cat_a", "click_seq__f_tag_b"],
+            values=torch.tensor(
+                [1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 0, 17, 18, 19, 20, 21, 22, 0]
+            ),
+            lengths=torch.tensor(
+                [1, 1, 1, 2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32
+            ),
+        )
+        self.assertTrue(
+            kjt_is_equal(batch.sparse_features["__BASE__"], expected_sparse_feat)
+        )
+        expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__f_tag_b"],
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
+        )
+        expected_seq_dense_feat = JaggedTensor(
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
+        )
+
+        torch.testing.assert_close(
+            batch.dense_features["__BASE__"].values(), expected_dense_feat.values()
+        )
+
+        self.assertTrue(
+            kjt_is_equal(
+                batch.sequence_mulval_lengths["__BASE__"],
+                expected_seq_mulval_lengths_user,
+            )
+        )
+        self.assertTrue(
+            jt_is_equal(
+                batch.sequence_dense_features["click_seq__f_int_a"],
+                expected_seq_dense_feat,
+            )
+        )
+        torch.testing.assert_close(batch.labels["label"], expected_label)
+
+    def test_fg_with_stub_feature(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs(
+            tag_b_seq=True, with_stub_feat=True
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        data_parser = DataParser(features=features, labels=["label"])
+        self.assertEqual(
+            sorted(list(data_parser.feature_input_names)),
+            [
+                "cat_a",
+                "click_seq__cat_a",
+                "click_seq__int_a",
+                "click_seq__tag_b",
+                "int_a",
+                "int_b",
+                "map_a",
+                "tag_b",
+            ],
+        )
+
+        data = data_parser.parse(
+            input_data={
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(["4\x1d5", "", "6"]),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+                "map_a": pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"]),
+                "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
+                "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
+                "click_seq__tag_b": pa.array(["17\x1d18;19;20\x1d21", "22", ""]),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "__SAMPLE_MASK__": pa.array([True, False, False]),
+            }
+        )
+        batch = data_parser.to_batch(data)
+
+        expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
+        expected_dense_feat = KeyedTensor(
+            keys=["f_int_a", "f_int_b", "f_lookup_a"],
+            length_per_key=[1, 2, 1],
+            values=torch.tensor(
+                [[7, 27, 37, 0.1], [8, 28, 38, 0.0], [9, 29, 39, 0.2]],
+                dtype=torch.float32,
+            ),
+        )
+        expected_sparse_feat = KeyedJaggedTensor.from_lengths_sync(
+            keys=[
+                "f_cat_a",
+                "f_tag_b",
+                "click_seq__f_cat_a",
+                "click_seq__f_tag_b",
+                "f_combo_a",
+            ],
+            values=torch.tensor(
+                [
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    10,
+                    11,
+                    12,
+                    13,
+                    0,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                    0,
+                    93,
+                    23,
+                    25,
+                    38,
+                    12,
+                ]
+            ),
+            lengths=torch.tensor(
+                [1, 1, 1, 2, 0, 1, 3, 1, 1, 5, 1, 1, 3, 1, 1], dtype=torch.int32
+            ),
+        )
+        self.assertTrue(
+            kjt_is_equal(batch.sparse_features["__BASE__"], expected_sparse_feat)
+        )
+        expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__f_tag_b"],
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
+        )
+        expected_seq_dense_feat = JaggedTensor(
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            batch.dense_features["__BASE__"].values(), expected_dense_feat.values()
+        )
+
+        self.assertTrue(
+            kjt_is_equal(
+                batch.sequence_mulval_lengths["__BASE__"],
+                expected_seq_mulval_lengths_user,
+            )
+        )
+        self.assertTrue(
+            jt_is_equal(
+                batch.sequence_dense_features["click_seq__f_int_a"],
+                expected_seq_dense_feat,
+            )
+        )
+        torch.testing.assert_close(batch.labels["label"], expected_label)
+
     def test_fg_bucketize_only(self):
-        feature_cfgs = self._create_test_fg_feature_cfgs()
+        feature_cfgs = self._create_test_fg_feature_cfgs(tag_b_seq=True)
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_BUCKETIZE)
         data_parser = DataParser(features=features, labels=["label"])
         self.assertEqual(
@@ -645,6 +910,7 @@ class DataParserTest(unittest.TestCase):
             [
                 "click_seq__f_cat_a",
                 "click_seq__f_int_a",
+                "click_seq__f_tag_b",
                 "f_cat_a",
                 "f_int_a",
                 "f_int_b",
@@ -664,6 +930,9 @@ class DataParserTest(unittest.TestCase):
                 "f_lookup_a": pa.array([0.1, 0.0, 0.2], type=pa.float32()),
                 "click_seq__f_cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
                 "click_seq__f_int_a": pa.array([["14", "15", "16"], ["17"], ["0"]]),
+                "click_seq__f_tag_b": pa.array(
+                    [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [["0"]]]
+                ),
                 "label": pa.array([0, 0, 1], pa.int32()),
             }
         )
@@ -685,6 +954,13 @@ class DataParserTest(unittest.TestCase):
             [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
         expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
+        expected_seq_tag_b_values = torch.tensor(
+            [17, 18, 19, 20, 21, 22, 0], dtype=torch.int64
+        )
+        expected_seq_tag_b_key_lengths = torch.tensor(
+            [2, 1, 2, 1, 1], dtype=torch.int32
+        )
+        expected_seq_tag_b_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["f_cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["f_cat_a.lengths"], expected_cat_a_lengths)
@@ -705,7 +981,34 @@ class DataParserTest(unittest.TestCase):
         torch.testing.assert_close(
             data["click_seq__f_int_a.lengths"], expected_seq_int_a_seq_lengths
         )
+        torch.testing.assert_close(
+            data["click_seq__f_tag_b.values"], expected_seq_tag_b_values
+        )
+        torch.testing.assert_close(
+            data["click_seq__f_tag_b.key_lengths"], expected_seq_tag_b_key_lengths
+        )
+        torch.testing.assert_close(
+            data["click_seq__f_tag_b.lengths"], expected_seq_tag_b_seq_lengths
+        )
         torch.testing.assert_close(data["label"], expected_label)
+
+    def test_fg_bucketize_only_with_stub_feat(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs(with_stub_feat=True)
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_BUCKETIZE)
+        data_parser = DataParser(features=features, labels=["label"])
+        self.assertEqual(
+            sorted(list(data_parser.feature_input_names)),
+            [
+                "click_seq__f_cat_a",
+                "click_seq__f_int_a",
+                "f_cat_a",
+                "f_combo_a",
+                "f_int_a",
+                "f_int_b",
+                "f_lookup_a",
+                "f_tag_b",
+            ],
+        )
 
     @parameterized.expand(
         [
@@ -716,9 +1019,9 @@ class DataParserTest(unittest.TestCase):
                     "f_int_a": pa.array([7, 8, 9], pa.float32()),
                     "f_int_b": pa.array(["27\x0337", "28\x0338", "29\x0339"]),
                     "f_lookup_a": pa.array([0.1, 0.0, 0.2]),
-                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", ""]),
-                    "click_seq__f_int_a": pa.array(["14;15;16", "17", ""]),
-                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", ""]),
+                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", "0"]),
+                    "click_seq__f_int_a": pa.array(["14;15;16", "17", "0"]),
+                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", "0"]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
                 FgMode.FG_NONE,
@@ -750,26 +1053,28 @@ class DataParserTest(unittest.TestCase):
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
-        expected_tag_b_values = torch.tensor([4, 5], dtype=torch.int64)
-        expected_tag_b_lengths = torch.tensor([2], dtype=torch.int32)
-        expected_int_a_values = torch.tensor([[7]], dtype=torch.float32)
+        expected_tag_b_values = torch.tensor([4, 5, 6], dtype=torch.int64)
+        expected_tag_b_lengths = torch.tensor([2, 0, 1], dtype=torch.int32)
+        expected_int_a_values = torch.tensor([[7], [8], [9]], dtype=torch.float32)
         expected_int_b_values = torch.tensor(
             [[27, 37], [28, 38], [29, 39]], dtype=torch.float32
         )
         expected_lookup_a_values = torch.tensor(
             [[0.1], [0.0], [0.2]], dtype=torch.float32
         )
-        expected_seq_cat_a_values = torch.tensor([10, 11, 12], dtype=torch.int64)
-        expected_seq_cat_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_cat_a_values = torch.tensor([10, 11, 12, 13, 0], dtype=torch.int64)
+        expected_seq_cat_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_int_a_values = torch.tensor(
-            [[14], [15], [16]], dtype=torch.float32
+            [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
-        expected_seq_int_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_tag_b_values = torch.tensor(
-            [17, 18, 19, 20, 21], dtype=torch.int64
+            [17, 18, 19, 20, 21, 22, 0], dtype=torch.int64
         )
-        expected_seq_tag_b_key_lengths = torch.tensor([2, 1, 2], dtype=torch.int32)
-        expected_seq_tag_b_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_tag_b_key_lengths = torch.tensor(
+            [2, 1, 2, 1, 1], dtype=torch.int32
+        )
+        expected_seq_tag_b_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["f_cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["f_cat_a.lengths"], expected_cat_a_lengths)
@@ -805,7 +1110,7 @@ class DataParserTest(unittest.TestCase):
             keys=["f_int_a"],
             length_per_key=[1],
             values=torch.tensor(
-                [[7]],
+                [[7], [8], [9]],
                 dtype=torch.float32,
             ),
         )
@@ -826,48 +1131,33 @@ class DataParserTest(unittest.TestCase):
                     3,
                     4,
                     5,
-                    4,
-                    5,
-                    4,
-                    5,
+                    6,
                     10,
                     11,
                     12,
-                    10,
-                    11,
-                    12,
-                    10,
-                    11,
-                    12,
+                    13,
+                    0,
                     17,
                     18,
                     19,
                     20,
                     21,
-                    17,
-                    18,
-                    19,
-                    20,
-                    21,
-                    17,
-                    18,
-                    19,
-                    20,
-                    21,
+                    22,
+                    0,
                 ]
             ),
             lengths=torch.tensor(
-                [1, 1, 1, 2, 2, 2, 3, 3, 3, 5, 5, 5], dtype=torch.int32
+                [1, 1, 1, 2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32
             ),
         )
         expected_seq_mulval_lengths = KeyedJaggedTensor.from_lengths_sync(
             keys=["click_seq__f_tag_b"],
-            values=torch.tensor([2, 1, 2, 2, 1, 2, 2, 1, 2], dtype=torch.int32),
-            lengths=torch.tensor([3, 3, 3], dtype=torch.int32),
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         expected_seq_dense_feat = JaggedTensor(
-            values=torch.tensor([[14], [15], [16]], dtype=torch.float32),
-            lengths=torch.tensor([3], dtype=torch.int32),
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         batch = data_parser.to_batch(data)
         torch.testing.assert_close(
@@ -902,9 +1192,9 @@ class DataParserTest(unittest.TestCase):
                     "f_int_a": pa.array([7, 8, 9], pa.float32()),
                     "f_int_b": pa.array(["27\x0337", "28\x0338", "29\x0339"]),
                     "f_lookup_a": pa.array([0.1, 0.0, 0.2]),
-                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", ""]),
-                    "click_seq__f_int_a": pa.array(["14;15;16", "17", ""]),
-                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", ""]),
+                    "click_seq__f_cat_a": pa.array(["10;11;12", "13", "0"]),
+                    "click_seq__f_int_a": pa.array(["14;15;16", "17", "0"]),
+                    "click_seq__f_tag_b": pa.array(["17\x0318;19;20\x0321", "22", "0"]),
                     "label": pa.array([0, 0, 1], pa.int32()),
                 },
                 FgMode.FG_NONE,
@@ -936,26 +1226,28 @@ class DataParserTest(unittest.TestCase):
 
         expected_cat_a_values = torch.tensor([1, 2, 3], dtype=torch.int64)
         expected_cat_a_lengths = torch.tensor([1, 1, 1], dtype=torch.int32)
-        expected_tag_b_values = torch.tensor([4, 5], dtype=torch.int64)
-        expected_tag_b_lengths = torch.tensor([2], dtype=torch.int32)
-        expected_int_a_values = torch.tensor([[7]], dtype=torch.float32)
+        expected_tag_b_values = torch.tensor([4, 5, 6], dtype=torch.int64)
+        expected_tag_b_lengths = torch.tensor([2, 0, 1], dtype=torch.int32)
+        expected_int_a_values = torch.tensor([[7], [8], [9]], dtype=torch.float32)
         expected_int_b_values = torch.tensor(
             [[27, 37], [28, 38], [29, 39]], dtype=torch.float32
         )
         expected_lookup_a_values = torch.tensor(
             [[0.1], [0.0], [0.2]], dtype=torch.float32
         )
-        expected_seq_cat_a_values = torch.tensor([10, 11, 12], dtype=torch.int64)
-        expected_seq_cat_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_cat_a_values = torch.tensor([10, 11, 12, 13, 0], dtype=torch.int64)
+        expected_seq_cat_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_int_a_values = torch.tensor(
-            [[14], [15], [16]], dtype=torch.float32
+            [[14], [15], [16], [17], [0]], dtype=torch.float32
         )
-        expected_seq_int_a_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_int_a_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_seq_tag_b_values = torch.tensor(
-            [17, 18, 19, 20, 21], dtype=torch.int64
+            [17, 18, 19, 20, 21, 22, 0], dtype=torch.int64
         )
-        expected_seq_tag_b_key_lengths = torch.tensor([2, 1, 2], dtype=torch.int32)
-        expected_seq_tag_b_seq_lengths = torch.tensor([3], dtype=torch.int32)
+        expected_seq_tag_b_key_lengths = torch.tensor(
+            [2, 1, 2, 1, 1], dtype=torch.int32
+        )
+        expected_seq_tag_b_seq_lengths = torch.tensor([3, 1, 1], dtype=torch.int32)
         expected_label = torch.tensor([0, 0, 1], dtype=torch.int64)
         torch.testing.assert_close(data["f_cat_a.values"], expected_cat_a_values)
         torch.testing.assert_close(data["f_cat_a.lengths"], expected_cat_a_lengths)
@@ -991,7 +1283,7 @@ class DataParserTest(unittest.TestCase):
             keys=["f_int_a"],
             length_per_key=[1],
             values=torch.tensor(
-                [[7]],
+                [[7], [8], [9]],
                 dtype=torch.float32,
             ),
         )
@@ -1010,18 +1302,20 @@ class DataParserTest(unittest.TestCase):
         )
         expected_seq_mulval_lengths_user = KeyedJaggedTensor.from_lengths_sync(
             keys=["click_seq__f_tag_b"],
-            values=torch.tensor([2, 1, 2], dtype=torch.int32),
-            lengths=torch.tensor([3], dtype=torch.int32),
+            values=torch.tensor([2, 1, 2, 1, 1], dtype=torch.int32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         expected_sparse_feat_user = KeyedJaggedTensor.from_lengths_sync(
             keys=["f_tag_b", "click_seq__f_cat_a", "click_seq__f_tag_b"],
-            values=torch.tensor([4, 5, 10, 11, 12, 17, 18, 19, 20, 21]),
-            lengths=torch.tensor([2, 3, 5], dtype=torch.int32),
+            values=torch.tensor(
+                [4, 5, 6, 10, 11, 12, 13, 0, 17, 18, 19, 20, 21, 22, 0]
+            ),
+            lengths=torch.tensor([2, 0, 1, 3, 1, 1, 5, 1, 1], dtype=torch.int32),
         )
 
         expected_seq_dense_feat = JaggedTensor(
-            values=torch.tensor([[14], [15], [16]], dtype=torch.float32),
-            lengths=torch.tensor([3], dtype=torch.int32),
+            values=torch.tensor([[14], [15], [16], [17], [0]], dtype=torch.float32),
+            lengths=torch.tensor([3, 1, 1], dtype=torch.int32),
         )
         batch = data_parser.to_batch(data)
 
@@ -1054,6 +1348,38 @@ class DataParserTest(unittest.TestCase):
             )
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
+
+    def test_dump_parsed_inputs(self):
+        feature_cfgs = self._create_test_fg_feature_cfgs(
+            tag_b_weighted=True, tag_b_seq=True
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        data_parser = DataParser(features=features, labels=["label"])
+
+        input_data = {
+            "cat_a": pa.array([1, 2, 3]),
+            "tag_b": pa.array(["4:0.1\x1d5:0.2", "", "6:0.3"]),
+            "int_a": pa.array([7, 8, 9], pa.float32()),
+            "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+            "map_a": pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"]),
+            "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
+            "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
+            "click_seq__tag_b": pa.array(["17\x1d18;19;20\x1d21", "22", ""]),
+            "label": pa.array([0, 0, 1], pa.int32()),
+            "__SAMPLE_MASK__": pa.array([True, False, False]),
+        }
+        data = data_parser.parse(input_data=input_data)
+        dump_str = data_parser.dump_parsed_inputs(data)
+        self.assertEqual(
+            dump_str,
+            pa.array(
+                [
+                    "f_cat_a:1 | f_tag_b:4:0.1,5:0.2 | f_int_a:7.0 | f_int_b:27.0,37.0 | f_lookup_a:0.1 | click_seq__f_cat_a:10;11;12 | click_seq__f_int_a:14.0;15.0;16.0 | click_seq__f_tag_b:17,18;19;20,21",  # NOQA
+                    "f_cat_a:2 | f_tag_b: | f_int_a:8.0 | f_int_b:28.0,38.0 | f_lookup_a:0.0 | click_seq__f_cat_a:13 | click_seq__f_int_a:17.0 | click_seq__f_tag_b:22",  # NOQA
+                    "f_cat_a:3 | f_tag_b:6:0.3 | f_int_a:9.0 | f_int_b:29.0,39.0 | f_lookup_a:0.2 | click_seq__f_cat_a:0 | click_seq__f_int_a:0.0 | click_seq__f_tag_b:0",  # NOQA
+                ]
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@
 
 import glob
 import os
+import sys
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import calc_slice_position
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
 
@@ -43,21 +45,23 @@ def _reader_iter(
         if cnt >= end:
             break
 
-        metadata = parquet_metas[input_file]
-        if cnt + metadata.num_rows <= start:
+        metadata = parquet_metas.get(input_file, None)
+        if metadata is not None and cnt + metadata.num_rows <= start:
             cnt += metadata.num_rows
             continue
         else:
-            i = 0
-            for i in range(metadata.num_row_groups):
-                row_group_rows = metadata.row_group(i).num_rows
-                if cnt + row_group_rows <= start:
-                    cnt += row_group_rows
-                    continue
-                else:
-                    break
+            row_groups = None
+            if metadata is not None:
+                i = 0
+                for i in range(metadata.num_row_groups):
+                    row_group_rows = metadata.row_group(i).num_rows
+                    if cnt + row_group_rows <= start:
+                        cnt += row_group_rows
+                        continue
+                    else:
+                        break
+                row_groups = list(range(i, metadata.num_row_groups))
 
-            row_groups = list(range(i, metadata.num_row_groups))
             parquet_file = parquet.ParquetFile(input_file)
             for batch in parquet_file.iter_batches(
                 batch_size, row_groups=row_groups, columns=columns, use_threads=False
@@ -72,7 +76,7 @@ def _reader_iter(
                         f"worker {worker_id} yield start batch. "
                         f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
                     )
-                    yield batch[start - cnt :]
+                    yield batch[start - cnt : end - cnt]
                 elif cnt + len(batch) > end:
                     yield batch[: end - cnt]
                 else:
@@ -133,6 +137,7 @@ class ParquetReader(BaseReader):
         shuffle_buffer_size (int): buffer size for shuffle.
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
+        rebalance (bool): rebalance parquet rows to equal number for each worker.
     """
 
     def __init__(
@@ -144,6 +149,7 @@ class ParquetReader(BaseReader):
         shuffle: bool = False,
         shuffle_buffer_size: int = 32,
         drop_redundant_bs_eq_one: bool = False,
+        rebalance: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -154,11 +160,11 @@ class ParquetReader(BaseReader):
             shuffle,
             shuffle_buffer_size,
         )
-
+        self._pg = dist_util.get_dist_object_pg()
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
+        self._rebalance = rebalance
 
         self._ordered_cols = None
-        self.schema = []
         self._input_files = []
         for input_path in self._input_path.split(","):
             self._input_files.extend(glob.glob(input_path))
@@ -167,14 +173,16 @@ class ParquetReader(BaseReader):
 
         parquet_file = parquet.ParquetFile(self._input_files[0])
         if self._selected_cols:
+            fields = []
             self._ordered_cols = []
             for field in parquet_file.schema_arrow:
                 # pyre-ignore [58]
                 if field.name in selected_cols:
-                    self.schema.append(field)
+                    fields.append(field)
                     self._ordered_cols.append(field.name)
+            self._schema = pa.schema(fields)
         else:
-            self.schema = parquet_file.schema_arrow
+            self._schema = parquet_file.schema_arrow
         parquet_file.close()
 
         rank = int(os.environ.get("RANK", 0))
@@ -183,38 +191,48 @@ class ParquetReader(BaseReader):
         # get parquet metadata
         self._parquet_metas = {}
         parquet_metas_per_rank = {}
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            for k, v in executor.map(
-                _get_metadata, self._input_files[rank::world_size]
-            ):
-                parquet_metas_per_rank[k] = v
-        if dist.is_initialized():
-            parquet_metas_list = [None] * world_size
-            dist.all_gather_object(parquet_metas_list, parquet_metas_per_rank)
-            for v in parquet_metas_list:
-                self._parquet_metas.update(v)
-        else:
-            self._parquet_metas = parquet_metas_per_rank
-
         self._num_rows = []
-        for input_file in self._input_files:
-            self._num_rows.append(self._parquet_metas[input_file].num_rows)
+        if self._rebalance:
+            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                for k, v in executor.map(
+                    _get_metadata, self._input_files[rank::world_size]
+                ):
+                    parquet_metas_per_rank[k] = v
+            if self._pg is not None:
+                parquet_metas_list = [None] * world_size
+                dist.all_gather_object(parquet_metas_list, parquet_metas_per_rank)
+                for v in parquet_metas_list:
+                    self._parquet_metas.update(v)
+            else:
+                self._parquet_metas = parquet_metas_per_rank
+
+            for input_file in self._input_files:
+                self._num_rows.append(self._parquet_metas[input_file].num_rows)
+
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        return self._schema
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        start, end, _ = calc_slice_position(
-            sum(self._num_rows),
-            worker_id,
-            num_workers,
-            self._batch_size,
-            self._drop_redundant_bs_eq_one,
-        )
+        start, end = 0, sys.maxsize
+        if self._rebalance:
+            start, end, _ = calc_slice_position(
+                sum(self._num_rows),
+                worker_id,
+                num_workers,
+                self._batch_size,
+                self._drop_redundant_bs_eq_one,
+            )
 
         if len(self._input_files) > 0:
             reader = _reader_iter(
-                self._input_files,
+                self._input_files
+                if self._rebalance
+                else self._input_files[worker_id::num_workers],
                 self._batch_size,
                 self._parquet_metas,
                 self._ordered_cols,
@@ -223,6 +241,16 @@ class ParquetReader(BaseReader):
                 worker_id,
             )
             yield from self._arrow_reader_iter(reader)
+
+    def num_files(self) -> Optional[int]:
+        """Get number of files in the dataset."""
+        if self._rebalance:
+            # We will rebalance the Parquet file into num_worker parts,
+            # eliminating the need for num_files to determine the number
+            # of workers to use.
+            return None
+        else:
+            return len(self._input_files)
 
 
 class ParquetWriter(BaseWriter):

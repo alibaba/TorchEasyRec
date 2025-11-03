@@ -21,7 +21,8 @@ from hypothesis.utils.conventions import not_set as _not_set
 from torch import nn
 from torch.fx import GraphModule
 
-from tzrec.models.model import ScriptWrapper
+from tzrec.acc.aot_utils import export_model_aot
+from tzrec.models.model import CudaExportWrapper, ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
 
 nv_gpu_unavailable: Tuple[bool, str] = (
@@ -48,6 +49,7 @@ class TestGraphType(Enum):
     NORMAL = 1
     FX_TRACE = 2
     JIT_SCRIPT = 3
+    AOT_INDUCTOR = 4
 
 
 def create_test_module(
@@ -59,16 +61,29 @@ def create_test_module(
     elif graph_type == TestGraphType.JIT_SCRIPT:
         module = symbolic_trace(module)
         module = torch.jit.script(module)
+    elif graph_type == TestGraphType.AOT_INDUCTOR:
+        module = symbolic_trace(module)
+
     return module
 
 
 def create_test_model(
-    model: nn.Module, graph_type: TestGraphType
+    model: nn.Module,
+    graph_type: TestGraphType,
+    data: Optional[Dict[str, torch.Tensor]] = None,
+    test_dir: str = "",
 ) -> Union[nn.Module, GraphModule, torch.jit.ScriptModule]:
     """Create model with graph type for tests."""
-    if graph_type == TestGraphType.JIT_SCRIPT:
-        model = ScriptWrapper(model)
-    return create_test_module(model, graph_type)
+    if graph_type == TestGraphType.AOT_INDUCTOR:
+        model = CudaExportWrapper(model)
+        assert data is not None
+        package_path = export_model_aot(model, data, test_dir)
+        model = torch._inductor.aoti_load_package(package_path)
+        return model
+    else:
+        if graph_type == TestGraphType.JIT_SCRIPT:
+            model = ScriptWrapper(model)
+        return create_test_module(model, graph_type)
 
 
 # pyre-ignore [2]

@@ -27,9 +27,7 @@ class BaseModule(nn.Module, abc.ABC):
     """
 
     def __init__(
-        self,
-        is_inference: bool = False,
-        kernel: Optional[Kernel] = None,
+        self, is_inference: bool = False, kernel: Optional[Kernel] = None, **kwargs: Any
     ) -> None:
         super().__init__()
         self._is_inference = is_inference
@@ -43,7 +41,6 @@ class BaseModule(nn.Module, abc.ABC):
         else:
             return Kernel.TRITON
 
-    # pyre-ignore [2]
     def recursive_setattr(self, name: str, value: Any) -> None:
         """Recursive set sub module attrs."""
         for _, module in self.named_modules():
@@ -127,3 +124,11 @@ def div_no_nan(
         posinf=0.0,
         neginf=0.0,
     )
+
+
+def init_linear_xavier_weights_zero_bias(m: torch.nn.Module) -> None:
+    """Init nn.Linear module with Xavier weights and zero bias."""
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)

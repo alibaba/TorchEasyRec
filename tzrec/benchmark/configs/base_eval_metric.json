@@ -130,5 +130,26 @@
     },
     "threshold": 0.005,
     "run_cnt": 1
+  },
+  "tzrec/benchmark/configs/criteo/dlrm.config": {
+    "label": {
+      "auc": 0.796
+    },
+    "threshold": 0.002,
+    "run_cnt": 1
+  },
+  "tzrec/benchmark/configs/criteo/rocket_launching.config": {
+    "label": {
+      "auc_light": 0.788
+    },
+    "threshold": 0.001,
+    "run_cnt": 1
+  },
+  "tzrec/benchmark/configs/kuairand/dlrm_hstu.config": {
+    "label": {
+      "auc_is_click": 0.718
+    },
+    "threshold": 0.005,
+    "run_cnt": 3
   }
 }

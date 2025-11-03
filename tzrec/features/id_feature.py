@@ -79,6 +79,8 @@ class IdFeature(BaseFeature):
         """Get embedding row count."""
         if self.config.HasField("zch"):
             num_embeddings = self.config.zch.zch_size
+        elif self.config.HasField("dynamicemb"):
+            num_embeddings = self.config.dynamicemb.max_capacity
         elif self.config.HasField("hash_bucket_size"):
             num_embeddings = self.config.hash_bucket_size
         elif self.config.HasField("num_buckets"):
@@ -125,7 +127,12 @@ class IdFeature(BaseFeature):
             input_feat = input_data[self.inputs[0]]
             if pa.types.is_list(input_feat.type):
                 input_feat = input_feat.fill_null([])
-            input_feat = input_feat.tolist()
+                input_feat = input_feat.tolist()
+            elif pa.types.is_map(input_feat.type):
+                input_feat = input_feat.fill_null({})
+                input_feat = list(map(dict, input_feat.tolist()))
+            else:
+                input_feat = input_feat.tolist()
             if self._is_weighted:
                 values, lengths, weights = self._fg_op.to_weighted_jagged_tensor(
                     input_feat
@@ -154,7 +161,7 @@ class IdFeature(BaseFeature):
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
-        if self.config.HasField("zch"):
+        if self.config.HasField("zch") or self.config.HasField("dynamicemb"):
             fg_cfg["hash_bucket_size"] = MAX_HASH_BUCKET_SIZE
         elif self.config.HasField("hash_bucket_size"):
             fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
@@ -177,6 +184,8 @@ class IdFeature(BaseFeature):
             fg_cfg["value_dim"] = 0
         if self.config.HasField("fg_value_type"):
             fg_cfg["value_type"] = self.config.fg_value_type
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
         return [fg_cfg]
 
     def assets(self) -> Dict[str, str]:

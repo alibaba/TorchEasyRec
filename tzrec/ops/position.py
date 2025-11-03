@@ -17,16 +17,27 @@ from typing import Optional
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
+from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
 from tzrec.ops.pytorch.pt_position import (
     pytorch_add_position_embeddings,
     pytorch_add_timestamp_positional_embeddings,
 )
-from tzrec.ops.triton.triton_position import (
-    triton_add_position_embeddings,
-    triton_add_timestamp_positional_embeddings,
-)
+
+torch.fx.wrap("pytorch_add_position_embeddings")
+torch.fx.wrap("pytorch_add_timestamp_positional_embeddings")
+
+if has_triton():
+    from tzrec.ops.triton.triton_position import (
+        triton_add_position_embeddings,
+        triton_add_timestamp_positional_embeddings,
+    )
+else:
+    triton_add_position_embeddings = pytorch_add_position_embeddings
+    triton_add_timestamp_positional_embeddings = (
+        pytorch_add_timestamp_positional_embeddings
+    )
 
 
 @torch.fx.wrap

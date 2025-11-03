@@ -29,7 +29,7 @@ import sphinx_rtd_theme
 # -- Project information -----------------------------------------------------
 
 project = "tzrec"
-copyright = "2024, EasyRec Team"
+copyright = "2024-2025, EasyRec Team"
 author = "EasyRec Team"
 
 version_file = "../../tzrec/version.py"

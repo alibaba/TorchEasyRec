@@ -46,12 +46,17 @@ message ModelConfig {
         MultiTower multi_tower = 102;
         MultiTowerDIN multi_tower_din = 103;
         MaskNet mask_net = 104;
+        WideAndDeep wide_and_deep = 105;
+        DCNV1 dcn_v1 = 106;
+        DCNV2 dcn_v2 = 107;
+        xDeepFM xdeepfm = 108;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
         DBMTL dbmtl = 202;
         PLE ple = 203;
         DC2VR dc2vr = 204;
+        DlrmHSTU dlrm_hstu = 205;
 
         DSSM dssm = 301;
         DSSMV2 dssm_v2 = 302;

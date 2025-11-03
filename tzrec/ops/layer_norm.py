@@ -16,19 +16,25 @@
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
+from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
 from tzrec.ops.pytorch.pt_layer_norm import (
     pytorch_layer_norm,
+    pytorch_rms_norm,
     pytorch_swish_layer_norm,
 )
-from tzrec.ops.triton.triton_layer_norm import (
-    triton_layer_norm,
-    triton_swish_layer_norm,
-)
 
-torch.fx.wrap("triton_layer_norm")
-torch.fx.wrap("triton_swish_layer_norm")
+if has_triton():
+    from tzrec.ops.triton.triton_layer_norm import (
+        triton_layer_norm,
+        triton_rms_norm,
+        triton_swish_layer_norm,
+    )
+else:
+    triton_layer_norm = pytorch_layer_norm
+    triton_rms_norm = pytorch_rms_norm
+    triton_swish_layer_norm = pytorch_swish_layer_norm
 
 
 def layer_norm(
@@ -40,9 +46,9 @@ def layer_norm(
 ) -> torch.Tensor:
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
-            torch._assert(x.is_cuda, "x must be CUDA tensor")
-            torch._assert(weight.is_cuda, "weight must be CUDA tensor")
-            torch._assert(bias.is_cuda, "bias must be CUDA tensor")
+            torch._assert(not x.is_cpu, "x must not be cpu tensor")
+            torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
+            torch._assert(not bias.is_cpu, "bias must not be cpu tensor")
         return triton_layer_norm(x, weight, bias, eps)
     else:
         return pytorch_layer_norm(
@@ -56,6 +62,21 @@ def layer_norm(
         )
 
 
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+    kernel: Kernel = Kernel.PYTORCH,
+) -> torch.Tensor:
+    if kernel == Kernel.TRITON:
+        if not is_fx_tracing():
+            torch._assert(not x.is_cpu, "x must not be cpu tensor")
+            torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
+        return triton_rms_norm(x, weight, eps)
+    else:
+        return pytorch_rms_norm(x, weight, eps)
+
+
 def swish_layer_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -65,9 +86,9 @@ def swish_layer_norm(
 ) -> torch.Tensor:
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
-            torch._assert(x.is_cuda, "x must be CUDA tensor")
-            torch._assert(weight.is_cuda, "weight must be CUDA tensor")
-            torch._assert(bias.is_cuda, "bias must be CUDA tensor")
+            torch._assert(not x.is_cpu, "x must not be cpu tensor")
+            torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
+            torch._assert(not bias.is_cpu, "bias must not be cpu tensor")
         return triton_swish_layer_norm(x, [x.shape[-1]], weight, bias, eps)
     else:
         return pytorch_swish_layer_norm(

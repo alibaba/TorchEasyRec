@@ -22,8 +22,8 @@ import urllib3
 from alibabacloud_credentials.client import Client as CredClient
 from odps import ODPS
 from odps.accounts import (
-    AliyunAccount,
     BaseAccount,
+    CloudAccount,
     CredentialProviderAccount,
 )
 from odps.apis.storage_api import (
@@ -142,7 +142,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.environ["ODPS_CONFIG_FILE_PATH"]
         )
-        account = AliyunAccount(account_id, account_key)
+        account = CloudAccount(account_id, account_key)
     elif (
         "ALIBABA_CLOUD_CREDENTIALS_URI" in os.environ
         or "ALIBABA_CLOUD_SECURITY_TOKEN" in os.environ
@@ -166,7 +166,7 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
         account_id, account_key, odps_endpoint = _parse_odps_config_file(
             os.path.join(os.getenv("HOME", "/home/admin"), ".odps_config.ini")
         )
-        account = AliyunAccount(account_id, account_key)
+        account = CloudAccount(account_id, account_key)
 
     # prevent graph-learn parse odps config hang
     os.environ["ACCESS_ID"] = account_id
@@ -178,7 +178,9 @@ def _create_odps_account() -> Tuple[BaseAccount, str]:
     return account, odps_endpoint
 
 
-def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str]]]:
+def _parse_table_path(
+    odps_table_path: str,
+) -> Tuple[str, str, Optional[List[str]], Optional[str]]:
     """Method that parse odps table path."""
     str_list = odps_table_path.split("/")
     if len(str_list) < 5 or str_list[3] != "tables":
@@ -192,7 +194,12 @@ def _parse_table_path(odps_table_path: str) -> Tuple[str, str, Optional[List[str
         table_partitions = None
     else:
         table_partitions = table_partition.split("&")
-    return str_list[2], str_list[4], table_partitions
+
+    table_name = str_list[4]
+    schema = None
+    if "." in table_name:
+        table_name, schema = table_name.split(".")[1], table_name.split(".")[0]
+    return str_list[2], table_name, table_partitions, schema
 
 
 def _read_rows_arrow_with_retry(
@@ -308,10 +315,6 @@ class OdpsDataset(BaseDataset):
         input_path: str,
         **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert dist.is_initialized(), (
-                "You should initialize distribute group first."
-            )
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
         self._reader = OdpsReader(
@@ -366,6 +369,7 @@ class OdpsReader(BaseReader):
             shuffle,
             shuffle_buffer_size,
         )
+        self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
         self._compression = _get_compression_type(compression)
@@ -378,9 +382,9 @@ class OdpsReader(BaseReader):
         self._input_to_sess = {}
         self._init_client()
 
-        self.schema = []
+        fields = []
         self._ordered_cols = []
-        _, table_name, _ = _parse_table_path(self._input_path.split(",")[0])
+        _, table_name, _, _ = _parse_table_path(self._input_path.split(",")[0])
         table = self._table_to_cli[table_name].table
         for column in table.schema.simple_columns:
             if not self._selected_cols or column.name in self._selected_cols:
@@ -390,21 +394,28 @@ class OdpsReader(BaseReader):
                         f"column [{column.name}] with dtype {column.type} "
                         "is not supported now."
                     )
-                self.schema.append(
+                fields.append(
                     pa.field(column.name, TYPE_TABLE_TO_PA[str(column.type).upper()])
                 )
                 self._ordered_cols.append(column.name)
+        self._schema = pa.schema(fields)
         self._init_session()
+
+    @property
+    def schema(self) -> pa.Schema:
+        """Table schema."""
+        return self._schema
 
     def _init_client(self) -> None:
         """Init storage api client."""
         for input_path in self._input_path.split(","):
-            project, table_name, _ = _parse_table_path(input_path)
+            project, table_name, _, schema = _parse_table_path(input_path)
             if project not in self._proj_to_o:
                 self._proj_to_o[project] = ODPS(
                     account=self._account,
                     project=project,
                     endpoint=self._odps_endpoint,
+                    schema=schema,
                 )
             if table_name not in self._table_to_cli:
                 o = self._proj_to_o[project]
@@ -417,7 +428,7 @@ class OdpsReader(BaseReader):
         sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             session_ids = []
-            _, table_name, partitions = _parse_table_path(input_path)
+            _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
             if self._is_orderby_partition and partitions is not None:
                 splited_partitions = [[x] for x in partitions]
@@ -436,8 +447,8 @@ class OdpsReader(BaseReader):
                 else:
                     session_ids.append(None)
 
-            if dist.is_initialized():
-                dist.broadcast_object_list(session_ids)
+            if self._pg is not None:
+                dist.broadcast_object_list(session_ids, group=self._pg)
             self._input_to_sess[input_path] = [
                 SessionRequest(session_id=x) for x in session_ids
             ]
@@ -453,7 +464,7 @@ class OdpsReader(BaseReader):
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
-        _, table_name, _ = _parse_table_path(input_path)
+        _, table_name, _, _ = _parse_table_path(input_path)
         client = self._table_to_cli[table_name]
 
         sess_reqs = self._input_to_sess[input_path]
@@ -482,21 +493,25 @@ class OdpsWriter(BaseWriter):
     Args:
         output_path (str): data output path.
         quota_name (str): storage api quota name.
+        world_size (int, optional): number of ranks, each rank has a writer.
     """
 
     def __init__(
-        self, output_path: str, quota_name: str = "pay-as-you-go", **kwargs: Any
+        self,
+        output_path: str,
+        quota_name: str = "pay-as-you-go",
+        world_size: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
-        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-            assert dist.is_initialized(), (
-                "You should initialize distribute group first."
-            )
         super().__init__(output_path)
+        self._pg = dist_util.get_dist_object_pg(world_size)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
 
-        self._project, self._table_name, partitions = _parse_table_path(output_path)
+        self._project, self._table_name, partitions, schema = _parse_table_path(
+            output_path
+        )
         if partitions is None:
             self._partition_spec = None
         else:
@@ -505,6 +520,7 @@ class OdpsWriter(BaseWriter):
             account=self._account,
             project=self._project,
             endpoint=self._odps_endpoint,
+            schema=schema,
         )
         self._client = None
         self._sess_req = None
@@ -549,8 +565,12 @@ class OdpsWriter(BaseWriter):
             )
             write_resp = self._client.create_write_session(write_req)
             session_id = write_resp.session_id
-        if dist.is_initialized():
-            session_id = dist_util.broadcast_string(session_id)
+            object_list = [session_id]
+        else:
+            object_list = [None]
+        if self._pg is not None:
+            dist.broadcast_object_list(object_list, group=self._pg)
+        session_id = object_list[0]
         self._sess_req = SessionRequest(session_id=session_id)
         while True:
             sess_resp = self._client.get_write_session(self._sess_req)
@@ -597,8 +617,12 @@ class OdpsWriter(BaseWriter):
         """Close and commit data."""
         if self._writer is not None:
             commit_msg, _ = self._writer.finish()
-            if dist.is_initialized():
-                commit_msgs = dist_util.gather_strings(commit_msg)
+            if self._pg is not None:
+                if int(os.environ.get("RANK", 0)) == 0:
+                    commit_msgs = [None for _ in range(self._pg.size())]
+                else:
+                    commit_msgs = None
+                dist.gather_object(commit_msg, commit_msgs, group=self._pg)
             else:
                 commit_msgs = [commit_msg]
             if int(os.environ.get("RANK", 0)) == 0:
@@ -610,4 +634,9 @@ class OdpsWriter(BaseWriter):
                     raise RuntimeError(
                         f"Fail to commit write session: {self._sess_req.session_id}"
                     )
+        elif self._pg is not None:
+            raise RuntimeError(
+                f"Writer on Rank[{os.environ.get('RANK', 0)}] has no "
+                "data, please check your input data."
+            )
         super().close()

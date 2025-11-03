@@ -10,18 +10,19 @@
 # limitations under the License.
 
 
+import os
 from typing import Dict
 
 import torch
 from torch import nn
 
-from tzrec.acc.export_utils import export_pm
+from tzrec.acc.pt2_utils import export_pm
 
 
 def export_model_aot(
     model: nn.Module, data: Dict[str, torch.Tensor], save_dir: str
-) -> torch.export.ExportedProgram:
-    """Export aot model.
+) -> str:
+    """Export AOTInductor model.
 
     Args:
         model (nn.Module): the model
@@ -30,5 +31,10 @@ def export_model_aot(
     """
     exported_pg, data = export_pm(model, data, save_dir)
 
-    # TODO(aot cmpile)
-    return exported_pg
+    # AsserScalar codegen is not correct.
+    with torch._inductor.config.patch({"scalar_asserts": False}):
+        package_path = torch._inductor.aoti_compile_and_package(
+            exported_pg,
+            package_path=os.path.join(save_dir, "aoti_model.pt2"),
+        )
+    return package_path
