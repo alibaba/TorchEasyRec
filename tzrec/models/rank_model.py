@@ -19,6 +19,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
+from tzrec.metrics.decay_auc import DecayAUC
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.metrics.grouped_xauc import GroupedXAUC
 from tzrec.metrics.xauc import XAUC
@@ -289,6 +290,7 @@ class RankModel(BaseModel):
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
         metric_kwargs = config_to_kwargs(oneof_metric_cfg)
         metric_name = metric_type + suffix
+        decay_rate = metric_cfg.step_decay_rate
         if metric_type == "auc":
             assert num_class <= 2, (
                 f"num_class must less than 2 when metric type is {metric_type}"
@@ -296,6 +298,10 @@ class RankModel(BaseModel):
             self._metric_modules[metric_name] = torchmetrics.AUROC(
                 task="binary", **metric_kwargs
             )
+            self._train_metric_modules[metric_name] = DecayAUC(
+                decay=decay_rate, **metric_kwargs
+            )
+            decay_rate = 0.0
         elif metric_type == "multiclass_auc":
             self._metric_modules[metric_name] = torchmetrics.AUROC(
                 task="multiclass", num_classes=num_class, **metric_kwargs
@@ -323,8 +329,8 @@ class RankModel(BaseModel):
             )
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
-        self._train_metrics_step_decay_rate[metric_name] = nn.Parameter(
-            torch.tensor(metric_cfg.step_decay_rate), requires_grad=False
+        self._train_metrics_step_decay_rates[metric_name] = nn.Parameter(
+            torch.tensor(decay_rate), requires_grad=False
         )
 
     def init_metric(self) -> None:
@@ -428,6 +434,46 @@ class RankModel(BaseModel):
                     losses, batch, batch.labels[self._label_name], loss_cfg
                 )
 
+    def _update_train_metric_impl(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        label: torch.Tensor,
+        metric_cfg: MetricConfig,
+        num_class: int = 1,
+        suffix: str = "",
+    ) -> None:
+        """Update and train metrics."""
+        metric_type = metric_cfg.WhichOneof("metric")
+        metric_name = metric_type + suffix
+        if metric_type == "auc":
+            pred = (
+                predictions["probs" + suffix]
+                if num_class == 1
+                else predictions["probs1" + suffix]
+            )
+            self._train_metric_modules[metric_name].update(pred, label)
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update metrics and train metrics."""
+        for metric_cfg in self._base_model_config.metrics:
+            self._update_metric_impl(
+                predictions,
+                batch,
+                batch.labels[self._label_name],
+                metric_cfg,
+                num_class=self._num_class,
+            )
+            self._update_train_metric_impl(
+                predictions,
+                batch.labels[self._label_name],
+                metric_cfg,
+                num_class=self._num_class,
+            )
+
     def train_update_and_compute_metric(
         self,
         predictions: Dict[str, torch.Tensor],
@@ -439,21 +485,20 @@ class RankModel(BaseModel):
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
         """
-        self.update_metric(predictions, batch)
-        step_metric_results = self.compute_metric()
+        self.update_train_metric(predictions, batch)
+        step_metric_results = self.compute_train_metric()
         for metric_name, metric_value in step_metric_results.items():
-            if metric_name in self._train_metrics_step_decay_rate.keys():
-                decay_rate = self._train_metrics_step_decay_rate[metric_name]
-                if metric_name in self._train_metrics.keys():
-                    old_metric_value = self._train_metrics.get(metric_name)
+            if metric_name in self._train_metrics_step_decay_rates.keys():
+                decay_rate = self._train_metrics_step_decay_rates[metric_name]
+                if metric_name in self._train_metrics_values.keys():
+                    old_metric_value = self._train_metrics_values.get(metric_name)
                     new_metric_value = (
                         decay_rate * old_metric_value + (1 - decay_rate) * metric_value
                     )
                 else:
                     new_metric_value = nn.Parameter(metric_value, requires_grad=False)
-
-                self._train_metrics[metric_name] = new_metric_value
+                self._train_metrics_values[metric_name] = new_metric_value
         metric_results = {}
-        for k, v in self._train_metrics.items():
+        for k, v in self._train_metrics_values.items():
             metric_results[k] = v.data
         return metric_results

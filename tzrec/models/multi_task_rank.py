@@ -179,3 +179,34 @@ class MultiTaskRank(RankModel):
                         loss_cfg,
                         suffix=f"_{tower_name}",
                     )
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ):
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+            losses (dict, optional): a dict of loss.
+        """
+        for task_tower_cfg in self._task_tower_cfgs:
+            tower_name = task_tower_cfg.tower_name
+            label_name = task_tower_cfg.label_name
+            for metric_cfg in task_tower_cfg.metrics:
+                self._update_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[label_name],
+                    metric_cfg,
+                    num_class=task_tower_cfg.num_class,
+                    suffix=f"_{tower_name}",
+                )
+                self._update_train_metric_impl(
+                    predictions,
+                    batch.labels[self._label_name],
+                    metric_cfg,
+                    num_class=self._num_class,
+                )
