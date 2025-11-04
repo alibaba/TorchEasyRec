@@ -54,17 +54,5 @@ _logging.basicConfig(
 _load_class.auto_import()
 
 
-try:
-    import fsspec
-    from pangudfs_client.common.property.pangu_write_type import DEFAULT_ECFILE_PARAM
-    from pangudfs_client.high_level_client.extern.fsspec import PanguDfs
-
-    from tzrec.utils.io_util import apply_monkeypatch
-
-    fsspec.register_implementation("dfs", PanguDfs)
-    fs = fsspec.filesystem("dfs", default_write_file_options=DEFAULT_ECFILE_PARAM)
-    apply_monkeypatch()
-except Exception as e:
-    from tzrec.utils.logging_util import logger
-
-    logger.debug(f"register pangudfs error. {str(e)}")
+from tzrec.utils.filesystem_util import register_external_filesystem
+register_external_filesystem()

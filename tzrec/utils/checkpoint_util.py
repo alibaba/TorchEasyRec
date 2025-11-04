@@ -155,7 +155,7 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
         latest_step: step of the latest checkpoint
     """
     if "model.ckpt-" not in model_dir:
-        ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*"))
+        ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*/"))
         if len(ckpt_metas) == 0:
             model_ckpt_dir = os.path.join(model_dir, "model")
             optim_ckpt_dir = os.path.join(model_dir, "optimizer")
