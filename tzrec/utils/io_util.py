@@ -31,11 +31,6 @@ def _is_remote_path(path):
     return bool(parsed.scheme) and len(parsed.scheme) > 1
 
 
-def _get_fs_and_path(path):
-    """Return (filesystem_instance, stripped_path) for URI or local fs."""
-    return fsspec.core.url_to_fs(path)
-
-
 def _patched_open(path, mode="r", *args, **kwargs):
     if _is_remote_path(path):
         return fsspec.open(path, mode, **kwargs).__enter__()
@@ -45,7 +40,7 @@ def _patched_open(path, mode="r", *args, **kwargs):
 
 def _patched_listdir(path):
     if _is_remote_path(path):
-        fs, _, rpath = _get_fs_and_path(path)
+        fs, rpath = fsspec.core.url_to_fs(path)
         return [os.path.basename(p) for p in fs.ls(rpath)]
     else:
         return _original_listdir(path)
@@ -53,7 +48,7 @@ def _patched_listdir(path):
 
 def _patched_remove(path):
     if _is_remote_path(path):
-        fs, _, rpath = _get_fs_and_path(path)
+        fs, rpath = fsspec.core.url_to_fs(path)
         return fs.rm(rpath)
     else:
         return _original_remove(path)
@@ -61,7 +56,7 @@ def _patched_remove(path):
 
 def _patched_exists(path):
     if _is_remote_path(path):
-        fs, _, rpath = _get_fs_and_path(path)
+        fs, rpath = fsspec.core.url_to_fs(path)
         return fs.exists(rpath)
     else:
         return _original_exists(path)
@@ -71,8 +66,8 @@ def _patched_copy(src, dst, *args, **kwargs):
     if _is_remote_path(src) or _is_remote_path(dst):
         # Always use fsspec filesystem copy
         # src and dst can each have their own fs
-        src_fs, _, src_path = _get_fs_and_path(src)
-        dst_fs, _, dst_path = _get_fs_and_path(dst)
+        src_fs, src_path = fsspec.core.url_to_fs(src)
+        dst_fs, dst_path = fsspec.core.url_to_fs(dst)
 
         # Read from src
         with src_fs.open(src_path, "rb") as fsrc:
