@@ -54,6 +54,7 @@ from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
+from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     fx_mark_keyed_tensor,
     fx_mark_seq_len,
@@ -63,7 +64,6 @@ from tzrec.utils.fx_util import (
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
-from tzrec.utils.filesystem_util import url_to_fs
 
 
 def export_model(
@@ -79,7 +79,7 @@ def export_model(
     fs, local_path = url_to_fs(save_dir)
     if fs is not None:
         # scripted model use io in cpp, so that we can not path to fsspec
-        local_path = os.environ.get('LOCAL_CACHE_DIR', local_path)
+        local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
     impl(
         pipeline_config=pipeline_config,
         model=model,
@@ -91,7 +91,6 @@ def export_model(
         logger.info(f"uploading {local_path} to {save_dir}.")
         fs.upload(local_path, save_dir, recursive=True)
         shutil.rmtree(local_path)
-
 
 
 def export_model_normal(

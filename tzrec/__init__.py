@@ -54,5 +54,8 @@ _logging.basicConfig(
 _load_class.auto_import()
 
 
-from tzrec.utils.filesystem_util import register_external_filesystem
-register_external_filesystem()
+from tzrec.utils.filesystem_util import (  # NOQA
+    register_external_filesystem as _register_external_filesystem,  # NOQA
+)  # NOQA
+
+_register_external_filesystem()

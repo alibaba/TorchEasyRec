@@ -9,15 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import io
 import builtins
+import glob as glob_module
 import os
 import shutil
-import glob as glob_module
-import fsspec
-import traceback
 import time
+import traceback
 
+import fsspec
 from tensorboard.compat import tensorflow_stub
 from tensorboard.compat.tensorflow_stub.io import gfile
 
@@ -31,7 +30,9 @@ _original_glob = glob_module.glob
 
 _CACHED_FSSPEC_FILESYSTEMS = {}
 
+
 def url_to_fs(path):
+    """Convert urlpath to filesystem and relative path."""
     protocol = None
     rpath = path
     if isinstance(path, str):
@@ -52,7 +53,7 @@ def _patched_open(path, mode="r", *args, **kwargs):
         return fs.open(path, mode, *args, **kwargs)
     else:
         return _original_open(path, mode, *args, **kwargs)
-    
+
 
 def _patched_makedirs(path, mode=0o777, exist_ok=False):
     fs, _ = url_to_fs(path)
@@ -60,7 +61,7 @@ def _patched_makedirs(path, mode=0o777, exist_ok=False):
         return fs.makedirs(path, exist_ok=exist_ok)
     else:
         return _original_makedirs(path, mode=mode, exist_ok=exist_ok)
-    
+
 
 def _patched_listdir(path):
     fs, _ = url_to_fs(path)
@@ -96,7 +97,7 @@ def _patched_copy(src, dst, *args, **kwargs):
         return dst
     else:
         return _original_copy(src, dst, *args, **kwargs)
-    
+
 
 def _patched_glob(pattern, *args, **kwargs):
     fs, _ = url_to_fs(pattern)
@@ -104,7 +105,6 @@ def _patched_glob(pattern, *args, **kwargs):
         return fs.glob(pattern, *args, **kwargs)
     else:
         return _original_glob(pattern, *args, **kwargs)
-
 
 
 def apply_monkeypatch():
@@ -129,23 +129,23 @@ def remove_monkeypatch():
     glob_module.glob = _original_glob
 
 
-
 class PanguGFile(object):
     """Provide tensorboard filesystem access to pangu dfs."""
 
     def __init__(self):
         from pangudfs_client.high_level_client import PanguClient
+
         self.pangu_client = PanguClient()
         self._max_retry_time = 10
 
-    def format_path(self, filename):
+    def _format_path(self, filename):
         if isinstance(filename, bytes):
             filename = filename.decode()
         return filename
 
     def exists(self, filename):
         """Determines whether a path exists or not."""
-        return self.pangu_client.status(self.format_path(filename), check_dir=True)
+        return self.pangu_client.status(self._format_path(filename), check_dir=True)
 
     def join(self, path, *paths):
         """Join paths with a slash."""
@@ -189,12 +189,15 @@ class PanguGFile(object):
             file_content = tensorflow_stub.compat.as_bytes(file_content)
 
         from pangudfs_client.common.exception import PanguException
+
         # cause hdfs client not stable ,add retry
         retry_times = 0
         while retry_times < self._max_retry_time:
             retry_times = retry_times + 1
             try:
-                with self.pangu_client.buffer_append(pangu_path=self.format_path(filename)) as writer:
+                with self.pangu_client.buffer_append(
+                    pangu_path=self._format_path(filename)
+                ) as writer:
                     writer.append(file_content)
                 return
             except PanguException as e:
@@ -205,15 +208,16 @@ class PanguGFile(object):
                     time.sleep(10)
 
     def glob(self, filename):
+        """Returns a list of files that match the given pattern(s)."""
         return []
 
     def isdir(self, dirname):
         """Returns whether the path is a directory or not."""
-        return self.pangu_client.is_dir(self.format_path(dirname))
+        return self.pangu_client.is_dir(self._format_path(dirname))
 
     def listdir(self, dirname):
         """Returns a list of entries contained within a directory."""
-        return self.pangu_client.list(self.format_path(dirname))
+        return self.pangu_client.list(self._format_path(dirname))
 
     def makedirs(self, dirname):
         """Creates a directory and all parent/intermediate directories."""
@@ -224,19 +228,21 @@ class PanguGFile(object):
         # NOTE: Size of the file is given by ContentLength from S3,
         # but we convert to .length
 
-        if not self.exists(self.format_path(filename)):
-            file_status = self.pangu_client.status(self.format_path(filename))
+        if not self.exists(self._format_path(filename)):
+            file_status = self.pangu_client.status(self._format_path(filename))
             return gfile.StatData(file_status.pangu_file_stat.file_size)
         else:
-            raise tensorflow_stub.errors.NotFoundError(None, None, "Could not find file")
-
+            raise tensorflow_stub.errors.NotFoundError(
+                None, None, "Could not find file"
+            )
 
 
 def register_external_filesystem():
+    """Register user-defined filesystems."""
     use_fsspec = int(os.environ.get("USE_FSSPEC", "1")) == 1
     try:
-        from tensorboard.compat.tensorflow_stub.io import gfile
         from pangudfs_client.high_level_client.extern.fsspec import PanguDfs
+        from tensorboard.compat.tensorflow_stub.io import gfile
 
         gfile.register_filesystem("dfs", PanguGFile())
         fsspec.register_implementation("dfs", PanguDfs)
