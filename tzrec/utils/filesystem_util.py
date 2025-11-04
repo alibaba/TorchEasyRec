@@ -22,7 +22,6 @@ from tensorboard.compat import tensorflow_stub
 from tensorboard.compat.tensorflow_stub.io import gfile
 
 _original_open = builtins.open
-_original_mkdir = os.mkdir
 _original_makedirs = os.makedirs
 _original_listdir = os.listdir
 _original_remove = os.remove
@@ -32,37 +31,31 @@ _original_glob = glob_module.glob
 
 _CACHED_FSSPEC_FILESYSTEMS = {}
 
-def _url_to_fs(path):
+def url_to_fs(path):
     protocol = None
+    rpath = path
     if isinstance(path, str):
-        protocol, _ = fsspec.core.split_protocol(path)
+        protocol, rpath = fsspec.core.split_protocol(path)
     if protocol is None:
-        return None
+        return None, rpath
     elif protocol in _CACHED_FSSPEC_FILESYSTEMS:
-        return _CACHED_FSSPEC_FILESYSTEMS[protocol]
+        return _CACHED_FSSPEC_FILESYSTEMS[protocol], rpath
     else:
         fs, _ = fsspec.core.url_to_fs(path)
         _CACHED_FSSPEC_FILESYSTEMS[protocol] = fs
-        return fs
+        return fs, rpath
 
 
 def _patched_open(path, mode="r", *args, **kwargs):
-    fs = _url_to_fs(path)
+    fs, _ = url_to_fs(path)
     if fs is not None:
         return fs.open(path, mode, *args, **kwargs)
     else:
         return _original_open(path, mode, *args, **kwargs)
-
-def _patched_mkdir(path, mode=0o777):
-    fs = _url_to_fs(path)
-    if fs is not None:
-        return fs.mkdir(path)
-    else:
-        return _original_mkdir(path, mode=mode)
     
 
 def _patched_makedirs(path, mode=0o777, exist_ok=False):
-    fs = _url_to_fs(path)
+    fs, _ = url_to_fs(path)
     if fs is not None:
         return fs.makedirs(path, exist_ok=exist_ok)
     else:
@@ -70,7 +63,7 @@ def _patched_makedirs(path, mode=0o777, exist_ok=False):
     
 
 def _patched_listdir(path):
-    fs = _url_to_fs(path)
+    fs, _ = url_to_fs(path)
     if fs is not None:
         return fs.ls(path, detail=False)
     else:
@@ -78,7 +71,7 @@ def _patched_listdir(path):
 
 
 def _patched_remove(path):
-    fs = _url_to_fs(path)
+    fs, _ = url_to_fs(path)
     if fs is not None:
         return fs.rm(path)
     else:
@@ -86,7 +79,7 @@ def _patched_remove(path):
 
 
 def _patched_exists(path):
-    fs = _url_to_fs(path)
+    fs, _ = url_to_fs(path)
     if fs is not None:
         return fs.exists(path, check_dir=True)
     else:
@@ -94,8 +87,8 @@ def _patched_exists(path):
 
 
 def _patched_copy(src, dst, *args, **kwargs):
-    src_fs = _url_to_fs(src)
-    dst_fs = _url_to_fs(dst)
+    src_fs, _ = url_to_fs(src)
+    dst_fs, _ = url_to_fs(dst)
     if src_fs is not None or dst_fs is not None:
         with src_fs.open(src, "rb") as fsrc:
             with dst_fs.open(dst, "wb") as fdst:
@@ -106,7 +99,7 @@ def _patched_copy(src, dst, *args, **kwargs):
     
 
 def _patched_glob(pattern, *args, **kwargs):
-    fs = _url_to_fs(pattern)
+    fs, _ = url_to_fs(pattern)
     if fs is not None:
         return fs.glob(pattern, *args, **kwargs)
     else:
@@ -117,8 +110,6 @@ def _patched_glob(pattern, *args, **kwargs):
 def apply_monkeypatch():
     """Apply fsspec-backed monkeypatches to builtins/os/shutil."""
     builtins.open = _patched_open
-    io.open = _patched_open
-    os.mkdir = _patched_mkdir
     os.makedirs = _patched_makedirs
     os.listdir = _patched_listdir
     os.remove = _patched_remove
@@ -130,8 +121,6 @@ def apply_monkeypatch():
 def remove_monkeypatch():
     """Restore original functions."""
     builtins.open = _original_open
-    io.open = _original_open
-    os.mkdir = _original_mkdir
     os.makedirs = _original_makedirs
     os.listdir = _original_listdir
     os.remove = _original_remove

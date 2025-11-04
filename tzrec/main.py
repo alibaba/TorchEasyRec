@@ -79,6 +79,7 @@ from tzrec.utils.export_util import export_model
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
+from tzrec.utils.filesystem_util import url_to_fs
 
 
 def _create_features(
@@ -921,6 +922,14 @@ def predict(
         reserved_cols = [x.strip() for x in reserved_columns.split(",")]
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
+    
+    fs, local_path = url_to_fs(scripted_model_path)
+    if fs is not None:
+        # scripted model use io in cpp, so that we can not path to fsspec
+        local_path = os.environ.get('LOCAL_CACHE_DIR', local_path)
+        logger.info(f"downloading {scripted_model_path} to {local_path}.")
+        fs.download(scripted_model_path, local_path)
+        scripted_model_path = local_path
 
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
