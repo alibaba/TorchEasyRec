@@ -177,16 +177,15 @@ class MultiTaskRank(RankModel):
                         num_class=task_tower_cfg.num_class,
                         suffix=f"_{tower_name}",
                     )
-            else:
-                for metric_cfg in task_tower_cfg.metrics:
-                    self._update_metric_impl(
-                        predictions,
-                        batch,
-                        batch.labels[label_name],
-                        metric_cfg,
-                        num_class=task_tower_cfg.num_class,
-                        suffix=f"_{tower_name}",
-                    )
+            for metric_cfg in task_tower_cfg.metrics:
+                self._update_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[label_name],
+                    metric_cfg,
+                    num_class=task_tower_cfg.num_class,
+                    suffix=f"_{tower_name}",
+                )
             if losses is not None:
                 for loss_cfg in task_tower_cfg.losses:
                     self._update_loss_metric_impl(

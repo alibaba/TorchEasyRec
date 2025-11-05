@@ -487,15 +487,14 @@ class RankModel(BaseModel):
                     metric_cfg,
                     num_class=self._num_class,
                 )
-        else:
-            for metric_cfg in self._base_model_config.metrics:
-                self._update_metric_impl(
-                    predictions,
-                    batch,
-                    batch.labels[self._label_name],
-                    metric_cfg,
-                    num_class=self._num_class,
-                )
+        for metric_cfg in self._base_model_config.metrics:
+            self._update_metric_impl(
+                predictions,
+                batch,
+                batch.labels[self._label_name],
+                metric_cfg,
+                num_class=self._num_class,
+            )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
                 self._update_loss_metric_impl(

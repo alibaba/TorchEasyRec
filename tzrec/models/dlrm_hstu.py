@@ -493,15 +493,14 @@ class DlrmHSTU(RankModel):
                         metric_cfg,
                         suffix=f"_{task_name}",
                     )
-            else:
-                for metric_cfg in task_cfg.metrics:
-                    self._update_metric_impl(
-                        predictions,
-                        batch,
-                        label,
-                        metric_cfg,
-                        suffix=f"_{task_name}",
-                    )
+            for metric_cfg in task_cfg.metrics:
+                self._update_metric_impl(
+                    predictions,
+                    batch,
+                    label,
+                    metric_cfg,
+                    suffix=f"_{task_name}",
+                )
             if losses is not None:
                 for loss_cfg in task_cfg.losses:
                     self._update_loss_metric_impl(

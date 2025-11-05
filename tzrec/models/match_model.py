@@ -428,11 +428,10 @@ class MatchModel(BaseModel):
                 self._update_train_metric_impl(
                     predictions, batch, batch.labels[self._label_name], metric_cfg
                 )
-        else:
-            for metric_cfg in self._base_model_config.metrics:
-                self._update_metric_impl(
-                    predictions, batch, batch.labels[self._label_name], metric_cfg
-                )
+        for metric_cfg in self._base_model_config.metrics:
+            self._update_metric_impl(
+                predictions, batch, batch.labels[self._label_name], metric_cfg
+            )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
                 self._update_loss_metric_impl(
