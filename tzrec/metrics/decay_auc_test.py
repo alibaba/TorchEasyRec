@@ -19,7 +19,7 @@ from tzrec.metrics.decay_auc import DecayAUC
 
 class DecayAUCTest(unittest.TestCase):
     def test_decay_auc(self):
-        metric = DecayAUC(thresholds=10)
+        metric = DecayAUC(thresholds=10, compute_with_cache=False)
         preds = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
         target = torch.tensor([1, 0, 1, 0, 0, 0, 1, 1])
         target2 = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0])

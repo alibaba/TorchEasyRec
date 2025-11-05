@@ -65,14 +65,7 @@ class DecayAUC(Metric):
             self.confmat = decay * self.confmat + (1 - decay) * self.buffer_confmat
         else:
             self.confmat += self.buffer_confmat
-        attr = "buffer_confmat"
-        default = self._defaults[attr]
-        current_val = getattr(self, attr)
-        if isinstance(default, Tensor):
-            setattr(self, attr, default.detach().clone().to(current_val.device))
-        else:
-            setattr(self, attr, [])
-        self._computed = None
+        self.buffer_confmat = torch.zeros_like(self.buffer_confmat)
 
     def compute(self) -> Tensor:
         """Compute metric."""

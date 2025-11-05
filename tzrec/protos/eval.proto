@@ -6,6 +6,4 @@ message EvalConfig {
     optional uint32 num_steps = 1;
     // the frequency progress be logged during eval
     optional uint32 log_step_count_steps = 2 [default = 10];
-    // Evaluation online with batch forward data of training
-    optional bool eval_online = 3 [default = false];
 }

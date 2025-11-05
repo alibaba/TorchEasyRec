@@ -69,6 +69,8 @@ message TrainMetricConfig {
         Accuracy accuracy = 6;
         XAUC xauc = 8;
     }
-    optional float decay_rate = 20 [default=0.50];
+    // metric decay rate
+    optional float decay_rate = 20 [default=0.90];
+    // train_config.log_step_count_steps can divide decay_steps evenly.
     optional uint32 decay_step = 21 [default=100];
 }

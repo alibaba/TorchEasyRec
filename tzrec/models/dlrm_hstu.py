@@ -458,6 +458,11 @@ class DlrmHSTU(RankModel):
                     metric_cfg,
                     suffix=f"_{task_name}",
                 )
+            for metric_cfg in task_cfg.train_metrics:
+                self._init_train_metric_impl(
+                    metric_cfg,
+                    suffix=f"_{task_name}",
+                )
             for loss_cfg in task_cfg.losses:
                 self._init_loss_metric_impl(loss_cfg, suffix=f"_{task_name}")
 
@@ -479,14 +484,24 @@ class DlrmHSTU(RankModel):
             label, label_lengths = self._get_label(batch, task_cfg)
             predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
 
-            for metric_cfg in task_cfg.metrics:
-                self._update_metric_impl(
-                    predictions,
-                    batch,
-                    label,
-                    metric_cfg,
-                    suffix=f"_{task_name}",
-                )
+            if self.training:
+                for metric_cfg in task_cfg.train_metrics:
+                    self._update_train_metric_impl(
+                        predictions,
+                        batch,
+                        label,
+                        metric_cfg,
+                        suffix=f"_{task_name}",
+                    )
+            else:
+                for metric_cfg in task_cfg.metrics:
+                    self._update_metric_impl(
+                        predictions,
+                        batch,
+                        label,
+                        metric_cfg,
+                        suffix=f"_{task_name}",
+                    )
             if losses is not None:
                 for loss_cfg in task_cfg.losses:
                     self._update_loss_metric_impl(
