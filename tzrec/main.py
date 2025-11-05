@@ -394,12 +394,9 @@ def _train_and_evaluate(
                 continue
             try:
                 losses, predictions, batch = pipeline.progress(train_iterator)
-                train_metrics = None
-                if eval_config.eval_online:
-                    train_metrics = _model.train_update_and_compute_metric(
-                        predictions, batch
-                    )
+                _model.update_metric(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
+                    train_metrics = _model.compute_train_metric()
                     _log_train(
                         i_step,
                         losses,

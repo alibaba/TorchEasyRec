@@ -33,6 +33,8 @@ message TaskTower {
     required string label_name = 2;
     // metrics for the task
     repeated MetricConfig metrics = 3;
+    // log train merics for task
+    repeated TrainMetricConfig train_metrics = 20;
     // loss for the task
     repeated LossConfig losses = 4;
     // num_class for multi-class classification loss
@@ -58,6 +60,8 @@ message BayesTaskTower {
     optional string label_name = 2;
     // metrics for the task
     repeated MetricConfig metrics = 3;
+    // log train merics for task
+    repeated TrainMetricConfig train_metrics = 20;
     // loss for the task
     repeated LossConfig losses = 4;
     // num_class for multi-class classification loss
@@ -88,6 +92,8 @@ message InterventionTaskTower {
     optional string label_name = 2;
     // metrics for the task
     repeated MetricConfig metrics = 3;
+    // log train merics for task
+    repeated TrainMetricConfig train_metrics = 20;
     // loss for the task
     repeated LossConfig losses = 4;
     // num_class for multi-class classification loss
@@ -125,6 +131,8 @@ message FusionSubTaskConfig {
     // optional uint32 num_class = 5 [default = 1];
     // metrics for the task
     repeated MetricConfig metrics = 6;
+    // log train merics for task
+    repeated TrainMetricConfig train_metrics = 20;
 }
 
 

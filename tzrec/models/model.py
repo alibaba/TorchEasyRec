@@ -67,8 +67,6 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             self._sample_weights = sample_weights
 
         self._train_metric_modules = nn.ModuleDict()
-        self._train_metrics_values = nn.ParameterDict()
-        self._train_metrics_step_decay_rates = nn.ParameterDict()
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -133,8 +131,6 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
     def compute_train_metric(self) -> Dict[str, torch.Tensor]:
         """Compute train metric."""
         metric_results = {}
-        for metric_name, metric in self._metric_modules.items():
-            metric_results[metric_name] = metric.compute()
         for metric_name, metric in self._train_metric_modules.items():
             metric_results[metric_name] = metric.compute()
         return metric_results

@@ -22,6 +22,7 @@ from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.decay_auc import DecayAUC
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.metrics.grouped_xauc import GroupedXAUC
+from tzrec.metrics.train_metric_wrapper import TrainMetricWrapper
 from tzrec.metrics.xauc import XAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
@@ -29,7 +30,7 @@ from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
-from tzrec.protos.metric_pb2 import MetricConfig
+from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 # repeat interleave session_id or grouping key for one-to-many rank sample
@@ -290,7 +291,6 @@ class RankModel(BaseModel):
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
         metric_kwargs = config_to_kwargs(oneof_metric_cfg)
         metric_name = metric_type + suffix
-        decay_rate = metric_cfg.step_decay_rate
         if metric_type == "auc":
             assert num_class <= 2, (
                 f"num_class must less than 2 when metric type is {metric_type}"
@@ -298,10 +298,6 @@ class RankModel(BaseModel):
             self._metric_modules[metric_name] = torchmetrics.AUROC(
                 task="binary", **metric_kwargs
             )
-            self._train_metric_modules[metric_name] = DecayAUC(
-                decay=decay_rate, **metric_kwargs
-            )
-            decay_rate = 0.0
         elif metric_type == "multiclass_auc":
             self._metric_modules[metric_name] = torchmetrics.AUROC(
                 task="multiclass", num_classes=num_class, **metric_kwargs
@@ -329,8 +325,35 @@ class RankModel(BaseModel):
             )
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
-        self._train_metrics_step_decay_rates[metric_name] = nn.Parameter(
-            torch.tensor(decay_rate), requires_grad=False
+
+    def _init_train_metric_impl(
+        self, metric_cfg: TrainMetricConfig, num_class: int = 1, suffix: str = ""
+    ) -> None:
+        metric_type = metric_cfg.WhichOneof("metric")
+        oneof_metric_cfg = getattr(metric_cfg, metric_type)
+        metric_kwargs = config_to_kwargs(oneof_metric_cfg)
+        metric_name = metric_type + suffix
+        if metric_type == "auc":
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
+            metric_module = DecayAUC(**metric_kwargs)
+        elif metric_type == "mean_absolute_error":
+            metric_module = torchmetrics.MeanAbsoluteError()
+        elif metric_type == "mean_squared_error":
+            metric_module = torchmetrics.MeanSquaredError()
+        elif metric_type == "accuracy":
+            metric_module = torchmetrics.Accuracy(
+                task="multiclass" if num_class > 1 else "binary",
+                num_classes=num_class,
+                **metric_kwargs,
+            )
+        elif metric_type == "xauc":
+            metric_module = XAUC(**metric_kwargs)
+        else:
+            raise ValueError(f"{metric_type} is not supported for this model")
+        self._train_metric_modules[metric_name] = TrainMetricWrapper(
+            metric_module, metric_cfg.decay_rate, metric_cfg.decay_step
         )
 
     def init_metric(self) -> None:
@@ -339,6 +362,8 @@ class RankModel(BaseModel):
             self._init_metric_impl(metric_cfg, self._num_class)
         for loss_cfg in self._base_model_config.losses:
             self._init_loss_metric_impl(loss_cfg)
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._init_train_metric_impl(metric_cfg, self._num_class)
 
     def _update_metric_impl(
         self,
@@ -407,6 +432,39 @@ class RankModel(BaseModel):
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
+    def _update_train_metric_impl(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        label: torch.Tensor,
+        metric_cfg: TrainMetricConfig,
+        num_class: int = 1,
+        suffix: str = "",
+    ) -> None:
+        metric_type = metric_cfg.WhichOneof("metric")
+        metric_name = metric_type + suffix
+        if metric_type == "auc":
+            pred = (
+                predictions["probs" + suffix]
+                if num_class == 1
+                else predictions["probs1" + suffix]
+            )
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "mean_absolute_error":
+            pred = predictions["y" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "mean_squared_error":
+            pred = predictions["y" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "accuracy":
+            pred = predictions["probs" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "xauc":
+            pred = predictions["y" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        else:
+            raise ValueError(f"{metric_type} is not supported for this model")
+
     def update_metric(
         self,
         predictions: Dict[str, torch.Tensor],
@@ -420,85 +478,26 @@ class RankModel(BaseModel):
             batch (Batch): input batch data.
             losses (dict, optional): a dict of loss.
         """
-        for metric_cfg in self._base_model_config.metrics:
-            self._update_metric_impl(
-                predictions,
-                batch,
-                batch.labels[self._label_name],
-                metric_cfg,
-                num_class=self._num_class,
-            )
+        if self.training:
+            for metric_cfg in self._base_model_config.train_metrics:
+                self._update_train_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[self._label_name],
+                    metric_cfg,
+                    num_class=self._num_class,
+                )
+        else:
+            for metric_cfg in self._base_model_config.metrics:
+                self._update_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[self._label_name],
+                    metric_cfg,
+                    num_class=self._num_class,
+                )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
                 self._update_loss_metric_impl(
                     losses, batch, batch.labels[self._label_name], loss_cfg
                 )
-
-    def _update_train_metric_impl(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        label: torch.Tensor,
-        metric_cfg: MetricConfig,
-        num_class: int = 1,
-        suffix: str = "",
-    ) -> None:
-        """Update and train metrics."""
-        metric_type = metric_cfg.WhichOneof("metric")
-        metric_name = metric_type + suffix
-        if metric_type == "auc":
-            pred = (
-                predictions["probs" + suffix]
-                if num_class == 1
-                else predictions["probs1" + suffix]
-            )
-            self._train_metric_modules[metric_name].update(pred, label)
-
-    def update_train_metric(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        batch: Batch,
-    ) -> None:
-        """Update metrics and train metrics."""
-        for metric_cfg in self._base_model_config.metrics:
-            self._update_metric_impl(
-                predictions,
-                batch,
-                batch.labels[self._label_name],
-                metric_cfg,
-                num_class=self._num_class,
-            )
-            self._update_train_metric_impl(
-                predictions,
-                batch.labels[self._label_name],
-                metric_cfg,
-                num_class=self._num_class,
-            )
-
-    def train_update_and_compute_metric(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        batch: Batch,
-    ) -> Dict[str, torch.Tensor]:
-        """Update and compute metric when in training mode.
-
-        Args:
-            predictions (dict): a dict of predicted result.
-            batch (Batch): input batch data.
-        """
-        self.update_train_metric(predictions, batch)
-        step_metric_results = self.compute_train_metric()
-        for metric_name, metric_value in step_metric_results.items():
-            if metric_name in self._train_metrics_step_decay_rates.keys():
-                decay_rate = self._train_metrics_step_decay_rates[metric_name]
-                if metric_name in self._train_metrics_values.keys():
-                    old_metric_value = self._train_metrics_values.get(metric_name)
-                    new_metric_value = (
-                        decay_rate * old_metric_value + (1 - decay_rate) * metric_value
-                    )
-                else:
-                    new_metric_value = nn.Parameter(metric_value, requires_grad=False)
-                self._train_metrics_values[metric_name] = new_metric_value
-        metric_results = {}
-        for k, v in self._train_metrics_values.items():
-            metric_results[k] = v.data
-        return metric_results

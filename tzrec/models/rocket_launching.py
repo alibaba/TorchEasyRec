@@ -171,6 +171,9 @@ class RocketLaunching(RankModel):
         for metric_cfg in self._base_model_config.metrics:
             self._init_metric_impl(metric_cfg, self._num_class, "_booster")
             self._init_metric_impl(metric_cfg, self._num_class, "_light")
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._init_train_metric_impl(metric_cfg, self._num_class, "_booster")
+            self._init_train_metric_impl(metric_cfg, self._num_class, "_light")
 
         for loss_cfg in self._base_model_config.losses:
             self._init_loss_metric_impl(loss_cfg, "_booster")
@@ -254,9 +257,9 @@ class RocketLaunching(RankModel):
                 batch (Batch): input batch data.
                 losses (dict, optional): a dict of loss.
         """
-        for metric_cfg in self._base_model_config.metrics:
-            if self.training:
-                self._update_metric_impl(
+        if self.training:
+            for metric_cfg in self._base_model_config.train_metrics:
+                self._update_train_metric_impl(
                     predictions,
                     batch,
                     batch.labels[self._label_name],
@@ -264,14 +267,24 @@ class RocketLaunching(RankModel):
                     num_class=self._num_class,
                     suffix="_booster",
                 )
-            self._update_metric_impl(
-                predictions,
-                batch,
-                batch.labels[self._label_name],
-                metric_cfg,
-                num_class=self._num_class,
-                suffix="_light",
-            )
+                self._update_train_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[self._label_name],
+                    metric_cfg,
+                    num_class=self._num_class,
+                    suffix="_light",
+                )
+        else:
+            for metric_cfg in self._base_model_config.metrics:
+                self._update_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[self._label_name],
+                    metric_cfg,
+                    num_class=self._num_class,
+                    suffix="_light",
+                )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
                 if self.training:
@@ -289,48 +302,3 @@ class RocketLaunching(RankModel):
                     loss_cfg,
                     suffix="_light",
                 )
-
-    def update_train_metric(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        batch: Batch,
-    ):
-        """Update train metric state.
-
-        Args:
-            predictions (dict): a dict of predicted result.
-            batch (Batch): input batch data.
-            losses (dict, optional): a dict of loss.
-        """
-        for metric_cfg in self._base_model_config.metrics:
-            if self.training:
-                self._update_metric_impl(
-                    predictions,
-                    batch,
-                    batch.labels[self._label_name],
-                    metric_cfg,
-                    num_class=self._num_class,
-                    suffix="_booster",
-                )
-                self._update_train_metric_impl(
-                    predictions,
-                    batch.labels[self._label_name],
-                    metric_cfg,
-                    num_class=self._num_class,
-                    suffix="_booster",
-                )
-            self._update_metric_impl(
-                predictions,
-                batch,
-                batch.labels[self._label_name],
-                metric_cfg,
-                num_class=self._num_class,
-                suffix="_light",
-            )
-            self._update_train_metric_impl(
-                predictions,
-                batch.labels[self._label_name],
-                metric_cfg,
-                num_class=self._num_class,
-                suffix="_light",
-            )
