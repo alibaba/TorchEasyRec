@@ -54,6 +54,7 @@ from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
+from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     fx_mark_keyed_tensor,
     fx_mark_seq_len,
@@ -75,13 +76,21 @@ def export_model(
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = os.environ.get("USE_RTP", "0") == "1"
     impl = export_rtp_model if use_rtp else export_model_normal
-    return impl(
+    fs, local_path = url_to_fs(save_dir)
+    if fs is not None:
+        # scripted model use io in cpp, so that we can not path to fsspec
+        local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+    impl(
         pipeline_config=pipeline_config,
         model=model,
         checkpoint_path=checkpoint_path,
-        save_dir=save_dir,
+        save_dir=local_path,
         assets=assets,
     )
+    if fs is not None and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        logger.info(f"uploading {local_path} to {save_dir}.")
+        fs.upload(local_path, save_dir, recursive=True)
+        shutil.rmtree(local_path)
 
 
 def export_model_normal(

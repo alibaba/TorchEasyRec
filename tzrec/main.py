@@ -76,6 +76,7 @@ from tzrec.utils.dist_util import (
     init_process_group,
 )
 from tzrec.utils.export_util import export_model
+from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
@@ -922,6 +923,19 @@ def predict(
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
 
+    device_and_backend = init_process_group()
+    device: torch.device = device_and_backend[0]
+
+    fs, local_path = url_to_fs(scripted_model_path)
+    if fs is not None:
+        # scripted model use io in cpp, so that we can not path to fsspec
+        local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            logger.info(f"downloading {scripted_model_path} to {local_path}.")
+            fs.download(scripted_model_path, local_path, recursive=True)
+        dist.barrier()
+        scripted_model_path = local_path
+
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
     )
@@ -952,9 +966,6 @@ def predict(
     if edit_config_json:
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
-
-    device_and_backend = init_process_group()
-    device: torch.device = device_and_backend[0]
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
