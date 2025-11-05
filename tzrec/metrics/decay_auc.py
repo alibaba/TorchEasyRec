@@ -72,6 +72,7 @@ class DecayAUC(Metric):
             setattr(self, attr, default.detach().clone().to(current_val.device))
         else:
             setattr(self, attr, [])
+        self._computed = None
 
     def compute(self) -> Tensor:
         """Compute metric."""
