@@ -167,16 +167,6 @@ class MultiTaskRank(RankModel):
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name
-            if self.training:
-                for metric_cfg in task_tower_cfg.train_metrics:
-                    self._update_train_metric_impl(
-                        predictions,
-                        batch,
-                        batch.labels[label_name],
-                        metric_cfg,
-                        num_class=task_tower_cfg.num_class,
-                        suffix=f"_{tower_name}",
-                    )
             for metric_cfg in task_tower_cfg.metrics:
                 self._update_metric_impl(
                     predictions,
@@ -195,3 +185,27 @@ class MultiTaskRank(RankModel):
                         loss_cfg,
                         suffix=f"_{tower_name}",
                     )
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        for task_tower_cfg in self._task_tower_cfgs:
+            tower_name = task_tower_cfg.tower_name
+            label_name = task_tower_cfg.label_name
+            for metric_cfg in task_tower_cfg.train_metrics:
+                self._update_train_metric_impl(
+                    predictions,
+                    batch,
+                    batch.labels[label_name],
+                    metric_cfg,
+                    num_class=task_tower_cfg.num_class,
+                    suffix=f"_{tower_name}",
+                )

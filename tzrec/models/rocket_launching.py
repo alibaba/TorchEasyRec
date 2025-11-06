@@ -253,13 +253,13 @@ class RocketLaunching(RankModel):
         """Update metric state.
 
         Args:
-                predictions (dict): a dict of predicted result.
-                batch (Batch): input batch data.
-                losses (dict, optional): a dict of loss.
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+            losses (dict, optional): a dict of loss.
         """
-        if self.training:
-            for metric_cfg in self._base_model_config.train_metrics:
-                self._update_train_metric_impl(
+        for metric_cfg in self._base_model_config.metrics:
+            if self.training:
+                self._update_metric_impl(
                     predictions,
                     batch,
                     batch.labels[self._label_name],
@@ -267,15 +267,6 @@ class RocketLaunching(RankModel):
                     num_class=self._num_class,
                     suffix="_booster",
                 )
-                self._update_train_metric_impl(
-                    predictions,
-                    batch,
-                    batch.labels[self._label_name],
-                    metric_cfg,
-                    num_class=self._num_class,
-                    suffix="_light",
-                )
-        for metric_cfg in self._base_model_config.metrics:
             self._update_metric_impl(
                 predictions,
                 batch,
@@ -301,3 +292,32 @@ class RocketLaunching(RankModel):
                     loss_cfg,
                     suffix="_light",
                 )
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._update_train_metric_impl(
+                predictions,
+                batch,
+                batch.labels[self._label_name],
+                metric_cfg,
+                num_class=self._num_class,
+                suffix="_booster",
+            )
+            self._update_train_metric_impl(
+                predictions,
+                batch,
+                batch.labels[self._label_name],
+                metric_cfg,
+                num_class=self._num_class,
+                suffix="_light",
+            )

@@ -484,15 +484,6 @@ class DlrmHSTU(RankModel):
             label, label_lengths = self._get_label(batch, task_cfg)
             predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
 
-            if self.training:
-                for metric_cfg in task_cfg.train_metrics:
-                    self._update_train_metric_impl(
-                        predictions,
-                        batch,
-                        label,
-                        metric_cfg,
-                        suffix=f"_{task_name}",
-                    )
             for metric_cfg in task_cfg.metrics:
                 self._update_metric_impl(
                     predictions,
@@ -510,3 +501,27 @@ class DlrmHSTU(RankModel):
                         loss_cfg,
                         suffix=f"_{task_name}",
                     )
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        for task_cfg in self._task_configs:
+            task_name = task_cfg.task_name
+            label, label_lengths = self._get_label(batch, task_cfg)
+            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            for metric_cfg in task_cfg.train_metrics:
+                self._update_train_metric_impl(
+                    predictions,
+                    batch,
+                    label,
+                    metric_cfg,
+                    suffix=f"_{task_name}",
+                )
