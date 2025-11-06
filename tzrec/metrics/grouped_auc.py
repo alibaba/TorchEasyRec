@@ -11,7 +11,7 @@
 
 
 import os
-from typing import Any, List, Tuple
+from typing import Any
 
 import torch
 from torch import distributed as dist
@@ -19,55 +19,16 @@ from torchmetrics import Metric
 from torchmetrics.functional.classification.auroc import _binary_auroc_compute
 
 
-def custom_reduce_fx(
-    data_list: List[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Custom reduce func for distributed training. Distribute data to different GPUs.
-
-    Args:
-            data_list (list): list of tensors,
-                    each tensor is a 2d-tensor of shape (3, num_samples).
-
-    Returns:
-            Tensor: a 2d-tensor of shape (3, num_samples_on_one_gpu).
-    """
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_rank = int(os.environ.get("RANK", 0))
-
-    pred_reduce = []
-    target_reduce = []
-    key_reduce = []
-    for data in data_list:
-        for i in range(world_size):
-            key_mask = (
-                data["grouping_key"][i] % world_size == local_rank  # pyre-ignore [6]
-            )
-            pred_selected = torch.masked_select(
-                data["preds"][i],  # pyre-ignore [6]
-                key_mask,
-            )
-            target_selected = torch.masked_select(
-                data["target"][i],  # pyre-ignore [6]
-                key_mask,
-            )
-            key_selected = torch.masked_select(
-                data["grouping_key"][i],  # pyre-ignore [6]
-                key_mask,
-            )
-
-            pred_reduce.append(pred_selected)
-            target_reduce.append(target_selected)
-            key_reduce.append(key_selected)
-    return torch.cat(pred_reduce), torch.cat(target_reduce), torch.cat(key_reduce)
-
-
 class GroupedAUC(Metric):
     """Grouped AUC."""
 
     def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-
-        self.add_state("eval_data", default=[], dist_reduce_fx=custom_reduce_fx)
+        super().__init__(sync_on_compute=False, **kwargs)
+        self.add_state("preds", default=[], dist_reduce_fx=None)
+        self.add_state("target", default=[], dist_reduce_fx=None)
+        self.add_state("grouping_key", default=[], dist_reduce_fx=None)
+        self._world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self._rank = int(os.environ.get("RANK", 0))
 
     # pyre-ignore [14]
     def update(
@@ -80,28 +41,63 @@ class GroupedAUC(Metric):
             target (Tensor): a integer 1d-tensor of target.
             grouping_key (Tensor): a integer 1d-tensor with group id.
         """
-        self.eval_data.append(
-            {"preds": preds, "target": target, "grouping_key": grouping_key}
-        )
+        if dist.is_initialized() and self._world_size > 1:
+            dest_ranks = grouping_key % self._world_size
+
+            preds_list = []
+            target_list = []
+            grouping_key_list = []
+            for i in range(self._world_size):
+                mask = dest_ranks == i
+                preds_list.append(preds[mask])
+                target_list.append(target[mask])
+                grouping_key_list.append(grouping_key[mask])
+
+            input_splits = torch.tensor(
+                [t.size(0) for t in preds_list], dtype=torch.int64, device=preds.device
+            )
+            output_splits = torch.empty_like(input_splits)
+            work = dist.all_to_all_single(output_splits, input_splits, async_op=True)
+
+            input_preds_t = torch.cat(preds_list)
+            input_target_t = torch.cat(target_list)
+            input_grouping_key_t = torch.cat(grouping_key_list)
+            work.wait()
+
+            outputs = []
+            works = []
+            for input_t in [input_preds_t, input_target_t, input_grouping_key_t]:
+                output_t = torch.empty(
+                    output_splits.sum().item(),
+                    dtype=input_t.dtype,
+                    device=input_t.device,
+                )
+                works.append(
+                    dist.all_to_all_single(
+                        output_t,
+                        input_t,
+                        output_split_sizes=output_splits.tolist(),
+                        input_split_sizes=input_splits.tolist(),
+                        async_op=True,
+                    )
+                )
+                outputs.append(output_t)
+            for work in works:
+                work.wait()
+
+            self.preds.append(outputs[0])
+            self.target.append(outputs[1])
+            self.grouping_key.append(outputs[2])
+        else:
+            self.preds.append(preds)
+            self.target.append(target)
+            self.grouping_key.append(grouping_key)
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
-        if not dist.is_initialized():
-            preds = torch.cat(
-                [data["preds"] for data in self.eval_data]  # pyre-ignore [29]
-            )
-            target = torch.cat(
-                [data["target"] for data in self.eval_data]  # pyre-ignore [29]
-            )
-            grouping_key = torch.cat(
-                [data["grouping_key"] for data in self.eval_data]  # pyre-ignore [29]
-            )
-        else:
-            preds, target, grouping_key = (
-                self.eval_data[0],  # pyre-ignore [29]
-                self.eval_data[1],  # pyre-ignore [29]
-                self.eval_data[2],  # pyre-ignore [29]
-            )
+        preds = torch.cat(self.preds)
+        target = torch.cat(self.target)
+        grouping_key = torch.cat(self.grouping_key)
 
         sorted_grouping_key, indices = torch.sort(grouping_key)
         sorted_preds = preds[indices]
@@ -118,39 +114,12 @@ class GroupedAUC(Metric):
             mean_target = torch.mean(target.to(torch.float32)).item()
             if mean_target > 0 and mean_target < 1:
                 aucs.append(_binary_auroc_compute((preds, target), None))
-        sum_gauc = torch.sum(torch.Tensor(aucs))
+        sum_gauc = torch.sum(torch.tensor(aucs, device=preds.device))
+        group_cnt = torch.tensor(len(aucs), device=preds.device)
 
-        # gather metric data across processes
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            group_cnt = len(aucs)
-            gather_metric_list = [
-                torch.empty_like(sum_gauc.cuda())
-                if dist.get_backend() == "nccl"
-                else torch.empty_like(sum_gauc)
-                for _ in range(dist.get_world_size())
-            ]
-            gather_group_count = [
-                torch.empty_like(torch.Tensor([group_cnt]).cuda())
-                if dist.get_backend() == "nccl"
-                else torch.empty_like(torch.Tensor([group_cnt]))
-                for _ in range(dist.get_world_size())
-            ]
+        if dist.is_initialized() and self._world_size > 1:
+            dist.all_reduce(sum_gauc)
+            dist.all_reduce(group_cnt)
 
-            dist.all_gather(
-                gather_metric_list,
-                sum_gauc.cuda() if dist.get_backend() == "nccl" else sum_gauc,
-            )
-            dist.all_gather(
-                gather_group_count,
-                torch.Tensor([group_cnt]).cuda()
-                if dist.get_backend() == "nccl"
-                else torch.Tensor([group_cnt]),
-            )
-
-            total_sum_gauc = torch.sum(torch.stack(gather_metric_list))
-            total_group_cnt = torch.sum(torch.stack(gather_group_count))
-
-            mean_gauc = total_sum_gauc / total_group_cnt
-        else:
-            mean_gauc = sum_gauc / len(aucs)
+        mean_gauc = sum_gauc / group_cnt
         return mean_gauc
