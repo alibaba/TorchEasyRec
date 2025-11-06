@@ -161,6 +161,8 @@ def _evaluate(
     """Evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    _model = model.module.model
+    _model.reset_metric()
     model.eval()
     pipeline = create_train_pipeline(model)
 
@@ -173,8 +175,6 @@ def _evaluate(
         desc_suffix += f" Epoch-{global_epoch}"
     if global_step is not None:
         desc_suffix += f" model-{global_step}"
-    _model = model.module.model
-    _model.reset_metric()
 
     plogger = None
     if is_local_rank_zero:
