@@ -57,7 +57,7 @@ ______________________________________________________________________
 model_config {
     metrics: {
         multiclass_auc {
-            thresholds: 200,
+            thresholds: 200
             average:'macro'
         }
     }
@@ -81,7 +81,7 @@ ______________________________________________________________________
 model_config {
     metrics: {
         accuracy {
-            threshold: 0.5,
+            threshold: 0.5
             top_k: 5
         }
     }
@@ -230,8 +230,8 @@ ______________________________________________________________________
 model_config {
     metrics: {
         xauc {
-               sample_ratio:  1e-3,
-               max_pairs: 100,
+               sample_ratio:  1e-3
+               max_pairs: 100
                in_batch: false
         }
     }
@@ -255,7 +255,7 @@ ______________________________________________________________________
 model_config {
     metrics: {
         grouped_xauc {
-               grouping_key:  'age',
+               grouping_key:  'age'
                max_pairs_per_group: 100
         }
     }
