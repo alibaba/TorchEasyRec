@@ -25,7 +25,7 @@ model_config {
 }
 ```
 
-## AUC 离线计算
+### AUC 离线计算
 在PAI上可以用pai命令对于模型预测结果的MaxCompute表精确计算AUC
 ```SQL
 pai -name=evaluate -project=algo_public
@@ -167,7 +167,7 @@ model_config {
 ```
 ---
 
-## GroupedAUC 离线计算
+### GroupedAUC 离线计算
 
 若训练时显存不足，可通过 SQL 对模型的离线预测结果表 计算 GAUC：
 
