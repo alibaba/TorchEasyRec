@@ -25,6 +25,7 @@ class GroupedAUCTest(unittest.TestCase):
         group_id = torch.tensor([1, 2, 2, 1, 3, 3, 4, 4])
         metric.update(preds, target, group_id)
         value = metric.compute()
+        print(value)
         torch.testing.assert_close(value, torch.tensor(0.5))
 
 
