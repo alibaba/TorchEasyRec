@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -19,18 +19,6 @@ from torchmetrics.functional.classification.precision_recall_curve import (
     _binary_precision_recall_curve_format,
     _binary_precision_recall_curve_update,
 )
-
-
-def _adjust_threshold_arg(
-    thresholds: Optional[Union[int, List[float], Tensor]] = None,
-    device: Optional[torch.device] = None,
-) -> Optional[Tensor]:
-    """Convert threshold arg for list and int to tensor format."""
-    if isinstance(thresholds, int):
-        return torch.linspace(0, 1, thresholds, device=device)
-    if isinstance(thresholds, list):
-        return torch.tensor(thresholds, device=device)
-    return thresholds
 
 
 class DecayAUC(Metric):

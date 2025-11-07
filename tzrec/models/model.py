@@ -128,11 +128,6 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric.reset()
         return metric_results
 
-    def reset_metric(self) -> None:
-        """Reset metric."""
-        for _, metric in self._metric_modules.items():
-            metric.reset()
-
     def compute_train_metric(self) -> Dict[str, torch.Tensor]:
         """Compute train metric."""
         metric_results = {}

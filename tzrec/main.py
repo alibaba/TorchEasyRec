@@ -174,7 +174,6 @@ def _evaluate(
     if global_step is not None:
         desc_suffix += f" model-{global_step}"
     _model = model.module.model
-    _model.reset_metric()
 
     plogger = None
     if is_local_rank_zero:
