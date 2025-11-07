@@ -40,11 +40,6 @@ torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_numel)
 
 
-# @torch.fx.wrap
-# def _fx_odict_jt_vcat(odict_jt: Dict[str, JaggedTensor]) -> torch.Tensor:
-#     return torch.cat([t.values() for t in odict_jt.values()], dim=-1)
-
-
 @torch.fx.wrap
 def _fx_construct_payload(
     payload_features: Dict[str, torch.Tensor],
