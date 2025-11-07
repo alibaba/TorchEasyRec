@@ -176,11 +176,6 @@ model_config: {
         group_name: 'all'
         feature_names: 'f1'
         feature_names: 'f2'
-        ...
-        wide_deep: DEEP
-    }
-    feature_groups: {
-        group_name: 'all'
         feature_names: 'f3'
         feature_names: 'f4'
         ...
