@@ -58,3 +58,19 @@ message MetricConfig {
         GroupedXAUC grouped_xauc = 9;
     }
 }
+
+
+message TrainMetricConfig {
+    oneof metric {
+        AUC auc = 1;
+        RecallAtK recall_at_k = 3;
+        MeanAbsoluteError mean_absolute_error = 4;
+        MeanSquaredError mean_squared_error = 5;
+        Accuracy accuracy = 6;
+        XAUC xauc = 8;
+    }
+    // metric decay rate
+    optional float decay_rate = 20 [default=0.90];
+    // train_config.log_step_count_steps can divide decay_steps evenly.
+    optional uint32 decay_step = 21 [default=100];
+}

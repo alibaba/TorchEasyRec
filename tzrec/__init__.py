@@ -52,3 +52,10 @@ _logging.basicConfig(
     format="[%(asctime)s][%(levelname)s] %(message)s", level=_log_level
 )
 _load_class.auto_import()
+
+
+from tzrec.utils.filesystem_util import (  # NOQA
+    register_external_filesystem as _register_external_filesystem,  # NOQA
+)  # NOQA
+
+_register_external_filesystem()
