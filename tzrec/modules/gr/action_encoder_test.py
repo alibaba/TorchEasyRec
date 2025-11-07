@@ -13,14 +13,21 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 
-from tzrec.modules.gr.action_encoder import ActionEncoder
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.modules.gr.action_encoder import SimpleActionEncoder
+from tzrec.utils.test_util import TestGraphType, create_test_module, gpu_unavailable
 
 
 class ActionEncoderTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
-    def test_forward(self) -> None:
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+        ]
+    )
+    def test_simple_action_encoder(self, graph_type) -> None:
         device = torch.device("cuda")
         action_embedding_dim = 32
         action_weights = [1, 2, 4, 8, 16]
@@ -47,32 +54,29 @@ class ActionEncoderTest(unittest.TestCase):
             sum([combined_action_weights[t] for t in x]) for x in enabled_actions
         ]
 
-        encoder = ActionEncoder(
-            watchtime_feature_name="watchtimes",
-            action_feature_name="actions",
+        encoder = SimpleActionEncoder(
             action_weights=action_weights,
             watchtime_to_action_thresholds=watchtime_to_action_thresholds,
             watchtime_to_action_weights=watchtime_to_action_weights,
             action_embedding_dim=action_embedding_dim,
             is_inference=False,
         ).to(device)
+        encoder = create_test_module(encoder, graph_type)
 
         seq_lengths = [6, 3]
         seq_offsets = [0, 6, 9]
         num_targets = [2, 1]
         uih_offsets = [0, 4, 6]
         target_offsets = [0, 2, 3]
-        seq_embeddings = torch.rand(9, 128, device=device)
         action_embeddings = encoder(
+            seq_actions=torch.tensor(actions, device=device),
             max_uih_len=4,
             max_targets=2,
             uih_offsets=torch.tensor(uih_offsets, device=device),
             target_offsets=torch.tensor(target_offsets, device=device),
-            seq_embeddings=seq_embeddings,
-            seq_payloads={
-                "watchtimes": torch.tensor(watchtimes, device=device),
-                "actions": torch.tensor(actions, device=device),
-            },
+            total_uih_len=6,
+            total_targets=3,
+            seq_watchtimes=torch.tensor(watchtimes, device=device),
         )
         self.assertEqual(
             action_embeddings.shape, (9, action_embedding_dim * num_action_types)
@@ -101,7 +105,8 @@ class ActionEncoderTest(unittest.TestCase):
                             torch.testing.assert_close(
                                 embedding[atype], torch.zeros_like(embedding[atype])
                             )
-        action_embeddings.sum().backward()
+        if graph_type == TestGraphType.NORMAL:
+            action_embeddings.sum().backward()
 
 
 if __name__ == "__main__":
