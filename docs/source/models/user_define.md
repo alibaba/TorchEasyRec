@@ -72,7 +72,7 @@ bash scripts/gen_proto.sh
 
 ```python
 # tzrec/model/custom_rank_model.py
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -96,9 +96,14 @@ class CustomRankModel(RankModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         # 构建EmbeddingGroup
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
@@ -114,6 +119,7 @@ class CustomRankModel(RankModel):
         # 初始化其他模块
         ...
 
+
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
 
@@ -124,12 +130,14 @@ class CustomRankModel(RankModel):
             predictions (dict): a dict of predicted result.
         """
         grouped_features = self.embedding_group(
-            batch.sparse_features, batch.dense_features
+            batch
         )
-        features = torch.cat(grouped_features, dim=-1)
+        features = grouped_features["all"]
+        tower_output = self.mlp(features)
         y = self.output_mlp(tower_output)
         # 其他前向推理
         ...
+
         return self._output_to_prediction(y)
 ```
 
@@ -165,14 +173,14 @@ eval_config {
 # 模型相关参数配置
 model_config: {
     feature_groups: {
-        group_name: 'group1'
+        group_name: 'all'
         feature_names: 'f1'
         feature_names: 'f2'
         ...
         wide_deep: DEEP
     }
     feature_groups: {
-        group_name: 'group2'
+        group_name: 'all'
         feature_names: 'f3'
         feature_names: 'f4'
         ...
