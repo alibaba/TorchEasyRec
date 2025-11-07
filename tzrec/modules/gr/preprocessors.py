@@ -110,21 +110,15 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
     """Contextual Interleave Preprocessor for HSTU.
 
     Args:
-        input_embedding_dim (int): The dimension of the sequence embeddings.
+        uih_embedding_dim (int): The dimension of the uih sequence embeddings.
+        target_embedding_dim (int): The dimension of the candidate sequence embeddings.
         output_embedding_dim (int): The dimension of the sequence embeddings.
         content_encoder (Dict[str, Any]): ContentEncoder module params.
         content_mlp (Dict[str, Any]): content MLP module params.
         action_encoder (Dict[str, Any]): ActionEncoder module params.
         action_mlp (Dict[str, Any]): action MLP module params.
-        contextual_feature_dim (int): contextual feature dimension,
-            default is equal to input_embedding_dim.
-        contextual_feature_to_max_length (Dict[str, int]): A mapping from contextual
-            feature to maximum padding length.
-        contextual_feature_to_min_uih_length (Dict[str, int]): A mapping from contextual
-            feature to uih length, if uih length < min_uih_length, will mask the
-            contextual feature.
-        contextual_feature_to_pooling (Dict[str, str]): A mapping from contextual
-            feature to pooling type.
+        contextual_feature_dim (int): contextual feature dimension.
+        max_contextual_seq_len (int): contextual feature num.
         enable_interleaving (bool): enable interleaving target or not.
         is_inference (bool): whether to run in inference mode.
     """
@@ -280,7 +274,9 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             output_num_targets = num_targets
             output_seq_timestamps = seq_timestamps
             if self._action_encoder_cfg is not None:
-                output_seq_embeddings = content_embeddings + action_embeddings
+                output_seq_embeddings = content_embeddings + fx_unwrap_optional_tensor(
+                    action_embeddings
+                )
             else:
                 output_seq_embeddings = content_embeddings
             output_total_uih_len = total_uih_len
@@ -336,7 +332,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             output_num_targets,
         )
 
-    def forward(  # noqa C901
+    def forward(
         self, grouped_features: Dict[str, torch.Tensor]
     ) -> Tuple[
         int,
@@ -351,15 +347,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         """Forward the module.
 
         Args:
-            max_uih_len (int): maximum user history sequence length.
-            max_targets (int): maximum candidates length.
-            total_uih_len (int): total user history sequence length.
-            total_targets (int): total candidates length.
-            seq_lengths (torch.Tensor): input sequence lengths.
-            seq_timestamps (torch.Tensor): input sequence timestamp tensor.
-            seq_embeddings (torch.Tensor): input sequence embedding tensor.
-            num_targets (torch.Tensor): number of targets.
-            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+            grouped_features (Dict[str, torch.Tensor]): embedding group features.
 
         Returns:
             output_max_seq_len (int): output maximum sequence length.

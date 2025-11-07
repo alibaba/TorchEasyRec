@@ -20,13 +20,8 @@ from tzrec.utils.test_util import TestGraphType, create_test_module, gpu_unavail
 
 
 class ActionEncoderTest(unittest.TestCase):
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)
-    @parameterized.expand(
-        [
-            [TestGraphType.NORMAL],
-            [TestGraphType.FX_TRACE],
-        ]
-    )
     def test_simple_action_encoder(self, graph_type) -> None:
         device = torch.device("cuda")
         action_embedding_dim = 32

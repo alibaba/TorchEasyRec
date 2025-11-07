@@ -59,11 +59,11 @@ message PLE {
 
 message DlrmHSTU {
     // hstu config
-    required HSTU hstu = 9;
+    required HSTU hstu = 1;
     // multi task tower config
-    required FusionMTLTower fusion_mtl_tower = 10;
+    required FusionMTLTower fusion_mtl_tower = 2;
     // max sequence length
-    required uint32 max_seq_len = 11;
+    required uint32 max_seq_len = 3;
     // item embedding mlp hidden dimension
-    optional uint32 item_embedding_hidden_dim = 12 [default = 512];
+    optional uint32 item_embedding_hidden_dim = 4 [default = 512];
 }

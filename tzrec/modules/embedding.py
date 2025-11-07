@@ -927,7 +927,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         for feature_group in feature_groups:
             group_name = feature_group.group_name
             self._group_to_is_jagged[group_name] = (
-                feature_group.group_type == model_pb2.JAGGED_SEQUENCE
+                hasattr(feature_group, "group_type")
+                and feature_group.group_type == model_pb2.JAGGED_SEQUENCE
             )
             for feature_name in feature_group.feature_names:
                 feature = name_to_feature[feature_name]

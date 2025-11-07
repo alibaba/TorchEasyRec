@@ -23,13 +23,8 @@ from tzrec.utils.test_util import TestGraphType, gpu_unavailable
 
 
 class ContentEncoderTest(unittest.TestCase):
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)
-    @parameterized.expand(
-        [
-            [TestGraphType.NORMAL],
-            [TestGraphType.FX_TRACE],
-        ]
-    )
     def test_slice_content_encoder(self, graph_type) -> None:
         device = torch.device("cuda")
         uih_embedding_dim = 32
@@ -60,13 +55,8 @@ class ContentEncoderTest(unittest.TestCase):
         )
         self.assertEqual(content_embeddings.size(), (9, 32))
 
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)
-    @parameterized.expand(
-        [
-            [TestGraphType.NORMAL],
-            [TestGraphType.FX_TRACE],
-        ]
-    )
     def test_pad_content_encoder(self, graph_type) -> None:
         device = torch.device("cuda")
         uih_embedding_dim = 32
@@ -99,13 +89,8 @@ class ContentEncoderTest(unittest.TestCase):
         if graph_type == TestGraphType.NORMAL:
             content_embeddings.sum().backward()
 
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)
-    @parameterized.expand(
-        [
-            [TestGraphType.NORMAL],
-            [TestGraphType.FX_TRACE],
-        ]
-    )
     def test_mlp_content_encoder(self, graph_type) -> None:
         device = torch.device("cuda")
         uih_embedding_dim = 32

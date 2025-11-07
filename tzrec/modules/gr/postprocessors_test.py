@@ -26,7 +26,7 @@ class PostprocessorTest(unittest.TestCase):
         seq_embeddings = torch.tensor(
             [[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.6], [0.7, 0.8]]], dtype=torch.float32
         )
-        result = postprocessor(seq_embeddings, None, {})
+        result = postprocessor(seq_embeddings, None)
         torch.testing.assert_close(
             result,
             torch.tensor(
@@ -44,7 +44,7 @@ class PostprocessorTest(unittest.TestCase):
         seq_embeddings = torch.tensor(
             [[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.6], [0.7, 0.8]]], dtype=torch.float32
         )
-        result = postprocessor(seq_embeddings, None, {})
+        result = postprocessor(seq_embeddings, None)
         torch.testing.assert_close(
             result,
             torch.tensor(
@@ -71,7 +71,7 @@ class PostprocessorTest(unittest.TestCase):
             [[1, 2], [3, 4]],
             dtype=torch.float32,
         )
-        result = postprocessor(seq_embeddings, seq_timestamps, {})
+        result = postprocessor(seq_embeddings, seq_timestamps)
         self.assertEqual(result.size(), (2, 2, 2))
 
 

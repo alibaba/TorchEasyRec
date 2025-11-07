@@ -36,14 +36,16 @@ class HSTUTransducer(BaseModule):
     """HSTU module.
 
     Args:
-        input_embedding_dim (int): input embedding dimension.
+        uih_embedding_dim (int): The dimension of the uih sequence embeddings.
+        target_embedding_dim (int): The dimension of the candidate sequence embeddings.
         stu (dict): STULayer config.
         attn_num_layers (int): number of STULayer.
         input_preprocessor (dict): InputPreprocessor config.
         output_postprocessor (dict): OutputPostprocessor config.
         input_dropout_ratio (float): dropout ratio after input_preprocessor.
         positional_encoder (dict): HSTUPositionalEncoder config.
-        contextual_feature_dim (int): contextual feature input dimension.
+        contextual_feature_dim (int): contextual feature dimension.
+        max_contextual_seq_len (int): contextual feature num.
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
@@ -103,8 +105,6 @@ class HSTUTransducer(BaseModule):
         torch.Tensor,
         torch.Tensor,
     ]:
-        # seq_payloads = _default_seq_payload(seq_payloads)
-
         with record_function("hstu_input_preprocessor"):
             (
                 output_max_seq_len,
