@@ -14,6 +14,7 @@ enum FeatureGroupType {
     DEEP = 0;
     WIDE = 1;
     SEQUENCE = 2;
+    JAGGED_SEQUENCE = 3;
 }
 
 message SeqGroupConfig {
