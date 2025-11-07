@@ -77,6 +77,8 @@ message ModelConfig {
 
     repeated MetricConfig metrics = 4;
 
+    repeated TrainMetricConfig train_metrics = 5;
+
     optional VariationalDropout variational_dropout = 11;
 
     optional Kernel kernel = 12 [default = PYTORCH];

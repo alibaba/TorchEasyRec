@@ -222,6 +222,7 @@ def _log_train(
     tb_summaries: List[str],
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
+    train_metrics: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     """Logging current training step."""
     if plogger is not None:
@@ -232,10 +233,15 @@ def _log_train(
         for i, g in enumerate(param_groups):
             lr_strs.append(f"lr_g{i}:{g['lr']:.5f}")
         total_loss = sum(losses.values())
-        plogger.log(
-            step,
-            f"{' '.join(lr_strs)} {' '.join(loss_strs)} total_loss: {total_loss:.5f}",
+        suffix = (
+            f"{' '.join(lr_strs)} {' '.join(loss_strs)} total_loss: {total_loss:.5f}"
         )
+        metric_strs = []
+        if train_metrics:
+            for k, v in train_metrics.items():
+                metric_strs.append(f"{k}:{v:.5f}")
+            suffix += f" {' '.join(metric_strs)}"
+        plogger.log(step, suffix)
     if summary_writer is not None:
         total_loss = sum(losses.values())
         if "loss" in tb_summaries:
@@ -285,6 +291,9 @@ def _log_train(
                             scalar_value=grad_norm,
                             global_step=step,
                         )
+        if train_metrics:
+            for k, v in train_metrics.items():
+                summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
 def _train_and_evaluate(
@@ -304,6 +313,7 @@ def _train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.train()
+    _model = model.module.model
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -384,9 +394,10 @@ def _train_and_evaluate(
             if i_step <= skip_steps:
                 continue
             try:
-                losses, _, _ = pipeline.progress(train_iterator)
-
+                losses, predictions, batch = pipeline.progress(train_iterator)
+                _model.update_train_metric(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
+                    train_metrics = _model.compute_train_metric()
                     _log_train(
                         i_step,
                         losses,
@@ -395,6 +406,7 @@ def _train_and_evaluate(
                         tb_summaries=tb_summaries,
                         plogger=plogger,
                         summary_writer=summary_writer,
+                        train_metrics=train_metrics,
                     )
 
                 for lr in lr_scheduler:
