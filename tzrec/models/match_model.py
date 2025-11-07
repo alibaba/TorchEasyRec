@@ -17,13 +17,14 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.metrics import recall_at_k
+from tzrec.metrics.train_metric_wrapper import TrainMetricWrapper
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import BaseModule, div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.loss_pb2 import LossConfig
-from tzrec.protos.metric_pb2 import MetricConfig
+from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
@@ -338,10 +339,28 @@ class MatchModel(BaseModel):
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
+    def _init_train_metric_impl(
+        self, metric_cfg: TrainMetricConfig, suffix: str = ""
+    ) -> None:
+        metric_type = metric_cfg.WhichOneof("metric")
+        metric_name = metric_type + suffix
+        oneof_metric_cfg = getattr(metric_cfg, metric_type)
+        metric_kwargs = config_to_kwargs(oneof_metric_cfg)
+        if metric_type == "recall_at_k":
+            metric_name = f"recall@{oneof_metric_cfg.top_k}" + suffix
+            metric_module = recall_at_k.RecallAtK(**metric_kwargs)
+        else:
+            raise ValueError(f"{metric_type} is not supported for this model")
+        self._train_metric_modules[metric_name] = TrainMetricWrapper(
+            metric_module, metric_cfg.decay_rate, metric_cfg.decay_step
+        )
+
     def init_metric(self) -> None:
         """Initialize metric modules."""
         for metric_cfg in self._base_model_config.metrics:
             self._init_metric_impl(metric_cfg)
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._init_train_metric_impl(metric_cfg)
         for loss_cfg in self._base_model_config.losses:
             self._init_loss_metric_impl(loss_cfg)
 
@@ -368,6 +387,29 @@ class MatchModel(BaseModel):
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
+    def _update_train_metric_impl(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        label: torch.Tensor,
+        metric_cfg: TrainMetricConfig,
+        suffix: str = "",
+    ) -> None:
+        metric_type = metric_cfg.WhichOneof("metric")
+        metric_name = metric_type + suffix
+        oneof_metric_cfg = getattr(metric_cfg, metric_type)
+        if metric_type == "recall_at_k":
+            metric_name = f"recall@{oneof_metric_cfg.top_k}" + suffix
+            pred = predictions["similarity" + suffix]
+            if self._in_batch_negative:
+                label = torch.eye(*pred.size(), dtype=torch.bool, device=pred.device)
+            else:
+                label = torch.zeros_like(pred, dtype=torch.bool)
+                label[:, 0] = True
+            self._train_metric_modules[metric_name].update(pred, label)
+        else:
+            raise ValueError(f"{metric_type} is not supported for this model")
+
     def update_metric(
         self,
         predictions: Dict[str, torch.Tensor],
@@ -390,6 +432,22 @@ class MatchModel(BaseModel):
                 self._update_loss_metric_impl(
                     losses, batch, batch.labels[self._label_name], loss_cfg
                 )
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._update_train_metric_impl(
+                predictions, batch, batch.labels[self._label_name], metric_cfg
+            )
 
 
 class TowerWrapper(nn.Module):

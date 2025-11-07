@@ -333,7 +333,9 @@ if __name__ == "__main__":
     dynamicemb_load_table_names = defaultdict(list)
     for feature in features:
         # not support WIDE embedding now.
-        if feature.config.HasField("dynamicemb"):
+        if hasattr(feature.config, "dynamicemb") and feature.config.HasField(
+            "dynamicemb"
+        ):
             if feature.config.dynamicemb.HasField("init_table"):
                 emb_config = feature.emb_config
                 assert (

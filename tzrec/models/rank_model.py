@@ -19,8 +19,10 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
+from tzrec.metrics.decay_auc import DecayAUC
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.metrics.grouped_xauc import GroupedXAUC
+from tzrec.metrics.train_metric_wrapper import TrainMetricWrapper
 from tzrec.metrics.xauc import XAUC
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
@@ -28,7 +30,7 @@ from tzrec.modules.utils import div_no_nan
 from tzrec.modules.variational_dropout import VariationalDropout
 from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
-from tzrec.protos.metric_pb2 import MetricConfig
+from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 # repeat interleave session_id or grouping key for one-to-many rank sample
@@ -324,12 +326,44 @@ class RankModel(BaseModel):
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
+    def _init_train_metric_impl(
+        self, metric_cfg: TrainMetricConfig, num_class: int = 1, suffix: str = ""
+    ) -> None:
+        metric_type = metric_cfg.WhichOneof("metric")
+        oneof_metric_cfg = getattr(metric_cfg, metric_type)
+        metric_kwargs = config_to_kwargs(oneof_metric_cfg)
+        metric_name = metric_type + suffix
+        if metric_type == "auc":
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
+            metric_module = DecayAUC(**metric_kwargs)
+        elif metric_type == "mean_absolute_error":
+            metric_module = torchmetrics.MeanAbsoluteError()
+        elif metric_type == "mean_squared_error":
+            metric_module = torchmetrics.MeanSquaredError()
+        elif metric_type == "accuracy":
+            metric_module = torchmetrics.Accuracy(
+                task="multiclass" if num_class > 1 else "binary",
+                num_classes=num_class,
+                **metric_kwargs,
+            )
+        elif metric_type == "xauc":
+            metric_module = XAUC(**metric_kwargs)
+        else:
+            raise ValueError(f"{metric_type} is not supported for this model")
+        self._train_metric_modules[metric_name] = TrainMetricWrapper(
+            metric_module, metric_cfg.decay_rate, metric_cfg.decay_step
+        )
+
     def init_metric(self) -> None:
         """Initialize metric modules."""
         for metric_cfg in self._base_model_config.metrics:
             self._init_metric_impl(metric_cfg, self._num_class)
         for loss_cfg in self._base_model_config.losses:
             self._init_loss_metric_impl(loss_cfg)
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._init_train_metric_impl(metric_cfg, self._num_class)
 
     def _update_metric_impl(
         self,
@@ -398,6 +432,39 @@ class RankModel(BaseModel):
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
+    def _update_train_metric_impl(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        label: torch.Tensor,
+        metric_cfg: TrainMetricConfig,
+        num_class: int = 1,
+        suffix: str = "",
+    ) -> None:
+        metric_type = metric_cfg.WhichOneof("metric")
+        metric_name = metric_type + suffix
+        if metric_type == "auc":
+            pred = (
+                predictions["probs" + suffix]
+                if num_class == 1
+                else predictions["probs1" + suffix]
+            )
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "mean_absolute_error":
+            pred = predictions["y" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "mean_squared_error":
+            pred = predictions["y" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "accuracy":
+            pred = predictions["probs" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        elif metric_type == "xauc":
+            pred = predictions["y" + suffix]
+            self._train_metric_modules[metric_name].update(pred, label)
+        else:
+            raise ValueError(f"{metric_type} is not supported for this model")
+
     def update_metric(
         self,
         predictions: Dict[str, torch.Tensor],
@@ -424,3 +491,23 @@ class RankModel(BaseModel):
                 self._update_loss_metric_impl(
                     losses, batch, batch.labels[self._label_name], loss_cfg
                 )
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._update_train_metric_impl(
+                predictions,
+                batch,
+                batch.labels[self._label_name],
+                metric_cfg,
+                num_class=self._num_class,
+            )
