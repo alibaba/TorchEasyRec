@@ -267,7 +267,7 @@ class MLPContentEncoder(BaseModule):
             content_embeddings: output content embedding tensor.
         """
         uih_embeddings = self.uih_mlp(uih_embeddings)
-        target_embeddings = self.uih_mlp(target_embeddings)
+        target_embeddings = self.target_mlp(target_embeddings)
         content_embeddings = concat_2D_jagged(
             values_left=uih_embeddings,
             values_right=target_embeddings,
