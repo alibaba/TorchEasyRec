@@ -212,8 +212,8 @@ class MLPContentEncoder(BaseModule):
     Args:
         uih_embedding_dim (int): dimension of uih input embeddings.
         target_embedding_dim (int): dimension of target input embeddings.
-        target_enrich_features (Dict[str, int]): target feature name to embedding
-            dim in payloads.
+        uih_mlp (Dict[str, int]): uih mlp config for uih sequence group.
+        target_mlp (Dict[str, int]): target mlp config for candidate sequence group.
         is_inference (bool): whether to run in inference mode.
     """
 

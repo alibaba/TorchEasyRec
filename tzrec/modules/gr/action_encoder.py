@@ -25,16 +25,7 @@ from tzrec.utils.config_util import config_to_kwargs
 
 
 class ActionEncoder(BaseModule):
-    """Action encoder for HSTU.
-
-    Args:
-        action_embedding_dim (int): dimension of action embedding.
-        action_weights (List[int]): bitmask of each action.
-        watchtime_to_action_thresholds (List[int]): threshold for watchtime of each
-            action.
-        watchtime_to_action_weights (List[int]): bitmask for watchtime of each action.
-        is_inference (bool): whether to run in inference mode.
-    """
+    """Abstract Action encoder for HSTU."""
 
     @property
     def output_dim(self) -> int:

@@ -141,7 +141,7 @@ class DlrmHSTU(RankModel):
             predictions (dict): a dict of predicted result.
         """
         with record_function("## preprocess ##"):
-            grouped_features = self.embedding_group(batch)
+            grouped_features = self.build_input(batch)
 
         with record_function("## item_forward ##"):
             candidates_item_embeddings = self._item_embedding_mlp(
