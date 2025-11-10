@@ -48,8 +48,7 @@ bash scripts/gen_proto.sh
 
 - 根据输入的`batch`数据，进行前向推理，得到`predictions`
   - `batch`为`tzrec.datasets.utils.Batch`的数据结构，包含`dense_features`（稠密特征）、`sparse_features`（稀疏特征）、`sequence_dense_features` (序列稠密特征)
-  - 一般可以将`dense_features`、`sparse_features` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
-  - `sequence_dense_features` 若需参与 embedding，需先手动按 data group 组织或单独处理
+    - 一般可以将`dense_features`、`sparse_features`、`sequence_dense_features` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
 
 ### 损失: init_loss & loss
 
