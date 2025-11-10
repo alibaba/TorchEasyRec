@@ -5,7 +5,7 @@ DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`ha
 注：目前使用DynamicEmbedding还处于实验阶段，配置和接口都可能调整，暂只支持训练和评估，暂不包含在官方提供的镜像环境中，使用前需要额外安装如下whl包
 
 ```bash
-pip install https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/dynamicemb-0.0.1%2B20251015.77b500a-cp311-cp311-linux_x86_64.whl
+pip install https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/dynamicemb-0.0.1%2B20251110.376d2ad-cp311-cp311-linux_x86_64.whl
 ```
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
