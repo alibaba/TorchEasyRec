@@ -4,6 +4,60 @@
 
 在模型训练与评估过程中，选择合适的评估指标对于衡量模型性能至关重要。本文档基于 `tzrec` 中定义的评估指标配置，详细介绍各类评估指标及其参数含义。
 
+在模型训练过程中，打印记录训练集的评估指标对算法训练过程分析有重要的参考意义，`tzrec`在训练过程中采用指标衰减的方式进行计算。
+
+## 示例配置
+
+```
+model_config {
+    metrics: {
+        auc {
+            thresholds: 200
+        }
+    }
+    train_metrics: {
+        auc {
+            thresholds: 200
+        }
+        decay_rate: 0.9
+        decay_step: 100
+    }
+}
+
+
+多目标模型示例如下:
+model_config {
+   dbmtl {
+     task_towers {
+        tower_name: "ctr"
+        label_name: "clk"
+        metrics: {
+          auc {
+            thresholds: 200
+          }
+        }
+        train_metrics: {
+          auc {
+            thresholds: 200
+          }
+          decay_rate: 0.9
+          decay_step: 100
+        }
+     }
+     ....
+   }
+
+}
+
+```
+
+- metrics:负责对测试集的评估
+  - metric: 测试评估指标类型及其配置
+- train_metrics:负责训练过程对已参与训练集的数据集进行评估，会在训练过程中打印对应的指标。
+  - metric: 训练评估指标类型及其配置，但有些指标并不支持衰减计算，支持的类型具体参考[配置文档](../reference.html)
+  - decay_rate: 历史指标的衰减率。
+  - decay_step: 历史指标每训练多少step会进一步衰减，配置需要可以被train_config.log_step_count_steps整除。
+
 ______________________________________________________________________
 
 ## AUC
@@ -261,30 +315,3 @@ model_config {
     }
 }
 ```
-
-# 训练评估
-
-## 简介
-
-在模型训练过程中，输出对训练集的评估指标对算法训练过程分析有重要的参考意义，tzrec在训练过程中采用指标衰减的方式进行计算.
-
-## 配置示例
-
-```
-model_config {
-    train_metrics: {
-        auc {
-            thresholds: 200
-        }
-        decay_rate: 0.9
-        decay_step: 100
-    }
-}
-```
-
-配置train_metrics，则会在训练过程中打印对应的指标。对于多任务的模型，和metrics一样配置在任务tower下面，和metrics配置同一层级。
-
-- train_metrics
-  - metric: 训练评估指标类型，但有些指标并不支持，具体参考[配置文档](../reference.html)
-  - decay_rate: 历史指标的衰减率。
-  - decay_step: 历史指标每训练多少step会进一步衰减，配置需要可以被train_config.log_step_count_steps整除。
