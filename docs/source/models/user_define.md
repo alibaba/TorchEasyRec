@@ -132,7 +132,7 @@ class CustomRankModel(RankModel):
         grouped_features = self.embedding_group(
             batch
         )
-        features = grouped_features["all"]
+        features = torch.cat([grouped_features["group1"], grouped_features["group2"]], dim=-1)
         tower_output = self.mlp(features)
         y = self.output_mlp(tower_output)
         # 其他前向推理
@@ -173,9 +173,15 @@ eval_config {
 # 模型相关参数配置
 model_config: {
     feature_groups: {
+        group_name: 'group1'
         group_name: 'all'
         feature_names: 'f1'
         feature_names: 'f2'
+        ...
+        wide_deep: DEEP
+    }
+    feature_groups: {
+        group_name: 'group2'
         feature_names: 'f3'
         feature_names: 'f4'
         ...
