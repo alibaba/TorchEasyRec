@@ -132,7 +132,7 @@ class CustomRankModel(RankModel):
         grouped_features = self.embedding_group(
             batch
         )
-        features = torch.cat([grouped_features["group1"], grouped_features["group2"]], dim=-1)
+        features = torch.cat(grouped_features, dim=-1)
         tower_output = self.mlp(features)
         y = self.output_mlp(tower_output)
         # 其他前向推理
