@@ -32,28 +32,20 @@ from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 torch.fx.wrap("len")
 
 
-@torch.fx.wrap
-def _default_seq_payload(
-    seq_payloads: Optional[Dict[str, torch.Tensor]],
-) -> Dict[str, torch.Tensor]:
-    if seq_payloads is None:
-        return {}
-    else:
-        return torch.jit._unwrap_optional(seq_payloads)
-
-
 class HSTUTransducer(BaseModule):
     """HSTU module.
 
     Args:
-        input_embedding_dim (int): input embedding dimension.
+        uih_embedding_dim (int): The dimension of the uih sequence embeddings.
+        target_embedding_dim (int): The dimension of the candidate sequence embeddings.
         stu (dict): STULayer config.
         attn_num_layers (int): number of STULayer.
         input_preprocessor (dict): InputPreprocessor config.
         output_postprocessor (dict): OutputPostprocessor config.
         input_dropout_ratio (float): dropout ratio after input_preprocessor.
         positional_encoder (dict): HSTUPositionalEncoder config.
-        contextual_feature_dim (int): contextual feature input dimension.
+        contextual_feature_dim (int): contextual feature dimension.
+        max_contextual_seq_len (int): contextual feature num.
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
@@ -61,14 +53,16 @@ class HSTUTransducer(BaseModule):
 
     def __init__(
         self,
-        input_embedding_dim: int,
+        uih_embedding_dim: int,
+        target_embedding_dim: int,
         stu: Dict[str, Any],
         attn_num_layers: int,
         input_preprocessor: Dict[str, Any],
         output_postprocessor: Dict[str, Any],
         input_dropout_ratio: float = 0.0,
         positional_encoder: Optional[Dict[str, Any]] = None,
-        contextual_feature_dim: Optional[int] = None,
+        contextual_feature_dim: int = 0,
+        max_contextual_seq_len: int = 0,
         is_inference: bool = True,
         return_full_embeddings: bool = False,
         listwise: bool = False,
@@ -79,8 +73,10 @@ class HSTUTransducer(BaseModule):
         )
         self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
             input_preprocessor,
-            input_embedding_dim=input_embedding_dim,
+            uih_embedding_dim=uih_embedding_dim,
+            target_embedding_dim=target_embedding_dim,
             contextual_feature_dim=contextual_feature_dim,
+            max_contextual_seq_len=max_contextual_seq_len,
             output_embedding_dim=stu["embedding_dim"],
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
@@ -98,16 +94,7 @@ class HSTUTransducer(BaseModule):
         self._listwise_training: bool = listwise and self.is_train
 
     def _preprocess(
-        self,
-        max_uih_len: int,
-        max_targets: int,
-        total_uih_len: int,
-        total_targets: int,
-        seq_lengths: torch.Tensor,
-        seq_timestamps: torch.Tensor,
-        seq_embeddings: torch.Tensor,
-        num_targets: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
+        self, grouped_features
     ) -> Tuple[
         int,
         int,
@@ -118,8 +105,6 @@ class HSTUTransducer(BaseModule):
         torch.Tensor,
         torch.Tensor,
     ]:
-        seq_payloads = _default_seq_payload(seq_payloads)
-
         with record_function("hstu_input_preprocessor"):
             (
                 output_max_seq_len,
@@ -130,17 +115,7 @@ class HSTUTransducer(BaseModule):
                 output_seq_timestamps,
                 output_seq_embeddings,
                 output_num_targets,
-            ) = self._input_preprocessor(
-                max_uih_len=max_uih_len,
-                max_targets=max_targets,
-                total_uih_len=total_uih_len,
-                total_targets=total_targets,
-                seq_lengths=seq_lengths,
-                seq_timestamps=seq_timestamps,
-                seq_embeddings=seq_embeddings,
-                num_targets=num_targets,
-                seq_payloads=seq_payloads,
-            )
+            ) = self._input_preprocessor(grouped_features)
 
         with record_function("hstu_positional_encoder"):
             if self._positional_encoder is not None:
@@ -199,14 +174,12 @@ class HSTUTransducer(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         with record_function("hstu_output_postprocessor"):
             if self._return_full_embeddings:
                 seq_embeddings = self._output_postprocessor(
                     seq_embeddings=seq_embeddings,
                     seq_timestamps=seq_timestamps,
-                    seq_payloads=seq_payloads,
                 )
             uih_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
                 seq_lengths - num_targets
@@ -244,7 +217,6 @@ class HSTUTransducer(BaseModule):
                 candidate_embeddings = self._output_postprocessor(
                     seq_embeddings=candidate_embeddings,
                     seq_timestamps=candidate_timestamps,
-                    seq_payloads=seq_payloads,
                 )
 
             return (
@@ -253,16 +225,7 @@ class HSTUTransducer(BaseModule):
             )
 
     def forward(
-        self,
-        max_uih_len: int,
-        max_targets: int,
-        total_uih_len: int,
-        total_targets: int,
-        seq_lengths: torch.Tensor,
-        seq_embeddings: torch.Tensor,
-        seq_timestamps: torch.Tensor,
-        num_targets: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
+        self, grouped_features: Dict[str, torch.Tensor]
     ) -> Tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -270,15 +233,7 @@ class HSTUTransducer(BaseModule):
         """Forward the module.
 
         Args:
-            max_uih_len (int): maximum user history sequence length.
-            max_targets (int): maximum candidates length.
-            total_uih_len (int): total user history sequence length.
-            total_targets (int): total candidates length.
-            seq_lengths (torch.Tensor): input sequence lengths.
-            seq_embeddings (torch.Tensor): input sequence embeddings.
-            seq_timestamps (torch.Tensor): input sequence timestamps.
-            num_targets (torch.Tensor): number of targets.
-            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+            grouped_features (Dict[str, torch.Tensor]): embedding group features.
 
         Returns:
             encoded_candidate_embeddings (torch.Tensor): output embedding of candidates.
@@ -293,17 +248,7 @@ class HSTUTransducer(BaseModule):
             seq_timestamps,
             seq_embeddings,
             num_targets,
-        ) = self._preprocess(
-            max_uih_len=max_uih_len,
-            max_targets=max_targets,
-            total_uih_len=total_uih_len,
-            total_targets=total_targets,
-            seq_lengths=seq_lengths,
-            seq_timestamps=seq_timestamps,
-            seq_embeddings=seq_embeddings,
-            num_targets=num_targets,
-            seq_payloads=seq_payloads,
-        )
+        ) = self._preprocess(grouped_features)
 
         encoded_embeddings = self._hstu_compute(
             max_seq_len=max_seq_len,
@@ -322,7 +267,6 @@ class HSTUTransducer(BaseModule):
             seq_embeddings=encoded_embeddings,
             seq_timestamps=seq_timestamps,
             num_targets=num_targets,
-            seq_payloads=seq_payloads,
         )
 
         if not self._is_inference:
