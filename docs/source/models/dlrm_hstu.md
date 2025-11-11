@@ -20,27 +20,39 @@ model_config {
         feature_names: "fans_user_num_range"
         feature_names: "friend_user_num_range"
         feature_names: "register_days_range"
-        group_type: SEQUENCE
+        group_type: DEEP
     }
     feature_groups {
         group_name: "uih"
         feature_names: "video_id"
-        group_type: SEQUENCE
+        group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "candidate"
         feature_names: "item_video_id"
-        group_type: SEQUENCE
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "uih_action"
+        feature_names: "action_weight"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "uih_watchtime"
+        feature_names: "watch_time"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "uih_timestamp"
+        feature_names: "action_timestamp"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "candidate_timestamp"
+        feature_names: "item_query_time"
+        group_type: JAGGED_SEQUENCE
     }
     dlrm_hstu {
-        uih_id_feature_name: "video_id"
-        uih_action_time_feature_name: "action_timestamp"
-        uih_action_weight_feature_name: "action_weight"
-        uih_watchtime_feature_name: "watch_time"
-        candidates_id_feature_name: "item_video_id"
-        candidates_query_time_feature_name: "item_query_time"
-        candidates_action_weight_feature_name: "item_action_weight"
-        candidates_watchtime_feature_name: "item_target_watchtime"
         hstu {
             stu {
                 embedding_dim: 512
@@ -128,21 +140,17 @@ model_config {
 
 - feature_groups: 特征组
 
-  - 包含三个feature_group: contextual, uih 和 candidate, **group name不能变**, 三个group的
-    - contextual: 用户侧的ID特征
-    - uih: 用户历史行为序列
-    - candidate: 用户当前样本时间窗交互的物品的行为序列，会参与建模，也会用作Label
+  - 包含feature_group: contextual, uih, candidate, uih_action, uih_watchtime, uih_timestamp, candidate_timestamp **group name不能变**, 三个group的
+    - contextual: 用户侧的ID特征；类型为DEEP
+    - uih: 用户历史行为序列，可增加side info；类型为JAGGED_SEQUENCE
+    - candidate: 用户当前样本时间窗交互的物品的行为序列，可增加side info；类型为JAGGED_SEQUENCE
+    - uih_action: 用户历史交互的行为事件序列，注: 该行为事件按位存储，如expr, click, add, buy三个行为，则一般expr=0, click=1, add=2, buy=4；类型为JAGGED_SEQUENCE
+    - uih_watchtime: 用户历史交互的行为时长序列；类型为JAGGED_SEQUENCE
+    - uih_timestamp: 用户历史交互的行为时间戳序列；类型为JAGGED_SEQUENCE
+    - candidate_timestamp: 用户当前样本时间窗交互的物品请求时间序列；类型为JAGGED_SEQUENCE
 
 - dlrm_hstu: dlrm_hstu 模型相关的参数
 
-  - uih_id_feature_name: 用户历史交互的物品id序列名
-  - uih_action_time_feature_name: 用户历史交互的行为时间戳序列名
-  - uih_action_weight_feature_name: 用户历史交互的行为事件序列名，注: 该行为事件按位存储，如expr, click, add, buy三个行为，则一般expr=0, click=1, add=2, buy=4
-  - uih_watchtime_feature_name: 用户历史交互的行为时长序列名
-  - candidates_id_feature_name: 用户当前样本时间窗交互的物品id序列名
-  - candidates_query_time_feature_name: 用户当前样本时间窗交互的物品请求时间序列名
-  - candidates_action_weight_feature_name: 用户当前样本时间窗交互的行为事件序列名
-  - candidates_watchtime_feature_name: 用户当前样本时间窗交互的行为时长序列名
   - hstu: HSTU模型参数配置
     - stu: STU模块配置
     - input_dropout_ratio: 输入是否使用dropout

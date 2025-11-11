@@ -38,14 +38,12 @@ class OutputPostprocessor(BaseModule):
         self,
         seq_embeddings: torch.Tensor,
         seq_timestamps: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Forward the module.
 
         Args:
             seq_embeddings: (L, D)
             seq_timestamps: (L, )
-            seq_payloads: str-keyed tensors. Implementation specific.
 
         Returns:
             postprocessed seq_embeddings, (L, D)
@@ -67,14 +65,12 @@ class L2NormPostprocessor(OutputPostprocessor):
         self,
         seq_embeddings: torch.Tensor,
         seq_timestamps: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Forward the postprocessor.
 
         Args:
             seq_embeddings (torch.Tensor): input sequence embedding tensor.
             seq_timestamps (torch.Tensor): input sequence timestamp tensor.
-            seq_payloads (Dict[str, torch.Tensor]):input sequence payload tensors.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
@@ -110,14 +106,12 @@ class LayerNormPostprocessor(OutputPostprocessor):
         self,
         seq_embeddings: torch.Tensor,
         seq_timestamps: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Forward the postprocessor.
 
         Args:
             seq_embeddings (torch.Tensor): input sequence embedding tensor.
             seq_timestamps (torch.Tensor): input sequence timestamp tensor.
-            seq_payloads (Dict[str, torch.Tensor]):input sequence payload tensors.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
@@ -213,14 +207,12 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         self,
         seq_embeddings: torch.Tensor,
         seq_timestamps: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Forward the postprocessor.
 
         Args:
             seq_embeddings (torch.Tensor): input sequence embedding tensor.
             seq_timestamps (torch.Tensor): input sequence timestamp tensor.
-            seq_payloads (Dict[str, torch.Tensor]):input sequence payload tensors.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.

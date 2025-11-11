@@ -81,6 +81,14 @@ class DlrmHSTUTest(unittest.TestCase):
             ),
             feature_pb2.FeatureConfig(
                 sequence_id_feature=feature_pb2.SequenceIdFeature(
+                    feature_name="video_cat",
+                    embedding_dim=16,
+                    embedding_name="video_cat_emb",
+                    num_buckets=100,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.SequenceIdFeature(
                     feature_name="item_video_id",
                     embedding_dim=16,
                     embedding_name="video_id_emb",
@@ -89,24 +97,30 @@ class DlrmHSTUTest(unittest.TestCase):
             ),
             feature_pb2.FeatureConfig(
                 sequence_id_feature=feature_pb2.SequenceIdFeature(
+                    feature_name="item_video_cat",
+                    embedding_dim=16,
+                    embedding_name="video_cat_emb",
+                    num_buckets=100,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_raw_feature=feature_pb2.SequenceRawFeature(
                     feature_name="action_timestamp"
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_raw_feature=feature_pb2.SequenceRawFeature(
                     feature_name="item_query_time"
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_raw_feature=feature_pb2.SequenceRawFeature(
                     feature_name="action_weight",
-                    num_buckets=1000,
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_raw_feature=feature_pb2.SequenceRawFeature(
                     feature_name="item_action_weight",
-                    num_buckets=1000,
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -125,23 +139,53 @@ class DlrmHSTUTest(unittest.TestCase):
             model_pb2.FeatureGroupConfig(
                 group_name="contextual",
                 feature_names=["user_id", "user_active_degree"],
-                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                group_type=model_pb2.FeatureGroupType.DEEP,
             ),
             model_pb2.FeatureGroupConfig(
                 group_name="uih",
-                feature_names=[
-                    "video_id",
-                ],
-                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                feature_names=["video_id", "video_cat"],
+                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
             ),
             model_pb2.FeatureGroupConfig(
                 group_name="candidate",
                 feature_names=[
                     "item_video_id",
+                    "item_video_cat",
                 ],
-                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="uih_timestamp",
+                feature_names=[
+                    "action_timestamp",
+                ],
+                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="candidate_timestamp",
+                feature_names=[
+                    "item_query_time",
+                ],
+                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="uih_action",
+                feature_names=[
+                    "action_weight",
+                ],
+                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
             ),
         ]
+        if has_watchtime:
+            feature_groups.append(
+                model_pb2.FeatureGroupConfig(
+                    group_name="uih_watchtime",
+                    feature_names=[
+                        "watch_time",
+                    ],
+                    group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+                )
+            )
 
         task_configs = [
             tower_pb2.FusionSubTaskConfig(
@@ -200,16 +244,6 @@ class DlrmHSTUTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             dlrm_hstu=multi_task_rank_pb2.DlrmHSTU(
-                uih_id_feature_name="video_id",
-                uih_action_time_feature_name="action_timestamp",
-                uih_action_weight_feature_name="action_weight",
-                uih_watchtime_feature_name="watch_time" if has_watchtime else "",
-                candidates_id_feature_name="item_video_id",
-                candidates_query_time_feature_name="item_query_time",
-                candidates_action_weight_feature_name="item_action_weight",
-                candidates_watchtime_feature_name="item_target_watchtime"
-                if has_watchtime
-                else "",
                 hstu=module_pb2.HSTU(
                     stu=module_pb2.STU(
                         embedding_dim=512,
@@ -225,19 +259,18 @@ class DlrmHSTUTest(unittest.TestCase):
                     ),
                     input_preprocessor=module_pb2.GRInputPreprocessor(
                         contextual_preprocessor=module_pb2.GRContextualPreprocessor(
-                            contextual_feature_to_max_length={
-                                "user_id": 1,
-                                "user_active_degree": 1,
-                            },
                             action_encoder=module_pb2.GRActionEncoder(
-                                action_embedding_dim=8,
-                                action_feature_name="action_weight",
-                                action_weights=[1, 2, 4],
+                                simple_action_encoder=module_pb2.GRSimpleActionEncoder(
+                                    action_embedding_dim=8, action_weights=[1, 2, 4]
+                                )
                             ),
                             action_mlp=module_pb2.GRContextualizedMLP(
                                 simple_mlp=module_pb2.GRSimpleContextualizedMLP(
                                     hidden_dim=256
                                 )
+                            ),
+                            content_encoder=module_pb2.GRContentEncoder(
+                                slice_content_encoder=module_pb2.GRSliceContentEncoder()
                             ),
                             content_mlp=module_pb2.GRContextualizedMLP(
                                 simple_mlp=module_pb2.GRSimpleContextualizedMLP(
@@ -272,15 +305,29 @@ class DlrmHSTUTest(unittest.TestCase):
                 "user_active_degree",
                 "video_id",
                 "item_video_id",
-                "action_weight",
-                "item_action_weight",
-                "action_timestamp",
-                "item_query_time",
+                "video_cat",
+                "item_video_cat",
             ],
-            values=torch.tensor(list(range(37))),
-            lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4, 2, 3, 2, 4]),
+            values=torch.tensor(list(range(26))),
+            lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4]),
         )
         sequence_dense_features = {
+            "action_timestamp": JaggedTensor(
+                values=torch.tensor([[1], [2], [3], [4], [5]]),
+                lengths=torch.tensor([2, 3]),
+            ),
+            "item_query_time": JaggedTensor(
+                values=torch.tensor([[6], [7], [8], [9], [10], [11]]),
+                lengths=torch.tensor([2, 4]),
+            ),
+            "action_weight": JaggedTensor(
+                values=torch.tensor([[0], [1], [0], [1], [0]]),
+                lengths=torch.tensor([2, 3]),
+            ),
+            "item_action_weight": JaggedTensor(
+                values=torch.tensor([[0], [1], [0], [0], [1], [0]]),
+                lengths=torch.tensor([2, 4]),
+            ),
             "watch_time": JaggedTensor(
                 values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
                 lengths=torch.tensor([2, 3]),
