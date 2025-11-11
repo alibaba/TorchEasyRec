@@ -93,11 +93,9 @@ message CIN {
     repeated uint32 cin_layer_size = 1;
 }
 
-message GRActionEncoder {
+message GRSimpleActionEncoder {
     // action embedding dim
     optional uint32 action_embedding_dim = 1;
-    // name of action feature in payloads
-    required string action_feature_name = 2;
     // bitmask of each action
     repeated uint32 action_weights = 3;
     // thresholds for watch time to actions
@@ -106,11 +104,34 @@ message GRActionEncoder {
     repeated uint32 watchtime_to_action_weights = 5;
 }
 
+message GRActionEncoder {
+    oneof action_encoder {
+        GRSimpleActionEncoder simple_action_encoder = 1;
+    }
+}
+
+message GRSliceContentEncoder {
+}
+
+message GRPadContentEncoder {
+}
+
+message GRMLPContentEncoder {
+    // mlp for uih seq embedding
+    required MLP uih_mlp = 1;
+    // mlp for candidate seq embedding
+    required MLP target_mlp = 2;
+}
+
 message GRContentEncoder {
-    // content feature name to embedding dim in payloads.
-    map<string, uint32> additional_content_features = 1;
-    // target feature name to embedding dim in payloads.
-    map<string, uint32> target_enrich_features = 2;
+    oneof content_encoder {
+        // slice candidate dim to uih dim
+        GRSliceContentEncoder slice_content_encoder = 1;
+        // padding candidate dim to uih dim
+        GRPadContentEncoder pad_content_encoder = 2;
+        // linear transform uih and candidate to same dim
+        GRMLPContentEncoder mlp_content_encoder = 3;
+    }
 }
 
 message GRSimpleContextualizedMLP {
@@ -135,30 +156,19 @@ message GRContextualizedMLP {
 }
 
 message GRContextualPreprocessor {
-    // a mapping from contextual feature to maximum padding length.
-    map<string, uint32> contextual_feature_to_max_length = 1;
-    // a mapping from contextual feature to uih length, if uih
-    // length < min_uih_length, will mask the contextual feature.
-    map<string, uint32> contextual_feature_to_min_uih_length = 2;
     // action encoder config
     optional GRActionEncoder action_encoder = 3;
     // action embedding mlp config
     optional GRContextualizedMLP action_mlp = 4;
+    // content encoder config
+    required GRContentEncoder content_encoder = 5;
     // content embedding mlp config
-    required GRContextualizedMLP content_mlp = 5;
-    // a mapping from contextual feature to maximum pooling type.
-    // pooling type: sum | mean | min | max
-    map<string, string> contextual_feature_to_pooling = 6;
+    required GRContextualizedMLP content_mlp = 6;
 }
 
 message GRContextualInterleavePreprocessor {
-    // a mapping from contextual feature to maximum padding length.
-    map<string, uint32> contextual_feature_to_max_length = 1;
-    // a mapping from contextual feature to uih length, if uih
-    // length < min_uih_length, will mask the contextual feature.
-    map<string, uint32> contextual_feature_to_min_uih_length = 2;
     // action encoder config
-    required GRActionEncoder action_encoder = 3;
+    optional GRActionEncoder action_encoder = 3;
     // enable interleave target or not
     optional bool enable_interleaving = 4 [default=true];
     // action embedding mlp config
@@ -167,9 +177,6 @@ message GRContextualInterleavePreprocessor {
     required GRContentEncoder content_encoder = 6;
     // content embedding mlp config
     required GRContextualizedMLP content_mlp = 7;
-    // a mapping from contextual feature to maximum pooling type.
-    // pooling type: sum | mean | min | max
-    map<string, string> contextual_feature_to_pooling = 8;
 }
 
 message GRInputPreprocessor {
