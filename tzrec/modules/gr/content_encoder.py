@@ -13,121 +13,296 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
-from typing import Dict, List, Optional
+import abc
+from typing import Any, Dict, Union
 
 import torch
 
+from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import BaseModule
 from tzrec.ops.jagged_tensors import concat_2D_jagged
+from tzrec.protos import module_pb2
+from tzrec.utils.config_util import config_to_kwargs
 
 
 class ContentEncoder(BaseModule):
-    """Content encoder for HSTU.
+    """Abstract Content encoder for HSTU."""
+
+    @property
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def forward(
+        self,
+        uih_embeddings: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        max_uih_len: int,
+        max_targets: int,
+        uih_offsets: torch.Tensor,
+        target_offsets: torch.Tensor,
+        total_uih_len: int,
+        total_targets: int,
+    ) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            uih_embeddings (torch.Tensor): input uih sequence embeddings.
+            target_embeddings (torch.Tensor): input target sequence embeddings.
+            max_uih_len (int): maximum user history sequence length.
+            max_targets (int): maximum targets sequence length.
+            uih_offsets (torch.Tensor): input user history sequence offsets.
+            target_offsets (torch.Tensor): target sequence lengths.
+            total_uih_len (int): total user history sequence length.
+            total_targets (int): total targets sequence length.
+
+        Returns:
+            content_embeddings: output content embedding tensor.
+        """
+        pass
+
+
+class SliceContentEncoder(ContentEncoder):
+    """Slice Content encoder for HSTU.
+
+    Padding uid embedding to same dim with target embedding.
 
     Args:
-        input_embedding_dim (int): dimension of input embeddings.
-        additional_content_features (Dict[str, int]): content feature name to embedding
-            dim in payloads.
-        target_enrich_features (Dict[str, int]): target feature name to embedding
+        uih_embedding_dim (int): dimension of input uih embeddings.
+        target_embedding_dim (int): dimension of input candidate embeddings.
             dim in payloads.
         is_inference (bool): whether to run in inference mode.
     """
 
     def __init__(
         self,
-        input_embedding_dim: int,
-        additional_content_features: Optional[Dict[str, int]] = None,
-        target_enrich_features: Optional[Dict[str, int]] = None,
+        uih_embedding_dim: int,
+        target_embedding_dim: int,
         is_inference: bool = False,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(is_inference=is_inference)
-        self._input_embedding_dim: int = input_embedding_dim
-        self._additional_content_features: Dict[str, int] = (
-            additional_content_features
-            if additional_content_features is not None
-            else {}
+        super().__init__(is_inference)
+        self._uih_embedding_dim = uih_embedding_dim
+        self._target_embedding_dim = target_embedding_dim
+        assert self._target_embedding_dim >= self._uih_embedding_dim
+
+    @property
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self._uih_embedding_dim
+
+    def forward(
+        self,
+        uih_embeddings: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        max_uih_len: int,
+        max_targets: int,
+        uih_offsets: torch.Tensor,
+        target_offsets: torch.Tensor,
+        total_uih_len: int,
+        total_targets: int,
+    ) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            uih_embeddings (torch.Tensor): input uih sequence embeddings.
+            target_embeddings (torch.Tensor): input target sequence embeddings.
+            max_uih_len (int): maximum user history sequence length.
+            max_targets (int): maximum targets sequence length.
+            uih_offsets (torch.Tensor): input user history sequence offsets.
+            target_offsets (torch.Tensor): target sequence lengths.
+            total_uih_len (int): total user history sequence length.
+            total_targets (int): total targets sequence length.
+
+        Returns:
+            content_embeddings: output content embedding tensor.
+        """
+        content_embeddings = concat_2D_jagged(
+            values_left=uih_embeddings,
+            values_right=target_embeddings[:, : self._uih_embedding_dim],
+            max_len_left=max_uih_len,
+            max_len_right=max_targets,
+            offsets_left=uih_offsets,
+            offsets_right=target_offsets,
+            kernel=self.kernel(),
         )
-        self._target_enrich_features: Dict[str, int] = (
-            target_enrich_features if target_enrich_features is not None else {}
-        )
-        self._target_enrich_dummy_embeddings: torch.nn.ParameterDict = (
-            torch.nn.ParameterDict(
-                {
-                    name: torch.nn.Parameter(
-                        torch.empty((1, dim)).normal_(mean=0, std=0.1),
-                    )
-                    for name, dim in self._target_enrich_features.items()
-                }
-            )
+        return content_embeddings
+
+
+class PadContentEncoder(ContentEncoder):
+    """Pad Content encoder for HSTU.
+
+    Padding uid embedding to same dim with target embedding.
+
+    Args:
+        uih_embedding_dim (int): dimension of input uih embeddings.
+        target_embedding_dim (int): dimension of input candidate embeddings.
+            dim in payloads.
+        is_inference (bool): whether to run in inference mode.
+    """
+
+    def __init__(
+        self,
+        uih_embedding_dim: int,
+        target_embedding_dim: int,
+        is_inference: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(is_inference)
+        self._uih_embedding_dim = uih_embedding_dim
+        self._target_embedding_dim = target_embedding_dim
+        assert self._target_embedding_dim > self._uih_embedding_dim
+        self._target_enrich_dummy_embeddings = torch.nn.Parameter(
+            torch.empty(
+                (1, self._target_embedding_dim - self._uih_embedding_dim)
+            ).normal_(mean=0, std=0.1),
         )
 
     @property
     def output_dim(self) -> int:
         """Output dimension of the module."""
-        return self._input_embedding_dim + sum(
-            list(self._additional_content_features.values())
-            + list(self._target_enrich_features.values())
-        )
+        return self._target_embedding_dim
 
     def forward(
         self,
+        uih_embeddings: torch.Tensor,
+        target_embeddings: torch.Tensor,
         max_uih_len: int,
         max_targets: int,
         uih_offsets: torch.Tensor,
         target_offsets: torch.Tensor,
-        seq_embeddings: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
+        total_uih_len: int,
+        total_targets: int,
     ) -> torch.Tensor:
         """Forward the module.
 
         Args:
+            uih_embeddings (torch.Tensor): input uih sequence embeddings.
+            target_embeddings (torch.Tensor): input target sequence embeddings.
             max_uih_len (int): maximum user history sequence length.
             max_targets (int): maximum targets sequence length.
             uih_offsets (torch.Tensor): input user history sequence offsets.
             target_offsets (torch.Tensor): target sequence lengths.
-            seq_embeddings (torch.Tensor): input sequence embeddings.
-            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+            total_uih_len (int): total user history sequence length.
+            total_targets (int): total targets sequence length.
 
         Returns:
-            torch.Tensor: output content embedding tensor.
+            content_embeddings: output content embedding tensor.
         """
-        content_embeddings_list: List[torch.Tensor] = []
-
-        content_embeddings_list: List[torch.Tensor] = [seq_embeddings]
-        if len(self._additional_content_features) > 0:
-            content_embeddings_list = content_embeddings_list + [
-                (seq_payloads[x].to(seq_embeddings.dtype))
-                for x in self._additional_content_features.keys()
-            ]
-
-        if self._target_enrich_dummy_embeddings:
-            total_seq_len: int = seq_embeddings.size(0)
-            for name, param in self._target_enrich_dummy_embeddings.items():
-                enrich_embeddings_target = seq_payloads[name].to(seq_embeddings.dtype)
-                total_targets: int = enrich_embeddings_target.size(0)
-                total_uih_len: int = total_seq_len - total_targets
-                enrich_embeddings_uih = param.tile(total_uih_len, 1).to(
-                    seq_embeddings.dtype
-                )
-                enrich_embeddings = concat_2D_jagged(
-                    values_left=enrich_embeddings_uih,
-                    values_right=enrich_embeddings_target,
-                    max_len_left=max_uih_len,
-                    max_len_right=max_targets,
-                    offsets_left=uih_offsets,
-                    offsets_right=target_offsets,
-                    kernel=self.kernel(),
-                )
-                content_embeddings_list.append(enrich_embeddings)
-
-        if (
-            len(self._target_enrich_features) == 0
-            and len(self._additional_content_features) == 0
-        ):
-            return seq_embeddings
-        else:
-            content_embeddings = torch.cat(
-                content_embeddings_list,
-                dim=1,
-            )
+        enrich_embeddings_uih = self._target_enrich_dummy_embeddings.tile(
+            total_uih_len, 1
+        ).to(uih_embeddings.dtype)
+        uih_embeddings = torch.cat([uih_embeddings, enrich_embeddings_uih], dim=1)
+        content_embeddings = concat_2D_jagged(
+            values_left=uih_embeddings,
+            values_right=target_embeddings,
+            max_len_left=max_uih_len,
+            max_len_right=max_targets,
+            offsets_left=uih_offsets,
+            offsets_right=target_offsets,
+            kernel=self.kernel(),
+        )
         return content_embeddings
+
+
+class MLPContentEncoder(BaseModule):
+    """MLP Content encoder for HSTU.
+
+    Args:
+        uih_embedding_dim (int): dimension of uih input embeddings.
+        target_embedding_dim (int): dimension of target input embeddings.
+        uih_mlp (Dict[str, int]): uih mlp config for uih sequence group.
+        target_mlp (Dict[str, int]): target mlp config for candidate sequence group.
+        is_inference (bool): whether to run in inference mode.
+    """
+
+    def __init__(
+        self,
+        uih_embedding_dim: int,
+        target_embedding_dim: int,
+        uih_mlp: Dict[str, Any],
+        target_mlp: Dict[str, Any],
+        is_inference: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(is_inference=is_inference)
+        self._uih_embedding_dim = uih_embedding_dim
+        self._target_embedding_dim = target_embedding_dim
+        self.uih_mlp = MLP(in_features=self._uih_embedding_dim, **uih_mlp)
+        self.target_mlp = MLP(in_features=self._target_embedding_dim, **target_mlp)
+        assert self.uih_mlp.output_dim() == self.target_mlp.output_dim(), (
+            "uih_mlp output_dim must be equal to target_mlp output_dim"
+        )
+
+    @property
+    def output_dim(self) -> int:
+        """Output dimension of the module."""
+        return self.uih_mlp.output_dim()
+
+    def forward(
+        self,
+        uih_embeddings: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        max_uih_len: int,
+        max_targets: int,
+        uih_offsets: torch.Tensor,
+        target_offsets: torch.Tensor,
+        total_uih_len: int,
+        total_targets: int,
+    ) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            uih_embeddings (torch.Tensor): input uih sequence embeddings.
+            target_embeddings (torch.Tensor): input target sequence embeddings.
+            max_uih_len (int): maximum user history sequence length.
+            max_targets (int): maximum targets sequence length.
+            uih_offsets (torch.Tensor): input user history sequence offsets.
+            target_offsets (torch.Tensor): target sequence lengths.
+            total_uih_len (int): total user history sequence length.
+            total_targets (int): total targets sequence length.
+
+        Returns:
+            content_embeddings: output content embedding tensor.
+        """
+        uih_embeddings = self.uih_mlp(uih_embeddings)
+        target_embeddings = self.target_mlp(target_embeddings)
+        content_embeddings = concat_2D_jagged(
+            values_left=uih_embeddings,
+            values_right=target_embeddings,
+            max_len_left=max_uih_len,
+            max_len_right=max_targets,
+            offsets_left=uih_offsets,
+            offsets_right=target_offsets,
+            kernel=self.kernel(),
+        )
+        return content_embeddings
+
+
+def create_content_encoder(
+    content_encoder_cfg: Union[module_pb2.GRContentEncoder, Dict[str, Any]],
+    **kwargs: Any,
+) -> ContentEncoder:
+    """Create ContentEncoder."""
+    if isinstance(content_encoder_cfg, module_pb2.GRContentEncoder):
+        content_encoder_type = content_encoder_cfg.WhichOneof("content_encoder")
+        config_dict = config_to_kwargs(
+            getattr(content_encoder_cfg, content_encoder_type)
+        )
+    else:
+        assert len(content_encoder_cfg) == 1, (
+            f"content_encoder_cfg should be {{content_encoder_type: content_encoder_kwargs}}, "  # NOQA
+            f"but got {content_encoder_type}"
+        )
+        content_encoder_type, config_dict = content_encoder_cfg.popitem()
+
+    config_dict = dict(config_dict, **kwargs)
+    if content_encoder_type == "slice_content_encoder":
+        return SliceContentEncoder(**config_dict)
+    elif content_encoder_type == "pad_content_encoder":
+        return PadContentEncoder(**config_dict)
+    elif content_encoder_type == "mlp_content_encoder":
+        return MLPContentEncoder(**config_dict)
+    else:
+        raise RuntimeError(f"Unknown content encoder type: {content_encoder_type}")

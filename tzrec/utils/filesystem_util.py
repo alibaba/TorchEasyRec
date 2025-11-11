@@ -24,6 +24,7 @@ _original_open = builtins.open
 _original_makedirs = os.makedirs
 _original_listdir = os.listdir
 _original_remove = os.remove
+_original_isdir = os.path.isdir
 _original_exists = os.path.exists
 _original_copy = shutil.copy
 _original_glob = glob_module.glob
@@ -61,6 +62,14 @@ def _patched_makedirs(path, mode=0o777, exist_ok=False):
         return fs.makedirs(path, exist_ok=exist_ok)
     else:
         return _original_makedirs(path, mode=mode, exist_ok=exist_ok)
+
+
+def _patched_isdir(path):
+    fs, _ = url_to_fs(path)
+    if fs is not None:
+        return fs.isdir(path)
+    else:
+        return _original_isdir(path)
 
 
 def _patched_listdir(path):
@@ -111,6 +120,7 @@ def apply_monkeypatch():
     """Apply fsspec-backed monkeypatches to builtins/os/shutil."""
     builtins.open = _patched_open
     os.makedirs = _patched_makedirs
+    os.path.isdir = _patched_isdir
     os.listdir = _patched_listdir
     os.remove = _patched_remove
     os.path.exists = _patched_exists
@@ -122,6 +132,7 @@ def remove_monkeypatch():
     """Restore original functions."""
     builtins.open = _original_open
     os.makedirs = _original_makedirs
+    os.path.isdir = _original_isdir
     os.listdir = _original_listdir
     os.remove = _original_remove
     os.path.exists = _original_exists
