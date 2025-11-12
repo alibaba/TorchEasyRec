@@ -416,24 +416,15 @@ def split_model(
     save_dir: str,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     rank=0,
-    assets: Optional[List[str]] = None,
 ) -> List[nn.Module]:
-    """split an EasyRec model into spars part and dense part."""
-    # device, _ = init_process_group()
-    # rank = int(os.environ.get("RANK", 0))
-    # world_size = int(os.environ.get("WORLD_SIZE", 1))
+    """split an EasyRec model into sparse part and dense part."""
     is_rank_zero = rank == 0
-    train_config = pipeline_config.train_config
-
-    # feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
-
     graph_dir = os.path.join(save_dir, "graph")
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
-    # dist.barrier()
 
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
@@ -450,30 +441,6 @@ def split_model(
 
     model.set_is_inference(True)
     model.eval()
-
-    # Build Sharded Model
-    # planner = create_planner(
-    #     device=device,
-    #     # pyre-ignore [16]
-    #     batch_size=dataloader.dataset.sampled_batch_size,
-    #     global_constraints_cfg=train_config.global_embedding_constraints
-    #     if train_config.HasField("global_embedding_constraints")
-    #     else None,
-    #     model=model,
-    # )
-    # sharders = get_default_sharders()
-    # plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
-    # if is_rank_zero:
-    #     logger.info(str(plan))
-
-    # dmp_model = DistributedModelParallel(
-    #     module=model,
-    #     sharders=sharders,
-    #     device=device,
-    #     plan=plan,
-    #     init_parameters=False,
-    #     init_data_parallel=False
-    # )
 
     tracer = Tracer(leaf_modules=_get_leaf_module_names(model))
     full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
@@ -512,12 +479,7 @@ def split_model(
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
-    # sparse_model = DistributedModelParallel(
-    #     module=sparse_gm,
-    #     sharders=sharders,
-    #     device=device,
-    #     plan=plan,
-    # )
+
     init_parameters(sparse_gm, device)
     sparse_gm.to(device)
     checkpoint_util.restore_model(checkpoint_path, sparse_gm)
@@ -529,7 +491,6 @@ def split_model(
     seqname_mapping = {}
     for feature in features:
         if feature.is_grouped_sequence:
-            # rtp do not use __ concat sequence_name and feature_name
             # pyre-ignore [16]
             seqname_mapping[feature.name] = (
                 f"{feature.sequence_name}_{feature.config.feature_name}"
