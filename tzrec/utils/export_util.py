@@ -167,10 +167,10 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense = split_model(
+            sparse, dense, output_keys = split_model(
                 pipeline_config, model, checkpoint_path, save_dir
             )
-            export_model_trt(sparse, dense, data, save_dir)
+            export_model_trt(sparse, dense, data, output_keys, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
             result = model(data)
@@ -417,15 +417,15 @@ def split_model(
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     rank=0,
     assets: Optional[List[str]] = None,
-) -> None:
-    """Export a EasyRec model on RTP."""
+) -> List[nn.Module]:
+    """split an EasyRec model into spars part and dense part."""
     # device, _ = init_process_group()
     # rank = int(os.environ.get("RANK", 0))
     # world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_rank_zero = rank == 0
     train_config = pipeline_config.train_config
 
-    feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
+    # feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
 
     graph_dir = os.path.join(save_dir, "graph")
     if is_rank_zero:
@@ -452,19 +452,19 @@ def split_model(
     model.eval()
 
     # Build Sharded Model
-    planner = create_planner(
-        device=device,
-        # pyre-ignore [16]
-        batch_size=dataloader.dataset.sampled_batch_size,
-        global_constraints_cfg=train_config.global_embedding_constraints
-        if train_config.HasField("global_embedding_constraints")
-        else None,
-        model=model,
-    )
-    sharders = get_default_sharders()
-    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
-    if is_rank_zero:
-        logger.info(str(plan))
+    # planner = create_planner(
+    #     device=device,
+    #     # pyre-ignore [16]
+    #     batch_size=dataloader.dataset.sampled_batch_size,
+    #     global_constraints_cfg=train_config.global_embedding_constraints
+    #     if train_config.HasField("global_embedding_constraints")
+    #     else None,
+    #     model=model,
+    # )
+    # sharders = get_default_sharders()
+    # plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
+    # if is_rank_zero:
+    #     logger.info(str(plan))
 
     # dmp_model = DistributedModelParallel(
     #     module=model,
@@ -475,10 +475,8 @@ def split_model(
     #     init_data_parallel=False
     # )
 
-    # Trace Sharded Model
-    unwrap_model = model
-    tracer = Tracer(leaf_modules=_get_leaf_module_names(unwrap_model))
-    full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
+    tracer = Tracer(leaf_modules=_get_leaf_module_names(model))
+    full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
             f.write(str(full_graph))
@@ -508,7 +506,7 @@ def split_model(
             t = node.args[1]
             outputs[name] = t
     graph.output(tuple([outputs, output_attrs]))
-    sparse_gm = torch.fx.GraphModule(unwrap_model, graph)
+    sparse_gm = torch.fx.GraphModule(model, graph)
     sparse_gm.graph.eliminate_dead_code()
     sparse_gm = _prune_unused_param_and_buffer(sparse_gm)
     if is_rank_zero:
@@ -593,37 +591,11 @@ def split_model(
                 mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
     graph.output(tuple(output_values))
-    dense_gm = torch.fx.GraphModule(unwrap_model, graph)
+    dense_gm = torch.fx.GraphModule(model, graph)
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
     init_parameters(dense_gm, device)
     dense_gm.to(device)
     checkpoint_util.restore_model(checkpoint_path, dense_gm)
 
-    return sparse_gm, dense_gm
-
-    # if is_rank_zero:
-    #     with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
-    #         f.write(str(gm.graph))
-    #     _ = gm(sparse_output)
-
-    #     # Save Dense Model
-    #     fx_tool = ExportTorchFxTool(save_dir)
-    #     fx_tool.set_output_nodes_name(output_keys)
-    #     fx_tool.export_fx_model(gm, sparse_output, mc_config)
-
-    #     has_fg_asset = False
-    #     if assets is not None:
-    #         for asset in assets:
-    #             if asset.endswith("fg.json"):
-    #                 has_fg_asset = True
-    #             shutil.copy(asset, save_dir)
-
-    #     # Save FG
-    #     if not has_fg_asset:
-    #         logger.info("saving fg json...")
-    #         fg_json = create_fg_json(features, asset_dir=save_dir)
-    #         fg_json["features"].extend(additional_fg)
-    #         _adjust_fg_json_for_rtp(fg_json, feature_to_embedding_info)
-    #         with open(os.path.join(save_dir, "fg.json"), "w") as f:
-    #             json.dump(fg_json, f, indent=4)
+    return sparse_gm, dense_gm, output_keys

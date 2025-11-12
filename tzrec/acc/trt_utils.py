@@ -22,6 +22,8 @@ from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 from torchrec.sparse.jagged_tensor import KeyedTensor
 from torch.export import Dim
+
+import inspect
 # cpu image has no torch_tensorrt
 has_tensorrt = False
 try:
@@ -123,10 +125,15 @@ class ScriptWrapperList(ScriptWrapper):
 class ScriptWrapperTRT(nn.Module):
     """Model inference wrapper for jit.script."""
 
-    def __init__(self, embedding_group: nn.Module, dense: nn.Module) -> None:
+    def __init__(self, 
+                 embedding_group: nn.Module, 
+                 dense: nn.Module,
+                 output_keys
+        ) -> None:
         super().__init__()
         self.embedding_group = embedding_group
         self.dense = dense
+        self.output_keys = output_keys
 
     def forward(
         self,
@@ -143,7 +150,7 @@ class ScriptWrapperTRT(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        all_features__ebc, all_features__ebc_attrs = self.embedding_group(data, device)
+        emb_ebc, _ = self.embedding_group(data, device)
         # grouped_features = all_features__ebc['all_features__ebc']
         # grouped_features = {"all_features__ebc": list(grouped_features[0].values())[0]}
 #         values = all_features__ebc["all_features__ebc"]
@@ -158,8 +165,9 @@ class ScriptWrapperTRT(nn.Module):
 #             values=values,
 #             length_per_key=lengths
 # )
-        y, y1 = self.dense(all_features__ebc)
-        return {"y": y, "y1": y1}
+        o = self.dense(emb_ebc)
+        outputs = {k: o[i] for i, k in enumerate(self.output_keys)}
+        return outputs
 
 
 def get_trt_max_seq_len() -> int:
@@ -175,6 +183,7 @@ def export_model_trt(
     sparse_model: nn.Module,
     dense_model: nn.Module,
     data: Dict[str, torch.Tensor],
+    output_keys: tuple,
     save_dir: str,
 ) -> None:
     """Export trt model.
@@ -186,7 +195,7 @@ def export_model_trt(
     """
     # ScriptWrapperList for trace the ScriptWrapperTRT(emb_trace_gpu, dense_layer_trt)
     # emb_trace_gpu = ScriptWrapperList(sparse_model)
-    emb_res = sparse_model(data, "cuda:0")
+    emb_ebc, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
     sparse_model_scripted = torch.jit.script(sparse_model_traced)
 
@@ -196,10 +205,9 @@ def export_model_trt(
     batch = torch.export.Dim("batch", min=1, max=max_batch_size)
     dynamic_shapes_list = []
     values_list_cuda = []
-    for i, value in enumerate(emb_res):
-        if i > 0:
-            break
-        v = list(value.values())[0].detach().to("cuda:0")
+    key_list = []
+    for i, k in enumerate(emb_ebc.keys()):
+        v = emb_ebc[k].detach().to("cuda:0")
         dict_dy = {0: batch}
         if v.dim() == 3:
             # workaround -> 0/1 specialization
@@ -211,50 +219,43 @@ def export_model_trt(
             v = torch.zeros((2,) + v.size()[1:], device="cuda:0", dtype=v.dtype)
         values_list_cuda.append(v)
         dynamic_shapes_list.append(dict_dy)
-
+        key_list.append(k)
     # convert dense
-    # logger.info("dense res: %s", dense_model(values_list_cuda))
     logger.info(
-        "dense res: %s", dense_model({"all_features__ebc": values_list_cuda[0]})
+        "dense res: %s", dense_model(emb_ebc)
     )
 
     dense_layer = symbolic_trace(dense_model)
-    dynamic_shapes = {"args": dynamic_shapes_list}
-    # exp_program = torch.export.export(
-    #     dense_layer,
-    #     (values_list_cuda,),
-    #     dynamic_shapes=dynamic_shapes
-    # )
-    # TODO: values_list_cuda[0]这里不能用[0], 会形成动态图， 要使用静态图
-    all_features__ebc = values_list_cuda[0]
-    # exp_program = torch.export.export(
-    #     dense_layer, ({"all_features__ebc": all_features__ebc},)
-    # )
-    dynamic_shapes = {
-        "data": {
-            "all_features__ebc": {0: Dim("batch", min=1, max=512)}
-        }
-    }
+    dense_signature = inspect.signature(dense_model.forward)
+    dense_arg_name = list(dense_signature.parameters.keys())[0]
+    dynamic_shapes = {}
+    for i, k in enumerate(key_list):
+        dynamic_shapes[dense_arg_name] = {k: dynamic_shapes_list[i]}
+
     exp_program = torch.export.export(
         dense_layer,
-        ({"all_features__ebc": all_features__ebc},),
+        (emb_ebc, ),
         dynamic_shapes=dynamic_shapes
     )
     dense_layer_trt = trt_convert(
-        exp_program, ({"all_features__ebc": all_features__ebc},)
+        exp_program, emb_ebc
     )
     dict_res = dense_layer_trt(
-        {"all_features__ebc": all_features__ebc}
+        emb_ebc
     )
     logger.info("dense trt res: %s", dict_res)
 
 
     dense_layer_trt_traced = torch.jit.trace(
-        dense_layer_trt, example_inputs=sparse_model_scripted(data)[0], strict=False
+        dense_layer_trt, example_inputs=emb_ebc, strict=False
     )
     dense_layer_trt_scripted = torch.jit.script(dense_layer_trt_traced)
     # save combined_model
-    combined_model = ScriptWrapperTRT(embedding_group=sparse_model_scripted, dense=dense_layer_trt_scripted)
+    combined_model = ScriptWrapperTRT(
+        embedding_group=sparse_model_scripted, 
+        dense=dense_layer_trt_scripted,
+        output_keys=output_keys
+    )
     result = combined_model(data, "cuda:0")
     logger.info("combined model result: %s", result)
     # combined_model = symbolic_trace(combined_model)
