@@ -48,7 +48,7 @@ bash scripts/gen_proto.sh
 
 - 根据输入的`batch`数据，进行前向推理，得到`predictions`
   - `batch`为`tzrec.datasets.utils.Batch`的数据结构，包含`dense_features`（稠密特征）、`sparse_features`（稀疏特征）、`sequence_dense_features` (序列稠密特征)
-    - 一般可以将`dense_features`、`sparse_features`、`sequence_dense_features` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
+  - 一般可以将`dense_features`、`sparse_features`、`sequence_dense_features` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
 
 ### 损失: init_loss & loss
 
@@ -71,7 +71,7 @@ bash scripts/gen_proto.sh
 以排序模型为例
 
 ```python
-# tzrec/model/custom_rank_model.py
+# tzrec/models/custom_rank_model.py
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -132,7 +132,7 @@ class CustomRankModel(RankModel):
         grouped_features = self.embedding_group(
             batch
         )
-        features = torch.cat(grouped_features, dim=-1)
+        features = torch.cat([grouped_features[name] for name in self.embedding_group.group_names()], dim=-1)
         tower_output = self.mlp(features)
         y = self.output_mlp(tower_output)
         # 其他前向推理
