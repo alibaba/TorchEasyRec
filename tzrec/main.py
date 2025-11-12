@@ -14,7 +14,6 @@ import itertools
 import json
 import os
 from collections import OrderedDict
-from datetime import timedelta
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
@@ -74,32 +73,13 @@ from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     create_train_pipeline,
+    init_process_group,
 )
 from tzrec.utils.export_util import export_model
+from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
-
-
-def init_process_group() -> Tuple[torch.device, str]:
-    """Init process_group, device, rank, backend."""
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
-        device: torch.device = torch.device(f"cuda:{rank}")
-        backend = "nccl"
-        torch.cuda.set_device(device)
-    else:
-        device: torch.device = torch.device("cpu")
-        backend = "gloo"
-
-    pg_timeout = None
-    if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
-        pg_timeout = timedelta(
-            seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
-        )
-    dist.init_process_group(backend=backend, timeout=pg_timeout)
-
-    return device, backend
 
 
 def _create_features(
@@ -242,6 +222,7 @@ def _log_train(
     tb_summaries: List[str],
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
+    train_metrics: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     """Logging current training step."""
     if plogger is not None:
@@ -252,10 +233,15 @@ def _log_train(
         for i, g in enumerate(param_groups):
             lr_strs.append(f"lr_g{i}:{g['lr']:.5f}")
         total_loss = sum(losses.values())
-        plogger.log(
-            step,
-            f"{' '.join(lr_strs)} {' '.join(loss_strs)} total_loss: {total_loss:.5f}",
+        suffix = (
+            f"{' '.join(lr_strs)} {' '.join(loss_strs)} total_loss: {total_loss:.5f}"
         )
+        metric_strs = []
+        if train_metrics:
+            for k, v in train_metrics.items():
+                metric_strs.append(f"{k}:{v:.5f}")
+            suffix += f" {' '.join(metric_strs)}"
+        plogger.log(step, suffix)
     if summary_writer is not None:
         total_loss = sum(losses.values())
         if "loss" in tb_summaries:
@@ -305,6 +291,9 @@ def _log_train(
                             scalar_value=grad_norm,
                             global_step=step,
                         )
+        if train_metrics:
+            for k, v in train_metrics.items():
+                summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
 def _train_and_evaluate(
@@ -324,6 +313,7 @@ def _train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.train()
+    _model = model.module.model
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -404,9 +394,10 @@ def _train_and_evaluate(
             if i_step <= skip_steps:
                 continue
             try:
-                losses, _, _ = pipeline.progress(train_iterator)
-
+                losses, predictions, batch = pipeline.progress(train_iterator)
+                _model.update_train_metric(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
+                    train_metrics = _model.compute_train_metric()
                     _log_train(
                         i_step,
                         losses,
@@ -415,6 +406,7 @@ def _train_and_evaluate(
                         tb_summaries=tb_summaries,
                         plogger=plogger,
                         summary_writer=summary_writer,
+                        train_metrics=train_metrics,
                     )
 
                 for lr in lr_scheduler:
@@ -943,6 +935,19 @@ def predict(
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
 
+    device_and_backend = init_process_group()
+    device: torch.device = device_and_backend[0]
+
+    fs, local_path = url_to_fs(scripted_model_path)
+    if fs is not None:
+        # scripted model use io in cpp, so that we can not path to fsspec
+        local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            logger.info(f"downloading {scripted_model_path} to {local_path}.")
+            fs.download(scripted_model_path, local_path, recursive=True)
+        dist.barrier()
+        scripted_model_path = local_path
+
     pipeline_config = config_util.load_pipeline_config(
         os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
     )
@@ -973,9 +978,6 @@ def predict(
     if edit_config_json:
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
-
-    device_and_backend = init_process_group()
-    device: torch.device = device_and_backend[0]
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0

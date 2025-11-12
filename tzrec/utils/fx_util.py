@@ -100,3 +100,9 @@ def fx_mark_tensor(
     Tensor will be sparse part output and dense part input.
     """
     return
+
+
+@torch.fx.wrap
+def fx_mark_seq_len(name: str, x: torch.Tensor) -> None:
+    """Mark a sequence length Tensor in fx.graph."""
+    return

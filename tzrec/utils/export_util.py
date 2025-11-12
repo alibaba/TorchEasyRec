@@ -19,12 +19,13 @@ from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
+from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 from torchrec import KeyedTensor
-from torchrec.distributed.train_pipeline.tracing import Tracer, _get_leaf_module_names
+from torchrec.distributed.train_pipeline.utils import Tracer, _get_leaf_module_names
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.embedding_modules import (
@@ -35,6 +36,7 @@ from torchrec.modules.embedding_modules import (
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
 )
+from torchrec.sparse import jagged_tensor
 
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
@@ -51,7 +53,16 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
-from tzrec.utils.fx_util import fx_mark_keyed_tensor, fx_mark_tensor, symbolic_trace
+
+from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
+from tzrec.utils.filesystem_util import url_to_fs
+from tzrec.utils.fx_util import (
+    fx_mark_keyed_tensor,
+    fx_mark_seq_len,
+    fx_mark_tensor,
+    symbolic_trace,
+)
+
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
@@ -66,14 +77,24 @@ def export_model(
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = os.environ.get("USE_RTP", "0") == "1"
-    impl = export_model_normal
-    return impl(
+
+    impl = export_rtp_model if use_rtp else export_model_normal
+    fs, local_path = url_to_fs(save_dir)
+    if fs is not None:
+        # scripted model use io in cpp, so that we can not path to fsspec
+        local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+    impl(
         pipeline_config=pipeline_config,
         model=model,
         checkpoint_path=checkpoint_path,
-        save_dir=save_dir,
+        save_dir=local_path,
         assets=assets,
     )
+    if fs is not None and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        logger.info(f"uploading {local_path} to {save_dir}.")
+        fs.upload(local_path, save_dir, recursive=True)
+        shutil.rmtree(local_path)
+
 
 
 def export_model_normal(
@@ -367,6 +388,10 @@ def _adjust_one_feature_for_rtp(
     if embedding_info is not None:
         feature["shared_name"] = embedding_info.name
         feature["embedding_dimension"] = embedding_info.embedding_dim
+        feature["gen_val_type"] = "lookup"
+    else:
+        feature["gen_val_type"] = "idle"
+
     if "value_dim" in feature:
         feature["value_dimension"] = feature["value_dim"]
         feature.pop("value_dim")
@@ -374,17 +399,20 @@ def _adjust_one_feature_for_rtp(
         feature["needDiscrete"] = feature["need_discrete"]
         feature.pop("need_discrete")
     if "boundaries" in feature:
+        feature["boundaries"] = ",".join(map(str, feature["boundaries"]))
         feature["gen_key_type"] = "boundary"
-        feature["gen_val_type"] = "lookup"
     elif "hash_bucket_size" in feature:
         feature["gen_key_type"] = "hash"
-        feature["gen_val_type"] = "lookup"
+    elif "num_buckets" in feature:
+        # in RTP, hash_bucket_size and gen_key_type=mod equal to num_buckets
+        feature["gen_key_type"] = "mod"
+        feature["hash_bucket_size"] = feature["num_buckets"]
+        feature.pop("num_buckets")
     else:
         for k in RTP_INVALID_BUCKET_KEYS:
             if k in feature:
                 raise ValueError(f"{k} is not supported when use rtp.")
         feature["gen_key_type"] = "idle"
-        feature["gen_val_type"] = "idle"
 
 
 def _adjust_fg_json_for_rtp(
@@ -401,12 +429,275 @@ def _adjust_fg_json_for_rtp(
             _adjust_one_feature_for_rtp(feature, embedding_info)
         else:
             sequence_name = feature["sequence_name"]
+            if "sequence_table" not in feature:
+                feature["sequence_table"] = "item"
             for sub_feature in feature["features"]:
                 feature_name = sub_feature["feature_name"]
                 embedding_info = feature_to_embedding_info.get(
                     f"{sequence_name}__{feature_name}", None
                 )
                 _adjust_one_feature_for_rtp(sub_feature, embedding_info)
+
+
+def export_rtp_model(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: Optional[str],
+    save_dir: str,
+    assets: Optional[List[str]] = None,
+) -> None:
+    """Export a EasyRec model on RTP."""
+    try:
+        from torch_fx_tool import ExportTorchFxTool
+    except Exception as e:
+        raise RuntimeError(
+            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251031.376cedb-py3-none-any.whl"
+        ) from e
+    assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
+        "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
+        "train/eval/export when use rtp for online inference."
+    )
+
+    device, _ = init_process_group()
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_rank_zero = rank == 0
+    train_config = pipeline_config.train_config
+
+    # RTP do not support fbgemm now. patch kt.regroup to slow path
+    def _all_keys_used_once(
+        keyed_tensors: List["KeyedTensor"], groups: List[List["str"]]
+    ) -> bool:
+        return False
+
+    jagged_tensor._all_keys_used_once = _all_keys_used_once
+
+    feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
+
+    graph_dir = os.path.join(save_dir, "graph")
+    if is_rank_zero:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        if not os.path.exists(graph_dir):
+            os.makedirs(graph_dir)
+    dist.barrier()
+
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+
+    # make dataparser to get user feats before create model
+    data_config = pipeline_config.data_config
+    features = cast(List[BaseFeature], model._features)
+    data_config.num_workers = 1
+    dataloader = create_dataloader(
+        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
+    )
+    batch = next(iter(dataloader))
+    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+
+    model.set_is_inference(True)
+    model.eval()
+
+    # Build Sharded Model
+    planner = create_planner(
+        device=device,
+        # pyre-ignore [16]
+        batch_size=dataloader.dataset.sampled_batch_size,
+        global_constraints_cfg=train_config.global_embedding_constraints
+        if train_config.HasField("global_embedding_constraints")
+        else None,
+        model=model,
+    )
+    sharders = get_default_sharders()
+    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
+    if is_rank_zero:
+        logger.info(str(plan))
+
+    dmp_model = DistributedModelParallel(
+        module=model,
+        sharders=sharders,
+        device=device,
+        plan=plan,
+        init_parameters=False,
+        init_data_parallel=False,
+    )
+
+    # Trace Sharded Model
+    unwrap_model = dmp_model.module
+    tracer = Tracer(leaf_modules=_get_leaf_module_names(unwrap_model))
+    full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+            f.write(str(full_graph))
+
+    # Extract Sparse Model
+    logger.info("exporting sparse model...")
+    graph = copy.deepcopy(full_graph)
+    for node in graph.nodes:
+        if node.op == "output":
+            graph.erase_node(node)
+    outputs = {}
+    output_attrs = {}
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            node_kt = node.args[1]
+            with graph.inserting_after(node_kt):
+                outputs[name] = graph.call_method("values", args=(node_kt,))
+                output_attrs[name + "__length_per_key"] = graph.call_method(
+                    "length_per_key", args=(node_kt,)
+                )
+                output_attrs[name + "__keys"] = graph.call_method(
+                    "keys", args=(node_kt,)
+                )
+        elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # sequence or query name
+            name = node.args[0]
+            t = node.args[1]
+            outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence length
+            name = node.args[0]
+            t = node.args[1]
+            with graph.inserting_after(t):
+                # RTP do not support rank=1 tensor
+                unsqueeze_t = graph.call_function(torch.unsqueeze, args=(t, 1))
+                outputs[name] = unsqueeze_t
+    graph.output(tuple([outputs, output_attrs]))
+    gm = torch.fx.GraphModule(unwrap_model, graph)
+    gm.graph.eliminate_dead_code()
+    gm = _prune_unused_param_and_buffer(gm)
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
+            f.write(str(gm.graph))
+    sparse_model = DistributedModelParallel(
+        module=gm,
+        sharders=sharders,
+        device=device,
+        plan=plan,
+    )
+    checkpoint_util.restore_model(checkpoint_path, sparse_model)
+    sparse_output, sparse_attrs = sparse_model(data, device=device)
+    # Save Sparse Parameters
+    logger.info("saving sparse parameters...")
+    local_tensor, meta = _get_rtp_embedding_tensor(sparse_model)
+    save_file(
+        local_tensor,
+        os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.safetensors"),
+    )
+    with open(
+        os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.json"), "w"
+    ) as f:
+        json.dump(meta, f, indent=4)
+
+    # Extract Dense Model
+    logger.info("exporting dense model...")
+    additional_fg = []
+    seqname_mapping = {}
+    for feature in features:
+        if feature.is_grouped_sequence:
+            # rtp do not use __ concat sequence_name and feature_name
+            # pyre-ignore [16]
+            seqname_mapping[feature.name] = (
+                f"{feature.sequence_name}_{feature.config.feature_name}"
+            )
+
+    graph = copy.deepcopy(full_graph)
+    output_keys = []
+    output_values = []
+    mc_config = defaultdict()
+    for node in graph.nodes:
+        if node.op == "output":
+            for k, v in sorted(node.args[0].items()):
+                output_keys.append(k)
+                output_values.append(v)
+            graph.erase_node(node)
+    input_node = next(node for node in graph.nodes if node.op == "placeholder")
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            node_kt = node.args[1]
+            with graph.inserting_before(node_kt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                new_node = graph.call_function(
+                    KeyedTensor,
+                    kwargs={
+                        "keys": sparse_attrs[name + "__keys"],
+                        "length_per_key": sparse_attrs[name + "__length_per_key"],
+                        "values": getitem_node,
+                    },
+                )
+                mc_config[name] = new_node.kwargs["keys"]
+                node_kt.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # sequence or query name
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                new_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                keys = [
+                    seqname_mapping[k] if k in seqname_mapping else k
+                    for k in node.kwargs["keys"]
+                ]
+                mc_config[name] = keys
+            node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                # rtp do not support RANK=1 tensor
+                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
+                # add sequence_length into fg
+                additional_fg.append(
+                    {
+                        "feature_name": name,
+                        "feature_type": "raw_feature",
+                        "expression": f"user:{name}",
+                    }
+                )
+                mc_config[name] = [name]
+            node_t.replace_all_uses_with(new_node)
+    graph.output(tuple(output_values))
+    gm = torch.fx.GraphModule(unwrap_model, graph)
+    gm.graph.eliminate_dead_code()
+    gm = _prune_unused_param_and_buffer(gm)
+    init_parameters(gm, device)
+    gm.to(device)
+    checkpoint_util.restore_model(checkpoint_path, gm)
+
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
+            f.write(str(gm.graph))
+        _ = gm(sparse_output)
+
+        # Save Dense Model
+        fx_tool = ExportTorchFxTool(os.path.join(save_dir, "fx_user_model"))
+        fx_tool.set_output_nodes_name(output_keys)
+        fx_tool.export_fx_model(gm, sparse_output, mc_config)
+
+        has_fg_asset = False
+        if assets is not None:
+            for asset in assets:
+                if asset.endswith("fg.json"):
+                    has_fg_asset = True
+                shutil.copy(asset, save_dir)
+
+        # Save FG
+        if not has_fg_asset:
+            logger.info("saving fg json...")
+            fg_json = create_fg_json(features, asset_dir=save_dir)
+            fg_json["features"].extend(additional_fg)
+            _adjust_fg_json_for_rtp(fg_json, feature_to_embedding_info)
+            with open(os.path.join(save_dir, "fg.json"), "w") as f:
+                json.dump(fg_json, f, indent=4)
 
 
 def split_model(

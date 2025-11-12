@@ -12,61 +12,118 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 
-from tzrec.modules.gr.content_encoder import ContentEncoder
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.modules.gr.content_encoder import (
+    MLPContentEncoder,
+    PadContentEncoder,
+    SliceContentEncoder,
+)
+from tzrec.utils.test_util import TestGraphType, gpu_unavailable
 
 
 class ContentEncoderTest(unittest.TestCase):
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)
-    def test_forward(self) -> None:
+    def test_slice_content_encoder(self, graph_type) -> None:
         device = torch.device("cuda")
-        input_embedding_dim = 32
-        additional_embedding_dim = 64
-        enrich_embedding_dim = 16
-        encoder = ContentEncoder(
-            input_embedding_dim=input_embedding_dim,
-            additional_content_features={
-                "a0": additional_embedding_dim,
-                "a1": additional_embedding_dim,
-            },
-            target_enrich_features={
-                "t0": enrich_embedding_dim,
-                "t1": enrich_embedding_dim,
-            },
+        uih_embedding_dim = 32
+        target_embedding_dim = 64
+        encoder = SliceContentEncoder(
+            uih_embedding_dim=uih_embedding_dim,
+            target_embedding_dim=target_embedding_dim,
             is_inference=False,
         ).to(device)
-        seq_lengths = [6, 3]
-        num_targets = [2, 1]
+
+        max_uih_len = 4
+        max_targets = 2
         uih_offsets = [0, 4, 6]
         target_offsets = [0, 2, 3]
-        seq_embeddings = torch.rand(
-            (sum(seq_lengths), input_embedding_dim), device=device
-        ).requires_grad_(True)
-        seq_payloads = {
-            "a0": torch.rand(
-                sum(seq_lengths), additional_embedding_dim, device=device
-            ).requires_grad_(True),
-            "a1": torch.rand(
-                sum(seq_lengths), additional_embedding_dim, device=device
-            ).requires_grad_(True),
-            "t0": torch.rand(
-                sum(num_targets), enrich_embedding_dim, device=device
-            ).requires_grad_(True),
-            "t1": torch.rand(
-                sum(num_targets), enrich_embedding_dim, device=device
-            ).requires_grad_(True),
-        }
+        total_uih_len = 6
+        total_targets = 3
         content_embeddings = encoder(
-            max_uih_len=4,
-            max_targets=2,
+            uih_embeddings=torch.rand(total_uih_len, uih_embedding_dim, device=device),
+            target_embeddings=torch.rand(
+                total_targets, target_embedding_dim, device=device
+            ),
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
             uih_offsets=torch.tensor(uih_offsets, device=device),
             target_offsets=torch.tensor(target_offsets, device=device),
-            seq_embeddings=seq_embeddings,
-            seq_payloads=seq_payloads,
+            total_uih_len=total_uih_len,
+            total_targets=total_targets,
         )
-        content_embeddings.sum().backward()
-        self.assertEqual(content_embeddings.size(), (9, 192))
+        self.assertEqual(content_embeddings.size(), (9, 32))
+
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
+    @unittest.skipIf(*gpu_unavailable)
+    def test_pad_content_encoder(self, graph_type) -> None:
+        device = torch.device("cuda")
+        uih_embedding_dim = 32
+        target_embedding_dim = 64
+        encoder = PadContentEncoder(
+            uih_embedding_dim=uih_embedding_dim,
+            target_embedding_dim=target_embedding_dim,
+            is_inference=False,
+        ).to(device)
+
+        max_uih_len = 4
+        max_targets = 2
+        uih_offsets = [0, 4, 6]
+        target_offsets = [0, 2, 3]
+        total_uih_len = 6
+        total_targets = 3
+        content_embeddings = encoder(
+            uih_embeddings=torch.rand(total_uih_len, uih_embedding_dim, device=device),
+            target_embeddings=torch.rand(
+                total_targets, target_embedding_dim, device=device
+            ),
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
+            uih_offsets=torch.tensor(uih_offsets, device=device),
+            target_offsets=torch.tensor(target_offsets, device=device),
+            total_uih_len=total_uih_len,
+            total_targets=total_targets,
+        )
+        self.assertEqual(content_embeddings.size(), (9, 64))
+        if graph_type == TestGraphType.NORMAL:
+            content_embeddings.sum().backward()
+
+    @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
+    @unittest.skipIf(*gpu_unavailable)
+    def test_mlp_content_encoder(self, graph_type) -> None:
+        device = torch.device("cuda")
+        uih_embedding_dim = 32
+        target_embedding_dim = 64
+        encoder = MLPContentEncoder(
+            uih_embedding_dim=uih_embedding_dim,
+            target_embedding_dim=target_embedding_dim,
+            uih_mlp=dict(hidden_units=[128]),
+            target_mlp=dict(hidden_units=[128]),
+            is_inference=False,
+        ).to(device)
+
+        max_uih_len = 4
+        max_targets = 2
+        uih_offsets = [0, 4, 6]
+        target_offsets = [0, 2, 3]
+        total_uih_len = 6
+        total_targets = 3
+        content_embeddings = encoder(
+            uih_embeddings=torch.rand(total_uih_len, uih_embedding_dim, device=device),
+            target_embeddings=torch.rand(
+                total_targets, target_embedding_dim, device=device
+            ),
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
+            uih_offsets=torch.tensor(uih_offsets, device=device),
+            target_offsets=torch.tensor(target_offsets, device=device),
+            total_uih_len=total_uih_len,
+            total_targets=total_targets,
+        )
+        self.assertEqual(content_embeddings.size(), (9, 128))
+        if graph_type == TestGraphType.NORMAL:
+            content_embeddings.sum().backward()
 
 
 if __name__ == "__main__":

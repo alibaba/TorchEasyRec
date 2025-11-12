@@ -14,6 +14,7 @@ enum FeatureGroupType {
     DEEP = 0;
     WIDE = 1;
     SEQUENCE = 2;
+    JAGGED_SEQUENCE = 3;
 }
 
 message SeqGroupConfig {
@@ -76,6 +77,8 @@ message ModelConfig {
     repeated LossConfig losses = 3;
 
     repeated MetricConfig metrics = 4;
+
+    repeated TrainMetricConfig train_metrics = 5;
 
     optional VariationalDropout variational_dropout = 11;
 

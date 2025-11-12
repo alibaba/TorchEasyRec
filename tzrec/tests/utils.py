@@ -1026,6 +1026,7 @@ def test_train_eval(
     item_id: str = "",
     cate_id: str = "",
     is_hstu: bool = False,
+    env_str: str = "",
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
@@ -1041,13 +1042,18 @@ def test_train_eval(
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
-
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
     )
 
 
-def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
+def test_eval(
+    pipeline_config_path: str,
+    test_dir: str,
+    env_str: str = "",
+) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
@@ -1056,7 +1062,8 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
-
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_eval.txt"), timeout=600
     )
@@ -1065,17 +1072,19 @@ def test_eval(pipeline_config_path: str, test_dir: str) -> bool:
 def test_export(
     pipeline_config_path: str,
     test_dir: str,
+    export_dir: str = "",
     asset_files: str = "",
     env_str: str = "",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
+    export_dir = export_dir or f"{test_dir}/export"
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
-        f"--export_dir {test_dir}/export "
+        f"--export_dir {export_dir} "
     )
     if env_str:
         cmd_str = f"{env_str} {cmd_str}"
@@ -1114,6 +1123,7 @@ def test_predict(
     test_dir: str,
     predict_threads: Optional[int] = None,
     predict_steps: Optional[int] = None,
+    env_str: str = "",
 ) -> bool:
     """Run predict integration test."""
     log_dir = os.path.join(test_dir, "log_predict")
@@ -1139,6 +1149,8 @@ def test_predict(
         cmd_str += f"--predict_threads {predict_threads} "
     if predict_steps is not None:
         cmd_str += f"--predict_steps {predict_steps} "
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
 
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
