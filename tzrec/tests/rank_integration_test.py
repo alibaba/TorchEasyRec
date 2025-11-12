@@ -878,6 +878,15 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(
         gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
     )
+    def test_multi_tower_with_fg_train_eval_export_trt_2(self):
+        self._test_rank_with_fg_trt(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
+            predict_columns=["user_id", "item_id", "clk", "probs"],
+        )
+
+    @unittest.skipIf(
+        gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
+    )
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_trt_fg_mock.config",
