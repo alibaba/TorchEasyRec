@@ -16,7 +16,7 @@ import os
 import shutil
 from collections import OrderedDict, defaultdict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 from safetensors.torch import save_file
@@ -730,7 +730,36 @@ def split_model(
     model.set_is_inference(True)
     model.eval()
 
-    tracer = Tracer(leaf_modules=_get_leaf_module_names(model))
+    def _get_leaf_module_names_wo_sharded(model: torch.nn.Module) -> List[str]:
+        def _get_leaf_module_names_helper_wo_sharded(
+            model: torch.nn.Module,
+            path: str,
+            leaf_module_names: Set[str],
+        ) -> bool:
+            if len(list(model.named_children())) == 0:
+                leaf_module_names.add(path)
+            else:
+                for name, child in model.named_children():
+                    if path == "":
+                        curr_path = name
+                    else:
+                        curr_path = path + "." + name
+
+                    _get_leaf_module_names_helper_wo_sharded(
+                        child,
+                        curr_path,
+                        leaf_module_names,
+                    )
+
+        leaf_module_names: Set[str] = set()
+        _get_leaf_module_names_helper_wo_sharded(
+            model,
+            "",
+            leaf_module_names,
+        )
+        return list(leaf_module_names)
+
+    tracer = Tracer(leaf_modules=_get_leaf_module_names_wo_sharded(model))
     full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
