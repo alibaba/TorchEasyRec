@@ -175,8 +175,10 @@ def export_model_trt(
     """Export trt model.
 
     Args:
-        model (nn.Module): the model
+        sparse_model (nn.Module): the sparse part
+        dense_model (nn.Module): the dense part
         data (Dict[str, torch.Tensor]): the test data
+        output_keys: tuple: the output key names
         save_dir (str): model save dir
     """
     emb_ebc, _ = sparse_model(data, "cuda:0")
@@ -215,8 +217,9 @@ def export_model_trt(
     dense_signature = inspect.signature(dense_model.forward)
     dense_arg_name = list(dense_signature.parameters.keys())[0]
     dynamic_shapes = {}
+    dynamic_shapes[dense_arg_name] = {}
     for i, k in enumerate(key_list):
-        dynamic_shapes[dense_arg_name] = {k: dynamic_shapes_list[i]}
+        dynamic_shapes[dense_arg_name].update({k: dynamic_shapes_list[i]})
 
     exp_program = torch.export.export(
         dense_layer,
@@ -259,7 +262,7 @@ def export_model_trt(
             record_shapes=True,
         ) as prof:
             with record_function("model_inference_dense"):
-                dict_res = dense_model(emb_ebc)
+                _ = dense_model(emb_ebc)
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
         with profile(
@@ -267,7 +270,7 @@ def export_model_trt(
             record_shapes=True,
         ) as prof:
             with record_function("model_inference_dense_trt"):
-                dict_res = dense_layer_trt(emb_ebc)
+                _ = dense_layer_trt(emb_ebc)
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
         model_gpu_combined = torch.jit.load(
@@ -280,7 +283,7 @@ def export_model_trt(
             record_shapes=True,
         ) as prof:
             with record_function("model_inference_combined_trt"):
-                dict_res = model_gpu_combined(data)
+                _ = model_gpu_combined(data)
         logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
     logger.info("trt convert success")

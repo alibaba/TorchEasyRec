@@ -705,10 +705,10 @@ def split_model(
     model: BaseModule,
     checkpoint_path: Optional[str],
     save_dir: str,
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     rank=0,
 ) -> List[nn.Module]:
     """split an EasyRec model into sparse part and dense part."""
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     is_rank_zero = rank == 0
     graph_dir = os.path.join(save_dir, "graph")
     if is_rank_zero:
@@ -763,6 +763,14 @@ def split_model(
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence length
+            name = node.args[0]
+            t = node.args[1]
+            with graph.inserting_after(t):
+                # RTP do not support rank=1 tensor
+                unsqueeze_t = graph.call_function(torch.unsqueeze, args=(t, 1))
+                outputs[name] = unsqueeze_t
     graph.output(tuple([outputs, output_attrs]))
     sparse_gm = torch.fx.GraphModule(model, graph)
     sparse_gm.graph.eliminate_dead_code()
@@ -817,30 +825,38 @@ def split_model(
                 mc_config[name] = new_node.kwargs["keys"]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # sequence or query name
             name = node.args[0]
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                if "keys" in node.kwargs:
-                    # sequence or query name
-                    keys = [
-                        seqname_mapping[k] if k in seqname_mapping else k
-                        for k in node.kwargs["keys"]
-                    ]
-                else:
-                    # sequence_length
-                    keys = [name]
-                    # add sequence_length into fg
-                    additional_fg.append(
-                        {
-                            "feature_name": name,
-                            "feature_type": "raw_feature",
-                            "expression": f"user:{name}",
-                        }
-                    )
+                keys = [
+                    seqname_mapping[k] if k in seqname_mapping else k
+                    for k in node.kwargs["keys"]
+                ]
                 mc_config[name] = keys
+            node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                # rtp do not support RANK=1 tensor
+                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
+                # add sequence_length into fg
+                additional_fg.append(
+                    {
+                        "feature_name": name,
+                        "feature_type": "raw_feature",
+                        "expression": f"user:{name}",
+                    }
+                )
+                mc_config[name] = [name]
             node_t.replace_all_uses_with(new_node)
     graph.output(tuple(output_values))
     dense_gm = torch.fx.GraphModule(model, graph)
