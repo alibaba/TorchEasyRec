@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -20,10 +21,7 @@ from tzrec.acc.utils import get_max_export_batch_size, is_debug_trt
 from tzrec.models.model import ScriptWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
-from torchrec.sparse.jagged_tensor import KeyedTensor
-from torch.export import Dim
 
-import inspect
 # cpu image has no torch_tensorrt
 has_tensorrt = False
 try:
@@ -125,11 +123,9 @@ class ScriptWrapperList(ScriptWrapper):
 class ScriptWrapperTRT(nn.Module):
     """Model inference wrapper for jit.script."""
 
-    def __init__(self, 
-                 embedding_group: nn.Module, 
-                 dense: nn.Module,
-                 output_keys
-        ) -> None:
+    def __init__(
+        self, embedding_group: nn.Module, dense: nn.Module, output_keys
+    ) -> None:
         super().__init__()
         self.embedding_group = embedding_group
         self.dense = dense
@@ -183,7 +179,7 @@ def export_model_trt(
     """
     emb_ebc, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
-    
+
     with open(os.path.join(save_dir, "gm_sparse.code"), "w") as f:
         f.write(sparse_model_traced.code)
 
@@ -222,13 +218,10 @@ def export_model_trt(
         dynamic_shapes[dense_arg_name].update({k: dynamic_shapes_list[i]})
 
     exp_program = torch.export.export(
-        dense_layer,
-        (emb_ebc, ),
-        dynamic_shapes=dynamic_shapes
+        dense_layer, (emb_ebc,), dynamic_shapes=dynamic_shapes
     )
     dense_layer_trt = trt_convert(exp_program, (emb_ebc,))
     # logger.info("dense trt res: %s", dense_layer_trt(emb_ebc))
-
 
     dense_layer_trt_traced = torch.jit.trace(
         dense_layer_trt, example_inputs=(emb_ebc,), strict=False
@@ -239,9 +232,9 @@ def export_model_trt(
     dense_layer_trt_scripted = torch.jit.script(dense_layer_trt_traced)
     # save combined_model
     combined_model = ScriptWrapperTRT(
-        embedding_group=sparse_model_scripted, 
+        embedding_group=sparse_model_scripted,
         dense=dense_layer_trt_scripted,
-        output_keys=output_keys
+        output_keys=output_keys,
     )
     result = combined_model(data, "cuda:0")
     logger.info("combined model result: %s", result)

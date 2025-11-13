@@ -53,7 +53,6 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
-
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -62,7 +61,6 @@ from tzrec.utils.fx_util import (
     fx_mark_tensor,
     symbolic_trace,
 )
-
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
@@ -94,7 +92,6 @@ def export_model(
         logger.info(f"uploading {local_path} to {save_dir}.")
         fs.upload(local_path, save_dir, recursive=True)
         shutil.rmtree(local_path)
-
 
 
 def export_model_normal(
@@ -707,8 +704,8 @@ def split_model(
     save_dir: str,
     rank=0,
 ) -> List[nn.Module]:
-    """split an EasyRec model into sparse part and dense part."""
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """Split an EasyRec model into sparse part and dense part."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     is_rank_zero = rank == 0
     graph_dir = os.path.join(save_dir, "graph")
     if is_rank_zero:
