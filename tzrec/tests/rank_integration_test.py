@@ -864,7 +864,7 @@ class RankIntegrationTest(unittest.TestCase):
         #     self.success = utils.test_export(
         #         os.path.join(self.test_dir, "pipeline.config"), self.test_dir
         #     )
-        # self.assertTrue(self.success)
+        self.assertTrue(self.success)
 
     @unittest.skipIf(
         gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
