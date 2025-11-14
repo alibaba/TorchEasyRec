@@ -11,6 +11,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -34,11 +35,11 @@ class RankIntegrationTest(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
         os.chmod(self.test_dir, 0o755)
 
-    # def tearDown(self):
-    #     if self.success:
-    #         if os.path.exists(self.test_dir):
-    #             shutil.rmtree(self.test_dir)
-    #     os.environ.pop("INPUT_TILE", None)
+    def tearDown(self):
+        if self.success:
+            if os.path.exists(self.test_dir):
+                shutil.rmtree(self.test_dir)
+        os.environ.pop("INPUT_TILE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
