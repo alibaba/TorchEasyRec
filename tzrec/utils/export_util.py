@@ -16,7 +16,7 @@ import os
 import shutil
 from collections import OrderedDict, defaultdict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 from safetensors.torch import save_file
@@ -50,6 +50,7 @@ from tzrec.features.feature import (
     create_feature_configs,
     create_fg_json,
 )
+from tzrec.modules.dense_embedding_collection import AutoDisEmbedding, MLPEmbedding
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
@@ -75,6 +76,7 @@ def export_model(
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = os.environ.get("USE_RTP", "0") == "1"
+
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
     if fs is not None:
@@ -184,7 +186,10 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            export_model_trt(model, data, save_dir)
+            sparse, dense = split_model(
+                pipeline_config, model, checkpoint_path, save_dir
+            )
+            export_model_trt(sparse, dense, data, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
             result = model(data)
@@ -691,3 +696,171 @@ def export_rtp_model(
             _adjust_fg_json_for_rtp(fg_json, feature_to_embedding_info)
             with open(os.path.join(save_dir, "fg.json"), "w") as f:
                 json.dump(fg_json, f, indent=4)
+
+
+def split_model(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: Optional[str],
+    save_dir: str,
+    rank=0,
+) -> List[nn.Module]:
+    """Split an EasyRec model into sparse part and dense part."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_rank_zero = rank == 0
+    graph_dir = os.path.join(save_dir, "graph")
+    if is_rank_zero:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        if not os.path.exists(graph_dir):
+            os.makedirs(graph_dir)
+
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+
+    # make dataparser to get user feats before create model
+    data_config = pipeline_config.data_config
+    features = cast(List[BaseFeature], model._features)
+    data_config.num_workers = 1
+    dataloader = create_dataloader(
+        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
+    )
+    batch = next(iter(dataloader))
+    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+
+    model.set_is_inference(True)
+    model.eval()
+
+    def _get_leaf_module_names_wo_sharded(model: torch.nn.Module) -> List[str]:
+        def _get_leaf_module_names_helper_wo_sharded(
+            model: torch.nn.Module,
+            path: str,
+            leaf_module_names: Set[str],
+        ) -> bool:
+            # AutoDis and MLP Embedding are special since they have children, but
+            # their children are relu, softmax, perceptrons which should not be
+            # regarded as leaf nodes.
+            if (
+                len(list(model.named_children())) == 0
+                or isinstance(model, AutoDisEmbedding)
+                or isinstance(model, MLPEmbedding)
+            ):
+                leaf_module_names.add(path)
+            else:
+                for name, child in model.named_children():
+                    if path == "":
+                        curr_path = name
+                    else:
+                        curr_path = path + "." + name
+
+                    _get_leaf_module_names_helper_wo_sharded(
+                        child,
+                        curr_path,
+                        leaf_module_names,
+                    )
+
+        leaf_module_names: Set[str] = set()
+        _get_leaf_module_names_helper_wo_sharded(
+            model,
+            "",
+            leaf_module_names,
+        )
+        return list(leaf_module_names)
+
+    tracer = Tracer(leaf_modules=_get_leaf_module_names_wo_sharded(model))
+    full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+            f.write(str(full_graph))
+
+    # Extract Sparse Model
+    logger.info("exporting sparse model...")
+    graph = copy.deepcopy(full_graph)
+    for node in graph.nodes:
+        if node.op == "output":
+            graph.erase_node(node)
+    outputs = {}
+    output_attrs = {}
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            node_kt = node.args[1]
+            with graph.inserting_after(node_kt):
+                outputs[name] = graph.call_method("values", args=(node_kt,))
+                output_attrs[name + "__length_per_key"] = graph.call_method(
+                    "length_per_key", args=(node_kt,)
+                )
+                output_attrs[name + "__keys"] = graph.call_method(
+                    "keys", args=(node_kt,)
+                )
+        elif node.op == "call_function" and node.target == fx_mark_tensor:
+            name = node.args[0]
+            t = node.args[1]
+            outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence length
+            name = node.args[0]
+            t = node.args[1]
+            outputs[name] = t
+    graph.output(tuple([outputs, output_attrs]))
+    sparse_gm = torch.fx.GraphModule(model, graph)
+    sparse_gm.graph.eliminate_dead_code()
+    sparse_gm = _prune_unused_param_and_buffer(sparse_gm)
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
+            f.write(str(sparse_gm.graph))
+
+    init_parameters(sparse_gm, device)
+    sparse_gm.to(device)
+    checkpoint_util.restore_model(checkpoint_path, sparse_gm)
+    _, sparse_attrs = sparse_gm(data, device=device)
+
+    # Extract Dense Model
+    logger.info("exporting dense model...")
+
+    graph = copy.deepcopy(full_graph)
+    input_node = next(node for node in graph.nodes if node.op == "placeholder")
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            node_kt = node.args[1]
+            with graph.inserting_before(node_kt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                new_node = graph.call_function(
+                    KeyedTensor,
+                    kwargs={
+                        "keys": sparse_attrs[name + "__keys"],
+                        "length_per_key": sparse_attrs[name + "__length_per_key"],
+                        "values": getitem_node,
+                    },
+                )
+                node_kt.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # sequence or query name
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                new_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+            node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+
+            node_t.replace_all_uses_with(get_node)
+    dense_gm = torch.fx.GraphModule(model, graph)
+    dense_gm.graph.eliminate_dead_code()
+    dense_gm = _prune_unused_param_and_buffer(dense_gm)
+    init_parameters(dense_gm, device)
+    dense_gm.to(device)
+    checkpoint_util.restore_model(checkpoint_path, dense_gm)
+
+    return sparse_gm, dense_gm
