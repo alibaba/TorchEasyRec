@@ -801,10 +801,7 @@ def split_model(
             # sequence length
             name = node.args[0]
             t = node.args[1]
-            with graph.inserting_after(t):
-                # RTP do not support rank=1 tensor
-                unsqueeze_t = graph.call_function(torch.unsqueeze, args=(t, 1))
-                outputs[name] = unsqueeze_t
+            outputs[name] = t
     graph.output(tuple([outputs, output_attrs]))
     sparse_gm = torch.fx.GraphModule(model, graph)
     sparse_gm.graph.eliminate_dead_code()
@@ -816,29 +813,12 @@ def split_model(
     init_parameters(sparse_gm, device)
     sparse_gm.to(device)
     checkpoint_util.restore_model(checkpoint_path, sparse_gm)
-    sparse_output, sparse_attrs = sparse_gm(data, device=device)
+    _, sparse_attrs = sparse_gm(data, device=device)
 
     # Extract Dense Model
     logger.info("exporting dense model...")
-    additional_fg = []
-    seqname_mapping = {}
-    for feature in features:
-        if feature.is_grouped_sequence:
-            # pyre-ignore [16]
-            seqname_mapping[feature.name] = (
-                f"{feature.sequence_name}_{feature.config.feature_name}"
-            )
 
     graph = copy.deepcopy(full_graph)
-    output_keys = []
-    output_values = []
-    mc_config = defaultdict()
-    for node in graph.nodes:
-        if node.op == "output":
-            for k, v in sorted(node.args[0].items()):
-                output_keys.append(k)
-                output_values.append(v)
-            graph.erase_node(node)
     input_node = next(node for node in graph.nodes if node.op == "placeholder")
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
@@ -856,7 +836,6 @@ def split_model(
                         "values": getitem_node,
                     },
                 )
-                mc_config[name] = new_node.kwargs["keys"]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_tensor:
             # sequence or query name
@@ -866,11 +845,6 @@ def split_model(
                 new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                keys = [
-                    seqname_mapping[k] if k in seqname_mapping else k
-                    for k in node.kwargs["keys"]
-                ]
-                mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence_length
@@ -880,19 +854,8 @@ def split_model(
                 get_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                # rtp do not support RANK=1 tensor
-                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
-                # add sequence_length into fg
-                additional_fg.append(
-                    {
-                        "feature_name": name,
-                        "feature_type": "raw_feature",
-                        "expression": f"user:{name}",
-                    }
-                )
-                mc_config[name] = [name]
-            node_t.replace_all_uses_with(new_node)
-    graph.output(tuple(output_values))
+
+            node_t.replace_all_uses_with(get_node)
     dense_gm = torch.fx.GraphModule(model, graph)
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
@@ -900,4 +863,4 @@ def split_model(
     dense_gm.to(device)
     checkpoint_util.restore_model(checkpoint_path, dense_gm)
 
-    return sparse_gm, dense_gm, output_keys
+    return sparse_gm, dense_gm

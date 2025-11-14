@@ -123,13 +123,10 @@ class ScriptWrapperList(ScriptWrapper):
 class ScriptWrapperTRT(nn.Module):
     """Model inference wrapper for jit.script."""
 
-    def __init__(
-        self, embedding_group: nn.Module, dense: nn.Module, output_keys
-    ) -> None:
+    def __init__(self, embedding_group: nn.Module, dense: nn.Module) -> None:
         super().__init__()
         self.embedding_group = embedding_group
         self.dense = dense
-        self.output_keys = output_keys
 
     def forward(
         self,
@@ -147,8 +144,7 @@ class ScriptWrapperTRT(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         emb_ebc, _ = self.embedding_group(data, device)
-        o = self.dense(emb_ebc)
-        outputs = {k: o[i] for i, k in enumerate(self.output_keys)}
+        outputs = self.dense(emb_ebc)
         return outputs
 
 
