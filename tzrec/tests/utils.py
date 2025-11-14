@@ -59,6 +59,10 @@ def _create_random_id_data(
     return data
 
 
+def _get_cuda_device_count() -> int:
+    return torch.cuda.device_count()
+
+
 class MockInput:
     """Mock input data base class."""
 
@@ -1038,7 +1042,7 @@ def test_train_eval(
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_cuda_device_count()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
@@ -1058,7 +1062,7 @@ def test_eval(
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_cuda_device_count()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
@@ -1081,7 +1085,7 @@ def test_export(
     export_dir = export_dir or f"{test_dir}/export"
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_cuda_device_count()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {export_dir} "
@@ -1134,6 +1138,8 @@ def test_predict(
         nproc_per_node = 1
     else:
         nproc_per_node = 2
+
+    nproc_per_node = min(nproc_per_node, _get_cuda_device_count())
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={nproc_per_node} --log_dir {log_dir} "
@@ -1191,7 +1197,7 @@ def test_hitrate(
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
         f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_cuda_device_count()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "
         f"--item_embedding_input {item_embedding_input} "
@@ -1312,7 +1318,7 @@ def test_tdm_retrieval(
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_cuda_device_count()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
         f"--predict_input_path {eval_data_path} "
@@ -1391,7 +1397,7 @@ def test_tdm_cluster_train_eval(
     log_dir = os.path.join(test_dir, "log_learnt_train_eval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_cuda_device_count()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path}"
     )
