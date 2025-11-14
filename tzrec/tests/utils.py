@@ -1157,6 +1157,36 @@ def test_predict(
     )
 
 
+def test_predict_checkpoint(
+    pipeline_config_path: str,
+    predict_input_path: str,
+    predict_output_path: str,
+    reserved_columns: str,
+    output_columns: str,
+    test_dir: str,
+    env_str: str = "",
+) -> bool:
+    """Run predict integration test."""
+    log_dir = os.path.join(test_dir, "log_predict")
+    cmd_str = (
+        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        "-r 3 -t 3 tzrec/predict.py "
+        f"--pipeline_config_path {pipeline_config_path} "
+        f"--predict_input_path {predict_input_path} "
+        f"--predict_output_path {predict_output_path} "
+        f"--reserved_columns {reserved_columns} "
+    )
+    if output_columns:
+        cmd_str += f"--output_columns {output_columns} "
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
+
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
+    )
+
+
 def test_create_faiss_index(
     embedding_input_path: str,
     index_output_dir: str,

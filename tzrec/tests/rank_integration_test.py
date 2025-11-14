@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 import unittest
 
@@ -35,11 +34,11 @@ class RankIntegrationTest(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
         os.chmod(self.test_dir, 0o755)
 
-    def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
-        os.environ.pop("INPUT_TILE", None)
+    # def tearDown(self):
+    #     if self.success:
+    #         if os.path.exists(self.test_dir):
+    #             shutil.rmtree(self.test_dir)
+    #     os.environ.pop("INPUT_TILE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
@@ -827,6 +826,23 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "output_dir/pipeline.config"))
         )
+
+    def test_multi_tower_din_predict_checkpoint(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_predict_checkpoint(
+                os.path.join(self.test_dir, "pipeline.config"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="user_id,item_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export(self):
