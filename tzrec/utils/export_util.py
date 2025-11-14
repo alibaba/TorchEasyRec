@@ -50,6 +50,7 @@ from tzrec.features.feature import (
     create_feature_configs,
     create_fg_json,
 )
+from tzrec.modules.dense_embedding_collection import AutoDisEmbedding, MLPEmbedding
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
@@ -736,7 +737,14 @@ def split_model(
             path: str,
             leaf_module_names: Set[str],
         ) -> bool:
-            if len(list(model.named_children())) == 0:
+            # AutoDis and MLP Embedding are special since they have children, but
+            # their children are relu, softmax, perceptrons which should not be
+            # regarded as leaf nodes.
+            if (
+                len(list(model.named_children())) == 0
+                or isinstance(model, AutoDisEmbedding)
+                or isinstance(model, MLPEmbedding)
+            ):
                 leaf_module_names.add(path)
             else:
                 for name, child in model.named_children():
