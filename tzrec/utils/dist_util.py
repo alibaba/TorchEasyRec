@@ -12,7 +12,7 @@
 import os
 from datetime import timedelta
 from queue import Queue
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 from torch import distributed as dist
@@ -38,6 +38,7 @@ from torchrec.distributed.train_pipeline import TrainPipelineBase as _TrainPipel
 from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist as _TrainPipelineSparseDist,
 )
+from torchrec.distributed.train_pipeline.pipeline_context import In
 from torchrec.distributed.types import (
     Awaitable,
     ModuleSharder,
@@ -209,6 +210,36 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
 
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
+
+
+class PredictPipelineSparseDist(_TrainPipelineSparseDist):
+    """TorchEasyRec's PredictPipelineSparseDist, make predict do not hang."""
+
+    def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+        if dataloader_iter is not self._dataloader_iter:
+            self._dataloader_iter = dataloader_iter
+            self._dataloader_exhausted = False
+
+        if self._dataloader_exhausted:
+            batch = None
+        else:
+            with record_function("## next_batch ##"):
+                batch = next(dataloader_iter, None)
+
+            # Check if all workers either have or do not have a batch available.
+            has_batch = torch.tensor(
+                0 if batch is None else 1, dtype=torch.float, device=self._device
+            )
+            dist.all_reduce(has_batch, dist.ReduceOp.AVG)
+            if batch is None:
+                if has_batch.item() > 0:
+                    # If some workers still have a batch, create a dummy batch
+                    # to avoid potential hang.
+                    batch = self.batches[0]
+                    batch.dummy = True
+                else:
+                    self._dataloader_exhausted = True
+        return batch
 
 
 def create_train_pipeline(

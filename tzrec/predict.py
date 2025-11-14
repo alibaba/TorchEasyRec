@@ -11,7 +11,7 @@
 
 import argparse
 
-from tzrec.main import predict
+from tzrec.main import predict, predict_checkpoint
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -19,7 +19,20 @@ if __name__ == "__main__":
         "--scripted_model_path",
         type=str,
         default=None,
-        help="scripted model to be evaled, if not specified, use the checkpoint",
+        help="exported scripted model to be predict, if not specified, use the "
+        "latest checkpoint in pipeline_config.model_dir",
+    )
+    parser.add_argument(
+        "--pipeline_config_path",
+        type=str,
+        default=None,
+        help="Path to pipeline config file.",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="checkpoint model to be predict.",
     )
     parser.add_argument(
         "--predict_input_path",
@@ -95,18 +108,36 @@ if __name__ == "__main__":
     )
     args, extra_args = parser.parse_known_args()
 
-    predict(
-        predict_input_path=args.predict_input_path,
-        predict_output_path=args.predict_output_path,
-        scripted_model_path=args.scripted_model_path,
-        reserved_columns=args.reserved_columns,
-        output_columns=args.output_columns,
-        batch_size=args.batch_size,
-        is_profiling=args.is_profiling,
-        debug_level=args.debug_level,
-        dataset_type=args.dataset_type,
-        predict_threads=args.predict_threads,
-        writer_type=args.writer_type,
-        edit_config_json=args.edit_config_json,
-        predict_steps=args.predict_steps,
-    )
+    if args.pipeline_config_path is not None:
+        predict_checkpoint(
+            pipeline_config_path=args.pipeline_config_path,
+            predict_input_path=args.predict_input_path,
+            predict_output_path=args.predict_output_path,
+            checkpoint_path=args.checkpoint_path,
+            reserved_columns=args.reserved_columns,
+            output_columns=args.output_columns,
+            batch_size=args.batch_size,
+            debug_level=args.debug_level,
+            dataset_type=args.dataset_type,
+            writer_type=args.writer_type,
+            edit_config_json=args.edit_config_json,
+            predict_steps=args.predict_steps,
+        )
+    elif args.scripted_model_path is not None:
+        predict(
+            predict_input_path=args.predict_input_path,
+            predict_output_path=args.predict_output_path,
+            scripted_model_path=args.scripted_model_path,
+            reserved_columns=args.reserved_columns,
+            output_columns=args.output_columns,
+            batch_size=args.batch_size,
+            is_profiling=args.is_profiling,
+            debug_level=args.debug_level,
+            dataset_type=args.dataset_type,
+            predict_threads=args.predict_threads,
+            writer_type=args.writer_type,
+            edit_config_json=args.edit_config_json,
+            predict_steps=args.predict_steps,
+        )
+    else:
+        raise ValueError("pipeline_config_path or scripted_model_path must be set.")
