@@ -60,9 +60,9 @@ def _create_random_id_data(
 
 
 def _get_nproc_per_node() -> int:
-    """Set nproc_per_node to gpu count, if cpu mode, set to 2."""
-    n_cuda = torch.cuda.device_count()
-    return n_cuda if n_cuda > 0 else 2
+    """Set nproc_per_node."""
+    n_proc = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
+    return n_proc
 
 
 class MockInput:
