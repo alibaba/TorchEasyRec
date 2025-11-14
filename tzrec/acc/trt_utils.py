@@ -161,7 +161,6 @@ def export_model_trt(
     sparse_model: nn.Module,
     dense_model: nn.Module,
     data: Dict[str, torch.Tensor],
-    output_keys: tuple,
     save_dir: str,
 ) -> None:
     """Export trt model.
@@ -170,7 +169,6 @@ def export_model_trt(
         sparse_model (nn.Module): the sparse part
         dense_model (nn.Module): the dense part
         data (Dict[str, torch.Tensor]): the test data
-        output_keys: tuple: the output key names
         save_dir (str): model save dir
     """
     emb_ebc, _ = sparse_model(data, "cuda:0")
@@ -230,7 +228,6 @@ def export_model_trt(
     combined_model = ScriptWrapperTRT(
         embedding_group=sparse_model_scripted,
         dense=dense_layer_trt_scripted,
-        output_keys=output_keys,
     )
     result = combined_model(data, "cuda:0")
     logger.info("combined model result: %s", result)

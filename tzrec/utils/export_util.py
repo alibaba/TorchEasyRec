@@ -186,10 +186,10 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense, output_keys = split_model(
+            sparse, dense = split_model(
                 pipeline_config, model, checkpoint_path, save_dir
             )
-            export_model_trt(sparse, dense, data, output_keys, save_dir)
+            export_model_trt(sparse, dense, data, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
             result = model(data)
