@@ -144,6 +144,8 @@ class Batch(Pipelineable):
     sample_weights: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     additional_infos: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # dummy batch or not
+    dummy: bool = field(default=False)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -178,6 +180,7 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.additional_infos.items()
             },
+            dummy=self.dummy,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -239,6 +242,7 @@ class Batch(Pipelineable):
             additional_infos={
                 k: v.pin_memory() for k, v in self.additional_infos.items()
             },
+            dummy=self.dummy,
         )
 
     def to_dict(
