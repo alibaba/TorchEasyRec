@@ -880,7 +880,7 @@ class RankIntegrationTest(unittest.TestCase):
     )
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
-            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock_nodice.config",
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
