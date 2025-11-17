@@ -72,22 +72,18 @@ model_config {
             input_preprocessor {
                 contextual_preprocessor {
                     action_encoder {
-                        action_embedding_dim: 8
-                        action_feature_name: "action_weight"
-                        action_weights: [1, 2]
+                        simple_action_encoder {
+                            action_embedding_dim: 8
+                            action_weights: [1, 2]
+                        }
                     }
-                    contextual_feature_to_max_length [
-                        {key: "user_id"               value: 1},
-                        {key: "user_active_degree"    value: 1},
-                        {key: "follow_user_num_range" value: 1},
-                        {key: "fans_user_num_range"   value: 1},
-                        {key: "friend_user_num_range" value: 1},
-                        {key: "register_days_range"   value: 1}
-                    ]
                     action_mlp {
                         simple_mlp {
                             hidden_dim: 256
                         }
+                    }
+                    content_encoder {
+                        slice_content_encoder {}
                     }
                     content_mlp {
                         simple_mlp {
