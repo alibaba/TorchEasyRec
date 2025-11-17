@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import random
 from collections import OrderedDict, defaultdict
@@ -525,7 +526,7 @@ def create_mock_data(
         input_data[label_field] = pa.array(np.random.randint(2, size=(num_rows,)))
 
     t = pa.Table.from_arrays(list(input_data.values()), names=list(input_data.keys()))
-    max_rows_per_file = num_rows // num_parts
+    max_rows_per_file = int(math.ceil(num_rows / num_parts))
     ds.write_dataset(
         t,
         data_dir,
@@ -560,7 +561,7 @@ def create_mock_join_data(
     for join_key, join_t in join_tables.items():
         t = t.join(join_t, keys=join_key)
 
-    max_rows_per_file = num_rows // num_parts
+    max_rows_per_file = int(math.ceil(num_rows / num_parts))
     ds.write_dataset(
         t,
         data_dir,
@@ -845,6 +846,7 @@ def load_config_for_test(
     item_id: str = "",
     cate_id: str = "",
     is_hstu: bool = False,
+    num_rows: Optional[int] = None,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
@@ -869,14 +871,14 @@ def load_config_for_test(
             os.path.join(test_dir, "train_data"),
             inputs,
             list(data_config.label_fields),
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
         )
         pipeline_config.eval_input_path, _ = create_mock_data(
             os.path.join(test_dir, "eval_data"),
             inputs,
             list(data_config.label_fields),
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
         )
     else:
@@ -905,7 +907,7 @@ def load_config_for_test(
             {user_id: user_inputs[user_id], item_id: item_inputs[item_id]},
             list(data_config.label_fields),
             {user_id: user_t, item_id: item_t},
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
             id_fields=[user_id, item_id],
         )
@@ -914,7 +916,7 @@ def load_config_for_test(
             {user_id: user_inputs[user_id], item_id: item_inputs[item_id]},
             list(data_config.label_fields),
             {user_id: user_t, item_id: item_t},
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
             id_fields=[user_id, item_id],
         )
@@ -1033,10 +1035,17 @@ def test_train_eval(
     cate_id: str = "",
     is_hstu: bool = False,
     env_str: str = "",
+    num_rows: Optional[int] = None,
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
-        pipeline_config_path, test_dir, user_id, item_id, cate_id, is_hstu
+        pipeline_config_path,
+        test_dir,
+        user_id,
+        item_id,
+        cate_id,
+        is_hstu,
+        num_rows=num_rows,
     )
 
     test_config_path = os.path.join(test_dir, "pipeline.config")
@@ -1174,11 +1183,11 @@ def test_predict_checkpoint(
     test_dir: str,
     env_str: str = "",
 ) -> bool:
-    """Run predict integration test."""
-    log_dir = os.path.join(test_dir, "log_predict")
+    """Run predict checkpoint integration test."""
+    log_dir = os.path.join(test_dir, "log_predict_ckpt")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/predict.py "
         f"--pipeline_config_path {pipeline_config_path} "
         f"--predict_input_path {predict_input_path} "
@@ -1191,7 +1200,7 @@ def test_predict_checkpoint(
         cmd_str = f"{env_str} {cmd_str}"
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_predict_ckpt.txt"), timeout=600
     )
 
 
