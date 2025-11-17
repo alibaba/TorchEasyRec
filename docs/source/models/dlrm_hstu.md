@@ -74,7 +74,7 @@ model_config {
                     action_encoder {
                         simple_action_encoder {
                             action_embedding_dim: 8
-                            action_weights: [1, 2, 4, 8, 16, 32, 64, 128]
+                            action_weights: [1, 2]
                         }
                     }
                     action_mlp {
