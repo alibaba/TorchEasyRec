@@ -63,6 +63,7 @@ from tzrec.models.model import (
     ScriptWrapper,
     TrainWrapper,
 )
+from tzrec.models.rank_model import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.ops import Kernel
@@ -1236,6 +1237,7 @@ def predict_checkpoint(
         features,
         [],
     )
+    model.set_is_inference(True)
     model = PredictWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
@@ -1277,10 +1279,31 @@ def predict_checkpoint(
         output_cols: List[str],
     ) -> None:
         output_dict = OrderedDict()
+        repeat_offsets = None
+        if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            # for gr models, we need convert flatted predictions to ListArray for
+            # keeping same batch-size with predictions
+            repeat_offsets = pa.array(
+                torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                )
+                .to("cpu")
+                .numpy()
+            )
+
         for c in output_cols:
-            v = predictions[c].to("cpu")
+            if c == TRAGET_REPEAT_INTERLEAVE_KEY:
+                continue
+            v = predictions[c]
+            if torch.is_floating_point(v):
+                v = v.float()
+            v = v.to("cpu")
             v = v.tolist() if v.ndim > 1 else v.numpy()
-            output_dict[c] = pa.array(v)
+            if repeat_offsets is None:
+                output_dict[c] = pa.array(v)
+            else:
+                output_dict[c] = pa.ListArray.from_arrays(repeat_offsets, pa.array(v))
+
         reserve_batch_record = reserves.get()
         if reserve_batch_record is not None:
             for k, v in zip(

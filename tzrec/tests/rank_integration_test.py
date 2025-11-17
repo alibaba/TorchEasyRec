@@ -858,6 +858,16 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
+        if self.success:
+            self.success = utils.test_predict_checkpoint(
+                os.path.join(self.test_dir, "pipeline.config"),
+                predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="user_id,video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
