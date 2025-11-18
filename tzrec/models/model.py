@@ -321,15 +321,15 @@ class PredictWrapper(BaseModule):
             if self._output_cols is not None:
                 result = dict()
                 for c in self._output_cols:
-                    result[c] = predictions[c].to("cpu", non_blocking=True)
+                    result[c] = predictions[c]
                 if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
                     result[TRAGET_REPEAT_INTERLEAVE_KEY] = predictions[
                         TRAGET_REPEAT_INTERLEAVE_KEY
-                    ].to("cpu", non_blocking=True)
+                    ]
             else:
-                result = {
-                    k: v.to("cpu", non_blocking=True) for k, v in predictions.items()
-                }
+                result = predictions
+            if self._device_type == "cuda":
+                result = {k: v.to("cpu", non_blocking=True) for k, v in result.items()}
         return None, (result, batch)
 
 

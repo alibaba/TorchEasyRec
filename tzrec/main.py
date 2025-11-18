@@ -1105,10 +1105,8 @@ def predict(
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
-            predictions = {
-                k: v.to("cpu", non_blocking=True) for k, v in predictions.items()
-            }
-            torch.cuda.synchronize()
+            if device.type == "cuda":
+                predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
 
     def _write_loop(output_cols: List[str]) -> None:
@@ -1262,7 +1260,10 @@ def predict_checkpoint(
     )
     model.set_is_inference(True)
     model = PredictWrapper(
-        model, device=device, mixed_precision=train_config.mixed_precision
+        model,
+        device=device,
+        mixed_precision=train_config.mixed_precision,
+        output_cols=output_cols,
     )
     planner = create_planner(
         device=device,
@@ -1325,7 +1326,8 @@ def predict_checkpoint(
         for i_step in step_iter:
             try:
                 predictions, batch = pipeline.progress(iterator)
-                torch.cuda.synchronize()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
                 if i_step == 0:
                     # lazy init writer and create write thread
                     if output_cols is None:
