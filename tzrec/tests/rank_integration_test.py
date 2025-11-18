@@ -885,7 +885,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
-        predict_ckpt_path = (os.path.join(self.test_dir, "predict_ckpt_result"),)
+        predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
         if self.success:
             self.success = utils.test_predict(
                 os.path.join(self.test_dir, "export"),
