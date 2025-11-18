@@ -22,6 +22,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 
+from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -279,6 +280,7 @@ class PredictWrapper(BaseModule):
         module: nn.Module,
         device: Optional[torch.device] = None,
         mixed_precision: Optional[str] = None,
+        output_cols: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.model = module
@@ -296,6 +298,7 @@ class PredictWrapper(BaseModule):
             raise ValueError(
                 f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
             )
+        self._output_cols = output_cols
 
     def forward(
         self, batch: Batch
@@ -315,7 +318,19 @@ class PredictWrapper(BaseModule):
             enabled=self._mixed_dtype is not None,
         ):
             predictions = self.model.predict(batch)
-        return None, (predictions, batch)
+            if self._output_cols is not None:
+                result = dict()
+                for c in self._output_cols:
+                    result[c] = predictions[c]
+                if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+                    result[TRAGET_REPEAT_INTERLEAVE_KEY] = predictions[
+                        TRAGET_REPEAT_INTERLEAVE_KEY
+                    ]
+            else:
+                result = predictions
+            if self._device_type == "cuda":
+                result = {k: v.to("cpu", non_blocking=True) for k, v in result.items()}
+        return None, (result, batch)
 
 
 class ScriptWrapper(BaseModule):

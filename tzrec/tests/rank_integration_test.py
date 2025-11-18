@@ -834,16 +834,42 @@ class RankIntegrationTest(unittest.TestCase):
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
+            num_rows=8192 * 16 + 1,
         )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="QUANT_EMB=FP32",
+            )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
         if self.success:
             self.success = utils.test_predict_checkpoint(
                 os.path.join(self.test_dir, "pipeline.config"),
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
-                predict_output_path=os.path.join(self.test_dir, "predict_result"),
-                reserved_columns="user_id,item_id",
+                predict_output_path=predict_ckpt_path,
+                reserved_columns="user_id,item_id,clk",
                 output_columns="",
                 test_dir=self.test_dir,
             )
+        self.assertTrue(self.success)
+        predict_columns = ["user_id", "item_id", "clk", "probs"]
+        df1 = ds.dataset(predict_output_path, format="parquet").to_table().to_pandas()
+        df2 = ds.dataset(predict_ckpt_path, format="parquet").to_table().to_pandas()
+        self.assertEqual(len(df2), 8192 * 16 + 1)
+        df1 = df1.sort_values(by=predict_columns).reset_index(drop=True)
+        df2 = df2.sort_values(by=predict_columns).reset_index(drop=True)
+        self.assertTrue(dfs_are_close(df1, df2, 1e-6))
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export(self):
@@ -858,6 +884,27 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_predict_checkpoint(
+                os.path.join(self.test_dir, "pipeline.config"),
+                predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_ckpt_path,
+                reserved_columns="user_id,video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )

@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 from datetime import timedelta
 from queue import Queue
@@ -235,7 +236,7 @@ class PredictPipelineSparseDist(_TrainPipelineSparseDist):
                 if has_batch.item() > 0:
                     # If some workers still have a batch, create a dummy batch
                     # to avoid potential hang.
-                    batch = self.batches[0]
+                    batch = copy.copy(self.batches[0])
                     batch.dummy = True
                 else:
                     self._dataloader_exhausted = True

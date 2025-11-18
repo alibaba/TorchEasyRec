@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.autograd.profiler import record_function
@@ -166,12 +166,13 @@ class DlrmHSTU(RankModel):
                         suffix=f"_{task_name}",
                     )
                 )
+        predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = grouped_features[
+            "candidate.sequence_length"
+        ]
 
         return predictions
 
-    def _get_label(
-        self, batch: Batch, task_cfg: FusionSubTaskConfig
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name
         is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
         label = batch.sequence_dense_features[label_name]
@@ -182,7 +183,7 @@ class DlrmHSTU(RankModel):
             label_values = (
                 torch.bitwise_and(label_values, task_cfg.task_bitmask) > 0
             ).to(label_values.dtype)
-        return label_values, label.lengths()
+        return label_values
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
@@ -198,8 +199,7 @@ class DlrmHSTU(RankModel):
         losses = {}
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label, label_lengths = self._get_label(batch, task_cfg)
-            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            label = self._get_label(batch, task_cfg)
 
             for loss_cfg in task_cfg.losses:
                 losses.update(
@@ -247,8 +247,7 @@ class DlrmHSTU(RankModel):
         """
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label, label_lengths = self._get_label(batch, task_cfg)
-            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            label = self._get_label(batch, task_cfg)
 
             for metric_cfg in task_cfg.metrics:
                 self._update_metric_impl(
@@ -281,8 +280,7 @@ class DlrmHSTU(RankModel):
         """
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label, label_lengths = self._get_label(batch, task_cfg)
-            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            label = self._get_label(batch, task_cfg)
             for metric_cfg in task_cfg.train_metrics:
                 self._update_train_metric_impl(
                     predictions,

@@ -36,6 +36,7 @@ from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
     TENSORBOARD_SUMMARIES,
+    TRAGET_REPEAT_INTERLEAVE_KEY,
     TRAIN_EVAL_RESULT_FILENAME,
     Mode,
 )
@@ -901,6 +902,44 @@ def export(
         )
 
 
+def _write_predictions(
+    writer: BaseWriter,
+    predictions: Dict[str, torch.Tensor],
+    reserves: RecordBatchTensor,
+    output_cols: List[str],
+) -> None:
+    output_dict = OrderedDict()
+    repeat_offsets = None
+    if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+        # for gr models, we need convert flatted predictions to ListArray for
+        # keeping same batch-size with predictions
+        repeat_offsets = pa.array(
+            torch.ops.fbgemm.asynchronous_complete_cumsum(
+                predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+            ).numpy()
+        )
+
+    for c in output_cols:
+        if c == TRAGET_REPEAT_INTERLEAVE_KEY:
+            continue
+        v = predictions[c]
+        if torch.is_floating_point(v):
+            v = v.float()
+        v = v.tolist() if v.ndim > 1 else v.numpy()
+        if repeat_offsets is None:
+            output_dict[c] = pa.array(v)
+        else:
+            output_dict[c] = pa.ListArray.from_arrays(repeat_offsets, pa.array(v))
+
+    reserve_batch_record = reserves.get()
+    if reserve_batch_record is not None:
+        for k, v in zip(
+            reserve_batch_record.column_names, reserve_batch_record.columns
+        ):
+            output_dict[k] = v
+    writer.write(output_dict)
+
+
 def predict(
     predict_input_path: str,
     predict_output_path: str,
@@ -1066,26 +1105,9 @@ def predict(
                 predictions = model(parsed_inputs)
             else:
                 predictions = model(parsed_inputs, device)
-            predictions = {k: v.to("cpu") for k, v in predictions.items()}
+            if device.type == "cuda":
+                predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
-
-    def _write(
-        predictions: Dict[str, torch.Tensor],
-        reserves: RecordBatchTensor,
-        output_cols: List[str],
-    ) -> None:
-        output_dict = OrderedDict()
-        for c in output_cols:
-            v = predictions[c]
-            v = v.tolist() if v.ndim > 1 else v.numpy()
-            output_dict[c] = pa.array(v)
-        reserve_batch_record = reserves.get()
-        if reserve_batch_record is not None:
-            for k, v in zip(
-                reserve_batch_record.column_names, reserve_batch_record.columns
-            ):
-                output_dict[k] = v
-        writer.write(output_dict)
 
     def _write_loop(output_cols: List[str]) -> None:
         while True:
@@ -1093,7 +1115,7 @@ def predict(
             if predictions is None:
                 break
             assert predictions is not None and reserves is not None
-            _write(predictions, reserves, output_cols)
+            _write_predictions(writer, predictions, reserves, output_cols)
 
     def _forward_loop() -> None:
         while True:
@@ -1116,7 +1138,7 @@ def predict(
                 predictions, reserves = _forward(batch)
                 if output_cols is None:
                     output_cols = sorted(predictions.keys())
-                _write(predictions, reserves, output_cols)
+                _write_predictions(writer, predictions, reserves, output_cols)
                 for _ in range(predict_threads):
                     t = Thread(target=_forward_loop)
                     t.start()
@@ -1236,8 +1258,12 @@ def predict_checkpoint(
         features,
         [],
     )
+    model.set_is_inference(True)
     model = PredictWrapper(
-        model, device=device, mixed_precision=train_config.mixed_precision
+        model,
+        device=device,
+        mixed_precision=train_config.mixed_precision,
+        output_cols=output_cols,
     )
     planner = create_planner(
         device=device,
@@ -1271,31 +1297,13 @@ def predict_checkpoint(
         Tuple[Optional[Dict[str, torch.Tensor]], Optional[RecordBatchTensor]]
     ] = Queue(maxsize=3)
 
-    def _write(
-        predictions: Dict[str, torch.Tensor],
-        reserves: RecordBatchTensor,
-        output_cols: List[str],
-    ) -> None:
-        output_dict = OrderedDict()
-        for c in output_cols:
-            v = predictions[c].to("cpu")
-            v = v.tolist() if v.ndim > 1 else v.numpy()
-            output_dict[c] = pa.array(v)
-        reserve_batch_record = reserves.get()
-        if reserve_batch_record is not None:
-            for k, v in zip(
-                reserve_batch_record.column_names, reserve_batch_record.columns
-            ):
-                output_dict[k] = v
-        writer.write(output_dict)
-
     def _write_loop(output_cols: List[str]) -> None:
         while True:
             predictions, reserves = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
             if predictions is None:
                 break
             assert predictions is not None and reserves is not None
-            _write(predictions, reserves, output_cols)
+            _write_predictions(writer, predictions, reserves, output_cols)
 
     pipeline = PredictPipelineSparseDist(
         model,
@@ -1318,18 +1326,22 @@ def predict_checkpoint(
         for i_step in step_iter:
             try:
                 predictions, batch = pipeline.progress(iterator)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
                 if i_step == 0:
                     # lazy init writer and create write thread
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())
-                        _write(predictions, batch.reserves, output_cols)
+                        _write_predictions(
+                            writer, predictions, batch.reserves, output_cols
+                        )
                     write_t = Thread(target=_write_loop, args=(output_cols,))
                     write_t.start()
                 elif not batch.dummy:
                     pred_queue.put(
                         (predictions, batch.reserves), timeout=PREDICT_QUEUE_TIMEOUT
                     )
-                if plogger:
+                if plogger and i_step % 100 == 0:
                     plogger.log(i_step)
             except StopIteration:
                 break
