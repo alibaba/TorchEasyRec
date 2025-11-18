@@ -1341,7 +1341,7 @@ def predict_checkpoint(
                     pred_queue.put(
                         (predictions, batch.reserves), timeout=PREDICT_QUEUE_TIMEOUT
                     )
-                if plogger:
+                if plogger and i_step % 100 == 0:
                     plogger.log(i_step)
             except StopIteration:
                 break
