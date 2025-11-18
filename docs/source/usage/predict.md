@@ -26,7 +26,10 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --predict_steps: 离线预测的步数，默认为完整的输入表
 - --is_profiling: 是否进行离线预测性能的Profiling
 
-注：该预测方式预测的模型前向逻辑已经固化在导出模型中，预测结果不受模型代码的变更影响
+注：
+
+- 该预测方式预测的模型前向逻辑已经固化在导出模型中，预测结果不受模型代码的变更影响
+- 不支持DynamicEmb等无法被torch.jit.script导出的模型
 
 ### 预测Checkpoint
 
