@@ -25,7 +25,8 @@ from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 from torchrec import KeyedTensor
-from torchrec.distributed.train_pipeline.utils import Tracer, _get_leaf_module_names
+from torchrec.distributed.model_parallel import ShardedModule
+from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.embedding_modules import (
@@ -50,7 +51,6 @@ from tzrec.features.feature import (
     create_feature_configs,
     create_fg_json,
 )
-from tzrec.modules.dense_embedding_collection import AutoDisEmbedding, MLPEmbedding
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util
@@ -227,6 +227,33 @@ def export_model_normal(
                 shutil.copy(asset, save_dir)
 
 
+def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Get ShardedModule as leaf modules."""
+
+    def _get_leaf_module_names_helper(
+        model: torch.nn.Module,
+        path: str,
+        leaf_module_names: Set[str],
+    ) -> bool:
+        if isinstance(model, ShardedModule):
+            leaf_module_names.add(path)
+        else:
+            for name, child in model.named_children():
+                _get_leaf_module_names_helper(
+                    child,
+                    name if path == "" else path + "." + name,
+                    leaf_module_names,
+                )
+
+    leaf_module_names: Set[str] = set()
+    _get_leaf_module_names_helper(
+        model,
+        "",
+        leaf_module_names,
+    )
+    return list(leaf_module_names)
+
+
 def _get_rtp_feature_to_embedding_info(
     model: nn.Module,
 ) -> Dict[str, BaseEmbeddingConfig]:
@@ -297,22 +324,22 @@ def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphMo
                 submodule = gm.get_submodule(module_path)
                 _add_module_by_dotted_path(new_root, module_path, submodule)
                 name_to_obj[module_path] = submodule
-
         elif node.op == "get_attr":
-            # This is a top-level parameter or buffer
             param_path = node.target
-            if param_path not in name_to_obj:
-                path_parts = param_path.split(".")
-                current_obj = gm
-                for part in path_parts:
-                    current_obj = getattr(current_obj, part)
+            module_path, _, param_name = param_path.rpartition(".")
 
-                # We need to register it on the new_root correctly
-                # For simplicity here, we assume it's a direct attribute.
+            if param_path not in name_to_obj:
+                if module_path not in name_to_obj:
+                    submodule = gm.get_submodule(module_path)
+                    _add_module_by_dotted_path(new_root, module_path, submodule)
+                    name_to_obj[module_path] = submodule
+                current_obj = getattr(name_to_obj[module_path], param_name)
+                parent = new_root.get_submodule(module_path)
+
                 if isinstance(current_obj, nn.Parameter):
-                    new_root.register_parameter(param_path, current_obj)
+                    parent.register_parameter(param_name, current_obj)
                 elif isinstance(current_obj, torch.Tensor):  # It's a buffer
-                    new_root.register_buffer(param_path, current_obj)
+                    parent.register_buffer(param_name, current_obj)
                 name_to_obj[param_path] = current_obj
 
     new_gm = torch.fx.GraphModule(new_root, gm.graph)
@@ -522,7 +549,7 @@ def export_rtp_model(
 
     # Trace Sharded Model
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_leaf_module_names(unwrap_model))
+    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
     full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
@@ -731,43 +758,7 @@ def split_model(
     model.set_is_inference(True)
     model.eval()
 
-    def _get_leaf_module_names_wo_sharded(model: torch.nn.Module) -> List[str]:
-        def _get_leaf_module_names_helper_wo_sharded(
-            model: torch.nn.Module,
-            path: str,
-            leaf_module_names: Set[str],
-        ) -> bool:
-            # AutoDis and MLP Embedding are special since they have children, but
-            # their children are relu, softmax, perceptrons which should not be
-            # regarded as leaf nodes.
-            if (
-                len(list(model.named_children())) == 0
-                or isinstance(model, AutoDisEmbedding)
-                or isinstance(model, MLPEmbedding)
-            ):
-                leaf_module_names.add(path)
-            else:
-                for name, child in model.named_children():
-                    if path == "":
-                        curr_path = name
-                    else:
-                        curr_path = path + "." + name
-
-                    _get_leaf_module_names_helper_wo_sharded(
-                        child,
-                        curr_path,
-                        leaf_module_names,
-                    )
-
-        leaf_module_names: Set[str] = set()
-        _get_leaf_module_names_helper_wo_sharded(
-            model,
-            "",
-            leaf_module_names,
-        )
-        return list(leaf_module_names)
-
-    tracer = Tracer(leaf_modules=_get_leaf_module_names_wo_sharded(model))
+    tracer = Tracer()
     full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
