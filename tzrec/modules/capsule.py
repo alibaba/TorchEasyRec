@@ -131,7 +131,7 @@ class CapsuleLayer(nn.Module):
         routing_logits = routing_logits * self._routing_logits_stddev
 
         capsule_mask = capsule_mask.unsqueeze(1)  # [bs, 1, max_k]
-        capsule_mask_thresh = (capsule_mask.float() * 2 - 1) * 1e32
+        capsule_mask_thresh = (capsule_mask.float() * 2 - 1) * float("inf")
 
         low_capsule_vec = torch.einsum("bsl, lh -> bsh", inputs, self.bilinear_matrix)
         low_capsule_vec_detach = low_capsule_vec.detach()
