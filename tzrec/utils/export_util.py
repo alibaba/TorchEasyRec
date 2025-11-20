@@ -329,11 +329,15 @@ def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphMo
             module_path, _, param_name = param_path.rpartition(".")
 
             if param_path not in name_to_obj:
-                if module_path not in name_to_obj:
+                if module_path == "":
+                    submodule = gm
+                elif module_path not in name_to_obj:
                     submodule = gm.get_submodule(module_path)
                     _add_module_by_dotted_path(new_root, module_path, submodule)
                     name_to_obj[module_path] = submodule
-                current_obj = getattr(name_to_obj[module_path], param_name)
+                else:
+                    submodule = name_to_obj[module_path]
+                current_obj = getattr(submodule, param_name)
                 parent = new_root.get_submodule(module_path)
 
                 if isinstance(current_obj, nn.Parameter):
