@@ -103,7 +103,7 @@ def _sim_with_sampler(
             device=hard_neg_indices.device,
         ).to_dense()
 
-        hard_neg_ui_sim = hard_neg_ui_sim - (1 - hard_neg_mask) * float("inf")
+        hard_neg_ui_sim = hard_neg_ui_sim - (1 - hard_neg_mask) * 1e32
         return torch.cat([pos_ui_sim, neg_ui_sim, hard_neg_ui_sim], dim=-1)
 
 
