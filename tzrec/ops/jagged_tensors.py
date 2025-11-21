@@ -29,7 +29,6 @@ from tzrec.ops.pytorch.pt_jagged_tensors import (
 torch.fx.wrap("pytorch_concat_2D_jagged")
 torch.fx.wrap("pytorch_split_2D_jagged")
 
-print("has_triton:", has_triton())
 if has_triton():
     from tzrec.ops.triton.triton_jagged_tensors import (
         triton_concat_2D_jagged,
