@@ -804,10 +804,6 @@ def split_model(
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
-
-    init_parameters(sparse_gm, device)
-    sparse_gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, sparse_gm)
     _, sparse_attrs = sparse_gm(data, device=device)
 
     # Extract Dense Model
@@ -854,8 +850,5 @@ def split_model(
     dense_gm = torch.fx.GraphModule(model, graph)
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
-    init_parameters(dense_gm, device)
-    dense_gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, dense_gm)
 
     return sparse_gm, dense_gm
