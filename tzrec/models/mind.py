@@ -322,7 +322,7 @@ class MIND(MatchModel):
         simi_pow = self._model_config.simi_pow
         interest_weight = torch.einsum("bkd, bd->bk", user_interests, pos_item_emb)
 
-        threshold = (interest_mask.float() * 2 - 1) * 1e32
+        threshold = (interest_mask.float() * 2 - 1) * float("inf")
         interest_weight = torch.minimum(interest_weight, threshold)
 
         interest_weight = interest_weight.unsqueeze(-1)

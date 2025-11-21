@@ -229,6 +229,33 @@ def export_model_normal(
                 shutil.copy(asset, save_dir)
 
 
+def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Get ShardedModule as leaf modules."""
+
+    def _get_leaf_module_names_helper(
+        model: torch.nn.Module,
+        path: str,
+        leaf_module_names: Set[str],
+    ) -> bool:
+        if isinstance(model, ShardedModule):
+            leaf_module_names.add(path)
+        else:
+            for name, child in model.named_children():
+                _get_leaf_module_names_helper(
+                    child,
+                    name if path == "" else path + "." + name,
+                    leaf_module_names,
+                )
+
+    leaf_module_names: Set[str] = set()
+    _get_leaf_module_names_helper(
+        model,
+        "",
+        leaf_module_names,
+    )
+    return list(leaf_module_names)
+
+
 def _get_rtp_feature_to_embedding_info(
     model: nn.Module,
 ) -> Dict[str, BaseEmbeddingConfig]:
@@ -502,44 +529,6 @@ FBGEMM_RTP_TORCH_OP_MAPPING = {
 }
 
 
-def _get_leaf_module_names_wo_sharded(model: torch.nn.Module) -> List[str]:
-    def _get_leaf_module_names_helper_wo_sharded(
-        model: torch.nn.Module,
-        path: str,
-        leaf_module_names: Set[str],
-    ) -> bool:
-        # AutoDis and MLP Embedding are special since they have children, but
-        # their children are relu, softmax, perceptrons which should not be
-        # regarded as leaf nodes.
-        if (
-            # len(list(model.named_children())) == 0
-            # or isinstance(model, AutoDisEmbedding)
-            # or isinstance(model, MLPEmbedding)
-            isinstance(model, ShardedModule)
-        ):
-            leaf_module_names.add(path)
-        else:
-            for name, child in model.named_children():
-                if path == "":
-                    curr_path = name
-                else:
-                    curr_path = path + "." + name
-
-                _get_leaf_module_names_helper_wo_sharded(
-                    child,
-                    curr_path,
-                    leaf_module_names,
-                )
-
-    leaf_module_names: Set[str] = set()
-    _get_leaf_module_names_helper_wo_sharded(
-        model,
-        "",
-        leaf_module_names,
-    )
-    return list(leaf_module_names)
-
-
 def export_rtp_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -626,7 +615,7 @@ def export_rtp_model(
 
     # Trace Sharded Model
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_leaf_module_names_wo_sharded(unwrap_model))
+    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
     full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
@@ -906,7 +895,7 @@ def split_model(
     model.set_is_inference(True)
     model.eval()
 
-    tracer = Tracer(leaf_modules=_get_leaf_module_names_wo_sharded(model))
+    tracer = Tracer()
     full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
@@ -951,10 +940,6 @@ def split_model(
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
-
-    init_parameters(sparse_gm, device)
-    sparse_gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, sparse_gm)
     _, sparse_attrs = sparse_gm(data, device=device)
 
     # Extract Dense Model
@@ -1004,8 +989,5 @@ def split_model(
     dense_gm = torch.fx.GraphModule(model, graph)
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
-    init_parameters(dense_gm, device)
-    dense_gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, dense_gm)
 
     return sparse_gm, dense_gm
