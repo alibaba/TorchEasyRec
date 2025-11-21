@@ -127,12 +127,10 @@ def pytorch_add_timestamp_positional_embeddings(
         ts = torch.log(ts)
     else:
         ts = torch.sqrt(ts)
-    ts = (ts / time_bucket_divisor).clamp(min=0).int()
-    ts = torch.clamp(
-        ts,
-        min=0,
-        max=num_time_buckets,
-    )
+    ts = (
+        (ts / time_bucket_divisor / num_time_buckets).clamp(min=0, max=1)
+        * num_time_buckets
+    ).int()
     position_embeddings = torch.index_select(
         pos_embeddings, 0, pos_inds.reshape(-1)
     ).view(B, max_seq_len, -1)

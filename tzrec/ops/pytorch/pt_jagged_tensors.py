@@ -69,14 +69,14 @@ def pytorch_concat_2D_jagged(
 ) -> torch.Tensor:
     if offsets_left is None:
         B = values_left.shape[0] // max_len_left
-        offsets_left_non_optional = max_len_left * torch.arange(
+        offsets_left_non_optional = max_len_left * fx_arange(
             B + 1, device=values_left.device
         )
     else:
         offsets_left_non_optional = offsets_left
     if offsets_right is None:
         B = values_right.shape[0] // max_len_right
-        offsets_right_non_optional = max_len_right * torch.arange(
+        offsets_right_non_optional = max_len_right * fx_arange(
             B + 1, device=values_left.device
         )
     else:
@@ -129,7 +129,7 @@ def pytorch_split_2D_jagged(
     if offsets_left is None:
         assert max_len_left is not None
         assert offsets_right is not None
-        offsets_left_non_optional = max_len_left * torch.arange(
+        offsets_left_non_optional = max_len_left * fx_arange(
             offsets_right.shape[0], device=values.device
         )
     else:
@@ -137,7 +137,7 @@ def pytorch_split_2D_jagged(
     if offsets_right is None:
         assert max_len_right is not None
         assert offsets_left is not None
-        offsets_right_non_optional = max_len_right * torch.arange(
+        offsets_right_non_optional = max_len_right * fx_arange(
             offsets_left.shape[0], device=values.device
         )
     else:

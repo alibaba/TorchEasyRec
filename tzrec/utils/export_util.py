@@ -462,7 +462,7 @@ def _rtp_slice_with_seq_len(
 
 @torch.fx.wrap
 def _rtp_torch_asynchronous_complete_cumsum(x: torch.Tensor) -> torch.Tensor:
-    return torch.cat([torch.zeros(1, dtype=x.dtype, device=x.device), x])
+    return torch.cat([torch.zeros_like(x), x])
 
 
 @torch.fx.wrap
@@ -472,7 +472,12 @@ def _rtp_torch_jagged_to_padded_dense(
     max_lengths: List[int],
     padding_value: float = 0,
 ) -> torch.Tensor:
-    return values.unsqueeze(0)
+    values = values.unsqueeze(0)
+    # dummy pad for fix:
+    #   Could not guard on data-dependent expression
+    #   Eq((u12//(u6 + u7 + 6)), 1)
+    pad_len = max_lengths[0] - values.size(1)
+    return F.pad(values, (0, 0, 0, pad_len))
 
 
 @torch.fx.wrap
@@ -482,10 +487,18 @@ def _rtp_torch_dense_to_jagged(
     return dense.squeeze(0), offsets
 
 
+@torch.fx.wrap
+def _rtp_torch_jagged_dense_elementwise_add_jagged_output(
+    x_values: torch.Tensor, x_offsets: List[torch.Tensor], y: torch.Tensor
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    return x_values + y.squeeze(0), x_offsets
+
+
 FBGEMM_RTP_TORCH_OP_MAPPING = {
     torch.ops.fbgemm.asynchronous_complete_cumsum: _rtp_torch_asynchronous_complete_cumsum,  # NOQA
     torch.ops.fbgemm.jagged_to_padded_dense: _rtp_torch_jagged_to_padded_dense,
     torch.ops.fbgemm.dense_to_jagged: _rtp_torch_dense_to_jagged,
+    torch.ops.fbgemm.jagged_dense_elementwise_add_jagged_output: _rtp_torch_jagged_dense_elementwise_add_jagged_output,  # NOQA
 }
 
 
@@ -807,13 +820,11 @@ def export_rtp_model(
                 mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and "fbgemm" in str(node.target):
-            breakpoint()
             if node.target in FBGEMM_RTP_TORCH_OP_MAPPING.keys():
                 assert data_config.batch_size == 1, (
                     "{node.target} op only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
                 )
                 with graph.inserting_before(node):
-                    print(FBGEMM_RTP_TORCH_OP_MAPPING[node.target], flush=True)
                     new_node = graph.call_function(
                         FBGEMM_RTP_TORCH_OP_MAPPING[node.target],
                         args=node.args,
@@ -821,7 +832,7 @@ def export_rtp_model(
                     )
                 node.replace_all_uses_with(new_node)
             else:
-                raise RuntimeError("{node.target} op is not supported by rtp")
+                raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
     gm.graph.eliminate_dead_code()
@@ -838,11 +849,12 @@ def export_rtp_model(
         # Save Dense Model
         # when batch_size=1, we assume gr model.
         dynamic = data_config.batch_size > 1
-        fx_tool = ExportTorchFxTool(
-            os.path.join(save_dir, "fx_user_model"), dynamic=dynamic
-        )
-        fx_tool.set_output_nodes_name(output_keys)
-        fx_tool.export_fx_model(gm, sparse_output, mc_config)
+        with torch._export.utils._disable_aten_to_metadata_assertions():
+            fx_tool = ExportTorchFxTool(
+                os.path.join(save_dir, "fx_user_model"), dynamic=dynamic
+            )
+            fx_tool.set_output_nodes_name(output_keys)
+            fx_tool.export_fx_model(gm, sparse_output, mc_config)
 
         has_fg_asset = False
         if assets is not None:
