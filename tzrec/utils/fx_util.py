@@ -64,7 +64,7 @@ def fx_int_item(x: torch.Tensor) -> int:
     """Fx trace wrapper for `int(x.item())`."""
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         int_item = x.item()
-        torch._check_is_size(int_item)
+        torch._check_is_size(int_item, max=2**31)
     else:
         int_item = int(x.item())
     # pyre-ignore[7]
@@ -76,7 +76,7 @@ def fx_numel(x: torch.Tensor) -> int:
     """Fx trace wrapper for x.numel()."""
     total_len = x.numel()
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        torch._check_is_size(total_len)
+        torch._check_is_size(total_len, max=2**31)
     return total_len
 
 
