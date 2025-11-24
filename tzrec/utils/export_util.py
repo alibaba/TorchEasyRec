@@ -808,6 +808,7 @@ def export_rtp_model(
                 mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and "fbgemm" in str(node.target):
+            # rtp do not support fbgemm op now.
             if node.target in FBGEMM_RTP_TORCH_OP_MAPPING.keys():
                 assert data_config.batch_size == 1, (
                     "{node.target} op only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
@@ -837,6 +838,7 @@ def export_rtp_model(
         # Save Dense Model
         # when batch_size=1, we assume gr model.
         dynamic = data_config.batch_size > 1
+        # remove device metadata assert to fix: torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function aten._assert_tensor_metadata.default*(FakeTensor(..., device-'cuda:0', size-(u1, 512)), None, None, torch. float32), **{'device': device(type-'cuda", index-0), 'layout': torch.strided}): got RuntimeError(Tensor device mismatch!')   # NOQA
         with torch._export.utils._disable_aten_to_metadata_assertions():
             fx_tool = ExportTorchFxTool(
                 os.path.join(save_dir, "fx_user_model"), dynamic=dynamic

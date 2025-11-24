@@ -42,7 +42,7 @@ def pytorch_add_position_embeddings(
     return torch.ops.fbgemm.jagged_dense_elementwise_add_jagged_output(
         jagged,
         [jagged_offsets],
-        dense_values,
+        dense_values.to(jagged.dtype),
     )[0]
 
 

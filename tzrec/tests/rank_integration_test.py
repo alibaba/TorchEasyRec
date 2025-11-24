@@ -891,7 +891,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "export"),
                 predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
                 predict_output_path=predict_output_path,
-                reserved_columns="user_id,video_id",
+                reserved_columns="user_id,cand_seq__video_id",
                 output_columns="",
                 test_dir=self.test_dir,
             )
@@ -900,7 +900,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
                 predict_output_path=predict_ckpt_path,
-                reserved_columns="user_id,video_id",
+                reserved_columns="user_id,cand_seq__video_id",
                 output_columns="",
                 test_dir=self.test_dir,
             )
@@ -949,7 +949,7 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
-    def test_multi_tower_din_rtp_train_eval_export(self):
+    def test_multi_tower_din_rtp_train_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_rtp_mock.config",
             self.test_dir,
@@ -958,16 +958,25 @@ class RankIntegrationTest(unittest.TestCase):
             env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
         )
         if self.success:
-            self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"),
-                self.test_dir,
-                env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
-            )
-        if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",
+            )
+        self.assertTrue(self.success)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dlrm_hstu_rtp_train_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config",
+            self.test_dir,
+            env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
+        )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="MAX_EXPORT_BATCH_SIZE=1 USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",  # NOQA
             )
         self.assertTrue(self.success)
 
