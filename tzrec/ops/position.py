@@ -25,9 +25,6 @@ from tzrec.ops.pytorch.pt_position import (
     pytorch_add_timestamp_positional_embeddings,
 )
 
-torch.fx.wrap("pytorch_add_position_embeddings")
-torch.fx.wrap("pytorch_add_timestamp_positional_embeddings")
-
 if has_triton():
     from tzrec.ops.triton.triton_position import (
         triton_add_position_embeddings,

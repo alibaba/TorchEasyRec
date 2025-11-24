@@ -19,6 +19,7 @@ from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
@@ -59,6 +60,7 @@ from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     fx_mark_keyed_tensor,
     fx_mark_seq_len,
+    fx_mark_seq_tensor,
     fx_mark_tensor,
     symbolic_trace,
 )
@@ -468,6 +470,64 @@ def _adjust_fg_json_for_rtp(
                 _adjust_one_feature_for_rtp(sub_feature, embedding_info)
 
 
+@torch.fx.wrap
+def _rtp_pad_to_max_seq_len(x: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    pad_len = max_seq_len - x.size(1)
+    x_padded = F.pad(x, (0, 0, 0, pad_len))
+    return x_padded
+
+
+@torch.fx.wrap
+def _rtp_slice_with_seq_len(
+    x: torch.Tensor, seq_len: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    seq_len_int = seq_len.max().item()
+    torch._check_is_size(seq_len_int, max=max_seq_len)
+    return x[:, :seq_len_int, :]
+
+
+@torch.fx.wrap
+def _rtp_torch_asynchronous_complete_cumsum(x: torch.Tensor) -> torch.Tensor:
+    return torch.cat([torch.zeros_like(x), x])
+
+
+@torch.fx.wrap
+def _rtp_torch_jagged_to_padded_dense(
+    values: torch.Tensor,
+    offsets: torch.Tensor,
+    max_lengths: List[int],
+    padding_value: float = 0,
+) -> torch.Tensor:
+    values = values.unsqueeze(0)
+    # dummy pad for fix:
+    #   Could not guard on data-dependent expression
+    #   Eq((u12//(u6 + u7 + 6)), 1)
+    pad_len = max_lengths[0] - values.size(1)
+    return F.pad(values, (0, 0, 0, pad_len))
+
+
+@torch.fx.wrap
+def _rtp_torch_dense_to_jagged(
+    dense: torch.Tensor, offsets: List[torch.Tensor], total_L: Optional[int] = None
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    return dense.squeeze(0), offsets
+
+
+@torch.fx.wrap
+def _rtp_torch_jagged_dense_elementwise_add_jagged_output(
+    x_values: torch.Tensor, x_offsets: List[torch.Tensor], y: torch.Tensor
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    return x_values + y.squeeze(0), x_offsets
+
+
+FBGEMM_RTP_TORCH_OP_MAPPING = {
+    torch.ops.fbgemm.asynchronous_complete_cumsum: _rtp_torch_asynchronous_complete_cumsum,  # NOQA
+    torch.ops.fbgemm.jagged_to_padded_dense: _rtp_torch_jagged_to_padded_dense,
+    torch.ops.fbgemm.dense_to_jagged: _rtp_torch_dense_to_jagged,
+    torch.ops.fbgemm.jagged_dense_elementwise_add_jagged_output: _rtp_torch_jagged_dense_elementwise_add_jagged_output,  # NOQA
+}
+
+
 def export_rtp_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -518,6 +578,7 @@ def export_rtp_model(
     data_config = pipeline_config.data_config
     features = cast(List[BaseFeature], model._features)
     data_config.num_workers = 1
+    data_config.batch_size = acc_utils.get_max_export_batch_size()
     dataloader = create_dataloader(
         data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
     )
@@ -580,10 +641,29 @@ def export_rtp_model(
                     "keys", args=(node_kt,)
                 )
         elif node.op == "call_function" and node.target == fx_mark_tensor:
-            # sequence or query name
+            # query
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
+            # sequence
+            name = node.args[0]
+            seq_node = node.args[1]
+            assert node.kwargs["max_seq_len"] is not None, (
+                f"[{node.kwargs['keys']}] should config sequence_length."
+            )
+            if node.kwargs["is_jagged_seq"]:
+                assert data_config.batch_size == 1, (
+                    "jagged sequence only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
+                )
+                with graph.inserting_after(seq_node):
+                    seq_node = graph.call_function(torch.unsqueeze, args=(seq_node, 0))
+            # rtp table_api always padding sequence to max_seq_len
+            with graph.inserting_after(seq_node):
+                seq_node = graph.call_function(
+                    _rtp_pad_to_max_seq_len, args=(seq_node, node.kwargs["max_seq_len"])
+                )
+            outputs[name] = seq_node
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence length
             name = node.args[0]
@@ -642,6 +722,31 @@ def export_rtp_model(
                 output_values.append(v)
             graph.erase_node(node)
     input_node = next(node for node in graph.nodes if node.op == "placeholder")
+
+    seq_len_nodes = {}
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            name = node.args[0]
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                # rtp do not support RANK=1 tensor
+                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
+                seq_len_nodes[name.split("__", 1)[0]] = new_node
+                # add sequence_length into fg
+                additional_fg.append(
+                    {
+                        "feature_name": name,
+                        "feature_type": "raw_feature",
+                        "expression": f"user:{name}",
+                    }
+                )
+                mc_config[name] = [name]
+            node_t.replace_all_uses_with(new_node)
+
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
             name = node.args[0]
@@ -674,26 +779,49 @@ def export_rtp_model(
                 ]
                 mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_seq_len:
-            # sequence_length
+        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
+            # sequence or query name
             name = node.args[0]
             node_t = node.args[1]
             with graph.inserting_before(node_t):
-                get_node = graph.call_function(
+                new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                # rtp do not support RANK=1 tensor
-                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
-                # add sequence_length into fg
-                additional_fg.append(
-                    {
-                        "feature_name": name,
-                        "feature_type": "raw_feature",
-                        "expression": f"user:{name}",
-                    }
+                seq_name = name.split("__", 1)[0]
+                new_node = graph.call_function(
+                    _rtp_slice_with_seq_len,
+                    args=(
+                        new_node,
+                        seq_len_nodes[seq_name],
+                        node.kwargs["max_seq_len"],
+                    ),
                 )
-                mc_config[name] = [name]
+                if node.kwargs["is_jagged_seq"]:
+                    assert data_config.batch_size == 1, (
+                        "jagged sequence only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
+                    )
+                    new_node = graph.call_function(torch.squeeze, args=(new_node, 0))
+                keys = [
+                    seqname_mapping[k] if k in seqname_mapping else k
+                    for k in node.kwargs["keys"]
+                ]
+                mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and "fbgemm" in str(node.target):
+            # rtp do not support fbgemm op now.
+            if node.target in FBGEMM_RTP_TORCH_OP_MAPPING.keys():
+                assert data_config.batch_size == 1, (
+                    "{node.target} op only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
+                )
+                with graph.inserting_before(node):
+                    new_node = graph.call_function(
+                        FBGEMM_RTP_TORCH_OP_MAPPING[node.target],
+                        args=node.args,
+                        kwargs=node.kwargs,
+                    )
+                node.replace_all_uses_with(new_node)
+            else:
+                raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
     gm.graph.eliminate_dead_code()
@@ -708,9 +836,15 @@ def export_rtp_model(
         _ = gm(sparse_output)
 
         # Save Dense Model
-        fx_tool = ExportTorchFxTool(os.path.join(save_dir, "fx_user_model"))
-        fx_tool.set_output_nodes_name(output_keys)
-        fx_tool.export_fx_model(gm, sparse_output, mc_config)
+        # when batch_size=1, we assume gr model.
+        dynamic = data_config.batch_size > 1
+        # remove device metadata assert to fix: torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function aten._assert_tensor_metadata.default*(FakeTensor(..., device-'cuda:0', size-(u1, 512)), None, None, torch. float32), **{'device': device(type-'cuda", index-0), 'layout': torch.strided}): got RuntimeError(Tensor device mismatch!')   # NOQA
+        with torch._export.utils._disable_aten_to_metadata_assertions():
+            fx_tool = ExportTorchFxTool(
+                os.path.join(save_dir, "fx_user_model"), dynamic=dynamic
+            )
+            fx_tool.set_output_nodes_name(output_keys)
+            fx_tool.export_fx_model(gm, sparse_output, mc_config)
 
         has_fg_asset = False
         if assets is not None:
@@ -788,7 +922,10 @@ def split_model(
                 output_attrs[name + "__keys"] = graph.call_method(
                     "keys", args=(node_kt,)
                 )
-        elif node.op == "call_function" and node.target == fx_mark_tensor:
+        elif node.op == "call_function" and node.target in (
+            fx_mark_tensor,
+            fx_mark_seq_tensor,
+        ):
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
@@ -828,7 +965,10 @@ def split_model(
                     },
                 )
                 node_kt.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_tensor:
+        elif node.op == "call_function" and node.target in (
+            fx_mark_tensor,
+            fx_mark_seq_tensor,
+        ):
             # sequence or query name
             name = node.args[0]
             node_t = node.args[1]
