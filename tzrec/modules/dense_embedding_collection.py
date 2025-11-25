@@ -54,7 +54,7 @@ class MLPDenseEmbeddingConfig(DenseEmbeddingConfig):
     """MLPDenseEmbeddingConfig class."""
 
     def __init__(
-        self, embedding_dim: int, feature_names: List[str], value_dim: int
+        self, embedding_dim: int, feature_names: List[str], value_dim: int = 1
     ) -> None:
         super().__init__(
             embedding_dim, feature_names, DenseEmbeddingType.MLP, value_dim
