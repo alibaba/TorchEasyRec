@@ -404,7 +404,7 @@ def _get_rtp_embedding_tensor(
     key_pattern = re.compile(
         r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
     )
-    for i in range(0, len(key_files), world_size):
+    for i in range(rank, len(key_files), world_size):
         key_file = key_files[i]
         path_parts = key_file.split(os.path.sep)
         match = key_pattern.match(path_parts[-1])
