@@ -35,10 +35,12 @@ class DenseEmbeddingConfig:
         embedding_dim: int,
         feature_names: List[str],
         embedding_type: DenseEmbeddingType,
+        value_dim: int = 1,
     ) -> None:
         self.embedding_dim = embedding_dim
         self.feature_names = feature_names
         self.embedding_type = embedding_type
+        self.value_dim = value_dim
 
     @property
     def group_key(self) -> str:
@@ -51,12 +53,19 @@ class DenseEmbeddingConfig:
 class MLPDenseEmbeddingConfig(DenseEmbeddingConfig):
     """MLPDenseEmbeddingConfig class."""
 
-    def __init__(self, embedding_dim: int, feature_names: List[str]) -> None:
-        super().__init__(embedding_dim, feature_names, DenseEmbeddingType.MLP)
+    def __init__(
+        self, embedding_dim: int, feature_names: List[str], value_dim: int = 1
+    ) -> None:
+        super().__init__(
+            embedding_dim, feature_names, DenseEmbeddingType.MLP, value_dim
+        )
 
     @property
     def group_key(self) -> str:
         """Config group key."""
+        if self.value_dim != 1:
+            return f"mlp#{self.embedding_dim}#vdim#{self.value_dim}#feature_name#\
+            {self.feature_names[0]}"
         return f"mlp#{self.embedding_dim}"
 
 
@@ -211,16 +220,28 @@ class MLPEmbedding(nn.Module):
         num_dense_feature: int,
         feature_names: List[str],
         embedding_dim: int,
+        value_dim: int = 1,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         self.num_dense_feature = num_dense_feature
         self.feature_names = feature_names
         self.embedding_dim = embedding_dim
-        self.proj_w = nn.Parameter(
-            torch.randn(num_dense_feature, embedding_dim)
-            * sqrt(2 / (1 + embedding_dim))  # glorot normal initialization
-        )
+        self.value_dim = value_dim
+
+        if value_dim == 1:
+            self.proj_w = nn.Parameter(
+                torch.randn(num_dense_feature, embedding_dim)
+                * sqrt(2 / (1 + embedding_dim))  # glorot normal initialization
+            )
+        else:
+            assert num_dense_feature == 1, (
+                "MLP embedding is applied to features one by one when value_dim > 1."
+            )
+            self.proj_w = nn.Parameter(
+                torch.randn(value_dim, embedding_dim)
+                * sqrt(2 / (value_dim + embedding_dim))  # glorot normal initialization
+            )
 
     def forward(self, input: Tensor) -> Tensor:
         """Forward the module.
@@ -233,9 +254,12 @@ class MLPEmbedding(nn.Module):
             output (Tensor): Tensor of mlp embedding, shape = [b, n * d],
                 where d is the embedding_dim.
         """
-        return torch.einsum("ni,bn->bni", self.proj_w, input).reshape(
-            (-1, self.num_dense_feature * self.embedding_dim)
-        )
+        if self.value_dim > 1:
+            return torch.einsum("vi,bv->bi", self.proj_w, input)
+        else:
+            return torch.einsum("ni,bn->bni", self.proj_w, input).reshape(
+                (-1, self.num_dense_feature * self.embedding_dim)
+            )
 
     # pyre-ignore[14]
     def state_dict(
@@ -254,10 +278,13 @@ class MLPEmbedding(nn.Module):
             destination = OrderedDict()
             # pyre-ignore[16]
             destination._metadata = OrderedDict()
-        for i in range(self.proj_w.shape[0]):
-            destination[f"{prefix}proj_w_{self.feature_names[i]}.weight"] = self.proj_w[
-                i
-            ]
+        if self.value_dim > 1:
+            destination[f"{prefix}proj_w_{self.feature_names[0]}.weight"] = self.proj_w
+        else:
+            for i in range(self.proj_w.shape[0]):
+                destination[f"{prefix}proj_w_{self.feature_names[i]}.weight"] = (
+                    self.proj_w[i]
+                )
         return destination
 
     def _load_from_state_dict(
@@ -349,11 +376,13 @@ class DenseEmbeddingCollection(nn.Module):
         for conf in self.grouped_configs:
             feature_names = conf.feature_names
             embedding_dim = conf.embedding_dim
+            value_dim = conf.value_dim
             if conf.embedding_type == DenseEmbeddingType.MLP:
                 self.dense_embs[conf.group_key] = MLPEmbedding(
                     num_dense_feature=len(feature_names),
                     feature_names=feature_names,
                     embedding_dim=embedding_dim,
+                    value_dim=value_dim,
                     device=device,
                 )
             elif conf.embedding_type == DenseEmbeddingType.AUTO_DIS:

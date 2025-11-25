@@ -468,11 +468,12 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Get DenseEmbeddingConfig of the feature."""
         if self._dense_emb_type:
             dense_emb_config = getattr(self.config, self._dense_emb_type)
-            assert self.value_dim <= 1, (
-                "dense embedding do not support"
-                f" feature [{self.name}] with value_dim > 1 now."
-            )
+
             if self._dense_emb_type == "autodis":
+                assert self.value_dim <= 1, (
+                    "autodis embedding do not support"
+                    f" feature [{self.name}] with value_dim > 1 now."
+                )
                 return AutoDisEmbeddingConfig(
                     embedding_dim=self._embedding_dim,
                     n_channels=dense_emb_config.num_channels,
@@ -484,6 +485,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 return MLPDenseEmbeddingConfig(
                     embedding_dim=self._embedding_dim,
                     feature_names=[self.name],
+                    value_dim=self.value_dim,
                 )
 
         return None
