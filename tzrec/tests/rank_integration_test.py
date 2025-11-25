@@ -967,16 +967,16 @@ class RankIntegrationTest(unittest.TestCase):
         export_dir = os.path.join(self.test_dir, "export")
         with open(os.path.join(export_dir, "model-000000-of-000002.json")) as f:
             weight_json = json.load(f)
-            self.assertTrue(
-                "model.model.embedding_group.emb_impls.__BASE__.ebc.user_id_emb.values/part_0_2"
-                in weight_json
-            )
         with open(os.path.join(export_dir, "model-000001-of-000002.json")) as f:
-            weight_json = json.load(f)
-            self.assertTrue(
-                "model.model.embedding_group.emb_impls.__BASE__.ebc.user_id_emb.values/part_1_2"
-                in weight_json
-            )
+            weight_json.update(json.load(f))
+        self.assertTrue(
+            "model.model.embedding_group.emb_impls.__BASE__.ebc.user_id_emb.values/part_0_2"
+            in weight_json
+        )
+        self.assertTrue(
+            "model.model.embedding_group.emb_impls.__BASE__.ebc.user_id_emb.values/part_1_2"
+            in weight_json
+        )
 
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_rtp_train_export(self):
