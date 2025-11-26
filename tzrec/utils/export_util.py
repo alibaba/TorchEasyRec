@@ -398,8 +398,8 @@ def _get_rtp_embedding_tensor(
             value_name_to_key[name] = None
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
-    key_files = glob.glob(
-        os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*")
+    key_files = sorted(
+        glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
     )
     key_pattern = re.compile(
         r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
