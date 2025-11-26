@@ -74,7 +74,14 @@ def rms_norm(
             torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
         return triton_rms_norm(x, weight, eps)
     else:
-        return pytorch_rms_norm(x, weight, eps)
+        return pytorch_rms_norm(
+            x,
+            [
+                x.shape[-1],
+            ],
+            weight,
+            eps,
+        )
 
 
 def swish_layer_norm(
