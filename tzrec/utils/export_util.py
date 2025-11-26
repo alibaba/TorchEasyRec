@@ -10,14 +10,17 @@
 # limitations under the License.
 
 import copy
+import glob
 import json
 import operator
 import os
+import re
 import shutil
 from collections import OrderedDict, defaultdict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
@@ -353,9 +356,12 @@ def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphMo
 
 
 def _get_rtp_embedding_tensor(
-    model: nn.Module,
+    model: nn.Module, checkpoint_path: str, embedding_infos: List[BaseEmbeddingConfig]
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """Get Embedding Tensors for RTP."""
+    emb_name_to_emb_dim = dict()
+    for emb_info in embedding_infos:
+        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
 
     def _remove_prefix(src: str, prefix: str = "torch.") -> str:
         if src.startswith(prefix):
@@ -363,8 +369,12 @@ def _get_rtp_embedding_tensor(
         return src
 
     out = {}
+    value_name_to_key = {}
     rank = int(os.environ.get("RANK", 0))
-    for key, values in model.state_dict().items():
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    for name, values in model.state_dict().items():
+        emb_name = name.split(".")[-2]
+        emb_dim = emb_name_to_emb_dim[emb_name]
         if isinstance(values, DTensor):
             raise ValueError("DTensors are not considered yet.")
         elif isinstance(values, ShardedTensor):
@@ -376,29 +386,76 @@ def _get_rtp_embedding_tensor(
                     placement = shards_meta.placement
                     assert placement is not None
                     if placement.rank() == rank:
-                        out[key + f"/part_{idx}_{num_shards}"] = values.local_tensor()
-        else:
-            out[key] = values
+                        name = name + f"/part_{idx}_{num_shards}"
+                        local_tensor = values.local_tensor()
+                        if list(local_tensor.shape)[-1] == emb_dim:
+                            # dynamicemb may have a dummy tensor in state_dict, skip it.
+                            out[name] = local_tensor
+                            value_name_to_key[name] = None
+        elif list(values.shape)[-1] == emb_dim:
+            # dynamicemb may have a dummy tensor in state_dict, skip it.
+            out[name] = values
+            value_name_to_key[name] = None
+
+    dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
+    key_files = sorted(
+        glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
+    )
+    key_pattern = re.compile(
+        r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
+    )
+    for i in range(rank, len(key_files), world_size):
+        key_file = key_files[i]
+        path_parts = key_file.split(os.path.sep)
+        match = key_pattern.match(path_parts[-1])
+        if match:
+            emb_name = match.group("emb_name")
+            emb_dim = emb_name_to_emb_dim[emb_name]
+            idx = match.group("idx")
+            num_shards = match.group("num_shards")
+            with open(key_file, "rb") as f:
+                keys = torch.tensor(np.fromfile(f, dtype=np.int64), dtype=torch.int64)
+            with open(
+                os.path.join(
+                    *path_parts[:-1],
+                    f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
+                ),
+                "rb",
+            ) as f:
+                values = torch.tensor(
+                    np.fromfile(f, dtype=np.float32), dtype=torch.float32
+                )
+            key_name = f"{path_parts[-2]}.{emb_name}.keys/part_{idx}_{num_shards}"
+            value_name = f"{path_parts[-2]}.{emb_name}.values/part_{idx}_{num_shards}"
+            out[key_name] = keys
+            out[value_name] = values.view([-1, emb_dim])
+            value_name_to_key[value_name] = key_name
+
+    # TODO(hongsheng.jhs): support mczch
 
     meta = {}
-    for key, values in out.items():
+    for name, key_name in value_name_to_key.items():
+        values = out[name]
         dimension = list(values.shape)[-1]
         dtype = _remove_prefix(str(values.dtype))
         memory: int = int(values.nbytes)
         shape = list(values.shape)
-        # TODO(hongsheng.jhs): support mczch and dynamicemb
-        is_hashmap = False
-
-        meta[key] = {
-            "name": key,
+        t_meta = {
+            "name": name,
             "dense": False,
             "dimension": dimension,
             "dtype": dtype,
             "memory": memory,
             "shape": shape,
-            "is_hashmap": is_hashmap,
         }
-        out[key] = values
+        if key_name is not None:
+            t_meta["hashmap_value"] = name
+            t_meta["hashmap_key"] = key_name
+            t_meta["hashmap_key_dtype"] = "int64"
+            t_meta["is_hashmap"] = True
+        else:
+            t_meta["is_hashmap"] = False
+        meta[name] = t_meta
     return out, meta
 
 
@@ -452,10 +509,7 @@ def _adjust_fg_json_for_rtp(
     """Adjust fg json to rtp style."""
     for feature in fg_json["features"]:
         if "features" not in feature:
-            try:
-                feature_name = feature["feature_name"]
-            except Exception:
-                breakpoint()
+            feature_name = feature["feature_name"]
             embedding_info = feature_to_embedding_info.get(feature_name, None)
             _adjust_one_feature_for_rtp(feature, embedding_info)
         else:
@@ -586,7 +640,6 @@ def export_rtp_model(
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
     model.set_is_inference(True)
-    model.eval()
 
     # Build Sharded Model
     planner = create_planner(
@@ -611,6 +664,7 @@ def export_rtp_model(
         init_parameters=False,
         init_data_parallel=False,
     )
+    dmp_model.eval()
 
     # Trace Sharded Model
     unwrap_model = dmp_model.module
@@ -685,11 +739,14 @@ def export_rtp_model(
         device=device,
         plan=plan,
     )
+    sparse_model.eval()
     checkpoint_util.restore_model(checkpoint_path, sparse_model)
     sparse_output, sparse_attrs = sparse_model(data, device=device)
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")
-    local_tensor, meta = _get_rtp_embedding_tensor(sparse_model)
+    local_tensor, meta = _get_rtp_embedding_tensor(
+        sparse_model, checkpoint_path, feature_to_embedding_info.values()
+    )
     save_file(
         local_tensor,
         os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.safetensors"),
@@ -766,7 +823,7 @@ def export_rtp_model(
                 mc_config[name] = new_node.kwargs["keys"]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_tensor:
-            # sequence or query name
+            # query
             name = node.args[0]
             node_t = node.args[1]
             with graph.inserting_before(node_t):
@@ -780,7 +837,7 @@ def export_rtp_model(
                 mc_config[name] = keys
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
-            # sequence or query name
+            # sequence
             name = node.args[0]
             node_t = node.args[1]
             with graph.inserting_before(node_t):
@@ -926,6 +983,7 @@ def split_model(
             fx_mark_tensor,
             fx_mark_seq_tensor,
         ):
+            # sequence or query
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
