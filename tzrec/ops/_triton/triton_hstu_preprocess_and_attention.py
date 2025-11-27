@@ -19,15 +19,15 @@ from typing import Optional, Tuple
 import torch
 from torch.nn import functional as F
 
-from tzrec.ops.triton.triton_addmm import (
+from tzrec.ops._triton.triton_addmm import (
     triton_addmm_bwd,
     triton_addmm_fwd,
 )
-from tzrec.ops.triton.triton_hstu_attention import (
+from tzrec.ops._triton.triton_hstu_attention import (
     triton_hstu_attention_bwd,
     triton_hstu_attention_fwd,
 )
-from tzrec.ops.triton.triton_layer_norm import (
+from tzrec.ops._triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
     triton_weighted_layer_norm_fwd,
     triton_weighted_layer_norm_fwd_with_mean_rstd,

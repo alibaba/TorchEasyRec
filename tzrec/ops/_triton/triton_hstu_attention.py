@@ -1513,7 +1513,7 @@ class _AttentionFunction(torch.autograd.Function):
 
 
 def triton_hstu_mha(
-    N: int,
+    max_seq_len: int,
     alpha: float,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1526,7 +1526,7 @@ def triton_hstu_mha(
     sort_by_length: bool = False,
 ) -> torch.Tensor:
     return _AttentionFunction.apply(
-        N,
+        max_seq_len,
         alpha,
         q,
         k,
@@ -1542,7 +1542,7 @@ def triton_hstu_mha(
 
 @triton_op("tzrec::triton_cached_hstu_mha", mutates_args={})
 def triton_cached_hstu_mha(
-    N: int,
+    max_seq_len: int,
     alpha: float,
     delta_q: torch.Tensor,
     k: torch.Tensor,
@@ -1552,6 +1552,7 @@ def triton_cached_hstu_mha(
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
 ) -> torch.Tensor:
+    N = max_seq_len
     Z = seq_offsets.size(0) - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
     L, H, DimQ = delta_q.shape
