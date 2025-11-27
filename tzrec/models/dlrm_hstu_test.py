@@ -47,17 +47,27 @@ class DlrmHSTUTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, True],
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, False],
-            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH, True],
-            [TestGraphType.JIT_SCRIPT, torch.device("cuda"), Kernel.PYTORCH, True],
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON, True],
-            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON, True],
-            # [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, True, False],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, True, True],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, False, False],
+            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH, True, False],
+            [
+                TestGraphType.JIT_SCRIPT,
+                torch.device("cuda"),
+                Kernel.PYTORCH,
+                True,
+                False,
+            ],
+            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON, True, False],
+            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON, True, False],
+            # [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON,
+            #  False, False],
         ]
     )
     @unittest.skipIf(*gpu_unavailable)
-    def test_dlrm_hstu(self, graph_type, device, kernel, has_watchtime) -> None:
+    def test_dlrm_hstu(
+        self, graph_type, device, kernel, has_watchtime, enable_global_average_loss
+    ) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -288,6 +298,7 @@ class DlrmHSTUTest(unittest.TestCase):
                     task_configs=task_configs,
                 ),
                 max_seq_len=100,
+                enable_global_average_loss=enable_global_average_loss,
             ),
         )
         dlrm_hstu = DlrmHSTU(

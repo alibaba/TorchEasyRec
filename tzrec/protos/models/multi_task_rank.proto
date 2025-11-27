@@ -66,4 +66,7 @@ message DlrmHSTU {
     required uint32 max_seq_len = 3;
     // item embedding mlp hidden dimension
     optional uint32 item_embedding_hidden_dim = 4 [default = 512];
+    // enables loss averaging computation globally across all ranks (total rank)
+    // instead of locally (local rank).
+    optional bool enable_global_average_loss = 5 [default = true];
 }
