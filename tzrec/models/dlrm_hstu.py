@@ -13,6 +13,7 @@
 from typing import Any, Dict, List, Optional
 
 import torch
+from torch import distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec import JaggedTensor
 
@@ -57,6 +58,14 @@ def _fx_construct_payload(
         results[k] = v.values()
     results.update(payload_features)
     return results
+
+
+@torch.fx.wrap
+def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
+    batch_size = torch.tensor(x.size(0), dtype=torch.float, device=x.device)
+    if dist.is_initialized():
+        dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
+    return batch_size
 
 
 class DlrmHSTU(RankModel):
@@ -200,6 +209,10 @@ class DlrmHSTU(RankModel):
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
             label = self._get_label(batch, task_cfg)
+            loss_weight = None
+            if self._model_config.enable_global_average_loss:
+                avg_batch_size = _fx_avg_batch_size(label)
+                loss_weight = label.size(0) / avg_batch_size
 
             for loss_cfg in task_cfg.losses:
                 losses.update(
@@ -207,7 +220,7 @@ class DlrmHSTU(RankModel):
                         predictions,
                         batch,
                         label,
-                        None,
+                        loss_weight,
                         loss_cfg,
                         suffix=f"_{task_name}",
                     )

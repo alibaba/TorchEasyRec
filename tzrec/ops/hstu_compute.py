@@ -18,25 +18,14 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.fx._symbolic_trace import is_fx_tracing
-from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
+from tzrec.ops._pytorch.pt_hstu_linear import (
+    pytorch_hstu_compute_output,
+)
 from tzrec.ops.hstu_attention import hstu_mha
 from tzrec.ops.layer_norm import layer_norm
 from tzrec.ops.mm import addmm
-from tzrec.ops.pytorch.pt_hstu_linear import (
-    pytorch_hstu_compute_output,
-)
-
-if has_triton():
-    from tzrec.ops.triton.triton_hstu_linear import (
-        triton_hstu_compute_output,
-    )
-    from tzrec.ops.triton.triton_hstu_preprocess_and_attention import (
-        triton_hstu_preprocess_and_attention,
-    )
-else:
-    triton_hstu_compute_output = pytorch_hstu_compute_output
 
 
 def hstu_compute_uqvk(
@@ -99,6 +88,10 @@ def hstu_compute_output(
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_hstu_linear import (
+            triton_hstu_compute_output,
+        )
+
         return triton_hstu_compute_output(
             attn=attn,
             u=u,
@@ -170,6 +163,10 @@ def hstu_preprocess_and_attention(
             "uvqk_weight.shape[1] must equal 2 * num_heads * (hidden_dim + attn_dim)",
         )
     if kernel == Kernel.TRITON and prefill is False:
+        from tzrec.ops._triton.triton_hstu_preprocess_and_attention import (
+            triton_hstu_preprocess_and_attention,
+        )
+
         u, attn_output = triton_hstu_preprocess_and_attention(
             x=x,
             norm_weight=norm_weight,
