@@ -8,7 +8,6 @@ graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn-1.
 graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn-1.3.7-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 grpcio-tools<1.63.0
 numpy<2
-packaging
 pandas
 psutil
 pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-0.7.4-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
