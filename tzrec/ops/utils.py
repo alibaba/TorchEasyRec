@@ -10,9 +10,14 @@
 # limitations under the License.
 
 import copy
+import os
 from typing import List
 
 import torch
+
+
+def enable_tma() -> bool:
+    return os.environ["ENABLE_TMA"] == "1"
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
