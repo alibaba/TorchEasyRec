@@ -21,7 +21,7 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton
 from triton.runtime.autotuner import autotune as triton_autotune
 
-from tzrec.ops.triton.triton_addmm import triton_addmm_fwd
+from tzrec.ops._triton.triton_addmm import triton_addmm_fwd
 from tzrec.ops.utils import (
     switch_to_contiguous_if_needed,
 )

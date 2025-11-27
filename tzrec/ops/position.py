@@ -17,24 +17,12 @@ from typing import Optional
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
-from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
-from tzrec.ops.pytorch.pt_position import (
+from tzrec.ops._pytorch.pt_position import (
     pytorch_add_position_embeddings,
     pytorch_add_timestamp_positional_embeddings,
 )
-
-if has_triton():
-    from tzrec.ops.triton.triton_position import (
-        triton_add_position_embeddings,
-        triton_add_timestamp_positional_embeddings,
-    )
-else:
-    triton_add_position_embeddings = pytorch_add_position_embeddings
-    triton_add_timestamp_positional_embeddings = (
-        pytorch_add_timestamp_positional_embeddings
-    )
 
 
 @torch.fx.wrap
@@ -78,6 +66,8 @@ def add_positional_embeddings(
         torch._assert(D2 == D, "wrong dense shape[1]")
 
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_position import triton_add_position_embeddings
+
         return triton_add_position_embeddings(
             jagged=seq_embeddings,
             jagged_offsets=seq_offsets,
@@ -115,6 +105,10 @@ def add_timestamp_positional_embeddings(
     assert time_bucket_fn in ["sqrt", "log"]
     seq_embeddings = seq_embeddings * alpha
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_position import (
+            triton_add_timestamp_positional_embeddings,
+        )
+
         return triton_add_timestamp_positional_embeddings(
             seq_embeddings=seq_embeddings,
             seq_offsets=seq_offsets,
