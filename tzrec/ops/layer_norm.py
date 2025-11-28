@@ -16,25 +16,13 @@
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
-from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
-from tzrec.ops.pytorch.pt_layer_norm import (
+from tzrec.ops._pytorch.pt_layer_norm import (
     pytorch_layer_norm,
     pytorch_rms_norm,
     pytorch_swish_layer_norm,
 )
-
-if has_triton():
-    from tzrec.ops.triton.triton_layer_norm import (
-        triton_layer_norm,
-        triton_rms_norm,
-        triton_swish_layer_norm,
-    )
-else:
-    triton_layer_norm = pytorch_layer_norm
-    triton_rms_norm = pytorch_rms_norm
-    triton_swish_layer_norm = pytorch_swish_layer_norm
 
 
 def layer_norm(
@@ -49,6 +37,10 @@ def layer_norm(
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
             torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
             torch._assert(not bias.is_cpu, "bias must not be cpu tensor")
+        from tzrec.ops._triton.triton_layer_norm import (
+            triton_layer_norm,
+        )
+
         return triton_layer_norm(x, weight, bias, eps)
     else:
         return pytorch_layer_norm(
@@ -72,6 +64,10 @@ def rms_norm(
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
             torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
+        from tzrec.ops._triton.triton_layer_norm import (
+            triton_rms_norm,
+        )
+
         return triton_rms_norm(x, weight, eps)
     else:
         return pytorch_rms_norm(x, weight, eps)
@@ -89,6 +85,10 @@ def swish_layer_norm(
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
             torch._assert(not weight.is_cpu, "weight must not be cpu tensor")
             torch._assert(not bias.is_cpu, "bias must not be cpu tensor")
+        from tzrec.ops._triton.triton_layer_norm import (
+            triton_swish_layer_norm,
+        )
+
         return triton_swish_layer_norm(x, [x.shape[-1]], weight, bias, eps)
     else:
         return pytorch_swish_layer_norm(

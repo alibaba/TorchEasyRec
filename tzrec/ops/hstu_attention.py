@@ -17,22 +17,12 @@ from typing import Optional
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
-from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
-from tzrec.ops.pytorch.pt_hstu_attention import (
+from tzrec.ops._pytorch.pt_hstu_attention import (
     pytorch_cached_hstu_mha,
     pytorch_hstu_mha,
 )
-
-if has_triton():
-    from tzrec.ops.triton.triton_hstu_attention import (
-        triton_cached_hstu_mha,
-        triton_hstu_mha,
-    )
-else:
-    triton_cached_hstu_mha = pytorch_cached_hstu_mha
-    triton_hstu_mha = pytorch_hstu_mha
 from tzrec.ops.utils import switch_to_contiguous_if_needed
 
 
@@ -79,8 +69,10 @@ def hstu_mha(
         seq_offsets = seq_offsets.contiguous()
 
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_hstu_attention import triton_hstu_mha
+
         return triton_hstu_mha(
-            N=max_seq_len,
+            max_seq_len=max_seq_len,
             alpha=alpha,
             q=q,
             k=k,
@@ -146,8 +138,10 @@ def delta_hstu_mha(
         v = switch_to_contiguous_if_needed(v)
 
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_hstu_attention import triton_cached_hstu_mha
+
         return triton_cached_hstu_mha(
-            N=max_seq_len,
+            max_seq_len=max_seq_len,
             alpha=alpha,
             delta_q=delta_q,
             k=k,

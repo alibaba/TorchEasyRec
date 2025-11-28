@@ -35,3 +35,6 @@ TENSORBOARD_SUMMARIES = [
     "gradient_norm",
     "gradient",
 ]
+
+# repeat interleave session_id or grouping key for one-to-many rank sample
+TRAGET_REPEAT_INTERLEAVE_KEY = "__TRAGET_REPEAT_INTERLEAVE_KEY__"

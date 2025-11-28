@@ -72,22 +72,18 @@ model_config {
             input_preprocessor {
                 contextual_preprocessor {
                     action_encoder {
-                        action_embedding_dim: 8
-                        action_feature_name: "action_weight"
-                        action_weights: [1, 2]
+                        simple_action_encoder {
+                            action_embedding_dim: 8
+                            action_weights: [1, 2]
+                        }
                     }
-                    contextual_feature_to_max_length [
-                        {key: "user_id"               value: 1},
-                        {key: "user_active_degree"    value: 1},
-                        {key: "follow_user_num_range" value: 1},
-                        {key: "fans_user_num_range"   value: 1},
-                        {key: "friend_user_num_range" value: 1},
-                        {key: "register_days_range"   value: 1}
-                    ]
                     action_mlp {
                         simple_mlp {
                             hidden_dim: 256
                         }
+                    }
+                    content_encoder {
+                        slice_content_encoder {}
                     }
                     content_mlp {
                         simple_mlp {
@@ -169,9 +165,18 @@ model_config {
 
 - kernel: 算子实现，可选TRITON/PYTORCH，TRITON通常比PYTORCH快2-3x，节省2-3x显存
 
-### 示例Config
+### 示例
+
+模型的训练和评估方式同[local_tutorial](../quick_start/local_tutorial.md)，以 kuairand-27k 为例的数据和配置如下：
+
+#### 数据
+
+[kuairand-27k.tar.gz](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/kuairand-27k.tar.gz)
+
+#### 配置文件
 
 [dlrm_hstu_kuairand.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_hstu_kuairand.config)
+注: 如遇到训练不稳定问题，可优先考虑调整混合精度相关的配置: 去除train_config中的mixed_precision，去除feature_configs中的data_type，设置train_config.cuda_matmul_allow_tf32=true
 
 ### 参考论文
 

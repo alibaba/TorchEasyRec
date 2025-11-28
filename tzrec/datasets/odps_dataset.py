@@ -539,8 +539,14 @@ class OdpsWriter(BaseWriter):
                     pt_name = pt_spec.split("=")[0]
                     pt_schemas.append(f"{pt_name} STRING")
                 schema = (schema, ",".join(pt_schemas))
+            table_kwargs = {}
+            if "ODPS_TABLE_LIFECYCLE" in os.environ:
+                table_kwargs["lifecycle"] = int(os.environ["ODPS_TABLE_LIFECYCLE"])
             self._o.create_table(
-                self._table_name, schema, hints={"odps.sql.type.system.odps2": "true"}
+                self._table_name,
+                schema,
+                hints={"odps.sql.type.system.odps2": "true"},
+                **table_kwargs,
             )
 
     def _create_partition(self) -> None:

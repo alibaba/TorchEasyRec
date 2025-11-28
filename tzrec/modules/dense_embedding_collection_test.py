@@ -33,6 +33,7 @@ class DenseEmbeddingCollectionTest(unittest.TestCase):
             MLPDenseEmbeddingConfig(16, ["dense_1"]),
             MLPDenseEmbeddingConfig(16, ["dense_2"]),
             MLPDenseEmbeddingConfig(8, ["dense_3"]),
+            MLPDenseEmbeddingConfig(8, ["dense_4"], 32),
         ]
 
         emb_collection = DenseEmbeddingCollection(emb_dense_configs)
@@ -40,13 +41,14 @@ class DenseEmbeddingCollectionTest(unittest.TestCase):
 
         batch_size = 4
         dense_feature = KeyedTensor(
-            keys=["dense_1", "dense_2", "dense_3"],
-            length_per_key=[1, 1, 1],
+            keys=["dense_1", "dense_2", "dense_3", "dense_4"],
+            length_per_key=[1, 1, 1, 32],
             values=torch.concat(
                 [
                     torch.randn(batch_size, 1),
                     torch.randn(batch_size, 1),
                     torch.randn(batch_size, 1),
+                    torch.randn(batch_size, 32),
                 ],
                 dim=1,
             ),
@@ -54,7 +56,7 @@ class DenseEmbeddingCollectionTest(unittest.TestCase):
         )
 
         result = emb_collection(dense_feature)
-        self.assertEqual(result.values().size(), (batch_size, 40))
+        self.assertEqual(result.values().size(), (batch_size, 48))
 
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
