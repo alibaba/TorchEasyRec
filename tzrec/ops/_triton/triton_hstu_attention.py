@@ -345,7 +345,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
     H,
     DimQ,
     DimV,
-    workspace_ptr,
     seq_offsets,
     num_targets,
     Out,
@@ -376,7 +375,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
-    TMA_DESC_SIZE: tl.constexpr,
 ):
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     off_h = off_h.to(tl.int64)
@@ -604,7 +602,6 @@ def _hstu_attn_fwd(  # noqa C901
     Q,
     K,
     V,
-    workspace_ptr,
     sort_by_length_indices,
     seq_offsets,
     num_targets,
@@ -640,7 +637,6 @@ def _hstu_attn_fwd(  # noqa C901
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
-    TMA_DESC_SIZE: tl.constexpr,
 ):
     off_hz = tl.program_id(1)
     off_z = off_hz // H
@@ -655,7 +651,6 @@ def _hstu_attn_fwd(  # noqa C901
         H=H,
         DimQ=DimQ,
         DimV=DimV,
-        workspace_ptr=workspace_ptr,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
         Out=Out,
@@ -686,7 +681,6 @@ def _hstu_attn_fwd(  # noqa C901
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         ENABLE_TMA=ENABLE_TMA,
-        TMA_DESC_SIZE=TMA_DESC_SIZE,
     )
 
 
@@ -1262,7 +1256,6 @@ def _hstu_attn_bwd(  # noqa C901
     Q,
     K,
     V,
-    tma_workspace_ptr,
     sort_by_length_indices,
     seq_offsets,
     num_targets,
@@ -1308,7 +1301,6 @@ def _hstu_attn_bwd(  # noqa C901
     UNROLL: tl.constexpr,
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
-    TMA_DESC_SIZE: tl.constexpr,
     ENABLE_BUFFER_OPS_ASSUMES: tl.constexpr,
 ):
     off_hz = tl.program_id(0)
@@ -1535,8 +1527,6 @@ def triton_hstu_attention_fwd(
     if L == 0:
         return out
 
-    TMA_DESC_SIZE = 128
-    workspace = None
     desc_q = q
     desc_k = k
     desc_v = v
@@ -1562,12 +1552,13 @@ def triton_hstu_attention_fwd(
             block_shape=dummy_block,
         )
 
-    def alloc_fn(size: int, align: int, stream: Optional[int]):
-        assert align == TMA_DESC_SIZE
-        return torch.empty(size, dtype=torch.int8, device="cuda")
+    if enable_tma:
 
-    # pyre-ignore [6]
-    triton.set_allocator(alloc_fn)
+        def alloc_fn(size: int, align: int, stream: Optional[int]):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_M"]),
         Z * H,
@@ -1577,7 +1568,6 @@ def triton_hstu_attention_fwd(
         Q=desc_q,
         K=desc_k,
         V=desc_v,
-        workspace_ptr=workspace,
         sort_by_length_indices=sort_by_length_indices,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
@@ -1611,7 +1601,6 @@ def triton_hstu_attention_fwd(
         HAS_MAX_ATTN_LEN=has_max_attn_len,
         HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
         ENABLE_TMA=enable_tma,
-        TMA_DESC_SIZE=TMA_DESC_SIZE,
     )
     return out
 
@@ -1656,15 +1645,13 @@ def triton_hstu_attention_bwd(
         device=q.device,
     )
     AUTOTUNE_Z = prev_power_of_2(Z)
-    TMA_DESC_SIZE = 128
-    tma_workspace = None
 
-    def alloc_fn(size: int, align: int, stream: Optional[int]):
-        assert align == TMA_DESC_SIZE
-        return torch.empty(size, dtype=torch.int8, device="cuda")
+    if enable_tma:
 
-    # pyre-ignore [6]
-    triton.set_allocator(alloc_fn)
+        def alloc_fn(size: int, align: int, stream: Optional[int]):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
 
     # Enable BufferOps on AMD
     ENABLE_BUFFER_OPS_ASSUMES = torch.version.hip is not None
@@ -1672,7 +1659,6 @@ def triton_hstu_attention_bwd(
         Q=q,
         K=k,
         V=v,
-        tma_workspace_ptr=tma_workspace,
         sort_by_length_indices=sort_by_length_indices,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
@@ -1714,7 +1700,6 @@ def triton_hstu_attention_bwd(
         BLOCK_D_V=DimV,
         HAS_SORT_BY_LENGTH_INDICES=sort_by_length_indices is not None,
         ENABLE_TMA=enable_tma,
-        TMA_DESC_SIZE=TMA_DESC_SIZE,
         ENABLE_BUFFER_OPS_ASSUMES=ENABLE_BUFFER_OPS_ASSUMES,
     )
 
@@ -1893,7 +1878,6 @@ def triton_cached_hstu_mha(
     L, _, DimV = v.shape
     out = torch.empty((DELTA_L, H, DimV), dtype=delta_q.dtype, device=delta_q.device)
 
-    TMA_DESC_SIZE = 128
     desc_q = delta_q
     desc_k = k
     desc_v = v
@@ -1919,12 +1903,13 @@ def triton_cached_hstu_mha(
             block_shape=dummy_block,
         )
 
-    def alloc_fn(size: int, align: int, stream: Optional[int]):
-        assert align == TMA_DESC_SIZE
-        return torch.empty(size, dtype=torch.int8, device="cuda")
+    if enable_tma:
 
-    # pyre-ignore [6]
-    triton.set_allocator(alloc_fn)
+        def alloc_fn(size: int, align: int, stream: Optional[int]):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
     grid = lambda meta: (  # noqa E731
         triton.cdiv(DeltaSize, meta["BLOCK_M"]),
         Z * H,
@@ -1936,7 +1921,6 @@ def triton_cached_hstu_mha(
         Q=desc_q,
         K=desc_k,
         V=desc_v,
-        workspace_ptr=None,
         sort_by_length_indices=None,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
@@ -1970,6 +1954,5 @@ def triton_cached_hstu_mha(
         HAS_MAX_ATTN_LEN=has_max_attn_len,
         HAS_SORT_BY_LENGTH_INDICES=False,
         ENABLE_TMA=enable_tma,
-        TMA_DESC_SIZE=TMA_DESC_SIZE,
     )
     return out
