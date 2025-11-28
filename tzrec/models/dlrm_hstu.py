@@ -97,20 +97,21 @@ class DlrmHSTU(RankModel):
 
         self.init_input()
 
-        self._contextual_group_type = self.embedding_group.group_type("contextual")
-        if self._contextual_group_type == model_pb2.SEQUENCE:
+        contextual_group_type = self.embedding_group.group_type("contextual")
+        if contextual_group_type == model_pb2.SEQUENCE:
             # When contextual uses the SEQUENCE group_type, it can share embeddings
             # with uih/candidate sequences
-            contextual_feature_dims = self.embedding_group.group_dims(
-                "contextual.query"
-            )
-        elif self._contextual_group_type == model_pb2.DEEP:
-            contextual_feature_dims = self.embedding_group.group_dims("contextual")
+            self._contextual_group_name = "contextual.query"
+        elif contextual_group_type == model_pb2.DEEP:
+            self._contextual_group_name = "contextual"
         else:
             raise ValueError(
                 "contextual feature cannot be group type: "
-                f"{model_pb2.FeatureGroupType.Name(self._contextual_group_type)} now."
+                f"{model_pb2.FeatureGroupType.Name(contextual_group_type)} now."
             )
+        contextual_feature_dims = self.embedding_group.group_dims(
+            self._contextual_group_name
+        )
         if len(set(contextual_feature_dims)) > 1:
             raise ValueError(
                 "output_dim of features in contextual features_group must be same, "
@@ -130,6 +131,7 @@ class DlrmHSTU(RankModel):
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
             max_contextual_seq_len=len(contextual_feature_dims),
+            contextual_group_name=self._contextual_group_name,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
             listwise=False,
@@ -172,9 +174,6 @@ class DlrmHSTU(RankModel):
             )
 
         with record_function("## user_forward ##"):
-            if self._contextual_group_type == model_pb2.SEQUENCE:
-                # hstu_transducer will use "contextual" key in preprocessor
-                grouped_features["contextual"] = grouped_features["contextual.query"]
             candidates_user_embeddings, _ = self._hstu_transducer(grouped_features)
         with record_function("## multitask_module ##"):
             mt_preds = self._multitask_module(
