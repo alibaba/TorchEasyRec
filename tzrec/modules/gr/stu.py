@@ -27,7 +27,7 @@ from tzrec.ops.hstu_compute import (
     hstu_preprocess_and_attention,
 )
 from tzrec.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged
-from tzrec.ops.utils import enable_tma
+from tzrec.utils import env_util
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
 
@@ -275,7 +275,7 @@ class STULayer(STU):
         self._output_norm_bias: torch.nn.Parameter = torch.nn.Parameter(
             torch.zeros((output_norm_shape,)),
         )
-        self._enable_tma = enable_tma()
+        self._enable_tma = env_util.enable_tma()
 
     def reset_kv_cache(self) -> None:
         """Reset the key-value cache."""
