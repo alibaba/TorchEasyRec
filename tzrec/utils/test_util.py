@@ -208,6 +208,6 @@ def get_test_enable_tma() -> List[bool]:
             import triton
             from packaging import version
 
-            if version.parse(triton.__version__) >= version.parse("3.6.0"):
+            if version.parse(triton.__version__) >= version.parse("3.5.0"):
                 results.append(True)
     return results
