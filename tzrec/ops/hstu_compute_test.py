@@ -15,7 +15,7 @@ import unittest
 from typing import Optional
 
 import torch
-from hypothesis import Verbosity, given
+from hypothesis import Verbosity, assume, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
@@ -298,6 +298,9 @@ class HSTUComputeTest(unittest.TestCase):
         rtol: Optional[float] = None,
         enable_tma: bool = False,
     ) -> None:
+        # has_max_attn_len=True & enable_tma=True will result in TritonGPUCoalesce error
+        # include/llvm/llvm/ADT/SmallVector.h:296: const_reference llvm::SmallVectorTemplateCommon<long>::operator[](size_type) const [T = long]: Assertion `idx < size()' failed.    # NOQA
+        assume(not has_max_attn_len or not enable_tma)
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cuda.matmul.allow_tf32 = False
 
