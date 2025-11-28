@@ -31,6 +31,7 @@ from tzrec.modules.utils import (
     init_linear_xavier_weights_zero_bias,
 )
 from tzrec.ops.utils import set_static_max_seq_lens
+from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
@@ -96,7 +97,21 @@ class DlrmHSTU(RankModel):
 
         self.init_input()
 
-        contextual_feature_dims = self.embedding_group.group_dims("contextual")
+        contextual_group_type = self.embedding_group.group_type("contextual")
+        if contextual_group_type == model_pb2.SEQUENCE:
+            # When contextual uses the SEQUENCE group_type, it can share embeddings
+            # with uih/candidate sequences
+            self._contextual_group_name = "contextual.query"
+        elif contextual_group_type == model_pb2.DEEP:
+            self._contextual_group_name = "contextual"
+        else:
+            raise ValueError(
+                "contextual feature cannot be group type: "
+                f"{model_pb2.FeatureGroupType.Name(contextual_group_type)} now."
+            )
+        contextual_feature_dims = self.embedding_group.group_dims(
+            self._contextual_group_name
+        )
         if len(set(contextual_feature_dims)) > 1:
             raise ValueError(
                 "output_dim of features in contextual features_group must be same, "
@@ -116,6 +131,7 @@ class DlrmHSTU(RankModel):
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
             max_contextual_seq_len=len(contextual_feature_dims),
+            contextual_group_name=self._contextual_group_name,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
             listwise=False,

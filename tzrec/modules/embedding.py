@@ -393,6 +393,12 @@ class EmbeddingGroup(nn.Module):
             raise ValueError("not support sequence group")
         return self._group_feature_dims[group_name]
 
+    def group_type(self, group_name: str) -> model_pb2.FeatureGroupType:
+        """Get feature group type."""
+        true_name = group_name.split(".")[0] if "." in group_name else group_name
+        feature_group = self._name_to_feature_group[true_name]
+        return feature_group.group_type
+
     def has_group(self, group_name: str) -> bool:
         """Check the feature group exist or not."""
         true_name = group_name.split(".")[0] if "." in group_name else group_name
