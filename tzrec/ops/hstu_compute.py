@@ -149,6 +149,7 @@ def hstu_preprocess_and_attention(
     sort_by_length: bool,
     prefill: bool = False,
     kernel: Kernel = Kernel.PYTORCH,
+    enable_tma: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -186,6 +187,7 @@ def hstu_preprocess_and_attention(
             recompute_uvqk_in_backward=recompute_uvqk_in_backward,
             recompute_normed_x_in_backward=recompute_normed_x_in_backward,
             sort_by_length=sort_by_length,
+            enable_tma=enable_tma,
         )
         attn_output = attn_output.view(-1, hidden_dim * num_heads)
         k = None

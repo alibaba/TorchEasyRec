@@ -8,14 +8,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import gc
 import random
 import unittest
 from typing import Optional
 
 import torch
-from hypothesis import Verbosity, given
+from hypothesis import Verbosity, assume, given
 from hypothesis import strategies as st
 
 from tzrec.ops import (
@@ -24,6 +23,7 @@ from tzrec.ops import (
 from tzrec.utils.test_util import (
     generate_sparse_seq_len,
     get_test_dtypes,
+    get_test_enable_tma,
     gpu_unavailable,
 )
 from tzrec.utils.test_util import hypothesis_settings as settings
@@ -48,7 +48,12 @@ def test_attn(
     contextual_seq_len: int = 0,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
+    enable_tma: bool = False,
 ) -> None:
+    # has_max_attn_len=True and enable_tma=True will result in TritonGPUCoalesce error
+    # include/llvm/llvm/ADT/SmallVector.h:296: const_reference llvm::SmallVectorTemplateCommon<long>::operator[](size_type) const [T = long]: Assertion `idx < size()' failed.    # NOQA
+    assume(not has_max_attn_len or not enable_tma)
+
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     from tzrec.ops.hstu_attention import hstu_mha
@@ -140,6 +145,7 @@ def test_attn(
         max_attn_len=max_attn_len,
         contextual_seq_len=contextual_seq_len,
         kernel=real_kernel,
+        enable_tma=enable_tma,
     )
 
     torch.testing.assert_close(
@@ -172,7 +178,12 @@ def test_delta_attn(
     contextual_seq_len: int = 0,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
+    enable_tma: bool = False,
 ) -> None:
+    # has_max_attn_len=True and enable_tma=True will result in TritonGPUCoalesce error
+    # include/llvm/llvm/ADT/SmallVector.h:296: const_reference llvm::SmallVectorTemplateCommon<long>::operator[](size_type) const [T = long]: Assertion `idx < size()' failed.  # NOQA
+    assume(not has_max_attn_len or not enable_tma)
+
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     from tzrec.ops.hstu_attention import delta_hstu_mha
@@ -234,6 +245,7 @@ def test_delta_attn(
         max_attn_len=max_attn_len,
         contextual_seq_len=contextual_seq_len,
         kernel=real_kernel,
+        enable_tma=enable_tma,
     )
     torch.testing.assert_close(
         ref_out,
@@ -264,6 +276,7 @@ class HSTUAttentionTest(unittest.TestCase):
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
+        enable_tma=st.sampled_from(get_test_enable_tma()),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -293,6 +306,7 @@ class HSTUAttentionTest(unittest.TestCase):
         has_multiple_targets=st.sampled_from([True, False]),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
         has_max_attn_len=st.sampled_from([True, False]),
+        enable_tma=st.sampled_from(get_test_enable_tma()),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -325,6 +339,7 @@ class HSTUAttentionTest(unittest.TestCase):
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([False, True]),
         contextual_seq_len=st.sampled_from([0, 10]),
+        enable_tma=st.sampled_from(get_test_enable_tma()),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -354,6 +369,7 @@ class HSTUAttentionTest(unittest.TestCase):
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
         has_max_attn_len=st.sampled_from([False, True]),
         contextual_seq_len=st.sampled_from([0, 10]),
+        enable_tma=st.sampled_from(get_test_enable_tma()),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -373,6 +389,7 @@ class HSTUAttentionTest(unittest.TestCase):
         dtype: torch.dtype,
         has_max_attn_len: bool,
         contextual_seq_len: int,
+        enable_tma: bool,
     ) -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -439,6 +456,7 @@ class HSTUAttentionTest(unittest.TestCase):
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             kernel=Kernel.TRITON,
+            enable_tma=enable_tma,
         )
         _, delta_out = split_2D_jagged(
             max_seq_len=max_seq_len,
@@ -462,6 +480,7 @@ class HSTUAttentionTest(unittest.TestCase):
             num_targets=num_targets if has_multiple_targets else None,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
+            enable_tma=enable_tma,
         )
         torch.testing.assert_close(
             delta_out,
