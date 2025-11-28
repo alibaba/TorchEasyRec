@@ -31,6 +31,7 @@ from tzrec.modules.utils import (
     init_linear_xavier_weights_zero_bias,
 )
 from tzrec.ops.utils import set_static_max_seq_lens
+from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
@@ -96,7 +97,20 @@ class DlrmHSTU(RankModel):
 
         self.init_input()
 
-        contextual_feature_dims = self.embedding_group.group_dims("contextual")
+        self._contextual_group_type = self.embedding_group.group_type("contextual")
+        if self._contextual_group_type == model_pb2.SEQUENCE:
+            # When contextual uses the SEQUENCE group_type, it can share embeddings
+            # with uih/candidate sequences
+            contextual_feature_dims = self.embedding_group.group_dims(
+                "contextual.query"
+            )
+        elif self._contextual_group_type == model_pb2.DEEP:
+            contextual_feature_dims = self.embedding_group.group_dims("contextual")
+        else:
+            raise ValueError(
+                "contextual feature cannot be group type: "
+                f"{model_pb2.FeatureGroupType.Name(self._contextual_group_type)} now."
+            )
         if len(set(contextual_feature_dims)) > 1:
             raise ValueError(
                 "output_dim of features in contextual features_group must be same, "
@@ -158,6 +172,9 @@ class DlrmHSTU(RankModel):
             )
 
         with record_function("## user_forward ##"):
+            if self._contextual_group_type == model_pb2.SEQUENCE:
+                # hstu_transducer will use "contextual" key in preprocessor
+                grouped_features["contextual"] = grouped_features["contextual.query"]
             candidates_user_embeddings, _ = self._hstu_transducer(grouped_features)
         with record_function("## multitask_module ##"):
             mt_preds = self._multitask_module(
