@@ -15,3 +15,13 @@ import os
 def use_hash_node_id() -> bool:
     """Use hash node id or not."""
     return os.environ.get("USE_HASH_NODE_ID", "0") == "1"
+
+
+def use_rtp() -> bool:
+    """Use RTP for online inference or not."""
+    flag = os.environ.get("USE_RTP", "0") == "1"
+    assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
+        "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
+        "train/eval/export when use rtp for online inference."
+    )
+    return flag

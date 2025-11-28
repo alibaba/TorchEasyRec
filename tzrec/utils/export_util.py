@@ -57,7 +57,7 @@ from tzrec.features.feature import (
 )
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -80,7 +80,7 @@ def export_model(
     assets: Optional[List[str]] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
-    use_rtp = os.environ.get("USE_RTP", "0") == "1"
+    use_rtp = env_util.use_rtp()
 
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
@@ -596,10 +596,6 @@ def export_rtp_model(
         raise RuntimeError(
             "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251031.376cedb-py3-none-any.whl"
         ) from e
-    assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
-        "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
-        "train/eval/export when use rtp for online inference."
-    )
 
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))

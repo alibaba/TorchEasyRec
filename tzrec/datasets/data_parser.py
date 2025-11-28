@@ -31,6 +31,7 @@ from tzrec.datasets.utils import (
     SparseData,
 )
 from tzrec.features.feature import BaseFeature, FgMode, create_fg_json
+from tzrec.utils import env_util
 from tzrec.utils.logging_util import logger
 
 
@@ -87,6 +88,11 @@ class DataParser:
         self._fg_threads = fg_threads
         self._fg_handler = None
 
+        self._use_rtp = env_util.use_rtp()
+        self._rtpfg_to_pyfg_feat_name = None
+        self._pyfg_to_rtpfg_input_name = None
+        self._rtpfg_to_pyfg_input_name = None
+
         self.dense_keys = defaultdict(list)
         self.dense_length_per_key = defaultdict(list)
         self.sparse_keys = defaultdict(list)
@@ -126,6 +132,9 @@ class DataParser:
                 | self._fg_handler.item_inputs()
                 | self._fg_handler.context_inputs()
             ) - set(self._fg_handler.sequence_feature_pks().values())
+            self.feature_input_names = set(
+                [self._to_real_input_name(x) for x in self.feature_input_names]
+            )
         elif self._fg_mode == FgMode.FG_NORMAL:
             for feature in features:
                 assert not feature.stub_type, (
@@ -297,7 +306,9 @@ class DataParser:
         )
 
         input_data_fg = {
-            k: v for k, v in input_data.items() if k in self.feature_input_names
+            self._to_pyfg_input_name(k): v
+            for k, v in input_data.items()
+            if k in self.feature_input_names
         }
         fg_output, status = self._fg_handler.process_arrow(input_data_fg)
         assert status.ok(), status.message()
@@ -305,7 +316,7 @@ class DataParser:
             if feature.stub_type:
                 continue
             feat_name = feature.name
-            feat_data = fg_output[feat_name]
+            feat_data = fg_output[self._to_pyfg_feat_name(feat_name)]
             if feature.is_sequence:
                 if feature.is_sparse:
                     output_data[f"{feat_name}.values"] = _to_tensor(feat_data.np_values)
@@ -859,6 +870,61 @@ class DataParser:
         for i in range(len(feature_rows)):
             result.append(" | ".join([f"{k}:{v}" for k, v in feature_rows[i].items()]))
         return pa.array(result)
+
+    def _build_fg_name_mapping(self) -> str:
+        """Build fg name mapping for RTP FG Compatible."""
+        assert self._use_rtp
+        self._rtpfg_to_pyfg_feat_name = {}
+        self._rtpfg_to_pyfg_input_name = {}
+        self._pyfg_to_rtpfg_input_name = {}
+        for feature in self._features:
+            if feature.is_grouped_sequence:
+                # RTP FG sequence {sequence_name}_{feature_name}
+                # Aliyun FG sequence {sequence_name}__{feature_name}
+                # We should mapping table input from RTP FG style to Aliyun PyFG style
+                # before use pyfg and remapping pyfg outputs to rtp style
+                feat_name = feature.name
+                fg_feat_name = (
+                    feature.sequence_name
+                    + "__"
+                    + feat_name.removeprefix(f"{feature.sequence_name}_")
+                )
+                self._rtpfg_to_pyfg_feat_name[feat_name] = fg_feat_name
+                for i_name in feature.inputs():
+                    fg_i_name = (
+                        feature.sequence_name
+                        + "__"
+                        + i_name.removeprefix(f"{feature.sequence_name}_")
+                    )
+                    self._rtpfg_to_pyfg_input_name[i_name] = fg_i_name
+                    self._pyfg_to_rtpfg_input_name[fg_i_name] = i_name
+
+    def _to_real_input_name(self, x: str) -> str:
+        """Mapping input name from PyFG to RTPFG when needed."""
+        if self._use_rtp:
+            if self._pyfg_to_rtpfg_input_name is None:
+                self._build_fg_name_mapping()
+            return self._pyfg_to_rtpfg_input_name.get(x, x)
+        else:
+            return x
+
+    def _to_pyfg_input_name(self, x: str) -> str:
+        """Mapping input name from RTPFG to PyFG when needed."""
+        if self._use_rtp:
+            if self._rtpfg_to_pyfg_input_name is None:
+                self._build_fg_name_mapping()
+            return self._rtpfg_to_pyfg_input_name.get(x, x)
+        else:
+            return x
+
+    def _to_pyfg_feat_name(self, x: str) -> str:
+        """Mapping feature name from RTPFG to PyFG when needed."""
+        if self._use_rtp:
+            if self._rtpfg_to_pyfg_feat_name is None:
+                self._build_fg_name_mapping()
+            return self._rtpfg_to_pyfg_feat_name.get(x, x)
+        else:
+            return x
 
     def __del__(self) -> None:
         if self._fg_handler:
