@@ -46,7 +46,7 @@ from torchrec.sparse import jagged_tensor
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt
-from tzrec.constant import Mode
+from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -594,7 +594,7 @@ def export_rtp_model(
         from torch_fx_tool import ExportTorchFxTool
     except Exception as e:
         raise RuntimeError(
-            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251031.376cedb-py3-none-any.whl"
+            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251201.8c109c4-py3-none-any.whl"
         ) from e
 
     device, _ = init_process_group()
@@ -755,14 +755,6 @@ def export_rtp_model(
     # Extract Dense Model
     logger.info("exporting dense model...")
     additional_fg = []
-    seqname_mapping = {}
-    for feature in features:
-        if feature.is_grouped_sequence:
-            # rtp do not use __ concat sequence_name and feature_name
-            # pyre-ignore [16]
-            seqname_mapping[feature.name] = (
-                f"{feature.sequence_name}_{feature.config.feature_name}"
-            )
 
     graph = copy.deepcopy(full_graph)
     output_keys = []
@@ -771,6 +763,8 @@ def export_rtp_model(
     for node in graph.nodes:
         if node.op == "output":
             for k, v in sorted(node.args[0].items()):
+                if k == TRAGET_REPEAT_INTERLEAVE_KEY:
+                    continue
                 output_keys.append(k)
                 output_values.append(v)
             graph.erase_node(node)
@@ -826,11 +820,7 @@ def export_rtp_model(
                 new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                keys = [
-                    seqname_mapping[k] if k in seqname_mapping else k
-                    for k in node.kwargs["keys"]
-                ]
-                mc_config[name] = keys
+                mc_config[name] = node.kwargs["keys"]
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
             # sequence
@@ -854,11 +844,7 @@ def export_rtp_model(
                         "jagged sequence only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
                     )
                     new_node = graph.call_function(torch.squeeze, args=(new_node, 0))
-                keys = [
-                    seqname_mapping[k] if k in seqname_mapping else k
-                    for k in node.kwargs["keys"]
-                ]
-                mc_config[name] = keys
+                mc_config[name] = node.kwargs["keys"]
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and "fbgemm" in str(node.target):
             # rtp do not support fbgemm op now.

@@ -11,6 +11,8 @@
 
 import os
 
+from tzrec.utils.logging_util import logger
+
 
 def use_hash_node_id() -> bool:
     """Use hash node id or not."""
@@ -20,8 +22,9 @@ def use_hash_node_id() -> bool:
 def use_rtp() -> bool:
     """Use RTP for online inference or not."""
     flag = os.environ.get("USE_RTP", "0") == "1"
-    assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
-        "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
-        "train/eval/export when use rtp for online inference."
-    )
+    if flag and os.environ.get("USE_FARM_HASH_TO_BUCKETIZE", "false") != "true":
+        logger.warning(
+            "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
+            "train/eval/export when use rtp for online inference."
+        )
     return flag

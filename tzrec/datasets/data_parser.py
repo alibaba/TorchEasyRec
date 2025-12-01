@@ -89,9 +89,8 @@ class DataParser:
         self._fg_handler = None
 
         self._use_rtp = env_util.use_rtp()
-        self._rtpfg_to_pyfg_feat_name = None
-        self._pyfg_to_rtpfg_input_name = None
-        self._rtpfg_to_pyfg_input_name = None
+        if self._use_rtp:
+            self._build_fg_name_mapping()
 
         self.dense_keys = defaultdict(list)
         self.dense_length_per_key = defaultdict(list)
@@ -873,7 +872,6 @@ class DataParser:
 
     def _build_fg_name_mapping(self) -> str:
         """Build fg name mapping for RTP FG Compatible."""
-        assert self._use_rtp
         self._rtpfg_to_pyfg_feat_name = {}
         self._rtpfg_to_pyfg_input_name = {}
         self._pyfg_to_rtpfg_input_name = {}
@@ -890,7 +888,7 @@ class DataParser:
                     + feat_name.removeprefix(f"{feature.sequence_name}_")
                 )
                 self._rtpfg_to_pyfg_feat_name[feat_name] = fg_feat_name
-                for i_name in feature.inputs():
+                for i_name in feature.inputs:
                     fg_i_name = (
                         feature.sequence_name
                         + "__"
@@ -902,8 +900,6 @@ class DataParser:
     def _to_real_input_name(self, x: str) -> str:
         """Mapping input name from PyFG to RTPFG when needed."""
         if self._use_rtp:
-            if self._pyfg_to_rtpfg_input_name is None:
-                self._build_fg_name_mapping()
             return self._pyfg_to_rtpfg_input_name.get(x, x)
         else:
             return x
@@ -911,8 +907,6 @@ class DataParser:
     def _to_pyfg_input_name(self, x: str) -> str:
         """Mapping input name from RTPFG to PyFG when needed."""
         if self._use_rtp:
-            if self._rtpfg_to_pyfg_input_name is None:
-                self._build_fg_name_mapping()
             return self._rtpfg_to_pyfg_input_name.get(x, x)
         else:
             return x
@@ -920,8 +914,6 @@ class DataParser:
     def _to_pyfg_feat_name(self, x: str) -> str:
         """Mapping feature name from RTPFG to PyFG when needed."""
         if self._use_rtp:
-            if self._rtpfg_to_pyfg_feat_name is None:
-                self._build_fg_name_mapping()
             return self._rtpfg_to_pyfg_feat_name.get(x, x)
         else:
             return x
