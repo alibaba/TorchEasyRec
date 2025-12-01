@@ -70,7 +70,14 @@ def rms_norm(
 
         return triton_rms_norm(x, weight, eps)
     else:
-        return pytorch_rms_norm(x, weight, eps)
+        return pytorch_rms_norm(
+            x,
+            [
+                x.shape[-1],
+            ],
+            weight,
+            eps,
+        )
 
 
 def swish_layer_norm(

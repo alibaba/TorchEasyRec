@@ -438,6 +438,7 @@ def _get_rtp_embedding_tensor(
         values = out[name]
         dimension = list(values.shape)[-1]
         dtype = _remove_prefix(str(values.dtype))
+        assert dtype == "float32", "RTP only support float32 sparse weights now."
         memory: int = int(values.nbytes)
         shape = list(values.shape)
         t_meta = {

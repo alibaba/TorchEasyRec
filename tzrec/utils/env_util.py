@@ -11,6 +11,8 @@
 
 import os
 
+import torch
+
 from tzrec.utils.logging_util import logger
 
 
@@ -28,3 +30,23 @@ def use_rtp() -> bool:
             "train/eval/export when use rtp for online inference."
         )
     return flag
+
+
+def enable_tma() -> bool:
+    """Enable TMA (Tensor Memory Accelerator) for triton ops."""
+    flag = os.environ.get("ENABLE_TMA", "0") == "1"
+    if flag:
+        if torch.cuda.is_available():
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 9:
+                import triton
+                from packaging import version
+
+                if version.parse(triton.__version__) >= version.parse("3.5.0"):
+                    return True
+                else:
+                    logger.warning("triton version lower than 3.5.0, we disable TMA.")
+            else:
+                logger.warning("device capability lower than 9.0, we disable TMA.")
+        else:
+            logger.warning("CUDA not available, we disable TMA.")
+    return False
