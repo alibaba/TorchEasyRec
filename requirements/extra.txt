@@ -1,2 +1,2 @@
 dynamicemb @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/dynamicemb-0.0.1%2B20251112.430ef40-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
-torch_fx_tool @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251031.376cedb-py3-none-any.whl
+torch_fx_tool @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251201.8c109c4-py3-none-any.whl
