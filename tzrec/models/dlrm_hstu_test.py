@@ -16,7 +16,8 @@ import unittest
 from collections import OrderedDict
 
 import torch
-from parameterized import parameterized
+from hypothesis import Verbosity, assume, given, settings
+from hypothesis import strategies as st
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -45,29 +46,38 @@ class DlrmHSTUTest(unittest.TestCase):
         if self.test_dir is not None and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    @parameterized.expand(
-        [
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, True, False],
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, True, True],
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.PYTORCH, False, False],
-            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.PYTORCH, True, False],
-            [
-                TestGraphType.JIT_SCRIPT,
-                torch.device("cuda"),
-                Kernel.PYTORCH,
-                True,
-                False,
-            ],
-            [TestGraphType.NORMAL, torch.device("cuda"), Kernel.TRITON, True, False],
-            [TestGraphType.FX_TRACE, torch.device("cuda"), Kernel.TRITON, True, False],
-            # [TestGraphType.AOT_INDUCTOR, torch.device("cuda"), Kernel.TRITON,
-            #  False, False],
-        ]
-    )
     @unittest.skipIf(*gpu_unavailable)
+    @given(
+        graph_type=st.sampled_from(
+            [TestGraphType.NORMAL, TestGraphType.FX_TRACE, TestGraphType.JIT_SCRIPT]
+        ),  # TestGraphType.AOT_INDUCTOR
+        kernel=st.sampled_from([Kernel.PYTORCH, Kernel.TRITON]),
+        has_watchtime=st.sampled_from([True, False]),
+        enable_global_average_loss=st.sampled_from([True, False]),
+        contextual_group_type=st.sampled_from(
+            [model_pb2.FeatureGroupType.DEEP, model_pb2.FeatureGroupType.SEQUENCE]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
     def test_dlrm_hstu(
-        self, graph_type, device, kernel, has_watchtime, enable_global_average_loss
+        self,
+        graph_type,
+        kernel,
+        has_watchtime,
+        enable_global_average_loss,
+        contextual_group_type,
     ) -> None:
+        # JIT_SCRIPT only support PYTORCH kernel now.
+        assume(
+            (graph_type == TestGraphType.JIT_SCRIPT and kernel == Kernel.PYTORCH)
+            or graph_type != TestGraphType.JIT_SCRIPT
+        )
+
+        device = torch.device("cuda")
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -149,7 +159,7 @@ class DlrmHSTUTest(unittest.TestCase):
             model_pb2.FeatureGroupConfig(
                 group_name="contextual",
                 feature_names=["user_id", "user_active_degree"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
+                group_type=contextual_group_type,
             ),
             model_pb2.FeatureGroupConfig(
                 group_name="uih",
