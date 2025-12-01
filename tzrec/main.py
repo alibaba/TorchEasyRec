@@ -1214,12 +1214,8 @@ def predict_checkpoint(
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
 
-    assert (
-        not hasattr(pipeline_config.model_config, "mind")
-        and not hasattr(pipeline_config.model_config, "dssm")
-        and not hasattr(pipeline_config.model_config, "dssmv2")
-        and not hasattr(pipeline_config.model_config, "dat")
-    ), (
+    model_type = pipeline_config.model_config.WhichOneof("model")
+    assert model_type not in ["mind", "dssm", "dssm_v2", "dat"], (
         "Currently twin-tower alike models are not supported in "
         "checkpoint predict, please run export firstly and use "
         "scripted model to predict."
