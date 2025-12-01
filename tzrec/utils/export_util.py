@@ -519,7 +519,7 @@ def _adjust_fg_json_for_rtp(
             for sub_feature in feature["features"]:
                 feature_name = sub_feature["feature_name"]
                 embedding_info = feature_to_embedding_info.get(
-                    f"{sequence_name}__{feature_name}", None
+                    f"{sequence_name}_{feature_name}", None
                 )
                 _adjust_one_feature_for_rtp(sub_feature, embedding_info)
 
