@@ -1213,6 +1213,14 @@ def predict_checkpoint(
         output_cols = [x.strip() for x in output_columns.split(",")]
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+
+    model_type = pipeline_config.model_config.WhichOneof("model")
+    assert model_type not in ["mind", "dssm", "dssm_v2", "dat"], (
+        "Currently twin-tower alike models are not supported in "
+        "checkpoint predict, please run export firstly and use "
+        "scripted model to predict."
+    )
+
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
     if dataset_type:
