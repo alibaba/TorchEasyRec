@@ -41,7 +41,7 @@ from tzrec.features.sequence_feature import (
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import config_util, misc_util
+from tzrec.utils import config_util, env_util, misc_util
 
 
 def _create_random_id_data(
@@ -289,6 +289,7 @@ class SeqMockInput(MockInput):
         vocab_list: Optional[List[str]] = None,
         sequence_length: Optional[int] = None,
         sequence_delim: Optional[str] = "|",
+        sequence_underline: Optional[str] = "__",
     ) -> None:
         super().__init__(name)
         self.num_ids = num_ids
@@ -297,6 +298,7 @@ class SeqMockInput(MockInput):
         self.sequence_delim = sequence_delim
         self.side_infos = side_infos
         self.item_id = item_id
+        self.sequence_underline = sequence_underline
 
     def create_sequence_data(
         self, num_rows: int, item_t: pa.Table
@@ -350,7 +352,7 @@ class SeqMockInput(MockInput):
         data = {}
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
-                data[f"{self.name}__{name}"] = arr
+                data[f"{self.name}{self.sequence_underline}{name}"] = arr
 
         return data
 
@@ -795,6 +797,7 @@ def build_mock_input_with_fg(
                     multival_sep="",
                 )
 
+    seq_underline = "_" if env_util.use_rtp() else "__"
     for feature in features:
         if type(feature) in [
             SequenceIdFeature,
@@ -803,7 +806,9 @@ def build_mock_input_with_fg(
         ]:
             for side, input_name in feature.side_inputs:
                 if feature.is_grouped_sequence:
-                    sub_name = input_name.replace(f"{feature.sequence_name}__", "")
+                    sub_name = input_name.replace(
+                        f"{feature.sequence_name}{seq_underline}", ""
+                    )
                     if feature.sequence_name not in inputs["user"]:
                         inputs["user"][feature.sequence_name] = SeqMockInput(
                             name=feature.sequence_name,
@@ -813,6 +818,7 @@ def build_mock_input_with_fg(
                             vocab_list=inputs["item"][item_id].vocab_list,
                             sequence_length=feature.sequence_length,
                             sequence_delim=feature.sequence_delim,
+                            sequence_underline=seq_underline,
                         )
                     inputs["user"][feature.sequence_name].side_infos.append(sub_name)
                     if sub_name in inputs["item"]:

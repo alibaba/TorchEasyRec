@@ -104,7 +104,7 @@ def fx_mark_tensor(
 
 @torch.fx.wrap
 def fx_mark_seq_tensor(
-    name: str,
+    seq_name: str,
     x: torch.Tensor,
     keys: Optional[List[str]] = None,
     max_seq_len: Optional[int] = None,
@@ -119,6 +119,6 @@ def fx_mark_seq_tensor(
 
 
 @torch.fx.wrap
-def fx_mark_seq_len(name: str, x: torch.Tensor) -> None:
+def fx_mark_seq_len(seq_name: str, x: torch.Tensor) -> None:
     """Mark a sequence length Tensor in fx.graph."""
     return

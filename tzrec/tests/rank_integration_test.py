@@ -40,6 +40,7 @@ class RankIntegrationTest(unittest.TestCase):
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
+        os.environ.pop("USE_RTP", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
@@ -950,12 +951,14 @@ class RankIntegrationTest(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_rtp_train_export(self):
+        # set USE_RTP env here for gen correct rtp style train/eval data
+        os.environ["USE_RTP"] = "1"
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_rtp_mock.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
-            env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
+            env_str="USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",
         )
         if self.success:
             self.success = utils.test_export(
@@ -981,9 +984,9 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_rtp_train_export(self):
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config",
+            "tzrec/tests/configs/dlrm_hstu_rtp_kuairand_1k.config",
             self.test_dir,
-            env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
+            env_str="USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",
         )
         if self.success:
             self.success = utils.test_export(
