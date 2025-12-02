@@ -62,12 +62,12 @@ Any contributions you make are greatly appreciated!
 
 ### Join Us
 
-- DingDing Group: 32260796, click [this url](https://page.dingtalk.com/wow/z/dingtalk/simple/ddhomedownload?action=joingroup&code=v1,k1,MwaiOIY1Tb2W+onmBBumO7sQsdDOYjBmv6FXC6wTGns=&_dt_no_comment=1&origin=11#/) or scan QrCode to join!
+- DingDing Group: 32260796, click [this url](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,QH4dGSsGXXWW+onmBBumO1U9mQElyRKWi2x16a6oTVY=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CQH4dGSsGXXWW%2BonmBBumO1U9mQElyRKWi2x16a6oTVY%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11) or scan QrCode to join!
 
-- DingDing Group2: 37930014162, click [this url](https://page.dingtalk.com/wow/z/dingtalk/simple/ddhomedownload?action=joingroup&code=v1,k1,1ppFWEXXNPyxUClHh77gCmpfB+JcPhbFv6FXC6wTGns=&_dt_no_comment=1&origin=11#/) or scan QrCode to join!
+- DingDing Group2: 37930014162, click [this url](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,qTwau91MJZmxUClHh77gCsgcLASX0/eyhysrOf+8emQ=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CqTwau91MJZmxUClHh77gCsgcLASX0%2FeyhysrOf%2B8emQ%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11) or scan QrCode to join!
 
-  <img src="docs/images/qrcode/dinggroup1.png" alt="dingroup1" width="350">
-    <img src="docs/images/qrcode/dinggroup2.png" alt="dingroup2" width="350">
+  <img src="docs/images/qrcode/dinggroup1.JPG" alt="dingroup1" width="350">
+    <img src="docs/images/qrcode/dinggroup2.JPG" alt="dingroup2" width="350">
 
 - Email Group: easy_rec@service.aliyun.com.
 
