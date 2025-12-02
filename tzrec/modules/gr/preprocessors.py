@@ -134,6 +134,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         action_mlp: Optional[Dict[str, Any]] = None,
         contextual_feature_dim: int = 0,
         max_contextual_seq_len: int = 0,
+        contextual_group_name: str = "contextual",
         enable_interleaving: bool = True,
         is_inference: bool = False,
         **kwargs: Any,
@@ -145,6 +146,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
 
         self._contextual_feature_dim: int = contextual_feature_dim
         self._max_contextual_seq_len: int = max_contextual_seq_len
+        self._contextual_group_name: str = contextual_group_name
         if max_contextual_seq_len > 0:
             std = 1.0 * sqrt(
                 2.0 / float(self._contextual_feature_dim + output_embedding_dim)
@@ -376,7 +378,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         contextual_input_embeddings: Optional[torch.Tensor] = None
         contextual_embeddings: Optional[torch.Tensor] = None
         if self._max_contextual_seq_len > 0:
-            contextual_input_embeddings = grouped_features["contextual"]
+            contextual_input_embeddings = grouped_features[self._contextual_group_name]
             contextual_embeddings = torch.baddbmm(
                 self._batched_contextual_linear_bias.to(
                     contextual_input_embeddings.dtype

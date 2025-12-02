@@ -34,7 +34,7 @@ class LayerNormTest(unittest.TestCase):
     @given(
         N=st.sampled_from([4200000]),
         D=st.sampled_from([512]),
-        is_swish=st.sampled_from([False]),
+        norm_type=st.sampled_from(["layer_norm"]),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
@@ -57,7 +57,7 @@ class LayerNormTest(unittest.TestCase):
     @given(
         N=st.integers(min_value=0, max_value=10000),
         D=st.integers(min_value=32, max_value=512),
-        is_swish=st.sampled_from([True, False]),
+        norm_type=st.sampled_from(["layer_norm", "swish_layer_norm", "rms_norm"]),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float32])),
     )
     @settings(
@@ -78,16 +78,13 @@ class LayerNormTest(unittest.TestCase):
         self,
         N: int,
         D: int,
-        is_swish: bool,
+        norm_type: str,
         dtype: torch.dtype,
         ref_kernel: Kernel,
         real_kernel: Kernel,
         skip_comparisons: bool = False,
     ) -> None:
-        from tzrec.ops.layer_norm import (
-            layer_norm,
-            swish_layer_norm,
-        )
+        from tzrec.ops.layer_norm import layer_norm, rms_norm, swish_layer_norm
 
         N = N // 4 * 4
         x = (
@@ -105,12 +102,21 @@ class LayerNormTest(unittest.TestCase):
             .uniform_(-1.0, 1.0)
             .requires_grad_()
         )
-        if is_swish:
+
+        # ref
+        if norm_type == "rms_norm":
+            layer_norm_func = rms_norm
+            has_bias = False
+        elif norm_type == "swish_layer_norm":
             layer_norm_func = swish_layer_norm
+            has_bias = True
         else:
             layer_norm_func = layer_norm
-        # ref
-        ref_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=ref_kernel)
+            has_bias = True
+        if has_bias:
+            ref_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=ref_kernel)
+        else:
+            ref_out = layer_norm_func(x, weight, eps=1e-6, kernel=ref_kernel)
         dout = torch.randn_like(ref_out) * 0.05
         ref_out.backward(dout)
         if skip_comparisons:
@@ -118,21 +124,28 @@ class LayerNormTest(unittest.TestCase):
         # pyre-ignore[16]
         ref_dx, x.grad = x.grad.detach().clone(), None
         ref_dw, weight.grad = weight.grad.detach().clone(), None
-        ref_db, bias.grad = bias.grad.detach().clone(), None
+        if has_bias:
+            ref_db, bias.grad = bias.grad.detach().clone(), None
         # opt
         x = x.detach().clone().requires_grad_()
         weight = weight.detach().clone().requires_grad_()
-        bias = bias.detach().clone().requires_grad_()
-        opt_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=real_kernel)
+        if has_bias:
+            bias = bias.detach().clone().requires_grad_()
+        if has_bias:
+            opt_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=real_kernel)
+        else:
+            opt_out = layer_norm_func(x, weight, eps=1e-6, kernel=real_kernel)
         dout = dout.detach().clone()
         opt_out.backward(dout)
         opt_dx, x.grad = x.grad.detach().clone(), None
         opt_dw, weight.grad = weight.grad.detach().clone(), None
-        opt_db, bias.grad = bias.grad.detach().clone(), None
+        if has_bias:
+            opt_db, bias.grad = bias.grad.detach().clone(), None
         torch.testing.assert_close(ref_out, opt_out)
         torch.testing.assert_close(ref_dx, opt_dx)
         torch.testing.assert_close(ref_dw, opt_dw)
-        torch.testing.assert_close(ref_db, opt_db)
+        if has_bias:
+            torch.testing.assert_close(ref_db, opt_db)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ class HSTUTransducer(BaseModule):
         positional_encoder (dict): HSTUPositionalEncoder config.
         contextual_feature_dim (int): contextual feature dimension.
         max_contextual_seq_len (int): contextual feature num.
+        contextual_group_name (str): contextual group name in grouped features.
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
@@ -63,6 +64,7 @@ class HSTUTransducer(BaseModule):
         positional_encoder: Optional[Dict[str, Any]] = None,
         contextual_feature_dim: int = 0,
         max_contextual_seq_len: int = 0,
+        contextual_group_name: str = "contextual",
         is_inference: bool = True,
         return_full_embeddings: bool = False,
         listwise: bool = False,
@@ -77,6 +79,7 @@ class HSTUTransducer(BaseModule):
             target_embedding_dim=target_embedding_dim,
             contextual_feature_dim=contextual_feature_dim,
             max_contextual_seq_len=max_contextual_seq_len,
+            contextual_group_name=contextual_group_name,
             output_embedding_dim=stu["embedding_dim"],
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
