@@ -671,6 +671,12 @@ def export_rtp_model(
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
             f.write(str(full_graph))
 
+    def _seq_len_name(seq_name: str) -> str:
+        return seq_name + "_sequence_length"
+
+    def _seq_feat_name(seq_name: str) -> str:
+        return seq_name + "_sequence"
+
     # Extract Sparse Model
     logger.info("exporting sparse model...")
     graph = copy.deepcopy(full_graph)
@@ -698,7 +704,8 @@ def export_rtp_model(
             outputs[name] = t
         elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
             # sequence
-            name = node.args[0]
+            seq_name = node.args[0]
+            name = _seq_feat_name(seq_name)
             seq_node = node.args[1]
             assert node.kwargs["max_seq_len"] is not None, (
                 f"[{node.kwargs['keys']}] should config sequence_length."
@@ -717,7 +724,8 @@ def export_rtp_model(
             outputs[name] = seq_node
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence length
-            name = node.args[0]
+            seq_name = node.args[0]
+            name = _seq_len_name(seq_name)
             t = node.args[1]
             with graph.inserting_after(t):
                 # RTP do not support rank=1 tensor
@@ -775,7 +783,8 @@ def export_rtp_model(
     for node in graph.nodes:
         if node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence_length
-            name = node.args[0]
+            seq_name = node.args[0]
+            name = _seq_len_name(seq_name)
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 get_node = graph.call_function(
@@ -783,7 +792,7 @@ def export_rtp_model(
                 )
                 # rtp do not support RANK=1 tensor
                 new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
-                seq_len_nodes[name.split("__", 1)[0]] = new_node
+                seq_len_nodes[seq_name] = new_node
                 # add sequence_length into fg
                 additional_fg.append(
                     {
@@ -792,6 +801,7 @@ def export_rtp_model(
                         "expression": f"user:{name}",
                     }
                 )
+                logger.info("You should add additional feature [{name}] into qinfo.")
                 mc_config[name] = [name]
             node_t.replace_all_uses_with(new_node)
 
@@ -825,13 +835,13 @@ def export_rtp_model(
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
             # sequence
-            name = node.args[0]
+            seq_name = node.args[0]
+            name = _seq_feat_name(seq_name)
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                seq_name = name.split("__", 1)[0]
                 new_node = graph.call_function(
                     _rtp_slice_with_seq_len,
                     args=(
@@ -942,6 +952,12 @@ def split_model(
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
             f.write(str(full_graph))
 
+    def _seq_len_name(seq_name: str) -> str:
+        return seq_name + "__sequence_length"
+
+    def _seq_feat_name(seq_name: str) -> str:
+        return seq_name + "__sequence"
+
     # Extract Sparse Model
     logger.info("exporting sparse model...")
     graph = copy.deepcopy(full_graph)
@@ -967,12 +983,21 @@ def split_model(
             fx_mark_seq_tensor,
         ):
             # sequence or query
+            name = (
+                node.args[0]
+                if node.target == fx_mark_tensor
+                else _seq_feat_name(node.args[0])
+            )
+            t = node.args[1]
+            outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
+            # sequence
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence length
-            name = node.args[0]
+            name = _seq_len_name(node.args[0])
             t = node.args[1]
             outputs[name] = t
     graph.output(tuple([outputs, output_attrs]))
@@ -1011,7 +1036,11 @@ def split_model(
             fx_mark_seq_tensor,
         ):
             # sequence or query name
-            name = node.args[0]
+            name = (
+                node.args[0]
+                if node.target == fx_mark_tensor
+                else _seq_feat_name(node.args[0])
+            )
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 new_node = graph.call_function(
@@ -1020,7 +1049,7 @@ def split_model(
             node_t.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence_length
-            name = node.args[0]
+            name = _seq_len_name(node.args[0])
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 get_node = graph.call_function(

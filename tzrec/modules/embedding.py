@@ -1310,7 +1310,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
                     if need_tile:
                         sequence_length = sequence_length.tile(tile_size)
-                    fx_mark_seq_len(f"{group_name}__sequence_length", sequence_length)
+                    fx_mark_seq_len(f"{group_name}", sequence_length)
                     results[f"{group_name}.sequence_length"] = sequence_length
 
                 if (
@@ -1329,7 +1329,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             if seq_t_list:
                 seq_cat_t = torch.cat(seq_t_list, dim=-1)
                 fx_mark_seq_tensor(
-                    f"{group_name}__sequence",
+                    f"{group_name}",
                     seq_cat_t,
                     keys=seq_t_keys,
                     max_seq_len=self._group_to_sequence_length[group_name],
