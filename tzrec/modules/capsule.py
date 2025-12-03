@@ -41,12 +41,25 @@ def sequence_mask(lengths: torch.Tensor, max_len: Optional[int] = None) -> torch
 
 
 @torch.fx.wrap
-def _init_routing_logits(x: torch.Tensor, k: int) -> torch.Tensor:
-    return torch.randn(
-        x.size()[:-1] + (k,),
-        device=x.device,
-        dtype=x.dtype,
+def _init_routing_logits(
+    x: torch.Tensor, k: int, init_method: str = "normal"
+) -> torch.Tensor:
+    """Initialize routing logits."""
+    assert init_method in ["normal", "zeros"], (
+        "init_method should be 'normal' or 'zeros'"
     )
+    if init_method == "zeros":
+        return torch.randn(
+            x.size()[:-1] + (k,),
+            device=x.device,
+            dtype=x.dtype,
+        )
+    else:
+        return torch.zeros(
+            x.size()[:-1] + (k,),
+            device=x.device,
+            dtype=x.dtype,
+        )
 
 
 class CapsuleLayer(nn.Module):
@@ -82,6 +95,8 @@ class CapsuleLayer(nn.Module):
         # scale ratio
         # self._scale_ratio = capsule_config.scale_ratio
         self._const_caps_num = capsule_config.const_caps_num
+
+        self._routing_init_method = capsule_config.routing_init_method
 
         self.bilinear_matrix = nn.Parameter(
             torch.randn(self._low_dim, self._high_dim)
@@ -125,7 +140,9 @@ class CapsuleLayer(nn.Module):
         Return:
             [batch_size, max_k, high_dim]
         """
-        routing_logits = _init_routing_logits(inputs, self._max_k)
+        routing_logits = _init_routing_logits(
+            inputs, self._max_k, self._routing_init_method
+        )
         routing_logits = routing_logits.detach()
 
         routing_logits = routing_logits * self._routing_logits_stddev
