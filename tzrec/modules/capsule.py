@@ -48,7 +48,7 @@ def _init_routing_logits(
     assert init_method in ["normal", "zeros"], (
         "init_method should be 'normal' or 'zeros'"
     )
-    if init_method == "zeros":
+    if init_method == "normal":
         return torch.randn(
             x.size()[:-1] + (k,),
             device=x.device,
