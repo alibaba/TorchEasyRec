@@ -1338,11 +1338,8 @@ def predict_checkpoint(
                     torch.cuda.synchronize()
                 if i_step == 0:
                     # lazy init writer and create write thread
-                    if output_cols is None:
-                        output_cols = sorted(predictions.keys())
-                        _write_predictions(
-                            writer, predictions, batch.reserves, output_cols
-                        )
+                    output_cols = sorted(predictions.keys())
+                    _write_predictions(writer, predictions, batch.reserves, output_cols)
                     write_t = Thread(target=_write_loop, args=(output_cols,))
                     write_t.start()
                 elif not batch.dummy:
