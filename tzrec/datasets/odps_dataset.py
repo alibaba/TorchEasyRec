@@ -359,6 +359,8 @@ class OdpsReader(BaseReader):
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
         compression: str = "LZ4_FRAME",
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -368,6 +370,8 @@ class OdpsReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
+            sample_cost_field=sample_cost_field,
+            batch_cost_size=batch_cost_size,
         )
         self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition

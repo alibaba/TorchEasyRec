@@ -209,6 +209,26 @@ class TrainPipelineBase(_TrainPipelineBase):
 class TrainPipelineSparseDist(_TrainPipelineSparseDist):
     """TorchEasyRec's TrainPipelineSparseDist, make backward support grad scaler."""
 
+    def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+        if dataloader_iter is not self._dataloader_iter:
+            self._dataloader_iter = dataloader_iter
+            self._dataloader_exhausted = False
+
+        if self._dataloader_exhausted:
+            batch = None
+        else:
+            with record_function("## next_batch ##"):
+                batch = next(dataloader_iter, None)
+
+            # Check if all workers either have or do not have a batch available.
+            has_batch = torch.tensor(
+                0 if batch is None else 1, dtype=torch.float, device=self._device
+            )
+            if has_batch.item() < 1:
+                self._dataloader_exhausted = True
+                batch = None
+        return batch
+
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
 
