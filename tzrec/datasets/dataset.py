@@ -461,6 +461,7 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._shuffle_buffer_size = shuffle_buffer_size
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
+        self._use_sample_cost = False
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
             assert (
                 self._sample_cost_field is not None and len(self._sample_cost_field) > 0
@@ -480,7 +481,7 @@ class BaseReader(metaclass=_reader_meta_cls):
     def _slice_buff_data(
         self, buff_data: pa.RecordBatch
     ) -> Tuple[pa.RecordBatch, Optional[pa.RecordBatch]]:
-        if self._batch_cost_size is not None:
+        if self._use_sample_cost:
             # calculate slice point by cost
             sample_cost = buff_data[self._sample_cost_field]
             cumsum_sample_cost = pc.cumulative_sum(sample_cost)
