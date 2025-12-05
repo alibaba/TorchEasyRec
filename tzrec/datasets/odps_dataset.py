@@ -326,6 +326,8 @@ class OdpsDataset(BaseDataset):
             quota_name=self._data_config.odps_data_quota_name,
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
             compression=self._data_config.odps_data_compression,
+            sample_cost_field=self._data_config.sample_cost_field,
+            batch_cost_size=self._data_config.batch_cost_size,
         )
         self._init_input_fields()
 

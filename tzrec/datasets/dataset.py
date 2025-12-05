@@ -461,10 +461,10 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._shuffle_buffer_size = shuffle_buffer_size
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
-        if self._batch_cost_size is not None:
-            assert self._sample_cost_field is not None, (
-                "Should set data_config.sample_cost_field when use batch_cost_size"
-            )
+        if self._batch_cost_size is not None and self._batch_cost_size > 0:
+            assert (
+                self._sample_cost_field is not None and len(self._sample_cost_field) > 0
+            ), "Should set data_config.sample_cost_field when use batch_cost_size"
 
     @property
     def schema(self) -> pa.Schema:
@@ -486,7 +486,7 @@ class BaseReader(metaclass=_reader_meta_cls):
             cumsum_sample_cost = pc.cumulative_sum(sample_cost)
             slice_size = pc.sum(
                 pc.less_equal(cumsum_sample_cost, self._batch_cost_size)
-            )
+            ).as_py()
         else:
             slice_size = self._batch_size
 
