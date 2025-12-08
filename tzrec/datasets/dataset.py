@@ -516,7 +516,7 @@ class BaseReader(metaclass=_reader_meta_cls):
                             [buff_data, pa.Table.from_batches([read_data])]
                         )
                 except StopIteration:
-                    if self._drop_remainder:
+                    if self._drop_remainder or buff_data is None:
                         data = buff_data = None
                     else:
                         data, buff_data = self._slice_buff_data(buff_data)
