@@ -34,15 +34,15 @@ RUN case ${DEVICE} in \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu126") pip install torch==2.8.0 fbgemm-gpu==1.3.0 --index-url https://download.pytorch.org/whl/cu126 && \
+        "cu126") pip install torch==2.9.0 fbgemm-gpu==1.4.0 --index-url https://download.pytorch.org/whl/cu126 && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python3.11/site-packages/torch-2.8.0+cu126.dist-info/METADATA && \
-                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
-                 pip install torchrec==1.3.0 && \
+                 pip install torchmetrics==1.0.3 tensordict torch_tensorrt==2.9.0 --extra-index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchrec==1.4.0 && \
                  pip cache purge ;; \
-        * )      pip install torch==2.8.0 fbgemm-gpu==1.3.0 --index-url https://download.pytorch.org/whl/cpu && \
+        * )      pip install torch==2.9.0 fbgemm-gpu==1.4.0 --index-url https://download.pytorch.org/whl/cpu && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.3.0 && \
+                 pip install torchrec==1.4.0 && \
                  pip cache purge ;; \
     esac && \
     /opt/conda/bin/conda clean -ya

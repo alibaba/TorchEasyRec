@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
+REPO_NAME=tzrec-test
 DOCKER_TAG=0.9
+DOCKER_TAG_SUFFIX=
 
 rm -rf docker/requirements*
 cp -r requirements*.txt docker/
@@ -10,11 +12,11 @@ cd docker
 
 for DEVICE in cpu cu126
 do
-    docker build --network host -t ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE} --build-arg DEVICE=${DEVICE} .
-    docker push ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-${DEVICE}
+    docker build --network host -t ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX} --build-arg DEVICE=${DEVICE} .
+    docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX}
 done
 
-docker images -q ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-cu126 | xargs -I {} docker tag {} ${REGISTRY}/tzrec-devel:${DOCKER_TAG}
-docker images -q ${REGISTRY}/tzrec-devel:${DOCKER_TAG}-cu126 | xargs -I {} docker tag {} ${REGISTRY}/tzrec-devel:latest
-docker push ${REGISTRY}/tzrec-devel:${DOCKER_TAG}
-docker push ${REGISTRY}/tzrec-devel:latest
+docker images -q ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-cu126${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
+docker images -q ${REGISTRY}${REPO_NAME}:${DOCKER_TAG}-cu126${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:latest
+docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
+docker push ${REGISTRY}/${REPO_NAME}:latest
