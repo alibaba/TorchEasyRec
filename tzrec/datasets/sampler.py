@@ -154,12 +154,16 @@ def _to_arrow_array(
             kv = pa.compute.split_pattern_regex(x, pattern=multival_sep)
             offsets = kv.offsets
             kv_list = pa.compute.split_pattern(kv.values, ":").values
-            keys = kv_list.take(list(range(0, len(kv_list), 2))).cast(
-                field_type.key_type, safe=False
-            )
-            items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
-                field_type.item_type, safe=False
-            )
+            if len(kv_list) > 0:
+                keys = kv_list.take(list(range(0, len(kv_list), 2))).cast(
+                    field_type.key_type, safe=False
+                )
+                items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
+                    field_type.item_type, safe=False
+                )
+            else:
+                keys = pa.array([], type=field_type.key_type)
+                items = pa.array([], type=field_type.item_type)
             result = pa.MapArray.from_arrays(offsets, keys, items)
 
     elif np.issubdtype(x.dtype, np.str_) and not pa.types.is_string(field_type):
