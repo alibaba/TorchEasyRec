@@ -204,8 +204,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         else:
             self._selected_input_names |= set(data_config.label_fields)
             self._selected_input_names |= set(data_config.sample_weight_fields)
-            if data_config.HasField("sample_cost_field"):
-                self._selected_input_names.add(data_config.sample_cost_field)
+        if data_config.HasField("sample_cost_field"):
+            self._selected_input_names.add(data_config.sample_cost_field)
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -466,6 +466,7 @@ class BaseReader(metaclass=_reader_meta_cls):
             assert (
                 self._sample_cost_field is not None and len(self._sample_cost_field) > 0
             ), "Should set data_config.sample_cost_field when use batch_cost_size"
+            self._use_sample_cost = True
 
     @property
     def schema(self) -> pa.Schema:
@@ -490,8 +491,7 @@ class BaseReader(metaclass=_reader_meta_cls):
             ).as_py()
         else:
             slice_size = self._batch_size
-
-        if len(buff_data) == slice_size:
+        if len(buff_data) <= slice_size:
             data = buff_data
             buff_data = None
         else:
@@ -516,8 +516,10 @@ class BaseReader(metaclass=_reader_meta_cls):
                             [buff_data, pa.Table.from_batches([read_data])]
                         )
                 except StopIteration:
-                    data = None if self._drop_remainder else buff_data
-                    buff_data = None
+                    if self._drop_remainder:
+                        data = buff_data = None
+                    else:
+                        data, buff_data = self._slice_buff_data(buff_data)
             else:
                 data, buff_data = self._slice_buff_data(buff_data)
 
