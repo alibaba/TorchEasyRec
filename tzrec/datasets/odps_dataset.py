@@ -347,6 +347,8 @@ class OdpsReader(BaseReader):
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
         compression (str):  storage api data compression name.
+        sample_cost_field (str): sample cost field name.
+        batch_cost_size (int): batch cost limit size.
     """
 
     def __init__(

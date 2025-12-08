@@ -166,12 +166,15 @@ def _evaluate(
     global_step: Optional[int] = None,
     eval_summary_writer: Optional[SummaryWriter] = None,
     global_epoch: Optional[int] = None,
+    check_all_workers_data_status: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.eval()
-    pipeline = create_train_pipeline(model)
+    pipeline = create_train_pipeline(
+        model, check_all_workers_data_status=check_all_workers_data_status
+    )
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
     iterator = iter(eval_dataloader)
@@ -316,6 +319,7 @@ def _train_and_evaluate(
     skip_steps: int = -1,
     ckpt_path: Optional[str] = None,
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+    check_all_workers_data_status: bool = False,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -382,7 +386,11 @@ def _train_and_evaluate(
     i_epoch = 0
     losses = {}
     for i_epoch in epoch_iter:
-        pipeline = create_train_pipeline(model, optimizer)
+        pipeline = create_train_pipeline(
+            model,
+            optimizer,
+            check_all_workers_data_status=check_all_workers_data_status,
+        )
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
 
@@ -442,6 +450,7 @@ def _train_and_evaluate(
                             global_step=i_step,
                             eval_summary_writer=eval_summary_writer,
                             global_epoch=i_epoch,
+                            check_all_workers_data_status=check_all_workers_data_status,
                         )
                         model.train()
             if train_config.is_profiling:
@@ -502,6 +511,7 @@ def _train_and_evaluate(
                 global_step=i_step,
                 eval_summary_writer=eval_summary_writer,
                 global_epoch=i_epoch,
+                check_all_workers_data_status=check_all_workers_data_status,
             )
             model.train()
 
@@ -693,6 +703,8 @@ def train_and_evaluate(
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
             f.write(tzrec_version + "\n")
 
+    # when slice batch by sample cost, data on all workers may not be balanced
+    check_all_workers_data_status = data_config.HasField("batch_cost_size")
     _train_and_evaluate(
         model,
         optimizer,
@@ -704,6 +716,7 @@ def train_and_evaluate(
         eval_config=pipeline_config.eval_config,
         skip_steps=skip_steps,
         ckpt_path=ckpt_path,
+        check_all_workers_data_status=check_all_workers_data_status,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -789,6 +802,9 @@ def evaluate(
     summary_writer = None
     if is_rank_zero:
         summary_writer = SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
+
+    # when slice batch by sample cost, data on all workers may not be balanced
+    check_all_workers_data_status = data_config.HasField("batch_cost_size")
     _evaluate(
         model,
         eval_dataloader,
@@ -798,6 +814,7 @@ def evaluate(
         ),
         global_step=global_step,
         eval_summary_writer=summary_writer,
+        check_all_workers_data_status=check_all_workers_data_status,
     )
     if is_local_rank_zero:
         logger.info("Evaluate Finished.")

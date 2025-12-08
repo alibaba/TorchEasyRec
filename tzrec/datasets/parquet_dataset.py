@@ -121,6 +121,8 @@ class ParquetDataset(BaseDataset):
             shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
+            sample_cost_field=self._data_config.sample_cost_field,
+            batch_cost_size=self._data_config.batch_cost_size,
         )
         self._init_input_fields()
 
@@ -138,6 +140,8 @@ class ParquetReader(BaseReader):
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
         rebalance (bool): rebalance parquet rows to equal number for each worker.
+        sample_cost_field (str): sample cost field name.
+        batch_cost_size (int): batch cost limit size.
     """
 
     def __init__(
@@ -150,6 +154,8 @@ class ParquetReader(BaseReader):
         shuffle_buffer_size: int = 32,
         drop_redundant_bs_eq_one: bool = False,
         rebalance: bool = True,
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -159,6 +165,8 @@ class ParquetReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
+            sample_cost_field=sample_cost_field,
+            batch_cost_size=batch_cost_size,
         )
         self._pg = dist_util.get_dist_object_pg()
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
