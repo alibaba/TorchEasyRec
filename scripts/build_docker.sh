@@ -10,7 +10,7 @@ cp -r requirements*.txt docker/
 cp -r requirements/ docker/requirements
 cd docker
 
-for DEVICE in cpu cu126
+for DEVICE in cu126
 do
     docker build --network host -t ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX} --build-arg DEVICE=${DEVICE} .
     docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX}
