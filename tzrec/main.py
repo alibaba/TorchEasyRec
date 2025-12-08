@@ -473,6 +473,7 @@ def _train_and_evaluate(
                         global_step=i_step,
                         eval_summary_writer=eval_summary_writer,
                         global_epoch=i_epoch,
+                        check_all_workers_data_status=check_all_workers_data_status,
                     )
                     model.train()
 
