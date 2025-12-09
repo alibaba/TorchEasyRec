@@ -472,6 +472,7 @@ if has_dynamicemb:
         multipass_prefetch_max_pass: Optional[int] = None,
         key_value_params: Optional[KeyValueParams] = None,
         kv_cache_load_factor: float = constants.KV_CACHING_RATIO,
+        use_virtual_table: bool = False,
     ) -> List[Storage]:
         """Calculates estimated storage sizes.
 
@@ -505,6 +506,7 @@ if has_dynamicemb:
             key_value_params (Optional[KeyValueParams]): fused params for SSD/DRAM KV
                 cache.
             kv_cache_load_factor (float): ratio of kv caching.
+            use_virtual_table (bool): use virtual table or not.
 
         Returns:
             List[Storage]: storage object for each device in topology.
@@ -599,6 +601,7 @@ if has_dynamicemb:
                 multipass_prefetch_max_pass=multipass_prefetch_max_pass,
                 key_value_params=key_value_params,
                 kv_cache_load_factor=kv_cache_load_factor,
+                use_virtual_table=use_virtual_table,
             )
 
     # pyre-ignore [9]
