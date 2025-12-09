@@ -3,7 +3,7 @@
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 REPO_NAME=tzrec-test
 DOCKER_TAG=1.0
-DOCKER_TAG_SUFFIX=
+DOCKER_TAG_SUFFIX=-u1
 
 rm -rf docker/requirements*
 cp -r requirements*.txt docker/
