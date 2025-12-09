@@ -120,6 +120,12 @@ message DataConfig {
     // maxcompute storage api data compression type, LZ4_FRAME | ZSTD | UNCOMPRESSED
     optional string odps_data_compression = 24 [default = "LZ4_FRAME"];
 
+    // sample cost field name
+    optional string sample_cost_field = 25;
+
+    // batch cost limit size
+    optional uint64 batch_cost_size = 26;
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;

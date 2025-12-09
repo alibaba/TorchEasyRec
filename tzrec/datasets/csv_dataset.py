@@ -69,6 +69,8 @@ class CsvDataset(BaseDataset):
             column_names=column_names,
             delimiter=self._data_config.delimiter,
             column_types=column_types,
+            sample_cost_field=self._data_config.sample_cost_field,
+            batch_cost_size=self._data_config.batch_cost_size,
         )
         self._init_input_fields()
 
@@ -85,6 +87,8 @@ class CsvReader(BaseReader):
         shuffle_buffer_size (int): buffer size for shuffle.
         column_names (list): set column name if csv without header.
         delimiter (str): csv delimiter.
+        sample_cost_field (str): sample cost field name.
+        batch_cost_size (int): batch cost limit size.
     """
 
     def __init__(
@@ -98,6 +102,8 @@ class CsvReader(BaseReader):
         column_names: Optional[List[str]] = None,
         delimiter: str = ",",
         column_types: Optional[Dict[str, pa.DataType]] = None,
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -107,6 +113,8 @@ class CsvReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
+            sample_cost_field=sample_cost_field,
+            batch_cost_size=batch_cost_size,
         )
         self._csv_fmt = ds.CsvFileFormat(
             parse_options=pa.csv.ParseOptions(delimiter=delimiter),

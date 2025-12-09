@@ -326,6 +326,8 @@ class OdpsDataset(BaseDataset):
             quota_name=self._data_config.odps_data_quota_name,
             drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
             compression=self._data_config.odps_data_compression,
+            sample_cost_field=self._data_config.sample_cost_field,
+            batch_cost_size=self._data_config.batch_cost_size,
         )
         self._init_input_fields()
 
@@ -345,6 +347,8 @@ class OdpsReader(BaseReader):
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
         compression (str):  storage api data compression name.
+        sample_cost_field (str): sample cost field name.
+        batch_cost_size (int): batch cost limit size.
     """
 
     def __init__(
@@ -359,6 +363,8 @@ class OdpsReader(BaseReader):
         quota_name: str = "pay-as-you-go",
         drop_redundant_bs_eq_one: bool = False,
         compression: str = "LZ4_FRAME",
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -368,6 +374,8 @@ class OdpsReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
+            sample_cost_field=sample_cost_field,
+            batch_cost_size=batch_cost_size,
         )
         self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
