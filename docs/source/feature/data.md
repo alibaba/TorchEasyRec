@@ -234,6 +234,17 @@ sample_weight_fields: 'col_name'
     label_fields: "buy"
   ```
 
+### drop_remainder
+
+- 是否丢弃掉最后一个不足batch_size的batch数据
+
+### batch_cost_size
+
+- 用于限制一个batch数据的最大cost，主要适用于变长序列的模型（如DlrmHSTU）同步训练时，不同worker间由于序列长度差异过大，导致workload不一样导致的
+- 需结合data_config.sample_cost_field使用，sample_cost_field指定样本表中的表示样本cost的列名，dataset会根据样本中的cost列，裁切出batch_cost_size限制下的动态Batch。
+  - 对于DlrmHSTU模型，cost列一般可以考虑设置为进入模型的token数 (contextual feature num + uih seq length + cand seq length)
+- 需将data_config.batch_size设置得较大一些，来保证有足够的数据裁切够batch_cost_size
+
 ### num_workers
 
 - 每个`proc`上的读数据并发度，`nproc-per-node * num_workers`建议小于单机CPU核数
