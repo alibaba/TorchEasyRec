@@ -777,11 +777,6 @@ def evaluate(
         checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
             pipeline_config.model_dir
         )
-    if checkpoint_path:
-        checkpoint_util.restore_model(checkpoint_path, model)
-    else:
-        raise ValueError("Eval checkpoint path should be specified.")
-
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
@@ -802,6 +797,11 @@ def evaluate(
     model = DistributedModelParallel(
         module=model, sharders=sharders, device=device, plan=plan
     )
+
+    if checkpoint_path:
+        checkpoint_util.restore_model(checkpoint_path, model)
+    else:
+        raise ValueError("Eval checkpoint path should be specified.")
 
     summary_writer = None
     if is_rank_zero:
@@ -1300,11 +1300,6 @@ def predict_checkpoint(
         checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
             pipeline_config.model_dir
         )
-    if checkpoint_path:
-        checkpoint_util.restore_model(checkpoint_path, model)
-    else:
-        raise ValueError("Predict checkpoint path should be specified.")
-
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
@@ -1325,6 +1320,11 @@ def predict_checkpoint(
         module=model, sharders=sharders, device=device, plan=plan
     )
     model.eval()
+
+    if checkpoint_path:
+        checkpoint_util.restore_model(checkpoint_path, model)
+    else:
+        raise ValueError("Predict checkpoint path should be specified.")
 
     pred_queue: Queue[
         Tuple[Optional[Dict[str, torch.Tensor]], Optional[RecordBatchTensor]]
