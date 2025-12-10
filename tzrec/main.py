@@ -1032,10 +1032,6 @@ def predict(
             "using new batch_size: %s in trt predict",
             pipeline_config.data_config.batch_size,
         )
-    elif is_aot:
-        # AOTInductor may hang when predict_threads > 1
-        predict_threads = 1
-        logger.info("using new predict_threads: 1 when use aot")
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)

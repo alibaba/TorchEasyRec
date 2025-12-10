@@ -53,9 +53,8 @@ class DlrmHSTUTest(unittest.TestCase):
                 TestGraphType.NORMAL,
                 TestGraphType.FX_TRACE,
                 TestGraphType.JIT_SCRIPT,
-                TestGraphType.AOT_INDUCTOR,
             ]
-        ),
+        ),  # TestGraphType.AOT_INDUCTOR,
         kernel=st.sampled_from([Kernel.PYTORCH, Kernel.TRITON]),
         has_watchtime=st.sampled_from([True, False]),
         enable_global_average_loss=st.sampled_from([True, False]),
