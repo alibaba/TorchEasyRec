@@ -28,7 +28,7 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 ## IdFeature: 类别型特征
 
-类别型特征，例如手机品牌、item_id、user_id、年龄段、星座等，一般在表里面存储的类型一般是string、bigint、array<string>或array<bigint>。可支持多值Id特征
+类别型特征，例如手机品牌、item_id、user_id、年龄段、星座等，一般在表里面存储的类型一般是string、bigint、array\<string>或array\<bigint>。可支持多值Id特征
 
 ```
 feature_configs {
@@ -598,7 +598,11 @@ feature_configs: {
 
 ## SequenceIdFeature：类别型序列特征
 
-类别型序列特征，支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；支持ARRAY<string>或ARRAY<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）
+类别型序列特征
+
+- 支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；
+- 支持array\<string>或array\<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）；
+- 支持多值序列array\<array\<string>>或array\<array\<bigint>>类型，多值序列需设置value_dim=0，通常情况下训练推理性能比单值序列差一些。
 
 ```
 feature_configs: {
@@ -621,7 +625,10 @@ feature_configs: {
 
 ## SequenceRawFeature：数值型序列特征
 
-数值型序列特征，支持string类型为`price1;price2;price3`， 其中`;`为序列分隔符；支持ARRAY<float>为`[price1,price2,price3]`或者ARRAY\<ARRAY<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）
+数值型序列特征
+
+- 支持string类型为`price1;price2;price3`， 其中`;`为序列分隔符；
+- 支持array\<float>为`[price1,price2,price3]`或者array\<array\<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）。
 
 ```
 feature_configs: {
