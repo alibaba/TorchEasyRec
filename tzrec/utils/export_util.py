@@ -84,18 +84,21 @@ def export_model(
 
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
+    use_local_cache_dir = False
     if fs is not None:
         # scripted model and safetensors use io in cpp,
         # so that we can not use fsspec to patch cpp io operations.
         local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+        use_local_cache_dir = True
     impl(
         pipeline_config=pipeline_config,
         model=model,
         checkpoint_path=checkpoint_path,
         save_dir=local_path,
         assets=assets,
+        use_local_cache_dir=use_local_cache_dir,
     )
-    if fs is not None and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+    if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
         fs.upload(local_path, save_dir, recursive=True, file_thread_num=os.cpu_count())
         logger.info(f"finish upload {local_path} to {save_dir}.")
@@ -108,6 +111,7 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -596,6 +600,8 @@ def export_rtp_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    use_local_cache_dir: bool = False,
+    **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""
     try:
@@ -607,8 +613,10 @@ def export_rtp_model(
 
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_rank_zero = rank == 0
+    is_local_rank_zero = local_rank == 0
     train_config = pipeline_config.train_config
 
     # RTP do not support fbgemm now. patch kt.regroup to slow path
@@ -622,9 +630,13 @@ def export_rtp_model(
     feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
 
     graph_dir = os.path.join(save_dir, "graph")
-    if is_rank_zero:
+    if is_rank_zero or (use_local_cache_dir and is_local_rank_zero):
+        # when caching save_dir on local_rank, we need make save_dir
+        # for each worker
         if not os.path.exists(save_dir):
+            logger.info(f"make save dir {save_dir}")
             os.makedirs(save_dir)
+    if is_rank_zero:
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
     dist.barrier()
@@ -762,13 +774,11 @@ def export_rtp_model(
     local_tensor, meta = _get_rtp_embedding_tensor(
         sparse_model, checkpoint_path, feature_to_embedding_info.values()
     )
-    save_file(
-        local_tensor,
-        os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.safetensors"),
-    )
-    with open(
-        os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.json"), "w"
-    ) as f:
+    local_tensor_name = f"model-{rank:06d}-of-{world_size:06d}"
+    local_tensor_path = os.path.join(save_dir, f"{local_tensor_name}.safetensors")
+    logger.info(f"save safetensor to {local_tensor_path}")
+    save_file(local_tensor, local_tensor_path)
+    with open(os.path.join(save_dir, f"{local_tensor_name}.json"), "w") as f:
         json.dump(meta, f, indent=4)
 
     # Extract Dense Model
