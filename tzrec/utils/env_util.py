@@ -50,3 +50,8 @@ def enable_tma() -> bool:
         else:
             logger.warning("CUDA not available, we disable TMA.")
     return False
+
+
+def force_load_sharding_plan() -> bool:
+    """Force load sharding plan in checkpoint or not."""
+    return os.environ.get("FORCE_LOAD_SHARDING_PLAN", "0") == "1"

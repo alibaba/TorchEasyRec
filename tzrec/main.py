@@ -772,10 +772,18 @@ def evaluate(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
 
+    global_step = None
+    if not checkpoint_path:
+        checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
+            pipeline_config.model_dir
+        )
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=eval_dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+        if checkpoint_path
+        else None,
         global_constraints_cfg=train_config.global_embedding_constraints
         if train_config.HasField("global_embedding_constraints")
         else None,
@@ -790,11 +798,6 @@ def evaluate(
         module=model, sharders=sharders, device=device, plan=plan
     )
 
-    global_step = None
-    if not checkpoint_path:
-        checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
     if checkpoint_path:
         checkpoint_util.restore_model(checkpoint_path, model)
     else:
@@ -1291,10 +1294,19 @@ def predict_checkpoint(
         mixed_precision=train_config.mixed_precision,
         output_cols=output_cols,
     )
+
+    global_step = None
+    if not checkpoint_path:
+        checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
+            pipeline_config.model_dir
+        )
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=predict_dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+        if checkpoint_path
+        else None,
         global_constraints_cfg=train_config.global_embedding_constraints
         if train_config.HasField("global_embedding_constraints")
         else None,
@@ -1309,11 +1321,6 @@ def predict_checkpoint(
     )
     model.eval()
 
-    global_step = None
-    if not checkpoint_path:
-        checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
     if checkpoint_path:
         checkpoint_util.restore_model(checkpoint_path, model)
     else:

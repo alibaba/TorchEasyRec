@@ -85,7 +85,8 @@ def export_model(
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
     if fs is not None:
-        # scripted model use io in cpp, so that we can not path to fsspec
+        # scripted model and safetensors use io in cpp,
+        # so that we can not use fsspec to patch cpp io operations.
         local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
     impl(
         pipeline_config=pipeline_config,
@@ -96,7 +97,8 @@ def export_model(
     )
     if fs is not None and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
-        fs.upload(local_path, save_dir, recursive=True)
+        fs.upload(local_path, save_dir, recursive=True, file_thread_num=os.cpu_count())
+        logger.info(f"finish upload {local_path} to {save_dir}.")
         shutil.rmtree(local_path)
 
 
@@ -398,38 +400,43 @@ def _get_rtp_embedding_tensor(
             value_name_to_key[name] = None
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
-    key_files = sorted(
-        glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
-    )
-    key_pattern = re.compile(
-        r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
-    )
-    for i in range(rank, len(key_files), world_size):
-        key_file = key_files[i]
-        path_parts = key_file.split(os.path.sep)
-        match = key_pattern.match(path_parts[-1])
-        if match:
-            emb_name = match.group("emb_name")
-            emb_dim = emb_name_to_emb_dim[emb_name]
-            idx = match.group("idx")
-            num_shards = match.group("num_shards")
-            with open(key_file, "rb") as f:
-                keys = torch.tensor(np.fromfile(f, dtype=np.int64), dtype=torch.int64)
-            with open(
-                os.path.join(
-                    *path_parts[:-1],
-                    f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
-                ),
-                "rb",
-            ) as f:
-                values = torch.tensor(
-                    np.fromfile(f, dtype=np.float32), dtype=torch.float32
+    if os.path.exists(dynamicemb_path):
+        key_files = sorted(
+            glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
+        )
+        key_pattern = re.compile(
+            r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
+        )
+        for i in range(rank, len(key_files), world_size):
+            key_file = key_files[i]
+            path_parts = key_file.split(os.path.sep)
+            match = key_pattern.match(path_parts[-1])
+            if match:
+                emb_name = match.group("emb_name")
+                emb_dim = emb_name_to_emb_dim[emb_name]
+                idx = match.group("idx")
+                num_shards = match.group("num_shards")
+                with open(key_file, "rb") as f:
+                    keys = torch.tensor(
+                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
+                    )
+                with open(
+                    os.path.join(
+                        *path_parts[:-1],
+                        f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
+                    ),
+                    "rb",
+                ) as f:
+                    values = torch.tensor(
+                        np.fromfile(f, dtype=np.float32), dtype=torch.float32
+                    )
+                key_name = f"{path_parts[-2]}.{emb_name}.keys/part_{idx}_{num_shards}"
+                value_name = (
+                    f"{path_parts[-2]}.{emb_name}.values/part_{idx}_{num_shards}"
                 )
-            key_name = f"{path_parts[-2]}.{emb_name}.keys/part_{idx}_{num_shards}"
-            value_name = f"{path_parts[-2]}.{emb_name}.values/part_{idx}_{num_shards}"
-            out[key_name] = keys
-            out[value_name] = values.view([-1, emb_dim])
-            value_name_to_key[value_name] = key_name
+                out[key_name] = keys
+                out[value_name] = values.view([-1, emb_dim])
+                value_name_to_key[value_name] = key_name
 
     # TODO(hongsheng.jhs): support mczch
 
@@ -643,6 +650,9 @@ def export_rtp_model(
         device=device,
         # pyre-ignore [16]
         batch_size=dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+        if checkpoint_path
+        else None,
         global_constraints_cfg=train_config.global_embedding_constraints
         if train_config.HasField("global_embedding_constraints")
         else None,
@@ -801,7 +811,7 @@ def export_rtp_model(
                         "expression": f"user:{name}",
                     }
                 )
-                logger.info("You should add additional feature [{name}] into qinfo.")
+                logger.info(f"You should add additional feature [{name}] into qinfo.")
                 mc_config[name] = [name]
             node_t.replace_all_uses_with(new_node)
 
