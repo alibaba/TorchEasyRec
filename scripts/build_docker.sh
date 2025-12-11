@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
-REPO_NAME=tzrec-test
+REPO_NAME=tzrec-devel
 DOCKER_TAG=1.0
-DOCKER_TAG_SUFFIX=-u1
+DOCKER_TAG_SUFFIX=
 
 rm -rf docker/requirements*
 cp -r requirements*.txt docker/
 cp -r requirements/ docker/requirements
 cd docker
 
-for DEVICE in cu126
+for DEVICE in cpu cu126
 do
     docker build --network host -t ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX} --build-arg DEVICE=${DEVICE} .
     docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX}

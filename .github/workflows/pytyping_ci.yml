@@ -9,7 +9,7 @@ jobs:
   ci-test:
     runs-on: tzrec-codestyle-runner
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-test:1.0-u1
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.0
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
         uses: actions/checkout@v2
