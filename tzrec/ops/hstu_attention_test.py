@@ -296,7 +296,7 @@ class HSTUAttentionTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
-        batch_size=st.just(64),
+        batch_size=st.just(32),
         heads=st.just(4),
         max_uih_len=st.sampled_from([32768]),
         max_targets=st.sampled_from([32]),
