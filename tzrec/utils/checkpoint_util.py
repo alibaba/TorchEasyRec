@@ -362,7 +362,7 @@ def save_model(
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:
-    """List."""
+    """List distributed checkpoint parameter names."""
     meta_paths = []
     if os.path.exists(os.path.join(checkpoint_dir, ".metadata")):
         meta_paths.append(checkpoint_dir)
