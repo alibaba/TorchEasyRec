@@ -72,7 +72,10 @@ class FusionMTLTower(nn.Module):
         if mlp is not None:
             self.tower_mlp = MLP(tower_feature_in, **mlp)
             linear_in = self.tower_mlp.output_dim()
-        self.linear = nn.Linear(linear_in, len(task_configs))
+        self.task_output_dims = []
+        for task_config in task_configs:
+            self.task_output_dims.append(task_config.get("num_class", 1))
+        self.linear = nn.Linear(linear_in, sum(self.task_output_dims))
 
     def forward(
         self, user_emb: torch.Tensor, item_emb: torch.Tensor
@@ -82,7 +85,7 @@ class FusionMTLTower(nn.Module):
         if self.tower_mlp:
             features = self.tower_mlp(features)
         tower_out = self.linear(features)
-        tower_outputs = tower_out.split([1] * len(self.task_configs), dim=-1)
+        tower_outputs = tower_out.split(self.task_output_dims, dim=-1)
 
         result_dict = {}
         for i, task_cfg in enumerate(self.task_configs):
