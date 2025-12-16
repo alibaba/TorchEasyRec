@@ -644,9 +644,13 @@ class OdpsWriter(BaseWriter):
                 while resp.status == Status.WAIT:
                     time.sleep(1)
                     resp = self._client.get_write_session(self._sess_req)
+                while resp.session_status == SessionStatus.COMMITTING:
+                    time.sleep(1)
+                    resp = self._client.get_write_session(self._sess_req)
                 if resp.session_status != SessionStatus.COMMITTED:
                     raise RuntimeError(
-                        f"Fail to commit write session: {self._sess_req.session_id}"
+                        f"Fail to commit write session: {self._sess_req.session_id}, "
+                        f"status: {resp.status}, session_status: {resp.session_status}."
                     )
         elif self._pg is not None:
             raise RuntimeError(
