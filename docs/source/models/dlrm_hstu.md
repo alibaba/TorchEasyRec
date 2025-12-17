@@ -169,7 +169,7 @@ model_config {
 
 #### MTGR Style 配置方式
 
-MTGR在candidate特征组中增加u-i交叉特征的序列，可使用mlp_content_encoder将uih和candidate拉齐到统一的特征空间，示例如下：
+MTGR在candidate特征组中增加u-i交叉特征的序列，可使用mlp_content_encoder将uih和candidate的序列token拉齐到统一的特征空间，示例如下：
 
 ```protobuf
 model_config {
