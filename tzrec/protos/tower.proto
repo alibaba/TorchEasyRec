@@ -127,8 +127,8 @@ message FusionSubTaskConfig {
     optional uint64 task_bitmask = 3;
     // loss for the task
     repeated LossConfig losses = 4;
-    // TODO: support multi-class classification loss
-    // optional uint32 num_class = 5 [default = 1];
+    // support multi-class classification loss
+    optional uint32 num_class = 5 [default = 1];
     // metrics for the task
     repeated MetricConfig metrics = 6;
     // log train merics for task

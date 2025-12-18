@@ -188,6 +188,7 @@ class DlrmHSTU(RankModel):
                     self._output_to_prediction_impl(
                         mt_preds[task_name],
                         loss_cfg,
+                        num_class=task_cfg.num_class,
                         suffix=f"_{task_name}",
                     )
                 )
@@ -215,7 +216,12 @@ class DlrmHSTU(RankModel):
         for task_cfg in self._task_configs:
             for loss_cfg in task_cfg.losses:
                 task_name = task_cfg.task_name
-                self._init_loss_impl(loss_cfg, suffix=f"_{task_name}", reduction="mean")
+                self._init_loss_impl(
+                    loss_cfg,
+                    num_class=task_cfg.num_class,
+                    suffix=f"_{task_name}",
+                    reduction="mean",
+                )
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
@@ -238,6 +244,7 @@ class DlrmHSTU(RankModel):
                         label,
                         loss_weight,
                         loss_cfg,
+                        num_class=task_cfg.num_class,
                         suffix=f"_{task_name}",
                     )
                 )
@@ -251,11 +258,13 @@ class DlrmHSTU(RankModel):
             for metric_cfg in task_cfg.metrics:
                 self._init_metric_impl(
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )
             for metric_cfg in task_cfg.train_metrics:
                 self._init_train_metric_impl(
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )
             for loss_cfg in task_cfg.losses:
@@ -284,6 +293,7 @@ class DlrmHSTU(RankModel):
                     batch,
                     label,
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )
             if losses is not None:
@@ -316,5 +326,6 @@ class DlrmHSTU(RankModel):
                     batch,
                     label,
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )

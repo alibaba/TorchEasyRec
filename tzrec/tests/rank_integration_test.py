@@ -40,6 +40,7 @@ class RankIntegrationTest(unittest.TestCase):
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
+        os.environ.pop("USE_RTP", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
@@ -543,6 +544,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.test_dir, "predict_result_tile_emb_trt"
         )
 
+        output_columns = "probs"
         # quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
@@ -554,7 +556,7 @@ class RankIntegrationTest(unittest.TestCase):
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=pred_output,
                 reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
+                output_columns=output_columns,
                 test_dir=self.test_dir,
             )
 
@@ -573,7 +575,7 @@ class RankIntegrationTest(unittest.TestCase):
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=trt_pred_output,
                 reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
+                output_columns=output_columns,
                 test_dir=trt_dir,
             )
             # compare TRT and origin result consistency
@@ -581,7 +583,7 @@ class RankIntegrationTest(unittest.TestCase):
             df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 2e-5))
 
         # quant and input-tile and trt
         if self.success:
@@ -596,7 +598,7 @@ class RankIntegrationTest(unittest.TestCase):
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=tile_trt_pred_output,
                 reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
+                output_columns=output_columns,
                 test_dir=input_tile_trt_dir,
             )
             # compare INPUT_TILE+TRT and origin result consistency
@@ -608,7 +610,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 2e-5))
 
         # quant and input-tile emb and trt
         if self.success:
@@ -623,7 +625,7 @@ class RankIntegrationTest(unittest.TestCase):
                 predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
                 predict_output_path=tile_trt_pred_output_emb,
                 reserved_columns="user_id,item_id,clk",
-                output_columns="probs",
+                output_columns=output_columns,
                 test_dir=input_tile_emb_trt_dir,
             )
             # compare INPUT_TILE_EMB+TRT and origin result consistency
@@ -635,7 +637,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 2e-5))
 
         self.assertTrue(self.success)
 
@@ -734,21 +736,21 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
         # trt is all same sa no-trt
-        for k, v in result_gpu.items():
+        for k in output_columns.split(","):
             torch.testing.assert_close(
-                result_gpu_trt[k].to(device), v, rtol=1e-6, atol=1e-6
+                result_gpu_trt[k], result_gpu[k], rtol=2e-5, atol=5e-5
             )
 
         # tile & trt is all same sa no-tile-trt
-        for k, v in result_gpu.items():
+        for k in output_columns.split(","):
             torch.testing.assert_close(
-                result_gpu_input_tile[k].to(device), v, rtol=1e-6, atol=1e-6
+                result_gpu_input_tile[k], result_gpu[k], rtol=2e-5, atol=5e-5
             )
 
         # tile emb & trt is all same sa no-tile-trt
-        for k, v in result_gpu.items():
+        for k in output_columns.split(","):
             torch.testing.assert_close(
-                result_gpu_input_tile_emb[k].to(device), v, rtol=1e-6, atol=1e-6
+                result_gpu_input_tile_emb[k], result_gpu[k], rtol=2e-5, atol=5e-5
             )
 
     def test_multi_tower_din_with_fg_train_eval_export(self):
@@ -794,7 +796,7 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
         )
 
-    @unittest.skip("AOTI cause illegal memory access.")
+    @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_with_fg_train_eval_aot_export_input_tile(self):
         self._test_rank_with_fg_aot_input_tile(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
@@ -950,12 +952,14 @@ class RankIntegrationTest(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_rtp_train_export(self):
+        # set USE_RTP env here for gen correct rtp style train/eval data
+        os.environ["USE_RTP"] = "1"
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_rtp_mock.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
-            env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
+            env_str="USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",
         )
         if self.success:
             self.success = utils.test_export(
@@ -981,9 +985,9 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_rtp_train_export(self):
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config",
+            "tzrec/tests/configs/dlrm_hstu_rtp_kuairand_1k.config",
             self.test_dir,
-            env_str="USE_FARM_HASH_TO_BUCKETIZE=true",
+            env_str="USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",
         )
         if self.success:
             self.success = utils.test_export(

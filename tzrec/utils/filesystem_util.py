@@ -28,6 +28,7 @@ _original_isdir = os.path.isdir
 _original_exists = os.path.exists
 _original_copy = shutil.copy
 _original_glob = glob_module.glob
+_original_getsize = os.path.getsize
 
 _CACHED_FSSPEC_FILESYSTEMS = {}
 
@@ -116,6 +117,14 @@ def _patched_glob(pattern, *args, **kwargs):
         return _original_glob(pattern, *args, **kwargs)
 
 
+def _patch_get_size(filename):
+    fs, _ = url_to_fs(filename)
+    if fs is not None:
+        return fs.info(filename)["size"]
+    else:
+        return _original_getsize(filename)
+
+
 def apply_monkeypatch():
     """Apply fsspec-backed monkeypatches to builtins/os/shutil."""
     builtins.open = _patched_open
@@ -126,6 +135,7 @@ def apply_monkeypatch():
     os.path.exists = _patched_exists
     shutil.copy = _patched_copy
     glob_module.glob = _patched_glob
+    os.path.getsize = _patch_get_size
 
 
 def remove_monkeypatch():
@@ -138,6 +148,7 @@ def remove_monkeypatch():
     os.path.exists = _original_exists
     shutil.copy = _original_copy
     glob_module.glob = _original_glob
+    os.path.getsize = _original_getsize
 
 
 class PanguGFile(object):

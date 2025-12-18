@@ -48,7 +48,7 @@ class MultiTowerDINTest(unittest.TestCase):
             [TestGraphType.NORMAL],
             [TestGraphType.FX_TRACE],
             [TestGraphType.JIT_SCRIPT],
-            # [TestGraphType.AOT_INDUCTOR],
+            [TestGraphType.AOT_INDUCTOR],
         ]
     )
     def test_multi_tower_din(self, graph_type) -> None:

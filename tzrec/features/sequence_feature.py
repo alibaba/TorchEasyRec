@@ -27,6 +27,7 @@ from tzrec.features.id_feature import FgMode, IdFeature
 from tzrec.features.raw_feature import RawFeature
 from tzrec.protos import feature_pb2
 from tzrec.protos.feature_pb2 import FeatureConfig
+from tzrec.utils import env_util
 from tzrec.utils.logging_util import logger
 
 
@@ -185,6 +186,7 @@ class SequenceIdFeature(IdFeature):
         fc_type = feature_config.WhichOneof("feature")
         config = getattr(feature_config, fc_type)
         self._is_grouped_seq = False
+        self._underline = "_" if env_util.use_rtp() else "__"
         self.sequence_name = None
         self.sequence_delim = None
         self.sequence_length = None
@@ -207,7 +209,7 @@ class SequenceIdFeature(IdFeature):
     def name(self) -> str:
         """Feature name."""
         if self._is_grouped_seq:
-            return f"{self.sequence_name}__{self.config.feature_name}"
+            return f"{self.sequence_name}{self._underline}{self.config.feature_name}"
         else:
             return self.config.feature_name
 
@@ -234,7 +236,7 @@ class SequenceIdFeature(IdFeature):
         if self.config.HasField("expression"):
             if self._is_grouped_seq:
                 side, name = self.config.expression.split(":")
-                return [(side, f"{self.sequence_name}__{name}")]
+                return [(side, f"{self.sequence_name}{self._underline}{name}")]
             else:
                 return [tuple(self.config.expression.split(":"))]
         else:
@@ -369,6 +371,7 @@ class SequenceRawFeature(RawFeature):
         fc_type = feature_config.WhichOneof("feature")
         config = getattr(feature_config, fc_type)
         self._is_grouped_seq = False
+        self._underline = "_" if env_util.use_rtp() else "__"
         self.sequence_name = None
         self.sequence_delim = None
         self.sequence_length = None
@@ -391,7 +394,7 @@ class SequenceRawFeature(RawFeature):
     def name(self) -> str:
         """Feature name."""
         if self._is_grouped_seq:
-            return f"{self.sequence_name}__{self.config.feature_name}"
+            return f"{self.sequence_name}{self._underline}{self.config.feature_name}"
         else:
             return self.config.feature_name
 
@@ -415,7 +418,7 @@ class SequenceRawFeature(RawFeature):
         if self.config.HasField("expression"):
             if self._is_grouped_seq:
                 side, name = self.config.expression.split(":")
-                return [(side, f"{self.sequence_name}__{name}")]
+                return [(side, f"{self.sequence_name}{self._underline}{name}")]
             else:
                 return [tuple(self.config.expression.split(":"))]
         else:
@@ -550,6 +553,7 @@ class SequenceCustomFeature(CustomFeature):
         fc_type = feature_config.WhichOneof("feature")
         config = getattr(feature_config, fc_type)
         self._is_grouped_seq = False
+        self._underline = "_" if env_util.use_rtp() else "__"
         self.sequence_name = None
         self.sequence_delim = None
         self.sequence_length = None
@@ -572,7 +576,7 @@ class SequenceCustomFeature(CustomFeature):
     def name(self) -> str:
         """Feature name."""
         if self._is_grouped_seq:
-            return f"{self.sequence_name}__{self.config.feature_name}"
+            return f"{self.sequence_name}{self._underline}{self.config.feature_name}"
         else:
             return self.config.feature_name
 
@@ -593,7 +597,9 @@ class SequenceCustomFeature(CustomFeature):
             if self._is_grouped_seq:
                 for expression in self.config.expression:
                     side, name = expression.split(":")
-                    side_inputs.append((side, f"{self.sequence_name}__{name}"))
+                    side_inputs.append(
+                        (side, f"{self.sequence_name}{self._underline}{name}")
+                    )
             else:
                 for expression in self.config.expression:
                     side_inputs.append(tuple(expression.split(":")))

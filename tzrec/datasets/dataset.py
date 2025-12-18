@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from torch import distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -203,6 +204,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         else:
             self._selected_input_names |= set(data_config.label_fields)
             self._selected_input_names |= set(data_config.sample_weight_fields)
+        if data_config.HasField("sample_cost_field"):
+            self._selected_input_names.add(data_config.sample_cost_field)
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -434,6 +437,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         drop_remainder (bool): drop last batch.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
+        sample_cost_field (str): sample cost field name.
+        batch_cost_size (int): batch cost limit size.
     """
 
     def __init__(
@@ -444,6 +449,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         drop_remainder: bool = False,
         shuffle: bool = False,
         shuffle_buffer_size: int = 32,
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
@@ -452,6 +459,14 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._drop_remainder = drop_remainder
         self._shuffle = shuffle
         self._shuffle_buffer_size = shuffle_buffer_size
+        self._sample_cost_field = sample_cost_field
+        self._batch_cost_size = batch_cost_size
+        self._use_sample_cost = False
+        if self._batch_cost_size is not None and self._batch_cost_size > 0:
+            assert (
+                self._sample_cost_field is not None and len(self._sample_cost_field) > 0
+            ), "Should set data_config.sample_cost_field when use batch_cost_size"
+            self._use_sample_cost = True
 
     @property
     def schema(self) -> pa.Schema:
@@ -463,6 +478,26 @@ class BaseReader(metaclass=_reader_meta_cls):
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         raise NotImplementedError
+
+    def _slice_buff_data(
+        self, buff_data: pa.RecordBatch
+    ) -> Tuple[pa.RecordBatch, Optional[pa.RecordBatch]]:
+        if self._use_sample_cost:
+            # calculate slice point by cost
+            sample_cost = buff_data[self._sample_cost_field]
+            cumsum_sample_cost = pc.cumulative_sum(sample_cost)
+            slice_size = pc.sum(
+                pc.less_equal(cumsum_sample_cost, self._batch_cost_size)
+            ).as_py()
+        else:
+            slice_size = self._batch_size
+        if len(buff_data) <= slice_size:
+            data = buff_data
+            buff_data = None
+        else:
+            data = buff_data.slice(0, slice_size)
+            buff_data = buff_data.slice(slice_size)
+        return data, buff_data
 
     def _arrow_reader_iter(
         self, reader: Iterator[pa.RecordBatch]
@@ -481,14 +516,12 @@ class BaseReader(metaclass=_reader_meta_cls):
                             [buff_data, pa.Table.from_batches([read_data])]
                         )
                 except StopIteration:
-                    data = None if self._drop_remainder else buff_data
-                    buff_data = None
-            elif len(buff_data) == self._batch_size:
-                data = buff_data
-                buff_data = None
+                    if self._drop_remainder or buff_data is None:
+                        data = buff_data = None
+                    else:
+                        data, buff_data = self._slice_buff_data(buff_data)
             else:
-                data = buff_data.slice(0, self._batch_size)
-                buff_data = buff_data.slice(self._batch_size)
+                data, buff_data = self._slice_buff_data(buff_data)
 
             if data is not None:
                 data_dict = {}
