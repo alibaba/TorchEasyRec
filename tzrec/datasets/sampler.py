@@ -144,6 +144,7 @@ def _to_arrow_array(
 ) -> pa.Array:
     if pa.types.is_list(field_type) or pa.types.is_map(field_type):
         x = pa.array(x, type=pa.string())
+        origin_x = x
         is_empty = pa.compute.equal(x, pa.scalar(""))
         x = pa.compute.if_else(is_empty, pa.nulls(len(x)), x)
         if pa.types.is_list(field_type):
@@ -155,12 +156,27 @@ def _to_arrow_array(
             offsets = kv.offsets
             kv_list = pa.compute.split_pattern(kv.values, ":").values
             if len(kv_list) > 0:
-                keys = kv_list.take(list(range(0, len(kv_list), 2))).cast(
-                    field_type.key_type, safe=False
-                )
-                items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
-                    field_type.item_type, safe=False
-                )
+                try:
+                    keys = kv_list.take(list(range(0, len(kv_list), 2))).cast(
+                        field_type.key_type, safe=False
+                    )
+                    items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
+                        field_type.item_type, safe=False
+                    )
+                except Exception as err:
+                    index = 0
+                    for i in range(1, len(kv_list), 2):
+                        try:
+                            float(kv_list[i].as_py())
+                        except Exception:
+                            index = i
+                            break
+                    index = (index - 1) / 2
+                    for j, c in enumerate(offsets):
+                        if index < c.as_py():
+                            error_data = origin_x[j - 1].as_py().replace(chr(29), " ")
+                            raise ValueError(f"Parse KV error: {error_data}") from err
+                    raise ValueError(f"Parse KV error:{str(err)}") from err
             else:
                 keys = pa.array([], type=field_type.key_type)
                 items = pa.array([], type=field_type.item_type)
