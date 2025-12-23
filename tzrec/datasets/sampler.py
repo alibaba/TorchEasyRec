@@ -139,6 +139,34 @@ SAMPLER_CFG_TYPES = Union[
 ]
 
 
+def _cast_data(
+    data: pa.Array,
+    start: int,
+    data_type: pa.DataType,
+    offsets: pa.Array,
+    origin_data: pa.array,
+):
+    try:
+        new_data = data.cast(data_type, safe=False)
+        return new_data
+    except Exception as err:
+        index = 0
+        for i in range(len(data)):
+            try:
+                element = data[i]
+                if element.is_valid:
+                    element.cast(data_type, safe=False)
+            except Exception:
+                index = start + i
+                break
+        index = (index - 1) / 2
+        for j, c in enumerate(offsets):
+            if index < c.as_py():
+                error_data = origin_data[j - 1].as_py().replace(chr(29), " ")
+                raise ValueError(f"Parse KV error: {error_data}") from err
+        raise ValueError(f"Parse KV error:{str(err)}") from err
+
+
 def _to_arrow_array(
     x: npt.NDArray, field_type: pa.DataType, multival_sep: str = chr(29)
 ) -> pa.Array:
@@ -156,27 +184,10 @@ def _to_arrow_array(
             offsets = kv.offsets
             kv_list = pa.compute.split_pattern(kv.values, ":").values
             if len(kv_list) > 0:
-                try:
-                    keys = kv_list.take(list(range(0, len(kv_list), 2))).cast(
-                        field_type.key_type, safe=False
-                    )
-                    items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
-                        field_type.item_type, safe=False
-                    )
-                except Exception as err:
-                    index = 0
-                    for i in range(1, len(kv_list), 2):
-                        try:
-                            float(kv_list[i].as_py())
-                        except Exception:
-                            index = i
-                            break
-                    index = (index - 1) / 2
-                    for j, c in enumerate(offsets):
-                        if index < c.as_py():
-                            error_data = origin_x[j - 1].as_py().replace(chr(29), " ")
-                            raise ValueError(f"Parse KV error: {error_data}") from err
-                    raise ValueError(f"Parse KV error:{str(err)}") from err
+                keys = kv_list.take(list(range(0, len(kv_list), 2)))
+                keys = _cast_data(keys, 0, field_type.key_type, offsets, origin_x)
+                items = kv_list.take(list(range(1, len(kv_list), 2)))
+                items = _cast_data(items, 1, field_type.item_type, offsets, origin_x)
             else:
                 keys = pa.array([], type=field_type.key_type)
                 items = pa.array([], type=field_type.item_type)
