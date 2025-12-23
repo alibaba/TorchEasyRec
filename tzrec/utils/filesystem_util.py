@@ -261,7 +261,7 @@ class PanguGFile(object):
 
 def register_external_filesystem():
     """Register user-defined filesystems."""
-    use_fsspec = int(os.environ.get("USE_FSSPEC", "1")) == 1
+    use_fsspec = int(os.environ.get("USE_FSSPEC", "0")) == 1
     try:
         from pangudfs_client.high_level_client.extern.fsspec import PanguDfs
         from tensorboard.compat.tensorflow_stub.io import gfile
