@@ -15,6 +15,7 @@ import torch
 import torchmetrics
 from torch import nn
 
+from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
@@ -32,9 +33,6 @@ from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.utils.config_util import config_to_kwargs
-
-# repeat interleave session_id or grouping key for one-to-many rank sample
-TRAGET_REPEAT_INTERLEAVE_KEY = "__TRAGET_REPEAT_INTERLEAVE_KEY__"
 
 
 @torch.fx.wrap

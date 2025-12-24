@@ -89,6 +89,8 @@ LR策略可以支持按epoch更新或者按step更新
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录下记录trace文件
 - use_tensorboard: 是否使用tensorboard，默认为true
 - tensorboard_summaries: 设置需要在tensorboard中展示的数据， 只在use_tensorboard为true时生效。 可选值为["loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"], 默认值是["loss", "learning_rate"]。 在训练数据量大， 训练时长较长时， 酌情开启"parameter"、 "gradient"、"gradient_norm", 避免出现性能问题。
+- cudnn_allow_tf32: cudnn是否打开tf32精度训练，默认为true
+- cuda_matmul_allow_tf32: cuda matmul 及 tzrec中的triton op是否打开tf32精度训练，默认为false，设置为true可加速训练
 - mixed_precision: **混合精度训练**，默认不开启，可以配置'BF16'或'FP16'
 - grad_scaler: 梯度动态缩放配置，使用FP16的情况下建议配置，参考[GradScaler](https://docs.pytorch.org/docs/stable/notes/amp_examples.html#typical-mixed-precision-training)
 

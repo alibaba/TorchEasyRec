@@ -62,6 +62,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import DataType
 
 from tzrec.protos import feature_pb2
+from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -122,24 +123,30 @@ def create_planner(
             for name, child in m.named_children():
                 q.put((f"{path}{name}.", child))
 
-    # the optimizer state key names differ when using data_parallel for
-    # embedding sharding compared to when using row_wise and table_wise
-    # https://github.com/pytorch/torchrec/issues/2394. So that, we
-    # add constraints for params with data_parallel plan in ckpt.
     if ckpt_plan_path is not None and os.path.exists(ckpt_plan_path):
+        force_load_sharding_plan = env_util.force_load_sharding_plan()
         with open(ckpt_plan_path, "r") as f:
             ckpt_plan = json.load(f)
             for module_path, module_plan in ckpt_plan.items():
                 for param_name, param_sharding in module_plan.items():
-                    if param_sharding["sharding_type"] == "data_parallel":
+                    if (
+                        param_sharding["sharding_type"] == "data_parallel"
+                        or force_load_sharding_plan
+                    ):
+                        # the optimizer state key names differ when using data_parallel
+                        # for embedding sharding compared to when using row_wise and
+                        # table_wise https://github.com/pytorch/torchrec/issues/2394.
+                        # So that, we add constraints for params with data_parallel
+                        # plan in ckpt.
                         fqn = f"{module_path}.{param_name}"
-                        if is_rank_zero:
-                            logger.info(
-                                f"add ParameterConstraints[sharding_types=['data_parallel']] for param[{fqn}] from checkpoint plan."  # NOQA
+                        if fqn not in fqn_constraints:
+                            if is_rank_zero:
+                                logger.info(
+                                    f"add ParameterConstraints[sharding_types=['{param_sharding['sharding_type']}']] for param[{fqn}] from checkpoint plan."  # NOQA
+                                )
+                            fqn_constraints[fqn] = ParameterConstraints(
+                                sharding_types=[param_sharding["sharding_type"]]
                             )
-                        fqn_constraints[fqn] = ParameterConstraints(
-                            sharding_types=["data_parallel"]
-                        )
 
     global_constraints = None
     if global_constraints_cfg is not None:

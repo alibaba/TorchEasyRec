@@ -10,6 +10,8 @@ HSTU (Hierarchical Sequential Trans-duction Units) 是Meta提出的一种生成�
 
 ### 配置说明
 
+#### MetaGR Style 配置方式
+
 ```protobuf
 model_config {
     feature_groups {
@@ -24,32 +26,32 @@ model_config {
     }
     feature_groups {
         group_name: "uih"
-        feature_names: "video_id"
+        feature_names: "uih_seq__video_id"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "candidate"
-        feature_names: "item_video_id"
+        feature_names: "cand_seq___video_id"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "uih_action"
-        feature_names: "action_weight"
+        feature_names: "uih_seq__action_weight"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "uih_watchtime"
-        feature_names: "watch_time"
+        feature_names: "uih_seq__watch_time"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "uih_timestamp"
-        feature_names: "action_timestamp"
+        feature_names: "uih_seq__action_timestamp"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "candidate_timestamp"
-        feature_names: "item_query_time"
+        feature_names: "cand_seq___query_time"
         group_type: JAGGED_SEQUENCE
     }
     dlrm_hstu {
@@ -72,22 +74,18 @@ model_config {
             input_preprocessor {
                 contextual_preprocessor {
                     action_encoder {
-                        action_embedding_dim: 8
-                        action_feature_name: "action_weight"
-                        action_weights: [1, 2]
+                        simple_action_encoder {
+                            action_embedding_dim: 8
+                            action_weights: [1, 2]
+                        }
                     }
-                    contextual_feature_to_max_length [
-                        {key: "user_id"               value: 1},
-                        {key: "user_active_degree"    value: 1},
-                        {key: "follow_user_num_range" value: 1},
-                        {key: "fans_user_num_range"   value: 1},
-                        {key: "friend_user_num_range" value: 1},
-                        {key: "register_days_range"   value: 1}
-                    ]
                     action_mlp {
                         simple_mlp {
                             hidden_dim: 256
                         }
+                    }
+                    content_encoder {
+                        slice_content_encoder {}
                     }
                     content_mlp {
                         simple_mlp {
@@ -111,7 +109,7 @@ model_config {
             }
             task_configs {
                 task_name: "is_click"
-                label_name: "item_action_weight"
+                label_name: "cand_seq___action_weight"
                 task_bitmask: 1
                 losses {
                     binary_cross_entropy {}
@@ -122,7 +120,7 @@ model_config {
             }
             task_configs {
                 task_name: "is_like"
-                label_name: "item_action_weight"
+                label_name: "cand_seq___action_weight"
                 task_bitmask: 2
                 losses {
                     binary_cross_entropy {}
@@ -169,9 +167,145 @@ model_config {
 
 - kernel: 算子实现，可选TRITON/PYTORCH，TRITON通常比PYTORCH快2-3x，节省2-3x显存
 
-### 示例Config
+#### MTGR Style 配置方式
+
+MTGR在candidate特征组中增加u-i交叉特征的序列，可使用mlp_content_encoder将uih和candidate的序列token拉齐到统一的特征空间，示例如下：
+
+```protobuf
+model_config {
+    feature_groups {
+        group_name: "contextual"
+        feature_names: "user_id"
+        feature_names: "user_active_degree"
+        feature_names: "follow_user_num_range"
+        feature_names: "fans_user_num_range"
+        feature_names: "friend_user_num_range"
+        feature_names: "register_days_range"
+        group_type: DEEP
+    }
+    feature_groups {
+        group_name: "uih"
+        feature_names: "uih_seq__video_id"
+        feature_names: "uih_seq__video_cate1"   # 物品属性
+        feature_names: "uih_seq__video_cate2"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "candidate"
+        feature_names: "cand_seq___video_id"
+        feature_names: "cand_seq___video_cate1" # 物品属性
+        feature_names: "cand_seq___video_cate2"
+        feature_names: "cand_seq___user_video_cross1"  # 交叉特征
+        feature_names: "cand_seq___user_video_cross2"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "uih_action"
+        feature_names: "uih_seq__action_weight"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "uih_watchtime"
+        feature_names: "uih_seq__watch_time"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "uih_timestamp"
+        feature_names: "uih_seq__action_timestamp"
+        group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "candidate_timestamp"
+        feature_names: "cand_seq___query_time"
+        group_type: JAGGED_SEQUENCE
+    }
+    dlrm_hstu {
+        hstu {
+            stu {
+                embedding_dim: 512
+                num_heads: 4
+                hidden_dim: 128
+                attention_dim: 128
+                output_dropout_ratio: 0.1
+                use_group_norm: true
+            }
+            input_dropout_ratio: 0.2
+            attn_num_layers: 3
+            positional_encoder {
+                num_position_buckets: 8192
+                num_time_buckets: 2048
+                use_time_encoding: true
+            }
+            input_preprocessor {
+                contextual_preprocessor {
+                    action_encoder {
+                        simple_action_encoder {
+                            action_embedding_dim: 8
+                            action_weights: [1, 2]
+                        }
+                    }
+                    action_mlp {
+                        simple_mlp {
+                            hidden_dim: 256
+                        }
+                    }
+                    content_encoder {
+                        mlp_content_encoder {
+                            uih_mlp {
+                                hidden_dim: 256
+                            }
+                            target_mlp {
+                                hidden_dim: 256
+                            }
+                        }
+                    }
+                    content_mlp {
+                        simple_mlp {
+                            hidden_dim: 256
+                        }
+                    }
+                }
+            }
+            output_postprocessor {
+                layernorm_postprocessor {}
+            }
+        }
+        fusion_mtl_tower {
+            mlp {
+                hidden_units: 512
+                activation: "nn.SiLU"
+                use_ln: true
+            }
+            task_configs {
+                task_name: "is_click"
+                label_name: "cand_seq___action_weight"
+                task_bitmask: 1
+                losses {
+                    binary_cross_entropy {}
+                }
+                metrics {
+                    auc {}
+                }
+            }
+        }
+        max_seq_len: 8000
+    }
+    kernel: TRITON
+}
+```
+
+### 示例
+
+模型的训练和评估方式同[local_tutorial](../quick_start/local_tutorial.md)，以 kuairand-27k 为例的数据和配置如下：
+
+#### 数据
+
+[kuairand-27k.tar.gz](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/kuairand-27k.tar.gz)
+
+#### 配置文件
 
 [dlrm_hstu_kuairand.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_hstu_kuairand.config)
+注: 如遇到训练不稳定问题，可优先考虑调整混合精度相关的配置: 去除train_config中的mixed_precision，去除feature_configs中的data_type，设置train_config.cuda_matmul_allow_tf32=true
 
 ### 参考论文
 

@@ -10,22 +10,27 @@
 # limitations under the License.
 
 import copy
+import glob
 import json
 import operator
 import os
+import re
 import shutil
 from collections import OrderedDict, defaultdict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 from torchrec import KeyedTensor
-from torchrec.distributed.train_pipeline.utils import Tracer, _get_leaf_module_names
+from torchrec.distributed.model_parallel import ShardedModule
+from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.embedding_modules import (
@@ -41,7 +46,7 @@ from torchrec.sparse import jagged_tensor
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt
-from tzrec.constant import Mode
+from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -52,12 +57,13 @@ from tzrec.features.feature import (
 )
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     fx_mark_keyed_tensor,
     fx_mark_seq_len,
+    fx_mark_seq_tensor,
     fx_mark_tensor,
     symbolic_trace,
 )
@@ -74,22 +80,28 @@ def export_model(
     assets: Optional[List[str]] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
-    use_rtp = os.environ.get("USE_RTP", "0") == "1"
+    use_rtp = env_util.use_rtp()
+
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
+    use_local_cache_dir = False
     if fs is not None:
-        # scripted model use io in cpp, so that we can not path to fsspec
+        # scripted model and safetensors use io in cpp,
+        # so that we can not use fsspec to patch cpp io operations.
         local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+        use_local_cache_dir = True
     impl(
         pipeline_config=pipeline_config,
         model=model,
         checkpoint_path=checkpoint_path,
         save_dir=local_path,
         assets=assets,
+        use_local_cache_dir=use_local_cache_dir,
     )
-    if fs is not None and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+    if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
-        fs.upload(local_path, save_dir, recursive=True)
+        fs.upload(local_path, save_dir, recursive=True, file_thread_num=os.cpu_count())
+        logger.info(f"finish upload {local_path} to {save_dir}.")
         shutil.rmtree(local_path)
 
 
@@ -99,6 +111,7 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -184,7 +197,10 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            export_model_trt(model, data, save_dir)
+            sparse, dense = split_model(
+                pipeline_config, model, checkpoint_path, save_dir
+            )
+            export_model_trt(sparse, dense, data, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
             result = model(data)
@@ -220,6 +236,33 @@ def export_model_normal(
         if assets is not None:
             for asset in assets:
                 shutil.copy(asset, save_dir)
+
+
+def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Get ShardedModule as leaf modules."""
+
+    def _get_leaf_module_names_helper(
+        model: torch.nn.Module,
+        path: str,
+        leaf_module_names: Set[str],
+    ) -> bool:
+        if isinstance(model, ShardedModule):
+            leaf_module_names.add(path)
+        else:
+            for name, child in model.named_children():
+                _get_leaf_module_names_helper(
+                    child,
+                    name if path == "" else path + "." + name,
+                    leaf_module_names,
+                )
+
+    leaf_module_names: Set[str] = set()
+    _get_leaf_module_names_helper(
+        model,
+        "",
+        leaf_module_names,
+    )
+    return list(leaf_module_names)
 
 
 def _get_rtp_feature_to_embedding_info(
@@ -292,22 +335,26 @@ def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphMo
                 submodule = gm.get_submodule(module_path)
                 _add_module_by_dotted_path(new_root, module_path, submodule)
                 name_to_obj[module_path] = submodule
-
         elif node.op == "get_attr":
-            # This is a top-level parameter or buffer
             param_path = node.target
-            if param_path not in name_to_obj:
-                path_parts = param_path.split(".")
-                current_obj = gm
-                for part in path_parts:
-                    current_obj = getattr(current_obj, part)
+            module_path, _, param_name = param_path.rpartition(".")
 
-                # We need to register it on the new_root correctly
-                # For simplicity here, we assume it's a direct attribute.
+            if param_path not in name_to_obj:
+                if module_path == "":
+                    submodule = gm
+                elif module_path not in name_to_obj:
+                    submodule = gm.get_submodule(module_path)
+                    _add_module_by_dotted_path(new_root, module_path, submodule)
+                    name_to_obj[module_path] = submodule
+                else:
+                    submodule = name_to_obj[module_path]
+                current_obj = getattr(submodule, param_name)
+                parent = new_root.get_submodule(module_path)
+
                 if isinstance(current_obj, nn.Parameter):
-                    new_root.register_parameter(param_path, current_obj)
+                    parent.register_parameter(param_name, current_obj)
                 elif isinstance(current_obj, torch.Tensor):  # It's a buffer
-                    new_root.register_buffer(param_path, current_obj)
+                    parent.register_buffer(param_name, current_obj)
                 name_to_obj[param_path] = current_obj
 
     new_gm = torch.fx.GraphModule(new_root, gm.graph)
@@ -315,9 +362,12 @@ def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphMo
 
 
 def _get_rtp_embedding_tensor(
-    model: nn.Module,
+    model: nn.Module, checkpoint_path: str, embedding_infos: List[BaseEmbeddingConfig]
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """Get Embedding Tensors for RTP."""
+    emb_name_to_emb_dim = dict()
+    for emb_info in embedding_infos:
+        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
 
     def _remove_prefix(src: str, prefix: str = "torch.") -> str:
         if src.startswith(prefix):
@@ -325,8 +375,12 @@ def _get_rtp_embedding_tensor(
         return src
 
     out = {}
+    value_name_to_key = {}
     rank = int(os.environ.get("RANK", 0))
-    for key, values in model.state_dict().items():
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    for name, values in model.state_dict().items():
+        emb_name = name.split(".")[-2]
+        emb_dim = emb_name_to_emb_dim[emb_name]
         if isinstance(values, DTensor):
             raise ValueError("DTensors are not considered yet.")
         elif isinstance(values, ShardedTensor):
@@ -338,29 +392,82 @@ def _get_rtp_embedding_tensor(
                     placement = shards_meta.placement
                     assert placement is not None
                     if placement.rank() == rank:
-                        out[key + f"/part_{idx}_{num_shards}"] = values.local_tensor()
-        else:
-            out[key] = values
+                        name = name + f"/part_{idx}_{num_shards}"
+                        local_tensor = values.local_tensor()
+                        if list(local_tensor.shape)[-1] == emb_dim:
+                            # dynamicemb may have a dummy tensor in state_dict, skip it.
+                            out[name] = local_tensor
+                            value_name_to_key[name] = None
+        elif list(values.shape)[-1] == emb_dim:
+            # dynamicemb may have a dummy tensor in state_dict, skip it.
+            out[name] = values
+            value_name_to_key[name] = None
+
+    dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
+    if os.path.exists(dynamicemb_path):
+        key_files = sorted(
+            glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
+        )
+        key_pattern = re.compile(
+            r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
+        )
+        for i in range(rank, len(key_files), world_size):
+            key_file = key_files[i]
+            path_parts = key_file.split(os.path.sep)
+            match = key_pattern.match(path_parts[-1])
+            if match:
+                emb_name = match.group("emb_name")
+                emb_dim = emb_name_to_emb_dim[emb_name]
+                idx = match.group("idx")
+                num_shards = match.group("num_shards")
+                with open(key_file, "rb") as f:
+                    keys = torch.tensor(
+                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
+                    )
+                with open(
+                    os.path.join(
+                        *path_parts[:-1],
+                        f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
+                    ),
+                    "rb",
+                ) as f:
+                    values = torch.tensor(
+                        np.fromfile(f, dtype=np.float32), dtype=torch.float32
+                    )
+                key_name = f"{path_parts[-2]}.{emb_name}.keys/part_{idx}_{num_shards}"
+                value_name = (
+                    f"{path_parts[-2]}.{emb_name}.values/part_{idx}_{num_shards}"
+                )
+                out[key_name] = keys
+                out[value_name] = values.view([-1, emb_dim])
+                value_name_to_key[value_name] = key_name
+
+    # TODO(hongsheng.jhs): support mczch
 
     meta = {}
-    for key, values in out.items():
+    for name, key_name in value_name_to_key.items():
+        values = out[name]
         dimension = list(values.shape)[-1]
         dtype = _remove_prefix(str(values.dtype))
+        assert dtype == "float32", "RTP only support float32 sparse weights now."
         memory: int = int(values.nbytes)
         shape = list(values.shape)
-        # TODO(hongsheng.jhs): support mczch and dynamicemb
-        is_hashmap = False
-
-        meta[key] = {
-            "name": key,
+        t_meta = {
+            "name": name,
             "dense": False,
             "dimension": dimension,
             "dtype": dtype,
             "memory": memory,
             "shape": shape,
-            "is_hashmap": is_hashmap,
         }
-        out[key] = values
+        if key_name is not None:
+            t_meta["hashmap_value"] = name
+            t_meta["hashmap_key"] = key_name
+            t_meta["hashmap_key_dtype"] = "int64"
+            t_meta["is_hashmap"] = True
+        else:
+            t_meta["is_hashmap"] = False
+        meta[name] = t_meta
     return out, meta
 
 
@@ -414,10 +521,7 @@ def _adjust_fg_json_for_rtp(
     """Adjust fg json to rtp style."""
     for feature in fg_json["features"]:
         if "features" not in feature:
-            try:
-                feature_name = feature["feature_name"]
-            except Exception:
-                breakpoint()
+            feature_name = feature["feature_name"]
             embedding_info = feature_to_embedding_info.get(feature_name, None)
             _adjust_one_feature_for_rtp(feature, embedding_info)
         else:
@@ -427,9 +531,67 @@ def _adjust_fg_json_for_rtp(
             for sub_feature in feature["features"]:
                 feature_name = sub_feature["feature_name"]
                 embedding_info = feature_to_embedding_info.get(
-                    f"{sequence_name}__{feature_name}", None
+                    f"{sequence_name}_{feature_name}", None
                 )
                 _adjust_one_feature_for_rtp(sub_feature, embedding_info)
+
+
+@torch.fx.wrap
+def _rtp_pad_to_max_seq_len(x: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    pad_len = max_seq_len - x.size(1)
+    x_padded = F.pad(x, (0, 0, 0, pad_len))
+    return x_padded
+
+
+@torch.fx.wrap
+def _rtp_slice_with_seq_len(
+    x: torch.Tensor, seq_len: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    seq_len_int = seq_len.max().item()
+    torch._check_is_size(seq_len_int, max=max_seq_len)
+    return x[:, :seq_len_int, :]
+
+
+@torch.fx.wrap
+def _rtp_torch_asynchronous_complete_cumsum(x: torch.Tensor) -> torch.Tensor:
+    return torch.cat([torch.zeros_like(x), x])
+
+
+@torch.fx.wrap
+def _rtp_torch_jagged_to_padded_dense(
+    values: torch.Tensor,
+    offsets: torch.Tensor,
+    max_lengths: List[int],
+    padding_value: float = 0,
+) -> torch.Tensor:
+    values = values.unsqueeze(0)
+    # dummy pad for fix:
+    #   Could not guard on data-dependent expression
+    #   Eq((u12//(u6 + u7 + 6)), 1)
+    pad_len = max_lengths[0] - values.size(1)
+    return F.pad(values, (0, 0, 0, pad_len))
+
+
+@torch.fx.wrap
+def _rtp_torch_dense_to_jagged(
+    dense: torch.Tensor, offsets: List[torch.Tensor], total_L: Optional[int] = None
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    return dense.squeeze(0), offsets
+
+
+@torch.fx.wrap
+def _rtp_torch_jagged_dense_elementwise_add_jagged_output(
+    x_values: torch.Tensor, x_offsets: List[torch.Tensor], y: torch.Tensor
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    return x_values + y.squeeze(0), x_offsets
+
+
+FBGEMM_RTP_TORCH_OP_MAPPING = {
+    torch.ops.fbgemm.asynchronous_complete_cumsum: _rtp_torch_asynchronous_complete_cumsum,  # NOQA
+    torch.ops.fbgemm.jagged_to_padded_dense: _rtp_torch_jagged_to_padded_dense,
+    torch.ops.fbgemm.dense_to_jagged: _rtp_torch_dense_to_jagged,
+    torch.ops.fbgemm.jagged_dense_elementwise_add_jagged_output: _rtp_torch_jagged_dense_elementwise_add_jagged_output,  # NOQA
+}
 
 
 def export_rtp_model(
@@ -438,23 +600,23 @@ def export_rtp_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    use_local_cache_dir: bool = False,
+    **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""
     try:
         from torch_fx_tool import ExportTorchFxTool
     except Exception as e:
         raise RuntimeError(
-            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251031.376cedb-py3-none-any.whl"
+            "torch_fx_tool not exist. please install https://tzrec.oss-accelerate.aliyuncs.com/third_party/rtp/torch_fx_tool-0.0.1%2B20251201.8c109c4-py3-none-any.whl"
         ) from e
-    assert os.environ["USE_FARM_HASH_TO_BUCKETIZE"] == "true", (
-        "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
-        "train/eval/export when use rtp for online inference."
-    )
 
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_rank_zero = rank == 0
+    is_local_rank_zero = local_rank == 0
     train_config = pipeline_config.train_config
 
     # RTP do not support fbgemm now. patch kt.regroup to slow path
@@ -468,9 +630,13 @@ def export_rtp_model(
     feature_to_embedding_info = _get_rtp_feature_to_embedding_info(model)
 
     graph_dir = os.path.join(save_dir, "graph")
-    if is_rank_zero:
+    if is_rank_zero or (use_local_cache_dir and is_local_rank_zero):
+        # when caching save_dir on local_rank, we need make save_dir
+        # for each worker
         if not os.path.exists(save_dir):
+            logger.info(f"make save dir {save_dir}")
             os.makedirs(save_dir)
+    if is_rank_zero:
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
     dist.barrier()
@@ -482,6 +648,7 @@ def export_rtp_model(
     data_config = pipeline_config.data_config
     features = cast(List[BaseFeature], model._features)
     data_config.num_workers = 1
+    data_config.batch_size = acc_utils.get_max_export_batch_size()
     dataloader = create_dataloader(
         data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
     )
@@ -489,13 +656,15 @@ def export_rtp_model(
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
     model.set_is_inference(True)
-    model.eval()
 
     # Build Sharded Model
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
         batch_size=dataloader.dataset.sampled_batch_size,
+        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+        if checkpoint_path
+        else None,
         global_constraints_cfg=train_config.global_embedding_constraints
         if train_config.HasField("global_embedding_constraints")
         else None,
@@ -514,14 +683,21 @@ def export_rtp_model(
         init_parameters=False,
         init_data_parallel=False,
     )
+    dmp_model.eval()
 
     # Trace Sharded Model
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_leaf_module_names(unwrap_model))
+    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
     full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
             f.write(str(full_graph))
+
+    def _seq_len_name(seq_name: str) -> str:
+        return seq_name + "_sequence_length"
+
+    def _seq_feat_name(seq_name: str) -> str:
+        return seq_name + "_sequence"
 
     # Extract Sparse Model
     logger.info("exporting sparse model...")
@@ -544,13 +720,34 @@ def export_rtp_model(
                     "keys", args=(node_kt,)
                 )
         elif node.op == "call_function" and node.target == fx_mark_tensor:
-            # sequence or query name
+            # query
             name = node.args[0]
             t = node.args[1]
             outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
+            # sequence
+            seq_name = node.args[0]
+            name = _seq_feat_name(seq_name)
+            seq_node = node.args[1]
+            assert node.kwargs["max_seq_len"] is not None, (
+                f"[{node.kwargs['keys']}] should config sequence_length."
+            )
+            if node.kwargs["is_jagged_seq"]:
+                assert data_config.batch_size == 1, (
+                    "jagged sequence only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
+                )
+                with graph.inserting_after(seq_node):
+                    seq_node = graph.call_function(torch.unsqueeze, args=(seq_node, 0))
+            # rtp table_api always padding sequence to max_seq_len
+            with graph.inserting_after(seq_node):
+                seq_node = graph.call_function(
+                    _rtp_pad_to_max_seq_len, args=(seq_node, node.kwargs["max_seq_len"])
+                )
+            outputs[name] = seq_node
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence length
-            name = node.args[0]
+            seq_name = node.args[0]
+            name = _seq_len_name(seq_name)
             t = node.args[1]
             with graph.inserting_after(t):
                 # RTP do not support rank=1 tensor
@@ -569,31 +766,24 @@ def export_rtp_model(
         device=device,
         plan=plan,
     )
+    sparse_model.eval()
     checkpoint_util.restore_model(checkpoint_path, sparse_model)
     sparse_output, sparse_attrs = sparse_model(data, device=device)
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")
-    local_tensor, meta = _get_rtp_embedding_tensor(sparse_model)
-    save_file(
-        local_tensor,
-        os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.safetensors"),
+    local_tensor, meta = _get_rtp_embedding_tensor(
+        sparse_model, checkpoint_path, feature_to_embedding_info.values()
     )
-    with open(
-        os.path.join(save_dir, f"model-{rank:06d}-of-{world_size:06d}.json"), "w"
-    ) as f:
+    local_tensor_name = f"model-{rank:06d}-of-{world_size:06d}"
+    local_tensor_path = os.path.join(save_dir, f"{local_tensor_name}.safetensors")
+    logger.info(f"save safetensor to {local_tensor_path}")
+    save_file(local_tensor, local_tensor_path)
+    with open(os.path.join(save_dir, f"{local_tensor_name}.json"), "w") as f:
         json.dump(meta, f, indent=4)
 
     # Extract Dense Model
     logger.info("exporting dense model...")
     additional_fg = []
-    seqname_mapping = {}
-    for feature in features:
-        if feature.is_grouped_sequence:
-            # rtp do not use __ concat sequence_name and feature_name
-            # pyre-ignore [16]
-            seqname_mapping[feature.name] = (
-                f"{feature.sequence_name}_{feature.config.feature_name}"
-            )
 
     graph = copy.deepcopy(full_graph)
     output_keys = []
@@ -602,10 +792,39 @@ def export_rtp_model(
     for node in graph.nodes:
         if node.op == "output":
             for k, v in sorted(node.args[0].items()):
+                if k == TRAGET_REPEAT_INTERLEAVE_KEY:
+                    continue
                 output_keys.append(k)
                 output_values.append(v)
             graph.erase_node(node)
     input_node = next(node for node in graph.nodes if node.op == "placeholder")
+
+    seq_len_nodes = {}
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            seq_name = node.args[0]
+            name = _seq_len_name(seq_name)
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                # rtp do not support RANK=1 tensor
+                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
+                seq_len_nodes[seq_name] = new_node
+                # add sequence_length into fg
+                additional_fg.append(
+                    {
+                        "feature_name": name,
+                        "feature_type": "raw_feature",
+                        "expression": f"user:{name}",
+                    }
+                )
+                logger.info(f"You should add additional feature [{name}] into qinfo.")
+                mc_config[name] = [name]
+            node_t.replace_all_uses_with(new_node)
+
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
             name = node.args[0]
@@ -625,39 +844,54 @@ def export_rtp_model(
                 mc_config[name] = new_node.kwargs["keys"]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_tensor:
-            # sequence or query name
+            # query
             name = node.args[0]
             node_t = node.args[1]
             with graph.inserting_before(node_t):
                 new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                keys = [
-                    seqname_mapping[k] if k in seqname_mapping else k
-                    for k in node.kwargs["keys"]
-                ]
-                mc_config[name] = keys
+                mc_config[name] = node.kwargs["keys"]
             node_t.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_seq_len:
-            # sequence_length
-            name = node.args[0]
+        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
+            # sequence
+            seq_name = node.args[0]
+            name = _seq_feat_name(seq_name)
             node_t = node.args[1]
             with graph.inserting_before(node_t):
-                get_node = graph.call_function(
+                new_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                # rtp do not support RANK=1 tensor
-                new_node = graph.call_function(torch.squeeze, args=(get_node, 1))
-                # add sequence_length into fg
-                additional_fg.append(
-                    {
-                        "feature_name": name,
-                        "feature_type": "raw_feature",
-                        "expression": f"user:{name}",
-                    }
+                new_node = graph.call_function(
+                    _rtp_slice_with_seq_len,
+                    args=(
+                        new_node,
+                        seq_len_nodes[seq_name],
+                        node.kwargs["max_seq_len"],
+                    ),
                 )
-                mc_config[name] = [name]
+                if node.kwargs["is_jagged_seq"]:
+                    assert data_config.batch_size == 1, (
+                        "jagged sequence only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
+                    )
+                    new_node = graph.call_function(torch.squeeze, args=(new_node, 0))
+                mc_config[name] = node.kwargs["keys"]
             node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and "fbgemm" in str(node.target):
+            # rtp do not support fbgemm op now.
+            if node.target in FBGEMM_RTP_TORCH_OP_MAPPING.keys():
+                assert data_config.batch_size == 1, (
+                    "{node.target} op only support MAX_EXPORT_BATCH_SIZE=1 when export rtp."  # NOQA
+                )
+                with graph.inserting_before(node):
+                    new_node = graph.call_function(
+                        FBGEMM_RTP_TORCH_OP_MAPPING[node.target],
+                        args=node.args,
+                        kwargs=node.kwargs,
+                    )
+                node.replace_all_uses_with(new_node)
+            else:
+                raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
     gm.graph.eliminate_dead_code()
@@ -672,9 +906,15 @@ def export_rtp_model(
         _ = gm(sparse_output)
 
         # Save Dense Model
-        fx_tool = ExportTorchFxTool(os.path.join(save_dir, "fx_user_model"))
-        fx_tool.set_output_nodes_name(output_keys)
-        fx_tool.export_fx_model(gm, sparse_output, mc_config)
+        # when batch_size=1, we assume gr model.
+        dynamic = data_config.batch_size > 1
+        # remove device metadata assert to fix: torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function aten._assert_tensor_metadata.default*(FakeTensor(..., device-'cuda:0', size-(u1, 512)), None, None, torch. float32), **{'device': device(type-'cuda", index-0), 'layout': torch.strided}): got RuntimeError(Tensor device mismatch!')   # NOQA
+        with torch._export.utils._disable_aten_to_metadata_assertions():
+            fx_tool = ExportTorchFxTool(
+                os.path.join(save_dir, "fx_user_model"), dynamic=dynamic
+            )
+            fx_tool.set_output_nodes_name(output_keys)
+            fx_tool.export_fx_model(gm, sparse_output, mc_config)
 
         has_fg_asset = False
         if assets is not None:
@@ -691,3 +931,154 @@ def export_rtp_model(
             _adjust_fg_json_for_rtp(fg_json, feature_to_embedding_info)
             with open(os.path.join(save_dir, "fg.json"), "w") as f:
                 json.dump(fg_json, f, indent=4)
+
+
+def split_model(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: Optional[str],
+    save_dir: str,
+    rank=0,
+) -> List[nn.Module]:
+    """Split an EasyRec model into sparse part and dense part."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_rank_zero = rank == 0
+    graph_dir = os.path.join(save_dir, "graph")
+    if is_rank_zero:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        if not os.path.exists(graph_dir):
+            os.makedirs(graph_dir)
+
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+
+    # make dataparser to get user feats before create model
+    data_config = pipeline_config.data_config
+    features = cast(List[BaseFeature], model._features)
+    data_config.num_workers = 1
+    dataloader = create_dataloader(
+        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
+    )
+    batch = next(iter(dataloader))
+    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+
+    model.set_is_inference(True)
+    model.eval()
+
+    tracer = Tracer()
+    full_graph = tracer.trace(model)  # , concrete_args=concrete_args)
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+            f.write(str(full_graph))
+
+    def _seq_len_name(seq_name: str) -> str:
+        return seq_name + "__sequence_length"
+
+    def _seq_feat_name(seq_name: str) -> str:
+        return seq_name + "__sequence"
+
+    # Extract Sparse Model
+    logger.info("exporting sparse model...")
+    graph = copy.deepcopy(full_graph)
+    for node in graph.nodes:
+        if node.op == "output":
+            graph.erase_node(node)
+    outputs = {}
+    output_attrs = {}
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            node_kt = node.args[1]
+            with graph.inserting_after(node_kt):
+                outputs[name] = graph.call_method("values", args=(node_kt,))
+                output_attrs[name + "__length_per_key"] = graph.call_method(
+                    "length_per_key", args=(node_kt,)
+                )
+                output_attrs[name + "__keys"] = graph.call_method(
+                    "keys", args=(node_kt,)
+                )
+        elif node.op == "call_function" and node.target in (
+            fx_mark_tensor,
+            fx_mark_seq_tensor,
+        ):
+            # sequence or query
+            name = (
+                node.args[0]
+                if node.target == fx_mark_tensor
+                else _seq_feat_name(node.args[0])
+            )
+            t = node.args[1]
+            outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
+            # sequence
+            name = node.args[0]
+            t = node.args[1]
+            outputs[name] = t
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence length
+            name = _seq_len_name(node.args[0])
+            t = node.args[1]
+            outputs[name] = t
+    graph.output(tuple([outputs, output_attrs]))
+    sparse_gm = torch.fx.GraphModule(model, graph)
+    sparse_gm.graph.eliminate_dead_code()
+    sparse_gm = _prune_unused_param_and_buffer(sparse_gm)
+    if is_rank_zero:
+        with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
+            f.write(str(sparse_gm.graph))
+    _, sparse_attrs = sparse_gm(data, device=device)
+
+    # Extract Dense Model
+    logger.info("exporting dense model...")
+
+    graph = copy.deepcopy(full_graph)
+    input_node = next(node for node in graph.nodes if node.op == "placeholder")
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = node.args[0]
+            node_kt = node.args[1]
+            with graph.inserting_before(node_kt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                new_node = graph.call_function(
+                    KeyedTensor,
+                    kwargs={
+                        "keys": sparse_attrs[name + "__keys"],
+                        "length_per_key": sparse_attrs[name + "__length_per_key"],
+                        "values": getitem_node,
+                    },
+                )
+                node_kt.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target in (
+            fx_mark_tensor,
+            fx_mark_seq_tensor,
+        ):
+            # sequence or query name
+            name = (
+                node.args[0]
+                if node.target == fx_mark_tensor
+                else _seq_feat_name(node.args[0])
+            )
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                new_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+            node_t.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_len:
+            # sequence_length
+            name = _seq_len_name(node.args[0])
+            node_t = node.args[1]
+            with graph.inserting_before(node_t):
+                get_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+
+            node_t.replace_all_uses_with(get_node)
+    dense_gm = torch.fx.GraphModule(model, graph)
+    dense_gm.graph.eliminate_dead_code()
+    dense_gm = _prune_unused_param_and_buffer(dense_gm)
+
+    return sparse_gm, dense_gm

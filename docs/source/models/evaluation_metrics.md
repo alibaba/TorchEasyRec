@@ -4,9 +4,67 @@
 
 在模型训练与评估过程中，选择合适的评估指标对于衡量模型性能至关重要。本文档基于 `tzrec` 中定义的评估指标配置，详细介绍各类评估指标及其参数含义。
 
+### 评估时指标
+
+在model_config中配置metrics，则会在评估时中打印评估集上的对应指标。
+
+```
+model_config {
+    metrics: {
+        auc {
+            thresholds: 200
+        }
+    }
+}
+```
+
+对于多任务的模型，需在任务task_towers下面配置metrics
+
+多任务的示例
+
+```
+model_config {
+   dbmtl {
+     task_towers {
+        metrics: {
+          auc {
+            thresholds: 200
+          }
+        }
+     }
+    ...
+   }
+}
+```
+
+### 训练时指标
+
+tzrec支持在模型训练过程中对训练集在线计算模型指标，模型backward前会对指标进行计算和累积，并支持对历史累积的指标值进行衰减。
+
+在model_config中配置train_metrics，则会在训练过程中打印对应的指标。对于多任务的模型，需在task_towers下面，配置train_metrics
+
+```
+model_config {
+    train_metrics: {
+        auc {
+            thresholds: 200
+        }
+        decay_rate: 0.9
+        decay_step: 100
+    }
+}
+```
+
+- train_metrics
+  - metric: 训练时评估指标类型，支持的训练时评估指标包括AUC,RecallAtK,MeanAbsoluteError,MeanSquaredError,Accuracy,XAUC
+  - decay_rate: 默认为0.9，历史指标的衰减率。
+  - decay_step: 默认为100，历史指标每训练多少step会进行一次衰减，配置需要可以被train_config.log_step_count_steps整除。
+
 ______________________________________________________________________
 
-## AUC
+## 指标详情
+
+### AUC
 
 **AUC（Area Under the ROC Curve）** 是二分类任务中最常用的评估指标之一，表示模型区分正负样本的能力。其值介于 0 到 1 之间，数值越大说明模型性能越好。
 
@@ -26,7 +84,7 @@ model_config {
 }
 ```
 
-### AUC 离线计算
+#### AUC 离线计算
 
 在PAI上可以用pai命令对于模型预测结果的MaxCompute表精确计算AUC
 
@@ -41,7 +99,7 @@ pai -name=evaluate -project=algo_public
 
 ______________________________________________________________________
 
-## MulticlassAUC
+### MulticlassAUC
 
 **多分类 AUC（Multiclass AUC）** 扩展了传统 AUC 到多类别场景，适用于标签数量大于 2 的分类任务。支持多种平均方式来综合各类别 AUC 值。
 
@@ -66,7 +124,7 @@ model_config {
 
 ______________________________________________________________________
 
-## Accuracy
+### Accuracy
 
 **准确率（Accuracy）** 表示预测正确的样本占总样本的比例，适用于分类任务。当类别数大于 1 时，支持 Top-K 准确率。
 
@@ -90,7 +148,7 @@ model_config {
 
 ______________________________________________________________________
 
-## RecallAtK
+### RecallAtK
 
 **召回率@K（Recall@K）** 衡量在前 K 个推荐结果中有多少比例的相关项目被成功召回。只支持向量召回任务。
 
@@ -115,7 +173,7 @@ model_config {
 
 ______________________________________________________________________
 
-## MeanAbsoluteError
+### MeanAbsoluteError
 
 **平均绝对误差（MAE）** 是回归任务中的常用指标，表示预测值与真实值之间绝对误差的平均值。
 
@@ -138,7 +196,7 @@ model_config {
 
 ______________________________________________________________________
 
-## MeanSquaredError
+### MeanSquaredError
 
 **均方误差（MSE）** 衡量预测值与真实值之间的平方误差的平均值，对异常值更敏感，广泛用于回归任务。
 
@@ -160,13 +218,13 @@ model_config {
 
 ______________________________________________________________________
 
-## GroupedAUC
+### GroupedAUC
 
 **分组 AUC（Grouped AUC）** 是一种扩展的 AUC 指标，用于评估在特定分组维度下的排序能力。常用于推荐系统中按用户、物品或其他业务维度进行分组评估。
 
 | 字段名       | 类型   | 是否必填 | 描述                                                                                                                               |
 | ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| grouping_key | string | required | 用于分组的字段名称（如 `"user_id"`），必须提供。分组字段需要再feature_configs中，一般可以设置较大的num_buckets或者hash_bucket_size |
+| grouping_key | string | required | 用于分组的字段名称（如 `"user_id"`），必须提供。分组字段需要在feature_configs中，一般可以设置较大的num_buckets或者hash_bucket_size |
 | 配置示例     |        |          |                                                                                                                                    |
 
 ```
@@ -181,7 +239,7 @@ model_config {
 
 ______________________________________________________________________
 
-### GroupedAUC 离线计算
+#### GroupedAUC 离线计算
 
 若训练时显存不足，可通过 SQL 对模型的离线预测结果表 计算 GAUC：
 
@@ -213,7 +271,7 @@ FROM (
 
 ______________________________________________________________________
 
-## XAUC
+### XAUC
 
 **XAUC** 是 GroupedAUC 的变体，用于评估在连续值目标的分组维度下的排序能力
 
@@ -240,7 +298,7 @@ model_config {
 
 ______________________________________________________________________
 
-## GroupedXAUC
+### GroupedXAUC
 
 **GroupedXAUC** 是 GroupedAUC 的变体，用于评估在连续值目标的分组维度下的排序能力。
 

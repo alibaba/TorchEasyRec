@@ -303,16 +303,20 @@ def restore_model(
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
-        logger.info(f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding...")
-        DynamicEmbLoad(
-            os.path.join(checkpoint_dir, "dynamicemb"),
-            model,
-            table_names=meta.get("dynamicemb_load_table_names", None),
-            optim=meta.get("dynamicemb_load_optim", optimizer is not None),
-        )
-        logger.info(
-            f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
-        )
+        dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
+        if os.path.exists(dynamicemb_path):
+            logger.info(
+                f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding..."
+            )
+            DynamicEmbLoad(
+                dynamicemb_path,
+                model,
+                table_names=meta.get("dynamicemb_load_table_names", None),
+                optim=meta.get("dynamicemb_load_optim", optimizer is not None),
+            )
+            logger.info(
+                f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
+            )
 
 
 def save_model(
@@ -358,7 +362,7 @@ def save_model(
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:
-    """List."""
+    """List distributed checkpoint parameter names."""
     meta_paths = []
     if os.path.exists(os.path.join(checkpoint_dir, ".metadata")):
         meta_paths.append(checkpoint_dir)

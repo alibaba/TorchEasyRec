@@ -9,10 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 from datetime import timedelta
 from queue import Queue
-from typing import List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple, Type
 
 import torch
 from torch import distributed as dist
@@ -33,11 +34,12 @@ from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel as _DistributedModelParallel,
 )
-from torchrec.distributed.train_pipeline import TrainPipeline
+from torchrec.distributed.train_pipeline import TrainPipeline, TrainPipelineContext
 from torchrec.distributed.train_pipeline import TrainPipelineBase as _TrainPipelineBase
 from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist as _TrainPipelineSparseDist,
 )
+from torchrec.distributed.train_pipeline.pipeline_context import In, Out
 from torchrec.distributed.types import (
     Awaitable,
     ModuleSharder,
@@ -207,18 +209,110 @@ class TrainPipelineBase(_TrainPipelineBase):
 class TrainPipelineSparseDist(_TrainPipelineSparseDist):
     """TorchEasyRec's TrainPipelineSparseDist, make backward support grad scaler."""
 
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        # keep for backward compatibility
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enqueue_batch_after_forward: bool = False,
+        check_all_workers_data_status: bool = False,
+    ) -> None:
+        super().__init__(
+            model,
+            optimizer,
+            device,
+            execute_all_batches,
+            apply_jit,
+            context_type,
+            pipeline_postproc,
+            custom_model_fwd,
+            dmp_collection_sync_interval_batches,
+            enqueue_batch_after_forward,
+        )
+        self._check_all_workers_data_status = check_all_workers_data_status
+
+    def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+        if dataloader_iter is not self._dataloader_iter:
+            self._dataloader_iter = dataloader_iter
+            self._dataloader_exhausted = False
+
+        if self._dataloader_exhausted:
+            batch = None
+        else:
+            with record_function("## next_batch ##"):
+                batch = next(dataloader_iter, None)
+
+            if self._check_all_workers_data_status:
+                # Check if all workers either have or do not have a batch available.
+                has_batch = torch.tensor(
+                    0 if batch is None else 1, dtype=torch.float, device=self._device
+                )
+                dist.all_reduce(has_batch, dist.ReduceOp.AVG)
+                if has_batch.item() < 1:
+                    # We drop remainder batches on all workers,
+                    # if one worker does not have a batch
+                    self._dataloader_exhausted = True
+                    batch = None
+            else:
+                if batch is None:
+                    self._dataloader_exhausted = True
+        return batch
+
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
 
 
+class PredictPipelineSparseDist(_TrainPipelineSparseDist):
+    """TorchEasyRec's PredictPipelineSparseDist, make predict do not hang."""
+
+    def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+        if dataloader_iter is not self._dataloader_iter:
+            self._dataloader_iter = dataloader_iter
+            self._dataloader_exhausted = False
+
+        if self._dataloader_exhausted:
+            batch = None
+        else:
+            with record_function("## next_batch ##"):
+                batch = next(dataloader_iter, None)
+
+            # Check if all workers either have or do not have a batch available.
+            has_batch = torch.tensor(
+                0 if batch is None else 1, dtype=torch.float, device=self._device
+            )
+            dist.all_reduce(has_batch, dist.ReduceOp.AVG)
+            if batch is None:
+                if has_batch.item() > 0:
+                    # If some workers still have a batch, create a dummy batch
+                    # to avoid potential hang.
+                    batch = copy.copy(self.batches[0])
+                    batch.dummy = True
+                else:
+                    self._dataloader_exhausted = True
+        return batch
+
+
 def create_train_pipeline(
-    model: nn.Module, optimizer: Optional[torch.optim.Optimizer] = None
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    check_all_workers_data_status: bool = False,
 ) -> TrainPipeline:
     """Create TrainPipeline.
 
     Args:
         model (nn.Module): a DMP model.
         optimizer (torch.optim.Optimizer): a KeyedOptimizer.
+        check_all_workers_data_status (bool): check data on all workers
+            is available or not.
 
     Return:
         a TrainPipeline.
@@ -247,4 +341,5 @@ def create_train_pipeline(
             optimizer,
             model.device,
             execute_all_batches=True,
+            check_all_workers_data_status=check_all_workers_data_status,
         )

@@ -17,28 +17,13 @@ from typing import Optional, Tuple
 
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
-from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
-from tzrec.ops.pytorch.pt_jagged_tensors import (
+from tzrec.ops._pytorch.pt_jagged_tensors import (
     pytorch_concat_2D_jagged,
     pytorch_jagged_dense_bmm_broadcast_add,
     pytorch_split_2D_jagged,
 )
-
-torch.fx.wrap("pytorch_concat_2D_jagged")
-torch.fx.wrap("pytorch_split_2D_jagged")
-
-if has_triton():
-    from tzrec.ops.triton.triton_jagged_tensors import (
-        triton_concat_2D_jagged,
-        triton_jagged_dense_bmm_broadcast_add,
-        triton_split_2D_jagged,
-    )
-else:
-    triton_concat_2D_jagged = pytorch_concat_2D_jagged
-    triton_jagged_dense_bmm_broadcast_add = pytorch_jagged_dense_bmm_broadcast_add
-    pytorch_split_2D_jagged = pytorch_split_2D_jagged
 
 
 def concat_2D_jagged(
@@ -58,6 +43,8 @@ def concat_2D_jagged(
             f"values_left shape[1] must be equal to values_right shape[1] {values_left.shape[1]} vs {values_right.shape[1]}",  # NOQA
         )
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_jagged_tensors import triton_concat_2D_jagged
+
         return triton_concat_2D_jagged(
             values_left=values_left,
             values_right=values_right,
@@ -110,6 +97,10 @@ def split_2D_jagged(
                 "offsets_left shape[0] must be equal to offsets_right shape[0]",
             )
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_jagged_tensors import (
+            triton_split_2D_jagged,
+        )
+
         return triton_split_2D_jagged(
             max_seq_len=max_seq_len,
             values=values,
@@ -154,6 +145,10 @@ def jagged_dense_bmm_broadcast_add(
         torch._assert(bias.shape[0] == B, "wrong bias shape[0]")
         torch._assert(bias.shape[1] == N, "wrong bias shape[1]")
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_jagged_tensors import (
+            triton_jagged_dense_bmm_broadcast_add,
+        )
+
         return triton_jagged_dense_bmm_broadcast_add(
             max_seq_len=max_seq_len,
             seq_offsets=seq_offsets,

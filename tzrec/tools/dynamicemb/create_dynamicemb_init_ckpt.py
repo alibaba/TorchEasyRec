@@ -24,7 +24,6 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_checkpoint_file_path,
     encode_meta_json_file_path,
 )
-from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 from dynamicemb.planner import DynamicEmbParameterConstraints
 
 from tzrec.datasets.dataset import BaseReader, create_reader
@@ -43,8 +42,6 @@ class DynamicEmbTableInitInfo:
     table_path: str
     # embedding save dir
     save_paths: List[str]
-    # need dump embedding score or not.
-    need_dump_scores: List[bool]
     # embedding dimension
     embedding_dim: int
     # embedding field separator
@@ -113,14 +110,12 @@ def _write_loop(
     rank: int,
     world_size: int,
     save_paths: List[str],
-    need_dump_scores: List[bool],
     reader_worker_num: int,
 ) -> None:
-    assert len(save_paths) == len(need_dump_scores)
     fkeys = []
     fvalues = []
     fscores = []
-    for save_dir, need_dump_score in zip(save_paths, need_dump_scores):
+    for save_dir in save_paths:
         fkeys.append(
             open(
                 encode_checkpoint_file_path(
@@ -137,17 +132,14 @@ def _write_loop(
                 "wb",
             )
         )
-        if need_dump_score:
-            fscores.append(
-                open(
-                    encode_checkpoint_file_path(
-                        save_dir, emb_name, rank, world_size, "scores"
-                    ),
-                    "wb",
-                )
+        fscores.append(
+            open(
+                encode_checkpoint_file_path(
+                    save_dir, emb_name, rank, world_size, "scores"
+                ),
+                "wb",
             )
-        else:
-            fscores.append(None)
+        )
 
     exit_cnt = 0
     prev_logger_rows = 0
@@ -234,7 +226,6 @@ def _init_one_emb(
                 i,
                 world_size,
                 init_info.save_paths,
-                init_info.need_dump_scores,
                 reader_worker_num,
             ),
         )
@@ -343,8 +334,7 @@ if __name__ == "__main__":
                     and emb_config.name in dyemb_name_to_mod_options
                 )
                 save_paths = []
-                need_dump_scores = []
-                for mod_path, options in dyemb_name_to_mod_options[emb_config.name]:
+                for mod_path, _options in dyemb_name_to_mod_options[emb_config.name]:
                     dynamicemb_load_table_names[mod_path].append(emb_config.name)
                     save_path = os.path.join(ckpt_dir, "dynamicemb", mod_path)
                     os.makedirs(save_path, exist_ok=True)
@@ -353,14 +343,10 @@ if __name__ == "__main__":
                     ) as f:
                         f.write(json.dumps({}))
                     save_paths.append(save_path)
-                    need_dump_scores.append(
-                        options.score_strategy != DynamicEmbScoreStrategy.TIMESTAMP
-                    )
 
                 dyemb_name_to_init_info[emb_config.name] = DynamicEmbTableInitInfo(
                     table_path=feature.config.dynamicemb.init_table,
                     save_paths=save_paths,
-                    need_dump_scores=need_dump_scores,
                     embedding_dim=emb_config.embedding_dim,
                     separator=args.separator,
                 )

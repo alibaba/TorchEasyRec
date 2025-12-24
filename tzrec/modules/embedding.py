@@ -46,6 +46,7 @@ from tzrec.utils.fx_util import (
     fx_int_item,
     fx_mark_keyed_tensor,
     fx_mark_seq_len,
+    fx_mark_seq_tensor,
     fx_mark_tensor,
 )
 
@@ -55,6 +56,7 @@ EMPTY_KJT = KeyedJaggedTensor.empty()
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_mark_keyed_tensor)
 torch.fx.wrap(fx_mark_tensor)
+torch.fx.wrap(fx_mark_seq_tensor)
 torch.fx.wrap(fx_mark_seq_len)
 
 
@@ -390,6 +392,12 @@ class EmbeddingGroup(nn.Module):
         if feature_group.group_type in (model_pb2.SEQUENCE, model_pb2.JAGGED_SEQUENCE):
             raise ValueError("not support sequence group")
         return self._group_feature_dims[group_name]
+
+    def group_type(self, group_name: str) -> model_pb2.FeatureGroupType:
+        """Get feature group type."""
+        true_name = group_name.split(".")[0] if "." in group_name else group_name
+        feature_group = self._name_to_feature_group[true_name]
+        return feature_group.group_type
 
     def has_group(self, group_name: str) -> bool:
         """Check the feature group exist or not."""
@@ -918,10 +926,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
         self._group_to_shared_query = OrderedDict()
         self._group_to_shared_sequence = OrderedDict()
-        self._group_to_shared_feature = OrderedDict()
         self._group_total_dim = dict()
         self._group_output_dims = dict()
         self._group_to_is_jagged = dict()
+        self._group_to_sequence_length = OrderedDict()
 
         feat_to_group_to_emb_name = defaultdict(dict)
         for feature_group in feature_groups:
@@ -955,7 +963,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             feature_names = list(feature_group.feature_names)
             shared_query = []
             shared_sequence = []
-            shared_feature = []
+            group_sequence_length = None
 
             for name in feature_names:
                 shared_name = name
@@ -1046,16 +1054,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     shared_sequence.append(shared_info)
                     sequence_dim += output_dim
                     sequence_dims.append(output_dim)
+                    group_sequence_length = feature.sequence_length
                 else:
                     shared_query.append(shared_info)
                     query_dim += output_dim
                     query_dims.append(output_dim)
-                shared_feature.append(shared_info)
                 output_dims.append(output_dim)
 
             self._group_to_shared_query[group_name] = shared_query
             self._group_to_shared_sequence[group_name] = shared_sequence
-            self._group_to_shared_feature[group_name] = shared_feature
+            self._group_to_sequence_length[group_name] = group_sequence_length
             self._group_total_dim[f"{group_name}.query"] = query_dim
             self._group_total_dim[f"{group_name}.sequence"] = sequence_dim
             self._group_output_dims[f"{group_name}.query"] = query_dims
@@ -1302,7 +1310,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
                     if need_tile:
                         sequence_length = sequence_length.tile(tile_size)
-                    fx_mark_seq_len(f"{group_name}__sequence_length", sequence_length)
+                    fx_mark_seq_len(f"{group_name}", sequence_length)
                     results[f"{group_name}.sequence_length"] = sequence_length
 
                 if (
@@ -1320,7 +1328,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
             if seq_t_list:
                 seq_cat_t = torch.cat(seq_t_list, dim=-1)
-                fx_mark_tensor(f"{group_name}__sequence", seq_cat_t, keys=seq_t_keys)
+                fx_mark_seq_tensor(
+                    f"{group_name}",
+                    seq_cat_t,
+                    keys=seq_t_keys,
+                    max_seq_len=self._group_to_sequence_length[group_name],
+                    is_jagged_seq=self._group_to_is_jagged[group_name],
+                )
                 results[f"{group_name}.sequence"] = seq_cat_t
 
         return results

@@ -6,7 +6,7 @@ repos:
         files: \.py$
         args: ["--license-filepath", "data/.license_header.txt", "--allow-past-years"]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.13.0
+    rev: v0.14.8
     hooks:
       - id: ruff
         args: [ --fix ]

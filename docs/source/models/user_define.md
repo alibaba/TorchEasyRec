@@ -48,7 +48,7 @@ bash scripts/gen_proto.sh
 
 - 根据输入的`batch`数据，进行前向推理，得到`predictions`
   - `batch`为`tzrec.datasets.utils.Batch`的数据结构，包含`dense_features`（稠密特征）、`sparse_features`（稀疏特征）、`sequence_dense_features` (序列稠密特征)
-  - 一般可以将`dense_features`、`sparse_features`、`sequence_dense_features` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
+  - 一般可以将`batch` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
 
 ### 损失: init_loss & loss
 
@@ -71,8 +71,8 @@ bash scripts/gen_proto.sh
 以排序模型为例
 
 ```python
-# tzrec/model/custom_rank_model.py
-from typing import Dict, List
+# tzrec/models/custom_rank_model.py
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -96,9 +96,14 @@ class CustomRankModel(RankModel):
     """
 
     def __init__(
-        self, model_config: ModelConfig, features: List[BaseFeature], labels: List[str]
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels)
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
         # 构建EmbeddingGroup
         self.embedding_group = EmbeddingGroup(
             features, list(model_config.feature_groups)
@@ -114,6 +119,7 @@ class CustomRankModel(RankModel):
         # 初始化其他模块
         ...
 
+
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
 
@@ -124,12 +130,14 @@ class CustomRankModel(RankModel):
             predictions (dict): a dict of predicted result.
         """
         grouped_features = self.embedding_group(
-            batch.sparse_features, batch.dense_features
+            batch
         )
-        features = torch.cat(grouped_features, dim=-1)
+        features = torch.cat([grouped_features[name] for name in self.embedding_group.group_names()], dim=-1)
+        tower_output = self.mlp(features)
         y = self.output_mlp(tower_output)
         # 其他前向推理
         ...
+
         return self._output_to_prediction(y)
 ```
 
