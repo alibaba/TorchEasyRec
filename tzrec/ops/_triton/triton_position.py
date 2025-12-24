@@ -467,6 +467,7 @@ def triton_add_timestamp_positional_embeddings_fwd(
     num_targets: Optional[torch.Tensor],
     interleave_targets: bool,
     time_bucket_fn: str,
+    time_bucket_increments: float,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int
 ]:
@@ -511,7 +512,7 @@ def triton_add_timestamp_positional_embeddings_fwd(
         AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
         D=D,
         num_time_buckets=ts_emb_size - 1,
-        time_bucket_increments=60.0,
+        time_bucket_increments=time_bucket_increments,
         time_bucket_scale=1.0,
         time_delta=0,
         max_contextual_seq_len=max_contextual_seq_len,
@@ -555,6 +556,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         num_targets: Optional[torch.Tensor],
         interleave_targets: bool,
         time_bucket_fn: str,
+        time_bucket_increments: float,
     ):
         (
             out,
@@ -576,6 +578,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             num_targets=num_targets,
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
+            time_bucket_increments=time_bucket_increments,
         )
         ctx.save_for_backward(
             sorted_pos_key_inds,
@@ -691,6 +694,7 @@ def triton_add_timestamp_positional_embeddings(
     num_targets: Optional[torch.Tensor],
     interleave_targets: bool,
     time_bucket_fn: str,
+    time_bucket_increments: float,
 ) -> torch.Tensor:
     return _AddTimestampPositionEmbeddingsFunction.apply(
         seq_embeddings,
@@ -704,4 +708,5 @@ def triton_add_timestamp_positional_embeddings(
         num_targets,
         interleave_targets,
         time_bucket_fn,
+        time_bucket_increments,
     )

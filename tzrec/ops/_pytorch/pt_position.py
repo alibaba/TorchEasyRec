@@ -92,6 +92,7 @@ def pytorch_add_timestamp_positional_embeddings(
     num_targets: Optional[torch.Tensor],
     interleave_targets: bool,
     time_bucket_fn: str,
+    time_bucket_increments: float,
 ) -> torch.Tensor:
     max_pos_ind = pos_embeddings.size(0)
     # position encoding
@@ -106,7 +107,6 @@ def pytorch_add_timestamp_positional_embeddings(
     B, _ = pos_inds.shape
     # timestamp encoding
     num_time_buckets = ts_embeddings.shape[0] - 1
-    time_bucket_increments = 60.0
     time_bucket_divisor = 1.0
     time_delta = 0
     timestamps = torch.ops.fbgemm.jagged_to_padded_dense(
