@@ -253,6 +253,10 @@ message GRPositionalEncoder {
     optional uint32 num_time_buckets = 2;
     // use timestamp encoding or not.
     optional bool use_time_encoding = 3 [default = false];
+    // transform function for timestamp gap
+    optional string time_bucket_fn = 4 [default = "sqrt"];
+    // timestamp gap will div by time_bucket_increments
+    optional float time_bucket_increments = 5 [default = 60.0];
 }
 
 message HSTU {
