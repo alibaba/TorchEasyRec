@@ -193,3 +193,83 @@ LD_LIBRARY_PATH= torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.train_eval \
     --pipeline_config_path multi_tower_din_taobao_local.config
 ```
+
+______________________________________________________________________
+
+**Q12: kv特征的key包含":"导致报错**
+
+**报错信息：**
+
+```
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/train_eval.py", line 57, in <module>
+[rank0]:     train_and_evaluate(
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/main.py", line 776, in train_and_evaluate
+[rank0]:     _train_and_evaluate(
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/main.py", line 505, in _train_and_evaluate
+[rank0]:     losses, _, _ = pipeline.progress(train_iterator)
+[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 577, in progress
+[rank0]:     self.fill_pipeline(dataloader_iter)
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 538, in fill_pipeline
+[rank0]:     if not self.enqueue_batch(dataloader_iter):
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 495, in enqueue_batch
+[rank0]:     batch, context = self.copy_batch_to_gpu(dataloader_iter)
+[rank0]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 685, in copy_batch_to_gpu
+[rank0]:     batch = self._next_batch(dataloader_iter)
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 705, in _next_batch
+[rank0]:     batch = next(dataloader_iter, None)
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 733, in __next__
+[rank0]:     data = self._next_data()
+[rank0]:            ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1515, in _next_data
+[rank0]:     return self._process_data(data, worker_id)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1550, in _process_data
+[rank0]:     data.reraise()
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/_utils.py", line 750, in reraise
+[rank0]:     raise exception
+[rank0]: pyarrow.lib.ArrowInvalid: Caught ArrowInvalid in DataLoader worker process 0.
+[rank0]: Original Traceback (most recent call last):
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+[rank0]:     data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 42, in fetch
+[rank0]:     data = next(self.dataset_iter)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/dataset.py", line 311, in __iter__
+[rank0]:     yield self._build_batch(input_data)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/dataset.py", line 376, in _build_batch
+[rank0]:     sampled = self._sampler.get(input_data)
+[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 423, in get
+[rank0]:     features = self._parse_nodes(nodes)
+[rank0]:                ^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 323, in _parse_nodes
+[rank0]:     feature = _to_arrow_array(feature, attr_type)
+[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 160, in _to_arrow_array
+[rank0]:     items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "pyarrow/array.pxi", line 1000, in pyarrow.lib.Array.cast
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/pyarrow/compute.py", line 405, in cast
+[rank0]:     return call_function("cast", [arr], options, memory_pool)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "pyarrow/_compute.pyx", line 590, in pyarrow._compute.call_function
+[rank0]:   File "pyarrow/_compute.pyx", line 385, in pyarrow._compute.Function.call
+[rank0]:   File "pyarrow/error.pxi", line 155, in pyarrow.lib.pyarrow_internal_check_status
+[rank0]:   File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+[rank0]: pyarrow.lib.ArrowInvalid: Failed to parse string: 'false}' as a scalar of type float
+
+```
+
+**原因：** kv特征的key包含":"导致报错
+
+**解决方法：** 检查特征表string类型字段是否包含":"，进行数据清洗。
