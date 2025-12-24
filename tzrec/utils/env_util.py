@@ -11,7 +11,47 @@
 
 import os
 
+import torch
+
+from tzrec.utils.logging_util import logger
+
 
 def use_hash_node_id() -> bool:
     """Use hash node id or not."""
     return os.environ.get("USE_HASH_NODE_ID", "0") == "1"
+
+
+def use_rtp() -> bool:
+    """Use RTP for online inference or not."""
+    flag = os.environ.get("USE_RTP", "0") == "1"
+    if flag and os.environ.get("USE_FARM_HASH_TO_BUCKETIZE", "false") != "true":
+        logger.warning(
+            "you should set USE_FARM_HASH_TO_BUCKETIZE=true for "
+            "train/eval/export when use rtp for online inference."
+        )
+    return flag
+
+
+def enable_tma() -> bool:
+    """Enable TMA (Tensor Memory Accelerator) for triton ops."""
+    flag = os.environ.get("ENABLE_TMA", "0") == "1"
+    if flag:
+        if torch.cuda.is_available():
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 9:
+                import triton
+                from packaging import version
+
+                if version.parse(triton.__version__) >= version.parse("3.5.0"):
+                    return True
+                else:
+                    logger.warning("triton version lower than 3.5.0, we disable TMA.")
+            else:
+                logger.warning("device capability lower than 9.0, we disable TMA.")
+        else:
+            logger.warning("CUDA not available, we disable TMA.")
+    return False
+
+
+def force_load_sharding_plan() -> bool:
+    """Force load sharding plan in checkpoint or not."""
+    return os.environ.get("FORCE_LOAD_SHARDING_PLAN", "0") == "1"

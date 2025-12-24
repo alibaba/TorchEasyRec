@@ -67,9 +67,7 @@ message ModelConfig {
 
         TDM tdm = 400;
 
-        MultiTowerDINTRT multi_tower_din_trt =500;
-
-        RocketLaunching rocket_launching = 600;
+        RocketLaunching rocket_launching = 500;
     }
 
     optional uint32 num_class = 2 [default = 1];

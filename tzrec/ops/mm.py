@@ -14,14 +14,8 @@
 # thanks to their public work.
 
 import torch
-from torch.utils._triton import has_triton
 
 from tzrec.ops import Kernel
-
-if has_triton():
-    from tzrec.ops.triton.triton_addmm import triton_addmm
-else:
-    triton_addmm = torch.addmm
 
 
 def addmm(
@@ -31,6 +25,8 @@ def addmm(
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
     if kernel == Kernel.TRITON:
+        from tzrec.ops._triton.triton_addmm import triton_addmm
+
         return triton_addmm(input, mat1, mat2)
     else:
         return torch.addmm(input, mat1, mat2)

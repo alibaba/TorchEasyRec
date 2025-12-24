@@ -10,9 +10,10 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
+from torch import distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec import JaggedTensor
 
@@ -30,6 +31,7 @@ from tzrec.modules.utils import (
     init_linear_xavier_weights_zero_bias,
 )
 from tzrec.ops.utils import set_static_max_seq_lens
+from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
@@ -57,6 +59,14 @@ def _fx_construct_payload(
         results[k] = v.values()
     results.update(payload_features)
     return results
+
+
+@torch.fx.wrap
+def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
+    batch_size = torch.tensor(x.size(0), dtype=torch.float, device=x.device)
+    if dist.is_initialized():
+        dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
+    return batch_size
 
 
 class DlrmHSTU(RankModel):
@@ -87,7 +97,21 @@ class DlrmHSTU(RankModel):
 
         self.init_input()
 
-        contextual_feature_dims = self.embedding_group.group_dims("contextual")
+        contextual_group_type = self.embedding_group.group_type("contextual")
+        if contextual_group_type == model_pb2.SEQUENCE:
+            # When contextual uses the SEQUENCE group_type, it can share embeddings
+            # with uih/candidate sequences
+            self._contextual_group_name = "contextual.query"
+        elif contextual_group_type == model_pb2.DEEP:
+            self._contextual_group_name = "contextual"
+        else:
+            raise ValueError(
+                "contextual feature cannot be group type: "
+                f"{model_pb2.FeatureGroupType.Name(contextual_group_type)} now."
+            )
+        contextual_feature_dims = self.embedding_group.group_dims(
+            self._contextual_group_name
+        )
         if len(set(contextual_feature_dims)) > 1:
             raise ValueError(
                 "output_dim of features in contextual features_group must be same, "
@@ -107,6 +131,7 @@ class DlrmHSTU(RankModel):
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
             max_contextual_seq_len=len(contextual_feature_dims),
+            contextual_group_name=self._contextual_group_name,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
             listwise=False,
@@ -163,15 +188,17 @@ class DlrmHSTU(RankModel):
                     self._output_to_prediction_impl(
                         mt_preds[task_name],
                         loss_cfg,
+                        num_class=task_cfg.num_class,
                         suffix=f"_{task_name}",
                     )
                 )
+        predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = grouped_features[
+            "candidate.sequence_length"
+        ]
 
         return predictions
 
-    def _get_label(
-        self, batch: Batch, task_cfg: FusionSubTaskConfig
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name
         is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
         label = batch.sequence_dense_features[label_name]
@@ -182,14 +209,19 @@ class DlrmHSTU(RankModel):
             label_values = (
                 torch.bitwise_and(label_values, task_cfg.task_bitmask) > 0
             ).to(label_values.dtype)
-        return label_values, label.lengths()
+        return label_values
 
     def init_loss(self) -> None:
         """Initialize loss modules."""
         for task_cfg in self._task_configs:
             for loss_cfg in task_cfg.losses:
                 task_name = task_cfg.task_name
-                self._init_loss_impl(loss_cfg, suffix=f"_{task_name}", reduction="mean")
+                self._init_loss_impl(
+                    loss_cfg,
+                    num_class=task_cfg.num_class,
+                    suffix=f"_{task_name}",
+                    reduction="mean",
+                )
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
@@ -198,8 +230,11 @@ class DlrmHSTU(RankModel):
         losses = {}
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label, label_lengths = self._get_label(batch, task_cfg)
-            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            label = self._get_label(batch, task_cfg)
+            loss_weight = None
+            if self._model_config.enable_global_average_loss:
+                avg_batch_size = _fx_avg_batch_size(label)
+                loss_weight = label.size(0) / avg_batch_size
 
             for loss_cfg in task_cfg.losses:
                 losses.update(
@@ -207,8 +242,9 @@ class DlrmHSTU(RankModel):
                         predictions,
                         batch,
                         label,
-                        None,
+                        loss_weight,
                         loss_cfg,
+                        num_class=task_cfg.num_class,
                         suffix=f"_{task_name}",
                     )
                 )
@@ -222,11 +258,13 @@ class DlrmHSTU(RankModel):
             for metric_cfg in task_cfg.metrics:
                 self._init_metric_impl(
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )
             for metric_cfg in task_cfg.train_metrics:
                 self._init_train_metric_impl(
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )
             for loss_cfg in task_cfg.losses:
@@ -247,8 +285,7 @@ class DlrmHSTU(RankModel):
         """
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label, label_lengths = self._get_label(batch, task_cfg)
-            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            label = self._get_label(batch, task_cfg)
 
             for metric_cfg in task_cfg.metrics:
                 self._update_metric_impl(
@@ -256,6 +293,7 @@ class DlrmHSTU(RankModel):
                     batch,
                     label,
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )
             if losses is not None:
@@ -281,13 +319,13 @@ class DlrmHSTU(RankModel):
         """
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
-            label, label_lengths = self._get_label(batch, task_cfg)
-            predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = label_lengths
+            label = self._get_label(batch, task_cfg)
             for metric_cfg in task_cfg.train_metrics:
                 self._update_train_metric_impl(
                     predictions,
                     batch,
                     label,
                     metric_cfg,
+                    num_class=task_cfg.num_class,
                     suffix=f"_{task_name}",
                 )

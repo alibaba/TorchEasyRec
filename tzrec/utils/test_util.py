@@ -198,3 +198,16 @@ def get_test_dtypes(dtypes: List[torch.dtype]) -> List[torch.dtype]:
         else:
             results.append(dtype)
     return results
+
+
+def get_test_enable_tma() -> List[bool]:
+    """Get valid enable_tma options."""
+    results = [False]
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 9:
+            import triton
+            from packaging import version
+
+            if version.parse(triton.__version__) >= version.parse("3.5.0"):
+                results.append(True)
+    return results

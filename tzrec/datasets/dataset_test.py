@@ -14,6 +14,7 @@ import math
 import os
 import tempfile
 import unittest
+from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
@@ -39,15 +40,21 @@ class _TestReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         input_fields: Optional[List[pa.Field]] = None,
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
     ) -> None:
-        super().__init__(input_path, batch_size, selected_cols)
+        super().__init__(
+            input_path,
+            batch_size,
+            selected_cols,
+            sample_cost_field=sample_cost_field,
+            batch_cost_size=batch_cost_size,
+        )
         self.input_fields = input_fields or []
 
-    def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
-    ) -> Iterator[Dict[str, pa.Array]]:
+    def _reader(self) -> Iterator[pa.RecordBatch]:
         for _ in range(100):
-            input_data = {}
+            input_data = OrderedDict()
             for f in self.input_fields:
                 if f.type == pa.int32():
                     data = np.random.randint(
@@ -93,7 +100,19 @@ class _TestReader(BaseReader):
                     raise ValueError(f"Unknown input_type {f.type}")
 
                 input_data[f.name] = pa.array(data)
-            yield input_data
+
+            if self._sample_cost_field is not None and len(self._sample_cost_field) > 0:
+                input_data[self._sample_cost_field] = pa.array(
+                    list(range(self._batch_size)), type=pa.int64()
+                )
+            yield pa.RecordBatch.from_arrays(
+                list(input_data.values()), names=list(input_data.keys())
+            )
+
+    def to_batches(
+        self, worker_id: int = 0, num_workers: int = 1
+    ) -> Iterator[Dict[str, pa.Array]]:
+        yield from self._arrow_reader_iter(self._reader())
 
 
 class _TestDataset(BaseDataset):
@@ -103,6 +122,8 @@ class _TestDataset(BaseDataset):
         features: List[BaseFeature],
         input_path: str,
         input_fields: Optional[List[pa.Field]] = None,
+        sample_cost_field: Optional[str] = None,
+        batch_cost_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
@@ -112,6 +133,8 @@ class _TestDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names),
             self.input_fields,
+            sample_cost_field=sample_cost_field,
+            batch_cost_size=batch_cost_size,
         )
 
 
@@ -772,6 +795,50 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(
             batch.dense_features[BASE_DATA_GROUP]["list_list_str_e"].size(), (4, 1)
         )
+
+    def test_dataset_with_batch_cost(self):
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="str_c", type=pa.string()),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+        ]
+        features = create_features(feature_cfgs)
+
+        dataloader = DataLoader(
+            dataset=_TestDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=4,
+                    dataset_type=data_pb2.DatasetType.OdpsDataset,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path="",
+                input_fields=input_fields,
+                mode=Mode.TRAIN,
+                sample_cost_field="sample_cost",
+                batch_cost_size=4,
+            ),
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+        self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (6,))
 
 
 if __name__ == "__main__":

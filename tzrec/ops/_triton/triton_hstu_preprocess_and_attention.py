@@ -19,15 +19,15 @@ from typing import Optional, Tuple
 import torch
 from torch.nn import functional as F
 
-from tzrec.ops.triton.triton_addmm import (
+from tzrec.ops._triton.triton_addmm import (
     triton_addmm_bwd,
     triton_addmm_fwd,
 )
-from tzrec.ops.triton.triton_hstu_attention import (
+from tzrec.ops._triton.triton_hstu_attention import (
     triton_hstu_attention_bwd,
     triton_hstu_attention_fwd,
 )
-from tzrec.ops.triton.triton_layer_norm import (
+from tzrec.ops._triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
     triton_weighted_layer_norm_fwd,
     triton_weighted_layer_norm_fwd_with_mean_rstd,
@@ -58,6 +58,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         recompute_uvqk_in_backward: bool,
         recompute_normed_x_in_backward: bool,
         sort_by_length: bool,
+        enable_tma: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         normed_x, x_mean, x_rstd, BLOCK_D, num_warps = triton_weighted_layer_norm_fwd(
             x=x,
@@ -97,6 +98,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
+            enable_tma=enable_tma,
         )
         # update ctx
         saved_tensors = [
@@ -135,6 +137,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.norm_num_warps = num_warps
         ctx.contextual_seq_len = contextual_seq_len
         ctx.sort_by_length = sort_by_length
+        ctx.enable_tma = enable_tma
         return silu_u, out
 
     @staticmethod
@@ -153,6 +156,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         torch.Tensor,  # d_uvqk_weight
         torch.Tensor,  # d_uvqk_bias
+        None,
         None,
         None,
         None,
@@ -243,6 +247,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             causal=ctx.causal,
             contextual_seq_len=ctx.contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
+            enable_tma=ctx.enable_tma,
         )
         if dq.data_ptr() != _dq.data_ptr():
             dq.copy_(_dq)
@@ -290,6 +295,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -313,6 +320,7 @@ def triton_hstu_preprocess_and_attention(
     recompute_uvqk_in_backward: bool = False,
     recompute_normed_x_in_backward: bool = False,
     sort_by_length: bool = False,
+    enable_tma: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _HSTUPreprocessAndAttentionFunction.apply(
         x,
@@ -334,4 +342,5 @@ def triton_hstu_preprocess_and_attention(
         recompute_uvqk_in_backward,
         recompute_normed_x_in_backward,
         sort_by_length,
+        enable_tma,
     )

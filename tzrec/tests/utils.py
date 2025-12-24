@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import random
 from collections import OrderedDict, defaultdict
@@ -40,7 +41,7 @@ from tzrec.features.sequence_feature import (
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import config_util, misc_util
+from tzrec.utils import config_util, env_util, misc_util
 
 
 def _create_random_id_data(
@@ -57,6 +58,12 @@ def _create_random_id_data(
             dtype=np.int64,
         )
     return data
+
+
+def _get_nproc_per_node() -> int:
+    """Set nproc_per_node."""
+    n_proc = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
+    return n_proc
 
 
 class MockInput:
@@ -282,6 +289,7 @@ class SeqMockInput(MockInput):
         vocab_list: Optional[List[str]] = None,
         sequence_length: Optional[int] = None,
         sequence_delim: Optional[str] = "|",
+        sequence_underline: Optional[str] = "__",
     ) -> None:
         super().__init__(name)
         self.num_ids = num_ids
@@ -290,6 +298,7 @@ class SeqMockInput(MockInput):
         self.sequence_delim = sequence_delim
         self.side_infos = side_infos
         self.item_id = item_id
+        self.sequence_underline = sequence_underline
 
     def create_sequence_data(
         self, num_rows: int, item_t: pa.Table
@@ -343,7 +352,7 @@ class SeqMockInput(MockInput):
         data = {}
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
-                data[f"{self.name}__{name}"] = arr
+                data[f"{self.name}{self.sequence_underline}{name}"] = arr
 
         return data
 
@@ -519,7 +528,7 @@ def create_mock_data(
         input_data[label_field] = pa.array(np.random.randint(2, size=(num_rows,)))
 
     t = pa.Table.from_arrays(list(input_data.values()), names=list(input_data.keys()))
-    max_rows_per_file = num_rows // num_parts
+    max_rows_per_file = int(math.ceil(num_rows / num_parts))
     ds.write_dataset(
         t,
         data_dir,
@@ -554,7 +563,7 @@ def create_mock_join_data(
     for join_key, join_t in join_tables.items():
         t = t.join(join_t, keys=join_key)
 
-    max_rows_per_file = num_rows // num_parts
+    max_rows_per_file = int(math.ceil(num_rows / num_parts))
     ds.write_dataset(
         t,
         data_dir,
@@ -788,6 +797,7 @@ def build_mock_input_with_fg(
                     multival_sep="",
                 )
 
+    seq_underline = "_" if env_util.use_rtp() else "__"
     for feature in features:
         if type(feature) in [
             SequenceIdFeature,
@@ -796,7 +806,9 @@ def build_mock_input_with_fg(
         ]:
             for side, input_name in feature.side_inputs:
                 if feature.is_grouped_sequence:
-                    sub_name = input_name.replace(f"{feature.sequence_name}__", "")
+                    sub_name = input_name.replace(
+                        f"{feature.sequence_name}{seq_underline}", ""
+                    )
                     if feature.sequence_name not in inputs["user"]:
                         inputs["user"][feature.sequence_name] = SeqMockInput(
                             name=feature.sequence_name,
@@ -806,6 +818,7 @@ def build_mock_input_with_fg(
                             vocab_list=inputs["item"][item_id].vocab_list,
                             sequence_length=feature.sequence_length,
                             sequence_delim=feature.sequence_delim,
+                            sequence_underline=seq_underline,
                         )
                     inputs["user"][feature.sequence_name].side_infos.append(sub_name)
                     if sub_name in inputs["item"]:
@@ -839,6 +852,7 @@ def load_config_for_test(
     item_id: str = "",
     cate_id: str = "",
     is_hstu: bool = False,
+    num_rows: Optional[int] = None,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
@@ -863,14 +877,14 @@ def load_config_for_test(
             os.path.join(test_dir, "train_data"),
             inputs,
             list(data_config.label_fields),
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
         )
         pipeline_config.eval_input_path, _ = create_mock_data(
             os.path.join(test_dir, "eval_data"),
             inputs,
             list(data_config.label_fields),
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
         )
     else:
@@ -899,7 +913,7 @@ def load_config_for_test(
             {user_id: user_inputs[user_id], item_id: item_inputs[item_id]},
             list(data_config.label_fields),
             {user_id: user_t, item_id: item_t},
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
             id_fields=[user_id, item_id],
         )
@@ -908,7 +922,7 @@ def load_config_for_test(
             {user_id: user_inputs[user_id], item_id: item_inputs[item_id]},
             list(data_config.label_fields),
             {user_id: user_t, item_id: item_t},
-            num_rows=data_config.batch_size * num_parts * 4,
+            num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
             id_fields=[user_id, item_id],
         )
@@ -1027,10 +1041,17 @@ def test_train_eval(
     cate_id: str = "",
     is_hstu: bool = False,
     env_str: str = "",
+    num_rows: Optional[int] = None,
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
-        pipeline_config_path, test_dir, user_id, item_id, cate_id, is_hstu
+        pipeline_config_path,
+        test_dir,
+        user_id,
+        item_id,
+        cate_id,
+        is_hstu,
+        num_rows=num_rows,
     )
 
     test_config_path = os.path.join(test_dir, "pipeline.config")
@@ -1038,7 +1059,7 @@ def test_train_eval(
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
     )
@@ -1058,7 +1079,7 @@ def test_eval(
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
@@ -1081,7 +1102,7 @@ def test_export(
     export_dir = export_dir or f"{test_dir}/export"
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "
         f"--export_dir {export_dir} "
@@ -1134,6 +1155,8 @@ def test_predict(
         nproc_per_node = 1
     else:
         nproc_per_node = 2
+
+    nproc_per_node = min(nproc_per_node, _get_nproc_per_node())
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={nproc_per_node} --log_dir {log_dir} "
@@ -1154,6 +1177,36 @@ def test_predict(
 
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
+    )
+
+
+def test_predict_checkpoint(
+    pipeline_config_path: str,
+    predict_input_path: str,
+    predict_output_path: str,
+    reserved_columns: str,
+    output_columns: str,
+    test_dir: str,
+    env_str: str = "",
+) -> bool:
+    """Run predict checkpoint integration test."""
+    log_dir = os.path.join(test_dir, "log_predict_ckpt")
+    cmd_str = (
+        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
+        "-r 3 -t 3 tzrec/predict.py "
+        f"--pipeline_config_path {pipeline_config_path} "
+        f"--predict_input_path {predict_input_path} "
+        f"--predict_output_path {predict_output_path} "
+        f"--reserved_columns {reserved_columns} "
+    )
+    if output_columns:
+        cmd_str += f"--output_columns {output_columns} "
+    if env_str:
+        cmd_str = f"{env_str} {cmd_str}"
+
+    return misc_util.run_cmd(
+        cmd_str, os.path.join(test_dir, "log_predict_ckpt.txt"), timeout=600
     )
 
 
@@ -1191,7 +1244,7 @@ def test_hitrate(
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
         f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "
         f"--item_embedding_input {item_embedding_input} "
@@ -1312,7 +1365,7 @@ def test_tdm_retrieval(
     log_dir = os.path.join(test_dir, "log_tdm_retrieval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/tdm/retrieval.py "
         f"--scripted_model_path {scripted_model_path} "
         f"--predict_input_path {eval_data_path} "
@@ -1391,7 +1444,7 @@ def test_tdm_cluster_train_eval(
     log_dir = os.path.join(test_dir, "log_learnt_train_eval")
     cmd_str = (
         f"PYTHONPATH=. torchrun {_standalone()} "
-        f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+        f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path}"
     )

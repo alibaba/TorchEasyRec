@@ -53,6 +53,9 @@ message B2ICapsule {
     optional float squash_pow = 7 [default = 1];
     // whether to use constant capsule number, Default: false
     optional bool const_caps_num = 8 [default = false];
+    // the initialization method for routing logits,
+    //  Default: normal, available: zeros.
+    optional string routing_init_method = 9 [default='normal'];
 }
 
 
@@ -102,6 +105,8 @@ message GRSimpleActionEncoder {
     repeated uint32 watchtime_to_action_thresholds = 4;
     // bitmask for watch time to actions
     repeated uint32 watchtime_to_action_weights = 5;
+    // action embedding weights init std
+    optional float embedding_init_std = 6 [default = 0.1];
 }
 
 message GRActionEncoder {
