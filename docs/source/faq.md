@@ -201,60 +201,19 @@ ______________________________________________________________________
 **报错信息：**
 
 ```
-[rank0]: Traceback (most recent call last):
-[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
-[rank0]:   File "<frozen runpy>", line 88, in _run_code
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/train_eval.py", line 57, in <module>
-[rank0]:     train_and_evaluate(
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/main.py", line 776, in train_and_evaluate
-[rank0]:     _train_and_evaluate(
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/main.py", line 505, in _train_and_evaluate
-[rank0]:     losses, _, _ = pipeline.progress(train_iterator)
-[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 577, in progress
-[rank0]:     self.fill_pipeline(dataloader_iter)
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 538, in fill_pipeline
-[rank0]:     if not self.enqueue_batch(dataloader_iter):
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 495, in enqueue_batch
-[rank0]:     batch, context = self.copy_batch_to_gpu(dataloader_iter)
-[rank0]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 685, in copy_batch_to_gpu
-[rank0]:     batch = self._next_batch(dataloader_iter)
-[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torchrec/distributed/train_pipeline/train_pipelines.py", line 705, in _next_batch
-[rank0]:     batch = next(dataloader_iter, None)
-[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 733, in __next__
-[rank0]:     data = self._next_data()
-[rank0]:            ^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1515, in _next_data
-[rank0]:     return self._process_data(data, worker_id)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1550, in _process_data
-[rank0]:     data.reraise()
-[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/_utils.py", line 750, in reraise
-[rank0]:     raise exception
-[rank0]: pyarrow.lib.ArrowInvalid: Caught ArrowInvalid in DataLoader worker process 0.
 [rank0]: Original Traceback (most recent call last):
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
 [rank0]:     data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 42, in fetch
 [rank0]:     data = next(self.dataset_iter)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/dataset.py", line 311, in __iter__
 [rank0]:     yield self._build_batch(input_data)
-[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/dataset.py", line 376, in _build_batch
 [rank0]:     sampled = self._sampler.get(input_data)
-[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 423, in get
 [rank0]:     features = self._parse_nodes(nodes)
-[rank0]:                ^^^^^^^^^^^^^^^^^^^^^^^^
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 323, in _parse_nodes
 [rank0]:     feature = _to_arrow_array(feature, attr_type)
-[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 [rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 160, in _to_arrow_array
 [rank0]:     items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
 [rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
