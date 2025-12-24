@@ -611,6 +611,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         None,
         None,
         None,
+        None,
     ]:
         (
             sorted_pos_key_inds,
@@ -657,6 +658,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             None,
             d_pos_embeddings.to(ctx.pos_dtype),
             d_ts_embeddings.to(ctx.ts_dtype),
+            None,
             None,
             None,
             None,
