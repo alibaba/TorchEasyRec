@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
+from tzrec.utils import filesystem_util
 
 
 class FileSystemUtilTest(unittest.TestCase):
@@ -24,8 +25,10 @@ class FileSystemUtilTest(unittest.TestCase):
             os.makedirs("./tmp")
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
         os.chmod(self.test_dir, 0o755)
+        filesystem_util.apply_monkeypatch()
 
     def tearDown(self):
+        filesystem_util.remove_monkeypatch()
         if self.success:
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
