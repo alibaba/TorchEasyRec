@@ -139,9 +139,8 @@ SAMPLER_CFG_TYPES = Union[
 ]
 
 
-def _cast_data(
+def _safe_cast_kv_data(
     data: pa.Array,
-    start: int,
     data_type: pa.DataType,
     offsets: pa.Array,
     origin_data: pa.array,
@@ -150,16 +149,15 @@ def _cast_data(
         new_data = data.cast(data_type, safe=False)
         return new_data
     except Exception as err:
-        index = 0
+        index = -1
         for i in range(len(data)):
             try:
                 element = data[i]
                 if element.is_valid:
                     element.cast(data_type, safe=False)
             except Exception:
-                index = start + i
+                index = i
                 break
-        index = (index - 1) / 2
         for j, c in enumerate(offsets):
             if index < c.as_py():
                 error_data = origin_data[j - 1].as_py().replace(chr(29), " ")
@@ -185,9 +183,11 @@ def _to_arrow_array(
             kv_list = pa.compute.split_pattern(kv.values, ":").values
             if len(kv_list) > 0:
                 keys = kv_list.take(list(range(0, len(kv_list), 2)))
-                keys = _cast_data(keys, 0, field_type.key_type, offsets, origin_x)
+                keys = _safe_cast_kv_data(keys, field_type.key_type, offsets, origin_x)
                 items = kv_list.take(list(range(1, len(kv_list), 2)))
-                items = _cast_data(items, 1, field_type.item_type, offsets, origin_x)
+                items = _safe_cast_kv_data(
+                    items, field_type.item_type, offsets, origin_x
+                )
             else:
                 keys = pa.array([], type=field_type.key_type)
                 items = pa.array([], type=field_type.item_type)
