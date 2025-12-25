@@ -44,6 +44,8 @@ class HSTUPositionalEncoder(BaseModule):
         num_time_buckets: int = 0,
         use_time_encoding: bool = False,
         contextual_seq_len: int = 0,
+        time_bucket_fn: str = "sqrt",
+        time_bucket_increments: float = 60.0,
         is_inference: bool = True,
     ) -> None:
         super().__init__(is_inference=is_inference)
@@ -63,6 +65,8 @@ class HSTUPositionalEncoder(BaseModule):
                     sqrt(1.0 / num_time_buckets),
                 ),
             )
+            self._time_bucket_fn = time_bucket_fn
+            self._time_bucket_increments = time_bucket_increments
 
     def forward(
         self,
@@ -99,6 +103,8 @@ class HSTUPositionalEncoder(BaseModule):
                 timestamps=seq_timestamps,
                 num_targets=num_targets,
                 interleave_targets=False,
+                time_bucket_fn=self._time_bucket_fn,
+                time_bucket_increments=self._time_bucket_increments,
                 kernel=self.kernel(),
             )
         else:

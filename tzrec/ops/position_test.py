@@ -161,7 +161,8 @@ class PositionEmbeddingsTest(unittest.TestCase):
         batch_size=st.integers(16, 32),
         D=st.integers(20, 200),
         max_targets=st.sampled_from([10, 20]),
-        time_bucket_fn=st.sampled_from(["log"]),
+        time_bucket_fn=st.sampled_from(["sqrt", "log"]),
+        time_bucket_increments=st.integers(10, 100),
         dtype=st.sampled_from(
             get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])
         ),
@@ -191,7 +192,8 @@ class PositionEmbeddingsTest(unittest.TestCase):
         batch_size=st.sampled_from([130]),
         D=st.sampled_from([128]),
         max_targets=st.sampled_from([10]),
-        time_bucket_fn=st.sampled_from(["log"]),
+        time_bucket_fn=st.sampled_from(["sqrt", "log"]),
+        time_bucket_increments=st.integers(10, 100),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
@@ -225,6 +227,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
         D: int,
         max_targets: int,
         time_bucket_fn: str,
+        time_bucket_increments: float,
         dtype: torch.dtype,
         ref_kernel: Kernel,
         real_kernel: Kernel,
@@ -305,6 +308,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
             num_targets=num_targets,
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
+            time_bucket_increments=time_bucket_increments,
             kernel=ref_kernel,
         )
         dout = torch.randn_like(ref_out) * 0.01
@@ -333,6 +337,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
             num_targets=num_targets,
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
+            time_bucket_increments=time_bucket_increments,
             kernel=real_kernel,
         )
 
