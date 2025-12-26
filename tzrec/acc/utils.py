@@ -195,6 +195,8 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
     if "QUANT_EMB" in os.environ:
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
+    if "QUANT_EC_EMB" in os.environ:
+        acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "ENABLE_AOT" in os.environ:
