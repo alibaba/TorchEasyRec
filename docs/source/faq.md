@@ -193,3 +193,42 @@ LD_LIBRARY_PATH= torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.train_eval \
     --pipeline_config_path multi_tower_din_taobao_local.config
 ```
+
+______________________________________________________________________
+
+**Q13: kv特征的key包含":"导致报错**
+
+**报错信息：**
+
+```
+[rank0]: Original Traceback (most recent call last):
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+[rank0]:     data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 42, in fetch
+[rank0]:     data = next(self.dataset_iter)
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/dataset.py", line 311, in __iter__
+[rank0]:     yield self._build_batch(input_data)
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/dataset.py", line 376, in _build_batch
+[rank0]:     sampled = self._sampler.get(input_data)
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 423, in get
+[rank0]:     features = self._parse_nodes(nodes)
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 323, in _parse_nodes
+[rank0]:     feature = _to_arrow_array(feature, attr_type)
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/tzrec/datasets/sampler.py", line 160, in _to_arrow_array
+[rank0]:     items = kv_list.take(list(range(1, len(kv_list), 2))).cast(
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "pyarrow/array.pxi", line 1000, in pyarrow.lib.Array.cast
+[rank0]:   File "/opt/conda/lib/python3.11/site-packages/pyarrow/compute.py", line 405, in cast
+[rank0]:     return call_function("cast", [arr], options, memory_pool)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "pyarrow/_compute.pyx", line 590, in pyarrow._compute.call_function
+[rank0]:   File "pyarrow/_compute.pyx", line 385, in pyarrow._compute.Function.call
+[rank0]:   File "pyarrow/error.pxi", line 155, in pyarrow.lib.pyarrow_internal_check_status
+[rank0]:   File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+[rank0]: pyarrow.lib.ArrowInvalid: Failed to parse string: 'false}' as a scalar of type float
+
+```
+
+**原因：** kv特征的key包含":"导致报错
+
+**解决方法：** 检查特征表string类型字段是否包含":"，进行数据清洗。
