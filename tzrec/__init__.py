@@ -41,18 +41,29 @@ except Exception:
     pass
 
 import logging as _logging  # NOQA
-
+import torch as _torch  # NOQA
+import numpy as _np  # NOQA
 from tzrec.utils import load_class as _load_class  # NOQA
 
 _log_level = _os.getenv("LOG_LEVEL")
 if _log_level:
     _log_level = getattr(_logging, _log_level)
-
 _logging.basicConfig(
     format="[%(asctime)s][%(levelname)s] %(message)s", level=_log_level
 )
-_load_class.auto_import()
 
+# reproducibility
+_torch_manual_seed = _os.getenv("TORCH_MANUAL_SEED")
+if _torch_manual_seed:
+    _torch.manual_seed(int(_torch_manual_seed))
+_numpy_manual_seed = _os.getenv("NUMPY_MANUAL_SEED")
+if _numpy_manual_seed:
+    _np.random.seed(int(_numpy_manual_seed))
+_use_deterministic_algorithms = _os.getenv("USE_DETERMINISTIC_ALGORITHMS", "0") == "1"
+if _use_deterministic_algorithms:
+    _torch.use_deterministic_algorithms(True)
+
+_load_class.auto_import()
 
 from tzrec.utils.filesystem_util import (  # NOQA
     register_external_filesystem as _register_external_filesystem,  # NOQA
