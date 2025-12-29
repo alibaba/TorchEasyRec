@@ -313,6 +313,7 @@ def restore_model(
                 model,
                 table_names=meta.get("dynamicemb_load_table_names", None),
                 optim=meta.get("dynamicemb_load_optim", optimizer is not None),
+                counter=True,
             )
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
@@ -344,6 +345,7 @@ def save_model(
             os.path.join(checkpoint_dir, "dynamicemb"),
             model,
             optim=optimizer is not None,
+            counter=True,
         )
     # save model plan
     if hasattr(model, "_plan") and model._plan is not None:

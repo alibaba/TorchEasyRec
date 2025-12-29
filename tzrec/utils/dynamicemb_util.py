@@ -191,12 +191,6 @@ def build_dynamicemb_constraints(
                 if admission_strategy_cfg.HasField("counter_capacity")
                 else num_embeddings
             )
-            # admission_counter = KVCounter(
-            #     capacity=_next_power_of_2(int(counter_capacity / world_size)),
-            #     bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
-            #     key_type=torch.int64,
-            #     device=torch.device(f"cuda:{local_rank}"),
-            # )
             admission_counter = KVCounterConfig(
                 capacity=counter_capacity,
                 bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
