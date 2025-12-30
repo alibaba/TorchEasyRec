@@ -5,7 +5,7 @@ DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`ha
 注：目前使用DynamicEmbedding还处于实验阶段，配置和接口都可能调整，暂只支持训练和评估，暂不包含在官方提供的镜像环境中，使用前需要额外安装如下whl包
 
 ```bash
-pip install https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/dynamicemb-0.0.1%2B20251112.430ef40-cp311-cp311-linux_x86_64.whl
+pip install https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/dynamicemb/dynamicemb-0.0.1%2B20251229.ae93cfc-cp311-cp311-linux_x86_64.whl
 ```
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
@@ -23,6 +23,9 @@ feature_configs {
                 std_dev: 0.05
             }
             score_strategy: "STEP"
+            frequency_admission_strategy {
+                threshold: 5
+            }
         }
     }
 }
@@ -48,6 +51,14 @@ feature_configs {
 - **eval_initializer_args**: （可选）评估时的初始化方式，默认是 CONSTANT，value=0
 
 - **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity
+
+- **admission_strategy**: (可选) 特征准入策略，默认不开启，目前只支持frequency_admission_strategy
+
+  - **frequency_admission_strategy**: 基于频次的特征准入策略
+    - threshold: 准入频次
+    - initializer_args: （可选）未准入的ID的初始化方式，默认是 CONSTANT，value=0
+    - counter_capacity: （可选）频次统计Counter的最大id数，默认与max_capacity相等
+    - counter_bucket_capacity: （可选）频次统计Counter的每个bucket的最大id数，默认为1024
 
 - **init_table**: （可选）初始化表的路径，支持Odps/Parquet/Csv格式，表的第一列为id值，第二列为embedding值。
 

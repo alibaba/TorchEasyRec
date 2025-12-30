@@ -36,6 +36,7 @@ TorchEasyRec implements state of the art deep learning models used in common rec
 
 - Efficient and robust feature generation
 - Large scale embedding with different sharding strategies
+- Dynamic (zero collision hash) embedding
 - Hybrid data-parallelism/model-parallelism
 - Optimized kernels for RecSys powered by TorchRec
 - Mixed precision
