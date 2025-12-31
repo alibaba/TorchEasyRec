@@ -8,9 +8,9 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 
 输入数据以parquet格式为例
 
-- 训练样本数据: [taobao_data_recall_train_transformed](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train_transformed.tar.gz)
-- 评估样本数据: [taobao_data_recall_eval_transformed](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval_transformed.tar.gz)
-- 物品池特征数据: [taobao_ad_feature_transformed_fill](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature_transformed_fill.tar.gz)
+- 训练样本数据: [taobao_data_recall_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz)
+- 评估样本数据: [taobao_data_recall_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz)
+- 物品池特征数据: [taobao_ad_feature](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz)
 
 #### 配置文件
 
@@ -19,13 +19,13 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 ```bash
 # 下载并解压
 mkdir -p data
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train_transformed.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval_transformed.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature_transformed_fill.tar.gz
+wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz
+wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz
+wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/tdm_taobao_local.config
-tar xf taobao_data_recall_train_transformed.tar.gz -C data
-tar xf taobao_data_recall_eval_transformed.tar.gz -C data
-tar xf taobao_ad_feature_transformed_fill.tar.gz -C data
+tar xf taobao_data_recall_train.tar.gz -C data
+tar xf taobao_data_recall_eval.tar.gz -C data
+tar xf taobao_ad_feature.tar.gz -C data
 ```
 
 ### 启动命令
@@ -34,7 +34,7 @@ tar xf taobao_ad_feature_transformed_fill.tar.gz -C data
 
 ```bash
 python -m tzrec.tools.tdm.init_tree \
-    --item_input_path data/taobao_ad_feature_transformed_fill/\*.parquet \
+    --item_input_path data/taobao_ad_feature/\*.parquet \
     --item_id_field adgroup_id \
     --cate_id_field cate_id \
     --attr_fields cate_id,campaign_id,customer,brand,price \
@@ -60,7 +60,11 @@ python -m tzrec.tools.tdm.init_tree \
 torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.train_eval \
-    --pipeline_config_path tdm_taobao_local.config
+    --pipeline_config_path tdm_taobao_local.config \
+    --train_input_path data/taobao_data_recall_train/\*.parquet \
+    --eval_input_path data/taobao_data_recall_eval/\*.parquet \
+    --model_dir experiments/tdm_taobao_local
+    --edit_config_json '{"data_config.tdm_sampler.item_input_path":"data/init_tree/node_table.txt", "data_config.tdm_sampler.edge_input_path":"data/init_tree/edge_table.txt", "data_config.tdm_sampler.predict_edge_input_path":"data/init_tree/predict_edge_table.txt"}'
 ```
 
 - --pipeline_config_path: 训练用的配置文件
@@ -94,7 +98,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.predict \
     --scripted_model_path experiments/tdm_taobao_local/export/embedding \
-    --predict_input_path data/taobao_ad_feature_transformed_fill/\*.parquet \
+    --predict_input_path data/taobao_ad_feature/\*.parquet \
     --predict_output_path experiments/tdm_taobao_local/item_emb \
     --reserved_columns adgroup_id,cate_id,campaign_id,customer,brand,price \
     --output_columns item_emb
@@ -137,6 +141,8 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.train_eval \
     --pipeline_config_path tdm_taobao_local.config \
+    --train_input_path data/taobao_data_recall_train/\*.parquet \
+    --eval_input_path data/taobao_data_recall_eval/\*.parquet \
     --model_dir experiments/tdm_taobao_local_learnt \
     --edit_config_json '{"data_config.tdm_sampler.item_input_path":"data/learnt_tree/node_table.txt", "data_config.tdm_sampler.edge_input_path":"data/learnt_tree/edge_table.txt", "data_config.tdm_sampler.predict_edge_input_path":"data/learnt_tree/predict_edge_table.txt"}'
 ```
@@ -172,7 +178,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=8 --node_rank=0 \
     -m tzrec.tools.tdm.retrieval \
     --scripted_model_path experiments/tdm_taobao_local/export/model/ \
-    --predict_input_path data/taobao_data_recall_eval_transformed/\*.parquet \
+    --predict_input_path data/taobao_data_recall_eval/\*.parquet \
     --predict_output_path data/init_tree/taobao_data_eval_recall \
     --recall_num 200 \
     --n_cluster 2 \
