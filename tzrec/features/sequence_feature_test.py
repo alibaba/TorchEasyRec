@@ -130,13 +130,20 @@ class SequenceIdFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["", [33, 44, 66, 26, 66], [2, 1, 1, 1], [2, 1, 1]],
-            ["xyz", [33, 44, 66, 13, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 0, [33, 44, 66, 26, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 0, [33, 44, 66, 13, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 1, [33, 66, 26, 66], [1, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 1, [33, 66, 13, 66], [1, 1, 1, 1], [2, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
     def test_sequence_id_feature_with_hash_bucket_size(
-        self, default_value, expected_values, expected_lengths, expected_seq_lengths
+        self,
+        default_value,
+        value_dim,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
     ):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
@@ -145,6 +152,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
                 embedding_dim=16,
                 expression="user:id_str",
                 default_value=default_value,
+                value_dim=value_dim,
             )
         )
         seq_feat = sequence_feature_lib.SequenceIdFeature(
@@ -176,13 +184,20 @@ class SequenceIdFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["", [33, 44, 66, 26, 66], [2, 1, 1, 1], [2, 1, 1]],
-            ["xyz", [33, 44, 66, 13, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 0, [33, 44, 66, 26, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 0, [33, 44, 66, 13, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 1, [33, 66, 26, 66], [1, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 1, [33, 66, 13, 66], [1, 1, 1, 1], [2, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
     def test_simple_sequence_id_feature_with_hash_bucket_size(
-        self, default_value, expected_values, expected_lengths, expected_seq_lengths
+        self,
+        default_value,
+        value_dim,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
     ):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             sequence_id_feature=feature_pb2.SequenceIdFeature(
@@ -193,6 +208,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
                 sequence_delim=";",
                 sequence_length=50,
                 default_value=default_value,
+                value_dim=value_dim,
             )
         )
         seq_feat = sequence_feature_lib.SequenceIdFeature(
@@ -223,6 +239,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
         [
             [
                 "",
+                0,
                 ["1;2", "", "3", "4\0355;6"],
                 [1, 2, 0, 3, 4, 5, 6],
                 [1, 1, 1, 1, 2, 1],
@@ -230,6 +247,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
             ],
             [
                 "",
+                0,
                 [["1", "2"], None, ["3"], ["4\0355", "6"]],
                 [1, 2, 0, 3, 4, 5, 6],
                 [1, 1, 1, 1, 2, 1],
@@ -237,6 +255,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
             ],
             [
                 "",
+                0,
                 [[1, 2], [], [3], [4, 6]],
                 [1, 2, 0, 3, 4, 6],
                 [1, 1, 1, 1, 1, 1],
@@ -244,9 +263,18 @@ class SequenceIdFeatureTest(unittest.TestCase):
             ],
             [
                 "0",
+                0,
                 ["1;2", "", "3", "4\0355;6"],
                 [1, 2, 0, 3, 4, 5, 6],
                 [1, 1, 1, 1, 2, 1],
+                [2, 1, 1, 2],
+            ],
+            [
+                "0",
+                1,
+                ["1;2", "", "3", "4\0355;6"],
+                [1, 2, 0, 3, 4, 6],
+                [1, 1, 1, 1, 1, 1],
                 [2, 1, 1, 2],
             ],
         ],
@@ -255,6 +283,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
     def test_sequence_id_feature_with_num_buckets(
         self,
         default_value,
+        value_dim,
         input_feat,
         expected_values,
         expected_lengths,
@@ -267,6 +296,7 @@ class SequenceIdFeatureTest(unittest.TestCase):
                 embedding_dim=16,
                 expression="user:id_str",
                 default_value=default_value,
+                value_dim=value_dim,
             )
         )
         seq_feat = sequence_feature_lib.SequenceIdFeature(
@@ -811,8 +841,8 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2]))
-        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 0])))
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 3, 2, 1]))
+        self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 1])))
 
 
 if __name__ == "__main__":
