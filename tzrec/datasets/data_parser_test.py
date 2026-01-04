@@ -929,7 +929,9 @@ class DataParserTest(unittest.TestCase):
                 ),
                 "f_lookup_a": pa.array([0.1, 0.0, 0.2], type=pa.float32()),
                 "click_seq__f_cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
-                "click_seq__f_int_a": pa.array([["14", "15", "16"], ["17"], ["0"]]),
+                "click_seq__f_int_a": pa.array(
+                    [[14, 15, 16], [17], [0]], type=pa.list_(pa.float32())
+                ),
                 "click_seq__f_tag_b": pa.array(
                     [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [["0"]]]
                 ),

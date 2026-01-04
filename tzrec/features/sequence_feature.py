@@ -456,14 +456,14 @@ class SequenceRawFeature(RawFeature):
                 input_feat = input_feat.fill_null([])
             input_feat = input_feat.tolist()
             if self._fg_op.is_sparse:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feat)
+                values, key_lengths, seq_lengths = (
+                    self._fg_op.to_bucketized_jagged_tensor(input_feat)
+                )
                 parsed_feat = SequenceSparseData(
                     name=self.name,
                     values=values,
-                    key_lengths=np.array(
-                        [self._fg_op.value_dimension()] * sum(lengths)
-                    ),
-                    seq_lengths=lengths,
+                    key_lengths=key_lengths,
+                    seq_lengths=seq_lengths,
                 )
             else:
                 values, lengths = self._fg_op.to_jagged_tensor(input_feat)
