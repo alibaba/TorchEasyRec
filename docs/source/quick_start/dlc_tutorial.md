@@ -4,7 +4,9 @@
 
 ## 创建数据集
 
+PAI-DLC的数据集支持多种数据存储方式：阿里云文件存储(NAS、CPFS)、阿里云对象存储(OSS)等等，这里用阿里云文件存储(NAS)和阿里云对象存储(OSS)举例。  
 进入[PAI控制台](https://pai.console.aliyun.com/)，点击 **AI资源管理-数据集** -> **创建数据集**。选择数据存储为**阿里云文件存储(NAS)**，挂载到`/mnt/data`下。任务运行时，会从挂载路径下读取训练数据和配置文件以及写入模型检查点等。
+选择数据存储为**阿里云对象存储(OSS)**时操作类似。
 
 ## 创建DLC任务
 
@@ -33,7 +35,7 @@ pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/ni
 
 **节点镜像** 选择官方镜像`torcheasyrec:1.0.0-pytorch2.9.0-gpu-py311-cu126-ubuntu22.04`
 
-**数据集配置** 选择刚新建的NAS数据集
+**数据集配置** 选择刚新建的NAS数据集。如果选择的是OSS数据集，注意在高级配置中设置{"mountType":"ossfs"}，以使用ossfs方式进行挂载。
 
 **资源配置** 选择框架为PyTorch，任务资源我们以选择单机8卡V100为例（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型），**驱动设置选择535+**
 
@@ -42,7 +44,7 @@ pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/ni
 #### 训练
 
 ```bash
-# 下载数据和配置文件并解压到nas上，如果数据已存在，则不需要上述下载和解压命令
+# 下载数据和配置文件并解压到nas/oss上，如果数据已存在，则不需要上述下载和解压命令
 cd /mnt/data
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz
 wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz
@@ -120,11 +122,12 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表。配置文件的data_config.dataset_type需设置为OdpsDataset。
 
 ```bash
+pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.train_eval \
---pipeline_config_path ${PIPELINE_CONFIG} \
+--pipeline_config_path  /mnt/data/multi_tower_din_taobao_dlc.config \
 --train_input_path odps://{project}/tables/{table_name}/{partition}
 ```
 
