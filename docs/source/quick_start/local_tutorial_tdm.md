@@ -64,7 +64,6 @@ torchrun --master_addr=localhost --master_port=32555 \
     --train_input_path data/taobao_data_recall_train/\*.parquet \
     --eval_input_path data/taobao_data_recall_eval/\*.parquet \
     --model_dir experiments/tdm_taobao_local
-    --edit_config_json '{"data_config.tdm_sampler.item_input_path":"data/init_tree/node_table.txt", "data_config.tdm_sampler.edge_input_path":"data/init_tree/edge_table.txt", "data_config.tdm_sampler.predict_edge_input_path":"data/init_tree/predict_edge_table.txt"}'
 ```
 
 - --pipeline_config_path: 训练用的配置文件
