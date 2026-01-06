@@ -9,5 +9,6 @@ message EvalConfig {
     // type of evaluator [latest | best] when train_and_evaluation
     // latest: regularly eval the serving graph and checkpoints
     // best: eval the best model according to best_eval_metric
-    optional string evaluator_type = 3 [default = 'latest'];
+    optional string evaluator_type = 3 [default = 'latest'];  
 }
+    
