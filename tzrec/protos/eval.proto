@@ -6,8 +6,4 @@ message EvalConfig {
     optional uint32 num_steps = 1;
     // the frequency progress be logged during eval
     optional uint32 log_step_count_steps = 2 [default = 10];
-    // type of evaluator [latest | best] when train_and_evaluation
-    // latest: regularly eval the serving graph and checkpoints
-    // best: eval the best model according to best_eval_metric
-    optional string evaluator_type = 3 [default = 'latest'];
 }
