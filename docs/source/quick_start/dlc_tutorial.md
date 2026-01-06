@@ -119,7 +119,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 
 ### 直读MaxCompute数据
 
-设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表。配置文件的data_config.dataset_type需设置为OdpsDataset。
+设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表。配置文件的data_config.dataset_type需设置为OdpsDataset。注意训练数据和评估数据必须同时来自MaxCompute表。
 
 ```bash
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
@@ -128,7 +128,8 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
 -m tzrec.train_eval \
 --pipeline_config_path  /mnt/data/multi_tower_din_taobao_dlc.config \
---train_input_path odps://{project}/tables/{table_name}/{partition}
+--train_input_path odps://{project}/tables/{table_name}/{partition} \
+--eval_input_path odps://{project}/tables/{table_name}/{partition} \
 ```
 
 ### 例行训练
