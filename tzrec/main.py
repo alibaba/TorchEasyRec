@@ -736,6 +736,8 @@ def evaluate(
         pipeline_config_path (str): path to EasyRecConfig object.
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path
+        eval_type (str): if specified, decide which type of checkpoint to use
+            (type: best, latest).
         eval_input_path (str, optional): eval data path, default use eval data in
             pipeline_config, could be a path or a list of paths
         eval_result_filename (str): evaluation result metrics save path.
