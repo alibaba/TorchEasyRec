@@ -129,7 +129,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 -m tzrec.train_eval \
 --pipeline_config_path  /mnt/data/multi_tower_din_taobao_dlc.config \
 --train_input_path odps://{project}/tables/{table_name}/{partition} \
---eval_input_path odps://{project}/tables/{table_name}/{partition} \
+--eval_input_path odps://{project}/tables/{table_name}/{partition}
 ```
 
 ### 例行训练
