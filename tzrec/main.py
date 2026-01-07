@@ -774,9 +774,17 @@ def evaluate(
 
     global_step = None
     if not checkpoint_path:
-        checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
+        if (
+            pipeline_config.HasField("eval_config")
+            and pipeline_config.eval_config.evaluator_type == "best"
+        ):
+            checkpoint_path, _ = checkpoint_util.best_checkpoint(
+                pipeline_config.model_dir, pipeline_config.eval_config
+            )
+        else:
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
+            )
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
