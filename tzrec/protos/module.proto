@@ -96,6 +96,11 @@ message CIN {
     repeated uint32 cin_layer_size = 1;
 }
 
+message WuKongLayer {
+    required uint32 rank_feature_num = 1 [default = 16];
+    required MLP feature_num_mlp = 2;
+}
+
 message GRSimpleActionEncoder {
     // action embedding dim
     optional uint32 action_embedding_dim = 1;

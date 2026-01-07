@@ -10,10 +10,12 @@
 # limitations under the License.
 
 
-from typing import List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
+
+from tzrec.modules.mlp import MLP
 
 
 @torch.fx.wrap
@@ -239,3 +241,130 @@ class CIN(nn.Module):
             x_out.append(torch.sum(x_vec, dim=2))
 
         return torch.cat(x_out, dim=1)
+
+
+class LinearCompressBlock(nn.Module):
+    """LinerBlock module for WuKongLayer.
+
+    Args:
+        feature_num_in (int): feature_num
+        feature_num_out(int): feature_out_num
+    """
+
+    def __init__(self, feature_num_in: int, feature_num_out: int) -> None:
+        super().__init__()
+        self._feature_num_out = feature_num_out
+        self._feature_num_in = feature_num_in
+        self.weight = nn.Parameter(torch.empty((feature_num_in, feature_num_out)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Reset the weight parameters."""
+        nn.init.kaiming_uniform_(self.weight)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            inputs (torch.Tensor): tensor with shape [batch_size, field_num, embed_dim].
+        """
+        outputs = inputs.permute(0, 2, 1)
+        outputs = outputs @ self.weight
+        outputs = outputs.permute(0, 2, 1)
+        return outputs
+
+
+class FactorizationMachineBlock(nn.Module):
+    """FM Block module for WuKongLayer.
+
+    Args:
+        feature_dim(int): embedding dimension
+        feature_num_in (int): feature_num
+        feature_num_out(int): feature_out_num
+        rank(int): FM rank less than feature_num_in
+        feature_num_mlp(dict): feature num MLP module parameters.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        feature_num_in: int,
+        feature_num_out: int,
+        rank: int,
+        feature_num_mlp: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__()
+        self.feature_num_in = feature_num_in
+        self.feature_num_out = feature_num_out
+        self.input_dim = input_dim
+        self.rank = rank
+        self.weight = nn.Parameter(torch.empty((feature_num_in, rank)))
+        self.norm = nn.LayerNorm(feature_num_in * rank)
+
+        self.mlp = MLP(in_features=feature_num_in * rank, **feature_num_mlp)
+        self.feature_out_liner = nn.Linear(
+            self.mlp.output_dim(), self.feature_num_out * self.input_dim
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Reset the weight parameters."""
+        nn.init.kaiming_uniform_(self.weight)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            inputs (torch.Tensor): tensor with shape [batch_size, field_num, embed_dim].
+        """
+        outputs = inputs.permute(0, 2, 1)
+        outputs = torch.matmul(outputs, self.weight)
+        outputs = torch.matmul(inputs, outputs)
+        outputs = outputs.view(-1, self.feature_num_in * self.rank)
+        outputs = self.mlp(self.norm(outputs))
+        outputs = self.feature_out_liner(outputs)
+        outputs = outputs.view(-1, self.feature_num_out, self.input_dim)
+        return outputs
+
+
+class WuKongLayer(nn.Module):
+    """WuKongLayer module for WuKong model.
+
+    Args:
+        input_dim(int): embedding dimension
+        feature_num (int): feature_num
+        rank_feature_num(int): FM rank less than feature_num_in
+        feature_num_mlp(dict): feature num MLP module parameters.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        feature_num: int,
+        rank_feature_num: int,
+        feature_num_mlp: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+        self._lcb_feature_num = feature_num // 2
+        self._fmb_feature_num = feature_num - self._lcb_feature_num
+        self.lcb = LinearCompressBlock(feature_num, self._lcb_feature_num)
+        self.fmb = FactorizationMachineBlock(
+            input_dim,
+            feature_num,
+            self._fmb_feature_num,
+            rank_feature_num,
+            feature_num_mlp,
+        )
+        self.norm = nn.LayerNorm(input_dim)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward the module.
+
+        Args:
+            inputs (torch.Tensor): tensor with shape [batch_size, field_num, embed_dim].
+        """
+        lcb = self.lcb(inputs)
+        fmb = self.fmb(inputs)
+        outputs = torch.concat((fmb, lcb), dim=1)
+        outputs = self.norm(outputs + inputs)
+        return outputs

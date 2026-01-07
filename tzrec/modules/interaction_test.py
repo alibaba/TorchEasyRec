@@ -15,7 +15,16 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.interaction import CIN, Cross, CrossV2, InputSENet, InteractionArch
+from tzrec.modules.interaction import (
+    CIN,
+    Cross,
+    CrossV2,
+    InputSENet,
+    InteractionArch,
+    WuKongLayer,
+)
+from tzrec.protos.module_pb2 import MLP
+from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -79,6 +88,22 @@ class CINTest(unittest.TestCase):
         features = torch.randn([5, 9, 16])
         result = cin(features)
         self.assertEqual(result.size(), (5, 45))
+
+
+class WuKongLayerTest(unittest.TestCase):
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
+    )
+    def test_wukong_layer(self, graph_type) -> None:
+        mlp_proto = MLP(hidden_units=[12, 8, 4])
+        mlp_cfg = config_to_kwargs(mlp_proto)
+        layer = WuKongLayer(
+            input_dim=16, feature_num=9, rank_feature_num=3, feature_num_mlp=mlp_cfg
+        )
+        layer = create_test_module(layer, graph_type)
+        features = torch.randn([5, 9, 16])
+        result = layer(features)
+        self.assertEqual(result.size(), (5, 9, 16))
 
 
 if __name__ == "__main__":
