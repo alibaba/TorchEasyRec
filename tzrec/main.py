@@ -726,6 +726,7 @@ def train_and_evaluate(
 def evaluate(
     pipeline_config_path: str,
     checkpoint_path: Optional[str] = None,
+    eval_type:Optional[str] = None,
     eval_input_path: Optional[str] = None,
     eval_result_filename: str = "eval_result.txt",
 ) -> None:
@@ -774,12 +775,13 @@ def evaluate(
 
     global_step = None
     if not checkpoint_path:
-        if (
-            pipeline_config.HasField("eval_config")
-            and pipeline_config.eval_config.evaluator_type == "best"
-        ):
+        if eval_type == "best":
             checkpoint_path, _ = checkpoint_util.best_checkpoint(
                 pipeline_config.model_dir, pipeline_config.eval_config
+            )
+        elif eval_type == "latest":
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
             )
         else:
             checkpoint_path, _ = checkpoint_util.latest_checkpoint(
