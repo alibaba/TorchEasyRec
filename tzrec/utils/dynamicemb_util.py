@@ -10,6 +10,8 @@
 # limitations under the License.
 
 import math
+import os
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type, cast
 
 import torch
@@ -54,6 +56,8 @@ try:
         DynamicEmbInitializerArgs,
         DynamicEmbInitializerMode,
         DynamicEmbScoreStrategy,
+        FrequencyAdmissionStrategy,
+        KVCounter,
         batched_dynamicemb_compute_kernel,
     )
     from dynamicemb.dynamicemb_config import DynamicEmbKernel
@@ -89,6 +93,14 @@ def _next_power_of_2(n: int) -> int:
     n |= n >> 16
     n |= n >> 32  # This line is necessary for 64-bit integers
     return n + 1
+
+
+@dataclass
+class KVCounterConfig:
+    """Config for KVCounter."""
+
+    capacity: int = None
+    bucket_capacity: int = 1024
 
 
 def _build_dynamicemb_initializer(
@@ -168,6 +180,33 @@ def build_dynamicemb_constraints(
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
         init_capacity = _next_power_of_2(dynamicemb_cfg.init_capacity_per_rank)
 
+    admission_counter = None
+    admit_strategy = None
+    admission_strategy_type = dynamicemb_cfg.WhichOneof("admission_strategy")
+    if admission_strategy_type is not None:
+        if admission_strategy_type == "frequency_admission_strategy":
+            admission_strategy_cfg = getattr(dynamicemb_cfg, admission_strategy_type)
+            counter_capacity = (
+                admission_strategy_cfg.counter_capacity
+                if admission_strategy_cfg.HasField("counter_capacity")
+                else num_embeddings
+            )
+            admission_counter = KVCounterConfig(
+                capacity=counter_capacity,
+                bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
+            )
+            admit_strategy = FrequencyAdmissionStrategy(
+                threshold=admission_strategy_cfg.threshold,
+                initializer_args=_build_dynamicemb_initializer(
+                    admission_strategy_cfg.initializer_args,
+                    num_embeddings,
+                    embedding_dim,
+                    is_eval=True,
+                ),
+            )
+        else:
+            raise ValueError(f"Unknown AdmissionStrategy: {admission_strategy_type}")
+
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
         max_capacity=dynamicemb_cfg.max_capacity,
         init_capacity=init_capacity,
@@ -182,6 +221,8 @@ def build_dynamicemb_constraints(
             is_eval=True,
         ),
         score_strategy=score_strategy,
+        admit_strategy=admit_strategy,
+        admission_counter=admission_counter,
     )
 
     constraints_kwargs = {}
@@ -636,6 +677,23 @@ if has_dynamicemb:
         if bak_local_hbm_for_values is not None:
             dynamicemb_options.local_hbm_for_values = bak_local_hbm_for_values
 
+        if dynamicemb_options.admission_counter is not None:
+            admission_strategy_cfg = dynamicemb_options.admission_counter
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            # If KVCounter is initialized before sharding, it will cause a planning error:                                    # NOQA
+            #   AttributeError: type object 'torch.storage.UntypedStorage' has no attribute 'dtype'. Did you mean: 'type'?    # NOQA
+            # Therefore, we keep `admission_counter` in `dynamicemb_options` as a config during planning,                     # NOQA
+            # and instantiate `KVCounter` later in `batched_dynamicemb_compute_kernel`.
+            admission_counter = KVCounter(
+                capacity=_next_power_of_2(
+                    int(admission_strategy_cfg.capacity / world_size)
+                ),
+                bucket_capacity=admission_strategy_cfg.bucket_capacity,
+                key_type=torch.int64,
+                device=torch.device(f"cuda:{local_rank}"),
+            )
+            dynamicemb_options.admission_counter = admission_counter
         return dynamicemb_options
 
     # pyre-ignore [9]
