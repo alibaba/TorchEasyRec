@@ -29,6 +29,12 @@ if __name__ == "__main__":
         "train_config.model_dir",
     )
     parser.add_argument(
+        "--eval_type",
+        type=str,
+        default="latest",
+        help="eval type, decide which type of checkpoint to use (type: best, latest)",
+    )
+    parser.add_argument(
         "--eval_input_path",
         type=str,
         default=None,
@@ -45,6 +51,7 @@ if __name__ == "__main__":
     evaluate(
         args.pipeline_config_path,
         checkpoint_path=args.checkpoint_path,
+        eval_typeh=args.eval_type,
         eval_input_path=args.eval_input_path,
         eval_result_filename=args.eval_result_filename,
     )
