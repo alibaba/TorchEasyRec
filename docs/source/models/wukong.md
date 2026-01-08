@@ -91,7 +91,7 @@ feature_groups: 特征组
 
 ### 示例Config
 
-[wukong_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_criteo.config)
+[wukong_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/wukong.config)
 
 ### 参考论文
 
