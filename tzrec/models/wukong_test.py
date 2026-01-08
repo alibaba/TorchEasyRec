@@ -53,17 +53,23 @@ class WuKongTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups,
             wukong=rank_model_pb2.WuKong(
-                layers=[
+                wukong_layers=[
                     module_pb2.WuKongLayer(
-                        rank_feature_num=2,
+                        lcb_feature_num=3,
+                        fmb_feature_num=4,
+                        compressed_feature_num=2,
                         feature_num_mlp=module_pb2.MLP(hidden_units=[4]),
                     ),
                     module_pb2.WuKongLayer(
-                        rank_feature_num=2,
+                        lcb_feature_num=3,
+                        fmb_feature_num=2,
+                        compressed_feature_num=2,
                         feature_num_mlp=module_pb2.MLP(hidden_units=[4]),
                     ),
                     module_pb2.WuKongLayer(
-                        rank_feature_num=2,
+                        lcb_feature_num=2,
+                        fmb_feature_num=2,
+                        compressed_feature_num=2,
                         feature_num_mlp=module_pb2.MLP(hidden_units=[4]),
                     ),
                 ],

@@ -278,11 +278,11 @@ class FactorizationMachineBlock(nn.Module):
     """FM Block module for WuKongLayer.
 
     Args:
-        feature_dim(int): embedding dimension
-        feature_num_in (int): feature_num
-        feature_num_out(int): feature_out_num
-        rank(int): FM rank less than feature_num_in
-        feature_num_mlp(dict): feature num MLP module parameters.
+        input_dim(int): embedding dimension
+        feature_num_in (int): number of input features.
+        feature_num_out(int): number of output features.
+        compressed_feature_num (int): number of compressed features in optimized FM.
+        feature_num_mlp (dict): MLP config
     """
 
     def __init__(
@@ -290,18 +290,22 @@ class FactorizationMachineBlock(nn.Module):
         input_dim: int,
         feature_num_in: int,
         feature_num_out: int,
-        rank: int,
+        compressed_feature_num: int,
         feature_num_mlp: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.feature_num_in = feature_num_in
         self.feature_num_out = feature_num_out
         self.input_dim = input_dim
-        self.rank = rank
-        self.weight = nn.Parameter(torch.empty((feature_num_in, rank)))
-        self.norm = nn.LayerNorm(feature_num_in * rank)
+        self.compressed_feature_num = compressed_feature_num
+        self.weight = nn.Parameter(
+            torch.empty((feature_num_in, compressed_feature_num))
+        )
+        self.norm = nn.LayerNorm(feature_num_in * compressed_feature_num)
 
-        self.mlp = MLP(in_features=feature_num_in * rank, **feature_num_mlp)
+        self.mlp = MLP(
+            in_features=feature_num_in * compressed_feature_num, **feature_num_mlp
+        )
         self.feature_out_liner = nn.Linear(
             self.mlp.output_dim(), self.feature_num_out * self.input_dim
         )
@@ -320,7 +324,7 @@ class FactorizationMachineBlock(nn.Module):
         outputs = inputs.permute(0, 2, 1)
         outputs = torch.matmul(outputs, self.weight)
         outputs = torch.matmul(inputs, outputs)
-        outputs = outputs.view(-1, self.feature_num_in * self.rank)
+        outputs = outputs.view(-1, self.feature_num_in * self.compressed_feature_num)
         outputs = self.mlp(self.norm(outputs))
         outputs = self.feature_out_liner(outputs)
         outputs = outputs.view(-1, self.feature_num_out, self.input_dim)
@@ -333,29 +337,43 @@ class WuKongLayer(nn.Module):
     Args:
         input_dim(int): embedding dimension
         feature_num (int): feature_num
-        rank_feature_num(int): FM rank less than feature_num_in
-        feature_num_mlp(dict): feature num MLP module parameters.
+        lcb_feature_num (int): LinearCompressBlock output feature num.
+        fmb_feature_num (int): FactorizationMachineBlock output feature num.
+        compressed_feature_num (int): number of compressed features in optimized FM.
+        feature_num_mlp (dict): feature num MLP module parameters.
     """
 
     def __init__(
         self,
         input_dim: int,
         feature_num: int,
-        rank_feature_num: int,
+        lcb_feature_num: int,
+        fmb_feature_num: int,
+        compressed_feature_num: int,
         feature_num_mlp: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        self._lcb_feature_num = feature_num // 2
-        self._fmb_feature_num = feature_num - self._lcb_feature_num
-        self.lcb = LinearCompressBlock(feature_num, self._lcb_feature_num)
+        self.lcb_feature_num = lcb_feature_num
+        self.fmb_feature_num = fmb_feature_num
+        self.lcb = LinearCompressBlock(feature_num, lcb_feature_num)
         self.fmb = FactorizationMachineBlock(
             input_dim,
             feature_num,
-            self._fmb_feature_num,
-            rank_feature_num,
+            fmb_feature_num,
+            compressed_feature_num,
             feature_num_mlp,
         )
         self.norm = nn.LayerNorm(input_dim)
+        if feature_num != lcb_feature_num + fmb_feature_num:
+            self.residual_projection = LinearCompressBlock(
+                feature_num, lcb_feature_num + fmb_feature_num
+            )
+        else:
+            self.residual_projection = nn.Identity()
+
+    def output_feature_num(self) -> int:
+        """Get output feature num."""
+        return self.lcb_feature_num + self.fmb_feature_num
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Forward the module.
@@ -366,5 +384,5 @@ class WuKongLayer(nn.Module):
         lcb = self.lcb(inputs)
         fmb = self.fmb(inputs)
         outputs = torch.concat((fmb, lcb), dim=1)
-        outputs = self.norm(outputs + inputs)
+        outputs = self.norm(outputs + self.residual_projection(inputs))
         return outputs

@@ -43,17 +43,20 @@ class WuKong(RankModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.init_input()
-        group_dims = self.embedding_group.group_dims("deep")
+        self.group_name = self.embedding_group.group_names()[0]
+        group_dims = self.embedding_group.group_dims(self.group_name)
         self._feature_num = len(group_dims)
         self._emb_dim = group_dims[0]
-        self._layers = nn.ModuleList()
-        for layer_cgf in self._model_config.layers:
+        self._wukong_layers = nn.ModuleList()
+        feature_num = self._feature_num
+        for layer_cgf in self._model_config.wukong_layers:
             layer = WuKongLayer(
-                self._emb_dim, self._feature_num, **config_to_kwargs(layer_cgf)
+                self._emb_dim, feature_num, **config_to_kwargs(layer_cgf)
             )
-            self._layers.append(layer)
+            self._wukong_layers.append(layer)
+            feature_num = layer.output_feature_num()
         self.final_mlp = MLP(
-            self._feature_num * self._emb_dim,
+            feature_num * self._emb_dim,
             **config_to_kwargs(self._model_config.final),
         )
         self.output_mlp = nn.Linear(self.final_mlp.output_dim(), self._num_class)
@@ -70,9 +73,9 @@ class WuKong(RankModel):
         grouped_features = self.build_input(batch)
 
         # dense
-        feat = grouped_features["deep"]
+        feat = grouped_features[self.group_name]
         feat = feat.reshape(-1, self._feature_num, self._emb_dim)
-        for layer in self._layers:
+        for layer in self._wukong_layers:
             feat = layer(feat)
         feat = feat.view(feat.size(0), -1)
         y_final = self.final_mlp(feat)

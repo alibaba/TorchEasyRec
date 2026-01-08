@@ -95,15 +95,20 @@ class WuKongLayerTest(unittest.TestCase):
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
     )
     def test_wukong_layer(self, graph_type) -> None:
-        mlp_proto = MLP(hidden_units=[12, 8, 4])
+        mlp_proto = MLP(hidden_units=[4])
         mlp_cfg = config_to_kwargs(mlp_proto)
         layer = WuKongLayer(
-            input_dim=16, feature_num=9, rank_feature_num=3, feature_num_mlp=mlp_cfg
+            input_dim=16,
+            feature_num=9,
+            lcb_feature_num=4,
+            fmb_feature_num=4,
+            compressed_feature_num=2,
+            feature_num_mlp=mlp_cfg,
         )
         layer = create_test_module(layer, graph_type)
         features = torch.randn([5, 9, 16])
         result = layer(features)
-        self.assertEqual(result.size(), (5, 9, 16))
+        self.assertEqual(result.size(), (5, 8, 16))
 
 
 if __name__ == "__main__":

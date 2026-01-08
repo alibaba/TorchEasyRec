@@ -72,6 +72,6 @@ message xDeepFM {
 
 
 message WuKong {
-    repeated WuKongLayer layers = 1;
+    repeated WuKongLayer wukong_layers = 1;
     required MLP final = 2;
 }
