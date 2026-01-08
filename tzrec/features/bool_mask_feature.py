@@ -38,7 +38,7 @@ class BoolMaskFeature(IdFeature):
             return None
 
     def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config impl."""
+        """Get fg json config."""
         fg_cfg = {
             "feature_type": "bool_mask_feature",
             "feature_name": self.name,
