@@ -9,23 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 from typing import Any, Dict, List, Optional, Tuple
-
-import pyarrow as pa
 
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
-    DenseData,
-    ParsedData,
-    SparseData,
 )
 from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
-    FgMode,
-    _parse_fg_encoded_dense_feature_impl,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
 
@@ -35,24 +26,16 @@ class MatchFeature(BaseFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+        super().__init__(feature_config, **kwargs)
         self._wildcard_pkey = self.config.pkey == "ALL"
         self._wildcard_skey = self.config.skey == "ALL"
-
-    @property
-    def name(self) -> str:
-        """Feature name."""
-        return self.config.feature_name
 
     # pyre-ignore [56]
     @BaseFeature.is_neg.setter
@@ -133,51 +116,8 @@ class MatchFeature(BaseFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            # input feature is already lookuped
-            feat = input_data[self.name]
-            if self.is_sparse:
-                parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-            else:
-                parsed_feat = _parse_fg_encoded_dense_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            inputs = copy.copy(self.inputs)
-            input_feats = [input_data[inputs.pop(0)].cast(pa.string()).tolist()]
-            if not self._wildcard_pkey:
-                input_feats.append(input_data[inputs.pop(0)].cast(pa.string()).tolist())
-            else:
-                input_feats.append([])
-            if not self._wildcard_skey:
-                input_feats.append(input_data[inputs.pop(0)].cast(pa.string()).tolist())
-            else:
-                input_feats.append([])
-            if self.is_sparse:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(*input_feats)
-                parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-            else:
-                values = self._fg_op.transform(*input_feats)
-                parsed_feat = DenseData(name=self.name, values=values)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "match_feature",
             "feature_name": self.name,

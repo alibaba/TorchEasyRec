@@ -10,17 +10,10 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import numpy as np
-import pyarrow as pa
 import pyfg
 
-from tzrec.datasets.utils import (
-    ParsedData,
-    SparseData,
-)
-from tzrec.features.feature import FgMode, _parse_fg_encoded_sparse_feature_impl
 from tzrec.features.id_feature import IdFeature
 from tzrec.protos.feature_pb2 import FeatureConfig, TextNormalizeOption
 
@@ -39,17 +32,14 @@ class TokenizeFeature(IdFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+        super().__init__(feature_config, **kwargs)
         self._tok_fg_op = None
 
     @property
@@ -95,40 +85,6 @@ class TokenizeFeature(IdFeature):
                     stop_char_file = os.path.join(self.config.asset_dir, stop_char_file)
         return stop_char_file
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            # input feature is already bucktized
-            feat = input_data[self.name]
-            parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                self.name, feat, **self._fg_encoded_kwargs
-            )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feat = input_data[self.inputs[0]]
-            if pa.types.is_list(input_feat.type):
-                input_feat = input_feat.fill_null([])
-            input_feat = input_feat.tolist()
-            if self.config.HasField("text_normalizer"):
-                fgout, status = self._fg_op.process({self.inputs[0]: input_feat})
-                assert status.ok(), status.message()
-                values = np.asarray(fgout[self.name].values, np.int64)
-                lengths = np.asarray(fgout[self.name].lengths, np.int32)
-            else:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor([input_feat])
-            parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
     def init_fg(self) -> None:
         """Init fg op."""
         super().init_fg()
@@ -144,8 +100,8 @@ class TokenizeFeature(IdFeature):
         else:
             self._tok_fg_op = self._fg_op
 
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfgs = []
         expression = self.config.expression
         if self.config.HasField("text_normalizer"):

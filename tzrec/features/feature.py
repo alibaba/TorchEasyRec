@@ -48,6 +48,8 @@ from tzrec.datasets.utils import (
     NEG_DATA_GROUP,
     DenseData,
     ParsedData,
+    SequenceDenseData,
+    SequenceSparseData,
     SparseData,
 )
 from tzrec.modules.dense_embedding_collection import (
@@ -58,7 +60,7 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.protos import feature_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
-from tzrec.utils import config_util, dynamicemb_util
+from tzrec.utils import config_util, dynamicemb_util, env_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
@@ -206,6 +208,135 @@ def _parse_fg_encoded_dense_feature_impl(
     return DenseData(name, feat_values)
 
 
+def _parse_fg_encoded_sequence_sparse_feature_impl(
+    name: str,
+    feat: pa.Array,
+    sequence_delim: str = ";",
+    multival_sep: str = chr(3),
+    default_value: Optional[List[int]] = None,
+) -> SequenceSparseData:
+    """Parse fg encoded sequence sparse feature.
+
+    Args:
+        name (str): feature name.
+        feat (pa.Array): input feature data.
+        sequence_delim (str): sequence delimiter.
+        multival_sep (str): string separator for multi-val data.
+        default_value (int): default value.
+
+    Returns:
+        an instance of SequenceSparseFeature.
+    """
+    if pa.types.is_string(feat.type):
+        # dtype = string
+        is_empty = pa.compute.equal(feat, pa.scalar(""))
+        feat = pa.compute.if_else(is_empty, pa.nulls(len(feat)), feat)
+        if default_value is not None:
+            feat = feat.fill_null(multival_sep.join(map(str, default_value)))
+        list_seq_feat = pa.compute.split_pattern(feat, sequence_delim)
+        list_feat = pa.compute.split_pattern(list_seq_feat.values, multival_sep)
+        seq_offsets = list_seq_feat.offsets.to_numpy()
+        seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+        feat_values = list_feat.values.cast(pa.int64()).to_numpy()
+        feat_offsets = list_feat.offsets.to_numpy()
+        feat_lengths = feat_offsets[1:] - feat_offsets[:-1]
+    elif pa.types.is_list(feat.type):
+        if pa.types.is_list(feat.type.value_type):
+            # dtype = list<list<int>> or others can cast to list<list<int>>
+            feat = feat.cast(pa.list_(pa.list_(pa.int64())), safe=False)
+            if default_value is not None:
+                is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+                feat = pa.compute.if_else(is_empty, pa.nulls(len(feat)), feat)
+                feat = feat.fill_null([default_value])
+            seq_offsets = feat.offsets.to_numpy()
+            seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+            feat_values = feat.values.values.to_numpy()
+            feat_offsets = feat.values.offsets.to_numpy()
+            feat_lengths = feat_offsets[1:] - feat_offsets[:-1]
+        else:
+            # dtype = list<int> or others can cast to list<int>
+            feat = feat.cast(pa.list_(pa.int64()), safe=False)
+            if default_value is not None:
+                is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+                feat = pa.compute.if_else(is_empty, pa.nulls(len(feat)), feat)
+                feat = feat.fill_null(default_value)
+            seq_offsets = feat.offsets.to_numpy()
+            seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+            feat_values = feat.values.to_numpy()
+            feat_lengths = np.ones_like(feat_values, dtype=np.int32)
+    else:
+        raise ValueError(
+            f"{name} only support str|list<int>|list<list<int>> dtype input,"
+            f" but get {feat.type}."
+        )
+    return SequenceSparseData(name, feat_values, feat_lengths, seq_lengths)
+
+
+def _parse_fg_encoded_sequence_dense_feature_impl(
+    name: str,
+    feat: pa.Array,
+    sequence_delim: str = ";",
+    multival_sep: str = chr(3),
+    value_dim: int = 1,
+    default_value: Optional[List[float]] = None,
+) -> SequenceDenseData:
+    """Parse fg encoded sequence dense feature.
+
+    Args:
+        name (str): feature name.
+        feat (pa.Array): input feature data.
+        sequence_delim (str): sequence delimiter.
+        multival_sep (str): string separator for multi-val data.
+        value_dtype (pa.DataType): value dtype.
+        value_dim (int): value dimension.
+        default_value (list): default value.
+
+    Returns:
+        an instance of SequenceSparseFeature.
+    """
+    if pa.types.is_string(feat.type):
+        is_empty = pa.compute.equal(feat, pa.scalar(""))
+        feat = pa.compute.if_else(is_empty, pa.nulls(len(feat)), feat)
+        if default_value is not None:
+            feat = feat.fill_null(multival_sep.join(map(str, default_value)))
+        list_seq_feat = pa.compute.split_pattern(feat, sequence_delim)
+        list_feat = pa.compute.split_pattern(list_seq_feat.values, multival_sep)
+        seq_offsets = list_seq_feat.offsets.to_numpy()
+        seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+        feat_values = (
+            list_feat.values.cast(pa.float32(), safe=False)
+            .to_numpy()
+            .reshape(-1, value_dim)
+        )
+    elif pa.types.is_list(feat.type):
+        if pa.types.is_list(feat.type.value_type):
+            # dtype = list<list<float>> or others can cast to list<list<float>>
+            feat = feat.cast(pa.list_(pa.list_(pa.float32())), safe=False)
+            if default_value is not None:
+                is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+                feat = pa.compute.if_else(is_empty, pa.nulls(len(feat)), feat)
+                feat = feat.fill_null([default_value])
+            seq_offsets = feat.offsets.to_numpy()
+            seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+            feat_values = feat.values.values.to_numpy().reshape(-1, value_dim)
+        else:
+            # dtype = list<float> or others can cast to list<float>
+            feat = feat.cast(pa.list_(pa.float32()), safe=False)
+            if default_value is not None:
+                is_empty = pa.compute.equal(pa.compute.list_value_length(feat), 0)
+                feat = pa.compute.if_else(is_empty, pa.nulls(len(feat)), feat)
+                feat = feat.fill_null(default_value)
+            seq_offsets = feat.offsets.to_numpy()
+            seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+            feat_values = feat.values.to_numpy().reshape(-1, value_dim)
+    else:
+        raise ValueError(
+            f"{name} only support str|list<float>|list<float<float>> dtype input,"
+            f" but get {feat.type}."
+        )
+    return SequenceDenseData(name, feat_values, seq_lengths)
+
+
 def _dtype_str_to_data_type(data_type_str: str) -> DataType:
     if data_type_str == "FP32":
         data_type = DataType.FP32
@@ -247,6 +378,10 @@ class BaseFeature(object, metaclass=_meta_cls):
         feature_config (FeatureConfig): a instance of feature config.
         fg_mode (FgMode): input data fg mode.
         fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
+        sequence_name (str): sequence group name.
+        sequence_delim (str): separator for sequence feature.
+        sequence_length (int): max sequence length.
+        sequence_pk (str): sequence primary key name for serving.
     """
 
     def __init__(
@@ -254,6 +389,12 @@ class BaseFeature(object, metaclass=_meta_cls):
         feature_config: FeatureConfig,
         fg_mode: FgMode = FgMode.FG_NONE,
         fg_encoded_multival_sep: Optional[str] = None,
+        is_sequence: bool = False,
+        sequence_name: Optional[str] = None,
+        sequence_delim: Optional[str] = None,
+        sequence_length: Optional[int] = None,
+        sequence_pk: Optional[str] = None,
+        **kwargs,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
         self._feature_config = feature_config
@@ -271,7 +412,31 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._side_inputs = None
         self._vocab_list = None
         self._vocab_dict = None
+        self._is_sequence = is_sequence
+        self._is_grouped_seq = False
 
+        # for sequence feature
+        self._underline = "_" if env_util.use_rtp() else "__"
+        self.sequence_name = None
+        self.sequence_delim = None
+        self.sequence_length = None
+        self.sequence_pk = None
+        if is_sequence:
+            if sequence_name is None:
+                self.sequence_delim = self.config.sequence_delim
+                self.sequence_length = self.config.sequence_length
+            else:
+                self._is_sequence = True
+                self._is_grouped_seq = True
+                self.sequence_name = sequence_name
+                self.sequence_delim = sequence_delim
+                self.sequence_length = sequence_length
+                if not sequence_pk:
+                    self.sequence_pk = f"user:{sequence_name}"
+                else:
+                    self.sequence_pk = sequence_pk
+
+        # for fg encoded data
         self._fg_encoded_kwargs = {}
         self._fg_encoded_multival_sep = fg_encoded_multival_sep or chr(3)
         if self.fg_mode == FgMode.FG_NONE:
@@ -297,7 +462,10 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def name(self) -> str:
         """Feature name."""
-        raise NotImplementedError
+        if self._is_grouped_seq:
+            return f"{self.sequence_name}{self._underline}{self.config.feature_name}"
+        else:
+            return self.config.feature_name
 
     @property
     def is_neg(self) -> bool:
@@ -371,12 +539,12 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def is_sequence(self) -> bool:
         """Feature is sequence or not."""
-        return False
+        return self._is_sequence
 
     @property
     def is_grouped_sequence(self) -> bool:
         """Feature is grouped sequence or not."""
-        return False
+        return self._is_grouped_seq
 
     @property
     def is_weighted(self) -> bool:
@@ -545,6 +713,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                     f"{self.__class__.__name__}[{self.name}] must have fg "
                     f"input names, e.g., item:cat_a."
                 )
+            self._side_inputs = []
             for x in side_inputs:
                 if not (
                     len(x) == 2
@@ -554,7 +723,13 @@ class BaseFeature(object, metaclass=_meta_cls):
                         f"{self.__class__.__name__}[{self.name}] must have valid fg "
                         f"input names, e.g., item:cat_a, but got {x}."
                     )
-            self._side_inputs = side_inputs
+                side, name = x[0], x[1]
+                seq_prefix = (
+                    f"{self.sequence_name}{self._underline}"
+                    if side == "item" and self._is_grouped_seq
+                    else ""
+                )
+                self._side_inputs.append((side, f"{seq_prefix}{name}"))
         return self._side_inputs
 
     @property
@@ -626,20 +801,99 @@ class BaseFeature(object, metaclass=_meta_cls):
         parsed_data = self._parse(t_input_data)
         return parsed_data
 
+    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
+        """Parse input data for the feature impl.
+
+        Args:
+            input_data (dict): raw input feature data.
+
+        Return:
+            parsed feature data.
+        """
+        if self.fg_mode == FgMode.FG_NONE:
+            # input feature is already lookuped
+            feat = input_data[self.name]
+            if self.is_sequence:
+                if self.is_sparse:
+                    parsed_feat = _parse_fg_encoded_sequence_sparse_feature_impl(
+                        self.name,
+                        feat,
+                        sequence_delim=self.sequence_delim,
+                        **self._fg_encoded_kwargs,
+                    )
+                else:
+                    parsed_feat = _parse_fg_encoded_sequence_dense_feature_impl(
+                        self.name,
+                        feat,
+                        sequence_delim=self.sequence_delim,
+                        value_dim=self.config.value_dim,
+                        **self._fg_encoded_kwargs,
+                    )
+            else:
+                if self.is_sparse:
+                    parsed_feat = _parse_fg_encoded_sparse_feature_impl(
+                        self.name, feat, **self._fg_encoded_kwargs
+                    )
+                else:
+                    parsed_feat = _parse_fg_encoded_dense_feature_impl(
+                        self.name, feat, **self._fg_encoded_kwargs
+                    )
+        elif self.fg_mode == FgMode.FG_NORMAL:
+            fgout, status = self._fg_op.process(input_data)
+            assert status.ok(), status.message()
+            feat_data = fgout[self.name]
+            if self.is_sequence:
+                if self._fg_op.is_sparse:
+                    parsed_feat = SequenceSparseData(
+                        name=self.name,
+                        values=feat_data.np_values,
+                        key_lengths=feat_data.np_key_lengths,
+                        seq_lengths=feat_data.np_lengths,
+                    )
+                else:
+                    parsed_feat = SequenceDenseData(
+                        name=self.name,
+                        values=feat_data.dense_values,
+                        seq_lengths=feat_data.np_lengths,
+                    )
+            else:
+                if self.is_sparse:
+                    parsed_feat = SparseData(
+                        name=self.name,
+                        values=feat_data.np_values,
+                        lengths=feat_data.np_lengths,
+                    )
+                else:
+                    parsed_feat = DenseData(
+                        name=self.name, values=feat_data.dense_values
+                    )
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported without fg handler."
+            )
+        return parsed_feat
+
     def init_fg(self) -> None:
         """Init fg op."""
         if self._fg_op is None:
             cfgs = self.fg_json()
-            if len(cfgs) > 1:
-                # pyre-ignore [16]
-                self._fg_op = pyfg.FgHandler({"features": cfgs}, 1)
-            else:
-                is_rank_zero = os.environ.get("RANK", "0") == "0"
-                # pyre-ignore [16]
-                self._fg_op = pyfg.FeatureFactory.create(cfgs[0], is_rank_zero)
+            # pyre-ignore [16]
+            self._fg_op = pyfg.FgArrowHandler({"features": cfgs}, 1)
 
     def fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config."""
+        fg_cfgs = self._fg_json()
+        if self.is_sequence:
+            for fg_cfg in fg_cfgs:
+                if not self._is_grouped_seq:
+                    fg_cfg["sequence_delim"] = self.sequence_delim
+                    fg_cfg["sequence_length"] = self.sequence_length
+                else:
+                    fg_cfg["feature_type"] = f"sequence_{fg_cfg['feature_type']}"
+        return fg_cfgs
+
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         raise NotImplementedError
 
     def fg_encoded_default_value(self) -> Optional[Union[List[int], List[float]]]:
@@ -669,23 +923,10 @@ class BaseFeature(object, metaclass=_meta_cls):
             # we try to initialize fg to get fg_encoded_default_value
             self.init_fg()
             # pyre-ignore [16]
-            if isinstance(self._fg_op, pyfg.FgHandler):
-                output, status = self._fg_op({x: [None] for _, x in self.side_inputs})
-                assert status.ok(), status.message()
-                default_value = output[self.name][0]
-                self._fg_op.reset_executor()
-            else:
-                output = self._fg_op([[None] for _ in self.side_inputs])
-                default_value = output[0]
-            if default_value is not None:
-                if not isinstance(default_value, list):
-                    default_value = [default_value]
-                elif len(default_value) == 0:
-                    # empty list
-                    default_value = None
-                elif isinstance(default_value[0], list):
-                    # list of list
-                    default_value = default_value[0]
+            output, status = self._fg_op({x: pa.nulls(1) for _, x in self.side_inputs})
+            assert status.ok(), status.message()
+            default_value = output[self.name][0]
+            self._fg_op.reset_executor()
             return default_value
 
     @property
@@ -764,7 +1005,7 @@ class BaseFeature(object, metaclass=_meta_cls):
 
     def __del__(self) -> None:
         # pyre-ignore [16]
-        if self._fg_op and isinstance(self._fg_op, pyfg.FgHandler):
+        if self._fg_op and isinstance(self._fg_op, pyfg.FgArrowHandler):
             self._fg_op.reset_executor()
 
 
@@ -790,7 +1031,8 @@ def create_features(
     """
     features = []
     for feat_config in feature_configs:
-        oneof_feat_config = getattr(feat_config, feat_config.WhichOneof("feature"))
+        feat_type = feat_config.WhichOneof("feature")
+        oneof_feat_config = getattr(feat_config)
         feat_cls_name = oneof_feat_config.__class__.__name__
         if feat_cls_name == "SequenceFeature":
             sequence_name = oneof_feat_config.sequence_name
@@ -800,14 +1042,15 @@ def create_features(
             for sub_feat_config in oneof_feat_config.features:
                 sub_feat_cls_name = config_util.which_msg(sub_feat_config, "feature")
                 # pyre-ignore [16]
-                feature = BaseFeature.create_class(f"Sequence{sub_feat_cls_name}")(
+                feature = BaseFeature.create_class(sub_feat_cls_name)(
                     sub_feat_config,
+                    fg_mode=fg_mode,
+                    fg_encoded_multival_sep=fg_encoded_multival_sep,
+                    is_sequence=True,
                     sequence_name=sequence_name,
                     sequence_delim=sequence_delim,
                     sequence_length=sequence_length,
                     sequence_pk=sequence_pk,
-                    fg_mode=fg_mode,
-                    fg_encoded_multival_sep=fg_encoded_multival_sep,
                 )
                 features.append(feature)
         else:
@@ -815,6 +1058,7 @@ def create_features(
                 feat_config,
                 fg_mode=fg_mode,
                 fg_encoded_multival_sep=fg_encoded_multival_sep,
+                is_sequence=feat_type.startswith("sequence_"),
             )
             features.append(feature)
 

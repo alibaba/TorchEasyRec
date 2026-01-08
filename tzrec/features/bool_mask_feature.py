@@ -11,38 +11,17 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyarrow as pa
-
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
-    ParsedData,
-    SparseData,
 )
 from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
-    FgMode,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.features.id_feature import IdFeature
-from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class BoolMaskFeature(IdFeature):
-    """BoolMaskFeature class.
-
-    Args:
-        feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
-    """
-
-    def __init__(
-        self,
-        feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
-    ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+    """BoolMaskFeature class."""
 
     # pyre-ignore [56]
     @IdFeature.is_neg.setter
@@ -58,39 +37,8 @@ class BoolMaskFeature(IdFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            feat = input_data[self.name]
-            parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                self.name,
-                feat,
-                **self._fg_encoded_kwargs,
-            )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feats = []
-            for name in self.inputs:
-                x = input_data[name]
-                if pa.types.is_list(x.type):
-                    x = x.fill_null([])
-                input_feats.append(x.tolist())
-            values, _, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
-            parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
     def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "bool_mask_feature",
             "feature_name": self.name,
@@ -122,4 +70,8 @@ class BoolMaskFeature(IdFeature):
             fg_cfg["value_type"] = self.config.fg_value_type
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if not self._is_grouped_seq:
+            fg_cfg["sequence_delim"] = self.sequence_delim
+            fg_cfg["sequence_length"] = self.sequence_length
         return [fg_cfg]

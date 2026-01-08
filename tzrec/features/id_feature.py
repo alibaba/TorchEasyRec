@@ -11,17 +11,9 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyarrow as pa
-
-from tzrec.datasets.utils import (
-    ParsedData,
-    SparseData,
-)
 from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
-    FgMode,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.protos import feature_pb2
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -39,10 +31,9 @@ class IdFeature(BaseFeature):
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+        super().__init__(feature_config, **kwargs)
 
         if isinstance(self.config, feature_pb2.IdFeature) and self.config.HasField(
             "weighted"
@@ -50,15 +41,13 @@ class IdFeature(BaseFeature):
             self._is_weighted = self.config.weighted
 
     @property
-    def name(self) -> str:
-        """Feature name."""
-        return self.config.feature_name
-
-    @property
     def value_dim(self) -> int:
         """Fg value dimension of the feature."""
         if self.config.HasField("value_dim"):
             return self.config.value_dim
+        elif self.is_sequence:
+            # for sequence, single value is default setting.
+            return 1
         else:
             return 0
 
@@ -106,51 +95,8 @@ class IdFeature(BaseFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            feat = input_data[self.inputs[0]]
-            parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                self.name,
-                feat,
-                is_weighted=self._is_weighted,
-                **self._fg_encoded_kwargs,
-            )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feat = input_data[self.inputs[0]]
-            if pa.types.is_list(input_feat.type):
-                input_feat = input_feat.fill_null([])
-                input_feat = input_feat.tolist()
-            elif pa.types.is_map(input_feat.type):
-                input_feat = input_feat.fill_null({})
-                input_feat = list(map(dict, input_feat.tolist()))
-            else:
-                input_feat = input_feat.tolist()
-            if self._is_weighted:
-                values, lengths, weights = self._fg_op.to_weighted_jagged_tensor(
-                    input_feat
-                )
-            else:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feat)
-                weights = None
-            parsed_feat = SparseData(
-                name=self.name, values=values, lengths=lengths, weights=weights
-            )
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "id_feature",
             "feature_name": self.name,
@@ -178,10 +124,7 @@ class IdFeature(BaseFeature):
             fg_cfg["num_buckets"] = self.config.num_buckets
         if self.config.weighted:
             fg_cfg["weighted"] = True
-        if self.config.HasField("value_dim"):
-            fg_cfg["value_dim"] = self.config.value_dim
-        else:
-            fg_cfg["value_dim"] = 0
+        fg_cfg["value_dim"] = self.value_dim
         if self.config.HasField("fg_value_type"):
             fg_cfg["value_type"] = self.config.fg_value_type
         if self.config.HasField("stub_type"):

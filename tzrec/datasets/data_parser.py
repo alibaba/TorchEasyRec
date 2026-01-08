@@ -169,7 +169,6 @@ class DataParser:
         """Init pyfg dag handler."""
         if not self._fg_handler:
             fg_json = create_fg_json(self._features)
-            print(fg_json)
             bucketize_only = self._fg_mode == FgMode.FG_BUCKETIZE
             # pyre-ignore [16]
             self._fg_handler = pyfg.FgArrowHandler(

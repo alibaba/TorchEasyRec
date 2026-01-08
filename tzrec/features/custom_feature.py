@@ -12,47 +12,20 @@
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyarrow as pa
 import pyfg
 from google.protobuf.json_format import MessageToDict
 
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
-    DenseData,
-    ParsedData,
-    SparseData,
 )
 from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
-    FgMode,
-    _parse_fg_encoded_dense_feature_impl,
-    _parse_fg_encoded_sparse_feature_impl,
 )
-from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class CustomFeature(BaseFeature):
-    """CustomFeature class.
-
-    Args:
-        feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
-    """
-
-    def __init__(
-        self,
-        feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
-    ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
-
-    @property
-    def name(self) -> str:
-        """Feature name."""
-        return self.config.feature_name
+    """CustomFeature class."""
 
     # pyre-ignore [56]
     @BaseFeature.is_neg.setter
@@ -125,47 +98,6 @@ class CustomFeature(BaseFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            # input feature is already lookuped
-            feat = input_data[self.name]
-            if self.is_sparse:
-                parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-            else:
-                parsed_feat = _parse_fg_encoded_dense_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feats = []
-            for name in self.inputs:
-                x = input_data[name]
-                if pa.types.is_list(x.type):
-                    x = x.fill_null([])
-                elif pa.types.is_map(x.type):
-                    x = x.fill_null({})
-                input_feats.append(x.tolist())
-            if self.is_sparse:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
-                parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-            else:
-                values = self._fg_op.transform(input_feats)
-                parsed_feat = DenseData(name=self.name, values=values)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
     def fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config."""
         fg_cfg = {
@@ -211,6 +143,12 @@ class CustomFeature(BaseFeature):
         fg_cfg["value_dim"] = self.value_dim
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if not self._is_grouped_seq:
+            fg_cfg["sequence_delim"] = self.sequence_delim
+            fg_cfg["sequence_length"] = self.sequence_length
+        fg_cfg["is_sequence"] = self.is_sequence
+
         return [fg_cfg]
 
     @property
