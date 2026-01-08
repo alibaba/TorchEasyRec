@@ -597,9 +597,12 @@ class SequenceCustomFeature(CustomFeature):
             if self._is_grouped_seq:
                 for expression in self.config.expression:
                     side, name = expression.split(":")
-                    side_inputs.append(
-                        (side, f"{self.sequence_name}{self._underline}{name}")
+                    seq_prefix = (
+                        f"{self.sequence_name}{self._underline}"
+                        if side == "item"
+                        else ""
                     )
+                    side_inputs.append((side, f"{seq_prefix}{name}"))
             else:
                 for expression in self.config.expression:
                     side_inputs.append(tuple(expression.split(":")))
