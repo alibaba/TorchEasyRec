@@ -1074,7 +1074,7 @@ def test_eval(
     pipeline_config_path: str,
     test_dir: str,
     env_str: str = "",
-    eval_type: Optional[str] = None
+    eval_type: Optional[str] = None,
 ) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
