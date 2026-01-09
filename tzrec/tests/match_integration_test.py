@@ -439,13 +439,13 @@ class MatchIntegrationTest(unittest.TestCase):
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                eval_type='best'
+                eval_type='best',
             )
         if self.success:
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                eval_type='latest'
+                eval_type='latest',
             )
         self.assertTrue(self.success)
 
