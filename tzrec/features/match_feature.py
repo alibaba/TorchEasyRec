@@ -83,6 +83,7 @@ class MatchFeature(BaseFeature):
         if self._is_sparse is None:
             self._is_sparse = (
                 self.config.HasField("zch")
+                or self.config.HasField("dynamicemb")
                 or self.config.HasField("hash_bucket_size")
                 or self.config.HasField("num_buckets")
                 or len(self.config.vocab_list) > 0
