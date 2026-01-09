@@ -431,6 +431,20 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
+    def test_mind_best_latest_eval(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/mind_mock.config", self.test_dir, item_id="item_id"
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir, eval_type='best'
+            )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir, eval_type='latest'
+            )
+        self.assertTrue(self.success)
+
     @unittest.skip("skip hstu match test")
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
