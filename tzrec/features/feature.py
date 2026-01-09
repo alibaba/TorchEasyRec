@@ -811,6 +811,10 @@ class BaseFeature(object, metaclass=_meta_cls):
         else:
             t_input_data = input_data
 
+        # filter output bool type inputs (masks), PyFgArrowHandler not support it.
+        t_input_data = {
+            k: v for k, v in t_input_data.items() if not pa.types.is_boolean(v.type)
+        }
         parsed_data = self._parse(t_input_data)
         return parsed_data
 

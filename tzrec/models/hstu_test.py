@@ -35,7 +35,7 @@ class HSTUTest(unittest.TestCase):
     def test_hstu(self, graph_type) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_id_feature=feature_pb2.IdFeature(
                     feature_name="historical_ids",
                     sequence_length=210,
                     embedding_dim=48,
