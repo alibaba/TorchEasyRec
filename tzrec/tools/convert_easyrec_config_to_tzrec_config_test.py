@@ -1038,10 +1038,10 @@ feature_configs {
   sequence_id_feature {
     feature_name: "user_video_sequence"
     expression: "user:user_video_sequence"
-    sequence_length: 1
-    sequence_delim: ","
     embedding_dim: 24
     hash_bucket_size: 1500000
+    sequence_length: 1
+    sequence_delim: ","
   }
 }
 feature_configs {
@@ -1103,23 +1103,23 @@ feature_configs {
   sequence_id_feature {
     feature_name: "click_100_seq__item_id"
     expression: "user:click_100_seq__item_id"
-    sequence_length: 1
-    sequence_delim: ";"
     embedding_dim: 24
     hash_bucket_size: 1500000
+    sequence_length: 1
+    sequence_delim: ";"
   }
 }
 feature_configs {
   sequence_raw_feature {
     feature_name: "click_100_seq__ts"
     expression: "user:click_100_seq__ts"
-    sequence_length: 1
-    sequence_delim: ";"
     embedding_dim: 4
     boundaries: 1e-08
     boundaries: 3.0
     boundaries: 25.0
     boundaries: 70.0
+    sequence_length: 1
+    sequence_delim: ";"
   }
 }
 """
@@ -2002,6 +2002,7 @@ feature_configs {
 
 class ConvertConfigTest(unittest.TestCase):
     def setUp(self):
+        self.maxDiff = None
         self.success = False
         if not os.path.exists("./tmp"):
             os.makedirs("./tmp")

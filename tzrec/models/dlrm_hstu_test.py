@@ -96,7 +96,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_id_feature=feature_pb2.IdFeature(
                     feature_name="video_id",
                     embedding_dim=16,
                     embedding_name="video_id_emb",
@@ -104,7 +104,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_id_feature=feature_pb2.IdFeature(
                     feature_name="video_cat",
                     embedding_dim=16,
                     embedding_name="video_cat_emb",
@@ -112,7 +112,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_id_feature=feature_pb2.IdFeature(
                     feature_name="item_video_id",
                     embedding_dim=16,
                     embedding_name="video_id_emb",
@@ -120,7 +120,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_id_feature=feature_pb2.IdFeature(
                     feature_name="item_video_cat",
                     embedding_dim=16,
                     embedding_name="video_cat_emb",

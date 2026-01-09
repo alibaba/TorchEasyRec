@@ -110,7 +110,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "sum",
                 [[3], [1], [1], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -131,7 +131,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "sum",
                 [[3], [1], [1], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -152,7 +152,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "sum",
                 [[0], [0], [0], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -170,7 +170,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "mean",
                 [[1.5], [1], [1], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(

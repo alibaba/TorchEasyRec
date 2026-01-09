@@ -11,17 +11,11 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyarrow as pa
-
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
-    ParsedData,
-    SparseData,
 )
 from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
-    FgMode,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.features.id_feature import IdFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -32,17 +26,14 @@ class ComboFeature(IdFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @IdFeature.is_neg.setter
@@ -66,43 +57,13 @@ class ComboFeature(IdFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
                 " or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
-
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            # input feature is already bucktized
-            feat = input_data[self.name]
-            parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                self.name, feat, **self._fg_encoded_kwargs
-            )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feats = []
-            for name in self.inputs:
-                x = input_data[name]
-                if pa.types.is_list(x.type):
-                    x = x.fill_null([])
-                input_feats.append(x.tolist())
-            values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
-            parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-        else:
-            raise ValueError(
-                "fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
@@ -111,11 +72,11 @@ class ComboFeature(IdFeature):
         else:
             return None
 
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "combo_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": list(self.config.expression),
             "value_type": "string",
@@ -139,4 +100,7 @@ class ComboFeature(IdFeature):
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

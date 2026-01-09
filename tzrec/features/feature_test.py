@@ -26,7 +26,6 @@ from tzrec.features import (
     lookup_feature,
     match_feature,
     raw_feature,
-    sequence_feature,
 )
 from tzrec.features import feature as feature_lib
 from tzrec.features.feature import FgMode
@@ -232,8 +231,8 @@ class FeatureTest(unittest.TestCase):
         self.assertTrue(isinstance(features[2], combo_feature.ComboFeature))
         self.assertTrue(isinstance(features[3], lookup_feature.LookupFeature))
         self.assertTrue(isinstance(features[4], match_feature.MatchFeature))
-        self.assertTrue(isinstance(features[5], sequence_feature.SequenceIdFeature))
-        self.assertTrue(isinstance(features[6], sequence_feature.SequenceRawFeature))
+        self.assertTrue(isinstance(features[5], id_feature.IdFeature))
+        self.assertTrue(isinstance(features[6], raw_feature.RawFeature))
 
     def _create_test_feature_cfgs(self):
         return [
@@ -287,7 +286,7 @@ class FeatureTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.SequenceIdFeature(
+                sequence_id_feature=feature_pb2.IdFeature(
                     feature_name="click_seq_cat_simple",
                     expression="item:click_seq_cat_simple",
                     sequence_length=50,
@@ -297,7 +296,7 @@ class FeatureTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_raw_feature=feature_pb2.RawFeature(
                     feature_name="click_seq_int_simple",
                     expression="user:click_seq_int_simple",
                     sequence_length=50,
