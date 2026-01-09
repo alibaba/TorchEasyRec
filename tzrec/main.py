@@ -777,9 +777,9 @@ def evaluate(
 
     global_step = None
     if not checkpoint_path:
-        if eval_type == "best":
+        if pipeline_config.HasField("export_config") and eval_type == "best":
             checkpoint_path, _ = checkpoint_util.best_checkpoint(
-                pipeline_config.model_dir, pipeline_config.eval_config
+                pipeline_config.model_dir, pipeline_config.export_config
             )
         elif eval_type == "latest":
             checkpoint_path, _ = checkpoint_util.latest_checkpoint(
