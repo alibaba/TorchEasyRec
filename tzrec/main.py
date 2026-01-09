@@ -726,6 +726,7 @@ def train_and_evaluate(
 def evaluate(
     pipeline_config_path: str,
     checkpoint_path: Optional[str] = None,
+    eval_type: Optional[str] = None,
     eval_input_path: Optional[str] = None,
     eval_result_filename: str = "eval_result.txt",
 ) -> None:
@@ -735,6 +736,8 @@ def evaluate(
         pipeline_config_path (str): path to EasyRecConfig object.
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path
+        eval_type (str): if specified, decide which type of checkpoint to use
+            (type: best, latest).
         eval_input_path (str, optional): eval data path, default use eval data in
             pipeline_config, could be a path or a list of paths
         eval_result_filename (str): evaluation result metrics save path.
@@ -774,9 +777,18 @@ def evaluate(
 
     global_step = None
     if not checkpoint_path:
-        checkpoint_path, global_step = checkpoint_util.latest_checkpoint(
-            pipeline_config.model_dir
-        )
+        if pipeline_config.HasField("export_config") and eval_type == "best":
+            checkpoint_path, _ = checkpoint_util.best_checkpoint(
+                pipeline_config.model_dir, pipeline_config.export_config
+            )
+        elif eval_type == "latest":
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
+            )
+        else:
+            checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.model_dir
+            )
     planner = create_planner(
         device=device,
         # pyre-ignore [16]

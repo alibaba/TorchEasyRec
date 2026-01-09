@@ -12,6 +12,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 - --pipeline_config_path: 评估用的配置文件
 - --checkpoint_path: 指定要评估的checkpoint, 默认评估model_dir下面最新的checkpoint
+- --eval_type: 指定要评估的checkpoint的类型(best、latest), 默认评估model_dir下面最新的checkpo
 - --eval_input_path: 评估数据的输入路径
 - --eval_result_filename: 评估指标的结果文件名
 
