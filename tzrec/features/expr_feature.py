@@ -15,10 +15,22 @@ from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
 )
 from tzrec.features.raw_feature import RawFeature
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class ExprFeature(RawFeature):
-    """ExprFeature class."""
+    """ExprFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @RawFeature.is_neg.setter
@@ -38,7 +50,7 @@ class ExprFeature(RawFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "expr_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": self.config.expression,
             "variables": list(self.config.variables),
@@ -54,4 +66,7 @@ class ExprFeature(RawFeature):
             fg_cfg["value_dim"] = self.config.value_dim
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

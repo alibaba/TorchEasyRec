@@ -15,10 +15,22 @@ from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
 )
 from tzrec.features.raw_feature import RawFeature
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class OverlapFeature(RawFeature):
-    """OverlapFeature class."""
+    """OverlapFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @RawFeature.is_neg.setter
@@ -51,7 +63,7 @@ class OverlapFeature(RawFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "overlap_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "query": self.config.query,
             "title": self.config.title,
             "method": self.config.method,
@@ -64,4 +76,7 @@ class OverlapFeature(RawFeature):
             fg_cfg["boundaries"] = list(self.config.boundaries)
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

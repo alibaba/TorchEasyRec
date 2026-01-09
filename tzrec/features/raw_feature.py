@@ -14,10 +14,22 @@ from typing import Any, Dict, List, Optional, Tuple
 from tzrec.features.feature import (
     BaseFeature,
 )
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class RawFeature(BaseFeature):
-    """RawFeature class."""
+    """RawFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     @property
     def value_dim(self) -> int:
@@ -55,6 +67,10 @@ class RawFeature(BaseFeature):
         else:
             return self.config.WhichOneof("dense_emb")
 
+    def _need_seq_prefix(self, side: str, name: str) -> bool:
+        """Check input fields should add prefix of group sequence or not."""
+        return self._is_grouped_seq
+
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
         if self.config.HasField("expression"):
@@ -66,7 +82,7 @@ class RawFeature(BaseFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "raw_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": self.config.expression,
             "value_type": "float",

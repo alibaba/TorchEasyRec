@@ -92,7 +92,7 @@ class MatchFeature(BaseFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
@@ -120,7 +120,7 @@ class MatchFeature(BaseFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "match_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "user": self.config.nested_map,
             "category": self.config.pkey,
             "item": self.config.skey,
@@ -176,6 +176,8 @@ class MatchFeature(BaseFeature):
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
         #     del fg_cfg["combiner"]
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]
 
     def assets(self) -> Dict[str, str]:

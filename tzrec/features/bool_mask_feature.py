@@ -18,10 +18,22 @@ from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
 )
 from tzrec.features.id_feature import IdFeature
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class BoolMaskFeature(IdFeature):
-    """BoolMaskFeature class."""
+    """BoolMaskFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @IdFeature.is_neg.setter
@@ -41,7 +53,7 @@ class BoolMaskFeature(IdFeature):
         """Get fg json config."""
         fg_cfg = {
             "feature_type": "bool_mask_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": list(self.config.expression),
         }
@@ -71,7 +83,12 @@ class BoolMaskFeature(IdFeature):
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
 
-        if not self._is_grouped_seq:
-            fg_cfg["sequence_delim"] = self.sequence_delim
-            fg_cfg["sequence_length"] = self.sequence_length
+        if self.is_sequence:
+            if self.is_grouped_sequence:
+                if len(self.config.sequence_fields) > 0:
+                    fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+            else:
+                fg_cfg["sequence_delim"] = self.sequence_delim
+                fg_cfg["sequence_length"] = self.sequence_length
+
         return [fg_cfg]

@@ -22,10 +22,22 @@ from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
 )
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class CustomFeature(BaseFeature):
-    """CustomFeature class."""
+    """CustomFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @BaseFeature.is_neg.setter
@@ -56,6 +68,7 @@ class CustomFeature(BaseFeature):
         if self._is_sparse is None:
             self._is_sparse = (
                 self.config.HasField("zch")
+                or self.config.HasField("dynamicemb")
                 or self.config.HasField("hash_bucket_size")
                 or self.config.HasField("num_buckets")
                 or len(self.vocab_list) > 0
@@ -82,7 +95,7 @@ class CustomFeature(BaseFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
@@ -102,7 +115,7 @@ class CustomFeature(BaseFeature):
         """Get fg json config."""
         fg_cfg = {
             "feature_type": "custom_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "operator_name": self.config.operator_name,
             "operator_lib_file": self.operator_lib_file,
@@ -144,10 +157,14 @@ class CustomFeature(BaseFeature):
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
 
-        if not self._is_grouped_seq:
-            fg_cfg["sequence_delim"] = self.sequence_delim
-            fg_cfg["sequence_length"] = self.sequence_length
-        fg_cfg["is_sequence"] = self.is_sequence
+        if self.is_sequence:
+            if self.is_grouped_sequence:
+                if len(self.config.sequence_fields) > 0:
+                    fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+            else:
+                fg_cfg["sequence_delim"] = self.sequence_delim
+                fg_cfg["sequence_length"] = self.sequence_length
+            fg_cfg["is_sequence"] = self.is_sequence
 
         return [fg_cfg]
 

@@ -18,10 +18,22 @@ from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
 )
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class LookupFeature(BaseFeature):
-    """LookupFeature class."""
+    """LookupFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @BaseFeature.is_neg.setter
@@ -78,7 +90,7 @@ class LookupFeature(BaseFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
@@ -98,7 +110,7 @@ class LookupFeature(BaseFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "lookup_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "map": self.config.map,
             "key": self.config.key,
             "default_value": self.config.default_value,
@@ -109,7 +121,7 @@ class LookupFeature(BaseFeature):
         }
         raw_fg_cfg = None
         if self.config.value_dim > 1:
-            fg_cfg["feature_name"] = self.name + "__lookup"
+            fg_cfg["feature_name"] = self.config.feature_name + "__lookup"
             fg_cfg["default_value"] = ""
             fg_cfg["value_type"] = "string"
             fg_cfg["value_dim"] = 1
@@ -118,7 +130,7 @@ class LookupFeature(BaseFeature):
             fg_cfg["stub_type"] = True
             raw_fg_cfg = {
                 "feature_type": "raw_feature",
-                "feature_name": self.name,
+                "feature_name": self.config.feature_name,
                 "default_value": self.config.default_value,
                 "expression": "feature:" + fg_cfg["feature_name"],
                 "separator": self.config.value_separator,
@@ -168,6 +180,9 @@ class LookupFeature(BaseFeature):
                 fg_cfg["value_dim"] = self.value_dim
             if self.config.HasField("stub_type"):
                 fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
 
         fg_cfgs = [fg_cfg]
         if raw_fg_cfg is not None:

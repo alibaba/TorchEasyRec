@@ -251,7 +251,7 @@ class IdFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], None, False],
+            ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], [], False],
             [
                 "xyz",
                 ["abc\x1defg", None, "hij"],
@@ -268,9 +268,9 @@ class IdFeatureTest(unittest.TestCase):
                 13,
                 False,
             ],
-            ["", [1, 2, None, 3], [95, 70, 13], [1, 1, 0, 1], None, False],
+            ["", [1, 2, None, 3], [95, 70, 13], [1, 1, 0, 1], [], False],
             ["4", [1, 2, None, 3], [95, 70, 56, 13], [1, 1, 1, 1], 56, False],
-            ["", [1, 2, None, 3], [49, 59, 21], [1, 1, 0, 1], None, True],
+            ["", [1, 2, None, 3], [49, 59, 21], [1, 1, 0, 1], [], True],
         ],
         name_func=test_util.parameterized_name_func,
     )

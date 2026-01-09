@@ -106,7 +106,7 @@ class TokenizeFeature(IdFeature):
         expression = self.config.expression
         if self.config.HasField("text_normalizer"):
             norm_cfg = self.config.text_normalizer
-            norm_fg_name = self.name + "__text_norm"
+            norm_fg_name = self.config.feature_name + "__text_norm"
             expression = "feature:" + norm_fg_name
             norm_fg_cfg = {
                 "feature_type": "text_normalizer",
@@ -136,7 +136,7 @@ class TokenizeFeature(IdFeature):
         ], "tokenizer_type only support [bpe, sentencepiece] now."
         fg_cfg = {
             "feature_type": "tokenize_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "vocab_file": self.vocab_file,
             "expression": expression,

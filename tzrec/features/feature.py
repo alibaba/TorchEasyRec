@@ -703,6 +703,19 @@ class BaseFeature(object, metaclass=_meta_cls):
                 self._inputs = [v for _, v in self.side_inputs]
         return self._inputs
 
+    def _need_seq_prefix(self, side: str, name: str) -> bool:
+        """Check input fields should add prefix of group sequence or not."""
+        if self._is_grouped_seq:
+            if (
+                hasattr(self.config, "sequence_fields")
+                and len(self.config.sequence_fields) > 0
+            ):
+                return name in self.config.sequence_fields
+            else:
+                return side == "item"
+        else:
+            return False
+
     @property
     def side_inputs(self) -> List[Tuple[str, str]]:
         """Input field names with side."""
@@ -726,7 +739,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 side, name = x[0], x[1]
                 seq_prefix = (
                     f"{self.sequence_name}{self._underline}"
-                    if side == "item" and self._is_grouped_seq
+                    if self._need_seq_prefix(side, name)
                     else ""
                 )
                 self._side_inputs.append((side, f"{seq_prefix}{name}"))
@@ -832,18 +845,21 @@ class BaseFeature(object, metaclass=_meta_cls):
             else:
                 if self.is_sparse:
                     parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                        self.name, feat, **self._fg_encoded_kwargs
+                        self.name,
+                        feat,
+                        is_weighted=self._is_weighted,
+                        **self._fg_encoded_kwargs,
                     )
                 else:
                     parsed_feat = _parse_fg_encoded_dense_feature_impl(
                         self.name, feat, **self._fg_encoded_kwargs
                     )
         elif self.fg_mode == FgMode.FG_NORMAL:
-            fgout, status = self._fg_op.process(input_data)
+            fgout, status = self._fg_op.process_arrow(input_data)
             assert status.ok(), status.message()
             feat_data = fgout[self.name]
             if self.is_sequence:
-                if self._fg_op.is_sparse:
+                if self.is_sparse:
                     parsed_feat = SequenceSparseData(
                         name=self.name,
                         values=feat_data.np_values,
@@ -862,6 +878,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                         name=self.name,
                         values=feat_data.np_values,
                         lengths=feat_data.np_lengths,
+                        weights=feat_data.np_weights if self._is_weighted else None,
                     )
                 else:
                     parsed_feat = DenseData(
@@ -877,18 +894,40 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Init fg op."""
         if self._fg_op is None:
             cfgs = self.fg_json()
-            # pyre-ignore [16]
-            self._fg_op = pyfg.FgArrowHandler({"features": cfgs}, 1)
+            print(cfgs)
+            if self._is_grouped_seq:
+                self._fg_op = pyfg.FgArrowHandler(
+                    {
+                        "features": [
+                            {
+                                "sequence_name": self.sequence_name,
+                                "sequence_length": self.sequence_length,
+                                "sequence_delim": self.sequence_delim,
+                                "sequence_pk": self.sequence_pk,
+                                "features": cfgs,
+                            }
+                        ]
+                    },
+                    1,
+                )
+            else:
+                # pyre-ignore [16]
+                self._fg_op = pyfg.FgArrowHandler({"features": cfgs}, 1)
 
     def fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config."""
         fg_cfgs = self._fg_json()
         if self.is_sequence:
             for fg_cfg in fg_cfgs:
+                if self.config.default_value == "":
+                    logger.warning(
+                        f"Sequence{self.__class__.__name__}[{self.name}]  "
+                        "not support empty default value now. reset to zero."
+                    )
+                    fg_cfg["default_value"] = "0"
                 if not self._is_grouped_seq:
                     fg_cfg["sequence_delim"] = self.sequence_delim
                     fg_cfg["sequence_length"] = self.sequence_length
-                else:
                     fg_cfg["feature_type"] = f"sequence_{fg_cfg['feature_type']}"
         return fg_cfgs
 
@@ -923,7 +962,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             # we try to initialize fg to get fg_encoded_default_value
             self.init_fg()
             # pyre-ignore [16]
-            output, status = self._fg_op({x: pa.nulls(1) for _, x in self.side_inputs})
+            output, status = self._fg_op({x: [None] for _, x in self.side_inputs})
             assert status.ok(), status.message()
             default_value = output[self.name][0]
             self._fg_op.reset_executor()
@@ -992,6 +1031,27 @@ class BaseFeature(object, metaclass=_meta_cls):
             return ""
 
     @property
+    def vocab_file_size(self) -> int:
+        """Vocab file size."""
+        if len(self.vocab_file) > 0:
+            vocab_dict = dict()
+            has_value = False
+            with open(self.vocab_file) as f:
+                for line in f.readlines():
+                    tokens = line.strip().split(maxsplit=1)
+                    if len(tokens) > 1:
+                        vocab_dict[tokens[0]] = int(tokens[1])
+                        has_value = True
+                    else:
+                        vocab_dict[tokens[0]] = 0
+            if has_value:
+                return max(list(vocab_dict.values())) + 1
+            else:
+                return len(vocab_dict)
+        else:
+            return ""
+
+    @property
     def default_bucketize_value(self) -> int:
         """Default bucketize value."""
         if self.config.HasField("default_bucketize_value"):
@@ -1032,7 +1092,7 @@ def create_features(
     features = []
     for feat_config in feature_configs:
         feat_type = feat_config.WhichOneof("feature")
-        oneof_feat_config = getattr(feat_config)
+        oneof_feat_config = getattr(feat_config, feat_type)
         feat_cls_name = oneof_feat_config.__class__.__name__
         if feat_cls_name == "SequenceFeature":
             sequence_name = oneof_feat_config.sequence_name

@@ -24,8 +24,6 @@ class IdFeature(BaseFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
@@ -80,13 +78,17 @@ class IdFeature(BaseFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
                 " or num_buckets or vocab_list or vocab_dict or zch.zch_size"
             )
         return num_embeddings
+
+    def _need_seq_prefix(self, side: str, name: str) -> bool:
+        """Check input fields should add prefix of group sequence or not."""
+        return self._is_grouped_seq
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
@@ -99,7 +101,7 @@ class IdFeature(BaseFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "id_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": self.config.expression,
             "value_type": "string",

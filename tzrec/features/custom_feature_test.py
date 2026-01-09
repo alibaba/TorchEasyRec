@@ -15,6 +15,7 @@ import unittest
 import numpy as np
 import pyarrow as pa
 from google.protobuf import struct_pb2
+from parameterized import parameterized
 
 from tzrec.features import custom_feature as custom_feature_lib
 from tzrec.features.feature import FgMode
@@ -156,11 +157,17 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [0], [0]]))
         self.assertTrue(np.allclose(parsed_feat.seq_lengths, np.array([2, 1, 1])))
 
-    def test_sequence_expr_feature_sparse(self):
+    @parameterized.expand(
+        [
+            [["item:ilng", "item:ilat", "user:ulng", "user:ulat"], []],
+            [["user:ilng", "user:ilat", "user:ulng", "user:ulat"], ["ilng", "ilat"]],
+        ]
+    )
+    def test_sequence_expr_feature_sparse(self, expression, sequence_fields):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             custom_feature=feature_pb2.CustomFeature(
                 feature_name="custom_feat",
-                expression=["item:ilng", "item:ilat", "user:ulng", "user:ulat"],
+                expression=expression,
                 operator_name="SeqExpr",
                 operator_lib_file="pyfg/lib/libseq_expr.so",
                 operator_params=struct_pb2.Struct(
@@ -170,6 +177,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
                 ),
                 boundaries=[0, 150, 1500],
                 embedding_dim=16,
+                sequence_fields=sequence_fields,
             )
         )
         seq_feat = custom_feature_lib.CustomFeature(

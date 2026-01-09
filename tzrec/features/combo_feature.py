@@ -18,10 +18,22 @@ from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
 )
 from tzrec.features.id_feature import IdFeature
+from tzrec.protos.feature_pb2 import FeatureConfig
 
 
 class ComboFeature(IdFeature):
-    """ComboFeature class."""
+    """ComboFeature class.
+
+    Args:
+        feature_config (FeatureConfig): a instance of feature config.
+    """
+
+    def __init__(
+        self,
+        feature_config: FeatureConfig,
+        **kwargs,
+    ) -> None:
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @IdFeature.is_neg.setter
@@ -45,7 +57,7 @@ class ComboFeature(IdFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.name}] must set hash_bucket_size"
@@ -64,7 +76,7 @@ class ComboFeature(IdFeature):
         """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "combo_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": list(self.config.expression),
             "value_type": "string",
@@ -88,4 +100,7 @@ class ComboFeature(IdFeature):
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]
