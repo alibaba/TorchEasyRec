@@ -894,7 +894,6 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Init fg op."""
         if self._fg_op is None:
             cfgs = self.fg_json()
-            print(cfgs)
             if self._is_grouped_seq:
                 self._fg_op = pyfg.FgArrowHandler(
                     {
