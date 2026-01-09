@@ -1074,6 +1074,7 @@ def test_eval(
     pipeline_config_path: str,
     test_dir: str,
     env_str: str = "",
+    eval_type: Optional[str] = None,
 ) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
@@ -1083,6 +1084,8 @@ def test_eval(
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
     )
+    if eval_type is not None:
+        cmd_str += f"--eval_type {eval_type} "
     if env_str:
         cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
