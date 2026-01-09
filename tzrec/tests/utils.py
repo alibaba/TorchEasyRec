@@ -700,6 +700,8 @@ def build_mock_input_with_fg(
     inputs = defaultdict(dict)
     single_id_fields = {user_id, item_id}
     for feature in features:
+        if feature.is_sequence:
+            continue
         if type(feature) is IdFeature:
             is_multi = (
                 random.random() < 0.5 and feature.inputs[0] not in single_id_fields
