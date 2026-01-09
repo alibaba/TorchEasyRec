@@ -67,10 +67,6 @@ class RawFeature(BaseFeature):
         else:
             return self.config.WhichOneof("dense_emb")
 
-    def _need_seq_prefix(self, side: str, name: str) -> bool:
-        """Check input fields should add prefix of group sequence or not."""
-        return self._is_grouped_seq
-
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
         if self.config.HasField("expression"):

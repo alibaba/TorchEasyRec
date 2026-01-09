@@ -69,6 +69,7 @@ _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
 
 
 MAX_HASH_BUCKET_SIZE = 2**63 - 1
+SINGLE_INPUT_FEATURE_CLASSES = ["IdFeature", "RawFeature", "TokenizeFeature"]
 
 
 def _parse_fg_encoded_sparse_feature_impl(
@@ -705,7 +706,9 @@ class BaseFeature(object, metaclass=_meta_cls):
 
     def _need_seq_prefix(self, side: str, name: str) -> bool:
         """Check input fields should add prefix of group sequence or not."""
-        if self._is_grouped_seq:
+        if self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
+            return True
+        elif self._is_grouped_seq:
             if (
                 hasattr(self.config, "sequence_fields")
                 and len(self.config.sequence_fields) > 0
