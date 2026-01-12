@@ -733,7 +733,7 @@ class SequenceCustomFeatureTest(unittest.TestCase):
                 operator_params=struct_pb2.Struct(
                     fields={
                         "formula": struct_pb2.Value(
-                            string_value="click_50_seq__cur_time-click_50_seq__clk_time_seq"
+                            string_value="cur_time-clk_time_seq"
                         )
                     }
                 ),
@@ -748,14 +748,12 @@ class SequenceCustomFeatureTest(unittest.TestCase):
         )
         self.assertEqual(seq_feat.output_dim, 1)
         self.assertEqual(seq_feat.is_sparse, False)
-        self.assertEqual(
-            seq_feat.inputs, ["click_50_seq__cur_time", "click_50_seq__clk_time_seq"]
-        )
+        self.assertEqual(seq_feat.inputs, ["cur_time", "clk_time_seq"])
         self.assertEqual(seq_feat.emb_config, None)
 
         input_data = {
-            "click_50_seq__cur_time": pa.array(["10"]),
-            "click_50_seq__clk_time_seq": pa.array(["2|3", "4"]),
+            "cur_time": pa.array(["10"]),
+            "clk_time_seq": pa.array(["2|3", "4"]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
@@ -828,16 +826,16 @@ class SequenceCustomFeatureTest(unittest.TestCase):
             [
                 "click_50_seq__ilng",
                 "click_50_seq__ilat",
-                "click_50_seq__ulng",
-                "click_50_seq__ulat",
+                "ulng",
+                "ulat",
             ],
         )
 
         input_data = {
             "click_50_seq__ilng": pa.array(["113.728|116.4074", "121.4737", None]),
             "click_50_seq__ilat": pa.array(["23.002|39.9042", "31.2304", None]),
-            "click_50_seq__ulng": pa.array(["113.1057", "116.4074", None]),
-            "click_50_seq__ulat": pa.array(["22.5614", "39.9042", None]),
+            "ulng": pa.array(["113.1057", "116.4074", None]),
+            "ulat": pa.array(["22.5614", "39.9042", None]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__custom_feat")
