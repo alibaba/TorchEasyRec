@@ -8,7 +8,7 @@ meta提出wukong架构，是一个简单的交互架构，旨在为推荐系统�
 
 - 2.确保模型性能的scaling law
 
-![din.png](../../images/models/wukong.jpg)
+![wukong.jpg](../../images/models/wukong.jpg)
 
 ## 模型配置
 
