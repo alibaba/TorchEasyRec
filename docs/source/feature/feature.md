@@ -596,57 +596,6 @@ feature_configs: {
 | RegexReplace | 正则替换 | pyfg/lib/libregex_replace.so | • regex_patten: 正则表达式，匹配的文本片段将会被替换 <br>• replacement: 替换文本 |
 |              |          |                              |                                                                                  |
 
-## SequenceIdFeature：类别型序列特征
-
-类别型序列特征
-
-- 支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；
-- 支持array\<string>或array\<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）；
-- 支持多值序列array\<array\<string>>或array\<array\<bigint>>类型，多值序列需设置value_dim=0，通常情况下训练推理性能比单值序列差一些。
-
-```
-
-```
-
-- **sequence_length**: 序列特征最大长度
-- **sequence_delim**: 序列特征分隔符
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
-- 其余配置同IdFeature
-
-## SequenceRawFeature：数值型序列特征
-
-数值型序列特征
-
-```
-
-```
-
-- **sequence_length**: 序列特征最大长度
-- **sequence_delim**: 序列特征分隔符
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- 其余配置同RawFeature
-
-## SequenceCustomFeature: 自定义序列特征
-
-自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
-
-```
-
-```
-
-- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
-
-- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
-
-- expression: 特征FG所依赖组合字段的来源
-
-- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
-
-| 算子名称 | 算子功能   | 算子动态库              | 算子参数                                                                                                                                                 |
-| -------- | ---------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SeqExpr  | 序列表达式 | pyfg/lib/libseq_expr.so | • formula: 表达式。如果值为spherical_distance， 计算两个经纬度坐标的距离，参数为[lng1_seq, lat1_seq, lng2, lat2]，前两个参数是序列，后两个参数是标量值。 |
-
 ## SequenceFeature：序列特征
 
 序列特征分为**分组序列特征**和**普通序列特征**两种
