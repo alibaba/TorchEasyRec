@@ -221,7 +221,6 @@ class SequenceTokenizeFeatureTest(unittest.TestCase):
                 vocab_file="data/test/tokenizer.json",
                 embedding_dim=16,
                 expression="user:token_input",
-                sequence_fields=["token_input"],
                 default_value=default_value,
             )
         )
