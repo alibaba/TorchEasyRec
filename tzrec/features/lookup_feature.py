@@ -181,12 +181,16 @@ class LookupFeature(BaseFeature):
             if self.config.HasField("stub_type"):
                 fg_cfg["stub_type"] = self.config.stub_type
 
-        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
-            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+        if self.is_grouped_sequence:
+            if len(self.config.sequence_fields) > 0:
+                fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+            if raw_fg_cfg is not None:
+                raw_fg_cfg["sequence_fields"] = [self.config.feature_name + "__lookup"]
 
         fg_cfgs = [fg_cfg]
         if raw_fg_cfg is not None:
             fg_cfgs.append(raw_fg_cfg)
+
         return fg_cfgs
 
     def assets(self) -> Dict[str, str]:

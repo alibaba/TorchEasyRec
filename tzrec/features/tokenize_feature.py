@@ -88,17 +88,10 @@ class TokenizeFeature(IdFeature):
     def init_fg(self) -> None:
         """Init fg op."""
         super().init_fg()
-        if self.config.HasField("text_normalizer"):
-            fg_cfgs = self.fg_json()
-            fg_cfg = None
-            for fg_cfg in fg_cfgs:
-                if fg_cfg["feature_name"] == self.name:
-                    break
-            assert fg_cfg is not None
-            # pyre-ignore [16]
-            self._tok_fg_op = pyfg.FeatureFactory.create(fg_cfg, False)
-        else:
-            self._tok_fg_op = self._fg_op
+        # for get vocab_size
+        fg_cfgs = self.fg_json()
+        # pyre-ignore [16]
+        self._tok_fg_op = pyfg.FeatureFactory.create(fg_cfgs[-1], False)
 
     def _fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config impl."""

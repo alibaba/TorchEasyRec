@@ -176,5 +176,81 @@ class TokenizeFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
 
+class SequenceTokenizeFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            [
+                "",
+                ["abc efg;hij", "", "hij"],
+                False,
+                [19758, 299, 73, 1944, 16054, 73, 1944],
+                [3, 2, 1, 2],
+                [2, 1, 1],
+            ],
+            [
+                "xyz",
+                ["abc efg;hij", "", "hij"],
+                False,
+                [19758, 299, 73, 1944, 16054, 35609, 73, 1944],
+                [3, 2, 1, 2],
+                [2, 1, 1],
+            ],
+            [
+                "",
+                ["ABC efg;hij", "", "HIJ"],
+                True,
+                [19758, 299, 73, 1944, 16054, 73, 1944],
+                [3, 2, 1, 2],
+                [2, 1, 1],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_tokenize_feature(
+        self,
+        default_value,
+        input_data,
+        use_text_norm,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                vocab_file="data/test/tokenizer.json",
+                embedding_dim=16,
+                expression="user:token_input",
+                sequence_fields=["token_input"],
+                default_value=default_value,
+            )
+        )
+        if use_text_norm:
+            text_norm = feature_pb2.TextNormalizer(
+                norm_options=[feature_pb2.TEXT_UPPER2LOWER]
+            )
+            seq_feat_cfg.tokenize_feature.text_normalizer.CopyFrom(text_norm)
+        seq_feat = tokenize_feature_lib.TokenizeFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["click_50_seq__token_input"])
+
+        input_data = {"click_50_seq__token_input": pa.array(input_data)}
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

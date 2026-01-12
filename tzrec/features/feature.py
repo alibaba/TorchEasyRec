@@ -925,7 +925,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         fg_cfgs = self._fg_json()
         if self.is_sequence:
             for fg_cfg in fg_cfgs:
-                if self.config.default_value == "":
+                if fg_cfg.get("default_value", "") == "":
                     logger.warning(
                         f"Sequence{self.__class__.__name__}[{self.name}]  "
                         "not support empty default value now. reset to zero."
