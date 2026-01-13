@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 import unittest
 
@@ -36,9 +35,9 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success:
-            if os.path.exists(self.test_dir):
-                shutil.rmtree(self.test_dir)
+        # if self.success:
+        #     if os.path.exists(self.test_dir):
+        #         shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
         os.environ.pop("USE_RTP", None)
 
@@ -884,7 +883,9 @@ class RankIntegrationTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")

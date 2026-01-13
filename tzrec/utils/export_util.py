@@ -197,16 +197,15 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense = split_model(
-                pipeline_config, model, checkpoint_path, save_dir
-            )
+            sparse, dense, _ = split_model(data, model, save_dir)
             export_model_trt(sparse, dense, data, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            export_model_aot(model, data, save_dir)
+            sparse, dense, meta_info = split_model(data, model, save_dir, is_aot=True)
+            export_model_aot(sparse, dense, data, meta_info, save_dir)
         else:
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
@@ -934,34 +933,20 @@ def export_rtp_model(
 
 
 def split_model(
-    pipeline_config: EasyRecConfig,
+    data: Dict[str, torch.Tensor],
     model: BaseModule,
-    checkpoint_path: Optional[str],
     save_dir: str,
-    rank=0,
-) -> List[nn.Module]:
+    is_aot: bool = False,
+) -> Tuple[nn.Module, nn.Module, Dict[str, Any]]:
     """Split an EasyRec model into sparse part and dense part."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    is_rank_zero = rank == 0
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     graph_dir = os.path.join(save_dir, "graph")
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
-
-    if not checkpoint_path:
-        raise ValueError("checkpoint path should be specified.")
-
-    # make dataparser to get user feats before create model
-    data_config = pipeline_config.data_config
-    features = cast(List[BaseFeature], model._features)
-    data_config.num_workers = 1
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
-    batch = next(iter(dataloader))
-    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
     model.set_is_inference(True)
     model.eval()
@@ -986,6 +971,8 @@ def split_model(
             graph.erase_node(node)
     outputs = {}
     output_attrs = {}
+    jagged_seq_tensor_names = []
+    seq_tensor_names = []
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
             name = node.args[0]
@@ -998,23 +985,20 @@ def split_model(
                 output_attrs[name + "__keys"] = graph.call_method(
                     "keys", args=(node_kt,)
                 )
-        elif node.op == "call_function" and node.target in (
-            fx_mark_tensor,
-            fx_mark_seq_tensor,
-        ):
-            # sequence or query
-            name = (
-                node.args[0]
-                if node.target == fx_mark_tensor
-                else _seq_feat_name(node.args[0])
-            )
+        elif node.op == "call_function" and node.target == fx_mark_tensor:
+            # query
+            name = node.args[0]
             t = node.args[1]
             outputs[name] = t
         elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
             # sequence
-            name = node.args[0]
+            name = _seq_feat_name(node.args[0])
             t = node.args[1]
             outputs[name] = t
+            if node.kwargs["is_jagged_seq"]:
+                jagged_seq_tensor_names.append(name)
+            else:
+                seq_tensor_names.append(name)
         elif node.op == "call_function" and node.target == fx_mark_seq_len:
             # sequence length
             name = _seq_len_name(node.args[0])
@@ -1027,7 +1011,10 @@ def split_model(
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
-    _, sparse_attrs = sparse_gm(data, device=device)
+    if is_aot:
+        _, sparse_attrs = sparse_gm(data)
+    else:
+        _, sparse_attrs = sparse_gm(data, device=device)
 
     # Extract Dense Model
     logger.info("exporting dense model...")
@@ -1081,4 +1068,8 @@ def split_model(
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
-    return sparse_gm, dense_gm
+    meta_info = {
+        "seq_tensor_names": seq_tensor_names,
+        "jagged_seq_tensor_names": jagged_seq_tensor_names,
+    }
+    return sparse_gm, dense_gm, meta_info

@@ -32,6 +32,7 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
+from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
@@ -1071,11 +1072,8 @@ def predict(
     )
 
     if is_aot:
-        model: torch.export.pt2_archive._package.AOTICompiledModel = (
-            torch._inductor.aoti_load_package(
-                os.path.join(scripted_model_path, "aoti_model.pt2"),
-                device_index=device.index,
-            )
+        model: aot_utils.AOTICombinedModel = aot_utils.load_model_aot(
+            scripted_model_path, device=device
         )
     else:
         # disable jit compile， as it compile too slow now.
