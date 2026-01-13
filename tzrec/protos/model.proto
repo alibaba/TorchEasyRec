@@ -81,4 +81,8 @@ message ModelConfig {
     optional VariationalDropout variational_dropout = 11;
 
     optional Kernel kernel = 12 [default = PYTORCH];
+
+    // init task loss minimum weight c for pareto
+    optional float pareto_init_weight_c = 13[default = 0.1];
+
 }

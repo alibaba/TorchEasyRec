@@ -68,6 +68,9 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             self._sample_weights = sample_weights
 
         self._train_metric_modules = nn.ModuleDict()
+        self._pareto_init_weight_c = -0.01
+        if model_config.HasField("pareto_init_weight_c"):
+            self._pareto_init_weight_c = model_config.pareto_init_weight_c
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -267,7 +270,7 @@ class TrainWrapper(BaseModule):
             losses = self.model.loss(predictions, batch)
             total_loss = torch.stack(list(losses.values())).sum()
 
-        losses = {k: v.detach() for k, v in losses.items()}
+        # losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}
         return total_loss, (losses, predictions, batch)
 

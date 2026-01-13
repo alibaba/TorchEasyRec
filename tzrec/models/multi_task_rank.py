@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -89,7 +90,7 @@ class MultiTaskRank(RankModel):
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
-        losses = {}
+        losses = OrderedDict()
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name

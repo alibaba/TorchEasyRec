@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -76,7 +77,7 @@ class RankModel(BaseModel):
         self._sample_weight_name = (
             sample_weights[0] if sample_weights else sample_weights
         )
-        self._loss_collection = {}
+        self._loss_collection = OrderedDict()
         self.embedding_group = None
         self.group_variational_dropouts = None
 
@@ -226,7 +227,7 @@ class RankModel(BaseModel):
         num_class: int = 1,
         suffix: str = "",
     ) -> Dict[str, torch.Tensor]:
-        losses = {}
+        losses = OrderedDict()
 
         loss_type = loss_cfg.WhichOneof("loss")
         loss_name = loss_type + suffix
