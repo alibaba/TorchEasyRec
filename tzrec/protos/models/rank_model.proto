@@ -69,3 +69,9 @@ message xDeepFM {
     // wide embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
     optional string wide_init_fn = 5;
 }
+
+
+message WuKong {
+    repeated WuKongLayer wukong_layers = 1;
+    required MLP final = 2;
+}
