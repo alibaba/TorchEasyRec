@@ -13,11 +13,9 @@ import copy
 import os
 from datetime import timedelta
 from queue import Queue
-from typing import Callable, Dict, Iterator, List, Optional, Tuple, Type
+from typing import Callable, Iterator, List, Optional, Tuple, Type
 
-import numpy as np
 import torch
-from scipy.optimize import minimize, nnls
 from torch import distributed as dist
 from torch import nn
 from torch.autograd.profiler import record_function
@@ -42,7 +40,6 @@ from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist as _TrainPipelineSparseDist,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import In, Out
-from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.types import (
     Awaitable,
     ModuleSharder,
@@ -202,98 +199,6 @@ def _pipeline_backward(losses: torch.Tensor, optimizer: torch.optim.Optimizer) -
             loss.backward()
 
 
-def _pareto_step(W: torch.Tensor, C: torch.Tensor, G: torch.Tensor) -> np.array:
-    """Ref:http://ofey.me/papers/Pareto.pdf.
-
-    Args:
-        W(Tensor): dimension (K,1)
-        C(Tensor): dimension (K,1)
-        G(Tensor): dimension (K,M)
-    """
-    GGT = torch.matmul(G, G.T)  # (K, K)
-    e = torch.ones(W.shape, device=W.device)  # (K, 1)
-    m_up = torch.hstack((GGT, e))  # (K, K+1)
-    m_down = torch.hstack(
-        (e.T, torch.zeros([1, 1], dtype=torch.float32, device=W.device))
-    )  # (1, K+1)
-    M = torch.vstack((m_up, m_down))  # (K+1, K+1)
-    z = torch.vstack((-torch.matmul(GGT, C), 1 - torch.sum(C)))  # (K+1, 1)
-    hat_w = torch.matmul(
-        torch.matmul(torch.linalg.inv(torch.matmul(M.T, M)), M), z
-    )  # (K+1, 1)
-    hat_w.detach()
-    hat_w = hat_w[:-1].cpu().numpy()  # (K, 1)
-    hat_w = hat_w.reshape(-1)
-    c = C.data.clone().cpu().numpy().reshape(-1)  # (K,)
-    new_w = _ASM(hat_w, c)
-    return new_w
-
-
-def _ASM(hat_w: np.array, c: np.array) -> np.array:
-    """Ref: http://ofey.me/papers/Pareto.pdf.
-
-    Args:
-        hat_w: dimension (K)
-        c: dimension (K)
-    """
-    A = np.array([[0 if i != j else 1 for i in range(len(c))] for j in range(len(c))])
-    b = hat_w
-    x0, _ = nnls(A, b)
-
-    def _fn(x, A, b):
-        return np.linalg.norm(A.dot(x) - b)
-
-    cons = {"type": "eq", "fun": lambda x: np.sum(x) + np.sum(c) - 1}
-    bounds = [[0.0, None] for _ in range(len(hat_w))]
-    min_out = minimize(
-        _fn, x0, args=(A, b), method="SLSQP", bounds=bounds, constraints=cons
-    )
-    new_w = min_out.x + c
-    return new_w
-
-
-def _pareto_w(
-    losses: Dict[str, torch.Tensor], model: torch.nn.Module, init_c: float
-) -> np.array:
-    """Compute pareto front of losses for weight."""
-    grads = []
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    for loss in losses.values():
-        loss_sum = torch.sum(loss, dim=0)
-        gradients = torch.autograd.grad(
-            loss_sum,
-            trainable_params,
-            retain_graph=True,
-            allow_unused=True,
-            create_graph=False,
-        )
-        grad_flattened = []
-        for grad, param in zip(gradients, trainable_params):
-            if grad is not None:
-                grad_flattened.append(grad.view(-1))
-            else:
-                grad_flattened.append(torch.zeros_like(param).view(-1))
-
-        all_grads = torch.cat(grad_flattened)
-        grads.append(all_grads)
-        # grads.append(all_grads.cpu().numpy())
-    grads = torch.stack(grads)
-    init_weight = 1 / len(losses)
-    # init_c = init_weight * 0.5
-    assert len(losses) * init_c <= 1.0 and len(losses) * init_c >= 0.0, (
-        f"all init_c should be in [0, 1], we found loss number {len(losses)}"
-    )
-    w = torch.fill(
-        torch.empty((len(losses), 1), dtype=torch.float32, device=grads.device),
-        init_weight,
-    )
-    c = torch.fill(
-        torch.empty((len(losses), 1), dtype=torch.float32, device=grads.device), init_c
-    )
-    return _pareto_step(w, c, grads)
-
-
 class TrainPipelineBase(_TrainPipelineBase):
     """TorchEasyRec's TrainPipelineBase, make backward support grad scaler."""
 
@@ -307,59 +212,9 @@ class TrainPipelineBase(_TrainPipelineBase):
         ] = None,
     ) -> None:
         super().__init__(model, optimizer, device, custom_model_fwd)
-        self.pareto_init_weight_c = model.module.model._pareto_init_weight_c
 
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
-
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
-        """For TrainPipelineBase progress."""
-        if not self._connected:
-            self._connect(dataloader_iter)
-        if self._data_iter_stopped:
-            raise StopIteration()
-
-        # Fetch next batch, if depleted, raise at start of next progress
-        next_batch = self._next_batch(dataloader_iter)
-        cur_batch = self._cur_batch
-
-        # for exhaustive data iter, some ranks will first depletes data,
-        # but we still need progress the train pipeline for other ranks;
-        # cur_batch could be None
-
-        if self._model.training:
-            with record_function("## zero_grad ##"):
-                self._optimizer.zero_grad()
-
-        if cur_batch is not None:
-            self._wait_for_batch(cur_batch)
-
-        # model will need to handle if cur_batch is empty; this is needed if there's
-        # communicative ops
-        with record_function("## forward ##"):
-            (losses, output) = self._model(cur_batch)
-
-        if self._model.training:
-            if self.pareto_init_weight_c >= 0.0:
-                losses_dict, predictions, batch = output
-                w = _pareto_w(losses_dict, self._model, self.pareto_init_weight_c)
-                new_loss = []
-                for i, loss in enumerate(losses_dict.values()):
-                    new_loss.append(loss * w[i])
-                losses = torch.stack(new_loss).sum()
-            self._backward(losses)
-
-        # Copy the next batch to GPU
-        self._cur_batch = cur_batch = next_batch
-        if cur_batch is not None:
-            self._copy_batch_to_gpu(cur_batch)
-
-        # Update
-        if self._model.training:
-            with record_function("## optimizer ##"):
-                self._optimizer.step()
-
-        return output
 
 
 class TrainPipelineSparseDist(_TrainPipelineSparseDist):
@@ -395,7 +250,6 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
             enqueue_batch_after_forward,
         )
         self._check_all_workers_data_status = check_all_workers_data_status
-        self.pareto_init_weight_c = model.module.model._pareto_init_weight_c
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         if dataloader_iter is not self._dataloader_iter:
@@ -426,73 +280,6 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
 
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
-
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
-        """For TrainPipelineSparseDist progress."""
-        self._state = PipelineState.IDLE
-        if not self._model_attached:
-            self.attach(self._model)
-
-        # fill the pipeline is only needed for the beginning when
-        # the pipeline (batches) is empty
-        self.fill_pipeline(dataloader_iter)
-
-        # here is the expected stop after exhausting all batches
-        if not self.batches:
-            raise StopIteration
-
-        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
-        self._set_module_context(self.contexts[0])
-
-        if self._model.training:
-            with record_function("## zero_grad ##"):
-                self._optimizer.zero_grad()
-
-        self._wait_for_batch()
-
-        if len(self.batches) >= 2:
-            # invoke splits all_to_all comms (first part of input_dist)
-            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
-
-        if not self._enqueue_batch_after_forward:
-            self.enqueue_batch(dataloader_iter)
-
-        # forward
-        with record_function(f"## forward {self.contexts[0].index} ##"):
-            self._state = PipelineState.CALL_FWD
-            losses, output = self._model_fwd(self.batches[0])
-
-        if self._enqueue_batch_after_forward:
-            self.enqueue_batch(dataloader_iter)
-
-        if len(self.batches) >= 2:
-            self.wait_sparse_data_dist(self.contexts[1])
-
-        if self._model.training:
-            # backward
-            if self.pareto_init_weight_c >= 0.0:
-                losses_dict, predictions, batch = output
-                w = _pareto_w(losses_dict, self._model, self.pareto_init_weight_c)
-                new_loss = []
-                for i, loss in enumerate(losses_dict.values()):
-                    new_loss.append(loss * w[i])
-                losses = torch.stack(new_loss).sum()
-
-            self._state = PipelineState.CALL_BWD
-            self._backward(losses)
-
-            self.sync_embeddings(
-                self._model,
-                self._dmp_collection_sync_interval_batches,
-                self.contexts[0],
-            )
-
-            # update
-            with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
-
-        self.dequeue_batch()
-        return output
 
 
 class PredictPipelineSparseDist(_TrainPipelineSparseDist):

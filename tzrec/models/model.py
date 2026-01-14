@@ -30,6 +30,7 @@ from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.rebuild_loss import ParetoDynamicLossWeight
 
 _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
@@ -248,6 +249,9 @@ class TrainWrapper(BaseModule):
             raise ValueError(
                 f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
             )
+        self.pareto = None
+        if self.model._pareto_init_weight_c >= 0:
+            self.pareto = ParetoDynamicLossWeight()
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -268,9 +272,14 @@ class TrainWrapper(BaseModule):
         ):
             predictions = self.model.predict(batch)
             losses = self.model.loss(predictions, batch)
-            total_loss = torch.stack(list(losses.values())).sum()
+            if self.training and self.pareto:
+                total_loss = self.pareto(
+                    losses, self.model, self.model._pareto_init_weight_c
+                )
+            else:
+                total_loss = torch.stack(list(losses.values())).sum()
 
-        # losses = {k: v.detach() for k, v in losses.items()}
+        losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}
         return total_loss, (losses, predictions, batch)
 
