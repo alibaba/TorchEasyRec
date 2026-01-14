@@ -340,7 +340,7 @@ class TrainPipelineBase(_TrainPipelineBase):
             (losses, output) = self._model(cur_batch)
 
         if self._model.training:
-            if self.pareto_init_weight_c > 0.0:
+            if self.pareto_init_weight_c >= 0.0:
                 losses_dict, predictions, batch = output
                 w = _pareto_w(losses_dict, self._model, self.pareto_init_weight_c)
                 new_loss = []
@@ -470,7 +470,7 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
 
         if self._model.training:
             # backward
-            if self.pareto_init_weight_c > 0.0:
+            if self.pareto_init_weight_c >= 0.0:
                 losses_dict, predictions, batch = output
                 w = _pareto_w(losses_dict, self._model, self.pareto_init_weight_c)
                 new_loss = []
