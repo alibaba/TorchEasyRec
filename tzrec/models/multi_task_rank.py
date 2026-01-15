@@ -43,6 +43,10 @@ class MultiTaskRank(RankModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._task_tower_cfgs = list(self._model_config.task_towers)
 
+        self._use_pareto_loss_weight = model_config.use_pareto_loss_weight
+        if self._use_pareto_loss_weight:
+            self._pareto_init_weight_cs = []
+
     def _multi_task_output_to_prediction(
         self, output: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -85,6 +89,15 @@ class MultiTaskRank(RankModel):
                     reduction=reduction,
                     suffix=f"_{tower_name}",
                 )
+                if self._use_pareto_loss_weight:
+                    self._pareto_init_weight_cs.append(
+                        task_tower_cfg.pareto_min_loss_weight
+                    )
+
+        if self._use_pareto_loss_weight:
+            assert 0 <= sum(self._pareto_init_weight_cs) < 1.0, (
+                "all pareto_min_loss_weight sum should be in [0, 1)"
+            )
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch

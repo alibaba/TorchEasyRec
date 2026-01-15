@@ -26,11 +26,11 @@ from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.modules.rebuild_loss import ParetoDynamicLossWeight
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils.load_class import get_register_class_meta
-from tzrec.utils.rebuild_loss import ParetoDynamicLossWeight
 
 _MODEL_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_MODEL_CLASS_MAP)
@@ -69,9 +69,6 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             self._sample_weights = sample_weights
 
         self._train_metric_modules = nn.ModuleDict()
-        self._pareto_init_weight_c = -0.01
-        if model_config.HasField("pareto_init_weight_c"):
-            self._pareto_init_weight_c = model_config.pareto_init_weight_c
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -250,8 +247,11 @@ class TrainWrapper(BaseModule):
                 f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
             )
         self.pareto = None
-        if self.model._pareto_init_weight_c >= 0:
-            self.pareto = ParetoDynamicLossWeight()
+        if (
+            hasattr(self.model, "_use_pareto_loss_weight")
+            and self.model._use_pareto_loss_weight
+        ):
+            self.pareto = ParetoDynamicLossWeight(self.model._pareto_init_weight_cs)
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -273,9 +273,7 @@ class TrainWrapper(BaseModule):
             predictions = self.model.predict(batch)
             losses = self.model.loss(predictions, batch)
             if self.training and self.pareto:
-                total_loss = self.pareto(
-                    losses, self.model, self.model._pareto_init_weight_c
-                )
+                total_loss = self.pareto(losses, self.model)
             else:
                 total_loss = torch.stack(list(losses.values())).sum()
 
