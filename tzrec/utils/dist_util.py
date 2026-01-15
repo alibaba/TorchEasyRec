@@ -202,17 +202,6 @@ def _pipeline_backward(losses: torch.Tensor, optimizer: torch.optim.Optimizer) -
 class TrainPipelineBase(_TrainPipelineBase):
     """TorchEasyRec's TrainPipelineBase, make backward support grad scaler."""
 
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        device: torch.device,
-        custom_model_fwd: Optional[
-            Callable[[In], Tuple[torch.Tensor, List[torch.Tensor]]]
-        ] = None,
-    ) -> None:
-        super().__init__(model, optimizer, device, custom_model_fwd)
-
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
 
