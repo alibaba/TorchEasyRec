@@ -65,6 +65,7 @@ message FusedAdagradOptimizer {
     required float lr = 1 [default = 0.002];
     optional bool gradient_clipping = 2 [default = false];
     optional float max_gradient = 3 [default = 1.0];
+    optional float initial_accumulator_value = 4 [default = 0.0];
 }
 
 message FusedAdamOptimizer {
@@ -123,11 +124,17 @@ message SGDOptimizer {
     required float lr = 1 [default = 0.002];
     optional float momentum = 2 [default = 0.9];
     optional float weight_decay = 3 [default = 0.0];
+    optional float dampening = 4 [default = 0.0];
+    optional bool nesterov = 5 [default = false];
+    optional bool fused = 6;
 }
 
 message AdagradOptimizer {
     required float lr = 1 [default = 0.002];
     optional float weight_decay = 2 [default = 0.0];
+    optional float initial_accumulator_value = 3 [default = 0.0];
+    optional float eps = 4;
+    optional bool fused = 5;
 }
 
 message AdamOptimizer {
@@ -135,13 +142,19 @@ message AdamOptimizer {
     optional float beta1 = 2 [default = 0.9];
     optional float beta2 = 3 [default = 0.999];
     optional float weight_decay = 4 [default = 0.0];
+    optional float eps = 5;
+    optional bool amsgrad = 6 [default = false];
+    optional bool fused = 7;
 }
 
 message AdamWOptimizer {
-  required float lr = 1 [default = 0.002];
-  optional float beta1 = 2 [default = 0.9];
-  optional float beta2 = 3 [default = 0.999];
-  optional float weight_decay = 4 [default = 0.0];
+    required float lr = 1 [default = 0.002];
+    optional float beta1 = 2 [default = 0.9];
+    optional float beta2 = 3 [default = 0.999];
+    optional float weight_decay = 4 [default = 0.0];
+    optional float eps = 5;
+    optional bool amsgrad = 6 [default = false];
+    optional bool fused = 7;
 }
 
 message ConstantLR {
