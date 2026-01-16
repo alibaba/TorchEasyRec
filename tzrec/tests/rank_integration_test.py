@@ -785,6 +785,11 @@ class RankIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
         )
 
+    def test_multi_tower_din_with_fg_adagrad_init_acc_train_eval_export(self):
+        self._test_rank_with_fg(
+            "tzrec/tests/configs/multi_tower_din_fg_mock_adagrad_init_acc.config"
+        )
+
     def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
