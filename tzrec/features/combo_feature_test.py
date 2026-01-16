@@ -191,13 +191,13 @@ class ComboFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
 
-class SequenceCustomFeatureTest(unittest.TestCase):
+class SequenceComboFeatureTest(unittest.TestCase):
     @parameterized.expand(
         [
             ["", 0, [2, 42, 3, 26, 23], [2, 1, 1, 1], [2, 1, 1]],
             ["xyz", 0, [2, 42, 3, 13, 23], [2, 1, 1, 1], [2, 1, 1]],
-            # ["", 1, [2, 3, 26, 23], [1, 1, 1, 1], [2, 1, 1]],
-            # ["xyz", 1, [2, 3, 13, 23], [1, 1, 1, 1], [2, 1, 1]],
+            ["", 1, [2, 3, 26, 23], [1, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 1, [2, 3, 13, 23], [1, 1, 1, 1], [2, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
