@@ -96,6 +96,17 @@ message CIN {
     repeated uint32 cin_layer_size = 1;
 }
 
+message WuKongLayer {
+    // LinearCompressBlock output feature num
+    required uint32 lcb_feature_num = 1;
+    // FactorizationMachineBlock output feature num
+    required uint32 fmb_feature_num = 2;
+    // number of compressed features in optimized FM.
+    optional uint32 compressed_feature_num = 3 [default = 16];
+    // feature num mlp
+    required MLP feature_num_mlp = 4;
+}
+
 message GRSimpleActionEncoder {
     // action embedding dim
     optional uint32 action_embedding_dim = 1;

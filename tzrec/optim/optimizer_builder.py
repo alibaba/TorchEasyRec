@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from functools import partial
 from typing import Any, Dict, List, Tuple, Type, Union
@@ -50,6 +51,12 @@ def create_sparse_optimizer(
     if optimizer_type == "sgd_optimizer":
         return optimizers.SGD, optimizer_kwargs
     elif optimizer_type == "adagrad_optimizer":
+        if "initial_accumulator_value" in optimizer_kwargs:
+            # see apply_split_helper function patch in tzrec.optim.optimizer.py
+            os.environ["FBGEMM_MOMENTUM1_STATE_INIT_VALUE"] = str(
+                optimizer_kwargs["initial_accumulator_value"]
+            )
+            optimizer_kwargs.pop("initial_accumulator_value")
         return optimizers.Adagrad, optimizer_kwargs
     elif optimizer_type == "adam_optimizer":
         return optimizers.Adam, optimizer_kwargs
