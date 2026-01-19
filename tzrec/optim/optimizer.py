@@ -217,7 +217,7 @@ def apply_split_helper(
                         torch.zeros(1, device=current_device, dtype=dtype)
                         if not use_init_value
                         else torch.full(
-                            1, init_value, device=current_device, dtype=dtype
+                            (1,), init_value, device=current_device, dtype=dtype
                         ),
                         [split.uvm_size],
                         is_host_mapped=uvm_host_mapped,
