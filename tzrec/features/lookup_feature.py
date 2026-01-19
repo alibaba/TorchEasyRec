@@ -122,7 +122,9 @@ class LookupFeature(BaseFeature):
         raw_fg_cfg = None
         if self.config.value_dim > 1:
             fg_cfg["feature_name"] = self.config.feature_name + "__lookup"
-            fg_cfg["default_value"] = ""
+            fg_cfg["default_value"] = self.config.value_separator.join(
+                [self.config.default_value] * self.config.value_dim
+            )
             fg_cfg["value_type"] = "string"
             fg_cfg["value_dim"] = 1
             fg_cfg["needDiscrete"] = True
