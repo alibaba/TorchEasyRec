@@ -99,3 +99,38 @@ DISTRIBUTE BY user_id
 SORT BY user_id asc,time_stamp asc
 ;
 ```
+
+## pe_mtl_loss
+
+该方法适用于多任务场景，主要作用于损失权重的学习。需要结合别的损失函数一起使用，根据每次batch中的数据的每个分量损失函数，给与每个分量损失不同的权重。https://dl.acm.org/doi/10.1145/3298689.3346998
+
+配置如下
+
+```
+model_config {
+    feature_groups {
+        group_name: "all"
+        feature_names: "user_id"
+        ...
+        group_type: DEEP
+    }
+    ${model_name} {
+        task_towers {
+            ...
+            ${loss_name} {}
+            pareto_min_loss_weight: 0.4
+        }
+        task_towers {
+            ...
+            losses {
+                ${loss_name} {}
+            }
+            pareto_min_loss_weight: 0.4
+        }
+    }
+    use_pareto_loss_weight: true
+}
+```
+
+- use_pareto_loss_weight: 是否使用pe_mtl_loss动态loss权重
+- pareto_min_loss_weight: 每个任务对应的最小损失权重，默认值为0.0，当use_pareto_loss_weight是true的时候，pareto_min_loss_weight才生效，所有tower的损失函数最小权重之和必须小于等于1.0
