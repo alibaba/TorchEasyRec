@@ -8,7 +8,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from typing import Dict
 
 import numpy as np
@@ -16,11 +15,16 @@ import torch
 from scipy.optimize import minimize, nnls
 
 
-class ParetoDynamicLossWeight(torch.nn.Module):
-    """Pareto front dynamic loss weight get losses for multi target."""
+class ParetoEfficientMultiTaskLoss(torch.nn.Module):
+    """Dynamic loss weights based on the Pareto-Efficient for multi-task learning."""
 
     def __init__(self, min_c: list[float]) -> None:
         super().__init__()
+        assert 0 <= sum(min_c) < 1.0, (
+            "all pareto_min_loss_weight sum should be in [0, 1), not {}".format(
+                sum(min_c)
+            )
+        )
         self._c = np.array(min_c).reshape([-1, 1])
 
     def _pareto_step(self, W: np.ndarray, C: np.ndarray, G: np.ndarray) -> np.array:

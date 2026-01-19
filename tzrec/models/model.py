@@ -26,7 +26,7 @@ from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.modules.rebuild_loss import ParetoDynamicLossWeight
+from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
@@ -251,7 +251,9 @@ class TrainWrapper(BaseModule):
             hasattr(self.model, "_use_pareto_loss_weight")
             and self.model._use_pareto_loss_weight
         ):
-            self.pareto = ParetoDynamicLossWeight(self.model._pareto_init_weight_cs)
+            self.pareto = ParetoEfficientMultiTaskLoss(
+                self.model._pareto_init_weight_cs
+            )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.

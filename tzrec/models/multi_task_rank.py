@@ -94,11 +94,6 @@ class MultiTaskRank(RankModel):
                         task_tower_cfg.pareto_min_loss_weight
                     )
 
-        if self._use_pareto_loss_weight:
-            assert 0 <= sum(self._pareto_init_weight_cs) < 1.0, (
-                "all pareto_min_loss_weight sum should be in [0, 1)"
-            )
-
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
