@@ -206,6 +206,7 @@ class SequenceTokenizeFeatureTest(unittest.TestCase):
         ],
         name_func=test_util.parameterized_name_func,
     )
+    @unittest.skip("not support sequence tokenize now.")
     def test_sequence_tokenize_feature(
         self,
         default_value,

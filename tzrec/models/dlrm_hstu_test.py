@@ -128,32 +128,30 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_raw_feature=feature_pb2.RawFeature(
                     feature_name="action_timestamp"
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_raw_feature=feature_pb2.RawFeature(
                     feature_name="item_query_time"
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_raw_feature=feature_pb2.RawFeature(
                     feature_name="action_weight",
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_raw_feature=feature_pb2.RawFeature(
                     feature_name="item_action_weight",
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
-                    feature_name="watch_time"
-                )
+                sequence_raw_feature=feature_pb2.RawFeature(feature_name="watch_time")
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.SequenceRawFeature(
+                sequence_raw_feature=feature_pb2.RawFeature(
                     feature_name="item_target_watchtime"
                 )
             ),
