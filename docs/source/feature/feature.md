@@ -685,9 +685,9 @@ feature_configs: {
     - 在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
   - **sequence_fields**: (可选) 指定每个序列子特征的序列类型的输入字段名，序列类型的字段在输入样本数据中列名应拼接上`${sequence_name}__`前缀
     - 在不指定sequence_fields的情况下:
-      - 只有一个输入字段的特征算子（如: IdFeature，RawFeature）认为输入字段是序列类型
+      - 对于只有一个输入字段的特征算子（如: IdFeature，RawFeature，TokenizeFeature等），`input_side != feature`的输入字段默认是序列类型
         - 以上述配置中`item_id`子特征为例，`item:iid`对应的输入样本数据中列名应为`click_seq__iid`
-      - `input_side`为`item`时，认为输入字段是序列类型
+      - 对于输入字段大于一个的特征算子（如: LookupFeature，ComboFeature等），`input_side != item`的输入字段默认是序列类型
         - 以上述配置中`user_cate_cnt`子特征为例，`item:cate`对应的输入样本数据中列名应为`click_seq__cate`，`user:kv_cate_cnt`对应的输入样本数据中列名应为`kv_cate_cnt`
     - 在指定sequence_fields的情况下：只有指定的字段认为是序列类型
       - 以上述配置中`user_search_cate_cnt`子特征为例，`user:searched_cate`对应的输入样本数据中列名应为`click_seq__searched_cate`，`user:kv_search_cate_cnt`对应的输入样本数据中列名应为`kv_search_cate_cnt`

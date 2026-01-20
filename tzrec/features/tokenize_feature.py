@@ -97,6 +97,7 @@ class TokenizeFeature(IdFeature):
         """Get fg json config impl."""
         fg_cfgs = []
         expression = self.config.expression
+        norm_fg_cfg = None
         if self.config.HasField("text_normalizer"):
             norm_cfg = self.config.text_normalizer
             norm_fg_name = self.config.feature_name + "__text_norm"
@@ -121,6 +122,9 @@ class TokenizeFeature(IdFeature):
                     if norm_option == TextNormalizeOption.TEXT_REMOVE_SPACE:
                         norm_fg_cfg["remove_space"] = True
                 norm_fg_cfg["parameter"] = parameter
+
+            if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+                norm_fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
             fg_cfgs.append(norm_fg_cfg)
 
         assert self.config.tokenizer_type in [
@@ -139,6 +143,13 @@ class TokenizeFeature(IdFeature):
         }
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+        if self.is_grouped_sequence:
+            if norm_fg_cfg is None:
+                if len(self.config.sequence_fields) > 0:
+                    fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+            else:
+                fg_cfg["sequence_fields"] = [norm_fg_name]
+
         fg_cfgs.append(fg_cfg)
         return fg_cfgs
 

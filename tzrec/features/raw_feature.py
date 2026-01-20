@@ -93,4 +93,7 @@ class RawFeature(BaseFeature):
             fg_cfg["boundaries"] = list(self.config.boundaries)
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

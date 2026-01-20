@@ -195,14 +195,14 @@ class SequenceTokenizeFeatureTest(unittest.TestCase):
                 [3, 2, 1, 2],
                 [2, 1, 1],
             ],
-            # [
-            #     "",
-            #     ["ABC efg;hij", "", "HIJ"],
-            #     True,
-            #     [19758, 299, 73, 1944, 16054, 73, 1944],
-            #     [3, 2, 1, 2],
-            #     [2, 1, 1],
-            # ],
+            [
+                "",
+                ["ABC efg;hij", "", "HIJ"],
+                True,
+                [19758, 299, 16054, 73, 1944, 17, 73, 1944],
+                [3, 2, 1, 2],
+                [2, 1, 1],
+            ],
         ],
         name_func=test_util.parameterized_name_func,
     )

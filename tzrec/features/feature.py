@@ -707,13 +707,13 @@ class BaseFeature(object, metaclass=_meta_cls):
     def _need_seq_prefix(self, side: str, name: str) -> bool:
         """Check input fields should add prefix of group sequence or not."""
         if self._is_grouped_seq:
-            if self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
-                return True
-            elif (
+            if (
                 hasattr(self.config, "sequence_fields")
                 and len(self.config.sequence_fields) > 0
             ):
                 return name in self.config.sequence_fields
+            elif self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
+                return side != "feature"
             else:
                 return side == "item"
         else:

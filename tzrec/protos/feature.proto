@@ -175,6 +175,8 @@ message IdFeature {
     required uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
     required string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message RawFeature {
@@ -232,6 +234,8 @@ message RawFeature {
     required uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
     required string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message ComboFeature {
@@ -672,6 +676,8 @@ message TokenizeFeature {
     required uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
     required string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 

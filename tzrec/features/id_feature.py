@@ -127,6 +127,9 @@ class IdFeature(BaseFeature):
             fg_cfg["value_type"] = self.config.fg_value_type
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]
 
     def assets(self) -> Dict[str, str]:
