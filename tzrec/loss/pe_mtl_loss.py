@@ -27,7 +27,7 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
         )
         self._c = np.array(min_c).reshape([-1, 1])
 
-    def _pareto_step(self, W: np.ndarray, C: np.ndarray, G: np.ndarray) -> np.array:
+    def _pareto_step(self, W: np.ndarray, C: np.ndarray, G: torch.Tensor) -> np.array:
         """Ref:http://ofey.me/papers/Pareto.pdf.
 
         Args:
@@ -35,7 +35,7 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
                 C: dimension (K,1)
                 G: multi loss grad. dimension (K,M)
         """
-        GGT = np.matmul(G, G.T)  # (K, K)
+        GGT = torch.matmul(G, G.T).detach().data.cpu().numpy()  # (K, K)
         e = np.mat(np.ones(np.shape(W)))  # (K, 1)
         m_up = np.hstack((GGT, e))  # (K, K+1)
         m_down = np.hstack(
@@ -99,8 +99,7 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
 
             all_grads = torch.cat(grad_flattened)
             grads.append(all_grads)
-        # grads.append(all_grads.cpu().numpy())
-        grads = torch.stack(grads).detach().data.cpu().numpy()
+        grads = torch.stack(grads)
         init_weight = 1 / len(losses)
         w = np.array([init_weight] * len(losses), dtype=np.float32).reshape([-1, 1])
         new_w = self._pareto_step(w, self._c, grads)

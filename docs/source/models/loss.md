@@ -102,7 +102,7 @@ SORT BY user_id asc,time_stamp asc
 
 ## pe_mtl_loss
 
-该方法适用于多任务场景，主要作用于损失权重的学习。需要结合别的损失函数一起使用，根据每次batch中的数据的每个分量损失函数，给与每个分量损失不同的权重。https://dl.acm.org/doi/10.1145/3298689.3346998
+Pareto-Efficient Algorithm for Multiple Objective Optimization，该方法适用于多任务场景，自动根据帕累托最优最优的原则调整不同目标的损失权重。https://dl.acm.org/doi/10.1145/3298689.3346998
 
 配置如下
 
@@ -117,7 +117,9 @@ model_config {
     ${model_name} {
         task_towers {
             ...
-            ${loss_name} {}
+            losses {
+                ${loss_name} {}
+            }
             pareto_min_loss_weight: 0.4
         }
         task_towers {

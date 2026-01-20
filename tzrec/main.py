@@ -668,6 +668,8 @@ def train_and_evaluate(
         remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
     )
+    # it is necessary to know the index that can match the parameter part_optimizer
+    # for lr scheduler use
     part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
         part_optim_cls, part_optim_kwargs, part_optim_params
     )
