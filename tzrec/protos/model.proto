@@ -82,4 +82,8 @@ message ModelConfig {
     optional VariationalDropout variational_dropout = 11;
 
     optional Kernel kernel = 12 [default = PYTORCH];
+
+    // whether use pareto loss weight
+    optional bool use_pareto_loss_weight = 13 [default = false];
+
 }

@@ -26,6 +26,7 @@ from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
@@ -245,6 +246,14 @@ class TrainWrapper(BaseModule):
             raise ValueError(
                 f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
             )
+        self.pareto = None
+        if (
+            hasattr(self.model, "_use_pareto_loss_weight")
+            and self.model._use_pareto_loss_weight
+        ):
+            self.pareto = ParetoEfficientMultiTaskLoss(
+                self.model._pareto_init_weight_cs
+            )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -265,7 +274,10 @@ class TrainWrapper(BaseModule):
         ):
             predictions = self.model.predict(batch)
             losses = self.model.loss(predictions, batch)
-            total_loss = torch.stack(list(losses.values())).sum()
+            if self.training and self.pareto:
+                total_loss = self.pareto(losses, self.model)
+            else:
+                total_loss = torch.stack(list(losses.values())).sum()
 
         losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}

@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -41,6 +42,10 @@ class MultiTaskRank(RankModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._task_tower_cfgs = list(self._model_config.task_towers)
+
+        self._use_pareto_loss_weight = model_config.use_pareto_loss_weight
+        if self._use_pareto_loss_weight:
+            self._pareto_init_weight_cs = []
 
     def _multi_task_output_to_prediction(
         self, output: Dict[str, torch.Tensor]
@@ -84,12 +89,16 @@ class MultiTaskRank(RankModel):
                     reduction=reduction,
                     suffix=f"_{tower_name}",
                 )
+                if self._use_pareto_loss_weight:
+                    self._pareto_init_weight_cs.append(
+                        task_tower_cfg.pareto_min_loss_weight
+                    )
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
-        losses = {}
+        losses = OrderedDict()
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
             label_name = task_tower_cfg.label_name

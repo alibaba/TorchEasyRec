@@ -51,6 +51,8 @@ message TaskTower {
     optional float in_task_space_weight = 10 [default = 1.0];
     // the loss weight for sample out the task space
     optional float out_task_space_weight = 11 [default = 1.0];
+    // use pareto front minimal loss weight, ge 0 and lt 1
+    optional float pareto_min_loss_weight = 12 [default = 0.0];
 };
 
 message BayesTaskTower {
@@ -83,6 +85,8 @@ message BayesTaskTower {
     optional float in_task_space_weight = 12 [default = 1.0];
     // the loss weight for sample out the task space
     optional float out_task_space_weight = 13 [default = 1.0];
+    // use pareto front minimal loss weight, ge 0 and lt 1
+    optional float pareto_min_loss_weight = 14 [default = 0.0];
 };
 
 message InterventionTaskTower {
@@ -115,6 +119,8 @@ message InterventionTaskTower {
     optional float in_task_space_weight = 12 [default = 1.0];
     // the loss weight for sample out the task space
     optional float out_task_space_weight = 13 [default = 1.0];
+    // use pareto front minimal loss weight, ge 0 and lt 1
+    optional float pareto_min_loss_weight = 14 [default = 0.0];
 };
 
 
