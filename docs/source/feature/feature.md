@@ -1,6 +1,6 @@
 # 特征
 
-TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、SequenceIdFeature、SequenceRawFeature、SequenceFeature。
+TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、SequenceFeature。
 
 **共用配置**
 
@@ -596,116 +596,22 @@ feature_configs: {
 | RegexReplace | 正则替换 | pyfg/lib/libregex_replace.so | • regex_patten: 正则表达式，匹配的文本片段将会被替换 <br>• replacement: 替换文本 |
 |              |          |                              |                                                                                  |
 
-## SequenceIdFeature：类别型序列特征
+## SequenceFeature：序列特征
 
-类别型序列特征
+序列特征分为**分组序列特征**和**普通序列特征**两种
 
-- 支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；
-- 支持array\<string>或array\<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）；
-- 支持多值序列array\<array\<string>>或array\<array\<bigint>>类型，多值序列需设置value_dim=0，通常情况下训练推理性能比单值序列差一些。
+### 分组序列特征
 
-```
-feature_configs: {
-    sequence_id_feature {
-        feature_name: "click_itemid_seq"
-        sequence_length: 50
-        sequence_delim: ";"
-        expression: "user:click_iid_seq"
-        embedding_dim: 32
-        hash_bucket_size: 100000
-    }
-}
-```
-
-- **sequence_length**: 序列特征最大长度
-- **sequence_delim**: 序列特征分隔符
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
-- 其余配置同IdFeature
-
-## SequenceRawFeature：数值型序列特征
-
-数值型序列特征
-
-- 支持string类型为`price1;price2;price3`， 其中`;`为序列分隔符；
-- 支持array\<float>为`[price1,price2,price3]`或者array\<array\<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）。
-
-```
-feature_configs: {
-    sequence_raw_feature {
-        feature_name: "click_price_seq"
-        sequence_length: 50
-        sequence_delim: ";"
-        expression: "user:click_price_seq"
-    }
-}
-```
-
-- **sequence_length**: 序列特征最大长度
-- **sequence_delim**: 序列特征分隔符
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- 其余配置同RawFeature
-
-## SequenceCustomFeature: 自定义序列特征
-
-自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
-
-```
-feature_configs: {
-    sequence_custom_feature {
-        feature_name: "seq_expr_1"
-        operator_name: "SeqExpr"
-        operator_lib_file: "pyfg/lib/libseq_expr.so"
-        expression: ["user:cur_time", "item:clk_time_seq"]
-        operator_params {
-            fields {
-                key: "formula"
-                value {
-                    string_value: "cur_time-clk_time_seq"
-                }
-            }
-        }
-    }
-}
-feature_configs: {
-    sequence_custom_feature {
-        feature_name: "seq_expr_2"
-        operator_name: "SeqExpr"
-        operator_lib_file: "pyfg/lib/libseq_expr.so"
-        expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
-        operator_params {
-            fields {
-                key: "formula"
-                value {
-                    string_value: "spherical_distance"
-                }
-            }
-        }
-    }
-}
-```
-
-- operator_name: 特征算子注册的名字，建议与实现的类名保持一致
-
-- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
-
-- expression: 特征FG所依赖组合字段的来源
-
-- 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
-
-| 算子名称 | 算子功能   | 算子动态库              | 算子参数                                                                                                                                                 |
-| -------- | ---------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SeqExpr  | 序列表达式 | pyfg/lib/libseq_expr.so | • formula: 表达式。如果值为spherical_distance， 计算两个经纬度坐标的距离，参数为[lng1_seq, lat1_seq, lng2, lat2]，前两个参数是序列，后两个参数是标量值。 |
-
-## SequenceFeature：分组序列特征
-
-分组序列特征的子序列格式一般为`XX;XX;XX`，如用户点击的Item的序列特征为`item_id1;item_id2;item_id3`，其中`;`为序列分隔符，也支持ARRAY类型，同SequenceIdFeature和SequenceRawFeature。
+分组序列特征的子序列格式一般为`XX;XX;XX`，如用户点击的Item的序列特征为`item_id1;item_id2;item_id3`，其中`;`为序列分隔符，也支持ARRAY类型，详建下文。
 
 分组序列特征支持使用物品或行为的属性构建一组子序列，如类目序列`cate1;cate2;cate1`、品牌序列`brand1;brand2;brand1`、行为时间序列`ts1;ts2;ts3`等。一条样本中，同一分组的子序列的长度需要保持相同。
 
 分组序列特征在线上模型服务时比其他序列特征更加高效，只需传递`sequence_pk`，线上模型服务从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。
 
+分组序列特征支持前文中**所有子特征类型**。
+
 ```
+# 分组序列特征
 feature_configs: {
     sequence_feature {
         sequence_name: "click_seq"
@@ -746,6 +652,25 @@ feature_configs: {
                 }
             }
         }
+        features {
+            lookup_feature {
+                feature_name: "user_cate_cnt"
+                map: "user:kv_cate_cnt"
+                key: "item:cate"
+                embedding_dim: 16
+                boundaries: [0, 1, 2, 3, 4]
+            }
+        }
+        features {
+            lookup_feature {
+                feature_name: "user_search_cate_cnt"
+                map: "user:kv_search_cate_cnt"
+                key: "user:searched_cate"
+                sequence_fields: ["searched_cate"]
+                embedding_dim: 16
+                boundaries: [0, 1, 2, 3, 4]
+            }
+        }
     }
 }
 ```
@@ -754,8 +679,82 @@ feature_configs: {
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列特征分隔符
 - **sequence_pk**: 序列特征主键，一般为ItemId列表，主要用于线上模型服务，线上模型服务会使用该ItemId列表从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。而行为属性相关子序列（如行为时间序列`ts1;ts2;ts3`）跟用户相关，则仍需从请求从传递。
-- **features**: 序列特征子特征，配置同IdFeature和RawFeature和SequenceCustomFeature
+- **features**: 序列特征子特征，配置同对应的子特征类型的配置
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
-  - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。在输入样本数据中列名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，`expression`为`item:iid`，输入样本数据中列名应为`click_seq__iid`。在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
-  - 其中当类型为IdFeature时
+  - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。
+    - 在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
+  - **sequence_fields**: (可选) 指定每个序列子特征的序列类型的输入字段名，序列类型的字段在输入样本数据中列名应拼接上`${sequence_name}__`前缀
+    - 在不指定sequence_fields的情况下:
+      - 对于只有一个输入字段的特征算子（如: IdFeature，RawFeature，TokenizeFeature等），`input_side != feature`的输入字段默认是序列类型
+        - 以上述配置中`item_id`子特征为例，`item:iid`对应的输入样本数据中列名应为`click_seq__iid`
+      - 对于输入字段大于一个的特征算子（如: LookupFeature，ComboFeature等），`input_side != item`的输入字段默认是序列类型
+        - 以上述配置中`user_cate_cnt`子特征为例，`item:cate`对应的输入样本数据中列名应为`click_seq__cate`，`user:kv_cate_cnt`对应的输入样本数据中列名应为`kv_cate_cnt`
+    - 在指定sequence_fields的情况下：只有指定的字段认为是序列类型
+      - 以上述配置中`user_search_cate_cnt`子特征为例，`user:searched_cate`对应的输入样本数据中列名应为`click_seq__searched_cate`，`user:kv_search_cate_cnt`对应的输入样本数据中列名应为`kv_search_cate_cnt`
+  - 其中当特征值为离散值时（如IdFeature，ComboFeature等），value_dim的默认值与非序列的版本不同
     - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
+- 序列类型的输入支持的类型:
+  - 支持string类型`item_id1;item_id2;item_id3`， 其中`;`为序列分隔符；
+  - 支持array\<string>或array\<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）；
+  - 支持多值序列array\<array\<string>>或array\<array\<bigint>>类型，多值序列需设置value_dim=0，通常情况下训练推理性能比单值序列差一些。
+  - 支持array\<float>为`[price1,price2,price3]`或者array\<array\<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）。
+
+### 普通序列特征
+
+```
+# 普通特征
+feature_configs: {
+    sequence_id_feature {
+        feature_name: "click_itemid_seq"
+        sequence_length: 50
+        sequence_delim: ";"
+        expression: "user:click_iid_seq"
+        embedding_dim: 32
+        hash_bucket_size: 100000
+    }
+}
+feature_configs: {
+    sequence_raw_feature {
+        feature_name: "click_price_seq"
+        sequence_length: 50
+        sequence_delim: ";"
+        expression: "user:click_price_seq"
+    }
+}
+feature_configs: {
+    sequence_custom_feature {
+        feature_name: "seq_expr_1"
+        operator_name: "SeqExpr"
+        operator_lib_file: "pyfg/lib/libseq_expr.so"
+        expression: ["user:cur_time", "item:clk_time_seq"]
+        operator_params {
+            fields {
+                key: "formula"
+                value {
+                    string_value: "cur_time-clk_time_seq"
+                }
+            }
+        }
+    }
+}
+feature_configs: {
+    sequence_custom_feature {
+        feature_name: "seq_expr_2"
+        operator_name: "SeqExpr"
+        operator_lib_file: "pyfg/lib/libseq_expr.so"
+        expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+        operator_params {
+            fields {
+                key: "formula"
+                value {
+                    string_value: "spherical_distance"
+                }
+            }
+        }
+    }
+}
+```
+
+- 配置同非序列版本，特征类型带`sequence_`前缀
+- 其中当特征值为离散值时（如IdFeature，ComboFeature等），value_dim的默认值与非序列的版本不同
+  - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出

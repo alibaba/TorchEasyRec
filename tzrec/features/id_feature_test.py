@@ -251,7 +251,7 @@ class IdFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], None, False],
+            ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], [], False],
             [
                 "xyz",
                 ["abc\x1defg", None, "hij"],
@@ -268,9 +268,9 @@ class IdFeatureTest(unittest.TestCase):
                 13,
                 False,
             ],
-            ["", [1, 2, None, 3], [95, 70, 13], [1, 1, 0, 1], None, False],
+            ["", [1, 2, None, 3], [95, 70, 13], [1, 1, 0, 1], [], False],
             ["4", [1, 2, None, 3], [95, 70, 56, 13], [1, 1, 1, 1], 56, False],
-            ["", [1, 2, None, 3], [49, 59, 21], [1, 1, 0, 1], None, True],
+            ["", [1, 2, None, 3], [49, 59, 21], [1, 1, 0, 1], [], True],
         ],
         name_func=test_util.parameterized_name_func,
     )
@@ -525,6 +525,347 @@ class IdFeatureTest(unittest.TestCase):
         self.assertEqual(parsed_feat.name, "id_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
+
+class SequenceIdFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            [
+                ["1;2", "", "3", "4\x035;6", None],
+                "",
+                [1, 2, 3, 4, 5, 6],
+                [1, 1, 1, 2, 1],
+                [2, 0, 1, 2, 0],
+            ],
+            [
+                [[[1], [2]], [], [[3]], [[4, 5], [6]], None],
+                "",
+                [1, 2, 3, 4, 5, 6],
+                [1, 1, 1, 2, 1],
+                [2, 0, 1, 2, 0],
+            ],
+            [
+                [[1, 2], [], [3], [4, 6], None],
+                "",
+                [1, 2, 3, 4, 6],
+                [1, 1, 1, 1, 1],
+                [2, 0, 1, 2, 0],
+            ],
+            [
+                ["1;2", "", "3", "4\x035;6", None],
+                "0",
+                [1, 2, 0, 3, 4, 5, 6, 0],
+                [1, 1, 1, 1, 2, 1, 1],
+                [2, 1, 1, 2, 1],
+            ],
+            [
+                [[[1], [2]], [], [[3]], [[4, 5], [6]], None],
+                "0",
+                [1, 2, 0, 3, 4, 5, 6, 0],
+                [1, 1, 1, 1, 2, 1, 1],
+                [2, 1, 1, 2, 1],
+            ],
+            [
+                [[1, 2], [], [3], [4, 6], None],
+                "0",
+                [1, 2, 0, 3, 4, 6, 0],
+                [1, 1, 1, 1, 1, 1, 1],
+                [2, 1, 1, 2, 1],
+            ],
+        ],
+    )
+    def test_fg_encoded_sequence_id_feature(
+        self,
+        input_feat,
+        default_value,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                embedding_dim=16,
+                fg_encoded_default_value=default_value,
+            )
+        )
+        seq_feat = id_feature_lib.IdFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+        )
+        input_data = {"click_50_seq__id_feat": pa.array(input_feat)}
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["click_50_seq__id_feat"])
+
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        np.testing.assert_allclose(
+            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
+        )
+
+    def test_fg_encoded_simple_sequence_id_feature(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="click_50_seq_id",
+                sequence_delim=";",
+                sequence_length=50,
+                embedding_dim=16,
+            )
+        )
+        seq_feat = id_feature_lib.IdFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+        )
+        input_data = {"click_50_seq_id": pa.array(["1;2", "", "3", "4\x035;6"])}
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["click_50_seq_id"])
+
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_id")
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 2, 3, 4, 5, 6]))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array([1, 1, 1, 2, 1]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 0, 1, 2]))
+
+    @parameterized.expand(
+        [
+            ["", 0, [33, 44, 66, 26, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 0, [33, 44, 66, 13, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 1, [33, 66, 26, 66], [1, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 1, [33, 66, 13, 66], [1, 1, 1, 1], [2, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_id_feature_with_hash_bucket_size(
+        self,
+        default_value,
+        value_dim,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                hash_bucket_size=100,
+                embedding_dim=16,
+                expression="user:id_str",
+                default_value=default_value,
+                value_dim=value_dim,
+            )
+        )
+        seq_feat = id_feature_lib.IdFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["click_50_seq__id_str"])
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="click_50_seq__id_feat_emb",
+            feature_names=["click_50_seq__id_feat"],
+        )
+        self.assertEqual(repr(seq_feat.emb_config), repr(expected_emb_config))
+
+        input_data = {"click_50_seq__id_str": pa.array(["abc\x1defg;hij", "", "hij"])}
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
+
+    @parameterized.expand(
+        [
+            ["", 0, [33, 44, 66, 26, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 0, [33, 44, 66, 13, 66], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 1, [33, 66, 26, 66], [1, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 1, [33, 66, 13, 66], [1, 1, 1, 1], [2, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_id_feature_with_hash_bucket_size(
+        self,
+        default_value,
+        value_dim,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="click_50_seq_id_feat",
+                hash_bucket_size=100,
+                embedding_dim=16,
+                expression="user:click_50_seq_id_str",
+                sequence_delim=";",
+                sequence_length=50,
+                default_value=default_value,
+                value_dim=value_dim,
+            )
+        )
+        seq_feat = id_feature_lib.IdFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["click_50_seq_id_str"])
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="click_50_seq_id_feat_emb",
+            feature_names=["click_50_seq_id_feat"],
+        )
+        self.assertEqual(repr(seq_feat.emb_config), repr(expected_emb_config))
+
+        input_data = {"click_50_seq_id_str": pa.array(["abc\x1defg;hij", "", "hij"])}
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_id_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
+
+    @parameterized.expand(
+        [
+            [
+                "",
+                0,
+                ["1;2", "", "3", "4\0355;6"],
+                [1, 2, 0, 3, 4, 5, 6],
+                [1, 1, 1, 1, 2, 1],
+                [2, 1, 1, 2],
+            ],
+            [
+                "",
+                0,
+                [["1", "2"], None, ["3"], ["4\0355", "6"]],
+                [1, 2, 0, 3, 4, 5, 6],
+                [1, 1, 1, 1, 2, 1],
+                [2, 1, 1, 2],
+            ],
+            [
+                "",
+                0,
+                [[1, 2], [], [3], [4, 6]],
+                [1, 2, 0, 3, 4, 6],
+                [1, 1, 1, 1, 1, 1],
+                [2, 1, 1, 2],
+            ],
+            [
+                "0",
+                0,
+                ["1;2", "", "3", "4\0355;6"],
+                [1, 2, 0, 3, 4, 5, 6],
+                [1, 1, 1, 1, 2, 1],
+                [2, 1, 1, 2],
+            ],
+            [
+                "0",
+                1,
+                ["1;2", "", "3", "4\0355;6"],
+                [1, 2, 0, 3, 4, 6],
+                [1, 1, 1, 1, 1, 1],
+                [2, 1, 1, 2],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_id_feature_with_num_buckets(
+        self,
+        default_value,
+        value_dim,
+        input_feat,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                num_buckets=10,
+                embedding_dim=16,
+                expression="user:id_str",
+                default_value=default_value,
+                value_dim=value_dim,
+            )
+        )
+        seq_feat = id_feature_lib.IdFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["click_50_seq__id_str"])
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=10,
+            embedding_dim=16,
+            name="click_50_seq__id_feat_emb",
+            feature_names=["click_50_seq__id_feat"],
+        )
+        self.assertEqual(repr(seq_feat.emb_config), repr(expected_emb_config))
+
+        input_data = {"click_50_seq__id_str": pa.array(input_feat)}
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
+
+    def test_sequence_id_feature_with_vocab_list(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="id_feat",
+                vocab_list=["a", "b", "c"],
+                embedding_dim=16,
+                expression="user:id_str",
+                default_value="0",
+            )
+        )
+        seq_feat = id_feature_lib.IdFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim="|",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        input_data = {"click_50_seq__id_str": pa.array(["c||a|b|b|", "", "a|b||c"])}
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__id_feat")
+        self.assertTrue(
+            np.allclose(parsed_feat.values, np.array([4, 0, 2, 3, 3, 0, 0, 2, 3, 0, 4]))
+        )
+        self.assertTrue(
+            np.allclose(
+                parsed_feat.key_lengths, np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+            )
+        )
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([6, 1, 4]))
+
+    # TODO(hongsheng.jhs): add max sequence length tests.
 
 
 if __name__ == "__main__":

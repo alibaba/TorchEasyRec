@@ -11,21 +11,12 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pyarrow as pa
-
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
-    DenseData,
-    ParsedData,
-    SparseData,
 )
 from tzrec.features.feature import (
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
-    FgMode,
-    _parse_fg_encoded_dense_feature_impl,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
 
@@ -35,22 +26,14 @@ class LookupFeature(BaseFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
-
-    @property
-    def name(self) -> str:
-        """Feature name."""
-        return self.config.feature_name
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @BaseFeature.is_neg.setter
@@ -108,7 +91,7 @@ class LookupFeature(BaseFeature):
             num_embeddings = max(list(self.vocab_dict.values())) + 1
         elif len(self.vocab_file) > 0:
             self.init_fg()
-            num_embeddings = self._fg_op.vocab_list_size()
+            num_embeddings = self.vocab_file_size
         else:
             num_embeddings = len(self.config.boundaries) + 1
         return num_embeddings
@@ -124,69 +107,11 @@ class LookupFeature(BaseFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            # input feature is already lookuped
-            feat = input_data[self.name]
-            if self.is_sparse:
-                parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-            else:
-                parsed_feat = _parse_fg_encoded_dense_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feats = []
-            for name in self.inputs:
-                x = input_data[name]
-                if pa.types.is_list(x.type):
-                    x = x.fill_null([])
-                elif pa.types.is_map(x.type):
-                    x = x.fill_null({})
-                input_feats.append(x.tolist())
-            if self.config.value_dim > 1:
-                fgout, status = self._fg_op.process(dict(zip(self.inputs, input_feats)))
-                assert status.ok(), status.message()
-                if self.is_sparse:
-                    values = np.asarray(fgout[self.name].values, np.int64)
-                    lengths = np.asarray(fgout[self.name].lengths, np.int32)
-                    parsed_feat = SparseData(
-                        name=self.name, values=values, lengths=lengths
-                    )
-                else:
-                    values = fgout[self.name].dense_values
-                    parsed_feat = DenseData(name=self.name, values=values)
-            else:
-                if self.is_sparse:
-                    values, lengths = self._fg_op.to_bucketized_jagged_tensor(
-                        *input_feats
-                    )
-                    parsed_feat = SparseData(
-                        name=self.name, values=values, lengths=lengths
-                    )
-                else:
-                    values = self._fg_op.transform(*input_feats)
-                    parsed_feat = DenseData(name=self.name, values=values)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "lookup_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "map": self.config.map,
             "key": self.config.key,
             "default_value": self.config.default_value,
@@ -197,8 +122,10 @@ class LookupFeature(BaseFeature):
         }
         raw_fg_cfg = None
         if self.config.value_dim > 1:
-            fg_cfg["feature_name"] = self.name + "__lookup"
-            fg_cfg["default_value"] = ""
+            fg_cfg["feature_name"] = self.config.feature_name + "__lookup"
+            fg_cfg["default_value"] = self.config.value_separator.join(
+                [self.config.default_value] * self.config.value_dim
+            )
             fg_cfg["value_type"] = "string"
             fg_cfg["value_dim"] = 1
             fg_cfg["needDiscrete"] = True
@@ -206,7 +133,7 @@ class LookupFeature(BaseFeature):
             fg_cfg["stub_type"] = True
             raw_fg_cfg = {
                 "feature_type": "raw_feature",
-                "feature_name": self.name,
+                "feature_name": self.config.feature_name,
                 "default_value": self.config.default_value,
                 "expression": "feature:" + fg_cfg["feature_name"],
                 "separator": self.config.value_separator,
@@ -257,9 +184,16 @@ class LookupFeature(BaseFeature):
             if self.config.HasField("stub_type"):
                 fg_cfg["stub_type"] = self.config.stub_type
 
+        if self.is_grouped_sequence:
+            if len(self.config.sequence_fields) > 0:
+                fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+            if raw_fg_cfg is not None:
+                raw_fg_cfg["sequence_fields"] = [self.config.feature_name + "__lookup"]
+
         fg_cfgs = [fg_cfg]
         if raw_fg_cfg is not None:
             fg_cfgs.append(raw_fg_cfg)
+
         return fg_cfgs
 
     def assets(self) -> Dict[str, str]:

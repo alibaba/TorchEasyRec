@@ -438,7 +438,7 @@ class ConvertConfig(object):
                 elif feature_name in self.feature_to_fg:
                     feature_config = tzrec_feature_pb2.FeatureConfig()
                     if cfg.sub_feature_type == easyrec_feature_config.IdFeature:
-                        feature = tzrec_feature_pb2.SequenceIdFeature()
+                        feature = tzrec_feature_pb2.IdFeature()
                         feature.feature_name = feature_name
                         feature.expression = self.feature_to_fg[feature_name][
                             "expression"
@@ -448,7 +448,7 @@ class ConvertConfig(object):
                         feature_config.ClearField("feature")
                         feature_config.sequence_id_feature.CopyFrom(feature)
                     else:
-                        feature = tzrec_feature_pb2.SequenceRawFeature()
+                        feature = tzrec_feature_pb2.RawFeature()
                         feature.feature_name = feature_name
                         feature.expression = self.feature_to_fg[feature_name][
                             "expression"
@@ -606,7 +606,7 @@ class ConvertConfig(object):
             elif feature_type == easyrec_feature_config.SequenceFeature:
                 feature_config = tzrec_feature_pb2.FeatureConfig()
                 if cfg.sub_feature_type == easyrec_feature_config.RawFeature:
-                    feature = tzrec_feature_pb2.SequenceRawFeature()
+                    feature = tzrec_feature_pb2.RawFeature()
                     feature.feature_name = feature_name
                     feature.expression = f"user:{input_names[0]}"
                     feature.sequence_length = cfg.sequence_length
@@ -618,7 +618,7 @@ class ConvertConfig(object):
                     feature_config.ClearField("feature")
                     feature_config.sequence_raw_feature.CopyFrom(feature)
                 else:
-                    feature = tzrec_feature_pb2.SequenceIdFeature()
+                    feature = tzrec_feature_pb2.IdFeature()
                     feature.feature_name = feature_name
                     feature.expression = f"user:{input_names[0]}"
                     feature.sequence_length = cfg.sequence_length

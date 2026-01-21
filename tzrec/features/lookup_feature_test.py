@@ -110,7 +110,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "sum",
                 [[3], [1], [1], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -131,7 +131,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "sum",
                 [[3], [1], [1], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -152,7 +152,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "sum",
                 [[0], [0], [0], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -170,7 +170,7 @@ class LookupFeatureTest(unittest.TestCase):
                 1,
                 "mean",
                 [[1.5], [1], [1], [0], [0], [0], [0]],
-                [0],
+                0,
             ],
             [
                 pa.array(
@@ -400,6 +400,184 @@ class LookupFeatureTest(unittest.TestCase):
         self.assertEqual(parsed_feat.name, "lookup_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
+
+class SequenceLookupFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            [
+                "sum",
+                [4, 2, 2, 2, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [2, 1, 2, 1, 1, 1, 1],
+            ],
+            [
+                "mean",
+                [3, 2, 2, 2, 1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1],
+                [2, 1, 2, 1, 1, 1, 1],
+            ],
+            [
+                "",
+                [2, 3, 2, 2, 2, 1, 1, 1, 1, 1],
+                [2, 1, 1, 1, 1, 1, 1, 1, 1],
+                [2, 1, 2, 1, 1, 1, 1],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_lookup_feature_with_boundary(
+        self,
+        combiner,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            lookup_feature=feature_pb2.LookupFeature(
+                feature_name="lookup_feat",
+                boundaries=[-0.5, 0.5, 1.5, 2.5],
+                embedding_dim=16,
+                map="user:kv_cate",
+                key="item:cate",
+                combiner=combiner,
+                default_value="0",
+            )
+        )
+        seq_feat = lookup_feature_lib.LookupFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["kv_cate", "click_50_seq__cate"])
+
+        input_data = {
+            "kv_cate": pa.array(
+                [
+                    "ca:1\x1dcb:2",
+                    "ca:1\x1dcb:2",
+                    "ca:1\x1dcb:2",
+                    "ca:1\x1dcb:2",
+                    "ca:1\x1dcb:2",
+                    "",
+                    "",
+                ]
+            ),
+            "click_50_seq__cate": pa.array(
+                ["ca\x1dcb;ca", "ca", "ca\x1dcd;ce", "cd", "", "ca", ""]
+            ),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__lookup_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
+
+    @parameterized.expand(
+        [
+            [
+                pa.array(
+                    [
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "",
+                        "",
+                    ]
+                ),
+                pa.array(["ca\x1dcb;ca", "ca", "ca\x1dcd", "cd", "", "ca", ""]),
+                1,
+                "sum",
+                [[3], [1], [1], [1], [0], [0], [0], [0]],
+                [2, 1, 1, 1, 1, 1, 1],
+            ],
+            [
+                pa.array(
+                    [
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "ca:1\x1dcb:2",
+                        "",
+                        "",
+                    ]
+                ),
+                pa.array(["ca\x1dcb;ca", "ca", "ca\x1dcd", "cd", "", "ca", ""]),
+                1,
+                "mean",
+                [[1.5], [1], [1], [1], [0], [0], [0], [0]],
+                [2, 1, 1, 1, 1, 1, 1],
+            ],
+            [
+                pa.array(
+                    [
+                        "ca:1,2\x1dcb:3,4",
+                        "ca:1,2\x1dcb:3,4",
+                        "ca:1,2\x1dcb:3,4",
+                        "",
+                        "ca:1,2\x1dcb:3,4",
+                    ]
+                ),
+                pa.array(["ca;cb", "cd;ca", "", "ca", ""]),
+                2,
+                "",
+                [[1, 2], [3, 4], [0, 0], [1, 2], [0, 0], [0, 0], [0, 0]],
+                [2, 2, 1, 1, 1],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_lookup_feature_dense(
+        self,
+        kv_data,
+        key_data,
+        value_dim,
+        combiner,
+        expected_values,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            lookup_feature=feature_pb2.LookupFeature(
+                feature_name="lookup_feat",
+                map="user:kv_cate",
+                key="item:cate",
+                value_dim=value_dim,
+                combiner=combiner,
+                default_value="0",
+            )
+        )
+        seq_feat = lookup_feature_lib.LookupFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, value_dim)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(seq_feat.inputs, ["kv_cate", "click_50_seq__cate"])
+
+        input_data = {
+            "kv_cate": kv_data,
+            "click_50_seq__cate": key_data,
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__lookup_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
 
 
 if __name__ == "__main__":
