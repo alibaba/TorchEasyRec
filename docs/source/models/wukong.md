@@ -15,7 +15,12 @@ meta提出wukong架构，是一个简单的交互架构，旨在为推荐系统�
 ```protobuf
 model_config: {
   feature_groups: {
-    group_name: 'deep'
+    group_name: 'dense'
+    feature_names: 'price'
+    wide_deep: DEEP
+  }
+  feature_groups: {
+    group_name: 'sparse'
     feature_names: 'user_id'
     feature_names: 'cms_segid'
     feature_names: 'cms_group_id'
@@ -32,10 +37,13 @@ model_config: {
     feature_names: 'pid'
     feature_names: 'tag_category_list'
     feature_names: 'tag_brand_list'
-    feature_names: 'price'
     wide_deep: DEEP
   }
   wukong {
+    dense_mlp {
+      hidden_units: 64
+      hidden_units: 16
+    }
     wukong_layers {
       lcb_feature_num: 16,
       fmb_feature_num: 16,
@@ -71,11 +79,16 @@ model_config: {
 
 ```
 
-feature_groups: 特征组
+- feature_groups: 特征组
 
-- feature_groups: 配置一个feature_group, 不能包含序列特征，所有特征都需要配置一样的embedding_dim。
+  - 包含两个feature_group: dense 和sparse group, **特征组名称不可变**,其中dense的特征组可以不设置，仅当设置了dense的特征组模型配置wukong.dense_mlp才起作用
+  - wide_deep: dlrm模型使用的都是Deep features, 所以都设置成DEEP
 
 - wukong: wukong模型相关的参数
+
+  - dense_mlp: dense mlp的参数配置
+
+    - hidden_units: dnn每一层的channel数目，即神经元的数目,输入dense features,最后一层channel数必须等于sparce feature得维度
 
   - wukong_layers: 特征交叉层参数，可以配置多层堆叠
 

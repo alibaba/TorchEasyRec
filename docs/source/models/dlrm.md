@@ -50,11 +50,11 @@ model_config: {
     wide_deep: DEEP
   }
   dlrm {
-      bot_mlp {
+      dense_mlp {
         hidden_units: 64
         hidden_units: 16
       }
-      top_mlp {
+      final {
         hidden_units: 128
         hidden_units: 64
         hidden_units: 32
@@ -73,7 +73,7 @@ model_config: {
 
 - feature_groups: 特征组
 
-  - 包含两个feature_group: dense 和sparse group, **group name不能变**
+  - 包含两个feature_group: dense 和sparse group, **特征组名称不可变**,其中dense的特征组可以不设置，仅当设置了dense的特征组模型配置dlrm.dense_mlp才起作用
   - wide_deep: dlrm模型使用的都是Deep features, 所以都设置成DEEP
 
 - dlrm: dlrm模型相关的参数

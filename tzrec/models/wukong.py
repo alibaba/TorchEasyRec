@@ -110,15 +110,15 @@ class WuKong(RankModel):
         """
         grouped_features = self.build_input(batch)
 
-        # dense
         # sparse
-        sparse_group_feat = grouped_features["sparse"]
+        sparse_group_feat = grouped_features[self._sparse_group_name]
         sparse_feat = sparse_group_feat.reshape(
             -1, self._sparse_num, self._per_sparse_dim
         )
         feat = sparse_feat
+        # dense
         if self.dense_mlp:
-            dense_group_feat = grouped_features["dense"]
+            dense_group_feat = grouped_features[self._dense_group_name]
             dense_feat = self.dense_mlp(dense_group_feat)
             feat = torch.cat([dense_feat.unsqueeze(1), feat], dim=1)
         for layer in self._wukong_layers:
