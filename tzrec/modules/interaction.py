@@ -77,25 +77,15 @@ class InteractionArch(nn.Module):
             dim += i
         return dim
 
-    def forward(
-        self, dense_features: torch.Tensor, sparse_features: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
         """Forward the module.
 
         Args:
-            dense_features (torch.Tensor): an input tensor of size B X D.
-            sparse_features (torch.Tensor): an input tensor of size B X N X D.
+            features (torch.Tensor): an input tensor of size B X N X D.
         """
-        if self.feature_num <= 0:
-            return dense_features
-
-        combined_values = torch.cat(
-            (dense_features.unsqueeze(1), sparse_features), dim=1
-        )  # B X (N+1) X D
-
         interactions = torch.bmm(
-            combined_values, torch.transpose(combined_values, 1, 2)
-        )  # B X (N+1) X (N+1)
+            features, torch.transpose(features, 1, 2)
+        )  # B X (N) X (N)
         interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
 
         return interactions_flat

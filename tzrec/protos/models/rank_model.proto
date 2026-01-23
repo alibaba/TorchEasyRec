@@ -34,7 +34,8 @@ message MultiTowerDIN {
 
 
 message DLRM {
-  required MLP dense_mlp = 1;
+  // if has dense feature group,must has dense_mlp
+  optional MLP dense_mlp = 1;
   // whether to include sparse features after interaction
   optional bool arch_with_sparse = 2 [default=true];
   required MLP final = 3;
@@ -72,6 +73,7 @@ message xDeepFM {
 
 
 message WuKong {
-    repeated WuKongLayer wukong_layers = 1;
-    required MLP final = 2;
+    optional MLP dense_mlp = 1;
+    repeated WuKongLayer wukong_layers = 2;
+    required MLP final = 3;
 }
