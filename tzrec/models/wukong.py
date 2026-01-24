@@ -43,20 +43,58 @@ class WuKong(RankModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.init_input()
-        self.group_name = self.embedding_group.group_names()[0]
-        group_dims = self.embedding_group.group_dims(self.group_name)
-        self._feature_num = len(group_dims)
-        self._emb_dim = group_dims[0]
+        if len(self.embedding_group.group_names()) == 1:
+            self._sparse_group_name = self.embedding_group.group_names()[0]
+        else:
+            self._sparse_group_name = "sparse"
+        self.dense_mlp = None
+        self._dense_group_name = "dense"
+        if len(
+            self.embedding_group.group_names()
+        ) > 1 and self.embedding_group.has_group(self._dense_group_name):
+            dense_dim = self.embedding_group.group_total_dim(self._dense_group_name)
+            dense_feature_dims = self.embedding_group.group_feature_dims(
+                self._dense_group_name
+            )
+            for feature_name in dense_feature_dims.keys():
+                if "seq_encoder" in feature_name:
+                    raise Exception("dense group not have sequence features.")
+            self.dense_mlp = MLP(
+                dense_dim, **config_to_kwargs(self._model_config.dense_mlp)
+            )
+
+        sparse_feature_dims = self.embedding_group.group_feature_dims(
+            self._sparse_group_name
+        )
+        self._per_sparse_dim = 0
+        for feature_name, dim in sparse_feature_dims.items():
+            self._per_sparse_dim = dim
+            if "seq_encoder" in feature_name:
+                raise Exception("sparse group not have sequence features.")
+
+        self._sparse_num = len(sparse_feature_dims)
+        sparse_dims = set(sparse_feature_dims.values())
+        if len(sparse_dims) > 1:
+            raise Exception(
+                f"sparse group feature dims must be the same, but we find {sparse_dims}"
+            )
+        if self.dense_mlp and self._per_sparse_dim != self.dense_mlp.output_dim():
+            raise Exception(
+                "dense mlp last hidden_unit must be the same sparse feature dim"
+            )
+
         self._wukong_layers = nn.ModuleList()
-        feature_num = self._feature_num
+        feature_num = self._sparse_num
+        if self.dense_mlp:
+            feature_num += 1
         for layer_cgf in self._model_config.wukong_layers:
             layer = WuKongLayer(
-                self._emb_dim, feature_num, **config_to_kwargs(layer_cgf)
+                self._per_sparse_dim, feature_num, **config_to_kwargs(layer_cgf)
             )
             self._wukong_layers.append(layer)
             feature_num = layer.output_feature_num()
         self.final_mlp = MLP(
-            feature_num * self._emb_dim,
+            feature_num * self._per_sparse_dim,
             **config_to_kwargs(self._model_config.final),
         )
         self.output_mlp = nn.Linear(self.final_mlp.output_dim(), self._num_class)
@@ -72,9 +110,17 @@ class WuKong(RankModel):
         """
         grouped_features = self.build_input(batch)
 
+        # sparse
+        sparse_group_feat = grouped_features[self._sparse_group_name]
+        sparse_feat = sparse_group_feat.reshape(
+            -1, self._sparse_num, self._per_sparse_dim
+        )
+        feat = sparse_feat
         # dense
-        feat = grouped_features[self.group_name]
-        feat = feat.reshape(-1, self._feature_num, self._emb_dim)
+        if self.dense_mlp:
+            dense_group_feat = grouped_features[self._dense_group_name]
+            dense_feat = self.dense_mlp(dense_group_feat)
+            feat = torch.cat([dense_feat.unsqueeze(1), feat], dim=1)
         for layer in self._wukong_layers:
             feat = layer(feat)
         feat = feat.view(feat.size(0), -1)
