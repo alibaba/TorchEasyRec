@@ -202,7 +202,6 @@ feature_configs: {
     raw_feature {
         feature_name: "pic_emb"
         expression: "item:pic_emb"
-        feature_type: RawFeature
         separator: "|"
         value_dim: 4
     }

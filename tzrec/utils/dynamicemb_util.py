@@ -11,7 +11,6 @@
 
 import math
 import os
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type, cast
 
 import torch
@@ -93,14 +92,6 @@ def _next_power_of_2(n: int) -> int:
     n |= n >> 16
     n |= n >> 32  # This line is necessary for 64-bit integers
     return n + 1
-
-
-@dataclass
-class KVCounterConfig:
-    """Config for KVCounter."""
-
-    capacity: int = None
-    bucket_capacity: int = 1024
 
 
 def _build_dynamicemb_initializer(
@@ -191,8 +182,9 @@ def build_dynamicemb_constraints(
                 if admission_strategy_cfg.HasField("counter_capacity")
                 else num_embeddings
             )
-            admission_counter = KVCounterConfig(
-                capacity=counter_capacity,
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            admission_counter = KVCounter(
+                capacity=_next_power_of_2(int(counter_capacity / world_size)),
                 bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
             )
             admit_strategy = FrequencyAdmissionStrategy(
@@ -677,23 +669,6 @@ if has_dynamicemb:
         if bak_local_hbm_for_values is not None:
             dynamicemb_options.local_hbm_for_values = bak_local_hbm_for_values
 
-        if dynamicemb_options.admission_counter is not None:
-            admission_strategy_cfg = dynamicemb_options.admission_counter
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            # If KVCounter is initialized before sharding, it will cause a planning error:                                    # NOQA
-            #   AttributeError: type object 'torch.storage.UntypedStorage' has no attribute 'dtype'. Did you mean: 'type'?    # NOQA
-            # Therefore, we keep `admission_counter` in `dynamicemb_options` as a config during planning,                     # NOQA
-            # and instantiate `KVCounter` later in `batched_dynamicemb_compute_kernel`.
-            admission_counter = KVCounter(
-                capacity=_next_power_of_2(
-                    int(admission_strategy_cfg.capacity / world_size)
-                ),
-                bucket_capacity=admission_strategy_cfg.bucket_capacity,
-                key_type=torch.int64,
-                device=torch.device(f"cuda:{local_rank}"),
-            )
-            dynamicemb_options.admission_counter = admission_counter
         return dynamicemb_options
 
     # pyre-ignore [9]
