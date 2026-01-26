@@ -48,9 +48,8 @@ class InteractionArchTest(unittest.TestCase):
         ia = InteractionArch(feature_num=4)
         self.assertEqual(ia.output_dim(), 6)
         ia = create_test_module(ia, graph_type)
-        dense_features = torch.randn([10, 8])
-        sparse_features = torch.randn([10, 3, 8])
-        result = ia(dense_features, sparse_features)
+        sparse_features = torch.randn([10, 4, 8])
+        result = ia(sparse_features)
         self.assertEqual(result.size(), (10, 6))
 
 
