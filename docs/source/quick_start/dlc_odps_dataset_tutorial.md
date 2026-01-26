@@ -71,6 +71,8 @@ MaxCompute表按如下格式设置：
 odps://{project}/tables/{table_name}/{partition}，多表按逗号分隔
 如果单表需要设置多个分区，可以用&简写，来分隔多个分区，odps://{project}/tables/{table_name}/{partition1}&{partition2}
 
+nproc-per-node: 如果是cpu训练，则设置为固定值1
+
 ### 评估命令
 
 完成模型训练后，进行模型评估：

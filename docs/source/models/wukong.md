@@ -82,7 +82,7 @@ model_config: {
 - feature_groups: 特征组
 
   - 包含两个feature_group: dense 和sparse group, **特征组名称不可变**,其中dense的特征组可以不设置，仅当设置了dense的特征组模型配置wukong.dense_mlp才起作用
-  - wide_deep: dlrm模型使用的都是Deep features, 所以都设置成DEEP
+  - wide_deep: wukong模型使用的都是Deep features, 所以都设置成DEEP
 
 - wukong: wukong模型相关的参数
 
