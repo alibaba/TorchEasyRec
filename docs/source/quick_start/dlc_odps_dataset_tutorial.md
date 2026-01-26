@@ -66,11 +66,12 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 - `--pipeline_config_path`: 训练用的配置文件路径。
 - `--train_input_path`: 指定训练用的MaxCompute的表。
 - `--eval_input_path`: 指定评估用的MaxCompute表。
-- `--nproc-per-node`: 如果是cpu训练，则设置为固定值1
 
 MaxCompute表按如下格式设置：
 odps://{project}/tables/{table_name}/{partition}，多表按逗号分隔
 如果单表需要设置多个分区，可以用&简写，来分隔多个分区，odps://{project}/tables/{table_name}/{partition1}&{partition2}
+
+nproc-per-node: 如果是cpu训练，则设置为固定值1
 
 ### 评估命令
 
