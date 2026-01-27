@@ -216,9 +216,30 @@ class DataParser:
                 output_data[label_name] = _to_tensor(
                     label.cast(pa.int64(), safe=False).to_numpy()
                 )
+            elif pa.types.is_list(label.type) and pa.types.is_floating(
+                label.values.type
+            ):
+                output_data[f"{label_name}.values"] = _to_tensor(
+                    label.values.cast(pa.float32(), safe=False).to_numpy()
+                )
+                offsets = label.offsets.to_numpy()
+                output_data[f"{label_name}.lengths"] = _to_tensor(
+                    offsets[1:] - offsets[:-1]
+                )
+            elif pa.types.is_list(label.type) and pa.types.is_integer(
+                label.values.type
+            ):
+                output_data[f"{label_name}.values"] = _to_tensor(
+                    label.values.cast(pa.int64(), safe=False).to_numpy()
+                )
+                offsets = label.offsets.to_numpy()
+                output_data[f"{label_name}.lengths"] = _to_tensor(
+                    offsets[1:] - offsets[:-1]
+                )
             else:
                 raise ValueError(
-                    f"label column [{label_name}] only support int or float dtype now."
+                    f"label column [{label_name}] only support "
+                    "int | float | list<int> | list<float> dtype now."
                 )
 
         for weight_name in self._sample_weights:
