@@ -52,6 +52,12 @@ if __name__ == "__main__":
         help='edit pipeline config str, example: {"model_dir":"experiments/",'
         '"feature_configs[0].raw_feature.boundaries":[4,5,6,7]}',
     )
+    parser.add_argument(
+        "--ignore_restore_optimizer",
+        action="store_true",
+        default=False,
+        help="ignore restore optimizer state from checkpoint.",
+    )
     args, extra_args = parser.parse_known_args()
 
     train_and_evaluate(
@@ -62,4 +68,5 @@ if __name__ == "__main__":
         args.continue_train,
         args.fine_tune_checkpoint,
         args.edit_config_json,
+        args.ignore_restore_optimizer,
     )
