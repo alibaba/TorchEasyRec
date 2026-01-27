@@ -439,8 +439,15 @@ class DataParser:
             sequence_dense_features[key] = sequence_dense_feature
 
         labels = {}
+        jagged_labels = {}
         for label_name in self._labels:
-            labels[label_name] = input_data[label_name]
+            if label_name in input_data:
+                labels[label_name] = input_data[label_name]
+            else:
+                jagged_labels[label_name] = JaggedTensor(
+                    values=input_data[f"{label_name}.values"],
+                    lengths=input_data[f"{label_name}.lengths"],
+                )
 
         sample_weights = {}
         for weight in self._sample_weights:
@@ -459,6 +466,7 @@ class DataParser:
             sequence_mulval_lengths=sequence_mulval_lengths,
             sequence_dense_features=sequence_dense_features,
             labels=labels,
+            jagged_labels=jagged_labels,
             sample_weights=sample_weights,
             tile_size=tile_size,
             additional_infos=additional_infos,
