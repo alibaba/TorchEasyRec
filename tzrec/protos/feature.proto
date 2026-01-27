@@ -176,7 +176,7 @@ message IdFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message RawFeature {
@@ -235,7 +235,7 @@ message RawFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message ComboFeature {
@@ -297,7 +297,7 @@ message ComboFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message LookupFeature {
@@ -392,7 +392,7 @@ message LookupFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message MatchFeature {
@@ -486,7 +486,7 @@ message MatchFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message ExprFeature {
@@ -542,7 +542,7 @@ message ExprFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message OverlapFeature {
@@ -602,7 +602,7 @@ message OverlapFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 
@@ -677,7 +677,7 @@ message TokenizeFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 
@@ -738,7 +738,7 @@ message KvDotProduct {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message CustomFeature {
@@ -824,7 +824,7 @@ message CustomFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message BoolMaskFeature {
@@ -892,7 +892,7 @@ message BoolMaskFeature {
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
-    optional string sequence_fields = 103;
+    repeated string sequence_fields = 103;
 }
 
 message SequenceFeature {
