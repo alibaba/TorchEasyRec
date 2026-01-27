@@ -283,7 +283,7 @@ if has_dynamicemb:
         num_buckets = max_capacity/bucket_capacity
         hbm_budget = min(global_hbm_for_values//world_size, total_value_memory) +
             max_capacity x (key<8byte> + score<8byte> + digest<1byte>) +
-            num_buckets x (bucket_size<4byte> + 4 x pointer<8byte>)
+            num_buckets x (bucket_size<4byte>)
         ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
         """
         if cache_ratio is None:
@@ -296,7 +296,7 @@ if has_dynamicemb:
                     16,
                 )
                 * (cache_ratio if is_hbm else 1 - cache_ratio)
-                + (8 + 8 + 1 + (4 + 4) / bucket_capacity) * (is_hbm and not only_values)
+                + (8 + 8 + 1 + 4 / bucket_capacity) * (is_hbm and not only_values)
             )
         )
 

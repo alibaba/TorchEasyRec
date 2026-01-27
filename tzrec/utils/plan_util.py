@@ -59,6 +59,7 @@ from torchrec.distributed.planner.types import (
     Enumerator,
     Proposer,
     ShardingOption,
+    Storage,
     Topology,
 )
 from torchrec.distributed.sharding_plan import (
@@ -71,7 +72,6 @@ from torchrec.distributed.types import (
     ModuleSharder,
     PipelineType,
     ShardingType,
-    Storage,
 )
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
 
