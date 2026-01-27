@@ -172,9 +172,9 @@ message IdFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -231,9 +231,9 @@ message RawFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -293,9 +293,9 @@ message ComboFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -388,9 +388,9 @@ message LookupFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -482,9 +482,9 @@ message MatchFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -538,9 +538,9 @@ message ExprFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -598,9 +598,9 @@ message OverlapFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -673,9 +673,9 @@ message TokenizeFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -734,9 +734,9 @@ message KvDotProduct {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -820,9 +820,9 @@ message CustomFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
@@ -888,9 +888,9 @@ message BoolMaskFeature {
     optional ParameterConstraints embedding_constraints = 50;
 
     // max sequence length, only take effect when use it as sequence
-    required uint32 sequence_length = 101;
+    optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
-    required string sequence_delim = 102 [default = ";"];
+    optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
 }
