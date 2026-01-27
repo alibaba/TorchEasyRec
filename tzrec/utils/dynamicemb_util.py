@@ -572,8 +572,8 @@ if has_dynamicemb:
             if isinstance(counter, KVCounter):
                 counter_hbm_specific_size = (
                     _calculate_dynamicemb_table_storage_specific_size(
-                        [counter.capacity],
-                        element_size=0,
+                        [counter.capacity, 0],
+                        element_size=0,  # counter does not contain embedding value
                         bucket_capacity=counter.bucket_capacity,
                     )
                 )
