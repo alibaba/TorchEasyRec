@@ -95,9 +95,17 @@ feature_configs {
 
 - **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
 
-- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+- **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等
 
-- **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况，**编号需要从2开始**，编码0预留给默认值，编码1预留给超出词表的词
+  - 未设置**default_bucketize_value**时: default_bucketize_value=1, **编号需会从2开始**，编码0预留给默认值(default_value)，编码1预留给超出词表的词
+    - 注意：如果default_value本身在vocab_list中，那么default_value的编码不为0，将会是vocab_list中的编码
+  - 设置**default_bucketize_value**时: vocab_list 用户完全自主控制
+
+- **vocab_dict**: 指定字典形式词表，适合多个词需要编码到同一个编号情况
+
+  - 未设置**default_bucketize_value**时: default_bucketize_value=1, **编号需要从2开始**，编码0预留给默认值(default_value)，编码1预留给超出词表的词
+    - 注意：如果default_value本身在vocab_dict中，vocab_dict中的等于default_value的元素的索引值将会被更新为0
+  - 设置**default_bucketize_value**时: vocab_dict 用户完全自主控制
 
 - **vocab_file**: 指定词表或字典形式词表的文件路径，适合取值比较多兵可以枚举的特征，编码未预留，必须设置**default_bucketize_value**参数
 

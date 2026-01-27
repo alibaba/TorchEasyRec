@@ -329,6 +329,7 @@ class IdFeatureTest(unittest.TestCase):
         [
             ["", ["abc", "efg"], None, [2, 3, 1], [2, 0, 1]],
             ["xyz", ["abc", "efg"], None, [2, 3, 0, 1], [2, 1, 1]],
+            ["abc", ["abc", "efg"], None, [2, 3, 2, 1], [2, 1, 1]],
             ["", ["xyz", "abc", "efg"], 0, [1, 2, 0], [2, 0, 1]],
             ["xyz", ["xyz", "abc", "efg"], 0, [1, 2, 0, 0], [2, 1, 1]],
         ],
@@ -383,6 +384,7 @@ class IdFeatureTest(unittest.TestCase):
         [
             ["", {"abc": 2, "efg": 2}, None, [2, 2, 1], [2, 0, 1]],
             ["xyz", {"abc": 2, "efg": 2}, None, [2, 2, 0, 1], [2, 1, 1]],
+            ["abc", {"abc": 2, "efg": 2}, None, [0, 2, 0, 1], [2, 1, 1]],
             ["", {"abc": 1, "efg": 1}, 0, [1, 1, 0], [2, 0, 1]],
             ["xyz", {"xyz": 0, "abc": 1, "efg": 1}, 0, [1, 1, 0, 0], [2, 1, 1]],
         ],

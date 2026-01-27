@@ -990,9 +990,13 @@ class BaseFeature(object, metaclass=_meta_cls):
                     )
                     self._vocab_list = list(self.config.vocab_list)
                 else:
-                    self._vocab_list = [self.config.default_value, "<OOV>"] + list(
-                        self.config.vocab_list
-                    )
+                    vocab_list = list(self.config.vocab_list)
+                    if self.config.default_value in vocab_list:
+                        logger.warning(
+                            f"default_value of {self.__class__.__name__}[{self.name}] "
+                            f"will be mapped to {vocab_list.index(self.config.default_value) + 2} rather than 0"  # NOQA
+                        )
+                    self._vocab_list = [self.config.default_value, "<OOV>"] + vocab_list
             else:
                 self._vocab_list = []
         return self._vocab_list
@@ -1010,12 +1014,18 @@ class BaseFeature(object, metaclass=_meta_cls):
                 else:
                     is_rank_zero = os.environ.get("RANK", "0") == "0"
                     if min(list(self.config.vocab_dict.values())) <= 1 and is_rank_zero:
-                        logger.warn(
+                        logger.warning(
                             "min index of vocab_dict in "
                             f"{self.__class__.__name__}[{self.name}] should "
                             "start from 2. index0 is default_value, index1 is <OOV>."
                         )
-                    vocab_dict[self.config.default_value] = 0
+                    if self.config.default_value:
+                        if self.config.default_value in vocab_dict:
+                            logger.warning(
+                                f"{self.config.default_value} of {self.__class__.__name__}[{self.name}] "  # NOQA
+                                f"will be mapped to 0 rather than {vocab_dict[self.config.default_value]}"  # NOQA
+                            )
+                        vocab_dict[self.config.default_value] = 0
                     self._vocab_dict = vocab_dict
             else:
                 self._vocab_dict = {}
