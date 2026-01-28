@@ -76,7 +76,6 @@ message DynamicEmbInitializerArgs {
     optional float value = 6 [default = 0.0];
 }
 
-
 message DynamicEmbFrequencyAdmissionStrategy {
     // minimum frequency threshold for admission
     required uint64 threshold = 1;
@@ -171,6 +170,13 @@ message IdFeature {
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message RawFeature {
@@ -223,6 +229,13 @@ message RawFeature {
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message ComboFeature {
@@ -278,6 +291,13 @@ message ComboFeature {
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message LookupFeature {
@@ -366,6 +386,13 @@ message LookupFeature {
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message MatchFeature {
@@ -453,6 +480,13 @@ message MatchFeature {
     }
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message ExprFeature {
@@ -502,6 +536,13 @@ message ExprFeature {
     }
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message OverlapFeature {
@@ -555,6 +596,13 @@ message OverlapFeature {
     }
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 
@@ -623,6 +671,13 @@ message TokenizeFeature {
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 
@@ -677,6 +732,13 @@ message KvDotProduct {
     }
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message CustomFeature {
@@ -756,6 +818,13 @@ message CustomFeature {
     }
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message BoolMaskFeature {
@@ -817,191 +886,13 @@ message BoolMaskFeature {
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
-}
 
-message SequenceIdFeature {
-    // feature name, e.g. item_cat_seq
-    required string feature_name = 1;
-    // feature input, e.g. item:item_cat_seq
-    required string expression = 2;
-    // max sequence length, only take effect in fg
-    required uint32 sequence_length = 3;
-    // sequence delimiter
-    required string sequence_delim = 4 [default = ";"];
-    // embedding name, feature with same embedding name will share embedding
-    optional string embedding_name = 5;
-    // embedding dimension
-    required uint32 embedding_dim = 6;
-    // number of hash size
-    optional uint64 hash_bucket_size = 7;
-    // number of id enumerators
-    optional uint64 num_buckets = 8;
-    // id vocabulary list
-    repeated string vocab_list = 9;
-    // id vocabulary dict
-    map<string, uint64> vocab_dict = 10;
-    // embedding pooling type, available is {sum | mean}
-    optional string pooling = 11 [default = "sum"];
-    // fg default value, default value before bucktize
-    optional string default_value = 12 [default = "0"];
-    // fg multi-value separator
-    optional string separator = 13 [default = "\x1d"];
-    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
-    optional string init_fn = 14;
-    // id value dimensions, now only support value_dim = 1
-    optional uint32 value_dim = 15 [default = 1];
-    // mask value in training progress
-    optional bool use_mask =  16;
-    // zero collision hash
-    optional ZeroCollisionHash zch = 17;
-    // id vocabulary file path
-    optional string vocab_file = 18;
-    // vocab file relative directory
-    optional string asset_dir = 19;
-    // dynamic embedding
-    optional DynamicEmbedding dynamicemb = 20;
-
-    // default value when fg_mode = FG_NONE,
-    // when use pai-fg, you do not need to set the param.
-    // when use own fg and data contain null value, you can set the param for fill null
-    optional string fg_encoded_default_value = 30;
-    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
-    // when use default_bucketize_value, we will not add additional bucketize_value of
-    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
-    optional uint64 default_bucketize_value = 31;
-    // embedding param trainable or not
-    optional bool trainable = 33 [default = true];
-    // only used as fg dag intermediate result or not
-    optional bool stub_type = 34 [default = false];
-    // embedding data type
-    optional string data_type = 35 [default = 'FP32'];
-    // embedding param constraints
-    optional ParameterConstraints embedding_constraints = 50;
-}
-
-message SequenceRawFeature {
-    // feature name, e.g. click_count
-    required string feature_name = 1;
-    // feature input, e.g. item:click_count
-    required string expression = 2;
-    // max sequence length, only take effect in fg
-    required uint32 sequence_length = 3;
-    // sequence delimiter
-    required string sequence_delim = 4 [default = ";"];
-    // embedding name, feature with same embedding name will share embedding
-    optional string embedding_name = 5;
-    // embedding dimension
-    optional uint32 embedding_dim = 6;
-    // boundaries for bucktize numeric feature
-    repeated float boundaries = 7;
-    // raw feature of multiple dimensions
-    optional uint32 value_dim = 8 [default = 1];
-    // fg normalizer, e.g.
-    // method=log10,threshold=1e-10,default=-10
-    // method=zscore,mean=0.0,standard_deviation=10.0
-    // method=minmax,min=2.1,max=2.2
-    // method=expression,expr=sign(x)
-    optional string normalizer = 9;
-    // embedding pooling type, available is {sum | mean}
-    optional string pooling = 10 [default = "sum"];
-    // fg default value
-    optional string default_value = 11 [default = "0"];
-    // fg multi-value separator
-    optional string separator = 12 [default = "\x1d"];
-    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
-    optional string init_fn = 13;
-    // mask value in training progress
-    optional bool use_mask =  14;
-
-    // default value when fg_mode = FG_NONE,
-    // when use pai-fg, you do not need to set the param.
-    // when use own fg and data contain null value, you can set the param for fill null
-    optional string fg_encoded_default_value = 30;
-    // embedding param trainable or not
-    optional bool trainable = 33 [default = true];
-    // only used as fg dag intermediate result or not
-    optional bool stub_type = 34 [default = false];
-    // embedding data type
-    optional string data_type = 35 [default = 'FP32'];
-    // embedding param constraints
-    optional ParameterConstraints embedding_constraints = 50;
-}
-
-
-message SequenceCustomFeature {
-    // feature name.
-    required string feature_name = 1;
-    // custom operator name.
-    required string operator_name = 2;
-    // custom operator lib file name.
-    required string operator_lib_file = 3;
-    // operator custom params.
-    optional google.protobuf.Struct operator_params = 4;
-    // custom operator is thread safe or not.
-    optional bool is_op_thread_safe = 5 [default = false];
-    // feature input, e.g. user:os
-    repeated string expression = 6;
-    // max sequence length, only take effect in fg
-    required uint32 sequence_length = 7;
-    // sequence delimiter
-    required string sequence_delim = 8 [default = ";"];
-    // embedding name, feature with same embedding name will share embedding
-    optional string embedding_name = 9;
-    // embedding dimension
-    optional uint32 embedding_dim = 10;
-    // boundaries for bucktize numeric value
-    repeated float boundaries = 11;
-    // number of hash size for sparse value
-    optional uint64 hash_bucket_size = 12;
-    // number of id enumerators for sparse value
-    optional uint64 num_buckets = 13;
-    // id vocabulary list for sparse value
-    repeated string vocab_list = 14;
-    // id vocabulary dict
-    map<string, uint64> vocab_dict = 15;
-    // embedding pooling type, available is {sum | mean}
-    optional string pooling = 16 [default = "sum"];
-    // fg default value
-    optional string default_value = 17 [default = "0"];
-    // fg multi-value separator
-    optional string separator = 18 [default = "\x1d"];
-    // fg normalizer, e.g.
-    // method=log10,threshold=1e-10,default=-10
-    // method=zscore,mean=0.0,standard_deviation=10.0
-    // method=minmax,min=2.1,max=2.2
-    // method=expression,expr=sign(x)
-    optional string normalizer = 19;
-    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
-    optional string init_fn = 20;
-    // value dimensions
-    optional uint32 value_dim = 21;
-    // mask value in training progress
-    optional bool use_mask = 22;
-    // zero collision hash
-    optional ZeroCollisionHash zch = 23;
-    // id vocabulary file path
-    optional string vocab_file = 24;
-    // vocab file relative directory
-    optional string asset_dir = 25;
-    // dynamic embedding
-    optional DynamicEmbedding dynamicemb = 26;
-
-    // default value when fg_mode = FG_NONE,
-    // when use pai-fg, you do not need to set the param.
-    // when use own fg and data contain null value, you can set the param for fill null
-    optional string fg_encoded_default_value = 30;
-    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
-    // when use default_bucketize_value, we will not add additional bucketize_value of
-    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
-    optional uint64 default_bucketize_value = 31;
-    // embedding param trainable or not
-    optional bool trainable = 33 [default = true];
-    // only used as fg dag intermediate result or not
-    optional bool stub_type = 34 [default = false];
-    // embedding data type
-    optional string data_type = 35 [default = 'FP32'];
-    // embedding param constraints
-    optional ParameterConstraints embedding_constraints = 50;
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
 }
 
 message SequenceFeature {
@@ -1029,12 +920,21 @@ message FeatureConfig {
         ExprFeature expr_feature = 7;
         OverlapFeature overlap_feature = 8;
         TokenizeFeature tokenize_feature = 9;
-        SequenceIdFeature sequence_id_feature = 10;
-        SequenceRawFeature sequence_raw_feature = 11;
-        CustomFeature custom_feature = 12;
-        SequenceCustomFeature sequence_custom_feature = 13;
-        KvDotProduct kv_dot_product = 14;
-        BoolMaskFeature bool_mask_feature = 15;
+        CustomFeature custom_feature = 10;
+        KvDotProduct kv_dot_product = 11;
+        BoolMaskFeature bool_mask_feature = 12;
+
+        IdFeature sequence_id_feature = 101;
+        RawFeature sequence_raw_feature = 102;
+        ComboFeature sequence_combo_feature = 103;
+        LookupFeature sequence_lookup_feature = 104;
+        MatchFeature sequence_match_feature = 105;
+        ExprFeature sequence_expr_feature = 107;
+        OverlapFeature sequence_overlap_feature = 108;
+        TokenizeFeature sequence_tokenize_feature = 109;
+        CustomFeature sequence_custom_feature = 110;
+        KvDotProduct sequence_kv_dot_product = 111;
+        BoolMaskFeature sequence_bool_mask_feature = 112;
     }
 }
 
@@ -1043,6 +943,14 @@ message SeqFeatureConfig {
     oneof feature {
         IdFeature id_feature = 1;
         RawFeature raw_feature = 2;
-        CustomFeature custom_feature = 3;
+        ComboFeature combo_feature = 3;
+        LookupFeature lookup_feature = 4;
+        MatchFeature match_feature = 5;
+        ExprFeature expr_feature = 7;
+        OverlapFeature overlap_feature = 8;
+        TokenizeFeature tokenize_feature = 9;
+        CustomFeature custom_feature = 10;
+        KvDotProduct kv_dot_product = 11;
+        BoolMaskFeature bool_mask_feature = 12;
     }
 }

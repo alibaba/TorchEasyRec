@@ -103,6 +103,9 @@ class ConvertConfig(object):
             _get_easyrec(easyrec_package_path)
         self.output_tzrec_config_path = output_tzrec_config_path
         self.easyrec_config = self.load_easyrec_config(easyrec_config_path)
+        self.easyrec_feature_config = self._get_compatible_feature_configs(
+            self.easyrec_config
+        )
 
         self.feature_to_fg = {}
         self.sub_sequence_to_group = {}
@@ -111,6 +114,14 @@ class ConvertConfig(object):
             self.fg_json = self.load_easyrec_fg_json(fg_json_path)
             self.analyse_fg(self.fg_json)
         self.use_old_fg = use_old_fg
+
+    def _get_compatible_feature_configs(self, easyrec_pipeline_config):
+        """Get easyrec feature configs."""
+        if easyrec_pipeline_config.feature_configs:
+            feature_configs = easyrec_pipeline_config.feature_configs
+        else:
+            feature_configs = easyrec_pipeline_config.feature_config.features
+        return feature_configs
 
     def analyse_fg(self, fg_json):
         """Analysis fg.json."""
@@ -209,7 +220,7 @@ class ConvertConfig(object):
                 tzrec_feature.num_buckets = easyrec_feature.num_buckets
 
     def _search_easyrec_config(self, feature_name):
-        for cfg in self.easyrec_config.feature_configs:
+        for cfg in self.easyrec_feature_config:
             if cfg.feature_name:
                 easy_feature_name = cfg.feature_name
             else:
@@ -390,7 +401,7 @@ class ConvertConfig(object):
         """Create tzrec feature config."""
         easyrec_feature_config = easyrec_feature_config_pb2.FeatureConfig()  # NOQA
         seq_group_cfg = OrderedDict()
-        for cfg in self.easyrec_config.feature_configs:
+        for cfg in self.easyrec_feature_config:
             if cfg.feature_name:
                 feature_name = cfg.feature_name
             else:
@@ -438,7 +449,7 @@ class ConvertConfig(object):
                 elif feature_name in self.feature_to_fg:
                     feature_config = tzrec_feature_pb2.FeatureConfig()
                     if cfg.sub_feature_type == easyrec_feature_config.IdFeature:
-                        feature = tzrec_feature_pb2.SequenceIdFeature()
+                        feature = tzrec_feature_pb2.IdFeature()
                         feature.feature_name = feature_name
                         feature.expression = self.feature_to_fg[feature_name][
                             "expression"
@@ -448,7 +459,7 @@ class ConvertConfig(object):
                         feature_config.ClearField("feature")
                         feature_config.sequence_id_feature.CopyFrom(feature)
                     else:
-                        feature = tzrec_feature_pb2.SequenceRawFeature()
+                        feature = tzrec_feature_pb2.RawFeature()
                         feature.feature_name = feature_name
                         feature.expression = self.feature_to_fg[feature_name][
                             "expression"
@@ -574,7 +585,7 @@ class ConvertConfig(object):
     def _create_feature_config_no_fg(self, pipeline_config):
         """Create tzrec feature config no fg json."""
         easyrec_feature_config = easyrec_feature_config_pb2.FeatureConfig()  # NOQA
-        for cfg in self.easyrec_config.feature_configs:
+        for cfg in self.easyrec_feature_config:
             if cfg.feature_name:
                 feature_name = cfg.feature_name
             else:
@@ -606,7 +617,7 @@ class ConvertConfig(object):
             elif feature_type == easyrec_feature_config.SequenceFeature:
                 feature_config = tzrec_feature_pb2.FeatureConfig()
                 if cfg.sub_feature_type == easyrec_feature_config.RawFeature:
-                    feature = tzrec_feature_pb2.SequenceRawFeature()
+                    feature = tzrec_feature_pb2.RawFeature()
                     feature.feature_name = feature_name
                     feature.expression = f"user:{input_names[0]}"
                     feature.sequence_length = cfg.sequence_length
@@ -618,7 +629,7 @@ class ConvertConfig(object):
                     feature_config.ClearField("feature")
                     feature_config.sequence_raw_feature.CopyFrom(feature)
                 else:
-                    feature = tzrec_feature_pb2.SequenceIdFeature()
+                    feature = tzrec_feature_pb2.IdFeature()
                     feature.feature_name = feature_name
                     feature.expression = f"user:{input_names[0]}"
                     feature.sequence_length = cfg.sequence_length

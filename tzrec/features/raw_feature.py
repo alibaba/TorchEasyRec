@@ -11,18 +11,8 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyarrow as pa
-
-from tzrec.datasets.utils import (
-    DenseData,
-    ParsedData,
-    SparseData,
-)
 from tzrec.features.feature import (
     BaseFeature,
-    FgMode,
-    _parse_fg_encoded_dense_feature_impl,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
 
@@ -32,22 +22,14 @@ class RawFeature(BaseFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
-
-    @property
-    def name(self) -> str:
-        """Feature name."""
-        return self.config.feature_name
+        super().__init__(feature_config, **kwargs)
 
     @property
     def value_dim(self) -> int:
@@ -79,7 +61,11 @@ class RawFeature(BaseFeature):
 
     @property
     def _dense_emb_type(self) -> Optional[str]:
-        return self.config.WhichOneof("dense_emb")
+        if self._is_sequence:
+            # sequence feature not support dense emb now.
+            return None
+        else:
+            return self.config.WhichOneof("dense_emb")
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
@@ -88,47 +74,11 @@ class RawFeature(BaseFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            feat = input_data[self.name]
-            if self.is_sparse:
-                parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-            else:
-                parsed_feat = _parse_fg_encoded_dense_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feat = input_data[self.inputs[0]]
-            if pa.types.is_list(input_feat.type):
-                input_feat = input_feat.fill_null([])
-            input_feat = input_feat.tolist()
-            if self._fg_op.is_sparse:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feat)
-                parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-            else:
-                values = self._fg_op.transform(input_feat)
-                parsed_feat = DenseData(name=self.name, values=values)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "raw_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": self.config.expression,
             "value_type": "float",
@@ -143,4 +93,7 @@ class RawFeature(BaseFeature):
             fg_cfg["boundaries"] = list(self.config.boundaries)
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

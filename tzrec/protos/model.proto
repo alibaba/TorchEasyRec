@@ -51,6 +51,7 @@ message ModelConfig {
         DCNV1 dcn_v1 = 106;
         DCNV2 dcn_v2 = 107;
         xDeepFM xdeepfm = 108;
+        WuKong wukong = 109;
 
         SimpleMultiTask simple_multi_task = 200;
         MMoE mmoe = 201;
@@ -81,4 +82,8 @@ message ModelConfig {
     optional VariationalDropout variational_dropout = 11;
 
     optional Kernel kernel = 12 [default = PYTORCH];
+
+    // whether use pareto loss weight
+    optional bool use_pareto_loss_weight = 13 [default = false];
+
 }

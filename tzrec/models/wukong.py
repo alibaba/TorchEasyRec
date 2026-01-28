@@ -17,13 +17,13 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.interaction import InteractionArch
+from tzrec.modules.interaction import WuKongLayer
 from tzrec.modules.mlp import MLP
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 
 
-class DLRM(RankModel):
+class WuKong(RankModel):
     """DLRM model.
 
     Args:
@@ -43,7 +43,6 @@ class DLRM(RankModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self.init_input()
-
         if len(self.embedding_group.group_names()) == 1:
             self._sparse_group_name = self.embedding_group.group_names()[0]
         else:
@@ -67,7 +66,6 @@ class DLRM(RankModel):
         sparse_feature_dims = self.embedding_group.group_feature_dims(
             self._sparse_group_name
         )
-        sparse_dim = self.embedding_group.group_total_dim(self._sparse_group_name)
         self._per_sparse_dim = 0
         for feature_name, dim in sparse_feature_dims.items():
             self._per_sparse_dim = dim
@@ -84,18 +82,21 @@ class DLRM(RankModel):
             raise Exception(
                 "dense mlp last hidden_unit must be the same sparse feature dim"
             )
-        self._feature_num = self._sparse_num
-        if self.dense_mlp:
-            self._feature_num += 1
-        self.interaction = InteractionArch(self._feature_num)
 
-        feature_dim = self.interaction.output_dim()
+        self._wukong_layers = nn.ModuleList()
+        feature_num = self._sparse_num
         if self.dense_mlp:
-            feature_dim += self.dense_mlp.output_dim()
-        if self._model_config.arch_with_sparse:
-            feature_dim += sparse_dim
-
-        self.final_mlp = MLP(feature_dim, **config_to_kwargs(self._model_config.final))
+            feature_num += 1
+        for layer_cgf in self._model_config.wukong_layers:
+            layer = WuKongLayer(
+                self._per_sparse_dim, feature_num, **config_to_kwargs(layer_cgf)
+            )
+            self._wukong_layers.append(layer)
+            feature_num = layer.output_feature_num()
+        self.final_mlp = MLP(
+            feature_num * self._per_sparse_dim,
+            **config_to_kwargs(self._model_config.final),
+        )
         self.output_mlp = nn.Linear(self.final_mlp.output_dim(), self._num_class)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -116,20 +117,14 @@ class DLRM(RankModel):
         )
         feat = sparse_feat
         # dense
-        dense_feat = None
         if self.dense_mlp:
             dense_group_feat = grouped_features[self._dense_group_name]
             dense_feat = self.dense_mlp(dense_group_feat)
             feat = torch.cat([dense_feat.unsqueeze(1), feat], dim=1)
-        # interaction
-        all_feat = self.interaction(feat)
-        # final mlp
-        if self.dense_mlp:
-            all_feat = torch.cat([all_feat, dense_feat], dim=-1)
-        if self._model_config.arch_with_sparse:
-            all_feat = torch.cat([all_feat, sparse_group_feat], dim=-1)
-        y_final = self.final_mlp(all_feat)
-
+        for layer in self._wukong_layers:
+            feat = layer(feat)
+        feat = feat.view(feat.size(0), -1)
+        y_final = self.final_mlp(feat)
         # output
         y = self.output_mlp(y_final)
         return self._output_to_prediction(y)

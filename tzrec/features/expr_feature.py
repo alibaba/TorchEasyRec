@@ -11,18 +11,8 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyarrow as pa
-
 from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
-    DenseData,
-    ParsedData,
-    SparseData,
-)
-from tzrec.features.feature import (
-    FgMode,
-    _parse_fg_encoded_dense_feature_impl,
-    _parse_fg_encoded_sparse_feature_impl,
 )
 from tzrec.features.raw_feature import RawFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -33,17 +23,14 @@ class ExprFeature(RawFeature):
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
-        fg_mode (FgMode): input data fg mode.
-        fg_encoded_multival_sep (str, optional): multival_sep when fg_mode=FG_NONE
     """
 
     def __init__(
         self,
         feature_config: FeatureConfig,
-        fg_mode: FgMode = FgMode.FG_NONE,
-        fg_encoded_multival_sep: Optional[str] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(feature_config, fg_mode, fg_encoded_multival_sep)
+        super().__init__(feature_config, **kwargs)
 
     # pyre-ignore [56]
     @RawFeature.is_neg.setter
@@ -59,50 +46,11 @@ class ExprFeature(RawFeature):
         else:
             return None
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        if self.fg_mode == FgMode.FG_NONE:
-            # input feature is already lookuped
-            feat = input_data[self.name]
-            if self.is_sparse:
-                parsed_feat = _parse_fg_encoded_sparse_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-            else:
-                parsed_feat = _parse_fg_encoded_dense_feature_impl(
-                    self.name, feat, **self._fg_encoded_kwargs
-                )
-        elif self.fg_mode == FgMode.FG_NORMAL:
-            input_feats = []
-            for name in self.inputs:
-                x = input_data[name]
-                if pa.types.is_list(x.type):
-                    x = x.fill_null([])
-                input_feats.append(x.tolist())
-            if self.is_sparse:
-                values, lengths = self._fg_op.to_bucketized_jagged_tensor(input_feats)
-                parsed_feat = SparseData(name=self.name, values=values, lengths=lengths)
-            else:
-                values = self._fg_op.transform(input_feats)
-                parsed_feat = DenseData(name=self.name, values=values)
-        else:
-            raise ValueError(
-                f"fg_mode: {self.fg_mode} is not supported without fg handler."
-            )
-        return parsed_feat
-
-    def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config."""
+    def _fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config impl."""
         fg_cfg = {
             "feature_type": "expr_feature",
-            "feature_name": self.name,
+            "feature_name": self.config.feature_name,
             "default_value": self.config.default_value,
             "expression": self.config.expression,
             "variables": list(self.config.variables),
@@ -118,4 +66,7 @@ class ExprFeature(RawFeature):
             fg_cfg["value_dim"] = self.config.value_dim
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
+
+        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

@@ -191,5 +191,58 @@ class ComboFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
 
+class SequenceComboFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ["", 0, [2, 42, 3, 26, 23], [2, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 0, [2, 42, 3, 13, 23], [2, 1, 1, 1], [2, 1, 1]],
+            ["", 1, [2, 3, 26, 23], [1, 1, 1, 1], [2, 1, 1]],
+            ["xyz", 1, [2, 3, 13, 23], [1, 1, 1, 1], [2, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_combo_feature_with_hash_bucket_size(
+        self,
+        default_value,
+        value_dim,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            combo_feature=feature_pb2.ComboFeature(
+                feature_name="combo_feat",
+                hash_bucket_size=100,
+                embedding_dim=16,
+                expression=["user:id_str", "item:iid_str"],
+                default_value=default_value,
+                value_dim=value_dim,
+            )
+        )
+        seq_feat = combo_feature_lib.ComboFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["id_str", "click_50_seq__iid_str"])
+
+        input_data = {
+            "id_str": pa.array(["ua", "", "ub"]),
+            "click_50_seq__iid_str": pa.array(["abc\x1defg;hij", "", "hij"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__combo_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

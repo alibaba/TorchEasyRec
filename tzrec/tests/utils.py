@@ -33,11 +33,6 @@ from tzrec.features.id_feature import IdFeature
 from tzrec.features.lookup_feature import LookupFeature
 from tzrec.features.match_feature import MatchFeature
 from tzrec.features.raw_feature import RawFeature
-from tzrec.features.sequence_feature import (
-    SequenceCustomFeature,
-    SequenceIdFeature,
-    SequenceRawFeature,
-)
 from tzrec.features.tokenize_feature import TokenizeFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -705,6 +700,8 @@ def build_mock_input_with_fg(
     inputs = defaultdict(dict)
     single_id_fields = {user_id, item_id}
     for feature in features:
+        if feature.is_sequence:
+            continue
         if type(feature) is IdFeature:
             is_multi = (
                 random.random() < 0.5 and feature.inputs[0] not in single_id_fields
@@ -799,11 +796,7 @@ def build_mock_input_with_fg(
 
     seq_underline = "_" if env_util.use_rtp() else "__"
     for feature in features:
-        if type(feature) in [
-            SequenceIdFeature,
-            SequenceRawFeature,
-            SequenceCustomFeature,
-        ]:
+        if feature.is_sequence:
             for side, input_name in feature.side_inputs:
                 if feature.is_grouped_sequence:
                     sub_name = input_name.replace(
@@ -838,7 +831,7 @@ def build_mock_input_with_fg(
                             input_name,
                             is_multi=True,
                             num_ids=10
-                            if isinstance(feature, SequenceCustomFeature)
+                            if isinstance(feature, CustomFeature)
                             else feature.num_embeddings,
                             multival_sep=feature.sequence_delim,
                         )
