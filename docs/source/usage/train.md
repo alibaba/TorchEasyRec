@@ -19,6 +19,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --continue_train: 是否增量训练
 - --fine_tune_checkpoint: 增量训练的checkpoint路径，如experiments/multi_tower_din_taobao_local/model.ckpt-0，如果不设置，增量训练使用model_dir下最近的检查点
 - --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs[0].raw_feature.boundaries":[4,5,6,7]}
+- --ignore_restore_optimizer: 加载checkpoint参数时，忽略加载优化器的参数
 
 ### 环境变量
 
