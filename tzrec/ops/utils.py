@@ -17,9 +17,18 @@ import torch
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        # disable check (x.size(0) < 10**9), the check will result in following error.
+        #  File "/opt/conda/lib/python3.11/site-packages/torch/_export/non_strict_utils.py", line 521, in produce_guards_and_solve_constraints  # NOQA
+        #      msg = dim_constraints.prettify_results(
+        #            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #    File "/opt/conda/lib/python3.11/site-packages/torch/fx/experimental/symbolic_shapes.py", line 3442, in prettify_results            # NOQA
+        #      assert op == "==", t
+        #             ^^^^^^^^^^
+        #  AssertionError: batch < 500000000/3
         # Tell Dynamo this data-dependent value is in the range (0, 10**9)
-        torch._check(x.size(0) > 0)
-        torch._check(x.size(0) < 10**9)
+        # torch._check(x.size(0) > 0)
+        # torch._check(x.size(0) < 10**9)
+        torch._check_is_size(x.size(0))
     if x.stride(-1) == 1:
         return x
     return x.contiguous()

@@ -21,9 +21,14 @@ from tzrec.utils.logging_util import logger
 
 
 class AOTICombinedModel(nn.Module):
-    """AOT Inductor model combined with sparse jit part."""
+    """AOT Inductor model combined with sparse jit part.
 
-    def __init__(self, sparse_model, dense_model):
+    Args:
+        sparse_model (nn.Module): sparse part scripted model.
+        dense_model (nn.Module): dense part AOTInductor model.
+    """
+
+    def __init__(self, sparse_model: nn.Module, dense_model: nn.Module) -> None:
         super().__init__()
         self.sparse_model = sparse_model
         self.dense_model = dense_model
@@ -34,8 +39,16 @@ class AOTICombinedModel(nn.Module):
         return self.dense_model(sparse_out)
 
 
-def load_model_aot(model_path: str, device: torch.device):
-    """Load AOTInductor model."""
+def load_model_aot(model_path: str, device: torch.device) -> AOTICombinedModel:
+    """Load AOTInductor model.
+
+    Args:
+        model_path (str): model directory.
+        device (torch.device): model placement.
+
+    Return:
+        AOTInductor combined model.
+    """
     sparse_model: torch.jit.ScriptModule = torch.jit.load(
         os.path.join(model_path, "scripted_sparse_model.pt"), map_location=device
     )
