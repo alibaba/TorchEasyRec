@@ -10,8 +10,6 @@
 # limitations under the License.
 
 import gc
-import os
-import shutil
 import unittest
 
 import torch
@@ -29,9 +27,6 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 class PositionEmbeddingsTest(unittest.TestCase):
     def teardown_example(self, example):
-        cache_dir = os.path.join(os.path.expanduser("~"), ".triton", "cache")
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
