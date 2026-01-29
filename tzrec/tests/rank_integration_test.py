@@ -915,7 +915,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
         )
 
     @unittest.skipIf(
