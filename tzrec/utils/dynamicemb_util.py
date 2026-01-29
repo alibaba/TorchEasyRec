@@ -36,7 +36,6 @@ from torchrec.distributed.types import (
     CacheParams,
     EmbeddingModuleShardingPlan,
     EnumerableShardingSpec,
-    KeyValueParams,
     ModuleSharder,
     ParameterSharding,
     PipelineType,
@@ -276,6 +275,7 @@ if has_dynamicemb:
         cache_ratio: Optional[float] = None,
         is_hbm: bool = True,
         only_values: bool = False,
+        bucket_capacity: int = 128,
     ) -> int:
         """Calculate dynamic embedding table storage.
 
@@ -283,13 +283,11 @@ if has_dynamicemb:
         num_buckets = max_capacity/bucket_capacity
         hbm_budget = min(global_hbm_for_values//world_size, total_value_memory) +
             max_capacity x (key<8byte> + score<8byte> + digest<1byte>) +
-            num_buckets x (bucket_size<4byte> + 4 x pointer<8byte>)
+            num_buckets x (bucket_size<4byte>)
         ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
         """
         if cache_ratio is None:
             cache_ratio = 1.0
-        # TODO: get bucket_capacity from DynamicEmbTableOptions
-        bucket_capacity = 128
         return math.ceil(
             _next_power_of_2(size[0])
             * (
@@ -298,7 +296,7 @@ if has_dynamicemb:
                     16,
                 )
                 * (cache_ratio if is_hbm else 1 - cache_ratio)
-                + (8 + 8 + 1 + (4 + 4) / bucket_capacity) * (is_hbm and not only_values)
+                + (8 + 8 + 1 + 4 / bucket_capacity) * (is_hbm and not only_values)
             )
         )
 
@@ -358,6 +356,7 @@ if has_dynamicemb:
                         sharding_option.cache_load_factor,
                         is_hbm=True,
                         only_values=True,
+                        bucket_capacity=dynamicemb_options.bucket_capacity,
                     )
                 )
 
@@ -449,6 +448,7 @@ if has_dynamicemb:
         optimizer_class: Optional[Type[torch.optim.Optimizer]] = None,
         cache_ratio: float = 1.0,
         is_inference: bool = False,
+        bucket_capacity: int = 128,
     ) -> Tuple[List[int], List[int]]:
         """Calculate storage for dynamicemb."""
         optimizer_multipler = 0.0
@@ -465,6 +465,7 @@ if has_dynamicemb:
                 optimizer_multipler,
                 cache_ratio,
                 is_hbm=True,
+                bucket_capacity=bucket_capacity,
             )
             for size in shard_sizes
         ]
@@ -476,14 +477,13 @@ if has_dynamicemb:
                 optimizer_multipler,
                 cache_ratio,
                 is_hbm=False,
+                bucket_capacity=bucket_capacity,
             )
             for size in shard_sizes
         ]
         return hdm_value_sizes, ddr_value_sizes
 
-    _tzrec_calculate_shard_storages = shard_estimators.calculate_shard_storages
-
-    def _calculate_shard_storages(
+    def dynamicemb_calculate_shard_storages(
         sharder: ModuleSharder[nn.Module],
         sharding_type: str,
         tensor: torch.Tensor,
@@ -503,9 +503,7 @@ if has_dynamicemb:
         count_ephemeral_storage_cost: bool = False,
         is_inference: bool = False,
         multipass_prefetch_max_pass: Optional[int] = None,
-        key_value_params: Optional[KeyValueParams] = None,
-        kv_cache_load_factor: float = constants.KV_CACHING_RATIO,
-        use_virtual_table: bool = False,
+        dynamicemb_options: Optional[dynamicemb.DynamicEmbTableOptions] = None,
     ) -> List[Storage]:
         """Calculates estimated storage sizes.
 
@@ -536,109 +534,90 @@ if has_dynamicemb:
             count_ephemeral_storage_cost (bool): count ephemeral storage cost
             is_inference: bool, whether the model is for inference.
             multipass_prefetch_max_pass (int): multipass prefetch max_pass
-            key_value_params (Optional[KeyValueParams]): fused params for SSD/DRAM KV
-                cache.
-            kv_cache_load_factor (float): ratio of kv caching.
-            use_virtual_table (bool): use virtual table or not.
+            dynamicemb_options (DynamicEmbTableOptions): dynamice embedding options
 
         Returns:
             List[Storage]: storage object for each device in topology.
         """
-        if compute_kernel == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value:
-            # storage estimator for dynamicemb
-            assert compute_device == "cuda"
+        # storage estimator for dynamicemb
+        assert compute_kernel == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+        assert compute_device == "cuda"
 
-            input_sizes, output_sizes = shard_estimators._calculate_shard_io_sizes(
-                sharding_type=sharding_type,
-                batch_sizes=batch_sizes,
-                world_size=world_size,
-                local_world_size=local_world_size,
-                input_lengths=input_lengths,
-                emb_dim=tensor.shape[1],
+        input_sizes, output_sizes = shard_estimators._calculate_shard_io_sizes(
+            sharding_type=sharding_type,
+            batch_sizes=batch_sizes,
+            world_size=world_size,
+            local_world_size=local_world_size,
+            input_lengths=input_lengths,
+            emb_dim=tensor.shape[1],
+            shard_sizes=shard_sizes,
+            input_data_type_size=input_data_type_size,
+            output_data_type_size=output_data_type_size,
+            num_poolings=num_poolings,
+            is_pooled=is_pooled,
+        )
+
+        hbm_specific_sizes, ddr_specific_sizes = (
+            _calculate_dynamicemb_storage_specific_sizes(
+                tensor=tensor,
                 shard_sizes=shard_sizes,
-                input_data_type_size=input_data_type_size,
-                output_data_type_size=output_data_type_size,
-                num_poolings=num_poolings,
-                is_pooled=is_pooled,
+                cache_ratio=caching_ratio if caching_ratio else 1.0,
+                is_inference=is_inference,
+                bucket_capacity=dynamicemb_options.bucket_capacity,
             )
+        )
+        counter_hbm_specific_size = 0
+        if dynamicemb_options.admission_counter is not None:
+            counter = dynamicemb_options.admission_counter
+            if isinstance(counter, KVCounter):
+                counter_hbm_specific_size = (
+                    _calculate_dynamicemb_table_storage_specific_size(
+                        [counter.capacity, 0],
+                        element_size=0,  # counter does not contain embedding value
+                        bucket_capacity=counter.bucket_capacity,
+                    )
+                )
 
-            hbm_specific_sizes, ddr_specific_sizes = (
-                _calculate_dynamicemb_storage_specific_sizes(
-                    tensor=tensor,
-                    shard_sizes=shard_sizes,
-                    cache_ratio=caching_ratio if caching_ratio else 1.0,
+        hbm_sizes: List[int] = [
+            (
+                hbm_specific_size
+                + counter_hbm_specific_size
+                + shard_estimators.calculate_pipeline_io_cost(
+                    input_size=input_size,
+                    output_size=output_size,
+                    prefetch_size=0,
+                    pipeline_type=pipeline_type,
+                    multipass_prefetch_max_pass=multipass_prefetch_max_pass,
+                    count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                     is_inference=is_inference,
                 )
             )
-
-            hbm_sizes: List[int] = [
-                (
-                    hbm_specific_size
-                    + shard_estimators.calculate_pipeline_io_cost(
-                        input_size=input_size,
-                        output_size=output_size,
-                        prefetch_size=0,
-                        pipeline_type=pipeline_type,
-                        multipass_prefetch_max_pass=multipass_prefetch_max_pass,
-                        count_ephemeral_storage_cost=count_ephemeral_storage_cost,
-                        is_inference=is_inference,
-                    )
-                )
-                for input_size, output_size, hbm_specific_size in zip(
-                    input_sizes,
-                    output_sizes,
-                    hbm_specific_sizes,
-                )
-            ]
-            ddr_sizes: List[int] = [
-                (
-                    input_size + output_size + ddr_specific_size
-                    if compute_device == "cpu" and not is_inference
-                    else ddr_specific_size
-                )
-                for input_size, output_size, ddr_specific_size in zip(
-                    input_sizes,
-                    output_sizes,
-                    ddr_specific_sizes,
-                )
-            ]
-
-            return [
-                Storage(
-                    hbm=hbm_size,
-                    ddr=ddr_size,
-                )
-                for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
-            ]
-
-        else:
-            return _tzrec_calculate_shard_storages(
-                sharder=sharder,
-                sharding_type=sharding_type,
-                tensor=tensor,
-                compute_device=compute_device,
-                compute_kernel=compute_kernel,
-                shard_sizes=shard_sizes,
-                batch_sizes=batch_sizes,
-                world_size=world_size,
-                local_world_size=local_world_size,
-                input_lengths=input_lengths,
-                num_poolings=num_poolings,
-                caching_ratio=caching_ratio,
-                is_pooled=is_pooled,
-                input_data_type_size=input_data_type_size,
-                output_data_type_size=output_data_type_size,
-                pipeline_type=pipeline_type,
-                count_ephemeral_storage_cost=count_ephemeral_storage_cost,
-                is_inference=is_inference,
-                multipass_prefetch_max_pass=multipass_prefetch_max_pass,
-                key_value_params=key_value_params,
-                kv_cache_load_factor=kv_cache_load_factor,
-                use_virtual_table=use_virtual_table,
+            for input_size, output_size, hbm_specific_size in zip(
+                input_sizes,
+                output_sizes,
+                hbm_specific_sizes,
             )
+        ]
+        ddr_sizes: List[int] = [
+            (
+                input_size + output_size + ddr_specific_size
+                if compute_device == "cpu" and not is_inference
+                else ddr_specific_size
+            )
+            for input_size, output_size, ddr_specific_size in zip(
+                input_sizes,
+                output_sizes,
+                ddr_specific_sizes,
+            )
+        ]
 
-    # pyre-ignore [9]
-    shard_estimators.calculate_shard_storages = _calculate_shard_storages
+        return [
+            Storage(
+                hbm=hbm_size,
+                ddr=ddr_size,
+            )
+            for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
+        ]
 
     _dynamicemb_get_dynamicemb_options_per_table = (
         batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table

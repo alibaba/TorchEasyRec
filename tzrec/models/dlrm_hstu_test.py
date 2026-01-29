@@ -144,17 +144,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 )
             ),
             feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.RawFeature(
-                    feature_name="item_action_weight",
-                )
-            ),
-            feature_pb2.FeatureConfig(
                 sequence_raw_feature=feature_pb2.RawFeature(feature_name="watch_time")
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.RawFeature(
-                    feature_name="item_target_watchtime"
-                )
             ),
         ]
         features = create_features(feature_cfgs)
@@ -348,16 +338,18 @@ class DlrmHSTUTest(unittest.TestCase):
                 values=torch.tensor([[0], [1], [0], [1], [0]]),
                 lengths=torch.tensor([2, 3]),
             ),
-            "item_action_weight": JaggedTensor(
-                values=torch.tensor([[0], [1], [0], [0], [1], [0]]),
-                lengths=torch.tensor([2, 4]),
-            ),
             "watch_time": JaggedTensor(
                 values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
                 lengths=torch.tensor([2, 3]),
             ),
+        }
+        jagged_labels = {
+            "item_action_weight": JaggedTensor(
+                values=torch.tensor([0, 1, 0, 0, 1, 0]),
+                lengths=torch.tensor([2, 4]),
+            ),
             "item_target_watchtime": JaggedTensor(
-                values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5], [0.6]]),
+                values=torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
                 lengths=torch.tensor([2, 4]),
             ),
         }
@@ -365,6 +357,7 @@ class DlrmHSTUTest(unittest.TestCase):
             sequence_dense_features=sequence_dense_features,
             sparse_features={BASE_DATA_GROUP: sparse_feature},
             labels={},
+            jagged_labels=jagged_labels,
         ).to(device)
 
         if graph_type == TestGraphType.JIT_SCRIPT:
