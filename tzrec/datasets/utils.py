@@ -136,6 +136,8 @@ class Batch(Pipelineable):
     sequence_dense_features: Dict[str, JaggedTensor] = field(default_factory=dict)
     # key of labels is label name
     labels: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # key of jagged_labels is label name
+    jagged_labels: Dict[str, JaggedTensor] = field(default_factory=dict)
     # reserved inputs [for predict]
     reserves: RecordBatchTensor = field(default_factory=RecordBatchTensor)
     # size for user side input tile when do inference and INPUT_TILE=2 or 3
@@ -170,6 +172,10 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.labels.items()
             },
+            jagged_labels={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.jagged_labels.items()
+            },
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={
@@ -199,6 +205,9 @@ class Batch(Pipelineable):
             v.record_stream(stream)
         for v in self.labels.values():
             v.record_stream(stream)
+        for v in self.jagged_labels.values():
+            # pyre-ignore [6]
+            v.record_stream(stream)
         for v in self.sample_weights.values():
             v.record_stream(stream)
         for v in self.additional_infos.values():
@@ -226,6 +235,17 @@ class Batch(Pipelineable):
                 lengths=lengths.pin_memory() if lengths is not None else None,
                 offsets=offsets.pin_memory() if offsets is not None else None,
             )
+        jagged_labels = {}
+        for k, v in self.jagged_labels.items():
+            weights = v._weights
+            lengths = v._lengths
+            offsets = v._offsets
+            jagged_labels[k] = JaggedTensor(
+                values=v.values().pin_memory(),
+                weights=weights.pin_memory() if weights is not None else None,
+                lengths=lengths.pin_memory() if lengths is not None else None,
+                offsets=offsets.pin_memory() if offsets is not None else None,
+            )
         return Batch(
             dense_features=dense_features,
             sparse_features={
@@ -236,6 +256,7 @@ class Batch(Pipelineable):
             },
             sequence_dense_features=sequence_dense_features,
             labels={k: v.pin_memory() for k, v in self.labels.items()},
+            jagged_labels=jagged_labels,
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
@@ -281,6 +302,9 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.labels.items():
             tensor_dict[f"{k}"] = v
+        for k, v in self.jagged_labels.items():
+            tensor_dict[f"{k}.values"] = v.values()
+            tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.sample_weights.items():
             tensor_dict[f"{k}"] = v
         if self.tile_size > 0:

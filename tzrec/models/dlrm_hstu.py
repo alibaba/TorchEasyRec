@@ -201,10 +201,11 @@ class DlrmHSTU(RankModel):
     def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name
         is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
-        label = batch.sequence_dense_features[label_name]
-        label_values = label.values().squeeze(1)
+        label = batch.jagged_labels[label_name]
         if is_sparse_label:
-            label_values = label_values.to(torch.int64)
+            label_values = label.values().to(torch.int64)
+        else:
+            label_values = label.values().to(torch.float32)
         if task_cfg.HasField("task_bitmask"):
             label_values = (
                 torch.bitwise_and(label_values, task_cfg.task_bitmask) > 0
