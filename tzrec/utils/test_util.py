@@ -22,7 +22,7 @@ from torch import nn
 from torch.fx import GraphModule
 
 from tzrec.acc.aot_utils import export_model_aot, load_model_aot
-from tzrec.models.model import CudaExportWrapper, ScriptWrapper
+from tzrec.models.model import ScriptWrapper
 from tzrec.utils.export_util import split_model
 from tzrec.utils.fx_util import symbolic_trace
 
@@ -76,9 +76,9 @@ def create_test_model(
 ) -> Union[nn.Module, GraphModule, torch.jit.ScriptModule]:
     """Create model with graph type for tests."""
     if graph_type == TestGraphType.AOT_INDUCTOR:
-        model = CudaExportWrapper(model)
+        model = ScriptWrapper(model)
         assert data is not None
-        sparse, dense, meta_info = split_model(data, model, test_dir, is_aot=True)
+        sparse, dense, meta_info = split_model(data, model, test_dir)
         export_model_aot(sparse, dense, data, meta_info, test_dir)
         model = load_model_aot(test_dir, torch.device("cuda:0"))
         return model

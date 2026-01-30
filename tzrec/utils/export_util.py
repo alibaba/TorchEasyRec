@@ -201,10 +201,10 @@ def export_model_normal(
             export_model_trt(sparse, dense, data, save_dir)
         elif acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
-            result = model(data)
+            result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense, meta_info = split_model(data, model, save_dir, is_aot=True)
+            sparse, dense, meta_info = split_model(data, model, save_dir)
             export_model_aot(sparse, dense, data, meta_info, save_dir)
         else:
             result = model(data)
@@ -933,10 +933,7 @@ def export_rtp_model(
 
 
 def split_model(
-    data: Dict[str, torch.Tensor],
-    model: BaseModule,
-    save_dir: str,
-    is_aot: bool = False,
+    data: Dict[str, torch.Tensor], model: BaseModule, save_dir: str
 ) -> Tuple[nn.Module, nn.Module, Dict[str, Any]]:
     """Split an EasyRec model into sparse part and dense part."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1011,10 +1008,7 @@ def split_model(
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
-    if is_aot:
-        _, sparse_attrs = sparse_gm(data)
-    else:
-        _, sparse_attrs = sparse_gm(data, device=device)
+    _, sparse_attrs = sparse_gm(data, device=device)
 
     # Extract Dense Model
     logger.info("exporting dense model...")

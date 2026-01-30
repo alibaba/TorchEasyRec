@@ -16,30 +16,12 @@ from typing import Any, Dict
 import torch
 from torch import nn
 
+from tzrec.models.model import CombinedModelWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
 
-class AOTICombinedModel(nn.Module):
-    """AOT Inductor model combined with sparse jit part.
-
-    Args:
-        sparse_model (nn.Module): sparse part scripted model.
-        dense_model (nn.Module): dense part AOTInductor model.
-    """
-
-    def __init__(self, sparse_model: nn.Module, dense_model: nn.Module) -> None:
-        super().__init__()
-        self.sparse_model = sparse_model
-        self.dense_model = dense_model
-
-    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Forward the model."""
-        sparse_out = self.sparse_model(data)
-        return self.dense_model(sparse_out)
-
-
-def load_model_aot(model_path: str, device: torch.device) -> AOTICombinedModel:
+def load_model_aot(model_path: str, device: torch.device) -> CombinedModelWrapper:
     """Load AOTInductor model.
 
     Args:
@@ -58,7 +40,7 @@ def load_model_aot(model_path: str, device: torch.device) -> AOTICombinedModel:
             device_index=device.index,
         )
     )
-    return AOTICombinedModel(sparse_model, dense_model)
+    return CombinedModelWrapper(sparse_model, dense_model)
 
 
 def export_model_aot(
@@ -77,7 +59,7 @@ def export_model_aot(
         meta_info (Dict[str, Any]): split meta info
         save_dir (str): model save dir
     """
-    sparse_output, _ = sparse_model(data)
+    sparse_output, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
 
     with open(os.path.join(save_dir, "gm_sparse.code"), "w") as f:
