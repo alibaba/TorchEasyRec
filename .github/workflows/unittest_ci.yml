@@ -21,4 +21,4 @@ jobs:
         id: run_unittest_ci
         run: |
           cd run_${{ github.run_id }}
-          CUDA_HOME=/usr/local/cuda-12 CI_HYPOTHESIS=true bash scripts/ci/ci_test.sh
+          TORCHINDUCTOR_CACHE_DIR=$HOME/.torchinductor CUDA_HOME=/usr/local/cuda-12 CI_HYPOTHESIS=true bash scripts/ci/ci_test.sh

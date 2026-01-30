@@ -889,7 +889,9 @@ class RankIntegrationTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
@@ -913,7 +915,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
         )
 
     @unittest.skipIf(

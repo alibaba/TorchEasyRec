@@ -11,14 +11,14 @@
 
 import inspect
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from tzrec.acc.utils import get_max_export_batch_size, is_debug_trt
-from tzrec.models.model import ScriptWrapper
+from tzrec.models.model import CombinedModelWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
@@ -88,64 +88,6 @@ def trt_convert(
 
     logger.info("trt convert end")
     return optimized_model
-
-
-class ScriptWrapperList(ScriptWrapper):
-    """Model inference wrapper for jit.script.
-
-    ScriptWrapperList for trace the ScriptWrapperTRT(emb_trace_gpu, dense_layer_trt)
-    and return a list of Tensor instead of a dict of Tensor
-    """
-
-    def __init__(self, module: nn.Module) -> None:
-        super().__init__(module)
-
-    # pyre-ignore [15]
-    def forward(
-        self,
-        data: Dict[str, torch.Tensor],
-        # pyre-ignore [9]
-        device: torch.device = "cpu",
-    ) -> List[torch.Tensor]:
-        """Predict the model.
-
-        Args:
-            data (dict): a dict of input data for Batch.
-            device (torch.device): inference device.
-
-        Return:
-            predictions (dict): a dict of predicted result.
-        """
-        batch = self.get_batch(data, device)
-        return self.model.predict(batch)
-
-
-class ScriptWrapperTRT(nn.Module):
-    """Model inference wrapper for jit.script."""
-
-    def __init__(self, embedding_group: nn.Module, dense: nn.Module) -> None:
-        super().__init__()
-        self.embedding_group = embedding_group
-        self.dense = dense
-
-    def forward(
-        self,
-        data: Dict[str, torch.Tensor],
-        # pyre-ignore [9]
-        device: torch.device = "cuda:0",
-    ) -> Dict[str, torch.Tensor]:
-        """Predict the model.
-
-        Args:
-            data (dict): a dict of input data for Batch.
-            device (torch.device): inference device.
-
-        Return:
-            predictions (dict): a dict of predicted result.
-        """
-        emb_ebc, _ = self.embedding_group(data, device)
-        outputs = self.dense(emb_ebc)
-        return outputs
 
 
 def get_trt_max_seq_len() -> int:
@@ -225,9 +167,9 @@ def export_model_trt(
 
     dense_layer_trt_scripted = torch.jit.script(dense_layer_trt_traced)
     # save combined_model
-    combined_model = ScriptWrapperTRT(
-        embedding_group=sparse_model_scripted,
-        dense=dense_layer_trt_scripted,
+    combined_model = CombinedModelWrapper(
+        sparse_model_scripted,
+        dense_layer_trt_scripted,
     )
     result = combined_model(data, "cuda:0")
     logger.info("combined model result: %s", result)

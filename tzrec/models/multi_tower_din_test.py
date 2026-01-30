@@ -55,6 +55,11 @@ class MultiTowerDINTest(unittest.TestCase):
         if graph_type == TestGraphType.AOT_INDUCTOR and gpu_unavailable[0]:
             return
 
+        device = (
+            torch.device("cuda")
+            if graph_type == TestGraphType.AOT_INDUCTOR
+            else torch.device("cpu")
+        )
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -148,7 +153,8 @@ class MultiTowerDINTest(unittest.TestCase):
         multi_tower_din = MultiTowerDIN(
             model_config=model_config, features=features, labels=["label"]
         )
-        init_parameters(multi_tower_din, device=torch.device("cpu"))
+        init_parameters(multi_tower_din, device=device)
+        multi_tower_din.to(device)
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["cat_a", "cat_b", "click_seq__cat_a", "click_seq__cat_b"],
@@ -169,7 +175,7 @@ class MultiTowerDINTest(unittest.TestCase):
             sparse_features={BASE_DATA_GROUP: sparse_feature},
             sequence_dense_features=sequence_dense_feature,
             labels={},
-        )
+        ).to(device)
         if graph_type == TestGraphType.JIT_SCRIPT:
             multi_tower_din = create_test_model(multi_tower_din, graph_type)
             predictions = multi_tower_din(batch.to_dict())
