@@ -69,6 +69,16 @@ def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
     return batch_size
 
 
+@torch.fx.wrap
+def _fx_flip_tensor_dict(
+    grouped_features: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    new_grouped_features = {}
+    for k, v in grouped_features.items():
+        new_grouped_features[k] = torch.flip(v, [0])
+    return new_grouped_features
+
+
 class DlrmHSTU(RankModel):
     """DLRM HSTU model.
 
@@ -168,6 +178,11 @@ class DlrmHSTU(RankModel):
         with record_function("## preprocess ##"):
             grouped_features = self.build_input(batch)
 
+        if not self._model_config.sequence_timestamp_is_ascending:
+            # if timestamp of sequence is descending,
+            # we should reverse all features
+            grouped_features = _fx_flip_tensor_dict(grouped_features)
+
         with record_function("## item_forward ##"):
             candidates_item_embeddings = self._item_embedding_mlp(
                 grouped_features["candidate.sequence"]
@@ -179,6 +194,11 @@ class DlrmHSTU(RankModel):
             mt_preds = self._multitask_module(
                 candidates_user_embeddings, candidates_item_embeddings
             )
+
+        if not self._model_config.sequence_timestamp_is_ascending:
+            # if timestamp of sequence is descending,
+            # we should reverse predictions back to input order
+            mt_preds = _fx_flip_tensor_dict(mt_preds)
 
         predictions = {}
         for task_cfg in self._task_configs:

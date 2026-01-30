@@ -61,6 +61,7 @@ class DlrmHSTUTest(unittest.TestCase):
         contextual_group_type=st.sampled_from(
             [model_pb2.FeatureGroupType.DEEP, model_pb2.FeatureGroupType.SEQUENCE]
         ),
+        sequence_timestamp_is_ascending=st.sampled_from([True, False]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -74,6 +75,7 @@ class DlrmHSTUTest(unittest.TestCase):
         has_watchtime,
         enable_global_average_loss,
         contextual_group_type,
+        sequence_timestamp_is_ascending,
     ) -> None:
         # JIT_SCRIPT only support PYTORCH kernel now.
         assume(
@@ -301,6 +303,7 @@ class DlrmHSTUTest(unittest.TestCase):
                 ),
                 max_seq_len=100,
                 enable_global_average_loss=enable_global_average_loss,
+                sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
             ),
         )
         dlrm_hstu = DlrmHSTU(
