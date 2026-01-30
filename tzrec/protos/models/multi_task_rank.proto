@@ -69,4 +69,6 @@ message DlrmHSTU {
     // enables loss averaging computation globally across all ranks (total rank)
     // instead of locally (local rank).
     optional bool enable_global_average_loss = 5 [default = true];
+    // timestamp of sequence is ascending or descending
+    optional bool sequence_timestamp_is_ascending = 6 [default = true];
 }
