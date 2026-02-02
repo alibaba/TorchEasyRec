@@ -32,6 +32,7 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
+from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
@@ -59,7 +60,6 @@ from tzrec.models.match_model import (
 )
 from tzrec.models.model import (
     BaseModel,
-    CudaExportWrapper,
     PredictWrapper,
     ScriptWrapper,
     TrainWrapper,
@@ -877,7 +877,7 @@ def export(
         list(data_config.label_fields),
         sampler_type=None,
     )
-    InferWrapper = CudaExportWrapper if acc_utils.is_aot() else ScriptWrapper
+    InferWrapper = ScriptWrapper
     model = InferWrapper(model)
 
     if not checkpoint_path:
@@ -1084,11 +1084,8 @@ def predict(
     )
 
     if is_aot:
-        model: torch.export.pt2_archive._package.AOTICompiledModel = (
-            torch._inductor.aoti_load_package(
-                os.path.join(scripted_model_path, "aoti_model.pt2"),
-                device_index=device.index,
-            )
+        model: aot_utils.CombinedModelWrapper = aot_utils.load_model_aot(
+            scripted_model_path, device=device
         )
     else:
         # disable jit compile， as it compile too slow now.
@@ -1130,11 +1127,7 @@ def predict(
                 # when predicting with a model exported using INPUT_TILE,
                 #  we set the batch size tensor to 1 to disable tiling.
                 parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if is_trt or is_aot:
-                parsed_inputs = OrderedDict(sorted(parsed_inputs.items()))
-                predictions = model(parsed_inputs)
-            else:
-                predictions = model(parsed_inputs, device)
+            predictions = model(parsed_inputs, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves

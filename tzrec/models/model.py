@@ -389,22 +389,34 @@ class ScriptWrapper(BaseModule):
         return self.model.predict(batch)
 
 
-class CudaExportWrapper(ScriptWrapper):
-    """Model inference wrapper for cuda export(aot/trt)."""
+class CombinedModelWrapper(nn.Module):
+    """Model inference wrapper for model combined with sparse and dense part.
 
-    # pyre-ignore [14]
+    Args:
+        sparse_model (nn.Module): sparse part scripted model.
+        dense_model (nn.Module): dense part AOTInductor model.
+    """
+
+    def __init__(self, sparse_model: nn.Module, dense_model: nn.Module) -> None:
+        super().__init__()
+        self.sparse_model = sparse_model
+        self.dense_model = dense_model
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
     ) -> Dict[str, torch.Tensor]:
         """Predict the model.
 
         Args:
             data (dict): a dict of input data for Batch.
+            device (torch.device): inference device.
 
         Return:
             predictions (dict): a dict of predicted result.
         """
-        batch = self._data_parser.to_batch(data)
-        batch = batch.to(torch.device("cuda"), non_blocking=True)
-        return self.model.predict(batch)
+        sparse_out, _ = self.sparse_model(data, device)
+        outputs = self.dense_model(sparse_out)
+        return outputs

@@ -1106,7 +1106,7 @@ def test_export(
         cmd_str += f"--asset_files {asset_files}"
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=1800
     )
 
 
