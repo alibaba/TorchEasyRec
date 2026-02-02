@@ -330,7 +330,7 @@ def _add_timestamp_position_embeddings_kernel(
     SeqEmb += seq_start.to(tl.int64) * stride_sn
     mask_n = offs_n < seq_len
     # position encoding
-    seq_len = tl.load(Lengths + off_b)
+    # seq_len = tl.load(Lengths + off_b)
     if HAS_MULTIPLE_TARGETS:
         num_targets = tl.load(NumTargets + off_b)
         if INTERLEAVE_TARGETS:
