@@ -69,6 +69,8 @@ message ModelConfig {
         TDM tdm = 400;
 
         RocketLaunching rocket_launching = 500;
+
+        yxTestDBMTL yxtestdbmtl = 1001;
     }
 
     optional uint32 num_class = 2 [default = 1];
