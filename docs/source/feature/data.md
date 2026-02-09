@@ -85,6 +85,33 @@ sample_weight_fields: 'col_name'
     - 暂不支持没有header的csv文件
     - csv格式数据读性能有瓶颈
 
+- KafkaDataset: 输入数据为Kafka消息流（每条消息为序列化的Arrow Batch）
+
+  - input_path: 按如下格式设置
+
+    - `kafka://broker:9092/topic?group.id=consumer_group`
+
+  - 需设置`input_fields`来指定数据的schema，因为Kafka消息中的Arrow Batch不包含schema信息
+
+    ```
+    input_fields: {
+        input_name: "user_id"
+        input_type: INT64
+    }
+    input_fields: {
+        input_name: "item_id"
+        input_type: INT64
+    }
+    input_fields: {
+        input_name: "label"
+        input_type: FLOAT
+    }
+    ```
+
+  - 注意:
+
+    - 每条Kafka消息应为一个zstd/lz4压缩的schema-less Arrow RecordBatch
+
 ### fg_mode
 
 - FG(Feature Generator) 的运行模式，支持FG_DAG, FG_NONE, FG_BUCKETIZE, FG_NORMAL

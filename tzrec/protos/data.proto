@@ -8,6 +8,7 @@ enum DatasetType {
     ParquetDataset = 2;
     CsvDataset = 3;
     OdpsDatasetV1 = 4;
+    KafkaDataset = 5;
 }
 
 enum FieldType {

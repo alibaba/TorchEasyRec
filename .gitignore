@@ -29,6 +29,8 @@ MANIFEST
 
 # Ide
 .idea/
+.vscode/
+.qoder/plans
 
 # Proto
 protoc*
@@ -39,6 +41,12 @@ protoc*
 docs/source/intro.md
 docs/source/proto.html
 
-.vscode/
+# Download Data
+data/test/kuairand-1k*
 
+# Other temp files
+.hypothesis/
+.config/
 tmp/
+docker/requirements*
+experiments/
