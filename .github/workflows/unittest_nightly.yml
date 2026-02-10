@@ -29,5 +29,4 @@ jobs:
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
           cd run_${{ github.run_id }}
-          PYTHONPATH=. python tzrec/datasets/kafka_dataset_test.py
-          # CUDA_HOME=/usr/local/cuda-12 bash scripts/ci/ci_test.sh
+          CUDA_HOME=/usr/local/cuda-12 bash scripts/ci/ci_test.sh
