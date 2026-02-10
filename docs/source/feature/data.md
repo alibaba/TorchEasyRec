@@ -2,8 +2,6 @@
 
 TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件。
 
-## DataConfig
-
 **一个最简单的data config的配置**
 
 这个配置里面，读取MaxCompute的表作为输入数据（OdpsDataset），并且输入数据已经编码好，每个worker上以8192的batch_size，并行度为8来读取数据
@@ -18,85 +16,99 @@ data_config {
 }
 ```
 
-如果希望在训练过程带上样本权重，支持在data_config中增加配置项
-sample_weight_fields: 'col_name'
+目前支持以下几种dataset_type:
 
-### dataset_type
+## OdpsDataset
 
-目前支持一下几种[input_type](../proto.html#tzrec.protos.DatasetType):
+输入数据为MaxCompute表
 
-- OdpsDataset: 输入数据为MaxCompute表
+- **前置条件**:
 
-  - **前置条件**:
+  - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
+  - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
 
-    - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
-    - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
+- input_path: 按如下格式设置
 
-  - input_path: 按如下格式设置
+  - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
+  - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
 
-    - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
-    - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
+- 运行训练/评估/导出/预测等命令时
 
-  - 运行训练/评估/导出/预测等命令时
+  - **本地环境**：
+    - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
+    ```bash
+    cat << EOF >> odps_conf
+    project_name=${PROJECT_NAME}
+    access_id=${ACCESS_ID}
+    access_key=${ACCESS_KEY}
+    end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
+    EOF
 
-    - **本地环境**：
-      - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
-      ```bash
-      cat << EOF >> odps_conf
-      project_name=${PROJECT_NAME}
-      access_id=${ACCESS_ID}
-      access_key=${ACCESS_KEY}
-      end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
-      EOF
+    ODPS_CONFIG_FILE_PATH=odps_conf \
+    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path ${PIPELINE_CONFIG}
+    ```
+  - **PAI-DLC/PAI-DSW环境**：
+    - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
+    ```bash
+    ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
+    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path ${PIPELINE_CONFIG}
+    ```
 
-      ODPS_CONFIG_FILE_PATH=odps_conf \
-      torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-      --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-      -m tzrec.train_eval \
-      --pipeline_config_path ${PIPELINE_CONFIG}
-      ```
-    - **PAI-DLC/PAI-DSW环境**：
-      - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
-      ```bash
-      ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
-      torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-      --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-      -m tzrec.train_eval \
-      --pipeline_config_path ${PIPELINE_CONFIG}
-      ```
+- 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
 
-  - 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
+- 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
 
-  - 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
+## ParquetDataset
 
-- ParquetDataset: 输入数据为parquet格式
+输入数据为parquet格式
 
-  - input_path: 按如下格式设置
-    - `${PATH_TO_DATA_DIR}/*.parquet`
-  - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
+- input_path: 按如下格式设置
+
+  - `${PATH_TO_DATA_DIR}/*.parquet`
+
+- 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
 - CsvDataset: 输入数据为csv格式
 
   - input_path: 按如下格式设置
+
     - `${PATH_TO_DATA_DIR}/*.csv`
+
   - 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
+
   - 需设置 `data_config.with_header`来指定是否有header行，默认为false
+
   - 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
+
   - 注意:
+
     - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
     - csv格式数据读性能有瓶颈
 
-- KafkaDataset: 输入数据为Kafka消息流（每条消息为schema-less序列化的Arrow Batch）
+## KafkaDataset
 
-  - input_path: 按如下格式设置
-    - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
-    - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
-  - 需设置`data_config.input_fields`来指定数据的schema，Kafka消息中的Arrow Batch不包含schema信息，详见下文input_fields参数说明
-  - 注意:
-    - Kafka分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
-  - KafkaDataset也支持[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)
-    - input_path: 按如下格式设置
-      - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
+输入数据为Kafka消息流, 每条消息为schema-less序列化的Arrow Batch
+
+- input_path: 按如下格式设置
+
+  - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
+  - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
+  - KafkaDataset也支持[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)， input_path按如下格式设置
+    - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
+
+- 需设置`data_config.input_fields`来指定数据的schema，Kafka消息中的Arrow Batch不包含schema信息，详见下文input_fields参数说明
+
+- 注意:
+
+  - Kafka分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+
+## data_config配置
 
 ### fg_mode
 
@@ -247,6 +259,10 @@ sample_weight_fields: 'col_name'
     label_fields: "buy"
   ```
 
+### sample_weight_fields
+
+- 训练样本的样本权重列名
+
 ### drop_remainder
 
 - 是否丢弃掉最后一个不足batch_size的batch数据，默认为false
@@ -289,7 +305,9 @@ input_fields: {
 
 - 当使用CsvDataset，如果出现以下情况，需要按如下方式指定`input_fields`，其余Dataset可以自动推理字段类型
   - 情况一：csv文件没有header行时 => 需至少设置`input_name`
-  - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32|INT64|STRING|FLOAT|DOUBLE
+  - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING
+- 当使用KafkaDataset：
+  - `input_type` 支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING | ARRAY_INT32 | ARRAY_INT64 | ARRAY_FLOAT | ARRAY_DOUBLE | ARRAY_STRING | ARRAY_ARRAY_INT32 | ARRAY_ARRAY_INT64 | ARRAY_ARRAY_FLOAT | ARRAY_ARRAY_DOUBLE | ARRAY_ARRAY_STRING | MAP_STRING_INT32 | MAP_STRING_INT64 | MAP_STRING_FLOAT | MAP_STRING_DOUBLE | MAP_STRING_STRING | MAP_INT64_INT32 | MAP_INT64_INT64 | MAP_INT64_FLOAT | MAP_INT64_DOUBLE | MAP_INT64_STRING | MAP_INT32_INT32 | MAP_INT32_INT64 | MAP_INT32_FLOAT | MAP_INT32_DOUBLE | MAP_INT32_STRING
 
 ### 更多配置
 
