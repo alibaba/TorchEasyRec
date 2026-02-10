@@ -79,38 +79,24 @@ sample_weight_fields: 'col_name'
 
   - input_path: 按如下格式设置
     - `${PATH_TO_DATA_DIR}/*.csv`
-  - 需设置`delimiter`来指名列分隔符，默认为`,`
+  - 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
+  - 需设置 `data_config.with_header`来指定是否有header行，默认为false
+  - 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
   - 注意:
     - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
-    - 暂不支持没有header的csv文件
     - csv格式数据读性能有瓶颈
 
-- KafkaDataset: 输入数据为Kafka消息流（每条消息为序列化的Arrow Batch）
+- KafkaDataset: 输入数据为Kafka消息流（每条消息为schema-less序列化的Arrow Batch）
 
   - input_path: 按如下格式设置
-
-    - `kafka://broker:9092/topic?group.id=consumer_group`
-
-  - 需设置`input_fields`来指定数据的schema，因为Kafka消息中的Arrow Batch不包含schema信息
-
-    ```
-    input_fields: {
-        input_name: "user_id"
-        input_type: INT64
-    }
-    input_fields: {
-        input_name: "item_id"
-        input_type: INT64
-    }
-    input_fields: {
-        input_name: "label"
-        input_type: FLOAT
-    }
-    ```
-
+    - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
+    - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
+  - 需设置`data_config.input_fields`来指定数据的schema，Kafka消息中的Arrow Batch不包含schema信息，详见下文input_fields参数说明
   - 注意:
-
-    - 每条Kafka消息应为一个zstd/lz4压缩的schema-less Arrow RecordBatch
+    - Kafka分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - KafkaDataset也支持[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)
+    - input_path: 按如下格式设置
+      - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
 
 ### fg_mode
 
@@ -302,7 +288,7 @@ input_fields: {
 ```
 
 - 当使用CsvDataset，如果出现以下情况，需要按如下方式指定`input_fields`，其余Dataset可以自动推理字段类型
-  - 情况一：csv文件没有header行时 => 只需设置`input_name`
+  - 情况一：csv文件没有header行时 => 需至少设置`input_name`
   - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32|INT64|STRING|FLOAT|DOUBLE
 
 ### 更多配置
