@@ -27,7 +27,7 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
     """Parse kafka URI into configuration dict.
 
     Args:
-        uri: kafka://broker:9092/topic?group.id=xxx&auto_offset=earliest
+        uri: kafka://broker:9092/topic?group.id=xxx&auto.offset.reset=earliest
 
     Returns:
         Dict containing broker, topic, and consumer config
@@ -45,8 +45,7 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
         raise ValueError("Kafka topic not specified in URI")
 
     params = dict(parse_qsl(parsed.query))
-
-    if not "group.id" not in params:
+    if "group.id" not in params:
         raise ValueError("Consumer group not specified in URI (use ?group.id=xxx)")
 
     if "debug" not in params:
@@ -176,7 +175,7 @@ class KafkaReader(BaseReader):
                     record_batchs.append(record_batch)
 
                 # estimate batch_size per message
-                if batch_size_per_msg:
+                if batch_size_per_msg is None:
                     batch_size_per_msg = current_batch_size / len(record_batch)
                 else:
                     batch_size_per_msg = (
@@ -184,12 +183,14 @@ class KafkaReader(BaseReader):
                         + 0.1 * current_batch_size / len(record_batch)
                     )
 
-                record_batch = pa.record_batch(
-                    pa.Table.from_batches(record_batchs).drop_columns(
-                        self._drop_columns
-                    )
+                # combine into one record batch
+                t = (
+                    pa.Table.from_batches(record_batchs)
+                    .drop_columns(self._drop_columns)
+                    .combine_chunks()
                 )
-                yield record_batch
+                for batch in t.to_batches():
+                    yield batch
 
         finally:
             consumer.close()

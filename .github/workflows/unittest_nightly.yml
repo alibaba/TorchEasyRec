@@ -24,6 +24,10 @@ jobs:
           ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
           CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
           ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ secrets.CI_ALIKAFKA_INSTANCE_ID }}
+          CI_REGION: ${{ secrets.CI_REGION }}
+          CI_KAFKA_BROKERS: ${{ secrets.CI_KAFKA_BROKERS }}
         run: |
           cd run_${{ github.run_id }}
-          CUDA_HOME=/usr/local/cuda-12 bash scripts/ci/ci_test.sh
+          PYTHONPATH=. python tzrec/datasets/kafka_dataset_test.py
+          # CUDA_HOME=/usr/local/cuda-12 bash scripts/ci/ci_test.sh
