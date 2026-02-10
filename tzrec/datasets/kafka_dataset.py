@@ -27,10 +27,12 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
     """Parse kafka URI into configuration dict.
 
     Args:
-        uri: kafka://broker:9092/topic?group.id=xxx&auto.offset.reset=earliest
+        uri: kafka URI.
+            e.g. kafka://broker:9092/topic?group.id=xxx&auto.offset.reset=earliest
 
     Returns:
-        Dict containing broker, topic, and consumer config
+        topic: kafka topic name
+        params: consumer config params
     """
     parsed = urlparse(uri)
     if parsed.scheme != "kafka":
@@ -61,7 +63,7 @@ class KafkaDataset(BaseDataset):
     Args:
         data_config (DataConfig): an instance of DataConfig.
         features (list): list of features.
-        input_path (str): kafka URI, e.g. kafka://broker:9092/topic?group=xxx
+        input_path (str): kafka URI, e.g. kafka://broker:9092/topic?group.id=xxx
     """
 
     def __init__(
@@ -93,7 +95,7 @@ class KafkaReader(BaseReader):
     """Kafka reader class.
 
     Args:
-        input_path (str): kafka URI, e.g. kafka://broker:9092/topic?group=xxx
+        input_path (str): kafka URI, e.g. kafka://broker:9092/topic?group.id=xxx
         batch_size (int): batch size.
         selected_cols (list): selection column names.
         drop_remainder (bool): drop last batch.
