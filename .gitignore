@@ -30,7 +30,8 @@ MANIFEST
 # Ide
 .idea/
 .vscode/
-.qoder/plans
+.qoder/
+.claude/
 
 # Proto
 protoc*
