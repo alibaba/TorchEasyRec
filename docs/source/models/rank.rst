@@ -15,3 +15,4 @@
    dcn_v2
    xdeepfm
    wukong
+   pepnet

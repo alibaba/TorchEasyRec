@@ -70,3 +70,25 @@ message DlrmHSTU {
     // instead of locally (local rank).
     optional bool enable_global_average_loss = 5 [default = true];
 }
+
+message PEPNet {
+    // all feature group name
+    required string main_group_name = 1;
+    // domain feature group name
+    optional string domain_group_name = 2;
+    // epnet hidden units
+    optional uint32 epnet_hidden_unit = 3;
+    // activation function for epnet
+    optional float  epnet_gamma = 4 [default = 2.0];
+    // user,item,author feature group name
+    optional string uia_group_name = 5;
+    // ppnet hidden units
+    repeated uint32 ppnet_hidden_units = 6;
+    // activation function for ppnet
+    optional string ppnet_activation = 7 [default = 'nn.ReLU'];
+    // ratio of dropout
+    repeated float ppnet_dropout_ratio = 8;
+    optional float  ppnet_gamma = 9 [default = 2.0];
+    // task tower
+    repeated TaskTower task_towers = 10;
+}
