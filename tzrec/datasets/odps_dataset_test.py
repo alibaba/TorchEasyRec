@@ -14,9 +14,11 @@ import multiprocessing as mp
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow as pa
+from alibabacloud_credentials.provider import EcsRamRoleCredentialsProvider
 from odps import ODPS
 from parameterized import parameterized
 from torch import distributed as dist
@@ -27,6 +29,15 @@ from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
 from tzrec.utils.misc_util import get_free_port, random_name
+
+_orig_ecs_ram_init = EcsRamRoleCredentialsProvider.__init__
+
+
+def _patched_ecs_ram_init(self, *args, **kwargs):
+    # apscheduler for ecs ram will exit timeout when use sampler,
+    # we set async_update_enabled=False when use sampler in tests.
+    kwargs.setdefault("async_update_enabled", False)
+    return _orig_ecs_ram_init(self, *args, **kwargs)
 
 
 class OdpsDatasetTest(unittest.TestCase):
@@ -295,7 +306,10 @@ class OdpsDatasetTest(unittest.TestCase):
         "odps config not found",
     )
     def test_odps_dataset_with_sampler(self, id_type="bigint"):
-        self._test_odps_dataset_with_sampler(id_type=id_type)
+        with patch.object(
+            EcsRamRoleCredentialsProvider, "__init__", _patched_ecs_ram_init
+        ):
+            self._test_odps_dataset_with_sampler(id_type=id_type)
 
     @unittest.skipIf(
         "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
@@ -306,7 +320,10 @@ class OdpsDatasetTest(unittest.TestCase):
         "schema odps project not found",
     )
     def test_odps_dataset_with_sampler_has_schema(self):
-        self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
+        with patch.object(
+            EcsRamRoleCredentialsProvider, "__init__", _patched_ecs_ram_init
+        ):
+            self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
 
 
 class OdpsWriterTest(unittest.TestCase):
