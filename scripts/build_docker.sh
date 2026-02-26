@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
-REPO_NAME=tzrec-devel
-DOCKER_TAG=1.0
+REPO_NAME=tzrec-test
+DOCKER_TAG=1.1
 DOCKER_TAG_SUFFIX=
 
 rm -rf docker/requirements*
