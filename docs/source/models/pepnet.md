@@ -116,6 +116,10 @@ model_config: {
 其中，logits/probs/y对应: sigmoid之前的值/概率/回归模型的预测值
 MMoE模型每个塔的指标为：指标名+ "\_" + tower_name
 
+## 示例Config
+
+[pepnet_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/pepnet_taobao.config)
+
 ## 参考论文
 
 [PEPNet.pdf](https://arxiv.org/pdf/2302.01115)
