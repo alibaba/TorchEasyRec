@@ -600,6 +600,8 @@ def create_reader(
     """
     if input_path.startswith("odps://"):
         reader_cls_name = "OdpsReader"
+    elif input_path.startswith("kafka://"):
+        reader_cls_name = "KafkaReader"
     elif input_path.endswith(".csv"):
         reader_cls_name = "CsvReader"
     elif input_path.endswith(".parquet"):
