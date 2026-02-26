@@ -34,6 +34,7 @@ class OdpsDatasetTest(unittest.TestCase):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
         self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
+        self.test_quota = os.environ.get("ODPS_DATA_QUOTA_NAME", "")
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -148,7 +149,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
                 is_orderby_partition=is_orderby_partition,
-                odps_data_quota_name="",
+                odps_data_quota_name=self.test_quota,
             ),
             features=features,
             input_path=f"odps://{project}/tables/{tb_prefix}test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
@@ -245,7 +246,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
                 fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
-                odps_data_quota_name="",
+                odps_data_quota_name=self.test_quota,
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f"odps://{project}/tables/{tb_prefix}test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
@@ -313,6 +314,7 @@ class OdpsWriterTest(unittest.TestCase):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
         self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
+        self.test_quota = os.environ.get("ODPS_DATA_QUOTA_NAME", "")
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -352,7 +354,7 @@ class OdpsWriterTest(unittest.TestCase):
             time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
-                quota_name="",
+                quota_name=self.test_quota,
                 world_size=writer_world_size,
             )
             for _ in range(5):
@@ -421,7 +423,7 @@ class OdpsWriterTest(unittest.TestCase):
             time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_schema_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}{partition_spec}",
-                quota_name="",
+                quota_name=self.test_quota,
                 world_size=writer_world_size,
             )
             for _ in range(5):
