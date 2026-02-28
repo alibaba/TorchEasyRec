@@ -44,7 +44,14 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import calc_slice_position, remove_nullable
+from tzrec.datasets.utils import (
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
+    calc_remaining_intervals,
+    calc_slice_position,
+    redistribute_intervals,
+    remove_nullable,
+)
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
@@ -229,6 +236,7 @@ def _reader_iter(
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
     compression: Compression,
+    input_path: Optional[str] = None,
 ) -> Iterator[pa.RecordBatch]:
     num_sess = len(sess_reqs)
     remain_row_count = 0
@@ -250,6 +258,10 @@ def _reader_iter(
         )
         if start == end:
             return
+
+        # Generate source_id for checkpoint tracking
+        source_id = f"{input_path}:{start}" if input_path else None
+        global_row_idx = start  # Track absolute row index
 
         offset = 0
         retry_cnt = 0
@@ -284,7 +296,25 @@ def _reader_iter(
                 break
             else:
                 retry_cnt = 0
-                offset += len(read_data)
+                batch_len = len(read_data)
+                offset += batch_len
+
+                # Inject checkpoint metadata if source_id is provided
+                if source_id is not None:
+                    row_indices = list(
+                        range(global_row_idx, global_row_idx + batch_len)
+                    )
+                    read_data = pa.RecordBatch.from_arrays(
+                        list(read_data.columns)
+                        + [
+                            pa.array([source_id] * batch_len, type=pa.string()),
+                            pa.array(row_indices, type=pa.int64()),
+                        ],
+                        names=list(read_data.schema.names)
+                        + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
+                    )
+                    global_row_idx += batch_len
+
             yield read_data
 
 
@@ -484,6 +514,7 @@ class OdpsReader(BaseReader):
             self._batch_size,
             self._drop_redundant_bs_eq_one,
             self._compression,
+            input_path,  # Pass input_path for checkpoint tracking
         )
         yield from self._arrow_reader_iter(iterator)
 

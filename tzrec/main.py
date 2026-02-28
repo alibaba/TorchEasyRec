@@ -321,12 +321,17 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
+    checkpoint_state: Optional[Dict[str, int]] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.train()
     _model = model.module.model
+
+    # Initialize dataloader checkpoint state
+    if checkpoint_state is None:
+        checkpoint_state = {}
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -418,6 +423,10 @@ def _train_and_evaluate(
                 continue
             try:
                 losses, predictions, batch = pipeline.progress(train_iterator)
+                # Update dataloader checkpoint state
+                checkpoint_util.update_checkpoint_state(
+                    checkpoint_state, batch.checkpoint_info
+                )
                 _model.update_train_metric(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
                     train_metrics = _model.compute_train_metric()
@@ -443,11 +452,13 @@ def _train_and_evaluate(
             if save_checkpoints_steps > 0 and i_step > 0:
                 if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
+                    ckpt_dir = os.path.join(model_dir, f"model.ckpt-{i_step}")
                     checkpoint_util.save_model(
-                        os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                        ckpt_dir,
                         model,
                         optimizer,
                     )
+                    checkpoint_util.save_dataloader_state(ckpt_dir, checkpoint_state)
                     if eval_dataloader is not None:
                         _evaluate(
                             model,
@@ -466,11 +477,13 @@ def _train_and_evaluate(
         if save_checkpoints_epochs > 0 and i_step > 0:
             if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
+                ckpt_dir = os.path.join(model_dir, f"model.ckpt-{i_step}")
                 checkpoint_util.save_model(
-                    os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                    ckpt_dir,
                     model,
                     optimizer,
                 )
+                checkpoint_util.save_dataloader_state(ckpt_dir, checkpoint_state)
                 if eval_dataloader is not None:
                     _evaluate(
                         model,
@@ -505,11 +518,13 @@ def _train_and_evaluate(
     if train_config.is_profiling:
         prof.stop()
     if last_ckpt_step != i_step:
+        ckpt_dir = os.path.join(model_dir, f"model.ckpt-{i_step}")
         checkpoint_util.save_model(
-            os.path.join(model_dir, f"model.ckpt-{i_step}"),
+            ckpt_dir,
             model,
             optimizer,
         )
+        checkpoint_util.save_dataloader_state(ckpt_dir, checkpoint_state)
         if eval_dataloader is not None:
             _evaluate(
                 model,
@@ -601,7 +616,7 @@ def train_and_evaluate(
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
     if os.path.exists(pipeline_config.model_dir):
-        # TODO(hongsheng.jhs): save and restore dataloader state.
+        # Restore dataloader state if continuing training
         latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
             pipeline_config.model_dir
         )
@@ -615,6 +630,15 @@ def train_and_evaluate(
                     "model_dir please delete dir model_dir or specify "
                     "--continue_train)"
                 )
+
+    # Restore dataloader checkpoint state
+    checkpoint_state: Optional[Dict[str, int]] = None
+    if ckpt_path and continue_train:
+        checkpoint_state = checkpoint_util.restore_dataloader_state(ckpt_path)
+        if checkpoint_state:
+            # Set checkpoint state on the dataset reader for resume
+            # pyre-ignore [16]
+            train_dataloader.dataset._reader.set_checkpoint_state(checkpoint_state)
 
     sampler_type = _get_sampler_type(data_config)
 
@@ -731,6 +755,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
+        checkpoint_state=checkpoint_state,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")

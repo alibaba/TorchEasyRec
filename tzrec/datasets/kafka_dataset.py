@@ -18,7 +18,7 @@ import pyarrow as pa
 from confluent_kafka import Consumer
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
-from tzrec.datasets.utils import FIELD_TYPE_TO_PA
+from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, FIELD_TYPE_TO_PA
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 
@@ -170,19 +170,37 @@ class KafkaReader(BaseReader):
 
                 current_batch_size = 0
                 record_batchs = []
+                # Track checkpoint metadata for each message
+                source_ids = []
+                row_indices = []
+
                 for msg in messages:
+                    if msg.error():
+                        continue
                     msg_data = msg.value()
                     record_batch = pa.ipc.read_record_batch(msg_data, self._full_schema)
                     current_batch_size += len(record_batch)
                     record_batchs.append(record_batch)
 
+                    # Generate checkpoint metadata for each row in this message
+                    partition = msg.partition()
+                    offset = msg.offset()
+                    source_id = f"{topic}:{partition}"
+                    batch_len = len(record_batch)
+                    source_ids.extend([source_id] * batch_len)
+                    # Use offset as the row index (each message has one offset)
+                    row_indices.extend([offset] * batch_len)
+
+                if not record_batchs:
+                    continue
+
                 # estimate batch_size per message
                 if batch_size_per_msg is None:
-                    batch_size_per_msg = current_batch_size / len(record_batch)
+                    batch_size_per_msg = current_batch_size / len(record_batchs)
                 else:
                     batch_size_per_msg = (
                         0.9 * batch_size_per_msg
-                        + 0.1 * current_batch_size / len(record_batch)
+                        + 0.1 * current_batch_size / len(record_batchs)
                     )
 
                 # combine into one record batch
@@ -191,6 +209,15 @@ class KafkaReader(BaseReader):
                     .drop_columns(self._drop_columns)
                     .combine_chunks()
                 )
+
+                # Add checkpoint metadata columns
+                t = t.append_column(
+                    CKPT_SOURCE_ID, pa.array(source_ids, type=pa.string())
+                )
+                t = t.append_column(
+                    CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
+                )
+
                 for batch in t.to_batches():
                     yield batch
 
