@@ -1,0 +1,35 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+
+
+        {
+            "name": "tzrec with torchrun",
+            "type": "python",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "cwd": "/nas/fengzuocheng/TorchEasyRec",
+            "args": [
+                "--nproc_per_node=1",           // 每个节点使用的GPU数量
+                "--nnodes=1",                   // 节点总数
+                "--node_rank=0",                // 当前节点rank
+                "--master_addr=127.0.0.1",      // 主节点地址
+                "--master_port=209",          // 主节点端口
+                "tzrec/train_eval.py",          // 训练脚本
+                "--pipeline_config_path=examples/modular/rank/multi_tower_din_taobao_rankbackbone.config"       ,// 配置文件路径
+                // "--train_input_path=data/taobao_data_train/*.parquet",
+                // "--eval_input_path=data/taobao_data_eval/*.parquet",
+                // "--continue_train"
+            ],
+            "env": {
+                "PYTHONPATH": "/nas/fengzuocheng/TorchEasyRec",
+                "CUDA_VISIBLE_DEVICES": "1",   // 指定可见GPU
+                "ODPS_CONFIG_FILE_PATH": "./odps_conf"
+            },
+            "python": "/root/miniconda3/envs/tzrec/bin/python",
+            "stopOnEntry": false
+        }
+    ]
+}

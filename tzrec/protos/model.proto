@@ -9,6 +9,8 @@ import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
 import "tzrec/protos/module.proto";
+import "tzrec/protos/backbone.proto";
+import "tzrec/protos/tower.proto";
 
 enum FeatureGroupType {
     DEEP = 0;
@@ -37,11 +39,34 @@ enum Kernel {
     CUDA = 2;
 }
 
+// configure backbone network common parameters
+message ModelParams {
+    optional float l2_regularization = 1;
+    repeated string outputs = 2;
+}
+
+message ModularRank {
+    required BackboneTower backbone = 1;
+    optional ModelParams model_params = 2;
+}
+message ModularMatch {
+    required BackboneTower backbone = 1;
+    optional ModelParams model_params = 2;
+}
+message ModularMultiTask {
+    required BackboneTower backbone = 1;
+    optional ModelParams model_params = 2;
+    repeated TaskTower task_towers = 3;
+}
 message ModelConfig {
 
     repeated FeatureGroupConfig feature_groups = 1;
 
     oneof model {
+        ModularRank rank_backbone = 1001;
+        ModularMatch match_backbone = 1002;
+        ModularMultiTask multi_task_backbone = 1003;
+
 	    DLRM dlrm = 100;
 	    DeepFM deepfm = 101;
         MultiTower multi_tower = 102;
