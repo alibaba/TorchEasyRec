@@ -17,7 +17,7 @@ from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.pepnet import EPNet, GateNU, PEPNet, PPNet
+from tzrec.models.pepnet import PEPNet
 from tzrec.protos import (
     feature_pb2,
     loss_pb2,
@@ -28,90 +28,7 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, create_test_module
-
-
-class GateNUTest(unittest.TestCase):
-    """Test GateNU module."""
-
-    @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
-    )
-    def test_gatenu(self, graph_type) -> None:
-        """Test GateNU forward pass."""
-        input_dim = 32
-        hidden_dim = 16
-        output_dim = 8
-
-        gatenu = GateNU(
-            input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim, gamma=2.0
-        )
-        gatenu = create_test_module(gatenu, graph_type)
-
-        batch_size = 4
-        x = torch.randn(batch_size, input_dim)
-
-        output = gatenu(x)
-
-        self.assertEqual(output.shape, (batch_size, output_dim))
-        # Check that output is in [0, gamma] range due to sigmoid activation
-        self.assertTrue(torch.all(output >= 0))
-        self.assertTrue(torch.all(output <= 2.0))
-
-
-class EPNetTest(unittest.TestCase):
-    """Test EPNet module."""
-
-    @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
-    )
-    def test_epnet(self, graph_type) -> None:
-        """Test EPNet forward pass."""
-        domain_dim = 16
-        embedding_dim = 32
-        epnet = EPNet(
-            main_dim=embedding_dim,
-            domain_dim=domain_dim,
-            hidden_dim=8,
-        )
-        epnet = create_test_module(epnet, graph_type)
-        batch_size = 4
-        domain_emb = torch.randn(batch_size, domain_dim)
-        main_emb = torch.randn(batch_size, embedding_dim)
-        personalized_emb = epnet(main_emb, domain_emb)
-        self.assertEqual(personalized_emb.shape, (batch_size, embedding_dim))
-
-
-class PPNetTest(unittest.TestCase):
-    """Test PPNet module."""
-
-    @parameterized.expand(
-        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
-    )
-    def test_ppnet_forward(self, graph_type) -> None:
-        """Test PPNet forward pass."""
-        main_feature = 32
-        uia_feature = 16
-        num_task = 2
-
-        ppnet = PPNet(
-            main_feature=main_feature,
-            uia_feature=uia_feature,
-            num_task=num_task,
-            hidden_units=[16, 8],
-        )
-        ppnet = create_test_module(ppnet, graph_type)
-        batch_size = 4
-        main_emb = torch.randn(batch_size, main_feature)
-        uia_emb = torch.randn(batch_size, uia_feature)
-
-        task_outputs = ppnet(main_emb, uia_emb)
-
-        self.assertEqual(len(task_outputs), num_task)
-        for output in task_outputs:
-            self.assertEqual(
-                output.shape, (batch_size, 8)
-            )  # Output dim from hidden_units
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 class PEPNetTest(unittest.TestCase):
@@ -152,24 +69,23 @@ class PEPNetTest(unittest.TestCase):
         ]
         feature_groups = [
             model_pb2.FeatureGroupConfig(
-                group_name="main",
+                group_name="all",
                 feature_names=["cat_a", "cat_b", "int_a"],
                 group_type=model_pb2.FeatureGroupType.DEEP,
             ),
         ]
-
-        if use_epnet:
-            feature_cfgs.append(
-                feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(
-                        feature_name="domain", embedding_dim=16, num_buckets=10
-                    )
+        feature_cfgs.append(
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="domainf", embedding_dim=16, num_buckets=3
                 )
             )
+        )
+        if use_epnet:
             feature_groups.append(
                 model_pb2.FeatureGroupConfig(
                     group_name="domain",
-                    feature_names=["domain"],
+                    feature_names=["domainf"],
                     group_type=model_pb2.FeatureGroupType.DEEP,
                 )
             )
@@ -192,7 +108,8 @@ class PEPNetTest(unittest.TestCase):
         features = create_features(feature_cfgs)
 
         pepnet_config = multi_task_rank_pb2.PEPNet(
-            main_group_name="main",
+            task_domain_num=3,
+            domain_input_name="domainf",
             task_towers=[
                 tower_pb2.TaskTower(
                     tower_name="t1",
@@ -235,7 +152,7 @@ class PEPNetTest(unittest.TestCase):
         pepnet = PEPNet(
             model_config=model_config,
             features=features,
-            labels=["label1", "label2"],
+            labels=["label1", "label2", "domainf"],
         )
         init_parameters(pepnet, device=torch.device("cpu"))
         pepnet = create_test_model(pepnet, graph_type)
@@ -243,10 +160,10 @@ class PEPNetTest(unittest.TestCase):
         sparse_keys = ["cat_a", "cat_b"]
         sparse_values = torch.tensor([1, 2, 3, 4, 5, 6, 7])
         sparse_lengths = torch.tensor([1, 2, 1, 3])
-        if use_epnet:
-            sparse_keys.append("domain")
-            sparse_values = torch.cat([sparse_values, torch.tensor([1, 2])])
-            sparse_lengths = torch.cat([sparse_lengths, torch.tensor([1, 1])])
+        sparse_keys.append("domainf")
+        domain_values = torch.tensor([1, 2])
+        sparse_values = torch.cat([sparse_values, domain_values])
+        sparse_lengths = torch.cat([sparse_lengths, torch.tensor([1, 1])])
         if use_ppnet:
             sparse_keys.append("uia")
             sparse_values = torch.cat([sparse_values, torch.tensor([3, 4])])
@@ -264,17 +181,25 @@ class PEPNetTest(unittest.TestCase):
         batch = Batch(
             dense_features={BASE_DATA_GROUP: dense_feature},
             sparse_features={BASE_DATA_GROUP: sparse_feature},
-            labels={},
+            sample_weights={"domainf": domain_values},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
             predictions = pepnet(batch.to_dict())
         else:
             predictions = pepnet(batch)
 
-        self.assertEqual(predictions["logits_t1"].size(), (2,))
-        self.assertEqual(predictions["probs_t1"].size(), (2,))
-        self.assertEqual(predictions["logits_t2"].size(), (2,))
-        self.assertEqual(predictions["probs_t2"].size(), (2,))
+        self.assertEqual(predictions["logits_t1_0"].size(), (2,))
+        self.assertEqual(predictions["probs_t1_0"].size(), (2,))
+        self.assertEqual(predictions["logits_t2_0"].size(), (2,))
+        self.assertEqual(predictions["probs_t2_0"].size(), (2,))
+        self.assertEqual(predictions["logits_t1_1"].size(), (2,))
+        self.assertEqual(predictions["probs_t1_1"].size(), (2,))
+        self.assertEqual(predictions["logits_t2_1"].size(), (2,))
+        self.assertEqual(predictions["probs_t2_1"].size(), (2,))
+        self.assertEqual(predictions["logits_t1_2"].size(), (2,))
+        self.assertEqual(predictions["probs_t1_2"].size(), (2,))
+        self.assertEqual(predictions["logits_t2_2"].size(), (2,))
+        self.assertEqual(predictions["probs_t2_2"].size(), (2,))
 
     @parameterized.expand(
         [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE], [TestGraphType.JIT_SCRIPT]]
@@ -326,14 +251,14 @@ class PEPNetTest(unittest.TestCase):
             ),
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
-                    feature_name="domain", embedding_dim=16, num_buckets=10
+                    feature_name="domainf", embedding_dim=16, num_buckets=10
                 )
             ),
         ]
         features = create_features(feature_cfgs)
         feature_groups = [
             model_pb2.FeatureGroupConfig(
-                group_name="main",
+                group_name="all",
                 feature_names=["cat_a", "cat_b", "int_a"],
                 group_type=model_pb2.FeatureGroupType.DEEP,
                 sequence_groups=[
@@ -360,14 +285,12 @@ class PEPNetTest(unittest.TestCase):
             ),
             model_pb2.FeatureGroupConfig(
                 group_name="domain",
-                feature_names=["domain"],
+                feature_names=["domainf"],
                 group_type=model_pb2.FeatureGroupType.DEEP,
             ),
         ]
 
         pepnet_config = multi_task_rank_pb2.PEPNet(
-            main_group_name="main",
-            domain_group_name="domain",
             epnet_hidden_unit=8,
             task_towers=[
                 tower_pb2.TaskTower(
@@ -417,7 +340,7 @@ class PEPNetTest(unittest.TestCase):
             keys=[
                 "cat_a",
                 "cat_b",
-                "domain",
+                "domainf",
                 "click_seq__cat_a",
                 "click_seq__cat_b",
             ],

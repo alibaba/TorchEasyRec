@@ -8,7 +8,7 @@ PEPNet将带有个性化先验信息的特征作为输入，通过门控机制�
 - Parameter Personalized Network (PPNet) 将用户和items的个性化信息与每一个task tower的DNN的输入进行拼接来获得个性化的门控分数，然后采用element-wise product应用到DNN的隐藏层单元上，来个性化优化DNN的参数。
 
 PEPNet的整体结构如下图所示，可以看到，核心的组件便是这三个：Gate NU（门控网络单元）、Embedding Personalized Network (EPNet)、Parameter Personalized Network (PPNet)
-![pepnet.jpg](../../images/models/pepnet.jpg)
+![pepnet.png](../../images/models/pepnet.png)
 
 ## 模型配置
 
@@ -47,10 +47,8 @@ model_config: {
     wide_deep: DEEP
   }
   pepnet {
-    main_group_name: "all"
-    domain_group_name: "domain"
-    epnet_hidden_unit: 128,
-    uia_group_name: "uia"
+    domain_input_name: 'occupation'
+    task_domain_num: 3
     ppnet_hidden_units: [512, 256]
     ppnet_dropout_ratio: [0.1, 0.1]
     task_towers {
@@ -87,16 +85,21 @@ model_config: {
 
 - feature_groups: 特征组
 
-  - 通常情况下有3个feature_group: 名称自定义，根据pepnet的配置，分为3类：all, domain, uia，其中domain和uia是可选配置，根据需求进行配置。
+  - 通常情况下有3个feature_group，分别为3类：all, domain, uia，其中domain和uia是可选配置，根据自身需求进行配置，如果没有对应配置，则也没有对应网络。
   - wide_deep: pepnet模型使用的都是Deep features, 所以都设置成DEEP
 
 - pepnet: pepnet模型相关的参数
 
-  - main_group_name: 主特征组名称,和feature_groups中的group_name对应
-  - domain_group_name: domain特征组名称,和feature_groups中的group_name对应，是epnet场景个性化部分的输入
-  - epnet_hidden_unit: epnet的gateGu的隐层设置，一般介于domain的dim和主特征组dim之间
-  - uia_group_name: 用户和item的个性化信息，和feature_groups中的group_name对应，是ppnet用户-商品个性化部分的输入
+  - epnet_hidden_unit: epnet的gateGu的隐层设置，一般介于domain的dim和主特征组dim之间，如果不设置，则默认为主特征组的dim
+  - epnet_gamma: epnet的门控参数，默认是2
   - ppnet_hidden_units: 个性化tower的隐藏层设置
+  - ppnet_activation: 个性化tower的激活函数,默认是relu
+  - ppnet_dropout_ratio: 个性化tower的dropout设置
+  - ppnet_gamma: 个性化tower的门控参数，默认是2
+  - domain_input_name: 域特征的名称
+    - 如果配置该参数，则要求该特征是num_bucket, 且**需要在data_config的label中配置该特征**，会产生和域数量一样多的任务tower。
+    - 如果不配置，每个任务塔只会有1个任务塔
+  - task_domain_num: 域的数量，会在每个task上产生和域的数量一样多的任务塔。要求域特征值需要小于该值但大于等于0
   - task_towers: 根据任务数配置task_towers
     - tower_name：TaskTower名
     - label_name: tower对应的label名
@@ -112,9 +115,9 @@ model_config: {
 
 ## 模型输出
 
-和其余多任务模型一样，每个塔的输出名为："logits\_" / "probs\_" / "y\_" + tower_name
-其中，logits/probs/y对应: sigmoid之前的值/概率/回归模型的预测值
-MMoE模型每个塔的指标为：指标名+ "\_" + tower_name
+- 在不配置domain_input_name和task_domain_num时， 和其余多任务模型一样，每个塔的输出名为："logits\_" / "probs\_" / "y\_" + tower_name
+  其中，logits/probs/y对应: sigmoid之前的值/概率/回归模型的预测值
+- 当配置domain_input_name和task_domain_num，则模型输出结果为："logits\_" / "probs\_" / "y\_" + tower_name + "\_domain_index",domain_index从0开始,到task_domain_num-1
 
 ## 示例Config
 

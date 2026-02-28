@@ -72,23 +72,21 @@ message DlrmHSTU {
 }
 
 message PEPNet {
-    // all feature group name
-    required string main_group_name = 1;
-    // domain feature group name
-    optional string domain_group_name = 2;
     // epnet hidden units
-    optional uint32 epnet_hidden_unit = 3;
+    optional uint32 epnet_hidden_unit = 1;
     // activation function for epnet
-    optional float  epnet_gamma = 4 [default = 2.0];
-    // user,item,author feature group name
-    optional string uia_group_name = 5;
+    optional float  epnet_gamma = 2 [default = 2.0];
     // ppnet hidden units
-    repeated uint32 ppnet_hidden_units = 6;
+    repeated uint32 ppnet_hidden_units = 3;
     // activation function for ppnet
-    optional string ppnet_activation = 7 [default = 'nn.ReLU'];
+    optional string ppnet_activation = 4 [default = 'nn.ReLU'];
     // ratio of dropout
-    repeated float ppnet_dropout_ratio = 8;
-    optional float  ppnet_gamma = 9 [default = 2.0];
+    repeated float ppnet_dropout_ratio = 5;
+    optional float  ppnet_gamma = 6 [default = 2.0];
+    // domain feature name, must is num bucket
+    optional string domain_input_name = 7;
+    // domain number for each task
+    optional uint32 task_domain_num = 8 [default = 1];
     // task tower
-    repeated TaskTower task_towers = 10;
+    repeated TaskTower task_towers = 9;
 }
