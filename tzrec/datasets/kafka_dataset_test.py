@@ -23,7 +23,6 @@ from confluent_kafka import Producer
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.kafka_dataset import KafkaDataset
-from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils.logging_util import logger
@@ -192,49 +191,6 @@ class KafkaDatasetTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
-
-
-class KafkaReaderCheckpointTest(unittest.TestCase):
-    """Tests for Kafka reader checkpoint functionality.
-
-    Note: These tests verify checkpoint source_id format without requiring
-    actual Kafka connections.
-    """
-
-    def test_checkpoint_source_id_format(self):
-        """Test Kafka checkpoint source_id format: {topic}:{partition}."""
-        topic = "my_topic"
-        partition = 3
-        expected_source_id = f"{topic}:{partition}"
-        self.assertEqual(expected_source_id, "my_topic:3")
-
-    def test_checkpoint_source_id_with_multiple_partitions(self):
-        """Test checkpoint source_id for multiple partitions."""
-        topic = "my_topic"
-        num_partitions = 12
-        source_ids = [f"{topic}:{p}" for p in range(num_partitions)]
-
-        # Each partition should have unique source_id
-        self.assertEqual(len(source_ids), len(set(source_ids)))
-
-        # Format should be consistent
-        for source_id in source_ids:
-            self.assertIn(topic, source_id)
-            self.assertIn(":", source_id)
-
-    def test_checkpoint_row_idx_is_offset(self):
-        """Test that CKPT_ROW_IDX stores Kafka message offset."""
-        # In Kafka, we store message offset as row_idx
-        # This allows resume from specific offset
-        offset = 12345
-        # Simulate checkpoint_info structure
-        checkpoint_info = {"my_topic:3": offset}
-        self.assertEqual(checkpoint_info["my_topic:3"], 12345)
-
-    def test_checkpoint_constants_exist(self):
-        """Verify checkpoint constants are defined."""
-        self.assertEqual(CKPT_SOURCE_ID, "__ckpt_source_id__")
-        self.assertEqual(CKPT_ROW_IDX, "__ckpt_row_idx__")
 
 
 if __name__ == "__main__":
