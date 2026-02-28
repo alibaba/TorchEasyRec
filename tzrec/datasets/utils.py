@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -30,6 +30,10 @@ C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
 HARD_NEG_INDICES = "hard_neg_indices"
+
+# Checkpoint metadata column names injected into RecordBatch
+CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
+CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
 
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
@@ -173,6 +177,8 @@ class Batch(Pipelineable):
     additional_infos: Dict[str, torch.Tensor] = field(default_factory=dict)
     # dummy batch or not
     dummy: bool = field(default=False)
+    # checkpoint info: {source_key: max_abs_row}
+    checkpoint_info: Optional[Dict[str, int]] = field(default=None)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -212,6 +218,7 @@ class Batch(Pipelineable):
                 for k, v in self.additional_infos.items()
             },
             dummy=self.dummy,
+            checkpoint_info=self.checkpoint_info,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -289,6 +296,7 @@ class Batch(Pipelineable):
                 k: v.pin_memory() for k, v in self.additional_infos.items()
             },
             dummy=self.dummy,
+            checkpoint_info=self.checkpoint_info,
         )
 
     def to_dict(
@@ -539,3 +547,131 @@ def remove_nullable(field_type: pa.DataType) -> pa.DataType:
 
     else:
         return field_type
+
+
+def calc_remaining_intervals(
+    checkpoint_state: Optional[Dict[str, int]],
+    input_path: str,
+    total_rows: int,
+) -> List[Tuple[int, int]]:
+    """Calculate remaining intervals from checkpoint state.
+
+    The checkpoint key format is `{input_path}:{start}` where `start` is the
+    beginning of the worker's range. From sorted starts + total_rows, we can
+    infer the original ranges and calculate remaining intervals.
+
+    Args:
+        checkpoint_state: dict mapping source_key to max consumed row index.
+        input_path: the input path to filter checkpoint entries.
+        total_rows: total number of rows in the dataset.
+
+    Returns:
+        List of (start, end) tuples representing remaining intervals.
+    """
+    if not checkpoint_state:
+        return [(0, total_rows)]  # No checkpoint, all data remaining
+
+    # Parse checkpoint keys: "{input_path}:{start}" -> (start, consumed)
+    # Filter by input_path matching
+    entries = []  # [(start, consumed), ...]
+    for key, consumed in checkpoint_state.items():
+        last_colon = key.rfind(":")
+        if last_colon == -1:
+            continue
+        key_input_path = key[:last_colon]
+        # Match input_path (exact match)
+        if key_input_path == input_path:
+            start = int(key[last_colon + 1 :])
+            entries.append((start, consumed))
+
+    if not entries:
+        return [(0, total_rows)]  # No matching checkpoint
+
+    # Sort by start to infer original ranges
+    entries.sort(key=lambda x: x[0])
+
+    # Calculate remaining intervals
+    remaining = []
+    num_entries = len(entries)
+    for i, (start, consumed) in enumerate(entries):
+        # Infer the end of this worker's range
+        if i + 1 < num_entries:
+            range_end = entries[i + 1][0]  # Next worker's start
+        else:
+            range_end = total_rows  # Last worker goes to end
+
+        # Remaining interval is [consumed+1, range_end)
+        if consumed + 1 < range_end:
+            remaining.append((consumed + 1, range_end))
+
+    return remaining if remaining else []
+
+
+def redistribute_intervals(
+    intervals: List[Tuple[int, int]],
+    worker_id: int,
+    num_workers: int,
+) -> List[Tuple[int, int]]:
+    """Redistribute remaining intervals among workers.
+
+    Flattens all intervals into a total row count, then assigns a portion
+    to each worker based on worker_id and num_workers.
+
+    Args:
+        intervals: List of (start, end) tuples representing remaining intervals.
+        worker_id: Current worker's ID (0-indexed).
+        num_workers: Total number of workers.
+
+    Returns:
+        List of (start, end) tuples assigned to this worker.
+    """
+    if not intervals:
+        return []
+
+    # Calculate total remaining rows
+    total_remaining = sum(end - start for start, end in intervals)
+    if total_remaining == 0:
+        return []
+
+    # Calculate this worker's share
+    rows_per_worker = total_remaining // num_workers
+    remainder = total_remaining % num_workers
+
+    # Workers 0..remainder-1 get one extra row
+    if worker_id < remainder:
+        worker_start = worker_id * (rows_per_worker + 1)
+        worker_rows = rows_per_worker + 1
+    else:
+        worker_start = remainder * (rows_per_worker + 1) + (
+            worker_id - remainder
+        ) * rows_per_worker
+        worker_rows = rows_per_worker
+
+    if worker_rows == 0:
+        return []
+
+    worker_end = worker_start + worker_rows
+
+    # Map worker's logical range [worker_start, worker_end) to actual intervals
+    result = []
+    current_pos = 0
+    for interval_start, interval_end in intervals:
+        interval_len = interval_end - interval_start
+        interval_logical_start = current_pos
+        interval_logical_end = current_pos + interval_len
+
+        # Check if this interval overlaps with worker's range
+        overlap_start = max(worker_start, interval_logical_start)
+        overlap_end = min(worker_end, interval_logical_end)
+
+        if overlap_start < overlap_end:
+            # Map back to actual row indices
+            actual_start = interval_start + (overlap_start - interval_logical_start)
+            actual_end = interval_start + (overlap_end - interval_logical_start)
+            result.append((actual_start, actual_end))
+
+        current_pos = interval_logical_end
+        if current_pos >= worker_end:
+            break
+
+    return result

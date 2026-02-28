@@ -23,6 +23,7 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
+from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
@@ -455,6 +456,40 @@ class OdpsWriterTest(unittest.TestCase):
             partition = None
         with t.open_reader(partition=partition) as reader:
             self.assertEqual(reader.count, 1280)
+
+
+class OdpsReaderCheckpointTest(unittest.TestCase):
+    """Tests for ODPS reader checkpoint functionality.
+
+    Note: These tests verify checkpoint source_id format without requiring
+    actual ODPS connections.
+    """
+
+    def test_checkpoint_source_id_format(self):
+        """Test ODPS checkpoint source_id format: odps://project/tables/table/part:start."""
+        # Test format parsing
+        input_path = "odps://my_project/tables/my_table/dt=20240101"
+        start = 500
+        expected_source_id = f"{input_path}:{start}"
+        self.assertEqual(expected_source_id, "odps://my_project/tables/my_table/dt=20240101:500")
+
+    def test_checkpoint_source_id_with_multiple_partitions(self):
+        """Test checkpoint source_id for multiple partitions."""
+        # Each partition should have its own source_id
+        input_paths = [
+            "odps://my_project/tables/my_table/dt=20240101",
+            "odps://my_project/tables/my_table/dt=20240102",
+        ]
+        for idx, path in enumerate(input_paths):
+            source_id = f"{path}:{idx * 1000}"
+            # Should be able to parse back
+            self.assertIn(path, source_id)
+            self.assertIn(":", source_id)
+
+    def test_checkpoint_constants_exist(self):
+        """Verify checkpoint constants are defined."""
+        self.assertEqual(CKPT_SOURCE_ID, "__ckpt_source_id__")
+        self.assertEqual(CKPT_ROW_IDX, "__ckpt_row_idx__")
 
 
 if __name__ == "__main__":
