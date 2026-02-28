@@ -333,9 +333,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
             # Use PyArrow group_by + max aggregation
             table = pa.table({CKPT_SOURCE_ID: source_ids, CKPT_ROW_IDX: row_idxs})
-            grouped = table.group_by(CKPT_SOURCE_ID).aggregate(
-                [(CKPT_ROW_IDX, "max")]
-            )
+            grouped = table.group_by(CKPT_SOURCE_ID).aggregate([(CKPT_ROW_IDX, "max")])
 
             # Convert to dict: {source_key: max_absolute_position}
             checkpoint_info = dict(

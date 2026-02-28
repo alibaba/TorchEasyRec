@@ -17,11 +17,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from tzrec.datasets.utils import (
-    calc_remaining_intervals,
     calc_slice_position,
     process_hstu_neg_sample,
     process_hstu_seq_data,
-    redistribute_intervals,
 )
 
 

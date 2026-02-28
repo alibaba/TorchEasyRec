@@ -24,7 +24,6 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
-from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import misc_util
@@ -207,7 +206,6 @@ class ParquetWriterTest(unittest.TestCase):
                 raise RuntimeError(f"writer worker-{i} failed.")
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-0.parquet")))
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-1.parquet")))
-
 
 
 if __name__ == "__main__":

@@ -317,7 +317,9 @@ class DataloaderCheckpointTest(unittest.TestCase):
         checkpoint_util.save_dataloader_state(self.test_dir, checkpoint_state)
 
         # Verify file exists
-        ckpt_path = os.path.join(self.test_dir, checkpoint_util.DATALOADER_CKPT_FILENAME)
+        ckpt_path = os.path.join(
+            self.test_dir, checkpoint_util.DATALOADER_CKPT_FILENAME
+        )
         self.assertTrue(os.path.exists(ckpt_path))
 
         # Restore
