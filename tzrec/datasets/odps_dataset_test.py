@@ -14,20 +14,30 @@ import multiprocessing as mp
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow as pa
+from alibabacloud_credentials.provider import EcsRamRoleCredentialsProvider
 from odps import ODPS
 from parameterized import parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
-from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
 from tzrec.utils.misc_util import get_free_port, random_name
+
+_orig_ecs_ram_init = EcsRamRoleCredentialsProvider.__init__
+
+
+def _patched_ecs_ram_init(self, *args, **kwargs):
+    # apscheduler for ecs ram will exit timeout when use sampler,
+    # we set async_update_enabled=False when use sampler in tests.
+    kwargs.setdefault("async_update_enabled", False)
+    return _orig_ecs_ram_init(self, *args, **kwargs)
 
 
 class OdpsDatasetTest(unittest.TestCase):
@@ -35,6 +45,7 @@ class OdpsDatasetTest(unittest.TestCase):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
         self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
+        self.test_quota = os.environ.get("ODPS_DATA_QUOTA_NAME", "")
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -149,7 +160,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
                 is_orderby_partition=is_orderby_partition,
-                odps_data_quota_name="",
+                odps_data_quota_name=self.test_quota,
             ),
             features=features,
             input_path=f"odps://{project}/tables/{tb_prefix}test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320",
@@ -246,7 +257,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
                 fg_mode=FgMode.FG_DAG,
                 label_fields=["label"],
-                odps_data_quota_name="",
+                odps_data_quota_name=self.test_quota,
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f"odps://{project}/tables/{tb_prefix}test_odps_sampler_{self.test_suffix}/dt=20240319/alpha=1",
                     num_sample=100,
@@ -295,7 +306,10 @@ class OdpsDatasetTest(unittest.TestCase):
         "odps config not found",
     )
     def test_odps_dataset_with_sampler(self, id_type="bigint"):
-        self._test_odps_dataset_with_sampler(id_type=id_type)
+        with patch.object(
+            EcsRamRoleCredentialsProvider, "__init__", _patched_ecs_ram_init
+        ):
+            self._test_odps_dataset_with_sampler(id_type=id_type)
 
     @unittest.skipIf(
         "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
@@ -306,7 +320,10 @@ class OdpsDatasetTest(unittest.TestCase):
         "schema odps project not found",
     )
     def test_odps_dataset_with_sampler_has_schema(self):
-        self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
+        with patch.object(
+            EcsRamRoleCredentialsProvider, "__init__", _patched_ecs_ram_init
+        ):
+            self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
 
 
 class OdpsWriterTest(unittest.TestCase):
@@ -314,6 +331,7 @@ class OdpsWriterTest(unittest.TestCase):
         self.o = None
         self.test_project = os.environ.get("CI_ODPS_PROJECT_NAME", None)
         self.test_schema_project = os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", None)
+        self.test_quota = os.environ.get("ODPS_DATA_QUOTA_NAME", "")
         if "ODPS_CONFIG_FILE_PATH" in os.environ:
             with open(os.environ["ODPS_CONFIG_FILE_PATH"], "r") as f:
                 for line in f.readlines():
@@ -353,7 +371,7 @@ class OdpsWriterTest(unittest.TestCase):
             time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}{partition_spec}",
-                quota_name="",
+                quota_name=self.test_quota,
                 world_size=writer_world_size,
             )
             for _ in range(5):
@@ -422,7 +440,7 @@ class OdpsWriterTest(unittest.TestCase):
             time.sleep(rank)  # prevent get credential failed
             writer = OdpsWriter(
                 f"odps://{self.test_schema_project}/tables/{schema}.test_odps_dataset_{self.test_suffix}{partition_spec}",
-                quota_name="",
+                quota_name=self.test_quota,
                 world_size=writer_world_size,
             )
             for _ in range(5):
@@ -456,40 +474,6 @@ class OdpsWriterTest(unittest.TestCase):
             partition = None
         with t.open_reader(partition=partition) as reader:
             self.assertEqual(reader.count, 1280)
-
-
-class OdpsReaderCheckpointTest(unittest.TestCase):
-    """Tests for ODPS reader checkpoint functionality.
-
-    Note: These tests verify checkpoint source_id format without requiring
-    actual ODPS connections.
-    """
-
-    def test_checkpoint_source_id_format(self):
-        """Test ODPS checkpoint source_id format: odps://project/tables/table/part:start."""
-        # Test format parsing
-        input_path = "odps://my_project/tables/my_table/dt=20240101"
-        start = 500
-        expected_source_id = f"{input_path}:{start}"
-        self.assertEqual(expected_source_id, "odps://my_project/tables/my_table/dt=20240101:500")
-
-    def test_checkpoint_source_id_with_multiple_partitions(self):
-        """Test checkpoint source_id for multiple partitions."""
-        # Each partition should have its own source_id
-        input_paths = [
-            "odps://my_project/tables/my_table/dt=20240101",
-            "odps://my_project/tables/my_table/dt=20240102",
-        ]
-        for idx, path in enumerate(input_paths):
-            source_id = f"{path}:{idx * 1000}"
-            # Should be able to parse back
-            self.assertIn(path, source_id)
-            self.assertIn(":", source_id)
-
-    def test_checkpoint_constants_exist(self):
-        """Verify checkpoint constants are defined."""
-        self.assertEqual(CKPT_SOURCE_ID, "__ckpt_source_id__")
-        self.assertEqual(CKPT_ROW_IDX, "__ckpt_row_idx__")
 
 
 if __name__ == "__main__":
