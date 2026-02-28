@@ -293,5 +293,83 @@ class CheckpointUtilTest(unittest.TestCase):
                 raise RuntimeError(f"worker-{i} failed.")
 
 
+class DataloaderCheckpointTest(unittest.TestCase):
+    """Tests for dataloader checkpoint utilities."""
+
+    def setUp(self):
+        if not os.path.exists("./tmp"):
+            os.makedirs("./tmp")
+        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+
+    def tearDown(self):
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def test_save_restore_dataloader_state(self):
+        """Test saving and restoring dataloader state."""
+        checkpoint_state = {
+            "/data/test.parquet:0": 499,
+            "/data/test.parquet:500": 999,
+        }
+
+        # Save
+        os.environ["RANK"] = "0"
+        checkpoint_util.save_dataloader_state(self.test_dir, checkpoint_state)
+
+        # Verify file exists
+        ckpt_path = os.path.join(
+            self.test_dir, checkpoint_util.DATALOADER_CKPT_FILENAME
+        )
+        self.assertTrue(os.path.exists(ckpt_path))
+
+        # Restore
+        restored_state = checkpoint_util.restore_dataloader_state(self.test_dir)
+        self.assertEqual(restored_state, checkpoint_state)
+
+    def test_restore_dataloader_state_not_found(self):
+        """Test restore returns None when no checkpoint exists."""
+        restored_state = checkpoint_util.restore_dataloader_state(self.test_dir)
+        self.assertIsNone(restored_state)
+
+    def test_update_checkpoint_state(self):
+        """Test merging checkpoint info by taking max per key."""
+        checkpoint_state = {"path:0": 100, "path:500": 200}
+
+        # Update with higher values
+        checkpoint_info = {"path:0": 150, "path:500": 180}  # 150 > 100, 180 < 200
+        checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
+
+        self.assertEqual(checkpoint_state["path:0"], 150)  # Updated
+        self.assertEqual(checkpoint_state["path:500"], 200)  # Not updated (200 > 180)
+
+    def test_update_checkpoint_state_with_new_keys(self):
+        """Test adding new keys to checkpoint state."""
+        checkpoint_state = {"path:0": 100}
+
+        checkpoint_info = {"path:500": 200}  # New key
+        checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
+
+        self.assertEqual(checkpoint_state["path:0"], 100)
+        self.assertEqual(checkpoint_state["path:500"], 200)
+
+    def test_update_checkpoint_state_with_none(self):
+        """Test handling None checkpoint info."""
+        checkpoint_state = {"path:0": 100}
+
+        checkpoint_util.update_dataloder_state(checkpoint_state, None)
+
+        # State should be unchanged
+        self.assertEqual(checkpoint_state, {"path:0": 100})
+
+    def test_update_checkpoint_state_empty(self):
+        """Test updating empty checkpoint state."""
+        checkpoint_state = {}
+
+        checkpoint_info = {"path:0": 100, "path:500": 200}
+        checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
+
+        self.assertEqual(checkpoint_state, {"path:0": 100, "path:500": 200})
+
+
 if __name__ == "__main__":
     unittest.main()

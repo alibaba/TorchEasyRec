@@ -13,8 +13,9 @@ import glob
 import json
 import os
 from dataclasses import replace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import torch.distributed as dist
 from torch import nn, optim
 from torch.distributed.checkpoint import (
     FileSystemReader,
@@ -361,6 +362,95 @@ def save_model(
                     }
             with open(os.path.join(checkpoint_dir, "plan"), "w") as f:
                 json.dump(plan, f)
+
+
+DATALOADER_CKPT_FILENAME = "dataloader_state.json"
+
+
+def save_dataloader_state(
+    checkpoint_dir: str,
+    dataloader_state: Dict[str, int],
+) -> None:
+    """Save dataloader state, aggregating from all ranks first.
+
+    This function aggregates checkpoint states from all ranks by taking
+    the maximum consumed row for each source, then rank 0 writes the
+    merged state to a JSON file.
+
+    Args:
+        checkpoint_dir: Directory to save the checkpoint state.
+        dataloader_state: Local checkpoint state {source_key: max_consumed_row}.
+    """
+    # All-gather states from all ranks
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        all_states = [None] * world_size
+        dist.all_gather_object(all_states, dataloader_state)
+
+        # Merge by taking max for each key
+        merged_state: Dict[str, int] = {}
+        for state in all_states:
+            if state:
+                for key, value in state.items():
+                    if key in merged_state:
+                        merged_state[key] = max(merged_state[key], value)
+                    else:
+                        merged_state[key] = value
+    else:
+        merged_state = dataloader_state
+
+    # Only rank 0 writes to file
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        ckpt_path = os.path.join(checkpoint_dir, DATALOADER_CKPT_FILENAME)
+        with open(ckpt_path, "w") as f:
+            json.dump(merged_state, f, indent=2)
+        logger.info(f"Saved dataloader state to {ckpt_path}")
+
+
+def restore_dataloader_state(checkpoint_dir: str) -> Optional[Dict[str, int]]:
+    """Restore dataloader checkpoint state from file.
+
+    Args:
+        checkpoint_dir: Directory containing the checkpoint state file.
+
+    Returns:
+        dataloader state dict {source_key: max_consumed_row}, or None if not found.
+    """
+    ckpt_path = os.path.join(checkpoint_dir, DATALOADER_CKPT_FILENAME)
+    if not os.path.exists(ckpt_path):
+        logger.info(f"No dataloader state found at {ckpt_path}")
+        return None
+
+    with open(ckpt_path, "r") as f:
+        state = json.load(f)
+
+    is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    if is_local_rank_zero:
+        logger.info(f"Restored dataloader state from {ckpt_path}")
+    return state
+
+
+def update_dataloder_state(
+    dataloader_state: Dict[str, int],
+    checkpoint_info: Optional[Dict[str, int]],
+) -> None:
+    """Merge batch's checkpoint_info into dataloader_state by taking max per key.
+
+    This updates dataloader_state in-place.
+
+    Args:
+        dataloader_state: Accumulated dataloader state to update.
+        checkpoint_info: Checkpoint info from current batch, or None.
+    """
+    if checkpoint_info is None:
+        return
+
+    for key, value in checkpoint_info.items():
+        if key in dataloader_state:
+            dataloader_state[key] = max(dataloader_state[key], value)
+        else:
+            dataloader_state[key] = value
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:

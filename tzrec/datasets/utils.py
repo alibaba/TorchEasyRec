@@ -31,6 +31,10 @@ C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
 HARD_NEG_INDICES = "hard_neg_indices"
 
+# Checkpoint metadata column names injected into RecordBatch
+CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
+CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
+
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
     FieldType.INT64: pa.int64(),
@@ -173,6 +177,8 @@ class Batch(Pipelineable):
     additional_infos: Dict[str, torch.Tensor] = field(default_factory=dict)
     # dummy batch or not
     dummy: bool = field(default=False)
+    # checkpoint info: {source_key: max_abs_row}
+    checkpoint_info: Optional[Dict[str, int]] = field(default=None)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -212,6 +218,7 @@ class Batch(Pipelineable):
                 for k, v in self.additional_infos.items()
             },
             dummy=self.dummy,
+            checkpoint_info=self.checkpoint_info,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -289,6 +296,7 @@ class Batch(Pipelineable):
                 k: v.pin_memory() for k, v in self.additional_infos.items()
             },
             dummy=self.dummy,
+            checkpoint_info=self.checkpoint_info,
         )
 
     def to_dict(

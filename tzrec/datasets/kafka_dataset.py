@@ -11,16 +11,18 @@
 
 
 import math
+import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
-from tzrec.datasets.utils import FIELD_TYPE_TO_PA
+from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, FIELD_TYPE_TO_PA
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils.logging_util import logger
 
 
 def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
@@ -156,7 +158,24 @@ class KafkaReader(BaseReader):
         """
         topic, config = _parse_kafka_uri(self._input_path)
         consumer = Consumer(config)
-        consumer.subscribe([topic])
+
+        # Define on_assign callback to seek to checkpointed offsets
+        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
+            if self._checkpoint_state:
+                for tp in partitions:
+                    source_key = f"{tp.topic}:{tp.partition}"
+                    if source_key in self._checkpoint_state:
+                        # Resume after last consumed offset
+                        tp.offset = self._checkpoint_state[source_key] + 1
+                    else:
+                        tp.offset = 0
+            consumer.assign(partitions)
+            logger.info(
+                f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "
+                f"assignment: {consumer.assignment()}"
+            )
+
+        consumer.subscribe([topic], on_assign=on_assign)
 
         batch_size_per_msg = None
         try:
@@ -170,19 +189,39 @@ class KafkaReader(BaseReader):
 
                 current_batch_size = 0
                 record_batchs = []
+                # Track checkpoint metadata for each message
+                source_ids = []
+                row_indices = []
+
                 for msg in messages:
+                    msg_error = msg.error()
+                    if msg_error:
+                        logger.error(msg_error)
+                        continue
                     msg_data = msg.value()
                     record_batch = pa.ipc.read_record_batch(msg_data, self._full_schema)
                     current_batch_size += len(record_batch)
                     record_batchs.append(record_batch)
 
+                    # Generate checkpoint metadata for each row in this message
+                    partition = msg.partition()
+                    offset = msg.offset()
+                    source_id = f"{topic}:{partition}"
+                    batch_len = len(record_batch)
+                    source_ids.extend([source_id] * batch_len)
+                    # Use offset as the row index (each message has one offset)
+                    row_indices.extend([offset] * batch_len)
+
+                if not record_batchs:
+                    continue
+
                 # estimate batch_size per message
                 if batch_size_per_msg is None:
-                    batch_size_per_msg = current_batch_size / len(record_batch)
+                    batch_size_per_msg = current_batch_size / len(record_batchs)
                 else:
                     batch_size_per_msg = (
                         0.9 * batch_size_per_msg
-                        + 0.1 * current_batch_size / len(record_batch)
+                        + 0.1 * current_batch_size / len(record_batchs)
                     )
 
                 # combine into one record batch
@@ -191,9 +230,20 @@ class KafkaReader(BaseReader):
                     .drop_columns(self._drop_columns)
                     .combine_chunks()
                 )
+
+                # Add checkpoint metadata columns
+                t = t.append_column(
+                    CKPT_SOURCE_ID, pa.array(source_ids, type=pa.string())
+                )
+                t = t.append_column(
+                    CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
+                )
+
                 for batch in t.to_batches():
                     yield batch
-
+        except Exception as e:
+            logger.error(f"KafkaReader exception: {e}", flush=True)
+            raise e
         finally:
             consumer.close()
 
