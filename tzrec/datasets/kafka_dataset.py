@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, FIELD_TYPE_TO_PA
@@ -156,7 +156,18 @@ class KafkaReader(BaseReader):
         """
         topic, config = _parse_kafka_uri(self._input_path)
         consumer = Consumer(config)
-        consumer.subscribe([topic])
+
+        # Define on_assign callback to seek to checkpointed offsets
+        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
+            if self._checkpoint_state:
+                for tp in partitions:
+                    source_key = f"{tp.topic}:{tp.partition}"
+                    if source_key in self._checkpoint_state:
+                        # Resume after last consumed offset
+                        tp.offset = self._checkpoint_state[source_key] + 1
+            consumer.assign(partitions)
+
+        consumer.subscribe([topic], on_assign=on_assign)
 
         batch_size_per_msg = None
         try:

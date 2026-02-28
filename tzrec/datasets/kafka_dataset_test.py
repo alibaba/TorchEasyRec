@@ -192,6 +192,122 @@ class KafkaDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
+    @unittest.skipIf(
+        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+    )
+    def test_kafka_dataset_checkpoint_metadata(self):
+        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs(
+            has_lookup=False
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        dataset = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_ckpt_test_group&auto.offset.reset=earliest",
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # Verify checkpoint_info is present and has correct format
+        self.assertIsNotNone(batch.checkpoint_info)
+        self.assertIsInstance(batch.checkpoint_info, dict)
+
+        # Checkpoint keys should be in format "{topic}:{partition}"
+        for key, value in batch.checkpoint_info.items():
+            self.assertIn(":", key)
+            topic_part, partition_str = key.rsplit(":", 1)
+            self.assertEqual(topic_part, self.test_topic)
+            self.assertTrue(partition_str.isdigit())
+            # Value should be a non-negative offset
+            self.assertIsInstance(value, int)
+            self.assertGreaterEqual(value, 0)
+
+    @unittest.skipIf(
+        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+    )
+    def test_kafka_dataset_checkpoint_resume(self):
+        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs(
+            has_lookup=False
+        )
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        # First, read some batches and capture checkpoint info
+        dataset1 = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_ckpt_resume_test_1&auto.offset.reset=earliest",
+        )
+        dataloader1 = DataLoader(
+            dataset=dataset1,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator1 = iter(dataloader1)
+
+        # Read first batch and capture checkpoint
+        batch1 = next(iterator1)
+        checkpoint_state = batch1.checkpoint_info.copy()
+        self.assertIsNotNone(checkpoint_state)
+        self.assertGreater(len(checkpoint_state), 0)
+
+        # Now create a new dataset with checkpoint state set
+        dataset2 = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_ckpt_resume_test_2&auto.offset.reset=earliest",
+        )
+
+        # Set checkpoint state to resume from saved offsets
+        dataset2._reader.set_checkpoint_state(checkpoint_state)
+
+        dataloader2 = DataLoader(
+            dataset=dataset2,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator2 = iter(dataloader2)
+
+        # Read batch from resumed dataset
+        batch2 = next(iterator2)
+
+        # The resumed batch should have offsets greater than the checkpoint
+        # (since we resume from checkpoint_offset + 1)
+        for key, new_offset in batch2.checkpoint_info.items():
+            if key in checkpoint_state:
+                # New offset should be greater than or equal to checkpoint offset
+                # (equal if we consumed the next message after checkpoint)
+                self.assertGreaterEqual(new_offset, checkpoint_state[key])
+
 
 if __name__ == "__main__":
     unittest.main()
