@@ -72,3 +72,23 @@ message DlrmHSTU {
     // timestamp of sequence is ascending or descending
     optional bool sequence_timestamp_is_ascending = 6 [default = true];
 }
+
+message PEPNet {
+    // epnet hidden units
+    optional uint32 epnet_hidden_unit = 1;
+    // activation function for epnet
+    optional float  epnet_gamma = 2 [default = 2.0];
+    // ppnet hidden units
+    repeated uint32 ppnet_hidden_units = 3;
+    // activation function for ppnet
+    optional string ppnet_activation = 4 [default = 'nn.ReLU'];
+    // ratio of dropout
+    repeated float ppnet_dropout_ratio = 5;
+    optional float  ppnet_gamma = 6 [default = 2.0];
+    // domain feature name, must is num bucket
+    optional string domain_input_name = 7;
+    // domain number for each task
+    optional uint32 task_domain_num = 8 [default = 1];
+    // task tower
+    repeated TaskTower task_towers = 9;
+}
