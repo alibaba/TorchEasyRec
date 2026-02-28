@@ -11,6 +11,7 @@
 
 
 import os
+import time
 import unittest
 
 import pyarrow as pa
@@ -25,6 +26,7 @@ from torch.utils.data import DataLoader
 from tzrec.datasets.kafka_dataset import KafkaDataset
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
 
@@ -54,15 +56,27 @@ class KafkaDatasetTest(unittest.TestCase):
             logger.error(e)
 
     def _create_test_table_and_feature_cfgs(self, has_lookup=True):
-        req = alikafka_models.CreateTopicRequest(
+        create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
             remark=self.test_topic,
             region_id=self.region,
-            partition_num=12,
+            partition_num=4,
         )
         runtime = util_models.RuntimeOptions()
-        self.client.create_topic_with_options(req, runtime)
+        self.client.create_topic_with_options(create_topic_req, runtime)
+
+        while True:
+            runtime = util_models.RuntimeOptions()
+            get_topic_request = alikafka_models.GetTopicListRequest(
+                instance_id=self.instance_id,
+                region_id=self.region,
+                topic=self.test_topic,
+            )
+            resp = self.client.get_topic_list(get_topic_request)
+            if resp.body.topic_list.topic_vo[0].status == 0:
+                break
+            time.sleep(10)
 
         input_fields = [
             data_pb2.Field(input_name="unused", input_type=data_pb2.STRING),
@@ -78,7 +92,8 @@ class KafkaDatasetTest(unittest.TestCase):
         ]
         config = {"bootstrap.servers": self.brokers}
         producer = Producer(config)
-        for _ in range(1000):
+
+        for _ in range(10000):
             record_batch = pa.record_batch(
                 {
                     "unused": pa.array(["unused"] * 128, type=pa.string()),
@@ -166,7 +181,7 @@ class KafkaDatasetTest(unittest.TestCase):
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
             collate_fn=lambda x: x,
         )
@@ -210,12 +225,12 @@ class KafkaDatasetTest(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_ckpt_test_group&auto.offset.reset=earliest",
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
         )
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
             collate_fn=lambda x: x,
         )
@@ -255,22 +270,30 @@ class KafkaDatasetTest(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_ckpt_resume_test_1&auto.offset.reset=earliest",
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
         )
         dataloader1 = DataLoader(
             dataset=dataset1,
             batch_size=None,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
             collate_fn=lambda x: x,
         )
         iterator1 = iter(dataloader1)
 
         # Read first batch and capture checkpoint
+        checkpoint_state_acc = {}
         batch1 = next(iterator1)
-        checkpoint_state = batch1.checkpoint_info.copy()
-        self.assertIsNotNone(checkpoint_state)
-        self.assertGreater(len(checkpoint_state), 0)
+        first_checkpoint_state = batch1.checkpoint_info.copy()
+        update_dataloder_state(checkpoint_state_acc, first_checkpoint_state)
+        self.assertIsNotNone(first_checkpoint_state)
+        self.assertGreater(len(first_checkpoint_state), 0)
+        # Read more batches
+        for _ in range(8):
+            batch1 = next(iterator1)
+            update_dataloder_state(checkpoint_state_acc, batch1.checkpoint_info.copy())
+        del iterator1
+        del dataloader1
 
         # Now create a new dataset with checkpoint state set
         dataset2 = KafkaDataset(
@@ -282,19 +305,17 @@ class KafkaDatasetTest(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_ckpt_resume_test_2&auto.offset.reset=earliest",
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
         )
-
-        # Set checkpoint state to resume from saved offsets
-        dataset2._reader.set_checkpoint_state(checkpoint_state)
-
         dataloader2 = DataLoader(
             dataset=dataset2,
             batch_size=None,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
             collate_fn=lambda x: x,
         )
+        # Set first batch checkpoint state to resume from saved offsets
+        dataloader2.dataset.load_state_dict(first_checkpoint_state)
         iterator2 = iter(dataloader2)
 
         # Read batch from resumed dataset
@@ -303,10 +324,14 @@ class KafkaDatasetTest(unittest.TestCase):
         # The resumed batch should have offsets greater than the checkpoint
         # (since we resume from checkpoint_offset + 1)
         for key, new_offset in batch2.checkpoint_info.items():
-            if key in checkpoint_state:
-                # New offset should be greater than or equal to checkpoint offset
+            if key in first_checkpoint_state:
+                # New offset should be greater than or equal to first checkpoint offset
                 # (equal if we consumed the next message after checkpoint)
-                self.assertGreaterEqual(new_offset, checkpoint_state[key])
+                self.assertGreaterEqual(new_offset, first_checkpoint_state[key])
+            if key in checkpoint_state_acc:
+                # New offset should be less than or equal to acc checkpoint offset
+                # (equal if we consumed the next message after checkpoint)
+                self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
 
 if __name__ == "__main__":

@@ -337,7 +337,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
 
         # Update with higher values
         checkpoint_info = {"path:0": 150, "path:500": 180}  # 150 > 100, 180 < 200
-        checkpoint_util.update_checkpoint_state(checkpoint_state, checkpoint_info)
+        checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
 
         self.assertEqual(checkpoint_state["path:0"], 150)  # Updated
         self.assertEqual(checkpoint_state["path:500"], 200)  # Not updated (200 > 180)
@@ -347,7 +347,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
         checkpoint_state = {"path:0": 100}
 
         checkpoint_info = {"path:500": 200}  # New key
-        checkpoint_util.update_checkpoint_state(checkpoint_state, checkpoint_info)
+        checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
 
         self.assertEqual(checkpoint_state["path:0"], 100)
         self.assertEqual(checkpoint_state["path:500"], 200)
@@ -356,7 +356,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
         """Test handling None checkpoint info."""
         checkpoint_state = {"path:0": 100}
 
-        checkpoint_util.update_checkpoint_state(checkpoint_state, None)
+        checkpoint_util.update_dataloder_state(checkpoint_state, None)
 
         # State should be unchanged
         self.assertEqual(checkpoint_state, {"path:0": 100})
@@ -366,7 +366,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
         checkpoint_state = {}
 
         checkpoint_info = {"path:0": 100, "path:500": 200}
-        checkpoint_util.update_checkpoint_state(checkpoint_state, checkpoint_info)
+        checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
 
         self.assertEqual(checkpoint_state, {"path:0": 100, "path:500": 200})
 

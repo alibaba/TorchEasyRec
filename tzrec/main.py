@@ -321,7 +321,7 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
-    checkpoint_state: Optional[Dict[str, int]] = None,
+    dataloader_state: Optional[Dict[str, int]] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -330,8 +330,8 @@ def _train_and_evaluate(
     _model = model.module.model
 
     # Initialize dataloader checkpoint state
-    if checkpoint_state is None:
-        checkpoint_state = {}
+    if dataloader_state is None:
+        dataloader_state = {}
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -424,8 +424,8 @@ def _train_and_evaluate(
             try:
                 losses, predictions, batch = pipeline.progress(train_iterator)
                 # Update dataloader checkpoint state
-                checkpoint_util.update_checkpoint_state(
-                    checkpoint_state, batch.checkpoint_info
+                checkpoint_util.update_dataloder_state(
+                    dataloader_state, batch.checkpoint_info
                 )
                 _model.update_train_metric(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
@@ -458,7 +458,7 @@ def _train_and_evaluate(
                         model,
                         optimizer,
                     )
-                    checkpoint_util.save_dataloader_state(ckpt_dir, checkpoint_state)
+                    checkpoint_util.save_dataloader_state(ckpt_dir, dataloader_state)
                     if eval_dataloader is not None:
                         _evaluate(
                             model,
@@ -483,7 +483,7 @@ def _train_and_evaluate(
                     model,
                     optimizer,
                 )
-                checkpoint_util.save_dataloader_state(ckpt_dir, checkpoint_state)
+                checkpoint_util.save_dataloader_state(ckpt_dir, dataloader_state)
                 if eval_dataloader is not None:
                     _evaluate(
                         model,
@@ -524,7 +524,7 @@ def _train_and_evaluate(
             model,
             optimizer,
         )
-        checkpoint_util.save_dataloader_state(ckpt_dir, checkpoint_state)
+        checkpoint_util.save_dataloader_state(ckpt_dir, dataloader_state)
         if eval_dataloader is not None:
             _evaluate(
                 model,
@@ -632,13 +632,11 @@ def train_and_evaluate(
                 )
 
     # Restore dataloader checkpoint state
-    checkpoint_state: Optional[Dict[str, int]] = None
+    dataloader_state: Optional[Dict[str, int]] = None
     if ckpt_path and continue_train:
-        checkpoint_state = checkpoint_util.restore_dataloader_state(ckpt_path)
-        if checkpoint_state:
-            # Set checkpoint state on the dataset reader for resume
-            # pyre-ignore [16]
-            train_dataloader.dataset._reader.set_checkpoint_state(checkpoint_state)
+        dataloader_state = checkpoint_util.restore_dataloader_state(ckpt_path)
+        if dataloader_state:
+            train_dataloader.dataset.load_state_dict(dataloader_state)
 
     sampler_type = _get_sampler_type(data_config)
 
@@ -755,7 +753,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
-        checkpoint_state=checkpoint_state,
+        dataloader_state=dataloader_state,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
