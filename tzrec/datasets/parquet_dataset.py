@@ -294,7 +294,13 @@ class ParquetReader(BaseReader):
                 return  # All data already consumed
 
             # Redistribute remaining intervals among current workers
-            worker_intervals = redistribute_intervals(remaining, worker_id, num_workers)
+            worker_intervals = redistribute_intervals(
+                remaining,
+                worker_id,
+                num_workers,
+                self._batch_size,
+                self._drop_redundant_bs_eq_one,
+            )
             if not worker_intervals:
                 return  # This worker has no data to process
 

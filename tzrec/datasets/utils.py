@@ -611,6 +611,8 @@ def redistribute_intervals(
     intervals: List[Tuple[int, int]],
     worker_id: int,
     num_workers: int,
+    batch_size: int = 1,
+    drop_redundant_bs_eq_one: bool = False,
 ) -> List[Tuple[int, int]]:
     """Redistribute remaining intervals among workers.
 
@@ -621,6 +623,9 @@ def redistribute_intervals(
         intervals: List of (start, end) tuples representing remaining intervals.
         worker_id: Current worker's ID (0-indexed).
         num_workers: Total number of workers.
+        batch_size: batch_size.
+        drop_redundant_bs_eq_one: drop last redundant batch with batch_size
+            equal one to prevent train_eval hung.
 
     Returns:
         List of (start, end) tuples assigned to this worker.
@@ -633,25 +638,17 @@ def redistribute_intervals(
     if total_remaining == 0:
         return []
 
-    # Calculate this worker's share
-    rows_per_worker = total_remaining // num_workers
-    remainder = total_remaining % num_workers
+    # Reuse calc_slice_position for worker start/end calculation
+    worker_start, worker_end, _ = calc_slice_position(
+        row_count=total_remaining,
+        slice_id=worker_id,
+        slice_count=num_workers,
+        batch_size=batch_size,
+        drop_redundant_bs_eq_one=drop_redundant_bs_eq_one,
+    )
 
-    # Workers 0..remainder-1 get one extra row
-    if worker_id < remainder:
-        worker_start = worker_id * (rows_per_worker + 1)
-        worker_rows = rows_per_worker + 1
-    else:
-        worker_start = (
-            remainder * (rows_per_worker + 1)
-            + (worker_id - remainder) * rows_per_worker
-        )
-        worker_rows = rows_per_worker
-
-    if worker_rows == 0:
+    if worker_start >= worker_end:
         return []
-
-    worker_end = worker_start + worker_rows
 
     # Map worker's logical range [worker_start, worker_end) to actual intervals
     result = []
