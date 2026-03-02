@@ -27,9 +27,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
-    calc_remaining_intervals,
-    calc_slice_position,
-    redistribute_intervals,
+    calc_slice_intervals,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -280,58 +278,19 @@ class ParquetReader(BaseReader):
         if len(self._input_files) == 0:
             return
 
-        total_rows = sum(self._num_rows) if self._rebalance else 0
-
-        # Check if we're resuming from checkpoint
-        if self._checkpoint_state and self._rebalance:
-            # Calculate remaining intervals from checkpoint
-            remaining = calc_remaining_intervals(
-                self._checkpoint_state,
-                self._input_path,
-                total_rows,
-            )
-            if not remaining:
-                return  # All data already consumed
-
-            # Redistribute remaining intervals among current workers
-            worker_intervals = redistribute_intervals(
-                remaining,
+        worker_intervals = [(0, sys.maxsize)]
+        if self._rebalance:
+            worker_intervals, _ = calc_slice_intervals(
+                sum(self._num_rows),
                 worker_id,
                 num_workers,
                 self._batch_size,
                 self._drop_redundant_bs_eq_one,
+                checkpoint_state=self._checkpoint_state,
+                source_id=self._input_path,
             )
-            if not worker_intervals:
-                return  # This worker has no data to process
 
-            # Generate source_id for this worker's intervals
-            for start, end in worker_intervals:
-                source_id = f"{self._input_path}:{start}"
-                reader = _reader_iter(
-                    self._input_files,
-                    self._batch_size,
-                    self._parquet_metas,
-                    self._ordered_cols,
-                    start,
-                    end,
-                    worker_id,
-                    source_id,
-                )
-                yield from self._arrow_reader_iter(reader)
-        else:
-            # Normal case: no checkpoint or not rebalancing
-            start, end = 0, sys.maxsize
-            source_id = None
-            if self._rebalance:
-                start, end, _ = calc_slice_position(
-                    total_rows,
-                    worker_id,
-                    num_workers,
-                    self._batch_size,
-                    self._drop_redundant_bs_eq_one,
-                )
-                source_id = f"{self._input_path}:{start}"
-
+        for start, end in worker_intervals:
             reader = _reader_iter(
                 self._input_files
                 if self._rebalance
@@ -342,7 +301,7 @@ class ParquetReader(BaseReader):
                 start,
                 end,
                 worker_id,
-                source_id,
+                source_id=f"{self._input_path}:{start}" if self._rebalance else None,
             )
             yield from self._arrow_reader_iter(reader)
 

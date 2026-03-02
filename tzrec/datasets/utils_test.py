@@ -18,10 +18,10 @@ import pyarrow.compute as pc
 
 from tzrec.datasets.utils import (
     calc_remaining_intervals,
+    calc_slice_intervals,
     calc_slice_position,
     process_hstu_neg_sample,
     process_hstu_seq_data,
-    redistribute_intervals,
 )
 
 
@@ -196,7 +196,7 @@ class CheckpointUtilsTest(unittest.TestCase):
     def test_redistribute_intervals_single_worker(self):
         """Test redistribute intervals with single worker."""
         intervals = [(100, 500), (600, 1000)]
-        result = redistribute_intervals(intervals, worker_id=0, num_workers=1)
+        result = calc_slice_intervals(intervals, worker_id=0, num_workers=1)
         self.assertEqual(result, [(100, 500), (600, 1000)])
 
     def test_redistribute_intervals_two_workers(self):
@@ -205,9 +205,9 @@ class CheckpointUtilsTest(unittest.TestCase):
         intervals = [(100, 500), (600, 1000)]
 
         # Worker 0 gets first half of total rows
-        result_w0 = redistribute_intervals(intervals, worker_id=0, num_workers=2)
+        result_w0 = calc_slice_intervals(intervals, worker_id=0, num_workers=2)
         # Worker 1 gets second half
-        result_w1 = redistribute_intervals(intervals, worker_id=1, num_workers=2)
+        result_w1 = calc_slice_intervals(intervals, worker_id=1, num_workers=2)
 
         # Combined should cover all intervals
         total_rows_w0 = sum(end - start for start, end in result_w0)
@@ -216,7 +216,7 @@ class CheckpointUtilsTest(unittest.TestCase):
 
     def test_redistribute_intervals_empty_intervals(self):
         """Test redistribute with empty intervals."""
-        result = redistribute_intervals([], worker_id=0, num_workers=2)
+        result = calc_slice_intervals([], worker_id=0, num_workers=2)
         self.assertEqual(result, [])
 
     def test_redistribute_intervals_topology_change(self):
@@ -227,9 +227,7 @@ class CheckpointUtilsTest(unittest.TestCase):
         # Now redistribute among 3 workers
         total_rows = 0
         for worker_id in range(3):
-            result = redistribute_intervals(
-                intervals, worker_id=worker_id, num_workers=3
-            )
+            result = calc_slice_intervals(intervals, worker_id=worker_id, num_workers=3)
             for start, end in result:
                 total_rows += end - start
 
