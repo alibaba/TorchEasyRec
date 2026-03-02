@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -175,24 +176,18 @@ class PEPNet(MultiTaskRank):
     def _select_domain_task_output(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        new_predictions = {}
+        new_predictions = defaultdict(list)
         if self._domain_input_name:
             for (
                 tower_domain_loss_predict_name,
                 tower_domain_loss_predict_value,
             ) in predictions.items():
-                tower_loss_name = "_".join(
-                    tower_domain_loss_predict_name.split("_")[:-1]
+                tower_loss_name, domain_index = tower_domain_loss_predict_name.rsplit(
+                    "_", 1
                 )
-                domain_index = int(tower_domain_loss_predict_name.split("_")[-1])
-                if tower_loss_name in new_predictions:
-                    new_predictions[tower_loss_name].append(
-                        (domain_index, tower_domain_loss_predict_value)
-                    )
-                else:
-                    new_predictions[tower_loss_name] = [
-                        (domain_index, tower_domain_loss_predict_value)
-                    ]
+                new_predictions[tower_loss_name] = [
+                    (domain_index, tower_domain_loss_predict_value)
+                ]
             domain_index = batch.labels[self._domain_input_name]
             for tower_loss_name, tower_loss_predict_values in new_predictions.items():
                 tower_loss_domain_predict = torch.stack(

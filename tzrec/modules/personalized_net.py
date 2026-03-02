@@ -22,6 +22,12 @@ class GateNU(nn.Module):
 
     Implements the Gate Neural Unit from the PEPNet paper with ReLU
     -> Sigmoid activation and optional gamma scaling factor.
+
+    Args:
+        input_dim (int): number of elements in each input sample.
+        hidden_dim (int): Gate Nu hidden dimension
+        output_dim (int): number of elements in each output sample.
+        gamma (float): Gate Nu gamma.
     """
 
     def __init__(
@@ -58,6 +64,12 @@ class EPNet(nn.Module):
 
     Generates personalized weights to scale the original embeddings
     based on domain and context information, following the original PEPNet paper.
+
+    Args:
+        main_dim (int): Main feature embedding tensor [B, embedding_dim].
+        domain_dim (int): Domain embedding tensor [B, domain_dim].
+        hidden_dim (int): Gate Nu hidden dimension.
+        gamma (float): Gate Nu gamma.
     """
 
     def __init__(
