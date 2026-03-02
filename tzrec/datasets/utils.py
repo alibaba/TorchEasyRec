@@ -535,18 +535,18 @@ def calc_slice_position(
 
 def calc_remaining_intervals(
     checkpoint_state: Optional[Dict[str, int]],
-    source_id: str,
+    input_path: str,
     total_rows: int,
 ) -> List[Tuple[int, int]]:
     """Calculate remaining intervals from checkpoint state.
 
-    The checkpoint key format is `{source_id}:{start}` where `start` is the
+    The checkpoint key format is `{input_path}:{start}` where `start` is the
     beginning of the worker's range. From sorted starts + total_rows, we can
     infer the original ranges and calculate remaining intervals.
 
     Args:
         checkpoint_state (dict): dict mapping source_id to max consumed row index.
-        source_id (str): the input path to filter checkpoint entries.
+        input_path (str): the input path to filter checkpoint entries.
         total_rows (int): total number of rows in the dataset.
 
     Returns:
@@ -555,16 +555,16 @@ def calc_remaining_intervals(
     if not checkpoint_state:
         return [(0, total_rows)]  # No checkpoint, all data remaining
 
-    # Parse checkpoint keys: "{source_id}:{start}" -> (start, consumed)
-    # Filter by source_id matching
+    # Parse checkpoint keys: "{input_path}:{start}" -> (start, consumed)
+    # Filter by input_path matching
     entries = []  # [(start, consumed), ...]
     for key, consumed in checkpoint_state.items():
         last_colon = key.rfind(":")
         if last_colon == -1:
             continue
-        key_source_id = key[:last_colon]
-        # Match source_id (exact match)
-        if key_source_id == source_id:
+        key_input_path = key[:last_colon]
+        # Match input_path (exact match)
+        if key_input_path == input_path:
             start = int(key[last_colon + 1 :])
             entries.append((start, consumed))
 
@@ -599,7 +599,7 @@ def calc_slice_intervals(
     drop_redundant_bs_eq_one: bool = False,
     pre_total_remain: int = 0,
     checkpoint_state: Optional[Dict[str, int]] = None,
-    source_id: Optional[str] = None,
+    input_path: Optional[str] = None,
 ) -> List[Tuple[int, int]]:
     """Redistribute remaining intervals among workers.
 
@@ -616,7 +616,7 @@ def calc_slice_intervals(
         pre_total_remain (int): remaining total count in pre-table is
             insufficient to meet the batch_size requirement for each worker.
         checkpoint_state (dict): dict mapping source_id to max consumed row index.
-        source_id (str): the input path to filter checkpoint entries.
+        input_path (str): the input path to filter checkpoint entries.
 
     Returns:
         worker_intervals (list): List of (start, end) tuples assigned to this worker.
@@ -624,7 +624,7 @@ def calc_slice_intervals(
             insufficient to meet the batch_size requirement for each worker.
     """
     if checkpoint_state:
-        intervals = calc_remaining_intervals(checkpoint_state, source_id, total_rows)
+        intervals = calc_remaining_intervals(checkpoint_state, input_path, total_rows)
         total_rows = sum(end - start for start, end in intervals)
 
     # Reuse calc_slice_position for worker start/end calculation

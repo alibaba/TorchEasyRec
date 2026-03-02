@@ -287,7 +287,7 @@ class ParquetReader(BaseReader):
                 self._batch_size,
                 self._drop_redundant_bs_eq_one,
                 checkpoint_state=self._checkpoint_state,
-                source_id=self._input_path,
+                input_path=self._input_path,
             )
 
         for start, end in worker_intervals:
