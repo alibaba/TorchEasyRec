@@ -134,11 +134,8 @@ class PEPNetTest(unittest.TestCase):
             ],
         )
         if use_epnet:
-            pepnet_config.domain_group_name = "domain"
-            pepnet_config.epnet_hidden_unit = 8
             pepnet_config.epnet_gamma = 2.0
         if use_ppnet:
-            pepnet_config.uia_group_name = "uia"
             pepnet_config.ppnet_hidden_units[:] = [16, 8]
             pepnet_config.ppnet_activation = "nn.ReLU"
             pepnet_config.ppnet_dropout_ratio[:] = [0.1, 0.1]
@@ -181,7 +178,7 @@ class PEPNetTest(unittest.TestCase):
         batch = Batch(
             dense_features={BASE_DATA_GROUP: dense_feature},
             sparse_features={BASE_DATA_GROUP: sparse_feature},
-            sample_weights={"domainf": domain_values},
+            labels={"domainf": domain_values},
         )
         if graph_type == TestGraphType.JIT_SCRIPT:
             predictions = pepnet(batch.to_dict())
