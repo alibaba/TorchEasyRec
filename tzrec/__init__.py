@@ -70,3 +70,9 @@ from tzrec.utils.filesystem_util import (  # NOQA
 )  # NOQA
 
 _register_external_filesystem()
+
+from tzrec.utils.misc_util import (  # NOQA
+    apply_ecs_ram_cred_patch as _apply_ecs_ram_cred_patch,  # NOQA
+)
+
+_apply_ecs_ram_cred_patch()
