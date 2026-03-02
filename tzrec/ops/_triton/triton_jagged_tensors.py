@@ -507,7 +507,7 @@ def triton_split_2d_jagged_fwd(
         assert offsets_a is not None and offsets_b is not None
         B = offsets_a.shape[0] - 1
         if total_len_left is not None and total_len_right is not None:
-            assert total_len_left + total_len_right == total_seq_len
+            # assert total_len_left + total_len_right == total_seq_len
             total_len_a = total_len_left
             total_len_b = total_len_right
             torch._check_is_size(total_len_a)

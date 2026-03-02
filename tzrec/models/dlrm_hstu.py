@@ -69,6 +69,16 @@ def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
     return batch_size
 
 
+@torch.fx.wrap
+def _fx_flip_tensor_dict(
+    grouped_features: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    new_grouped_features = {}
+    for k, v in grouped_features.items():
+        new_grouped_features[k] = torch.flip(v, [0])
+    return new_grouped_features
+
+
 class DlrmHSTU(RankModel):
     """DLRM HSTU model.
 
@@ -168,6 +178,11 @@ class DlrmHSTU(RankModel):
         with record_function("## preprocess ##"):
             grouped_features = self.build_input(batch)
 
+        if not self._model_config.sequence_timestamp_is_ascending:
+            # if timestamp of sequence is descending,
+            # we should reverse all features
+            grouped_features = _fx_flip_tensor_dict(grouped_features)
+
         with record_function("## item_forward ##"):
             candidates_item_embeddings = self._item_embedding_mlp(
                 grouped_features["candidate.sequence"]
@@ -179,6 +194,11 @@ class DlrmHSTU(RankModel):
             mt_preds = self._multitask_module(
                 candidates_user_embeddings, candidates_item_embeddings
             )
+
+        if not self._model_config.sequence_timestamp_is_ascending:
+            # if timestamp of sequence is descending,
+            # we should reverse predictions back to input order
+            mt_preds = _fx_flip_tensor_dict(mt_preds)
 
         predictions = {}
         for task_cfg in self._task_configs:
@@ -201,10 +221,11 @@ class DlrmHSTU(RankModel):
     def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name
         is_sparse_label = any([_is_classification_loss(x) for x in task_cfg.losses])
-        label = batch.sequence_dense_features[label_name]
-        label_values = label.values().squeeze(1)
+        label = batch.jagged_labels[label_name]
         if is_sparse_label:
-            label_values = label_values.to(torch.int64)
+            label_values = label.values().to(torch.int64)
+        else:
+            label_values = label.values().to(torch.float32)
         if task_cfg.HasField("task_bitmask"):
             label_values = (
                 torch.bitwise_and(label_values, task_cfg.task_bitmask) > 0

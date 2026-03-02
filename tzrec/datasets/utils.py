@@ -31,12 +31,41 @@ C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
 HARD_NEG_INDICES = "hard_neg_indices"
 
+# Checkpoint metadata column names injected into RecordBatch
+CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
+CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
+
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
     FieldType.INT64: pa.int64(),
     FieldType.FLOAT: pa.float32(),
     FieldType.DOUBLE: pa.float64(),
     FieldType.STRING: pa.string(),
+    FieldType.ARRAY_INT32: pa.list_(pa.int32()),
+    FieldType.ARRAY_INT64: pa.list_(pa.int64()),
+    FieldType.ARRAY_FLOAT: pa.list_(pa.float32()),
+    FieldType.ARRAY_DOUBLE: pa.list_(pa.float64()),
+    FieldType.ARRAY_STRING: pa.list_(pa.string()),
+    FieldType.ARRAY_ARRAY_INT32: pa.list_(pa.list_(pa.int32())),
+    FieldType.ARRAY_ARRAY_INT64: pa.list_(pa.list_(pa.int64())),
+    FieldType.ARRAY_ARRAY_FLOAT: pa.list_(pa.list_(pa.float32())),
+    FieldType.ARRAY_ARRAY_DOUBLE: pa.list_(pa.list_(pa.float64())),
+    FieldType.ARRAY_ARRAY_STRING: pa.list_(pa.list_(pa.string())),
+    FieldType.MAP_STRING_INT32: pa.map_(pa.string(), pa.int32()),
+    FieldType.MAP_STRING_INT64: pa.map_(pa.string(), pa.int64()),
+    FieldType.MAP_STRING_FLOAT: pa.map_(pa.string(), pa.float32()),
+    FieldType.MAP_STRING_DOUBLE: pa.map_(pa.string(), pa.float64()),
+    FieldType.MAP_STRING_STRING: pa.map_(pa.string(), pa.string()),
+    FieldType.MAP_INT64_INT32: pa.map_(pa.int64(), pa.int32()),
+    FieldType.MAP_INT64_INT64: pa.map_(pa.int64(), pa.int64()),
+    FieldType.MAP_INT64_FLOAT: pa.map_(pa.int64(), pa.float32()),
+    FieldType.MAP_INT64_DOUBLE: pa.map_(pa.int64(), pa.float64()),
+    FieldType.MAP_INT64_STRING: pa.map_(pa.int64(), pa.string()),
+    FieldType.MAP_INT32_INT32: pa.map_(pa.int32(), pa.int32()),
+    FieldType.MAP_INT32_INT64: pa.map_(pa.int32(), pa.int64()),
+    FieldType.MAP_INT32_FLOAT: pa.map_(pa.int32(), pa.float32()),
+    FieldType.MAP_INT32_DOUBLE: pa.map_(pa.int32(), pa.float64()),
+    FieldType.MAP_INT32_STRING: pa.map_(pa.int32(), pa.string()),
 }
 
 
@@ -136,6 +165,8 @@ class Batch(Pipelineable):
     sequence_dense_features: Dict[str, JaggedTensor] = field(default_factory=dict)
     # key of labels is label name
     labels: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # key of jagged_labels is label name
+    jagged_labels: Dict[str, JaggedTensor] = field(default_factory=dict)
     # reserved inputs [for predict]
     reserves: RecordBatchTensor = field(default_factory=RecordBatchTensor)
     # size for user side input tile when do inference and INPUT_TILE=2 or 3
@@ -146,6 +177,8 @@ class Batch(Pipelineable):
     additional_infos: Dict[str, torch.Tensor] = field(default_factory=dict)
     # dummy batch or not
     dummy: bool = field(default=False)
+    # checkpoint info: {source_key: max_abs_row}
+    checkpoint_info: Optional[Dict[str, int]] = field(default=None)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -170,6 +203,10 @@ class Batch(Pipelineable):
                 k: v.to(device=device, non_blocking=non_blocking)
                 for k, v in self.labels.items()
             },
+            jagged_labels={
+                k: v.to(device=device, non_blocking=non_blocking)
+                for k, v in self.jagged_labels.items()
+            },
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={
@@ -181,6 +218,7 @@ class Batch(Pipelineable):
                 for k, v in self.additional_infos.items()
             },
             dummy=self.dummy,
+            checkpoint_info=self.checkpoint_info,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -198,6 +236,9 @@ class Batch(Pipelineable):
             # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.labels.values():
+            v.record_stream(stream)
+        for v in self.jagged_labels.values():
+            # pyre-ignore [6]
             v.record_stream(stream)
         for v in self.sample_weights.values():
             v.record_stream(stream)
@@ -226,6 +267,17 @@ class Batch(Pipelineable):
                 lengths=lengths.pin_memory() if lengths is not None else None,
                 offsets=offsets.pin_memory() if offsets is not None else None,
             )
+        jagged_labels = {}
+        for k, v in self.jagged_labels.items():
+            weights = v._weights
+            lengths = v._lengths
+            offsets = v._offsets
+            jagged_labels[k] = JaggedTensor(
+                values=v.values().pin_memory(),
+                weights=weights.pin_memory() if weights is not None else None,
+                lengths=lengths.pin_memory() if lengths is not None else None,
+                offsets=offsets.pin_memory() if offsets is not None else None,
+            )
         return Batch(
             dense_features=dense_features,
             sparse_features={
@@ -236,6 +288,7 @@ class Batch(Pipelineable):
             },
             sequence_dense_features=sequence_dense_features,
             labels={k: v.pin_memory() for k, v in self.labels.items()},
+            jagged_labels=jagged_labels,
             reserves=self.reserves,
             tile_size=self.tile_size,
             sample_weights={k: v.pin_memory() for k, v in self.sample_weights.items()},
@@ -243,6 +296,7 @@ class Batch(Pipelineable):
                 k: v.pin_memory() for k, v in self.additional_infos.items()
             },
             dummy=self.dummy,
+            checkpoint_info=self.checkpoint_info,
         )
 
     def to_dict(
@@ -281,6 +335,9 @@ class Batch(Pipelineable):
             tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.labels.items():
             tensor_dict[f"{k}"] = v
+        for k, v in self.jagged_labels.items():
+            tensor_dict[f"{k}.values"] = v.values()
+            tensor_dict[f"{k}.lengths"] = v.lengths()
         for k, v in self.sample_weights.items():
             tensor_dict[f"{k}"] = v
         if self.tile_size > 0:

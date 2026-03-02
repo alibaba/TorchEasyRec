@@ -45,7 +45,12 @@ def run_cmd(cmd_str, log_file, env=None, timeout=None):
             proc = subprocess.Popen(
                 run_cmd_str, stdout=lfile, stderr=subprocess.STDOUT, shell=True, env=env
             )
-        proc.wait(timeout)
+        try:
+            proc.wait(timeout)
+        except subprocess.TimeoutExpired as e:
+            proc.kill()
+            proc.wait()
+            raise e
         if proc.returncode == 0:
             return True
         else:

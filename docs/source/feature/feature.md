@@ -1,6 +1,6 @@
 # 特征
 
-TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、SequenceFeature。
+TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、CustomFeature、SequenceFeature。
 
 **共用配置**
 
@@ -540,7 +540,7 @@ feature_configs: {
 
 - 其余配置同RawFeature
 
-## BoolMaskFeature
+## BoolMaskFeature：布尔值过滤
 
 通过布尔值过滤元素，类似tf.boolean_mask(tensor, mask).
 
@@ -594,6 +594,14 @@ feature_configs: {
 - operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
 
 - expression: 特征FG所依赖组合字段的来源
+
+- operator_params: 特征算子的自定义参数，是一个[google.protobuf.Struct](https://protobuf.dev/reference/protobuf/google.protobuf/#struct)对象
+
+  - key: 参数名
+  - value: 参数值，是一个[google.protobuf.Value](https://protobuf.dev/reference/protobuf/google.protobuf/#value)对象，常用：
+    - number_value: 值为数值
+    - string_value: 值为字符串
+    - bool_value: 值为布尔
 
 - 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
 
