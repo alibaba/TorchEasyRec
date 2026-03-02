@@ -227,7 +227,9 @@ class CheckpointUtilsTest(unittest.TestCase):
         # Now redistribute among 3 workers
         total_rows = 0
         for worker_id in range(3):
-            result = redistribute_intervals(intervals, worker_id=worker_id, num_workers=3)
+            result = redistribute_intervals(
+                intervals, worker_id=worker_id, num_workers=3
+            )
             for start, end in result:
                 total_rows += end - start
 

@@ -47,9 +47,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
-    calc_remaining_intervals,
     calc_slice_position,
-    redistribute_intervals,
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature

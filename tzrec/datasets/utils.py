@@ -593,7 +593,7 @@ def calc_remaining_intervals(
     # Calculate remaining intervals
     remaining = []
     num_entries = len(entries)
-    for i, (start, consumed) in enumerate(entries):
+    for i, (_, consumed) in enumerate(entries):
         # Infer the end of this worker's range
         if i + 1 < num_entries:
             range_end = entries[i + 1][0]  # Next worker's start
@@ -642,9 +642,10 @@ def redistribute_intervals(
         worker_start = worker_id * (rows_per_worker + 1)
         worker_rows = rows_per_worker + 1
     else:
-        worker_start = remainder * (rows_per_worker + 1) + (
-            worker_id - remainder
-        ) * rows_per_worker
+        worker_start = (
+            remainder * (rows_per_worker + 1)
+            + (worker_id - remainder) * rows_per_worker
+        )
         worker_rows = rows_per_worker
 
     if worker_rows == 0:

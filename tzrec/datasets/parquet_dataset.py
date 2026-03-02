@@ -77,13 +77,13 @@ def _reader_iter(
                 original_batch_len = len(batch)  # Store before any modification
                 if cnt + original_batch_len <= start:
                     logger.debug(
-                        f"worker {worker_id} skip batch. "
-                        f"start: {start}, end: {end}, cnt: {cnt}, len: {original_batch_len}."
+                        f"worker {worker_id} skip batch. start: {start}, "
+                        f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
                 elif cnt <= start:
                     logger.debug(
-                        f"worker {worker_id} yield start batch. "
-                        f"start: {start}, end: {end}, cnt: {cnt}, len: {original_batch_len}."
+                        f"worker {worker_id} yield start batch. start: {start}, "
+                        f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
                     sliced_batch = batch[start - cnt : end - cnt]
                     # Inject checkpoint metadata if source_id is provided
@@ -302,9 +302,7 @@ class ParquetReader(BaseReader):
                 return  # All data already consumed
 
             # Redistribute remaining intervals among current workers
-            worker_intervals = redistribute_intervals(
-                remaining, worker_id, num_workers
-            )
+            worker_intervals = redistribute_intervals(remaining, worker_id, num_workers)
             if not worker_intervals:
                 return  # This worker has no data to process
 
