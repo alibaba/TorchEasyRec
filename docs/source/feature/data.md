@@ -309,6 +309,29 @@ input_fields: {
 - 当使用KafkaDataset：
   - `input_type` 支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING | ARRAY_INT32 | ARRAY_INT64 | ARRAY_FLOAT | ARRAY_DOUBLE | ARRAY_STRING | ARRAY_ARRAY_INT32 | ARRAY_ARRAY_INT64 | ARRAY_ARRAY_FLOAT | ARRAY_ARRAY_DOUBLE | ARRAY_ARRAY_STRING | MAP_STRING_INT32 | MAP_STRING_INT64 | MAP_STRING_FLOAT | MAP_STRING_DOUBLE | MAP_STRING_STRING | MAP_INT64_INT32 | MAP_INT64_INT64 | MAP_INT64_FLOAT | MAP_INT64_DOUBLE | MAP_INT64_STRING | MAP_INT32_INT32 | MAP_INT32_INT64 | MAP_INT32_FLOAT | MAP_INT32_DOUBLE | MAP_INT32_STRING
 
+### input_fields_str
+
+`input_fields_str`是`input_fields`的简化配置格式，格式为: `field_name1:field_type1;field_name2:field_type2;`
+
+示例:
+
+```
+data_config {
+    input_fields_str: "user_id:BIGINT;item_id:BIGINT;label:FLOAT;features:ARRAY<FLOAT>;"
+}
+```
+
+支持的类型名(仅支持ODPS格式):
+
+- 基本类型: INT, INT32, BIGINT, INT64, STRING, FLOAT, DOUBLE
+- 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)
+- 数组类型: ARRAY<INT>, ARRAY<INT32>, ARRAY<BIGINT>, ARRAY<INT64>, ARRAY<STRING>, ARRAY<FLOAT>, ARRAY<DOUBLE>
+- 嵌套数组: ARRAY\<ARRAY<INT>>, ARRAY\<ARRAY<BIGINT>>, ARRAY\<ARRAY<STRING>> 等
+- Map类型: MAP\<STRING,INT>, MAP\<STRING,INT32>, MAP\<STRING,BIGINT>, MAP\<STRING,INT64>, MAP\<BIGINT,STRING>, MAP\<INT64,STRING> 等
+- 逗号周围允许空格: `MAP<STRING, BIGINT>` 是有效的
+
+注意: 如果同时设置了`input_fields_str`和`input_fields`，`input_fields_str`优先级更高。
+
 ### 更多配置
 
 - [参考文档](../proto.html#tzrec.protos.DataConfig)

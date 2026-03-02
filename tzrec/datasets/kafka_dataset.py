@@ -19,7 +19,12 @@ import pyarrow as pa
 from confluent_kafka import Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
-from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, FIELD_TYPE_TO_PA
+from tzrec.datasets.utils import (
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
+    FIELD_TYPE_TO_PA,
+    get_input_fields_config,
+)
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils.logging_util import logger
@@ -77,8 +82,9 @@ class KafkaDataset(BaseDataset):
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
 
+        input_fields_list = get_input_fields_config(self._data_config)
         input_fields = []
-        for f in self._data_config.input_fields:
+        for f in input_fields_list:
             pa_type = FIELD_TYPE_TO_PA.get(f.input_type)
             input_fields.append(pa.field(f.input_name, pa_type))
 

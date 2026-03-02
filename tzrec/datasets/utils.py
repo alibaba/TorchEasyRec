@@ -9,8 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -20,6 +21,7 @@ import torch
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
 
+from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
 
 BASE_DATA_GROUP = "__BASE__"
@@ -67,6 +69,129 @@ FIELD_TYPE_TO_PA = {
     FieldType.MAP_INT32_DOUBLE: pa.map_(pa.int32(), pa.float64()),
     FieldType.MAP_INT32_STRING: pa.map_(pa.int32(), pa.string()),
 }
+
+# Type name mapping from ODPS-style type str to FieldType enum
+# Note: Aliases INT/INT32 and BIGINT/INT64 are handled by normalizing the type string
+TYPE_STR_TO_FIELD_TYPE = {
+    # Basic types (use canonical names INT32/INT64)
+    "INT32": FieldType.INT32,
+    "INT64": FieldType.INT64,
+    "STRING": FieldType.STRING,
+    "FLOAT": FieldType.FLOAT,
+    "DOUBLE": FieldType.DOUBLE,
+    # Array types (use canonical INT32/INT64 inside)
+    "ARRAY<INT32>": FieldType.ARRAY_INT32,
+    "ARRAY<INT64>": FieldType.ARRAY_INT64,
+    "ARRAY<STRING>": FieldType.ARRAY_STRING,
+    "ARRAY<FLOAT>": FieldType.ARRAY_FLOAT,
+    "ARRAY<DOUBLE>": FieldType.ARRAY_DOUBLE,
+    # Nested array types
+    "ARRAY<ARRAY<INT32>>": FieldType.ARRAY_ARRAY_INT32,
+    "ARRAY<ARRAY<INT64>>": FieldType.ARRAY_ARRAY_INT64,
+    "ARRAY<ARRAY<STRING>>": FieldType.ARRAY_ARRAY_STRING,
+    "ARRAY<ARRAY<FLOAT>>": FieldType.ARRAY_ARRAY_FLOAT,
+    "ARRAY<ARRAY<DOUBLE>>": FieldType.ARRAY_ARRAY_DOUBLE,
+    # Map types (use canonical INT32/INT64 inside)
+    "MAP<STRING,INT32>": FieldType.MAP_STRING_INT32,
+    "MAP<STRING,INT64>": FieldType.MAP_STRING_INT64,
+    "MAP<STRING,STRING>": FieldType.MAP_STRING_STRING,
+    "MAP<STRING,FLOAT>": FieldType.MAP_STRING_FLOAT,
+    "MAP<STRING,DOUBLE>": FieldType.MAP_STRING_DOUBLE,
+    "MAP<INT64,INT32>": FieldType.MAP_INT64_INT32,
+    "MAP<INT64,INT64>": FieldType.MAP_INT64_INT64,
+    "MAP<INT64,STRING>": FieldType.MAP_INT64_STRING,
+    "MAP<INT64,FLOAT>": FieldType.MAP_INT64_FLOAT,
+    "MAP<INT64,DOUBLE>": FieldType.MAP_INT64_DOUBLE,
+    "MAP<INT32,INT32>": FieldType.MAP_INT32_INT32,
+    "MAP<INT32,INT64>": FieldType.MAP_INT32_INT64,
+    "MAP<INT32,STRING>": FieldType.MAP_INT32_STRING,
+    "MAP<INT32,FLOAT>": FieldType.MAP_INT32_FLOAT,
+    "MAP<INT32,DOUBLE>": FieldType.MAP_INT32_DOUBLE,
+}
+
+
+def _normalize_type_str(type_str: str) -> str:
+    """Normalize type string.
+
+    1. Converting to uppercase
+    2. Removing spaces
+    3. Replacing ODPS aliases: BIGINT->INT64, INT->INT32
+       (handles both BIGINT/INT64 and INT/INT32 as valid inputs)
+
+    Args:
+        type_str: type string to normalize
+
+    Returns:
+        normalized type string
+    """
+    normalized = type_str.upper().strip()
+    normalized = re.sub(r"\s*", "", normalized)
+    # Use word boundaries to match whole words only
+    normalized = re.sub(r"\bBIGINT\b", "INT64", normalized)
+    normalized = re.sub(r"\bINT\b", "INT32", normalized)
+    return normalized
+
+
+def get_input_fields_config(
+    data_config: data_pb2.DataConfig,
+) -> List[data_pb2.Field]:
+    """Get input fields from data_config.input_fields_str or data_config.input_fields.
+
+    If input_fields_str is specified, parse it and return the fields.
+    Otherwise, return data_config.input_fields directly.
+
+    Args:
+        data_config: DataConfig proto message
+
+    Returns:
+        List of Field proto messages
+    """
+    if data_config.HasField("input_fields_str") and data_config.input_fields_str:
+        input_fields_str = data_config.input_fields_str.strip()
+        if not input_fields_str:
+            return []
+
+        fields = []
+        # Split by semicolon, filter out empty parts
+        field_parts = [p.strip() for p in input_fields_str.split(";") if p.strip()]
+        for field_part in field_parts:
+            if ":" not in field_part:
+                raise ValueError(
+                    f"Invalid input_fields_str format: '{field_part}'. "
+                    "Expected format: 'field_name:field_type'"
+                )
+            name, type_str = field_part.split(":", 1)
+            name = name.strip()
+            type_str = type_str.strip()
+
+            if not name:
+                raise ValueError(
+                    f"Empty field name in input_fields_str: '{field_part}'"
+                )
+            if not type_str:
+                raise ValueError(
+                    f"Empty field type in input_fields_str: '{field_part}'"
+                )
+
+            # Normalize the type string
+            normalized_type = _normalize_type_str(type_str)
+
+            if normalized_type not in TYPE_STR_TO_FIELD_TYPE:
+                raise ValueError(
+                    f"Unknown field type '{type_str}' "
+                    f"(normalized: '{normalized_type}') for field '{name}'. "
+                    f"Supported types: {list(TYPE_STR_TO_FIELD_TYPE.keys())}"
+                )
+
+            field_proto = data_pb2.Field()
+            field_proto.input_name = name
+            field_proto.input_type = TYPE_STR_TO_FIELD_TYPE[normalized_type]
+            fields.append(field_proto)
+
+        return fields
+    else:
+        # Return the existing input_fields
+        return list(data_config.input_fields)
 
 
 @dataclass
