@@ -26,6 +26,8 @@ from tzrec.datasets.sampler import BaseSampler, TDMSampler
 from tzrec.datasets.utils import (
     C_NEG_SAMPLE_MASK,
     C_SAMPLE_MASK,
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
     Batch,
     RecordBatchTensor,
     process_hstu_neg_sample,
@@ -306,6 +308,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         return rank * num_workers + worker_id, num_workers * world_size
 
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+        """Set checkpoint state for resume.
+
+        Args:
+            state: dict mapping source_key to max consumed row index.
+        """
+        assert self._reader is not None
+        self._reader.load_state_dict(state)
+
     def __iter__(self) -> Iterator[Batch]:
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
@@ -323,6 +334,24 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         Returns:
             an instance of Batch.
         """
+        # Extract checkpoint info if present
+        checkpoint_info = None
+        if CKPT_SOURCE_ID in input_data and CKPT_ROW_IDX in input_data:
+            source_ids = input_data.pop(CKPT_SOURCE_ID)
+            row_idxs = input_data.pop(CKPT_ROW_IDX)
+
+            # Use PyArrow group_by + max aggregation
+            table = pa.table({CKPT_SOURCE_ID: source_ids, CKPT_ROW_IDX: row_idxs})
+            grouped = table.group_by(CKPT_SOURCE_ID).aggregate([(CKPT_ROW_IDX, "max")])
+
+            # Convert to dict: {source_key: max_absolute_position}
+            checkpoint_info = dict(
+                zip(
+                    grouped[CKPT_SOURCE_ID].to_pylist(),
+                    grouped[f"{CKPT_ROW_IDX}_max"].to_pylist(),
+                )
+            )
+
         use_sample_mask = self._mode == Mode.TRAIN and (
             self._data_config.negative_sample_mask_prob > 0
             or self._data_config.sample_mask_prob > 0
@@ -416,6 +445,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 batch.reserves = RecordBatchTensor(pa.record_batch(reserved_data))
         else:
             batch = self._data_parser.to_batch(output_data)
+
+        # Set checkpoint info on batch
+        batch.checkpoint_info = checkpoint_info
         return batch
 
     @property
@@ -462,11 +494,20 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
         self._use_sample_cost = False
+        self._checkpoint_state: Optional[Dict[str, int]] = None
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
             assert (
                 self._sample_cost_field is not None and len(self._sample_cost_field) > 0
             ), "Should set data_config.sample_cost_field when use batch_cost_size"
             self._use_sample_cost = True
+
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+        """Set checkpoint state for resume.
+
+        Args:
+            state: dict mapping source_key to max consumed row index.
+        """
+        self._checkpoint_state = state
 
     @property
     def schema(self) -> pa.Schema:
