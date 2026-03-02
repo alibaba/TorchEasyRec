@@ -11,16 +11,18 @@
 
 
 import math
+import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, FIELD_TYPE_TO_PA
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils.logging_util import logger
 
 
 def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
@@ -156,7 +158,24 @@ class KafkaReader(BaseReader):
         """
         topic, config = _parse_kafka_uri(self._input_path)
         consumer = Consumer(config)
-        consumer.subscribe([topic])
+
+        # Define on_assign callback to seek to checkpointed offsets
+        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
+            if self._checkpoint_state:
+                for tp in partitions:
+                    source_key = f"{tp.topic}:{tp.partition}"
+                    if source_key in self._checkpoint_state:
+                        # Resume after last consumed offset
+                        tp.offset = self._checkpoint_state[source_key] + 1
+                    else:
+                        tp.offset = 0
+            consumer.assign(partitions)
+            logger.info(
+                f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "
+                f"assignment: {consumer.assignment()}"
+            )
+
+        consumer.subscribe([topic], on_assign=on_assign)
 
         batch_size_per_msg = None
         try:
@@ -175,7 +194,9 @@ class KafkaReader(BaseReader):
                 row_indices = []
 
                 for msg in messages:
-                    if msg.error():
+                    msg_error = msg.error()
+                    if msg_error:
+                        logger.error(msg_error)
                         continue
                     msg_data = msg.value()
                     record_batch = pa.ipc.read_record_batch(msg_data, self._full_schema)
@@ -220,7 +241,9 @@ class KafkaReader(BaseReader):
 
                 for batch in t.to_batches():
                     yield batch
-
+        except Exception as e:
+            logger.error(f"KafkaReader exception: {e}", flush=True)
+            raise e
         finally:
             consumer.close()
 

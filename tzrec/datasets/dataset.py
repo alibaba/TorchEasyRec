@@ -308,6 +308,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         return rank * num_workers + worker_id, num_workers * world_size
 
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+        """Set checkpoint state for resume.
+
+        Args:
+            state: dict mapping source_key to max consumed row index.
+        """
+        assert self._reader is not None
+        self._reader.load_state_dict(state)
+
     def __iter__(self) -> Iterator[Batch]:
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
@@ -333,9 +342,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
             # Use PyArrow group_by + max aggregation
             table = pa.table({CKPT_SOURCE_ID: source_ids, CKPT_ROW_IDX: row_idxs})
-            grouped = table.group_by(CKPT_SOURCE_ID).aggregate(
-                [(CKPT_ROW_IDX, "max")]
-            )
+            grouped = table.group_by(CKPT_SOURCE_ID).aggregate([(CKPT_ROW_IDX, "max")])
 
             # Convert to dict: {source_key: max_absolute_position}
             checkpoint_info = dict(
@@ -494,7 +501,7 @@ class BaseReader(metaclass=_reader_meta_cls):
             ), "Should set data_config.sample_cost_field when use batch_cost_size"
             self._use_sample_cost = True
 
-    def set_checkpoint_state(self, state: Optional[Dict[str, int]]) -> None:
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
         """Set checkpoint state for resume.
 
         Args:
