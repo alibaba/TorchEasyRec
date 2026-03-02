@@ -37,6 +37,34 @@ from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
 
+def _inject_checkpoint_metadata(
+    batch: pa.RecordBatch,
+    source_id: str,
+    global_row_idx: int,
+) -> Tuple[pa.RecordBatch, int]:
+    """Inject checkpoint metadata (source_id and row_idx) into a batch.
+
+    Args:
+        batch: The input record batch.
+        source_id: The source identifier for checkpointing.
+        global_row_idx: The current global row index.
+
+    Returns:
+        A tuple of (new_batch_with_metadata, updated_global_row_idx).
+    """
+    batch_len = len(batch)
+    row_indices = list(range(global_row_idx, global_row_idx + batch_len))
+    new_batch = pa.RecordBatch.from_arrays(
+        list(batch.columns)
+        + [
+            pa.array([source_id] * batch_len, type=pa.string()),
+            pa.array(row_indices, type=pa.int64()),
+        ],
+        names=list(batch.schema.names) + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
+    )
+    return new_batch, global_row_idx + batch_len
+
+
 def _reader_iter(
     input_files: List[str],
     batch_size: int,
@@ -86,59 +114,23 @@ def _reader_iter(
                         f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
                     sliced_batch = batch[start - cnt : end - cnt]
-                    # Inject checkpoint metadata if source_id is provided
                     if source_id is not None:
-                        batch_len = len(sliced_batch)
-                        row_indices = list(
-                            range(global_row_idx, global_row_idx + batch_len)
+                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
                         )
-                        sliced_batch = pa.RecordBatch.from_arrays(
-                            list(sliced_batch.columns)
-                            + [
-                                pa.array([source_id] * batch_len, type=pa.string()),
-                                pa.array(row_indices, type=pa.int64()),
-                            ],
-                            names=list(sliced_batch.schema.names)
-                            + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                        )
-                        global_row_idx += batch_len
                     yield sliced_batch
                 elif cnt + original_batch_len > end:
                     sliced_batch = batch[: end - cnt]
-                    # Inject checkpoint metadata if source_id is provided
                     if source_id is not None:
-                        batch_len = len(sliced_batch)
-                        row_indices = list(
-                            range(global_row_idx, global_row_idx + batch_len)
+                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
                         )
-                        sliced_batch = pa.RecordBatch.from_arrays(
-                            list(sliced_batch.columns)
-                            + [
-                                pa.array([source_id] * batch_len, type=pa.string()),
-                                pa.array(row_indices, type=pa.int64()),
-                            ],
-                            names=list(sliced_batch.schema.names)
-                            + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                        )
-                        global_row_idx += batch_len
                     yield sliced_batch
                 else:
-                    # Inject checkpoint metadata if source_id is provided
                     if source_id is not None:
-                        batch_len = len(batch)
-                        row_indices = list(
-                            range(global_row_idx, global_row_idx + batch_len)
+                        batch, global_row_idx = _inject_checkpoint_metadata(
+                            batch, source_id, global_row_idx
                         )
-                        batch = pa.RecordBatch.from_arrays(
-                            list(batch.columns)
-                            + [
-                                pa.array([source_id] * batch_len, type=pa.string()),
-                                pa.array(row_indices, type=pa.int64()),
-                            ],
-                            names=list(batch.schema.names)
-                            + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                        )
-                        global_row_idx += batch_len
                     yield batch
 
                 cnt += original_batch_len
