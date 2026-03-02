@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import io
 import os
 import time
 import unittest
@@ -55,7 +56,9 @@ class KafkaDatasetTest(unittest.TestCase):
         except Exception as e:
             logger.error(e)
 
-    def _create_test_table_and_feature_cfgs(self, has_lookup=True):
+    def _create_test_table_and_feature_cfgs(
+        self, has_lookup=True, embedded_schema=False
+    ):
         create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
@@ -112,7 +115,15 @@ class KafkaDatasetTest(unittest.TestCase):
                     "label": pa.array([0] * 128, type=pa.int64()),
                 }
             )
-            producer.produce(topic=self.test_topic, value=record_batch.serialize())
+            if embedded_schema:
+                # Serialize with embedded schema using IPC stream format
+                sink = io.BytesIO()
+                with pa.ipc.new_stream(sink, record_batch.schema) as writer:
+                    writer.write_batch(record_batch)
+                value = sink.getvalue()
+            else:
+                value = record_batch.serialize()
+            producer.produce(topic=self.test_topic, value=value)
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -332,6 +343,55 @@ class KafkaDatasetTest(unittest.TestCase):
                 # New offset should be less than or equal to acc checkpoint offset
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
+
+    @unittest.skipIf(
+        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+    )
+    def test_kafka_dataset_embedded_schema(self):
+        """Test KafkaDataset with embedded schema (no input_fields)."""
+        feature_cfgs, _ = self._create_test_table_and_feature_cfgs(embedded_schema=True)
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        # Create dataset WITHOUT input_fields - schema inferred from message
+        dataset = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                # No input_fields - embedded schema mode
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        for _ in range(2):
+            data = next(iterator)
+            data_dict = data.to_dict()
+            self.assertEqual(
+                sorted(data_dict.keys()),
+                [
+                    "id_a.lengths",
+                    "id_a.values",
+                    "label",
+                    "lookup_h.values",
+                    "raw_c.values",
+                    "raw_d.values",
+                    "raw_e.values",
+                    "raw_f.values",
+                    "raw_g.values",
+                    "tag_b.lengths",
+                    "tag_b.values",
+                ],
+            )
+            self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
 
 if __name__ == "__main__":
