@@ -90,7 +90,6 @@ class KafkaDataset(BaseDataset):
             self._data_config.drop_remainder,
             input_fields=input_fields,
         )
-        self._init_input_fields()
 
 
 class KafkaReader(BaseReader):

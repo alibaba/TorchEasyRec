@@ -285,8 +285,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     @property
     def input_fields(self) -> List[pa.Field]:
         """Input fields info, overwrote by subclass for auto infer the info."""
-        if not self._input_fields:
-            self._input_fields = list(self._data_config.input_fields)
+        if self._input_fields is None:
+            self._init_input_fields()
         return self._input_fields
 
     def get_worker_info(self) -> Tuple[int, int]:
