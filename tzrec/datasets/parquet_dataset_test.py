@@ -27,12 +27,34 @@ from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, Parque
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import misc_util
+from tzrec.utils.checkpoint_util import update_dataloder_state
 
 
 class ParquetDatasetTest(unittest.TestCase):
-    @parameterized.expand([[5000], [10000]])
-    def test_parquet_dataset(self, num_rows):
-        feature_cfgs = [
+    def _create_test_parquet_data(self, test_dir: str, num_rows: int = 1000) -> None:
+        """Create test parquet data files."""
+        t = pa.Table.from_arrays(
+            [
+                pa.array(["unused"] * num_rows),
+                pa.array(["1"] * num_rows),
+                pa.array(["2\x033"] * num_rows),
+                pa.array([4] * num_rows),
+                pa.array([[5.0, 6.0]] * num_rows, type=pa.list_(pa.float32())),
+                pa.array([0] * num_rows),
+            ],
+            names=["unused", "id_a", "tag_b", "raw_c", "raw_d", "label"],
+        )
+        ds.write_dataset(
+            t,
+            test_dir,
+            format="parquet",
+            max_rows_per_file=5000,
+            max_rows_per_group=5000,
+        )
+
+    def _create_feature_cfgs(self):
+        """Create feature configs for testing."""
+        return [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(feature_name="id_a")
             ),
@@ -46,27 +68,14 @@ class ParquetDatasetTest(unittest.TestCase):
                 raw_feature=feature_pb2.RawFeature(feature_name="raw_d", value_dim=2)
             ),
         ]
+
+    @parameterized.expand([[5000], [10000]])
+    def test_parquet_dataset(self, num_rows):
+        feature_cfgs = self._create_feature_cfgs()
         features = create_features(feature_cfgs)
 
-        t = pa.Table.from_arrays(
-            [
-                pa.array(["unused"] * num_rows),
-                pa.array(["1"] * num_rows),
-                pa.array(["2\x033"] * num_rows),
-                pa.array([4] * num_rows),
-                pa.array([[5.0, 6.0]] * num_rows, type=pa.list_(pa.float32())),
-                pa.array([0] * num_rows),
-            ],
-            names=["unused", "id_a", "tag_b", "raw_c", "raw_d", "label"],
-        )
         with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            ds.write_dataset(
-                t,
-                test_dir,
-                format="parquet",
-                max_rows_per_file=5000,
-                max_rows_per_group=5000,
-            )
+            self._create_test_parquet_data(test_dir, num_rows)
 
             dataset = ParquetDataset(
                 data_config=data_pb2.DataConfig(
@@ -101,6 +110,130 @@ class ParquetDatasetTest(unittest.TestCase):
                     "tag_b.values",
                 ],
             )
+
+    def test_parquet_dataset_checkpoint_metadata(self):
+        """Test that checkpoint_info is present and has correct format."""
+        feature_cfgs = self._create_feature_cfgs()
+        features = create_features(feature_cfgs)
+
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_test_parquet_data(test_dir, num_rows=1000)
+            input_path = f"{test_dir}/*.parquet"
+
+            dataset = ParquetDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=128,
+                    dataset_type=data_pb2.DatasetType.ParquetDataset,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path=input_path,
+            )
+            dataloader = DataLoader(
+                dataset=dataset,
+                batch_size=None,
+                num_workers=2,
+                pin_memory=True,
+                collate_fn=lambda x: x,
+            )
+            iterator = iter(dataloader)
+            batch = next(iterator)
+
+            # Verify checkpoint_info is present and has correct format
+            self.assertIsNotNone(batch.checkpoint_info)
+            self.assertIsInstance(batch.checkpoint_info, dict)
+
+            # Checkpoint keys should be in format "{input_path}:{start}"
+            for key, value in batch.checkpoint_info.items():
+                self.assertIn(":", key)
+                parts = key.rsplit(":", 1)
+                self.assertEqual(len(parts), 2)
+                # start should be numeric
+                self.assertTrue(parts[1].isdigit())
+                # Value should be a non-negative integer
+                self.assertIsInstance(value, int)
+                self.assertGreaterEqual(value, 0)
+
+    def test_parquet_dataset_checkpoint_resume(self):
+        """Test checkpoint resume functionality."""
+        feature_cfgs = self._create_feature_cfgs()
+        features = create_features(feature_cfgs)
+
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_test_parquet_data(test_dir, num_rows=1000)
+            input_path = f"{test_dir}/*.parquet"
+
+            # First, read some batches and capture checkpoint info
+            dataset1 = ParquetDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=128,
+                    dataset_type=data_pb2.DatasetType.ParquetDataset,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path=input_path,
+            )
+            dataloader1 = DataLoader(
+                dataset=dataset1,
+                batch_size=None,
+                num_workers=2,
+                pin_memory=True,
+                collate_fn=lambda x: x,
+            )
+            iterator1 = iter(dataloader1)
+
+            # Read first batch and capture checkpoint
+            checkpoint_state_acc = {}
+            batch1 = next(iterator1)
+            first_checkpoint_state = batch1.checkpoint_info.copy()
+            update_dataloder_state(checkpoint_state_acc, first_checkpoint_state)
+            self.assertIsNotNone(first_checkpoint_state)
+            self.assertGreater(len(first_checkpoint_state), 0)
+
+            # Read more batches
+            for _ in range(3):
+                batch1 = next(iterator1)
+                update_dataloder_state(
+                    checkpoint_state_acc, batch1.checkpoint_info.copy()
+                )
+            del iterator1
+            del dataloader1
+
+            # Now create a new dataset with checkpoint state set
+            dataset2 = ParquetDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=128,
+                    dataset_type=data_pb2.DatasetType.ParquetDataset,
+                    fg_mode=data_pb2.FgMode.FG_NONE,
+                    label_fields=["label"],
+                ),
+                features=features,
+                input_path=input_path,
+            )
+            dataloader2 = DataLoader(
+                dataset=dataset2,
+                batch_size=None,
+                num_workers=2,
+                pin_memory=True,
+                collate_fn=lambda x: x,
+            )
+            # Set first batch checkpoint state to resume from saved offsets
+            dataloader2.dataset.load_state_dict(first_checkpoint_state)
+            iterator2 = iter(dataloader2)
+
+            # Read batch from resumed dataset
+            batch2 = next(iterator2)
+
+            # The resumed batch should have offsets greater than the checkpoint
+            for key, new_offset in batch2.checkpoint_info.items():
+                if key in first_checkpoint_state:
+                    # New offset should be greater than first checkpoint offset
+                    self.assertGreater(new_offset, first_checkpoint_state[key])
+                if key in checkpoint_state_acc:
+                    # New offset should be less than or equal to acc checkpoint offset
+                    self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
 
 class ParquetReaderTest(unittest.TestCase):

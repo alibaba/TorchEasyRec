@@ -24,11 +24,43 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import calc_slice_position
+from tzrec.datasets.utils import (
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
+    calc_slice_intervals,
+)
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
+
+
+def _inject_checkpoint_metadata(
+    batch: pa.RecordBatch,
+    source_id: str,
+    global_row_idx: int,
+) -> Tuple[pa.RecordBatch, int]:
+    """Inject checkpoint metadata (source_id and row_idx) into a batch.
+
+    Args:
+        batch: The input record batch.
+        source_id: The source identifier for checkpointing.
+        global_row_idx: The current global row index.
+
+    Returns:
+        A tuple of (new_batch_with_metadata, updated_global_row_idx).
+    """
+    batch_len = len(batch)
+    row_indices = list(range(global_row_idx, global_row_idx + batch_len))
+    new_batch = pa.RecordBatch.from_arrays(
+        list(batch.columns)
+        + [
+            pa.array([source_id] * batch_len, type=pa.string()),
+            pa.array(row_indices, type=pa.int64()),
+        ],
+        names=list(batch.schema.names) + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
+    )
+    return new_batch, global_row_idx + batch_len
 
 
 def _reader_iter(
@@ -39,8 +71,10 @@ def _reader_iter(
     start: int,
     end: int,
     worker_id: int,
+    source_id: Optional[str] = None,
 ) -> Iterator[pa.RecordBatch]:
     cnt = 0
+    global_row_idx = start  # Track absolute global row index
     for input_file in input_files:
         if cnt >= end:
             break
@@ -66,23 +100,38 @@ def _reader_iter(
             for batch in parquet_file.iter_batches(
                 batch_size, row_groups=row_groups, columns=columns, use_threads=False
             ):
-                if cnt + len(batch) <= start:
+                original_batch_len = len(batch)  # Store before any modification
+                if cnt + original_batch_len <= start:
                     logger.debug(
-                        f"worker {worker_id} skip batch. "
-                        f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
+                        f"worker {worker_id} skip batch. start: {start}, "
+                        f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
                 elif cnt <= start:
                     logger.debug(
-                        f"worker {worker_id} yield start batch. "
-                        f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
+                        f"worker {worker_id} yield start batch. start: {start}, "
+                        f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
-                    yield batch[start - cnt : end - cnt]
-                elif cnt + len(batch) > end:
-                    yield batch[: end - cnt]
+                    sliced_batch = batch[start - cnt : end - cnt]
+                    if source_id is not None:
+                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
+                        )
+                    yield sliced_batch
+                elif cnt + original_batch_len > end:
+                    sliced_batch = batch[: end - cnt]
+                    if source_id is not None:
+                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
+                        )
+                    yield sliced_batch
                 else:
+                    if source_id is not None:
+                        batch, global_row_idx = _inject_checkpoint_metadata(
+                            batch, source_id, global_row_idx
+                        )
                     yield batch
 
-                cnt += len(batch)
+                cnt += original_batch_len
                 if cnt >= end:
                     break
             parquet_file.close()
@@ -226,17 +275,22 @@ class ParquetReader(BaseReader):
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        start, end = 0, sys.maxsize
+        if len(self._input_files) == 0:
+            return
+
+        worker_intervals = [(0, sys.maxsize)]
         if self._rebalance:
-            start, end, _ = calc_slice_position(
+            worker_intervals, _ = calc_slice_intervals(
                 sum(self._num_rows),
                 worker_id,
                 num_workers,
                 self._batch_size,
                 self._drop_redundant_bs_eq_one,
+                checkpoint_state=self._checkpoint_state,
+                input_path=self._input_path,
             )
 
-        if len(self._input_files) > 0:
+        for start, end in worker_intervals:
             reader = _reader_iter(
                 self._input_files
                 if self._rebalance
@@ -247,6 +301,7 @@ class ParquetReader(BaseReader):
                 start,
                 end,
                 worker_id,
+                source_id=f"{self._input_path}:{start}" if self._rebalance else None,
             )
             yield from self._arrow_reader_iter(reader)
 
