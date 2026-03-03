@@ -1,6 +1,6 @@
 name: Code Review
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, synchronize]
 
 jobs:
@@ -12,14 +12,16 @@ jobs:
       pull-requests: write
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
       - name: RunCodeReview
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: "/review"
           claude_args: "--model ${{ secrets.ANTHROPIC_MODEL }}"
+          show_full_output: true
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
