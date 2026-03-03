@@ -10,9 +10,10 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: FetchCommit
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
       - name: RunCodeReview
         uses: anthropics/claude-code-action@v1
