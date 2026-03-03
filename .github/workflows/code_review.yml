@@ -5,7 +5,7 @@ on:
 
 jobs:
   review:
-    runs-on: tzrec-codestyle-runner
+    runs-on: tzrec-codereview-runner
     permissions:
       id-token: write
       contents: read
