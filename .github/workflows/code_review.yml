@@ -6,13 +6,15 @@ on:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: tzrec-codestyle-runner
+    container:
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.0
     steps:
-      - name: FetchCommit
-        uses: actions/checkout@v4
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v2
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          path: run_${{ github.run_id }}
 
       - name: RunCodeReview
         uses: anthropics/claude-code-action@v1
