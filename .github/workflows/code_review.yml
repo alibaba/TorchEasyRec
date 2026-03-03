@@ -19,7 +19,11 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: "/review"
+          prompt: |
+            /review
+            IMPORTANT: Do NOT run any python scripts, pytest, or build commands.
+            Only perform static code analysis based on the git diff.
+            Post your feedback immediately using the available tools.
           claude_args: |
             --model ${{ secrets.ANTHROPIC_MODEL }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr *)"
