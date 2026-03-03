@@ -69,6 +69,7 @@ message ModelConfig {
         TDM tdm = 400;
 
         RocketLaunching rocket_launching = 500;
+        PEPNet pepnet = 206;
     }
 
     optional uint32 num_class = 2 [default = 1];
