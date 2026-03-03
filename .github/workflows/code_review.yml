@@ -32,6 +32,7 @@ jobs:
             **CRITICAL RESTRICTIONS:**
             1. **NO POSITIVE COMMENTS OR PRAISE:** Only identify problems and issues
             2. **NO CODE EXECUTION:** Rely exclusively on reading file contents and static analysis. You cannot run `python`, `bash`, or any shell commands other than `gh` tools. Do not attempt to verify code by executing it.
+            3. **ONLY COMMENT ON CHANGED LINES:** When creating inline comments, you MUST only comment on lines that are part of the actual diff. Use `gh pr diff` to identify the exact lines that changed before creating comments.
 
             Perform a comprehensive code review focusing exclusively on identifying problems:
 
