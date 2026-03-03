@@ -7,7 +7,6 @@ jobs:
   review:
     runs-on: tzrec-codereview-runner
     permissions:
-      id-token: write
       contents: read
       pull-requests: write
     steps:
@@ -20,6 +19,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: "/review"
           claude_args: "--model ${{ secrets.ANTHROPIC_MODEL }}"
           show_full_output: true
