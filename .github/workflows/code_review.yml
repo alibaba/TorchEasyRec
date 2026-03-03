@@ -10,11 +10,10 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
-        uses: actions/checkout@v4
+      - name: FetchCommit
+        uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
       - name: RunCodeReview
         uses: anthropics/claude-code-action@v1
         with:
@@ -23,7 +22,7 @@ jobs:
           prompt: "/review"
           claude_args: |
             --model ${{ secrets.ANTHROPIC_MODEL }}
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr *)"
           show_full_output: true
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
