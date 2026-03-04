@@ -74,22 +74,22 @@ data_config {
 
 - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
-- CsvDataset: 输入数据为csv格式
+## CsvDataset
 
-  - input_path: 按如下格式设置
+- input_path: 按如下格式设置
 
-    - `${PATH_TO_DATA_DIR}/*.csv`
+  - `${PATH_TO_DATA_DIR}/*.csv`
 
-  - 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
+- 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
 
-  - 需设置 `data_config.with_header`来指定是否有header行，默认为false
+- 需设置 `data_config.with_header`来指定是否有header行，默认为false
 
-  - 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
+- 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
 
-  - 注意:
+- 注意:
 
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
-    - csv格式数据读性能有瓶颈
+  - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
+  - csv格式数据读性能有瓶颈
 
 ## KafkaDataset
 
@@ -321,7 +321,7 @@ data_config {
 }
 ```
 
-支持的类型名(仅支持ODPS格式):
+支持的类型名:
 
 - 基本类型: INT, INT32, BIGINT, INT64, STRING, FLOAT, DOUBLE
 - 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)

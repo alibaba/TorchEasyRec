@@ -125,14 +125,14 @@ def _normalize_type_str(type_str: str) -> str:
         normalized type string
     """
     normalized = type_str.upper().strip()
-    normalized = re.sub(r"\s*", "", normalized)
+    normalized = re.sub(r"\s+", "", normalized)
     # Use word boundaries to match whole words only
     normalized = re.sub(r"\bBIGINT\b", "INT64", normalized)
     normalized = re.sub(r"\bINT\b", "INT32", normalized)
     return normalized
 
 
-def get_input_fields_config(
+def get_input_fields_proto(
     data_config: data_pb2.DataConfig,
 ) -> List[data_pb2.Field]:
     """Get input fields from data_config.input_fields_str or data_config.input_fields.

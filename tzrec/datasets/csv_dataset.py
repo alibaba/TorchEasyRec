@@ -23,7 +23,7 @@ from pyarrow import csv
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import FIELD_TYPE_TO_PA, get_input_fields_config
+from tzrec.datasets.utils import FIELD_TYPE_TO_PA, get_input_fields_proto
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 
@@ -45,7 +45,7 @@ class CsvDataset(BaseDataset):
         **kwargs: Any,
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
-        input_fields = get_input_fields_config(self._data_config)
+        input_fields = get_input_fields_proto(self._data_config)
         column_names = None
         column_types = {}
         if not self._data_config.with_header:

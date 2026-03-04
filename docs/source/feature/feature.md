@@ -203,7 +203,7 @@ feature_configs {
 - **mlp**: 由一层MLP变换特征到`embedding_dim`维度
 - **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
 
-Embedding特征: 支持string类型如`"0.1|0.2|0.3|0.4"`；支持ARRAY<float>类型如`[0.1,0.2,0.3,0.4]`（建议，性能更好），配置方式如下
+Embedding特征: 支持string类型如`"0.1|0.2|0.3|0.4"`；支持ARRAY\<float>类型如`[0.1,0.2,0.3,0.4]`（建议，性能更好），配置方式如下
 
 ```
 feature_configs: {
