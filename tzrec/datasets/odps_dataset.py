@@ -575,54 +575,60 @@ class OdpsReader(BaseReader):
         """Get batch iterator."""
         input_paths = self._input_path.split(",")
         num_tables = len(input_paths)
-        remain_row_count = 0
 
-        for table_idx, input_path in enumerate(input_paths):
-            is_last_table = table_idx == num_tables - 1
-            _, table_name, _, _ = _parse_table_path(input_path)
-            client = self._table_to_cli[table_name]
-            sess_reqs = self._input_to_sess[input_path]
-            num_sess = len(sess_reqs)
+        def _combined_reader() -> Iterator[pa.RecordBatch]:
+            remain_row_count = 0
 
-            for sess_idx, sess_req in enumerate(sess_reqs):
-                is_last_session = sess_idx == num_sess - 1
-                # Only drop redundant on the very last session of the very last table
-                should_drop_redundant = (
-                    self._drop_redundant_bs_eq_one and is_last_table and is_last_session
-                )
+            for table_idx, input_path in enumerate(input_paths):
+                is_last_table = table_idx == num_tables - 1
+                _, table_name, _, _ = _parse_table_path(input_path)
+                client = self._table_to_cli[table_name]
+                sess_reqs = self._input_to_sess[input_path]
+                num_sess = len(sess_reqs)
 
-                # Get session record count
-                record_count = _get_session_record_count(client, sess_req)
-
-                # Generate source_id with session_id for unique identification
-                source_id_prefix = f"{input_path}#{sess_req.session_id}"
-
-                # Calculate intervals (similar to parquet pattern)
-                worker_intervals, remain_row_count = calc_slice_intervals(
-                    record_count,
-                    worker_id,
-                    num_workers,
-                    self._batch_size,
-                    should_drop_redundant,
-                    pre_total_remain=remain_row_count,
-                    checkpoint_state=self._checkpoint_state,
-                    source_id=source_id_prefix,
-                )
-
-                for start, end in worker_intervals:
-                    if start >= end:
-                        continue
-                    source_id = f"{source_id_prefix}:{start}"
-                    reader = _reader_iter(
-                        client,
-                        sess_req,
-                        self._batch_size,
-                        self._compression,
-                        start,
-                        end,
-                        source_id,
+                for sess_idx, sess_req in enumerate(sess_reqs):
+                    is_last_session = sess_idx == num_sess - 1
+                    # Only drop redundant on the very last session of the very
+                    # last table
+                    should_drop_redundant = (
+                        self._drop_redundant_bs_eq_one
+                        and is_last_table
+                        and is_last_session
                     )
-                    yield from self._arrow_reader_iter(reader)
+
+                    # Get session record count
+                    record_count = _get_session_record_count(client, sess_req)
+
+                    # Generate source_id with session_id for unique identification
+                    source_id_prefix = f"{input_path}#{sess_req.session_id}"
+
+                    # Calculate intervals (similar to parquet pattern)
+                    worker_intervals, remain_row_count = calc_slice_intervals(
+                        record_count,
+                        worker_id,
+                        num_workers,
+                        self._batch_size,
+                        should_drop_redundant,
+                        pre_total_remain=remain_row_count,
+                        checkpoint_state=self._checkpoint_state,
+                        input_path=source_id_prefix,
+                    )
+
+                    for start, end in worker_intervals:
+                        if start >= end:
+                            continue
+                        source_id = f"{source_id_prefix}:{start}"
+                        yield from _reader_iter(
+                            client,
+                            sess_req,
+                            self._batch_size,
+                            self._compression,
+                            start,
+                            end,
+                            source_id,
+                        )
+
+        yield from self._arrow_reader_iter(_combined_reader())
 
 
 class OdpsWriter(BaseWriter):

@@ -261,20 +261,24 @@ class ParquetReader(BaseReader):
                 input_path=self._input_path,
             )
 
-        for start, end in worker_intervals:
-            reader = _reader_iter(
-                self._input_files
-                if self._rebalance
-                else self._input_files[worker_id::num_workers],
-                self._batch_size,
-                self._parquet_metas,
-                self._ordered_cols,
-                start,
-                end,
-                worker_id,
-                source_id=f"{self._input_path}:{start}" if self._rebalance else None,
-            )
-            yield from self._arrow_reader_iter(reader)
+        def _combined_reader() -> Iterator[pa.RecordBatch]:
+            for start, end in worker_intervals:
+                yield from _reader_iter(
+                    self._input_files
+                    if self._rebalance
+                    else self._input_files[worker_id::num_workers],
+                    self._batch_size,
+                    self._parquet_metas,
+                    self._ordered_cols,
+                    start,
+                    end,
+                    worker_id,
+                    source_id=f"{self._input_path}:{start}"
+                    if self._rebalance
+                    else None,
+                )
+
+        yield from self._arrow_reader_iter(_combined_reader())
 
     def num_files(self) -> Optional[int]:
         """Get number of files in the dataset."""
