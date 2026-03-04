@@ -163,7 +163,7 @@ class OdpsDatasetTest(unittest.TestCase):
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
             collate_fn=lambda x: x,
         )
@@ -429,6 +429,10 @@ class OdpsDatasetTest(unittest.TestCase):
             len(restored_sess_list),
             2,
             "Should have 2 sessions: 1 restored + 1 for unconsumed partition",
+        )
+        self.assertEqual(
+            restored_sess_list[0].session_id,
+            list(first_checkpoint_state.keys())[0].split("#")[1].split(":")[0],
         )
 
     def _test_odps_dataset_with_sampler(self, id_type="bigint", schema=None):

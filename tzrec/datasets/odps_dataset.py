@@ -319,10 +319,12 @@ def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -
             for session_id, client in sess_id_to_cli.items():
                 try:
                     client.get_read_session(SessionRequest(session_id, refresh=True))
+                    logger.info(f"refresh session: {session_id}")
                 except ODPSError as e:
+                    # we ignore the refresh error because the session should have been
+                    # refreshed within the last 12 hours.
                     logger.debug(f"refresh session failed: {session_id} error: {e}")
                     continue
-                logger.info(f"refresh session: {session_id}")
             start_time = time.time()
         time.sleep(5)
 
@@ -528,6 +530,12 @@ class OdpsReader(BaseReader):
 
         # Restore sessions for each input_path
         for input_path, session_ids in session_ids_by_input.items():
+            if input_path not in self._input_to_sess:
+                logger.warning(
+                    f"Checkpoint contains unknown input_path: {input_path}. "
+                    "Input paths may have changed since checkpoint was saved."
+                )
+                continue
             _, table_name, _, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
 
