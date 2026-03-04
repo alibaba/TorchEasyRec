@@ -565,8 +565,18 @@ class OdpsReader(BaseReader):
                         "Please restart training from scratch."
                     ) from e
 
-            # Replace newly created sessions with restored ones
-            self._input_to_sess[input_path] = restored_sess_reqs
+            # When orderby partition, partitions are consumed in order.
+            # Checkpoint only contains consumed partition sessions.
+            # Merge: restored sessions + unconsumed partition sessions (newly created)
+            current_sessions = self._input_to_sess.get(input_path, [])
+            n_restored = len(restored_sess_reqs)
+            if n_restored < len(current_sessions):
+                # Keep sessions for unconsumed partitions
+                self._input_to_sess[input_path] = (
+                    restored_sess_reqs + current_sessions[n_restored:]
+                )
+            else:
+                self._input_to_sess[input_path] = restored_sess_reqs
 
     def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
         """Set checkpoint state and restore sessions.
