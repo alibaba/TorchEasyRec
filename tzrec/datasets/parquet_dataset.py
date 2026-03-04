@@ -27,14 +27,40 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
-    calc_remaining_intervals,
-    calc_slice_position,
-    redistribute_intervals,
+    calc_slice_intervals,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
+
+
+def _inject_checkpoint_metadata(
+    batch: pa.RecordBatch,
+    source_id: str,
+    global_row_idx: int,
+) -> Tuple[pa.RecordBatch, int]:
+    """Inject checkpoint metadata (source_id and row_idx) into a batch.
+
+    Args:
+        batch: The input record batch.
+        source_id: The source identifier for checkpointing.
+        global_row_idx: The current global row index.
+
+    Returns:
+        A tuple of (new_batch_with_metadata, updated_global_row_idx).
+    """
+    batch_len = len(batch)
+    row_indices = list(range(global_row_idx, global_row_idx + batch_len))
+    new_batch = pa.RecordBatch.from_arrays(
+        list(batch.columns)
+        + [
+            pa.array([source_id] * batch_len, type=pa.string()),
+            pa.array(row_indices, type=pa.int64()),
+        ],
+        names=list(batch.schema.names) + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
+    )
+    return new_batch, global_row_idx + batch_len
 
 
 def _reader_iter(
@@ -86,59 +112,23 @@ def _reader_iter(
                         f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
                     sliced_batch = batch[start - cnt : end - cnt]
-                    # Inject checkpoint metadata if source_id is provided
                     if source_id is not None:
-                        batch_len = len(sliced_batch)
-                        row_indices = list(
-                            range(global_row_idx, global_row_idx + batch_len)
+                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
                         )
-                        sliced_batch = pa.RecordBatch.from_arrays(
-                            list(sliced_batch.columns)
-                            + [
-                                pa.array([source_id] * batch_len, type=pa.string()),
-                                pa.array(row_indices, type=pa.int64()),
-                            ],
-                            names=list(sliced_batch.schema.names)
-                            + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                        )
-                        global_row_idx += batch_len
                     yield sliced_batch
                 elif cnt + original_batch_len > end:
                     sliced_batch = batch[: end - cnt]
-                    # Inject checkpoint metadata if source_id is provided
                     if source_id is not None:
-                        batch_len = len(sliced_batch)
-                        row_indices = list(
-                            range(global_row_idx, global_row_idx + batch_len)
+                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
                         )
-                        sliced_batch = pa.RecordBatch.from_arrays(
-                            list(sliced_batch.columns)
-                            + [
-                                pa.array([source_id] * batch_len, type=pa.string()),
-                                pa.array(row_indices, type=pa.int64()),
-                            ],
-                            names=list(sliced_batch.schema.names)
-                            + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                        )
-                        global_row_idx += batch_len
                     yield sliced_batch
                 else:
-                    # Inject checkpoint metadata if source_id is provided
                     if source_id is not None:
-                        batch_len = len(batch)
-                        row_indices = list(
-                            range(global_row_idx, global_row_idx + batch_len)
+                        batch, global_row_idx = _inject_checkpoint_metadata(
+                            batch, source_id, global_row_idx
                         )
-                        batch = pa.RecordBatch.from_arrays(
-                            list(batch.columns)
-                            + [
-                                pa.array([source_id] * batch_len, type=pa.string()),
-                                pa.array(row_indices, type=pa.int64()),
-                            ],
-                            names=list(batch.schema.names)
-                            + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                        )
-                        global_row_idx += batch_len
                     yield batch
 
                 cnt += original_batch_len
@@ -288,52 +278,19 @@ class ParquetReader(BaseReader):
         if len(self._input_files) == 0:
             return
 
-        total_rows = sum(self._num_rows) if self._rebalance else 0
-
-        # Check if we're resuming from checkpoint
-        if self._checkpoint_state and self._rebalance:
-            # Calculate remaining intervals from checkpoint
-            remaining = calc_remaining_intervals(
-                self._checkpoint_state,
-                self._input_path,
-                total_rows,
+        worker_intervals = [(0, sys.maxsize)]
+        if self._rebalance:
+            worker_intervals, _ = calc_slice_intervals(
+                sum(self._num_rows),
+                worker_id,
+                num_workers,
+                self._batch_size,
+                self._drop_redundant_bs_eq_one,
+                checkpoint_state=self._checkpoint_state,
+                input_path=self._input_path,
             )
-            if not remaining:
-                return  # All data already consumed
 
-            # Redistribute remaining intervals among current workers
-            worker_intervals = redistribute_intervals(remaining, worker_id, num_workers)
-            if not worker_intervals:
-                return  # This worker has no data to process
-
-            # Generate source_id for this worker's intervals
-            for start, end in worker_intervals:
-                source_id = f"{self._input_path}:{start}"
-                reader = _reader_iter(
-                    self._input_files,
-                    self._batch_size,
-                    self._parquet_metas,
-                    self._ordered_cols,
-                    start,
-                    end,
-                    worker_id,
-                    source_id,
-                )
-                yield from self._arrow_reader_iter(reader)
-        else:
-            # Normal case: no checkpoint or not rebalancing
-            start, end = 0, sys.maxsize
-            source_id = None
-            if self._rebalance:
-                start, end, _ = calc_slice_position(
-                    total_rows,
-                    worker_id,
-                    num_workers,
-                    self._batch_size,
-                    self._drop_redundant_bs_eq_one,
-                )
-                source_id = f"{self._input_path}:{start}"
-
+        for start, end in worker_intervals:
             reader = _reader_iter(
                 self._input_files
                 if self._rebalance
@@ -344,7 +301,7 @@ class ParquetReader(BaseReader):
                 start,
                 end,
                 worker_id,
-                source_id,
+                source_id=f"{self._input_path}:{start}" if self._rebalance else None,
             )
             yield from self._arrow_reader_iter(reader)
 
