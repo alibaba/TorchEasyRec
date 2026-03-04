@@ -198,7 +198,7 @@ class KafkaReader(BaseReader):
             raise ValueError(
                 "Message may not be in Arrow IPC stream format. Failed to read "
                 "schema from Kafka message. You should provide input_fields in "
-                "config when using serialize record_batch without schema: {e}."
+                f"config when using serialize record_batch without schema: {e}."
             ) from e
         finally:
             consumer.close()
@@ -261,7 +261,10 @@ class KafkaReader(BaseReader):
                     if self._has_embedded_schema:
                         # Read with embedded schema using IPC stream reader
                         reader = pa.ipc.open_stream(msg_data)
-                        record_batch = reader.read_next_batch()
+                        try:
+                            record_batch = reader.read_next_batch()
+                        finally:
+                            reader.close()
                     else:
                         # Schema-less message (current behavior)
                         record_batch = pa.ipc.read_record_batch(
