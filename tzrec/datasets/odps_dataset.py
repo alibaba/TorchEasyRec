@@ -45,9 +45,8 @@ from torch import distributed as dist
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import (
-    CKPT_ROW_IDX,
-    CKPT_SOURCE_ID,
-    calc_slice_position,
+    calc_slice_intervals,
+    inject_checkpoint_metadata,
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
@@ -228,37 +227,63 @@ def _read_rows_arrow_with_retry(
 
 def _reader_iter(
     client: StorageApiArrowClient,
-    sess_reqs: List[SessionRequest],
+    sess_req: SessionRequest,
     worker_id: int,
     num_workers: int,
     batch_size: int,
     drop_redundant_bs_eq_one: bool,
     compression: Compression,
     input_path: Optional[str] = None,
-) -> Iterator[pa.RecordBatch]:
-    num_sess = len(sess_reqs)
-    remain_row_count = 0
-    for i, sess_req in enumerate(sess_reqs):
-        while True:
-            scan_resp = client.get_read_session(sess_req)
-            if scan_resp.session_status == SessionStatus.INIT:
-                time.sleep(1)
-                continue
-            break
-        start, end, remain_row_count = calc_slice_position(
-            # pyre-ignore [6]
-            scan_resp.record_count,
-            worker_id,
-            num_workers,
-            batch_size,
-            drop_redundant_bs_eq_one if i == num_sess - 1 else False,
-            remain_row_count,
-        )
+    checkpoint_state: Optional[Dict[str, int]] = None,
+    pre_remain_row_count: int = 0,
+) -> Iterator[Tuple[pa.RecordBatch, int]]:
+    """Read data from a single ODPS session with checkpoint support.
+
+    Args:
+        client: StorageAPI Arrow client.
+        sess_req: Session request for the session to read.
+        worker_id: Worker ID for data partitioning.
+        num_workers: Total number of workers.
+        batch_size: Batch size for reading.
+        drop_redundant_bs_eq_one: Drop last batch if batch_size equals 1.
+        compression: Compression type.
+        input_path: Input path for checkpoint tracking.
+        checkpoint_state: Checkpoint state for resumption.
+        pre_remain_row_count: Remaining row count from previous session.
+
+    Yields:
+        Tuple of (record_batch, remain_row_count) for each batch.
+    """
+    while True:
+        scan_resp = client.get_read_session(sess_req)
+        if scan_resp.session_status == SessionStatus.INIT:
+            time.sleep(1)
+            continue
+        break
+
+    # Use input_path with session_id for unique identification
+    session_id = sess_req.session_id
+    source_id_prefix = f"{input_path}#{session_id}" if input_path else None
+
+    # Calculate intervals using calc_slice_intervals (supports checkpoint)
+    worker_intervals, remain_row_count = calc_slice_intervals(
+        # pyre-ignore [6]
+        scan_resp.record_count,
+        worker_id,
+        num_workers,
+        batch_size,
+        drop_redundant_bs_eq_one,
+        pre_total_remain=pre_remain_row_count,
+        checkpoint_state=checkpoint_state,
+        input_path=source_id_prefix,
+    )
+
+    for start, end in worker_intervals:
         if start == end:
-            return
+            continue
 
         # Generate source_id for checkpoint tracking
-        source_id = f"{input_path}:{start}" if input_path else None
+        source_id = f"{source_id_prefix}:{start}" if source_id_prefix else None
         global_row_idx = start  # Track absolute row index
 
         offset = 0
@@ -299,21 +324,11 @@ def _reader_iter(
 
                 # Inject checkpoint metadata if source_id is provided
                 if source_id is not None:
-                    row_indices = list(
-                        range(global_row_idx, global_row_idx + batch_len)
+                    read_data, global_row_idx = inject_checkpoint_metadata(
+                        read_data, source_id, global_row_idx
                     )
-                    read_data = pa.RecordBatch.from_arrays(
-                        list(read_data.columns)
-                        + [
-                            pa.array([source_id] * batch_len, type=pa.string()),
-                            pa.array(row_indices, type=pa.int64()),
-                        ],
-                        names=list(read_data.schema.names)
-                        + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-                    )
-                    global_row_idx += batch_len
 
-            yield read_data
+            yield read_data, remain_row_count
 
 
 def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
@@ -497,6 +512,72 @@ class OdpsReader(BaseReader):
             )
             t.start()
 
+    def _restore_sessions(self, checkpoint_state: Dict[str, int]) -> None:
+        """Restore ODPS sessions from checkpoint state.
+
+        Parses session_ids from checkpoint keys and validates they are still active.
+        Raises RuntimeError if any session is expired/invalid.
+
+        Checkpoint key format: "{input_path}#{session_id}:{start}"
+
+        Args:
+            checkpoint_state: Checkpoint state dict mapping source_key to row index.
+        """
+        # Parse unique session_ids from checkpoint keys
+        session_ids_by_input: Dict[str, List[str]] = {}  # {input_path: [session_ids]}
+        for key in checkpoint_state.keys():
+            # Parse: "{input_path}#{session_id}:{start}"
+            last_colon = key.rfind(":")
+            if last_colon == -1:
+                continue
+            prefix = key[:last_colon]  # "{input_path}#{session_id}"
+            hash_idx = prefix.rfind("#")
+            if hash_idx == -1:
+                continue
+            input_path = prefix[:hash_idx]
+            session_id = prefix[hash_idx + 1 :]
+            if input_path not in session_ids_by_input:
+                session_ids_by_input[input_path] = []
+            if session_id not in session_ids_by_input[input_path]:
+                session_ids_by_input[input_path].append(session_id)
+
+        # Restore sessions for each input_path
+        for input_path, session_ids in session_ids_by_input.items():
+            _, table_name, _, _ = _parse_table_path(input_path)
+            client = self._table_to_cli[table_name]
+
+            restored_sess_reqs = []
+            for session_id in session_ids:
+                sess_req = SessionRequest(session_id=session_id)
+                try:
+                    resp = client.get_read_session(sess_req)
+                    if resp.session_status == SessionStatus.EXPIRED:
+                        raise RuntimeError(
+                            f"Cannot resume from checkpoint: ODPS session {session_id} "
+                            f"for {input_path} has expired. Row order may have changed."
+                            " Please restart training from scratch."
+                        )
+                    restored_sess_reqs.append(sess_req)
+                except ODPSError as e:
+                    raise RuntimeError(
+                        f"Cannot resume from checkpoint: ODPS session {session_id} "
+                        f"for {input_path} is invalid. Error: {e}. "
+                        "Please restart training from scratch."
+                    ) from e
+
+            # Replace newly created sessions with restored ones
+            self._input_to_sess[input_path] = restored_sess_reqs
+
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+        """Set checkpoint state and restore sessions.
+
+        Args:
+            state: dict mapping source_key to max consumed row index.
+        """
+        super().load_state_dict(state)
+        if state:
+            self._restore_sessions(state)
+
     def _iter_one_table(
         self, input_path: str, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
@@ -504,17 +585,29 @@ class OdpsReader(BaseReader):
         client = self._table_to_cli[table_name]
 
         sess_reqs = self._input_to_sess[input_path]
-        iterator = _reader_iter(
-            client,
-            sess_reqs,
-            worker_id,
-            num_workers,
-            self._batch_size,
-            self._drop_redundant_bs_eq_one,
-            self._compression,
-            input_path,  # Pass input_path for checkpoint tracking
-        )
-        yield from self._arrow_reader_iter(iterator)
+        num_sess = len(sess_reqs)
+        remain_row_count = 0
+
+        for i, sess_req in enumerate(sess_reqs):
+            # Create iterator for this session
+            def batch_iterator(sess_req=sess_req, i=i) -> Iterator[pa.RecordBatch]:
+                nonlocal remain_row_count
+                for batch, remain in _reader_iter(
+                    client,
+                    sess_req,
+                    worker_id,
+                    num_workers,
+                    self._batch_size,
+                    self._drop_redundant_bs_eq_one if i == num_sess - 1 else False,
+                    self._compression,
+                    input_path,
+                    self._checkpoint_state,
+                    remain_row_count,
+                ):
+                    remain_row_count = remain
+                    yield batch
+
+            yield from self._arrow_reader_iter(batch_iterator())
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1

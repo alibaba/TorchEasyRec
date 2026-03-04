@@ -25,42 +25,13 @@ from torch import distributed as dist
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import (
-    CKPT_ROW_IDX,
-    CKPT_SOURCE_ID,
     calc_slice_intervals,
+    inject_checkpoint_metadata,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
-
-
-def _inject_checkpoint_metadata(
-    batch: pa.RecordBatch,
-    source_id: str,
-    global_row_idx: int,
-) -> Tuple[pa.RecordBatch, int]:
-    """Inject checkpoint metadata (source_id and row_idx) into a batch.
-
-    Args:
-        batch: The input record batch.
-        source_id: The source identifier for checkpointing.
-        global_row_idx: The current global row index.
-
-    Returns:
-        A tuple of (new_batch_with_metadata, updated_global_row_idx).
-    """
-    batch_len = len(batch)
-    row_indices = list(range(global_row_idx, global_row_idx + batch_len))
-    new_batch = pa.RecordBatch.from_arrays(
-        list(batch.columns)
-        + [
-            pa.array([source_id] * batch_len, type=pa.string()),
-            pa.array(row_indices, type=pa.int64()),
-        ],
-        names=list(batch.schema.names) + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
-    )
-    return new_batch, global_row_idx + batch_len
 
 
 def _reader_iter(
@@ -113,20 +84,20 @@ def _reader_iter(
                     )
                     sliced_batch = batch[start - cnt : end - cnt]
                     if source_id is not None:
-                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                        sliced_batch, global_row_idx = inject_checkpoint_metadata(
                             sliced_batch, source_id, global_row_idx
                         )
                     yield sliced_batch
                 elif cnt + original_batch_len > end:
                     sliced_batch = batch[: end - cnt]
                     if source_id is not None:
-                        sliced_batch, global_row_idx = _inject_checkpoint_metadata(
+                        sliced_batch, global_row_idx = inject_checkpoint_metadata(
                             sliced_batch, source_id, global_row_idx
                         )
                     yield sliced_batch
                 else:
                     if source_id is not None:
-                        batch, global_row_idx = _inject_checkpoint_metadata(
+                        batch, global_row_idx = inject_checkpoint_metadata(
                             batch, source_id, global_row_idx
                         )
                     yield batch
