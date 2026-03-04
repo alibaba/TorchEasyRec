@@ -18,6 +18,8 @@ import pyarrow.compute as pc
 
 from tzrec.datasets.utils import (
     _normalize_type_str,
+    calc_remaining_intervals,
+    calc_slice_intervals,
     calc_slice_position,
     get_input_fields_proto,
     process_hstu_neg_sample,
@@ -47,6 +49,162 @@ class DatasetUtilsTest(unittest.TestCase):
                 worker_row_counts[j] += end - start
         self.assertTrue(np.all(np.ceil(np.array(worker_row_counts) / batch_size) == 82))
         self.assertEqual(sum(worker_row_counts), num_tables * 81 - 1)
+
+    def test_calc_remaining_intervals_no_checkpoint(self):
+        """Test remaining intervals when no checkpoint exists."""
+        result = calc_remaining_intervals(
+            checkpoint_state=None,
+            input_path="/data/test.parquet",
+            total_rows=1000,
+        )
+        self.assertEqual(result, [(0, 1000)])
+
+    def test_calc_remaining_intervals_empty_checkpoint(self):
+        """Test remaining intervals with empty checkpoint state."""
+        result = calc_remaining_intervals(
+            checkpoint_state={},
+            input_path="/data/test.parquet",
+            total_rows=1000,
+        )
+        self.assertEqual(result, [(0, 1000)])
+
+    def test_calc_remaining_intervals_single_worker(self):
+        """Test remaining intervals with single worker checkpoint."""
+        # Worker consumed rows 0-499 (checkpoint at row 499)
+        checkpoint_state = {"/data/test.parquet:0": 499}
+        result = calc_remaining_intervals(
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+            total_rows=1000,
+        )
+        # Remaining: [500, 1000)
+        self.assertEqual(result, [(500, 1000)])
+
+    def test_calc_remaining_intervals_multiple_workers(self):
+        """Test remaining intervals with multiple workers' checkpoints."""
+        # 2 workers: worker0 [0, 500), worker1 [500, 1000)
+        # Worker0 consumed up to row 299
+        # Worker1 consumed up to row 799
+        checkpoint_state = {
+            "/data/test.parquet:0": 299,
+            "/data/test.parquet:500": 799,
+        }
+        result = calc_remaining_intervals(
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+            total_rows=1000,
+        )
+        # Remaining: [300, 500), [800, 1000)
+        self.assertEqual(result, [(300, 500), (800, 1000)])
+
+    def test_calc_remaining_intervals_fully_consumed(self):
+        """Test remaining intervals when all data is consumed."""
+        # Worker consumed all rows up to 999 (last row)
+        checkpoint_state = {"/data/test.parquet:0": 999}
+        result = calc_remaining_intervals(
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+            total_rows=1000,
+        )
+        # No remaining intervals
+        self.assertEqual(result, [])
+
+    def test_calc_remaining_intervals_unrelated_path(self):
+        """Test remaining intervals when checkpoint is for different path."""
+        checkpoint_state = {"/data/other.parquet:0": 499}
+        result = calc_remaining_intervals(
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+            total_rows=1000,
+        )
+        # Unrelated checkpoint, return full range
+        self.assertEqual(result, [(0, 1000)])
+
+    def test_calc_slice_intervals_single_worker(self):
+        """Test calc_slice_intervals with single worker."""
+        # Simulate intervals [(100, 500), (600, 1000)] via checkpoint_state
+        # checkpoint at row 99 means rows 0-99 consumed, remaining starts at 100
+        # checkpoint at row 599 means rows 500-599 consumed, remaining starts at 600
+        checkpoint_state = {
+            "/data/test.parquet:0": 99,
+            "/data/test.parquet:500": 599,
+        }
+        result, _ = calc_slice_intervals(
+            total_rows=1000,
+            worker_id=0,
+            num_workers=1,
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+        )
+        self.assertEqual(result, [(100, 500), (600, 1000)])
+
+    def test_calc_slice_intervals_two_workers(self):
+        """Test calc_slice_intervals among two workers."""
+        # Total remaining: 800 rows (400 + 400)
+        # Intervals: [(100, 500), (600, 1000)]
+        checkpoint_state = {
+            "/data/test.parquet:0": 99,
+            "/data/test.parquet:500": 599,
+        }
+
+        # Worker 0 gets first half of total rows
+        result_w0, _ = calc_slice_intervals(
+            total_rows=1000,
+            worker_id=0,
+            num_workers=2,
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+        )
+        # Worker 1 gets second half
+        result_w1, _ = calc_slice_intervals(
+            total_rows=1000,
+            worker_id=1,
+            num_workers=2,
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+        )
+
+        # Combined should cover all intervals
+        total_rows_w0 = sum(end - start for start, end in result_w0)
+        total_rows_w1 = sum(end - start for start, end in result_w1)
+        self.assertEqual(total_rows_w0 + total_rows_w1, 800)
+
+    def test_calc_slice_intervals_empty_intervals(self):
+        """Test calc_slice_intervals with empty intervals (fully consumed)."""
+        # All data consumed: checkpoint at row 999 (last row)
+        checkpoint_state = {"/data/test.parquet:0": 999}
+        result, _ = calc_slice_intervals(
+            total_rows=1000,
+            worker_id=0,
+            num_workers=2,
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+        )
+        self.assertEqual(result, [])
+
+    def test_calc_slice_intervals_topology_change(self):
+        """Test calc_slice_intervals when changing from 2 to 3 workers."""
+        # Original 2 workers, remaining intervals from their checkpoints
+        # Intervals: [(300, 500), (800, 1000)] = 400 rows total
+        checkpoint_state = {
+            "/data/test.parquet:0": 299,
+            "/data/test.parquet:500": 799,
+        }
+
+        # Now redistribute among 3 workers
+        total_rows = 0
+        for worker_id in range(3):
+            result, _ = calc_slice_intervals(
+                total_rows=1000,
+                worker_id=worker_id,
+                num_workers=3,
+                checkpoint_state=checkpoint_state,
+                input_path="/data/test.parquet",
+            )
+            for start, end in result:
+                total_rows += end - start
+
+        self.assertEqual(total_rows, 400)  # All remaining rows accounted for
 
     def test_process_hstu_seq_data(self):
         """Test processing sequence data for HSTU match model."""

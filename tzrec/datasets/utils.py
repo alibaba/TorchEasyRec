@@ -658,6 +658,138 @@ def calc_slice_position(
     return real_start, real_end, (size % batch_size) * slice_count + split_point
 
 
+def calc_remaining_intervals(
+    checkpoint_state: Optional[Dict[str, int]],
+    input_path: str,
+    total_rows: int,
+) -> List[Tuple[int, int]]:
+    """Calculate remaining intervals from checkpoint state.
+
+    The checkpoint key format is `{input_path}:{start}` where `start` is the
+    beginning of the worker's range. From sorted starts + total_rows, we can
+    infer the original ranges and calculate remaining intervals.
+
+    Args:
+        checkpoint_state (dict): dict mapping source_id to max consumed row index.
+        input_path (str): the input path to filter checkpoint entries.
+        total_rows (int): total number of rows in the dataset.
+
+    Returns:
+        List of (start, end) tuples representing remaining intervals.
+    """
+    if not checkpoint_state:
+        return [(0, total_rows)]  # No checkpoint, all data remaining
+
+    # Parse checkpoint keys: "{input_path}:{start}" -> (start, consumed)
+    # Filter by input_path matching
+    entries = []  # [(start, consumed), ...]
+    for key, consumed in checkpoint_state.items():
+        last_colon = key.rfind(":")
+        if last_colon == -1:
+            continue
+        key_input_path = key[:last_colon]
+        # Match input_path (exact match)
+        if key_input_path == input_path:
+            start = int(key[last_colon + 1 :])
+            entries.append((start, consumed))
+
+    if not entries:
+        return [(0, total_rows)]  # No matching checkpoint
+
+    # Sort by start to infer original ranges
+    entries.sort(key=lambda x: x[0])
+
+    # Calculate remaining intervals
+    remaining = []
+    num_entries = len(entries)
+    for i, (_, consumed) in enumerate(entries):
+        # Infer the end of this worker's range
+        if i + 1 < num_entries:
+            range_end = entries[i + 1][0]  # Next worker's start
+        else:
+            range_end = total_rows  # Last worker goes to end
+
+        # Remaining interval is [consumed+1, range_end)
+        if consumed + 1 < range_end:
+            remaining.append((consumed + 1, range_end))
+
+    return remaining if remaining else []
+
+
+def calc_slice_intervals(
+    total_rows: int,
+    worker_id: int,
+    num_workers: int,
+    batch_size: int = 1,
+    drop_redundant_bs_eq_one: bool = False,
+    pre_total_remain: int = 0,
+    checkpoint_state: Optional[Dict[str, int]] = None,
+    input_path: Optional[str] = None,
+) -> List[Tuple[int, int]]:
+    """Redistribute remaining intervals among workers.
+
+    Flattens all intervals into a total row count, then assigns a portion
+    to each worker based on worker_id and num_workers.
+
+    Args:
+        total_rows (int): total number of rows in the dataset.
+        worker_id: Current worker's ID (0-indexed).
+        num_workers: Total number of workers.
+        batch_size: batch_size.
+        drop_redundant_bs_eq_one: drop last redundant batch with batch_size
+            equal one to prevent train_eval hung.
+        pre_total_remain (int): remaining total count in pre-table is
+            insufficient to meet the batch_size requirement for each worker.
+        checkpoint_state (dict): dict mapping source_id to max consumed row index.
+        input_path (str): the input path to filter checkpoint entries.
+
+    Returns:
+        worker_intervals (list): List of (start, end) tuples assigned to this worker.
+        total_remain (int): remaining total count in curr-table is
+            insufficient to meet the batch_size requirement for each worker.
+    """
+    if checkpoint_state:
+        intervals = calc_remaining_intervals(checkpoint_state, input_path, total_rows)
+        total_rows = sum(end - start for start, end in intervals)
+
+    # Reuse calc_slice_position for worker start/end calculation
+    worker_start, worker_end, total_remain = calc_slice_position(
+        row_count=total_rows,
+        slice_id=worker_id,
+        slice_count=num_workers,
+        batch_size=batch_size,
+        drop_redundant_bs_eq_one=drop_redundant_bs_eq_one,
+        pre_total_remain=pre_total_remain,
+    )
+
+    if checkpoint_state:
+        # Map worker's logical range [worker_start, worker_end) to actual intervals
+        result = []
+        current_pos = 0
+        for interval_start, interval_end in intervals:
+            interval_len = interval_end - interval_start
+            interval_logical_start = current_pos
+            interval_logical_end = current_pos + interval_len
+
+            # Check if this interval overlaps with worker's range
+            overlap_start = max(worker_start, interval_logical_start)
+            overlap_end = min(worker_end, interval_logical_end)
+
+            if overlap_start < overlap_end:
+                # Map back to actual row indices
+                actual_start = interval_start + (overlap_start - interval_logical_start)
+                actual_end = interval_start + (overlap_end - interval_logical_start)
+                result.append((actual_start, actual_end))
+
+            current_pos = interval_logical_end
+            if current_pos >= worker_end:
+                break
+    else:
+        result = [(worker_start, worker_end)]
+
+    return result, total_remain
+
+
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:
     """Recursive removal of the null=False property from lists and nested lists."""
     if pa.types.is_list(field_type):

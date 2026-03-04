@@ -1,4 +1,4 @@
-alibabacloud_credentials
+alibabacloud_credentials<2.0.0,>=1.0.2
 anytree
 common_io @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/common_io-0.4.1%2Btunnel-py2.py3-none-any.whl
 confluent-kafka
