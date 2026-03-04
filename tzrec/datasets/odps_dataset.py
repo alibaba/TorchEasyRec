@@ -225,110 +225,91 @@ def _read_rows_arrow_with_retry(
     return reader
 
 
-def _reader_iter(
+def _get_session_record_count(
     client: StorageApiArrowClient,
     sess_req: SessionRequest,
-    worker_id: int,
-    num_workers: int,
-    batch_size: int,
-    drop_redundant_bs_eq_one: bool,
-    compression: Compression,
-    input_path: Optional[str] = None,
-    checkpoint_state: Optional[Dict[str, int]] = None,
-    pre_remain_row_count: int = 0,
-) -> Iterator[Tuple[pa.RecordBatch, int]]:
-    """Read data from a single ODPS session with checkpoint support.
-
-    Args:
-        client: StorageAPI Arrow client.
-        sess_req: Session request for the session to read.
-        worker_id: Worker ID for data partitioning.
-        num_workers: Total number of workers.
-        batch_size: Batch size for reading.
-        drop_redundant_bs_eq_one: Drop last batch if batch_size equals 1.
-        compression: Compression type.
-        input_path: Input path for checkpoint tracking.
-        checkpoint_state: Checkpoint state for resumption.
-        pre_remain_row_count: Remaining row count from previous session.
-
-    Yields:
-        Tuple of (record_batch, remain_row_count) for each batch.
-    """
+) -> int:
+    """Get record count from a session, waiting until ready."""
     while True:
         scan_resp = client.get_read_session(sess_req)
         if scan_resp.session_status == SessionStatus.INIT:
             time.sleep(1)
             continue
         break
+    # pyre-ignore [7]
+    return scan_resp.record_count
 
-    # Use input_path with session_id for unique identification
-    session_id = sess_req.session_id
-    source_id_prefix = f"{input_path}#{session_id}" if input_path else None
 
-    # Calculate intervals using calc_slice_intervals (supports checkpoint)
-    worker_intervals, remain_row_count = calc_slice_intervals(
-        # pyre-ignore [6]
-        scan_resp.record_count,
-        worker_id,
-        num_workers,
-        batch_size,
-        drop_redundant_bs_eq_one,
-        pre_total_remain=pre_remain_row_count,
-        checkpoint_state=checkpoint_state,
-        input_path=source_id_prefix,
+def _reader_iter(
+    client: StorageApiArrowClient,
+    sess_req: SessionRequest,
+    batch_size: int,
+    compression: Compression,
+    start: int,
+    end: int,
+    source_id: Optional[str] = None,
+) -> Iterator[pa.RecordBatch]:
+    """Read data from a single ODPS session.
+
+    Args:
+        client: StorageAPI Arrow client.
+        sess_req: Session request for the session to read.
+        batch_size: Batch size for reading.
+        compression: Compression type.
+        start: Start row index.
+        end: End row index.
+        source_id: Source ID for checkpoint tracking.
+
+    Yields:
+        RecordBatch for each batch.
+    """
+    if start >= end:
+        return
+
+    global_row_idx = start  # Track absolute row index
+    offset = 0
+    retry_cnt = 0
+    read_req = ReadRowsRequest(
+        session_id=sess_req.session_id,
+        row_index=start,
+        row_count=end - start,
+        max_batch_rows=min(batch_size, 20000),
+        compression=compression,
     )
-
-    for start, end in worker_intervals:
-        if start == end:
+    reader = _read_rows_arrow_with_retry(client, read_req)
+    max_retry_count = 5
+    while True:
+        try:
+            read_data = reader.read()
+            retry_cnt = 0
+        # pyre-ignore [66]
+        except (urllib3.exceptions.HTTPError, pa.lib.ArrowInvalid) as e:
+            if retry_cnt >= max_retry_count:
+                raise e
+            retry_cnt += 1
+            read_req = ReadRowsRequest(
+                session_id=sess_req.session_id,
+                row_index=start + offset,
+                row_count=end - start - offset,
+                max_batch_rows=min(batch_size, 20000),
+                compression=compression,
+            )
+            reader = _read_rows_arrow_with_retry(client, read_req)
             continue
+        if read_data is None:
+            break
+        else:
+            retry_cnt = 0
+            batch_len = len(read_data)
+            offset += batch_len
 
-        # Generate source_id for checkpoint tracking
-        source_id = f"{source_id_prefix}:{start}" if source_id_prefix else None
-        global_row_idx = start  # Track absolute row index
-
-        offset = 0
-        retry_cnt = 0
-        read_req = ReadRowsRequest(
-            session_id=sess_req.session_id,
-            row_index=start,
-            row_count=end - start,
-            max_batch_rows=min(batch_size, 20000),
-            compression=compression,
-        )
-        reader = _read_rows_arrow_with_retry(client, read_req)
-        max_retry_count = 5
-        while True:
-            try:
-                read_data = reader.read()
-                retry_cnt = 0
-            # pyre-ignore [66]
-            except (urllib3.exceptions.HTTPError, pa.lib.ArrowInvalid) as e:
-                if retry_cnt >= max_retry_count:
-                    raise e
-                retry_cnt += 1
-                read_req = ReadRowsRequest(
-                    session_id=sess_req.session_id,
-                    row_index=start + offset,
-                    row_count=end - start - offset,
-                    max_batch_rows=min(batch_size, 20000),
-                    compression=compression,
+            # Inject checkpoint metadata if source_id is provided
+            if source_id is not None:
+                read_data, global_row_idx = inject_checkpoint_metadata(
+                    read_data, source_id, global_row_idx
                 )
-                reader = _read_rows_arrow_with_retry(client, read_req)
-                continue
-            if read_data is None:
-                break
-            else:
-                retry_cnt = 0
-                batch_len = len(read_data)
-                offset += batch_len
 
-                # Inject checkpoint metadata if source_id is provided
-                if source_id is not None:
-                    read_data, global_row_idx = inject_checkpoint_metadata(
-                        read_data, source_id, global_row_idx
-                    )
-
-            yield read_data, remain_row_count
+        yield read_data
 
 
 def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
@@ -588,43 +569,60 @@ class OdpsReader(BaseReader):
         if state:
             self._restore_sessions(state)
 
-    def _iter_one_table(
-        self, input_path: str, worker_id: int = 0, num_workers: int = 1
-    ) -> Iterator[Dict[str, pa.Array]]:
-        _, table_name, _, _ = _parse_table_path(input_path)
-        client = self._table_to_cli[table_name]
-
-        sess_reqs = self._input_to_sess[input_path]
-        num_sess = len(sess_reqs)
-        remain_row_count = 0
-
-        for i, sess_req in enumerate(sess_reqs):
-            # Create iterator for this session
-            def batch_iterator(sess_req=sess_req, i=i) -> Iterator[pa.RecordBatch]:
-                nonlocal remain_row_count
-                for batch, remain in _reader_iter(
-                    client,
-                    sess_req,
-                    worker_id,
-                    num_workers,
-                    self._batch_size,
-                    self._drop_redundant_bs_eq_one if i == num_sess - 1 else False,
-                    self._compression,
-                    input_path,
-                    self._checkpoint_state,
-                    remain_row_count,
-                ):
-                    remain_row_count = remain
-                    yield batch
-
-            yield from self._arrow_reader_iter(batch_iterator())
-
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        for input_path in self._input_path.split(","):
-            yield from self._iter_one_table(input_path, worker_id, num_workers)
+        input_paths = self._input_path.split(",")
+        num_tables = len(input_paths)
+        remain_row_count = 0
+
+        for table_idx, input_path in enumerate(input_paths):
+            is_last_table = table_idx == num_tables - 1
+            _, table_name, _, _ = _parse_table_path(input_path)
+            client = self._table_to_cli[table_name]
+            sess_reqs = self._input_to_sess[input_path]
+            num_sess = len(sess_reqs)
+
+            for sess_idx, sess_req in enumerate(sess_reqs):
+                is_last_session = sess_idx == num_sess - 1
+                # Only drop redundant on the very last session of the very last table
+                should_drop_redundant = (
+                    self._drop_redundant_bs_eq_one and is_last_table and is_last_session
+                )
+
+                # Get session record count
+                record_count = _get_session_record_count(client, sess_req)
+
+                # Generate source_id with session_id for unique identification
+                source_id_prefix = f"{input_path}#{sess_req.session_id}"
+
+                # Calculate intervals (similar to parquet pattern)
+                worker_intervals, remain_row_count = calc_slice_intervals(
+                    record_count,
+                    worker_id,
+                    num_workers,
+                    self._batch_size,
+                    should_drop_redundant,
+                    pre_total_remain=remain_row_count,
+                    checkpoint_state=self._checkpoint_state,
+                    source_id=source_id_prefix,
+                )
+
+                for start, end in worker_intervals:
+                    if start >= end:
+                        continue
+                    source_id = f"{source_id_prefix}:{start}"
+                    reader = _reader_iter(
+                        client,
+                        sess_req,
+                        self._batch_size,
+                        self._compression,
+                        start,
+                        end,
+                        source_id,
+                    )
+                    yield from self._arrow_reader_iter(reader)
 
 
 class OdpsWriter(BaseWriter):
