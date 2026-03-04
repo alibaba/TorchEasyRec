@@ -163,7 +163,7 @@ class OdpsDatasetTest(unittest.TestCase):
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True,
             collate_fn=lambda x: x,
         )

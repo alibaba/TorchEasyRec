@@ -54,7 +54,7 @@ from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
-ODPS_READ_SESSION_EXPIRED_TIME = 18 * 3600
+ODPS_READ_SESSION_REFRESH_INTERVAL = 600
 
 TYPE_TABLE_TO_PA = {
     "BIGINT": pa.int64(),
@@ -315,10 +315,14 @@ def _reader_iter(
 def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -> None:
     start_time = time.time()
     while True:
-        if time.time() - start_time > ODPS_READ_SESSION_EXPIRED_TIME:
+        if time.time() - start_time > ODPS_READ_SESSION_REFRESH_INTERVAL:
             for session_id, client in sess_id_to_cli.items():
+                try:
+                    client.get_read_session(SessionRequest(session_id, refresh=True))
+                except ODPSError as e:
+                    logger.debug(f"refresh session failed: {session_id} error: {e}")
+                    continue
                 logger.info(f"refresh session: {session_id}")
-                client.get_read_session(SessionRequest(session_id, refresh=True))
             start_time = time.time()
         time.sleep(5)
 
