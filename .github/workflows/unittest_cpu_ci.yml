@@ -5,6 +5,10 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+concurrency:
+  group: unittest-cpu-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   ci-test:
     runs-on: tzrec-cpu-runner
