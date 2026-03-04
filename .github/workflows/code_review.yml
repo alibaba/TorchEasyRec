@@ -1,0 +1,76 @@
+name: Code Review
+on:
+  pull_request_target:
+    types: [review_requested]
+
+concurrency:
+  group: codereview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: tzrec-codereview-runner
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: RunCodeReview
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            **CRITICAL RESTRICTIONS:**
+            1. **NO POSITIVE COMMENTS OR PRAISE:** Only identify problems and issues
+            2. **NO CODE EXECUTION:** Rely exclusively on reading file contents and static analysis. You cannot run `python`, `bash`, or any shell commands other than `gh` tools. Do not attempt to verify code by executing it.
+            3. **ONLY COMMENT ON CHANGED LINES:** When creating inline comments, you MUST only comment on lines that are part of the actual diff. Use `gh pr diff` to identify the exact lines that changed before creating comments.
+
+            Perform a comprehensive code review focusing exclusively on identifying problems:
+
+            1. **Code Quality Issues**
+               - Violations of clean code principles and best practices
+               - Missing or inadequate error handling
+               - Unhandled edge cases
+               - Poor code readability or maintainability problems
+
+            2. **Security Vulnerabilities**
+               - Potential security risks
+               - Inadequate input sanitization
+               - Authentication/authorization flaws
+               - Data exposure risks
+
+            3. **Performance Problems**
+               - Performance bottlenecks
+               - Inefficient database queries
+               - Memory leaks or resource management issues
+               - Suboptimal algorithms
+
+            4. **Testing Deficiencies**
+               - Inadequate test coverage
+               - Poor test quality
+               - Missing test scenarios
+               - Flaky or unreliable tests
+
+            5. **Documentation Gaps**
+               - Missing or inaccurate code documentation
+               - Incomplete README updates for new features
+               - Incomplete documentation updates in docs/source directory for new features
+
+            Provide detailed feedback using inline comments for specific issues.
+            Use top-level comments for general problem observations.
+
+          claude_args: |
+            --model ${{ secrets.ANTHROPIC_MODEL }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+          show_full_output: true
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
