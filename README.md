@@ -12,10 +12,10 @@
     <a href="https://torcheasyrec.readthedocs.io/">
       <img src="https://readthedocs.org/projects/torcheasyrec/badge/?version=latest" alt="Documentation">
     </a>
+    <img src="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" alt="Python">
     <a href="https://github.com/alibaba/TorchEasyRec/stargazers">
       <img src="https://img.shields.io/github/stars/alibaba/TorchEasyRec?style=social&label=Stars" alt="GitHub Stars">
     </a>
-    <img src="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" alt="Python">
   </p>
 </div>
 
@@ -30,7 +30,7 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 ### Data Sources
 
 - **MaxCompute/ODPS** - Native Alibaba Cloud data warehouse integration
-- **Parquet** - High-performance columnar file format when use [OSS](https://help.aliyun.com/zh/oss/) or NAS storage, with built-in auto-rebalancing capabilities
+- **Parquet** - High-performance columnar file format when use Local | [OSS](https://help.aliyun.com/zh/oss/) | [NAS](https://help.aliyun.com/zh/nas/) storage, with built-in auto-rebalancing capabilities
 - **CSV** - Standard tabular file format
 - **Streaming** - Kafka message queue integration, also compatible with [Alibaba Datahub](https://help.aliyun.com/zh/datahub/product-overview/what-is-datahub)
 - **Checkpointable** - Resume training from exact data position
@@ -118,7 +118,8 @@ For the completed documentation, please refer to https://torcheasyrec.readthedoc
 
   - DingDing Group: 32260796 - [Join](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,QH4dGSsGXXWW+onmBBumO1U9mQElyRKWi2x16a6oTVY=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CQH4dGSsGXXWW%2BonmBBumO1U9mQElyRKWi2x16a6oTVY%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11)
   - DingDing Group2: 37930014162 - [Join](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,qTwau91MJZmxUClHh77gCsgcLASX0/eyhysrOf+8emQ=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CqTwau91MJZmxUClHh77gCsgcLASX0%2FeyhysrOf%2B8emQ%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11)
-    <img src="docs/images/qrcode/dinggroup1.JPG" alt="dingroup1" width="350">
+
+  <img src="docs/images/qrcode/dinggroup1.JPG" alt="dingroup1" width="350">
     <img src="docs/images/qrcode/dinggroup2.JPG" alt="dingroup2" width="350">
 
 - If you have any questions about how to use TorchEasyRec, please join the DingTalk group and contact us.
