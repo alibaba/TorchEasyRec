@@ -21,6 +21,7 @@ from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
 from confluent_kafka import Producer
+from parameterized import parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.kafka_dataset import KafkaDataset
@@ -55,7 +56,9 @@ class KafkaDatasetTest(unittest.TestCase):
         except Exception as e:
             logger.error(e)
 
-    def _create_test_table_and_feature_cfgs(self, has_lookup=True):
+    def _create_test_table_and_feature_cfgs(
+        self, has_lookup=True, use_input_fields_str=False
+    ):
         create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
@@ -78,18 +81,29 @@ class KafkaDatasetTest(unittest.TestCase):
                 break
             time.sleep(10)
 
-        input_fields = [
-            data_pb2.Field(input_name="unused", input_type=data_pb2.STRING),
-            data_pb2.Field(input_name="id_a", input_type=data_pb2.STRING),
-            data_pb2.Field(input_name="tag_b", input_type=data_pb2.STRING),
-            data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
-            data_pb2.Field(input_name="raw_d", input_type=data_pb2.DOUBLE),
-            data_pb2.Field(input_name="raw_e", input_type=data_pb2.INT32),
-            data_pb2.Field(input_name="raw_f", input_type=data_pb2.FLOAT),
-            data_pb2.Field(input_name="raw_g", input_type=data_pb2.ARRAY_FLOAT),
-            data_pb2.Field(input_name="map_h", input_type=data_pb2.MAP_STRING_INT64),
-            data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
-        ]
+        if use_input_fields_str:
+            input_fields_str = (
+                "unused:STRING;id_a:STRING;tag_b:STRING;raw_c:INT64;"
+                "raw_d:DOUBLE;raw_e:INT32;raw_f:FLOAT;raw_g:ARRAY<FLOAT>;"
+                "map_h:MAP<STRING,INT64>;label:INT64"
+            )
+            input_fields = None
+        else:
+            input_fields_str = None
+            input_fields = [
+                data_pb2.Field(input_name="unused", input_type=data_pb2.STRING),
+                data_pb2.Field(input_name="id_a", input_type=data_pb2.STRING),
+                data_pb2.Field(input_name="tag_b", input_type=data_pb2.STRING),
+                data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
+                data_pb2.Field(input_name="raw_d", input_type=data_pb2.DOUBLE),
+                data_pb2.Field(input_name="raw_e", input_type=data_pb2.INT32),
+                data_pb2.Field(input_name="raw_f", input_type=data_pb2.FLOAT),
+                data_pb2.Field(input_name="raw_g", input_type=data_pb2.ARRAY_FLOAT),
+                data_pb2.Field(
+                    input_name="map_h", input_type=data_pb2.MAP_STRING_INT64
+                ),
+                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+            ]
         config = {"bootstrap.servers": self.brokers}
         producer = Producer(config)
 
@@ -158,23 +172,33 @@ class KafkaDatasetTest(unittest.TestCase):
                     ),
                 )
             )
-        return feature_cfgs, input_fields
+        return feature_cfgs, input_fields, input_fields_str
 
+    @parameterized.expand([[False], [True]])
     @unittest.skipIf(
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
-    def test_kafka_dataset(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs()
+    def test_kafka_dataset(self, use_input_fields_str):
+        feature_cfgs, input_fields, input_fields_str = (
+            self._create_test_table_and_feature_cfgs(
+                use_input_fields_str=use_input_fields_str
+            )
+        )
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
+        data_config = data_pb2.DataConfig(
+            batch_size=8196,
+            dataset_type=data_pb2.DatasetType.KafkaDataset,
+            fg_mode=FgMode.FG_DAG,
+            label_fields=["label"],
+        )
+        if use_input_fields_str:
+            data_config.input_fields_str = input_fields_str
+        else:
+            data_config.input_fields.extend(input_fields)
+
         dataset = KafkaDataset(
-            data_config=data_pb2.DataConfig(
-                batch_size=8196,
-                dataset_type=data_pb2.DatasetType.KafkaDataset,
-                input_fields=input_fields,
-                fg_mode=FgMode.FG_DAG,
-                label_fields=["label"],
-            ),
+            data_config=data_config,
             features=features,
             input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
         )
@@ -211,7 +235,7 @@ class KafkaDatasetTest(unittest.TestCase):
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_metadata(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs(
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs(
             has_lookup=False
         )
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
@@ -255,7 +279,7 @@ class KafkaDatasetTest(unittest.TestCase):
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_resume(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs(
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs(
             has_lookup=False
         )
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)

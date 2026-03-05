@@ -17,12 +17,16 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from tzrec.datasets.utils import (
+    _normalize_type_str,
     calc_remaining_intervals,
     calc_slice_intervals,
     calc_slice_position,
+    get_input_fields_proto,
     process_hstu_neg_sample,
     process_hstu_seq_data,
 )
+from tzrec.protos import data_pb2
+from tzrec.protos.data_pb2 import FieldType
 
 
 class DatasetUtilsTest(unittest.TestCase):
@@ -276,6 +280,156 @@ class DatasetUtilsTest(unittest.TestCase):
             "3|105|106",
         ]
         self.assertEqual(result.to_pylist(), expected_results)
+
+    def test_normalize_type_str_basic_types(self):
+        """Test normalizing basic types."""
+        self.assertEqual(_normalize_type_str("int32"), "INT32")
+        self.assertEqual(_normalize_type_str("INT64"), "INT64")
+        self.assertEqual(_normalize_type_str("string"), "STRING")
+        self.assertEqual(_normalize_type_str("float"), "FLOAT")
+        self.assertEqual(_normalize_type_str("double"), "DOUBLE")
+
+    def test_normalize_type_str_aliases(self):
+        """Test ODPS aliases: BIGINT -> INT64, INT -> INT32."""
+        self.assertEqual(_normalize_type_str("BIGINT"), "INT64")
+        self.assertEqual(_normalize_type_str("bigint"), "INT64")
+        self.assertEqual(_normalize_type_str("INT"), "INT32")
+        self.assertEqual(_normalize_type_str("int"), "INT32")
+
+    def test_normalize_type_str_array_types(self):
+        """Test array types with aliases."""
+        self.assertEqual(_normalize_type_str("ARRAY<BIGINT>"), "ARRAY<INT64>")
+        self.assertEqual(_normalize_type_str("ARRAY<INT>"), "ARRAY<INT32>")
+        self.assertEqual(_normalize_type_str("ARRAY<INT64>"), "ARRAY<INT64>")
+        self.assertEqual(_normalize_type_str("ARRAY<INT32>"), "ARRAY<INT32>")
+        self.assertEqual(_normalize_type_str("ARRAY<STRING>"), "ARRAY<STRING>")
+        self.assertEqual(_normalize_type_str("array<float>"), "ARRAY<FLOAT>")
+
+    def test_normalize_type_str_nested_array_types(self):
+        """Test nested array types."""
+        self.assertEqual(
+            _normalize_type_str("ARRAY<ARRAY<BIGINT>>"), "ARRAY<ARRAY<INT64>>"
+        )
+        self.assertEqual(
+            _normalize_type_str("ARRAY<ARRAY<INT>>"), "ARRAY<ARRAY<INT32>>"
+        )
+
+    def test_normalize_type_str_map_types(self):
+        """Test map types with aliases."""
+        self.assertEqual(_normalize_type_str("MAP<STRING,BIGINT>"), "MAP<STRING,INT64>")
+        self.assertEqual(_normalize_type_str("MAP<STRING,INT>"), "MAP<STRING,INT32>")
+        self.assertEqual(_normalize_type_str("MAP<BIGINT,STRING>"), "MAP<INT64,STRING>")
+        self.assertEqual(_normalize_type_str("MAP<INT,STRING>"), "MAP<INT32,STRING>")
+        self.assertEqual(_normalize_type_str("MAP<BIGINT,BIGINT>"), "MAP<INT64,INT64>")
+
+    def test_normalize_type_str_spaces(self):
+        """Test handling of spaces around commas and angle brackets."""
+        self.assertEqual(_normalize_type_str("MAP<STRING, INT>"), "MAP<STRING,INT32>")
+        self.assertEqual(
+            _normalize_type_str("MAP< STRING , BIGINT >"), "MAP<STRING,INT64>"
+        )
+        self.assertEqual(_normalize_type_str("ARRAY< INT >"), "ARRAY<INT32>")
+        self.assertEqual(_normalize_type_str("  BIGINT  "), "INT64")
+
+    def test_get_input_fields_proto_basic_types(self):
+        """Test parsing basic types from input_fields_str."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "user_id:BIGINT;item_id:INT64;label:FLOAT"
+
+        fields = get_input_fields_proto(data_config)
+
+        self.assertEqual(len(fields), 3)
+        self.assertEqual(fields[0].input_name, "user_id")
+        self.assertEqual(fields[0].input_type, FieldType.INT64)
+        self.assertEqual(fields[1].input_name, "item_id")
+        self.assertEqual(fields[1].input_type, FieldType.INT64)
+        self.assertEqual(fields[2].input_name, "label")
+        self.assertEqual(fields[2].input_type, FieldType.FLOAT)
+
+    def test_get_input_fields_proto_array_types(self):
+        """Test parsing array types."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "ids:ARRAY<BIGINT>;values:ARRAY<FLOAT>"
+
+        fields = get_input_fields_proto(data_config)
+
+        self.assertEqual(len(fields), 2)
+        self.assertEqual(fields[0].input_name, "ids")
+        self.assertEqual(fields[0].input_type, FieldType.ARRAY_INT64)
+        self.assertEqual(fields[1].input_name, "values")
+        self.assertEqual(fields[1].input_type, FieldType.ARRAY_FLOAT)
+
+    def test_get_input_fields_proto_map_types(self):
+        """Test parsing map types."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "feat_map:MAP<STRING, BIGINT>"
+
+        fields = get_input_fields_proto(data_config)
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].input_name, "feat_map")
+        self.assertEqual(fields[0].input_type, FieldType.MAP_STRING_INT64)
+
+    def test_get_input_fields_proto_nested_array(self):
+        """Test parsing nested array types."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "nested:ARRAY<ARRAY<INT>>"
+
+        fields = get_input_fields_proto(data_config)
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].input_name, "nested")
+        self.assertEqual(fields[0].input_type, FieldType.ARRAY_ARRAY_INT32)
+
+    def test_get_input_fields_proto_empty_string(self):
+        """Test empty input_fields_str returns empty list."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = ""
+
+        fields = get_input_fields_proto(data_config)
+        self.assertEqual(len(fields), 0)
+
+    def test_get_input_fields_proto_trailing_semicolon(self):
+        """Test handling of trailing semicolon."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "user_id:BIGINT;item_id:INT64;"
+
+        fields = get_input_fields_proto(data_config)
+
+        self.assertEqual(len(fields), 2)
+        self.assertEqual(fields[0].input_name, "user_id")
+        self.assertEqual(fields[1].input_name, "item_id")
+
+    def test_get_input_fields_proto_fallback_to_input_fields(self):
+        """Test fallback to input_fields when input_fields_str is not set."""
+        data_config = data_pb2.DataConfig()
+        field1 = data_config.input_fields.add()
+        field1.input_name = "test_field"
+        field1.input_type = FieldType.STRING
+
+        fields = get_input_fields_proto(data_config)
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].input_name, "test_field")
+        self.assertEqual(fields[0].input_type, FieldType.STRING)
+
+    def test_get_input_fields_proto_invalid_format(self):
+        """Test error handling for invalid format."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "invalid_field"
+
+        with self.assertRaises(ValueError) as context:
+            get_input_fields_proto(data_config)
+        self.assertIn("Invalid input_fields_str format", str(context.exception))
+
+    def test_get_input_fields_proto_unknown_type(self):
+        """Test error handling for unknown type."""
+        data_config = data_pb2.DataConfig()
+        data_config.input_fields_str = "field1:UNKNOWN_TYPE"
+
+        with self.assertRaises(ValueError) as context:
+            get_input_fields_proto(data_config)
+        self.assertIn("Unknown field type", str(context.exception))
 
 
 if __name__ == "__main__":

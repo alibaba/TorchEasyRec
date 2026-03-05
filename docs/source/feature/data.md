@@ -74,22 +74,22 @@ data_config {
 
 - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
-- CsvDataset: 输入数据为csv格式
+## CsvDataset
 
-  - input_path: 按如下格式设置
+- input_path: 按如下格式设置
 
-    - `${PATH_TO_DATA_DIR}/*.csv`
+  - `${PATH_TO_DATA_DIR}/*.csv`
 
-  - 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
+- 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
 
-  - 需设置 `data_config.with_header`来指定是否有header行，默认为false
+- 需设置 `data_config.with_header`来指定是否有header行，默认为false
 
-  - 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
+- 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
 
-  - 注意:
+- 注意:
 
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
-    - csv格式数据读性能有瓶颈
+  - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
+  - csv格式数据读性能有瓶颈
 
 ## KafkaDataset
 
@@ -308,6 +308,29 @@ input_fields: {
   - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING
 - 当使用KafkaDataset：
   - `input_type` 支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING | ARRAY_INT32 | ARRAY_INT64 | ARRAY_FLOAT | ARRAY_DOUBLE | ARRAY_STRING | ARRAY_ARRAY_INT32 | ARRAY_ARRAY_INT64 | ARRAY_ARRAY_FLOAT | ARRAY_ARRAY_DOUBLE | ARRAY_ARRAY_STRING | MAP_STRING_INT32 | MAP_STRING_INT64 | MAP_STRING_FLOAT | MAP_STRING_DOUBLE | MAP_STRING_STRING | MAP_INT64_INT32 | MAP_INT64_INT64 | MAP_INT64_FLOAT | MAP_INT64_DOUBLE | MAP_INT64_STRING | MAP_INT32_INT32 | MAP_INT32_INT64 | MAP_INT32_FLOAT | MAP_INT32_DOUBLE | MAP_INT32_STRING
+
+### input_fields_str
+
+`input_fields_str`是`input_fields`的简化配置格式，格式为: `field_name1:field_type1;field_name2:field_type2;`
+
+示例:
+
+```
+data_config {
+    input_fields_str: "user_id:BIGINT;item_id:BIGINT;label:FLOAT;features:ARRAY<FLOAT>;"
+}
+```
+
+支持的类型名:
+
+- 基本类型: INT, INT32, BIGINT, INT64, STRING, FLOAT, DOUBLE
+- 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)
+- 数组类型: ARRAY<INT>, ARRAY<INT32>, ARRAY<BIGINT>, ARRAY<INT64>, ARRAY<STRING>, ARRAY<FLOAT>, ARRAY<DOUBLE>
+- 嵌套数组: ARRAY\<ARRAY<INT>>, ARRAY\<ARRAY<BIGINT>>, ARRAY\<ARRAY<STRING>> 等
+- Map类型: MAP\<STRING,INT>, MAP\<STRING,INT32>, MAP\<STRING,BIGINT>, MAP\<STRING,INT64>, MAP\<BIGINT,STRING>, MAP\<INT64,STRING> 等
+- 逗号周围允许空格: `MAP<STRING, BIGINT>` 是有效的
+
+注意: 如果同时设置了`input_fields_str`和`input_fields`，`input_fields_str`优先级更高。
 
 ### 更多配置
 

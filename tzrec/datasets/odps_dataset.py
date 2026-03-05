@@ -329,7 +329,6 @@ class OdpsDataset(BaseDataset):
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
         )
-        self._init_input_fields()
 
 
 class OdpsReader(BaseReader):
