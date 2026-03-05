@@ -1,6 +1,7 @@
 # 数据格式
 
-TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件。
+TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件，同时支持Kafka和Datahub的流式消息。
+TorchEasyRec的OdpsDataset, ParquetDataset, KafkaDataset进一步可支持训练断点续训功能，当训练中断后可以从上次的数据位置继续训练，避免重复处理已消费的数据。
 
 **一个最简单的data config的配置**
 

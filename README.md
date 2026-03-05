@@ -22,7 +22,7 @@ TorchEasyRec implements state of the art deep learning models used in common rec
 ### Diversified input data
 
 - [MaxCompute Table](https://help.aliyun.com/document_detail/27819.html)
-- [OSS files](https://help.aliyun.com/product/31815.html)
+- [OSS files](https://help.aliyun.com/product/31815.html) / NAS files
 - CSV files
 - Parquet files
 - Kafka streaming (with [Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode) support via Kafka-compatible mode)
