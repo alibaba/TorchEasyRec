@@ -113,7 +113,8 @@ data_config {
 
 - 注意:
 
-  - Kafka分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - 当使用 Arrow IPC Stream 格式 (带 schema) 时，每个 Kafka消息应只包含一个 record batch。如果单个消息包含多个 record batches，只有第一个 batch 会被读取，后续 batches 将被忽略。如需发送多个 batches，请将其作为多个独立的 Kafka消息发送。
 
 ## data_config配置
 

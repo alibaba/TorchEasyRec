@@ -265,6 +265,10 @@ class KafkaReader(BaseReader):
                     msg_data = msg.value()
                     if self._has_embedded_schema:
                         # Read with embedded schema using IPC stream reader
+                        # NOTE: Only the first record batch is read from each message.
+                        # If a Kafka message contains multiple record batches in the IPC
+                        # stream format, subsequent batches will be silently dropped.
+                        # Each Kafka message should contain exactly one record batch.
                         reader = pa.ipc.open_stream(msg_data)
                         try:
                             record_batch = reader.read_next_batch()
