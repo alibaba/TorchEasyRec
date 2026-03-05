@@ -16,33 +16,41 @@
   </p>
 </div>
 
-## Highlights
-
-|            Highlight             | Description                                                                                              |
-| :------------------------------: | :------------------------------------------------------------------------------------------------------- |
-|     **Production Validated**     | Battle-tested algorithms powering real-world recommendation systems at scale                             |
-|          **20+ Models**          | DSSM, TDM, DeepFM, DIN, MMoE, PLE, PEPNet, DLRM-HSTU and more                                            |
-| **10+ Feature Generation Types** | IdFeature, RawFeature, ComboFeature, LookupFeature, ExprFeature, SequenceFeature, CustomFeature and more |
-|           **Scalable**           | Powered by TorchRec with hybrid data/model parallelism                                                   |
-|     **Zero-Collision Hash**      | Dynamic embedding with LFU/LRU eviction for billion-scale features                                       |
-|      **Multi-Source Data**       | MaxCompute, Parquet, Kafka streaming, CSV, OSS/NAS                                                       |
-|       **Easy Deployment**        | One-click deploy to EAS with auto-scaling                                                                |
-
 ## What is TorchEasyRec?
 
 TorchEasyRec implements state-of-the-art deep learning models for recommendation tasks: **candidate generation (matching)**, **scoring (ranking)**, **multi-task learning**, and **generative recommendation**. It enables efficient development of high-performance models through simple configuration and easy customization.
 
 ![TorchEasyRec Framework](docs/images/intro.png)
 
-## Quick Start
+## Key Features
 
-Get started with TorchEasyRec in minutes:
+### Data Sources
 
-| Tutorial                                                                 | Description                                         |
-| ------------------------------------------------------------------------ | --------------------------------------------------- |
-| [Local Training](docs/source/quick_start/local_tutorial.md)              | Train models on your local machine or single server |
-| [PAI-DLC Training](docs/source/quick_start/dlc_tutorial.md)              | Distributed training on Alibaba Cloud PAI-DLC       |
-| [DLC + MaxCompute](docs/source/quick_start/dlc_odps_dataset_tutorial.md) | Train with MaxCompute (ODPS) datasets on PAI-DLC    |
+- **MaxCompute/ODPS** - Native Alibaba Cloud data warehouse integration
+- **Parquet** - High-performance columnar file format when use [OSS](https://help.aliyun.com/zh/oss/) or NAS storage, with built-in auto-rebalancing capabilities
+- **CSV** - Standard tabular file format
+- **Streaming** - Kafka message queue integration, also compatible with [Alibaba Datahub](https://help.aliyun.com/zh/datahub/product-overview/what-is-datahub)
+- **Checkpointable** - Resume training from exact data position
+
+### Scalability
+
+- **Distributed Training** - Hybrid data/model parallelism via TorchRec
+- **Large Embeddings** - Row-wise, column-wise, table-wise sharding
+- **Zero-Collision Hash** - Large scale Dynamic embedding with eviction policies (LFU/LRU)
+- **Mixed Precision** - FP16/BF16 training support
+
+### Production
+
+- **Feature Generation** - Consistent FG between training and serving
+- **[EAS](https://help.aliyun.com/zh/pai/user-guide/eas-model-serving) Deployment** - Auto-scaling model serving on Alibaba Cloud
+- **TensorRT/AOTInductor** - Model acceleration for inference
+
+### Features & Models
+
+- **20+ Models** - Battle-tested algorithms powering real-world recommendation: DSSM, TDM, DeepFM, DIN, MMoE, PLE, PEPNet, DLRM-HSTU and more
+- **Custom Model** - Easy to implement [customized models](docs/source/models/user_define.md)
+- **10+ Feature Types** - IdFeature, RawFeature, ComboFeature, LookupFeature, ExprFeature, SequenceFeature, CustomFeature, and more
+- **Custom Feature** - Easy to implement [customized features](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
 
 ## Supported Models
 
@@ -87,36 +95,17 @@ Get started with TorchEasyRec in minutes:
 | -------------------------------------------- | ------------------------------------------ |
 | [DLRM-HSTU](docs/source/models/dlrm_hstu.md) | Hierarchical Sequential Transduction Units |
 
-## Key Features
-
-### Data Sources
-
-- **MaxCompute/ODPS** - Native Alibaba Cloud data warehouse integration
-- **Parquet** - [OSS](https://help.aliyun.com/zh/oss/) or NAS efficient file formats with auto-rebalancing
-- **CSV** - Standard table file formats
-- **Kafka Streaming** - Real-time training with Datahub support
-- **Checkpointable** - Resume training from exact data position
-
-### Scalability
-
-- **Distributed Training** - Hybrid data/model parallelism via TorchRec
-- **Large Embeddings** - Row-wise, column-wise, table-wise sharding
-- **Zero-Collision Hash** - Dynamic embedding with eviction policies (LFU/LRU)
-- **Mixed Precision** - FP16/BF16 training support
-
-### Production
-
-- **Feature Generation** - Consistent FG between training and serving
-- **EAS Deployment** - Auto-scaling model serving on Alibaba Cloud
-- **TensorRT/AOTInductor** - Model acceleration for inference
-- **Export Formats** - TorchScript, ONNX, SavedModel
-
 ## Documentation
 
-- [Feature Configuration](https://torcheasyrec.readthedocs.io/zh-cn/latest/feature/feature.html)
-- [Data Formats](https://torcheasyrec.readthedocs.io/zh-cn/latest/feature/data.html)
-- [Model Configuration](https://torcheasyrec.readthedocs.io/zh-cn/latest/reference.html)
-- [Custom Models](https://torcheasyrec.readthedocs.io/zh-cn/latest/models/user_define.html)
+Get started with TorchEasyRec in minutes:
+
+| Tutorial                                                                 | Description                                         |
+| ------------------------------------------------------------------------ | --------------------------------------------------- |
+| [Local Training](docs/source/quick_start/local_tutorial.md)              | Train models on your local machine or single server |
+| [PAI-DLC Training](docs/source/quick_start/dlc_tutorial.md)              | Distributed training on Alibaba Cloud PAI-DLC       |
+| [DLC + MaxCompute](docs/source/quick_start/dlc_odps_dataset_tutorial.md) | Train with MaxCompute (ODPS) datasets on PAI-DLC    |
+
+For the completed documentation, please refer to https://torcheasyrec.readthedocs.io/
 
 ## Community & Support
 
