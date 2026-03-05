@@ -152,6 +152,10 @@ message DataConfig {
     // batch cost limit size
     optional uint64 batch_cost_size = 26;
 
+    // simplified input fields string format: input_name1:input_type1;input_name2:input_type2;
+    // type names follow ODPS conventions with aliases: BIGINT->INT64, INT->INT32
+    optional string input_fields_str = 27;
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;

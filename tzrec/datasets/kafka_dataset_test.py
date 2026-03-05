@@ -22,6 +22,7 @@ from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
 from confluent_kafka import Producer
+from parameterized import parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.kafka_dataset import KafkaDataset
@@ -56,9 +57,7 @@ class KafkaDatasetTest(unittest.TestCase):
         except Exception as e:
             logger.error(e)
 
-    def _create_test_table_and_feature_cfgs(
-        self, has_lookup=True, embedded_schema=False
-    ):
+    def _create_test_table_and_feature_cfgs(self, embedded_schema=False):
         create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
@@ -81,6 +80,11 @@ class KafkaDatasetTest(unittest.TestCase):
                 break
             time.sleep(10)
 
+        input_fields_str = (
+            "unused:STRING;id_a:STRING;tag_b:STRING;raw_c:INT64;"
+            "raw_d:DOUBLE;raw_e:INT32;raw_f:FLOAT;raw_g:ARRAY<FLOAT>;"
+            "map_h:MAP<STRING,INT64>;label:INT64"
+        )
         input_fields = [
             data_pb2.Field(input_name="unused", input_type=data_pb2.STRING),
             data_pb2.Field(input_name="id_a", input_type=data_pb2.STRING),
@@ -160,32 +164,38 @@ class KafkaDatasetTest(unittest.TestCase):
                     feature_name="raw_g", expression="user:raw_g", value_dim=3
                 ),
             ),
+            feature_pb2.FeatureConfig(
+                lookup_feature=feature_pb2.LookupFeature(
+                    feature_name="lookup_h", map="user:map_h", key="item:id_a"
+                ),
+            ),
         ]
-        if has_lookup:
-            feature_cfgs.append(
-                feature_pb2.FeatureConfig(
-                    lookup_feature=feature_pb2.LookupFeature(
-                        feature_name="lookup_h", map="user:map_h", key="item:id_a"
-                    ),
-                )
-            )
-        return feature_cfgs, input_fields
+        return feature_cfgs, input_fields, input_fields_str
 
+    @parameterized.expand([[False, False], [True, False], [True, True]])
     @unittest.skipIf(
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
-    def test_kafka_dataset(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs()
+    def test_kafka_dataset(self, use_input_fields_str, embedded_schema):
+        feature_cfgs, input_fields, input_fields_str = (
+            self._create_test_table_and_feature_cfgs(embedded_schema=embedded_schema)
+        )
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
+        data_config = data_pb2.DataConfig(
+            batch_size=8196,
+            dataset_type=data_pb2.DatasetType.KafkaDataset,
+            fg_mode=FgMode.FG_DAG,
+            label_fields=["label"],
+        )
+        if not embedded_schema:
+            if use_input_fields_str:
+                data_config.input_fields_str = input_fields_str
+            else:
+                data_config.input_fields.extend(input_fields)
+
         dataset = KafkaDataset(
-            data_config=data_pb2.DataConfig(
-                batch_size=8196,
-                dataset_type=data_pb2.DatasetType.KafkaDataset,
-                input_fields=input_fields,
-                fg_mode=FgMode.FG_DAG,
-                label_fields=["label"],
-            ),
+            data_config=data_config,
             features=features,
             input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
         )
@@ -222,7 +232,7 @@ class KafkaDatasetTest(unittest.TestCase):
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_metadata(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs(
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs(
             has_lookup=False
         )
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
@@ -266,9 +276,7 @@ class KafkaDatasetTest(unittest.TestCase):
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_resume(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs(
-            has_lookup=False
-        )
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
         # First, read some batches and capture checkpoint info
@@ -343,55 +351,6 @@ class KafkaDatasetTest(unittest.TestCase):
                 # New offset should be less than or equal to acc checkpoint offset
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
-
-    @unittest.skipIf(
-        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
-    )
-    def test_kafka_dataset_embedded_schema(self):
-        """Test KafkaDataset with embedded schema (no input_fields)."""
-        feature_cfgs, _ = self._create_test_table_and_feature_cfgs(embedded_schema=True)
-        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
-
-        # Create dataset WITHOUT input_fields - schema inferred from message
-        dataset = KafkaDataset(
-            data_config=data_pb2.DataConfig(
-                batch_size=8196,
-                dataset_type=data_pb2.DatasetType.KafkaDataset,
-                # No input_fields - embedded schema mode
-                fg_mode=FgMode.FG_DAG,
-                label_fields=["label"],
-            ),
-            features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
-        )
-        dataloader = DataLoader(
-            dataset=dataset,
-            batch_size=None,
-            num_workers=2,
-            pin_memory=True,
-            collate_fn=lambda x: x,
-        )
-        iterator = iter(dataloader)
-        for _ in range(2):
-            data = next(iterator)
-            data_dict = data.to_dict()
-            self.assertEqual(
-                sorted(data_dict.keys()),
-                [
-                    "id_a.lengths",
-                    "id_a.values",
-                    "label",
-                    "lookup_h.values",
-                    "raw_c.values",
-                    "raw_d.values",
-                    "raw_e.values",
-                    "raw_f.values",
-                    "raw_g.values",
-                    "tag_b.lengths",
-                    "tag_b.values",
-                ],
-            )
-            self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
 
 if __name__ == "__main__":

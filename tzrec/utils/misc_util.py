@@ -16,6 +16,8 @@ import string
 import subprocess
 from datetime import datetime
 
+from alibabacloud_credentials.provider import EcsRamRoleCredentialsProvider
+
 RUN_CMD_RETRY_NUM = 3
 
 
@@ -69,3 +71,18 @@ def get_free_port(host: str = "127.0.0.1") -> int:
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+_orig_ecs_ram_cred_init = EcsRamRoleCredentialsProvider.__init__
+
+
+def _patched_ecs_ram_cred_init(self, *args, **kwargs):
+    # apscheduler for ecs ram will exit timeout when use sampler,
+    # so that we set async_update_enabled=False as default.
+    kwargs.setdefault("async_update_enabled", False)
+    return _orig_ecs_ram_cred_init(self, *args, **kwargs)
+
+
+def apply_ecs_ram_cred_patch():
+    """Apply patch for ecs ram credential."""
+    EcsRamRoleCredentialsProvider.__init__ = _patched_ecs_ram_cred_init

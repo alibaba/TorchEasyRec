@@ -9,8 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -20,6 +21,7 @@ import torch
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
 
+from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
 
 BASE_DATA_GROUP = "__BASE__"
@@ -34,6 +36,35 @@ HARD_NEG_INDICES = "hard_neg_indices"
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
 CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
+
+
+def inject_checkpoint_metadata(
+    batch: pa.RecordBatch,
+    source_id: str,
+    global_row_idx: int,
+) -> Tuple[pa.RecordBatch, int]:
+    """Inject checkpoint metadata (source_id and row_idx) into a batch.
+
+    Args:
+        batch: The input record batch.
+        source_id: The source identifier for checkpointing.
+        global_row_idx: The current global row index.
+
+    Returns:
+        A tuple of (new_batch_with_metadata, updated_global_row_idx).
+    """
+    batch_len = len(batch)
+    row_indices = list(range(global_row_idx, global_row_idx + batch_len))
+    new_batch = pa.RecordBatch.from_arrays(
+        list(batch.columns)
+        + [
+            pa.array([source_id] * batch_len, type=pa.string()),
+            pa.array(row_indices, type=pa.int64()),
+        ],
+        names=list(batch.schema.names) + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
+    )
+    return new_batch, global_row_idx + batch_len
+
 
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
@@ -67,6 +98,129 @@ FIELD_TYPE_TO_PA = {
     FieldType.MAP_INT32_DOUBLE: pa.map_(pa.int32(), pa.float64()),
     FieldType.MAP_INT32_STRING: pa.map_(pa.int32(), pa.string()),
 }
+
+# Type name mapping from ODPS-style type str to FieldType enum
+# Note: Aliases INT/INT32 and BIGINT/INT64 are handled by normalizing the type string
+TYPE_STR_TO_FIELD_TYPE = {
+    # Basic types (use canonical names INT32/INT64)
+    "INT32": FieldType.INT32,
+    "INT64": FieldType.INT64,
+    "STRING": FieldType.STRING,
+    "FLOAT": FieldType.FLOAT,
+    "DOUBLE": FieldType.DOUBLE,
+    # Array types (use canonical INT32/INT64 inside)
+    "ARRAY<INT32>": FieldType.ARRAY_INT32,
+    "ARRAY<INT64>": FieldType.ARRAY_INT64,
+    "ARRAY<STRING>": FieldType.ARRAY_STRING,
+    "ARRAY<FLOAT>": FieldType.ARRAY_FLOAT,
+    "ARRAY<DOUBLE>": FieldType.ARRAY_DOUBLE,
+    # Nested array types
+    "ARRAY<ARRAY<INT32>>": FieldType.ARRAY_ARRAY_INT32,
+    "ARRAY<ARRAY<INT64>>": FieldType.ARRAY_ARRAY_INT64,
+    "ARRAY<ARRAY<STRING>>": FieldType.ARRAY_ARRAY_STRING,
+    "ARRAY<ARRAY<FLOAT>>": FieldType.ARRAY_ARRAY_FLOAT,
+    "ARRAY<ARRAY<DOUBLE>>": FieldType.ARRAY_ARRAY_DOUBLE,
+    # Map types (use canonical INT32/INT64 inside)
+    "MAP<STRING,INT32>": FieldType.MAP_STRING_INT32,
+    "MAP<STRING,INT64>": FieldType.MAP_STRING_INT64,
+    "MAP<STRING,STRING>": FieldType.MAP_STRING_STRING,
+    "MAP<STRING,FLOAT>": FieldType.MAP_STRING_FLOAT,
+    "MAP<STRING,DOUBLE>": FieldType.MAP_STRING_DOUBLE,
+    "MAP<INT64,INT32>": FieldType.MAP_INT64_INT32,
+    "MAP<INT64,INT64>": FieldType.MAP_INT64_INT64,
+    "MAP<INT64,STRING>": FieldType.MAP_INT64_STRING,
+    "MAP<INT64,FLOAT>": FieldType.MAP_INT64_FLOAT,
+    "MAP<INT64,DOUBLE>": FieldType.MAP_INT64_DOUBLE,
+    "MAP<INT32,INT32>": FieldType.MAP_INT32_INT32,
+    "MAP<INT32,INT64>": FieldType.MAP_INT32_INT64,
+    "MAP<INT32,STRING>": FieldType.MAP_INT32_STRING,
+    "MAP<INT32,FLOAT>": FieldType.MAP_INT32_FLOAT,
+    "MAP<INT32,DOUBLE>": FieldType.MAP_INT32_DOUBLE,
+}
+
+
+def _normalize_type_str(type_str: str) -> str:
+    """Normalize type string.
+
+    1. Converting to uppercase
+    2. Removing spaces
+    3. Replacing ODPS aliases: BIGINT->INT64, INT->INT32
+       (handles both BIGINT/INT64 and INT/INT32 as valid inputs)
+
+    Args:
+        type_str: type string to normalize
+
+    Returns:
+        normalized type string
+    """
+    normalized = type_str.upper().strip()
+    normalized = re.sub(r"\s+", "", normalized)
+    # Use word boundaries to match whole words only
+    normalized = re.sub(r"\bBIGINT\b", "INT64", normalized)
+    normalized = re.sub(r"\bINT\b", "INT32", normalized)
+    return normalized
+
+
+def get_input_fields_proto(
+    data_config: data_pb2.DataConfig,
+) -> List[data_pb2.Field]:
+    """Get input fields from data_config.input_fields_str or data_config.input_fields.
+
+    If input_fields_str is specified, parse it and return the fields.
+    Otherwise, return data_config.input_fields directly.
+
+    Args:
+        data_config: DataConfig proto message
+
+    Returns:
+        List of Field proto messages
+    """
+    if data_config.HasField("input_fields_str") and data_config.input_fields_str:
+        input_fields_str = data_config.input_fields_str.strip()
+        if not input_fields_str:
+            return []
+
+        fields = []
+        # Split by semicolon, filter out empty parts
+        field_parts = [p.strip() for p in input_fields_str.split(";") if p.strip()]
+        for field_part in field_parts:
+            if ":" not in field_part:
+                raise ValueError(
+                    f"Invalid input_fields_str format: '{field_part}'. "
+                    "Expected format: 'field_name:field_type'"
+                )
+            name, type_str = field_part.split(":", 1)
+            name = name.strip()
+            type_str = type_str.strip()
+
+            if not name:
+                raise ValueError(
+                    f"Empty field name in input_fields_str: '{field_part}'"
+                )
+            if not type_str:
+                raise ValueError(
+                    f"Empty field type in input_fields_str: '{field_part}'"
+                )
+
+            # Normalize the type string
+            normalized_type = _normalize_type_str(type_str)
+
+            if normalized_type not in TYPE_STR_TO_FIELD_TYPE:
+                raise ValueError(
+                    f"Unknown field type '{type_str}' "
+                    f"(normalized: '{normalized_type}') for field '{name}'. "
+                    f"Supported types: {list(TYPE_STR_TO_FIELD_TYPE.keys())}"
+                )
+
+            field_proto = data_pb2.Field()
+            field_proto.input_name = name
+            field_proto.input_type = TYPE_STR_TO_FIELD_TYPE[normalized_type]
+            fields.append(field_proto)
+
+        return fields
+    else:
+        # Return the existing input_fields
+        return list(data_config.input_fields)
 
 
 @dataclass
@@ -531,6 +685,138 @@ def calc_slice_position(
         real_end = real_end - 1
         split_point = 0
     return real_start, real_end, (size % batch_size) * slice_count + split_point
+
+
+def calc_remaining_intervals(
+    checkpoint_state: Optional[Dict[str, int]],
+    input_path: str,
+    total_rows: int,
+) -> List[Tuple[int, int]]:
+    """Calculate remaining intervals from checkpoint state.
+
+    The checkpoint key format is `{input_path}:{start}` where `start` is the
+    beginning of the worker's range. From sorted starts + total_rows, we can
+    infer the original ranges and calculate remaining intervals.
+
+    Args:
+        checkpoint_state (dict): dict mapping source_id to max consumed row index.
+        input_path (str): the input path to filter checkpoint entries.
+        total_rows (int): total number of rows in the dataset.
+
+    Returns:
+        List of (start, end) tuples representing remaining intervals.
+    """
+    if not checkpoint_state:
+        return [(0, total_rows)]  # No checkpoint, all data remaining
+
+    # Parse checkpoint keys: "{input_path}:{start}" -> (start, consumed)
+    # Filter by input_path matching
+    entries = []  # [(start, consumed), ...]
+    for key, consumed in checkpoint_state.items():
+        last_colon = key.rfind(":")
+        if last_colon == -1:
+            continue
+        key_input_path = key[:last_colon]
+        # Match input_path (exact match)
+        if key_input_path == input_path:
+            start = int(key[last_colon + 1 :])
+            entries.append((start, consumed))
+
+    if not entries:
+        return [(0, total_rows)]  # No matching checkpoint
+
+    # Sort by start to infer original ranges
+    entries.sort(key=lambda x: x[0])
+
+    # Calculate remaining intervals
+    remaining = []
+    num_entries = len(entries)
+    for i, (_, consumed) in enumerate(entries):
+        # Infer the end of this worker's range
+        if i + 1 < num_entries:
+            range_end = entries[i + 1][0]  # Next worker's start
+        else:
+            range_end = total_rows  # Last worker goes to end
+
+        # Remaining interval is [consumed+1, range_end)
+        if consumed + 1 < range_end:
+            remaining.append((consumed + 1, range_end))
+
+    return remaining if remaining else []
+
+
+def calc_slice_intervals(
+    total_rows: int,
+    worker_id: int,
+    num_workers: int,
+    batch_size: int = 1,
+    drop_redundant_bs_eq_one: bool = False,
+    pre_total_remain: int = 0,
+    checkpoint_state: Optional[Dict[str, int]] = None,
+    input_path: Optional[str] = None,
+) -> List[Tuple[int, int]]:
+    """Redistribute remaining intervals among workers.
+
+    Flattens all intervals into a total row count, then assigns a portion
+    to each worker based on worker_id and num_workers.
+
+    Args:
+        total_rows (int): total number of rows in the dataset.
+        worker_id: Current worker's ID (0-indexed).
+        num_workers: Total number of workers.
+        batch_size: batch_size.
+        drop_redundant_bs_eq_one: drop last redundant batch with batch_size
+            equal one to prevent train_eval hung.
+        pre_total_remain (int): remaining total count in pre-table is
+            insufficient to meet the batch_size requirement for each worker.
+        checkpoint_state (dict): dict mapping source_id to max consumed row index.
+        input_path (str): the input path to filter checkpoint entries.
+
+    Returns:
+        worker_intervals (list): List of (start, end) tuples assigned to this worker.
+        total_remain (int): remaining total count in curr-table is
+            insufficient to meet the batch_size requirement for each worker.
+    """
+    if checkpoint_state:
+        intervals = calc_remaining_intervals(checkpoint_state, input_path, total_rows)
+        total_rows = sum(end - start for start, end in intervals)
+
+    # Reuse calc_slice_position for worker start/end calculation
+    worker_start, worker_end, total_remain = calc_slice_position(
+        row_count=total_rows,
+        slice_id=worker_id,
+        slice_count=num_workers,
+        batch_size=batch_size,
+        drop_redundant_bs_eq_one=drop_redundant_bs_eq_one,
+        pre_total_remain=pre_total_remain,
+    )
+
+    if checkpoint_state:
+        # Map worker's logical range [worker_start, worker_end) to actual intervals
+        result = []
+        current_pos = 0
+        for interval_start, interval_end in intervals:
+            interval_len = interval_end - interval_start
+            interval_logical_start = current_pos
+            interval_logical_end = current_pos + interval_len
+
+            # Check if this interval overlaps with worker's range
+            overlap_start = max(worker_start, interval_logical_start)
+            overlap_end = min(worker_end, interval_logical_end)
+
+            if overlap_start < overlap_end:
+                # Map back to actual row indices
+                actual_start = interval_start + (overlap_start - interval_logical_start)
+                actual_end = interval_start + (overlap_end - interval_logical_start)
+                result.append((actual_start, actual_end))
+
+            current_pos = interval_logical_end
+            if current_pos >= worker_end:
+                break
+    else:
+        result = [(worker_start, worker_end)]
+
+    return result, total_remain
 
 
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:

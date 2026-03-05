@@ -24,7 +24,10 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import calc_slice_position
+from tzrec.datasets.utils import (
+    calc_slice_intervals,
+    inject_checkpoint_metadata,
+)
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
@@ -39,8 +42,10 @@ def _reader_iter(
     start: int,
     end: int,
     worker_id: int,
+    source_id: Optional[str] = None,
 ) -> Iterator[pa.RecordBatch]:
     cnt = 0
+    global_row_idx = start  # Track absolute global row index
     for input_file in input_files:
         if cnt >= end:
             break
@@ -66,23 +71,38 @@ def _reader_iter(
             for batch in parquet_file.iter_batches(
                 batch_size, row_groups=row_groups, columns=columns, use_threads=False
             ):
-                if cnt + len(batch) <= start:
+                original_batch_len = len(batch)  # Store before any modification
+                if cnt + original_batch_len <= start:
                     logger.debug(
-                        f"worker {worker_id} skip batch. "
-                        f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
+                        f"worker {worker_id} skip batch. start: {start}, "
+                        f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
                 elif cnt <= start:
                     logger.debug(
-                        f"worker {worker_id} yield start batch. "
-                        f"start: {start}, end: {end}, cnt: {cnt}, len: {len(batch)}."
+                        f"worker {worker_id} yield start batch. start: {start}, "
+                        f"end: {end}, cnt: {cnt}, len: {original_batch_len}."
                     )
-                    yield batch[start - cnt : end - cnt]
-                elif cnt + len(batch) > end:
-                    yield batch[: end - cnt]
+                    sliced_batch = batch[start - cnt : end - cnt]
+                    if source_id is not None:
+                        sliced_batch, global_row_idx = inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
+                        )
+                    yield sliced_batch
+                elif cnt + original_batch_len > end:
+                    sliced_batch = batch[: end - cnt]
+                    if source_id is not None:
+                        sliced_batch, global_row_idx = inject_checkpoint_metadata(
+                            sliced_batch, source_id, global_row_idx
+                        )
+                    yield sliced_batch
                 else:
+                    if source_id is not None:
+                        batch, global_row_idx = inject_checkpoint_metadata(
+                            batch, source_id, global_row_idx
+                        )
                     yield batch
 
-                cnt += len(batch)
+                cnt += original_batch_len
                 if cnt >= end:
                     break
             parquet_file.close()
@@ -124,7 +144,6 @@ class ParquetDataset(BaseDataset):
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
         )
-        self._init_input_fields()
 
 
 class ParquetReader(BaseReader):
@@ -226,29 +245,39 @@ class ParquetReader(BaseReader):
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        start, end = 0, sys.maxsize
+        if len(self._input_files) == 0:
+            return
+
+        worker_intervals = [(0, sys.maxsize)]
         if self._rebalance:
-            start, end, _ = calc_slice_position(
+            worker_intervals, _ = calc_slice_intervals(
                 sum(self._num_rows),
                 worker_id,
                 num_workers,
                 self._batch_size,
                 self._drop_redundant_bs_eq_one,
+                checkpoint_state=self._checkpoint_state,
+                input_path=self._input_path,
             )
 
-        if len(self._input_files) > 0:
-            reader = _reader_iter(
-                self._input_files
-                if self._rebalance
-                else self._input_files[worker_id::num_workers],
-                self._batch_size,
-                self._parquet_metas,
-                self._ordered_cols,
-                start,
-                end,
-                worker_id,
-            )
-            yield from self._arrow_reader_iter(reader)
+        def _combined_reader() -> Iterator[pa.RecordBatch]:
+            for start, end in worker_intervals:
+                yield from _reader_iter(
+                    self._input_files
+                    if self._rebalance
+                    else self._input_files[worker_id::num_workers],
+                    self._batch_size,
+                    self._parquet_metas,
+                    self._ordered_cols,
+                    start,
+                    end,
+                    worker_id,
+                    source_id=f"{self._input_path}:{start}"
+                    if self._rebalance
+                    else None,
+                )
+
+        yield from self._arrow_reader_iter(_combined_reader())
 
     def num_files(self) -> Optional[int]:
         """Get number of files in the dataset."""
