@@ -1,6 +1,6 @@
 # 模型服务
 
-TorchEasyRec Processor是一套高性能的Torch推荐模型的推理服务，可以在阿里云[模型在线服务(PAI-EAS)](https://help.aliyun.com/document_detail/113696.html)来部署。TorchEasyRec Processor联合优化了特征生成(FG)、[FeatureStore](https://help.aliyun.com/zh/pai/user-guide/featurestore-overview)特征缓存和TorchEasyRec的模型推理，在保证离在线一致性的同时，提供了高性能的推理。
+[TorchEasyRec Processor](https://help.aliyun.com/zh/pai/user-guide/torcheasyrec-processor)是一套高性能的Torch推荐模型的推理服务，可以在阿里云[模型在线服务(PAI-EAS)](https://help.aliyun.com/document_detail/113696.html)来部署。TorchEasyRec Processor联合优化了特征生成(FG)、[FeatureStore](https://help.aliyun.com/zh/pai/user-guide/featurestore-overview)特征缓存和TorchEasyRec的模型推理，在保证离在线一致性的同时，提供了高性能的推理。
 
 ## 部署服务
 
@@ -43,7 +43,7 @@ cat << EOF > tzrec_rank.json
       }
     }
   ],
-  "processor":"easyrec-torch-1.5"
+  "processor":"easyrec-torch-1.11"
 }
 EOF
 

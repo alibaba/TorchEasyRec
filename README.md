@@ -30,7 +30,7 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 ### Data Sources
 
 - **MaxCompute/ODPS** - Native Alibaba Cloud data warehouse integration
-- **Parquet** - High-performance columnar file format when use Local | [OSS](https://help.aliyun.com/zh/oss/) | [NAS](https://help.aliyun.com/zh/nas/) storage, with built-in auto-rebalancing capabilities
+- **Parquet** - High-performance columnar file format when using Local | [OSS](https://help.aliyun.com/zh/oss/) | [NAS](https://help.aliyun.com/zh/nas/) storage, with built-in auto-rebalancing capabilities
 - **CSV** - Standard tabular file format
 - **Streaming** - Kafka message queue integration, also compatible with [Alibaba Datahub](https://help.aliyun.com/zh/datahub/product-overview/what-is-datahub)
 - **Checkpointable** - Resume training from exact data position
@@ -44,6 +44,7 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 
 ### Production
 
+- **Run Everywhere** - Local, [PAI-DLC](https://help.aliyun.com/zh/pai/user-guide/container-training), [PAI-DSW](https://help.aliyun.com/zh/pai/user-guide/dsw-notebook-service)
 - **Feature Generation** - Consistent FG between training and serving
 - **[EAS](https://help.aliyun.com/zh/pai/user-guide/eas-model-serving) Deployment** - Auto-scaling model serving on Alibaba Cloud
 - **TensorRT/AOTInductor** - Model acceleration for inference
@@ -107,7 +108,7 @@ Get started with TorchEasyRec in minutes:
 | [PAI-DLC Training](docs/source/quick_start/dlc_tutorial.md)                        | Distributed training on Alibaba Cloud PAI-DLC       |
 | [PAI-DLC + MaxCompute Table](docs/source/quick_start/dlc_odps_dataset_tutorial.md) | Train with MaxCompute (ODPS) tables on PAI-DLC      |
 
-For the completed documentation, please refer to https://torcheasyrec.readthedocs.io/
+For the complete documentation, please refer to https://torcheasyrec.readthedocs.io/
 
 ## Community & Support
 
