@@ -174,14 +174,9 @@ class KafkaDatasetTest(unittest.TestCase):
             )
         return feature_cfgs, input_fields, input_fields_str
 
+    @parameterized.expand([[False], [True]])
     @unittest.skipIf(
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
-    )
-    @parameterized.expand(
-        [
-            [False],  # use_input_fields_str
-            [True],  # test with input_fields_str
-        ]
     )
     def test_kafka_dataset(self, use_input_fields_str):
         feature_cfgs, input_fields, input_fields_str = (
