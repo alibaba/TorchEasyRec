@@ -51,21 +51,20 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 ### Features & Models
 
 - **20+ Models** - Battle-tested algorithms powering real-world recommendation: DSSM, TDM, DeepFM, DIN, MMoE, PLE, PEPNet, DLRM-HSTU and more
-- **Custom Model** - Easy to implement [customized models](docs/source/models/user_define.md)
 - **10+ Feature Types** - IdFeature, RawFeature, ComboFeature, LookupFeature, ExprFeature, SequenceFeature, CustomFeature, and more
+- **Custom Model** - Easy to implement [customized models](docs/source/models/user_define.md)
 - **Custom Feature** - Easy to implement [customized features](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
 
 ## Supported Models
 
 ### Matching (Candidate Generation)
 
-| Model                                 | Description                                      |
-| ------------------------------------- | ------------------------------------------------ |
-| [DSSM](docs/source/models/dssm.md)    | Two-tower deep semantic matching model           |
-| [DSSM-V2](docs/source/models/dssm.md) | Enhanced DSSM with cross-tower embedding sharing |
-| [MIND](docs/source/models/mind.md)    | Multi-interest network with dynamic routing      |
-| [TDM](docs/source/models/tdm.md)      | Tree-based deep model for large-scale retrieval  |
-| [DAT](docs/source/models/dat.md)      | Dual augmented two-tower model                   |
+| Model                              | Description                                     |
+| ---------------------------------- | ----------------------------------------------- |
+| [DSSM](docs/source/models/dssm.md) | Two-tower deep semantic matching model          |
+| [MIND](docs/source/models/mind.md) | Multi-interest network with dynamic routing     |
+| [TDM](docs/source/models/tdm.md)   | Tree-based deep model for large-scale retrieval |
+| [DAT](docs/source/models/dat.md)   | Dual augmented two-tower model                  |
 
 ### Ranking (Scoring)
 
@@ -102,11 +101,11 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 
 Get started with TorchEasyRec in minutes:
 
-| Tutorial                                                                 | Description                                         |
-| ------------------------------------------------------------------------ | --------------------------------------------------- |
-| [Local Training](docs/source/quick_start/local_tutorial.md)              | Train models on your local machine or single server |
-| [PAI-DLC Training](docs/source/quick_start/dlc_tutorial.md)              | Distributed training on Alibaba Cloud PAI-DLC       |
-| [DLC + MaxCompute](docs/source/quick_start/dlc_odps_dataset_tutorial.md) | Train with MaxCompute (ODPS) datasets on PAI-DLC    |
+| Tutorial                                                                           | Description                                         |
+| ---------------------------------------------------------------------------------- | --------------------------------------------------- |
+| [Local Training](docs/source/quick_start/local_tutorial.md)                        | Train models on your local machine or single server |
+| [PAI-DLC Training](docs/source/quick_start/dlc_tutorial.md)                        | Distributed training on Alibaba Cloud PAI-DLC       |
+| [PAI-DLC + MaxCompute Table](docs/source/quick_start/dlc_odps_dataset_tutorial.md) | Train with MaxCompute (ODPS) tables on PAI-DLC      |
 
 For the completed documentation, please refer to https://torcheasyrec.readthedocs.io/
 
