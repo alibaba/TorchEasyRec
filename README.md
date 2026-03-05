@@ -6,8 +6,11 @@
     <a href="https://github.com/alibaba/TorchEasyRec/blob/master/LICENSE">
       <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
     </a>
-    <a href="https://github.com/alibaba/TorchEasyRec/actions">
-      <img src="https://github.com/alibaba/TorchEasyRec/workflows/CI/badge.svg" alt="CI Status">
+    <a href="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_ci.yml">
+      <img src="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_ci.yml/badge.svg" alt="Unit Test">
+    </a>
+    <a href="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml">
+      <img src="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml/badge.svg" alt="Unit Test Nightly">
     </a>
     <img src="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" alt="Python">
   </p>
