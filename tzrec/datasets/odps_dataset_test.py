@@ -26,6 +26,7 @@ from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_ac
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
+from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.misc_util import get_free_port, random_name
 
 
@@ -207,6 +208,232 @@ class OdpsDatasetTest(unittest.TestCase):
     )
     def test_odps_dataset_has_schema(self):
         self._test_odps_dataset(is_orderby_partition=False, schema="rec")
+
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
+    def test_odps_dataset_checkpoint_metadata(self):
+        """Test that checkpoint_info is present and has correct format."""
+        account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        self.o = ODPS(account=account, project=project, endpoint=odps_endpoint)
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        input_path = (
+            f"odps://{project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319"
+        )
+
+        dataset = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+                odps_data_quota_name=self.test_quota,
+            ),
+            features=features,
+            input_path=input_path,
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # Verify checkpoint_info is present and has correct format
+        self.assertIsNotNone(batch.checkpoint_info)
+        self.assertIsInstance(batch.checkpoint_info, dict)
+
+        # Checkpoint keys should be in format "{input_path}#{session_id}:{start}"
+        for key, value in batch.checkpoint_info.items():
+            self.assertIn(":", key)
+            self.assertIn("#", key)
+            parts = key.rsplit(":", 1)
+            self.assertEqual(len(parts), 2)
+            # start should be numeric
+            self.assertTrue(parts[1].isdigit())
+            # Verify session_id is present (between # and last :)
+            prefix = parts[0]
+            hash_idx = prefix.rfind("#")
+            self.assertGreater(hash_idx, 0)
+            session_id = prefix[hash_idx + 1 :]
+            self.assertGreater(len(session_id), 0)
+            # Value should be a non-negative integer
+            self.assertIsInstance(value, int)
+            self.assertGreaterEqual(value, 0)
+
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
+    def test_odps_dataset_checkpoint_resume(self):
+        """Test checkpoint resume functionality."""
+        account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        self.o = ODPS(account=account, project=project, endpoint=odps_endpoint)
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        input_path = (
+            f"odps://{project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319"
+        )
+
+        # First, read some batches and capture checkpoint info
+        dataset1 = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+                odps_data_quota_name=self.test_quota,
+            ),
+            features=features,
+            input_path=input_path,
+        )
+        dataloader1 = DataLoader(
+            dataset=dataset1,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator1 = iter(dataloader1)
+
+        # Read first batch and capture checkpoint
+        checkpoint_state_acc = {}
+        batch1 = next(iterator1)
+        first_checkpoint_state = batch1.checkpoint_info.copy()
+        update_dataloder_state(checkpoint_state_acc, first_checkpoint_state)
+        self.assertIsNotNone(first_checkpoint_state)
+        self.assertGreater(len(first_checkpoint_state), 0)
+
+        # Read more batches
+        for _ in range(3):
+            batch1 = next(iterator1)
+            update_dataloder_state(checkpoint_state_acc, batch1.checkpoint_info.copy())
+        del iterator1
+        del dataloader1
+
+        # Now create a new dataset with checkpoint state set
+        dataset2 = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+                odps_data_quota_name=self.test_quota,
+            ),
+            features=features,
+            input_path=input_path,
+        )
+        dataloader2 = DataLoader(
+            dataset=dataset2,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        # Set first batch checkpoint state to resume from saved offsets
+        dataloader2.dataset.load_state_dict(first_checkpoint_state)
+        iterator2 = iter(dataloader2)
+
+        # Read batch from resumed dataset
+        batch2 = next(iterator2)
+
+        # The resumed batch should have offsets greater than the checkpoint
+        for key, new_offset in batch2.checkpoint_info.items():
+            if key in first_checkpoint_state:
+                # New offset should be greater than first checkpoint offset
+                self.assertGreater(new_offset, first_checkpoint_state[key])
+            if key in checkpoint_state_acc:
+                # New offset should be less than or equal to acc checkpoint offset
+                self.assertLessEqual(new_offset, checkpoint_state_acc[key])
+
+    @unittest.skipIf(
+        "ODPS_CONFIG_FILE_PATH" not in os.environ
+        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        "odps config not found",
+    )
+    def test_odps_dataset_checkpoint_resume_orderby_partition(self):
+        """Test checkpoint resume with is_orderby_partition=True."""
+        account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        self.o = ODPS(account=account, project=project, endpoint=odps_endpoint)
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        # Use both partitions: dt=20240319 & dt=20240320
+        input_path = (
+            f"odps://{project}/tables/test_odps_dataset_{self.test_suffix}/"
+            "dt=20240319&dt=20240320"
+        )
+
+        # First dataset with is_orderby_partition=True
+        dataset1 = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+                is_orderby_partition=True,
+                odps_data_quota_name=self.test_quota,
+            ),
+            features=features,
+            input_path=input_path,
+        )
+        # Verify 2 sessions created (one per partition)
+        sess_list = list(dataset1._reader._input_to_sess.values())[0]
+        self.assertEqual(len(sess_list), 2)
+
+        dataloader1 = DataLoader(
+            dataset=dataset1,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator1 = iter(dataloader1)
+
+        # Read only 1 batch (partial consumption of first partition only)
+        batch1 = next(iterator1)
+        first_checkpoint_state = batch1.checkpoint_info.copy()
+        self.assertIsNotNone(first_checkpoint_state)
+        del iterator1
+        del dataloader1
+
+        # Create new dataset and restore from checkpoint
+        dataset2 = OdpsDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+                is_orderby_partition=True,
+                odps_data_quota_name=self.test_quota,
+            ),
+            features=features,
+            input_path=input_path,
+        )
+        # Load checkpoint state (only has first partition session)
+        dataset2.load_state_dict(first_checkpoint_state)
+
+        # Verify sessions are preserved: checkpoint session + new session for
+        # unconsumed partition
+        restored_sess_list = list(dataset2._reader._input_to_sess.values())[0]
+        self.assertEqual(
+            len(restored_sess_list),
+            2,
+            "Should have 2 sessions: 1 restored + 1 for unconsumed partition",
+        )
+        self.assertEqual(
+            restored_sess_list[0].session_id,
+            list(first_checkpoint_state.keys())[0].split("#")[1].split(":")[0],
+        )
 
     def _test_odps_dataset_with_sampler(self, id_type="bigint", schema=None):
         account, odps_endpoint = _create_odps_account()

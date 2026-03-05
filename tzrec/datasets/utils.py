@@ -37,6 +37,35 @@ HARD_NEG_INDICES = "hard_neg_indices"
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
 CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
 
+
+def inject_checkpoint_metadata(
+    batch: pa.RecordBatch,
+    source_id: str,
+    global_row_idx: int,
+) -> Tuple[pa.RecordBatch, int]:
+    """Inject checkpoint metadata (source_id and row_idx) into a batch.
+
+    Args:
+        batch: The input record batch.
+        source_id: The source identifier for checkpointing.
+        global_row_idx: The current global row index.
+
+    Returns:
+        A tuple of (new_batch_with_metadata, updated_global_row_idx).
+    """
+    batch_len = len(batch)
+    row_indices = list(range(global_row_idx, global_row_idx + batch_len))
+    new_batch = pa.RecordBatch.from_arrays(
+        list(batch.columns)
+        + [
+            pa.array([source_id] * batch_len, type=pa.string()),
+            pa.array(row_indices, type=pa.int64()),
+        ],
+        names=list(batch.schema.names) + [CKPT_SOURCE_ID, CKPT_ROW_IDX],
+    )
+    return new_batch, global_row_idx + batch_len
+
+
 FIELD_TYPE_TO_PA = {
     FieldType.INT32: pa.int32(),
     FieldType.INT64: pa.int64(),
