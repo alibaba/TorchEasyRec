@@ -6,11 +6,14 @@
     <a href="https://github.com/alibaba/TorchEasyRec/blob/master/LICENSE">
       <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
     </a>
-    <a href="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_ci.yml">
-      <img src="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_ci.yml/badge.svg" alt="Unit Test">
-    </a>
     <a href="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml">
       <img src="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml/badge.svg" alt="Unit Test Nightly">
+    </a>
+    <a href="https://torcheasyrec.readthedocs.io/">
+      <img src="https://readthedocs.org/projects/torcheasyrec/badge/?version=latest" alt="Documentation">
+    </a>
+    <a href="https://github.com/alibaba/TorchEasyRec/stargazers">
+      <img src="https://img.shields.io/github/stars/alibaba/TorchEasyRec?style=social&label=Stars" alt="GitHub Stars">
     </a>
     <img src="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" alt="Python">
   </p>
@@ -56,13 +59,13 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 
 ### Matching (Candidate Generation)
 
-| Model                                    | Description                                      |
-| ---------------------------------------- | ------------------------------------------------ |
-| [DSSM](docs/source/models/dssm.md)       | Two-tower deep semantic matching model           |
-| [DSSM-V2](docs/source/models/dssm_v2.md) | Enhanced DSSM with cross-tower embedding sharing |
-| [MIND](docs/source/models/mind.md)       | Multi-interest network with dynamic routing      |
-| [TDM](docs/source/models/tdm.md)         | Tree-based deep model for large-scale retrieval  |
-| [DAT](docs/source/models/dat.md)         | Dual augmented two-tower model                   |
+| Model                                 | Description                                      |
+| ------------------------------------- | ------------------------------------------------ |
+| [DSSM](docs/source/models/dssm.md)    | Two-tower deep semantic matching model           |
+| [DSSM-V2](docs/source/models/dssm.md) | Enhanced DSSM with cross-tower embedding sharing |
+| [MIND](docs/source/models/mind.md)    | Multi-interest network with dynamic routing      |
+| [TDM](docs/source/models/tdm.md)      | Tree-based deep model for large-scale retrieval  |
+| [DAT](docs/source/models/dat.md)      | Dual augmented two-tower model                   |
 
 ### Ranking (Scoring)
 
@@ -135,7 +138,7 @@ Any contributions you make are greatly appreciated!
 If you use TorchEasyRec in your research, please cite:
 
 ```bibtex
-@software{torchasyrec2024,
+@software{torcheasyrec2024,
   title = {TorchEasyRec: An Easy-to-Use Framework for Recommendation},
   author = {Alibaba PAI Team},
   year = {2024},
