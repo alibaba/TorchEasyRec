@@ -1,84 +1,159 @@
-# TorchEasyRec Introduction
+<div align="center">
+  <h1>TorchEasyRec</h1>
+  <p><strong>A PyTorch-based recommendation system framework for production-ready deep learning models</strong></p>
+
+<p>
+    <a href="https://github.com/alibaba/TorchEasyRec/blob/master/LICENSE">
+      <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
+    </a>
+    <a href="https://github.com/alibaba/TorchEasyRec/actions">
+      <img src="https://github.com/alibaba/TorchEasyRec/workflows/CI/badge.svg" alt="CI Status">
+    </a>
+    <img src="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" alt="Python">
+  </p>
+</div>
+
+## Highlights
+
+|                          | Feature                                                                      |
+| :----------------------: | :--------------------------------------------------------------------------- |
+| **Production Validated** | Battle-tested algorithms powering real-world recommendation systems at scale |
+|      **25+ Models**      | DSSM, DeepFM, DIN, MMoE, PLE, PEPNet, DLRM-HSTU and more                     |
+|       **Scalable**       | Powered by TorchRec with hybrid data/model parallelism                       |
+| **Zero-Collision Hash**  | Dynamic embedding with LFU/LRU eviction for billion-scale features           |
+|  **Multi-Source Data**   | MaxCompute, Parquet, Kafka streaming, CSV, OSS/NAS                           |
+|   **Easy Deployment**    | One-click export to EAS with auto-scaling                                    |
 
 ## What is TorchEasyRec?
 
-![intro.png](docs/images/intro.png)
+TorchEasyRec implements state-of-the-art deep learning models for recommendation tasks: **candidate generation (matching)**, **scoring (ranking)**, **multi-task learning**, and **generative recommendation**. It enables efficient development of high-performance models through simple configuration and easy customization.
 
-### TorchEasyRec is an easy-to-use framework for Recommendation
+![TorchEasyRec Framework](docs/images/intro.png)
 
-TorchEasyRec implements state of the art deep learning models used in common recommendation tasks: candidate generation(matching), scoring(ranking), multi-task learning and generative recommendation. It improves the efficiency of generating high performance models by simple configuration and easy customization.
+## Quick Start
 
-### Get Started
+Get started with TorchEasyRec in minutes:
 
-- [Local](docs/source/quick_start/local_tutorial.md)
-- [PAI-DLC](docs/source/quick_start/dlc_tutorial.md)
+| Tutorial                                                                 | Description                                         |
+| ------------------------------------------------------------------------ | --------------------------------------------------- |
+| [Local Training](docs/source/quick_start/local_tutorial.md)              | Train models on your local machine or single server |
+| [PAI-DLC Training](docs/source/quick_start/dlc_tutorial.md)              | Distributed training on Alibaba Cloud PAI-DLC       |
+| [DLC + MaxCompute](docs/source/quick_start/dlc_odps_dataset_tutorial.md) | Train with MaxCompute (ODPS) datasets on PAI-DLC    |
 
-## Why TorchEasyRec?
+## Supported Models
 
-### Run everywhere
+### Matching (Candidate Generation)
 
-- Local / [PAI-DLC](https://help.aliyun.com/zh/pai/user-guide/container-training) / [PAI-DSW](https://help.aliyun.com/zh/pai/user-guide/dsw-notebook-service) / [EMR-DataScience](https://help.aliyun.com/document_detail/170836.html)
+| Model                                    | Description                                      |
+| ---------------------------------------- | ------------------------------------------------ |
+| [DSSM](docs/source/models/dssm.md)       | Two-tower deep semantic matching model           |
+| [DSSM-V2](docs/source/models/dssm_v2.md) | Enhanced DSSM with cross-tower embedding sharing |
+| [MIND](docs/source/models/mind.md)       | Multi-interest network with dynamic routing      |
+| [TDM](docs/source/models/tdm.md)         | Tree-based deep model for large-scale retrieval  |
+| [DAT](docs/source/models/dat.md)         | Dual augmented two-tower model                   |
 
-### Diversified input data
+### Ranking (Scoring)
 
-- [MaxCompute Table](https://help.aliyun.com/document_detail/27819.html)
-- [OSS files](https://help.aliyun.com/product/31815.html) / NAS files
-- CSV files
-- Parquet files
-- Kafka streaming (with [Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode) support via Kafka-compatible mode)
+| Model                                                     | Description                                    |
+| --------------------------------------------------------- | ---------------------------------------------- |
+| [DeepFM](docs/source/models/deepfm.md)                    | Factorization-machine based neural network     |
+| [WideAndDeep](docs/source/models/wide_and_deep.md)        | Wide & Deep learning for recommendations       |
+| [MultiTower](docs/source/models/multi_tower.md)           | Flexible multi-tower architecture              |
+| [DIN](docs/source/models/din.md)                          | Deep Interest Network with attention mechanism |
+| [DLRM](docs/source/models/dlrm.md)                        | Deep Learning Recommendation Model             |
+| [DCN](docs/source/models/dcn.md)                          | Deep & Cross Network                           |
+| [DCN-V2](docs/source/models/dcn_v2.md)                    | Improved Deep & Cross Network                  |
+| [MaskNet](docs/source/models/masknet.md)                  | Instance-guided mask for feature interaction   |
+| [xDeepFM](docs/source/models/xdeepfm.md)                  | Compressed interaction network                 |
+| [WuKong](docs/source/models/wukong.md)                    | Dense scaling with high-order interactions     |
+| [RocketLaunching](docs/source/models/rocket_launching.md) | Knowledge distillation framework               |
 
-### Easy-to-use
+### Multi-Task Learning
 
-- Flexible feature config and model config
-- Easy to implement [customized models](docs/source/models/user_define.md)
-- Easy deployment to [EAS](https://help.aliyun.com/zh/pai/user-guide/eas-model-serving): automatic scaling, easy monitoring
+| Model                                  | Description                                  |
+| -------------------------------------- | -------------------------------------------- |
+| [MMoE](docs/source/models/mmoe.md)     | Multi-gate Mixture-of-Experts                |
+| [PLE](docs/source/models/ple.md)       | Progressive Layered Extraction               |
+| [DBMTL](docs/source/models/dbmtl.md)   | Deep Bayesian Multi-task Learning            |
+| [PEPNet](docs/source/models/pepnet.md) | Personalized Embedding and Parameter Network |
 
-### Fast and robust
+### Generative Recommendation
 
-- Efficient and robust feature generation
-- Large scale embedding with different sharding strategies
-- Dynamic (zero collision hash) embedding
-- Hybrid data-parallelism/model-parallelism
-- Optimized kernels for RecSys powered by TorchRec
-- Mixed precision
-- Consistency guarantee: train and serving
-- Checkpointable dataset for fault-tolerant training resumption
+| Model                                        | Description                                |
+| -------------------------------------------- | ------------------------------------------ |
+| [DLRM-HSTU](docs/source/models/dlrm_hstu.md) | Hierarchical Sequential Transduction Units |
 
-### A variety of features & models
+## Key Features
 
-- [Feature](docs/source/feature/feature.md): IdFeature / RawFeature / ComboFeature / LookupFeature / MatchFeature / ExprFeature / OverlapFeature / TokenizeFeature / KvDotProduct / BoolMaskFeature / CustomFeature / SequenceFeature
-- Match: [DSSM](docs/source/models/dssm.md) / [TDM](docs/source/models/tdm.md) / [DAT](docs/source/models/dat.md) / [MIND](docs/source/models/mind.md)
-- Rank: [WideAndDeep](docs/source/models/wide_and_deep.md) / [DeepFM](docs/source/models/deepfm.md) / [MultiTower](docs/source/models/multi_tower.md) / [DIN](docs/source/models/din.md) / [RocketLaunching](docs/source/models/rocket_launching.md) / [DLRM](docs/source/models/dlrm.md) / [MaskNet](docs/source/models/masknet.md) / [DCN](docs/source/models/dcn.md) / [DCNv2](docs/source/models/dcn_v2.md) / [xDeepFM](docs/source/models/xdeepfm.md) / [WuKong](docs/source/models/wukong.md)
-- Multi-Task: [MMoE](docs/source/models/mmoe.md) / [DBMTL](docs/source/models/dbmtl.md) / [PLE](docs/source/models/ple.md) / [PEPNet](docs/source/models/pepnet.md) / [PE-LTR](docs/source/models/loss.md)
-- Generative-Rec: [DlrmHSTU](docs/source/models/dlrm_hstu.md)
-- More models in development
+### Data Sources
 
-## Contribute
+- **MaxCompute/ODPS** - Native Alibaba Cloud data warehouse integration
+- **Parquet** - [OSS](https://help.aliyun.com/zh/oss/) or NAS efficient file formats with auto-rebalancing
+- **CSV** - Standard table file formats
+- **Kafka Streaming** - Real-time training with Datahub support
+- **Checkpointable** - Resume training from exact data position
+
+### Scalability
+
+- **Distributed Training** - Hybrid data/model parallelism via TorchRec
+- **Large Embeddings** - Row-wise, column-wise, table-wise sharding
+- **Zero-Collision Hash** - Dynamic embedding with eviction policies (LFU/LRU)
+- **Mixed Precision** - FP16/BF16 training support
+
+### Production
+
+- **Feature Generation** - Consistent FG between training and serving
+- **EAS Deployment** - Auto-scaling model serving on Alibaba Cloud
+- **TensorRT/AOTInductor** - Model acceleration for inference
+- **Export Formats** - TorchScript, ONNX, SavedModel
+
+### Feature Types
+
+- [Feature Documentation](docs/source/feature/feature.md): IdFeature / RawFeature / ComboFeature / LookupFeature / MatchFeature / ExprFeature / OverlapFeature / TokenizeFeature / SequenceFeature
+
+## Documentation
+
+- [Feature Configuration](https://torcheasyrec.readthedocs.io/zh-cn/latest/feature/feature.html)
+- [Data Formats](https://torcheasyrec.readthedocs.io/zh-cn/latest/feature/data.html)
+- [Model Configuration](https://torcheasyrec.readthedocs.io/zh-cn/latest/reference.html)
+- [Custom Models](https://torcheasyrec.readthedocs.io/zh-cn/latest/models/user_define.html)
+
+## Community & Support
+
+- **GitHub Issues** - [Report bugs or Request features](https://github.com/alibaba/TorchEasyRec/issues)
+
+- **DingTalk Groups**
+
+  - DingDing Group: 32260796 - [Join](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,QH4dGSsGXXWW+onmBBumO1U9mQElyRKWi2x16a6oTVY=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CQH4dGSsGXXWW%2BonmBBumO1U9mQElyRKWi2x16a6oTVY%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11)
+  - DingDing Group2: 37930014162 - [Join](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,qTwau91MJZmxUClHh77gCsgcLASX0/eyhysrOf+8emQ=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CqTwau91MJZmxUClHh77gCsgcLASX0%2FeyhysrOf%2B8emQ%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11)
+    <img src="docs/images/qrcode/dinggroup1.JPG" alt="dingroup1" width="350">
+    <img src="docs/images/qrcode/dinggroup2.JPG" alt="dingroup2" width="350">
+
+- If you have any questions about how to use TorchEasyRec, please join the DingTalk group and contact us.
+
+- If you have enterprise service needs or need to purchase Alibaba Cloud services to build a recommendation system, please join the DingTalk group to contact us.
+
+## Contributing
 
 Any contributions you make are greatly appreciated!
 
-- Please report bugs by submitting a issue.
-- Please submit contributions using pull requests.
-- Please refer to the [Development](docs/source/develop.md) document for more details.
+- Please report bugs by submitting an issue
+- Please submit contributions using pull requests
+- Please refer to the [Development Guide](docs/source/develop.md) for more details
 
-## Contact
+## Citation
 
-### Join Us
+If you use TorchEasyRec in your research, please cite:
 
-- DingDing Group: 32260796, click [this url](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,QH4dGSsGXXWW+onmBBumO1U9mQElyRKWi2x16a6oTVY=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CQH4dGSsGXXWW%2BonmBBumO1U9mQElyRKWi2x16a6oTVY%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11) or scan QrCode to join!
-
-- DingDing Group2: 37930014162, click [this url](https://h5.dingtalk.com/circle/joinCircle.html?corpId=ding1fe214a7fea14f55a39a90f97fcb1e09&token=a970cf981a8cd15424aeb839c0fdc2a4&groupCode=v1,k1,qTwau91MJZmxUClHh77gCsgcLASX0/eyhysrOf+8emQ=&from=group&ext=%7B%22channel%22%3A%22QR_GROUP_NORMAL%22%2C%22extension%22%3A%7B%22groupCode%22%3A%22v1%2Ck1%2CqTwau91MJZmxUClHh77gCsgcLASX0%2FeyhysrOf%2B8emQ%3D%22%2C%22groupFrom%22%3A%22group%22%7D%2C%22inviteId%22%3A75657307%2C%22orgId%22%3A644683226%2C%22shareType%22%3A%22GROUP%22%7D&origin=11) or scan QrCode to join!
-
-  <img src="docs/images/qrcode/dinggroup1.JPG" alt="dingroup1" width="350">
-    <img src="docs/images/qrcode/dinggroup2.JPG" alt="dingroup2" width="350">
-
-- Email Group: easy_rec@service.aliyun.com.
-
-### Enterprise Service
-
-- If you have any questions about how to use TorchEasyRec, please join the DingTalk group and contact us.
-- If you have enterprise service needs or need to purchase Alibaba Cloud services to build a recommendation system, please join the DingTalk group to contact us.
+```bibtex
+@software{torchasyrec2024,
+  title = {TorchEasyRec: An Easy-to-Use Framework for Recommendation},
+  author = {Alibaba PAI Team},
+  year = {2024},
+  url = {https://github.com/alibaba/TorchEasyRec}
+}
+```
 
 ## License
 
-TorchEasyRec is released under Apache License 2.0. Please note that third-party libraries may not have the same license as TorchEasyRec.
+TorchEasyRec is released under [Apache License 2.0](LICENSE). Please note that third-party libraries may not have the same license as TorchEasyRec.
