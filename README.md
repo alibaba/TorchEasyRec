@@ -18,14 +18,15 @@
 
 ## Highlights
 
-|                          | Feature                                                                      |
-| :----------------------: | :--------------------------------------------------------------------------- |
-| **Production Validated** | Battle-tested algorithms powering real-world recommendation systems at scale |
-|      **25+ Models**      | DSSM, DeepFM, DIN, MMoE, PLE, PEPNet, DLRM-HSTU and more                     |
-|       **Scalable**       | Powered by TorchRec with hybrid data/model parallelism                       |
-| **Zero-Collision Hash**  | Dynamic embedding with LFU/LRU eviction for billion-scale features           |
-|  **Multi-Source Data**   | MaxCompute, Parquet, Kafka streaming, CSV, OSS/NAS                           |
-|   **Easy Deployment**    | One-click export to EAS with auto-scaling                                    |
+|            Highlight             | Description                                                                                              |
+| :------------------------------: | :------------------------------------------------------------------------------------------------------- |
+|     **Production Validated**     | Battle-tested algorithms powering real-world recommendation systems at scale                             |
+|          **20+ Models**          | DSSM, TDM, DeepFM, DIN, MMoE, PLE, PEPNet, DLRM-HSTU and more                                            |
+| **10+ Feature Generation Types** | IdFeature, RawFeature, ComboFeature, LookupFeature, ExprFeature, SequenceFeature, CustomFeature and more |
+|           **Scalable**           | Powered by TorchRec with hybrid data/model parallelism                                                   |
+|     **Zero-Collision Hash**      | Dynamic embedding with LFU/LRU eviction for billion-scale features                                       |
+|      **Multi-Source Data**       | MaxCompute, Parquet, Kafka streaming, CSV, OSS/NAS                                                       |
+|       **Easy Deployment**        | One-click deploy to EAS with auto-scaling                                                                |
 
 ## What is TorchEasyRec?
 
@@ -109,10 +110,6 @@ Get started with TorchEasyRec in minutes:
 - **EAS Deployment** - Auto-scaling model serving on Alibaba Cloud
 - **TensorRT/AOTInductor** - Model acceleration for inference
 - **Export Formats** - TorchScript, ONNX, SavedModel
-
-### Feature Types
-
-- [Feature Documentation](docs/source/feature/feature.md): IdFeature / RawFeature / ComboFeature / LookupFeature / MatchFeature / ExprFeature / OverlapFeature / TokenizeFeature / SequenceFeature
 
 ## Documentation
 
