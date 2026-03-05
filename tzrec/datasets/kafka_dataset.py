@@ -197,7 +197,10 @@ class KafkaReader(BaseReader):
 
             msg_data = msg.value()
             reader = pa.ipc.open_stream(msg_data)
-            schema = reader.schema
+            try:
+                schema = reader.schema
+            finally:
+                reader.close()
             return schema
         except pa.ArrowInvalid as e:
             raise ValueError(
