@@ -1,13 +1,13 @@
 # Rocket Launching
 
-### 简介
+## 简介
 
 像点击率预估这样的在线实时响应系统对响应时间要求非常严格，结构复杂，层数很深的深度模型不能很好的满足严苛的响应时间的限制。
 
 为了获得满足响应时间限制的具有优良表现的模型，采用Rocket Launching框架。训练阶段，同时训练繁简两个复杂度有明显差异的网络，简单的网络称为轻量网络（light net），复杂的网络称为助推器网络（booster net），两网络共享部分参数，分别学习类别标记，此外，轻量网络通过学习助推器的 soft target 来模仿助推器的学习过程，从而得到更好的训练效果。测试阶段，仅采用轻量网络进行预测。
 ![rocket_launching.png](../../images/models/rocket_launching.png)
 
-### 配置说明
+## 配置说明
 
 ```protobuf
 model_config: {
@@ -70,6 +70,6 @@ model_config: {
 
 [rocket_launching_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/rocket_launching_criteo.config)
 
-### 参考论文
+## 参考论文
 
 [Rocket Launching: A Universal and Efficient Framework for Training Well-performing Light Net](https://arxiv.org/abs/1708.04106)

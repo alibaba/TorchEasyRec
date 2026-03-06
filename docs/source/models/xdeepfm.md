@@ -1,12 +1,12 @@
 # xDeepFM
 
-### 简介
+## 简介
 
 xDeepFM模型延续了deep&cross network(参考[DCN](https://easyrec.readthedocs.io/en/latest/models/dcn.html))模型的建模思想。不过，在建模显式高阶交叉特征时，采用了不同于deep&cross network的方式，文章称为compressed interaction network(CIN)，并将CIN网络与深度神经网络结合，最后输入到输出层。
 
 ![xdeepfm.png](../../images/models/xdeepfm.png)
 
-### 配置说明
+## 配置说明
 
 ```protobuf
 
@@ -79,10 +79,10 @@ model_config {
   - hidden_units: dnn每一层的channel数目，即神经元的数目
 - final: 整合cross层, deep层的全连接层
 
-### 示例Config
+## 示例Config
 
 [xdeepfm_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/xdeepfm_criteo.config)
 
-### 参考论文
+## 参考论文
 
 [xDeepFM](https://arxiv.org/pdf/1803.05170)
