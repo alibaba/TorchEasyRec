@@ -149,4 +149,4 @@ If you use TorchEasyRec in your research, please cite:
 
 ## License
 
-TorchEasyRec is released under [Apache License 2.0](LICENSE). Please note that third-party libraries may not have the same license as TorchEasyRec.
+TorchEasyRec is released under [Apache License 2.0](https://github.com/alibaba/TorchEasyRec/blob/master/LICENSE). Please note that third-party libraries may not have the same license as TorchEasyRec.

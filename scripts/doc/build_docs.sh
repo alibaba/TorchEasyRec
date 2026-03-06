@@ -11,7 +11,7 @@ bash scripts/doc/build_doc_pre_work.sh
 # make sphinx
 cd docs
 rm -rf build
-make html
+LC_ALL=C.UTF-8 LANG=C.UTF-8 make html
 rm -rf build/html/_modules
 cd -
 
