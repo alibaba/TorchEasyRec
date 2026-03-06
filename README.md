@@ -7,7 +7,7 @@
       <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
     </a>
     <a href="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml">
-      <img src="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml/badge.svg" alt="Unit Test Nightly">
+      <img src="https://github.com/alibaba/TorchEasyRec/actions/workflows/unittest_nightly.yml/badge.svg?branch=master" alt="Unit Test Nightly">
     </a>
     <a href="https://torcheasyrec.readthedocs.io/">
       <img src="https://readthedocs.org/projects/torcheasyrec/badge/?version=latest" alt="Documentation">
