@@ -22,7 +22,7 @@ input:
 
 ## 配置说明
 
-```protobuf
+```
 model_config: {
   feature_groups: {
     group_name: 'dense'

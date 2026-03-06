@@ -4,7 +4,7 @@
 
 模型导出任务依赖pipeline.config中的export_config 配置
 
-```protobuf
+```
 export_config {
 }
 ```

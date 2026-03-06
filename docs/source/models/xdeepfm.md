@@ -8,8 +8,7 @@ xDeepFM模型延续了deep&cross network(参考[DCN](https://easyrec.readthedocs
 
 ## 配置说明
 
-```protobuf
-
+```
 model_config {
     feature_groups {
         group_name: "wide"
