@@ -94,7 +94,7 @@ class KafkaDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._data_config.drop_remainder,
-            input_fields=input_fields,
+            input_fields=input_fields if input_fields else None,
         )
 
 
@@ -126,28 +126,90 @@ class KafkaReader(BaseReader):
         )
 
         self._drop_columns = []
+        self._has_embedded_schema = False
+
         if input_fields:
             self._full_schema = pa.schema(input_fields)
-            if self._selected_cols:
-                fields = []
-                self._ordered_cols = []
-                for field in input_fields:
-                    if field.name in self._selected_cols:
-                        fields.append(field)
-                        self._ordered_cols.append(field.name)
-                    else:
-                        self._drop_columns.append(field.name)
-                self._schema = pa.schema(fields)
-            else:
-                self._schema = pa.schema(input_fields)
-                self._ordered_cols = [f.name for f in input_fields]
         else:
-            raise ValueError("input_fields must be specified for KafkaReader. ")
+            # Embedded schema mode - peek schema from first message
+            self._full_schema = self._peek_schema_from_kafka()
+            self._has_embedded_schema = True
+
+        if self._selected_cols:
+            fields = []
+            self._ordered_cols = []
+            for field in self._full_schema:
+                if field.name in self._selected_cols:
+                    fields.append(field)
+                    self._ordered_cols.append(field.name)
+                else:
+                    self._drop_columns.append(field.name)
+            self._schema = pa.schema(fields)
+        else:
+            self._schema = self._full_schema
+            self._ordered_cols = [f.name for f in self._full_schema]
 
     @property
     def schema(self) -> pa.Schema:
         """Table schema."""
         return self._schema
+
+    def _peek_schema_from_kafka(self) -> pa.Schema:
+        """Peek at newest Kafka message to extract schema.
+
+        Uses assign() and seek() to directly read the newest message from partition 0,
+        avoiding affecting consumer group.
+
+        Returns:
+            PyArrow schema from the message.
+
+        Raises:
+            ValueError: If no messages available or message doesn't contain
+                valid schema.
+        """
+        topic, config = _parse_kafka_uri(self._input_path)
+        consumer = Consumer(config)
+
+        try:
+            # Directly assign partition 0 (no subscribe, no group coordination)
+            tp = TopicPartition(topic, 0)
+            consumer.assign([tp])
+
+            # Get the high watermark (newest offset) for the partition
+            low, high = consumer.get_watermark_offsets(tp, timeout=60.0)
+            if high <= low:
+                raise ValueError(
+                    "No messages available in Kafka topic to infer schema. "
+                    "Either provide input_fields in config or ensure topic "
+                    "has messages."
+                )
+
+            # Seek to the last message (high - 1)
+            tp.offset = high - 1
+            consumer.seek(tp)
+
+            # Poll for the message
+            msg = consumer.poll(timeout=10.0)
+            if msg is None:
+                raise ValueError("Failed to read message from Kafka topic after seek.")
+            if msg.error():
+                raise ValueError(f"Error reading Kafka message: {msg.error()}")
+
+            msg_data = msg.value()
+            reader = pa.ipc.open_stream(msg_data)
+            try:
+                schema = reader.schema
+            finally:
+                reader.close()
+            return schema
+        except pa.ArrowInvalid as e:
+            raise ValueError(
+                "Message may not be in Arrow IPC stream format. Failed to read "
+                "schema from Kafka message. You should provide input_fields in "
+                f"config when using serialize record_batch without schema: {e}."
+            ) from e
+        finally:
+            consumer.close()
 
     def _reader(
         self, worker_id: int = 0, num_workers: int = 1
@@ -204,7 +266,22 @@ class KafkaReader(BaseReader):
                         logger.error(msg_error)
                         continue
                     msg_data = msg.value()
-                    record_batch = pa.ipc.read_record_batch(msg_data, self._full_schema)
+                    if self._has_embedded_schema:
+                        # Read with embedded schema using IPC stream reader
+                        # NOTE: Only the first record batch is read from each message.
+                        # If a Kafka message contains multiple record batches in the IPC
+                        # stream format, subsequent batches will be silently dropped.
+                        # Each Kafka message should contain exactly one record batch.
+                        reader = pa.ipc.open_stream(msg_data)
+                        try:
+                            record_batch = reader.read_next_batch()
+                        finally:
+                            reader.close()
+                    else:
+                        # Schema-less message (current behavior)
+                        record_batch = pa.ipc.read_record_batch(
+                            msg_data, self._full_schema
+                        )
                     current_batch_size += len(record_batch)
                     record_batchs.append(record_batch)
 

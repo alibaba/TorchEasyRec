@@ -93,7 +93,11 @@ data_config {
 
 ## KafkaDataset
 
-输入数据为Kafka消息流, 每条消息为schema-less序列化的Arrow Batch
+输入数据为Kafka消息流, 支持两种Arrow Batch序列化格式:
+
+- schema-less格式: 需设置`data_config.input_fields`来指定数据的schema
+
+- 带schema格式(Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断
 
 - input_path: 按如下格式设置
 
@@ -102,11 +106,15 @@ data_config {
   - KafkaDataset也支持[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)， input_path按如下格式设置
     - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
 
-- 需设置`data_config.input_fields`来指定数据的schema，Kafka消息中的Arrow Batch不包含schema信息，详见下文input_fields参数说明
+- `data_config.input_fields`配置:
+
+  - 当消息为schema-less格式时(使用`record_batch.serialize()`)，需设置`input_fields`来指定schema
+  - 当消息为带schema格式时(Arrow IPC Stream格式)，无需设置`input_fields`，schema将从消息中自动推断
 
 - 注意:
 
-  - Kafka分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - 当使用 Arrow IPC Stream 格式 (带 schema) 时，每个 Kafka消息应只包含一个 record batch。如果单个消息包含多个 record batches，只有第一个 batch 会被读取，后续 batches 将被忽略。如需发送多个 batches，请将其作为多个独立的 Kafka消息发送。
 
 ## data_config配置
 
