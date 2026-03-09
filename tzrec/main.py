@@ -37,7 +37,7 @@ from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
     TENSORBOARD_SUMMARIES,
-    TRAGET_REPEAT_INTERLEAVE_KEY,
+    TARGET_REPEAT_INTERLEAVE_KEY,
     TRAIN_EVAL_RESULT_FILENAME,
     Mode,
 )
@@ -967,17 +967,17 @@ def _write_predictions(
 ) -> None:
     output_dict = OrderedDict()
     repeat_offsets = None
-    if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+    if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
         # for gr models, we need convert flatted predictions to ListArray for
         # keeping same batch-size with predictions
         repeat_offsets = pa.array(
             torch.ops.fbgemm.asynchronous_complete_cumsum(
-                predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                predictions[TARGET_REPEAT_INTERLEAVE_KEY]
             ).numpy()
         )
 
     for c in output_cols:
-        if c == TRAGET_REPEAT_INTERLEAVE_KEY:
+        if c == TARGET_REPEAT_INTERLEAVE_KEY:
             continue
         v = predictions[c]
         if torch.is_floating_point(v):

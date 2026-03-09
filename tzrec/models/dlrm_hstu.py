@@ -20,7 +20,7 @@ from torchrec import JaggedTensor
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.rank_model import (
-    TRAGET_REPEAT_INTERLEAVE_KEY,
+    TARGET_REPEAT_INTERLEAVE_KEY,
     RankModel,
     _is_classification_loss,
 )
@@ -212,7 +212,7 @@ class DlrmHSTU(RankModel):
                         suffix=f"_{task_name}",
                     )
                 )
-        predictions[TRAGET_REPEAT_INTERLEAVE_KEY] = grouped_features[
+        predictions[TARGET_REPEAT_INTERLEAVE_KEY] = grouped_features[
             "candidate.sequence_length"
         ]
 

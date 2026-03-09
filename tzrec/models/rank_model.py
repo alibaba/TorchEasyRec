@@ -16,7 +16,7 @@ import torch
 import torchmetrics
 from torch import nn
 
-from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
@@ -244,9 +244,9 @@ class RankModel(BaseModel):
             session_id = batch.sparse_features[BASE_DATA_GROUP][
                 loss_cfg.jrc_loss.session_name
             ].to_padded_dense(1)[:, 0]
-            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 session_id = session_id.repeat_interleave(
-                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             losses[loss_name] = self._loss_modules[loss_name](pred, label, session_id)
         elif loss_type == "l2_loss":
@@ -410,9 +410,9 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
-            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 grouping_key = grouping_key.repeat_interleave(
-                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         elif metric_type == "xauc":
@@ -423,9 +423,9 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
-            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 grouping_key = grouping_key.repeat_interleave(
-                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         else:
