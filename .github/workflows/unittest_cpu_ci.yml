@@ -23,6 +23,13 @@ jobs:
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
         id: run_unittest_ci
+        env:
+          ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
+          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ secrets.CI_ALIKAFKA_INSTANCE_ID }}
+          CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
+          CI_REGION: ${{ secrets.CI_REGION }}
         run: |
           cd run_${{ github.run_id }}
           CI_HYPOTHESIS=true bash scripts/ci/ci_test_cpu.sh

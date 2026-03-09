@@ -232,9 +232,7 @@ class KafkaDatasetTest(unittest.TestCase):
         "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_metadata(self):
-        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs(
-            has_lookup=False
-        )
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
         dataset = KafkaDataset(
