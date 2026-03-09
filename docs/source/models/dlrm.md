@@ -1,6 +1,6 @@
 # DLRM
 
-### 简介
+## 简介
 
 DLRM(Deep Learning Recommendation Model for Personalization and Recommendation Systems[Facebook])是一种DNN模型, 支持使用连续值特征(price/age/...)和ID类特征(user_id/item_id/...), 并对特征之间的交互(interaction)进行了建模(基于内积的方式).
 
@@ -20,9 +20,9 @@ input:
 [ dense features ]          [sparse indices] , ..., [sparse indices]
 ```
 
-### 配置说明
+## 配置说明
 
-```protobuf
+```
 model_config: {
   feature_groups: {
     group_name: 'dense'
@@ -91,10 +91,10 @@ model_config: {
 
     - hidden_units: dnn每一层的channel数目，即神经元的数目
 
-### 示例Config
+## 示例Config
 
 [DLRM_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_criteo.config)
 
-### 参考论文
+## 参考论文
 
 [DLRM](https://arxiv.org/abs/1906.00091)
