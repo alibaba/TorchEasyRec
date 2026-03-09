@@ -174,7 +174,7 @@ class KafkaDatasetTest(unittest.TestCase):
 
     @parameterized.expand([[False, False], [True, False], [True, True]])
     @unittest.skipIf(
-        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )
     def test_kafka_dataset(self, use_input_fields_str, embedded_schema):
         feature_cfgs, input_fields, input_fields_str = (
@@ -229,7 +229,7 @@ class KafkaDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
     @unittest.skipIf(
-        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_metadata(self):
         feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
@@ -271,7 +271,7 @@ class KafkaDatasetTest(unittest.TestCase):
             self.assertGreaterEqual(value, 0)
 
     @unittest.skipIf(
-        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )
     def test_kafka_dataset_checkpoint_resume(self):
         feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
