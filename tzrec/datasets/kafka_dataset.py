@@ -184,9 +184,9 @@ class KafkaReader(BaseReader):
                     "has messages."
                 )
 
-            # Seek to the last message (high - 1)
-            tp.offset = high - 1
-            consumer.seek(tp)
+            # Re-assign with specific offset to read the last message
+            tp = TopicPartition(topic, 0, high - 1)
+            consumer.assign([tp])
 
             # Poll for the message
             msg = consumer.poll(timeout=10.0)
