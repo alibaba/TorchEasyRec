@@ -113,6 +113,49 @@ data_config {
     - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
   - 当使用 Arrow IPC Stream 格式 (带 schema) 时，每个 Kafka消息应只包含一个 record batch。如果单个消息包含多个 record batches，只有第一个 batch 会被读取，后续 batches 将被忽略。如需发送多个 batches，请将其作为多个独立的 Kafka消息发送。
 
+### 使用 Flink ArrowBatchUDTF 序列化数据
+
+TorchEasyRec 提供了 Flink UDTF 用于将 Flink 流数据序列化为 Arrow IPC 格式，写入 Kafka 供 KafkaDataset 消费。
+
+#### 下载 UDF JAR
+
+- JAR 下载地址: `https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/flink/flink-arrow-batch-udf-0.1.jar`
+
+#### 在阿里云 Flink VVP 中使用
+
+1. **注册 UDF**: 参考[UDF管理文档](https://help.aliyun.com/zh/flink/realtime-flink/user-guide/manage-udfs)注册 ArrowBatchUDTF，类名为 `com.aliyun.pai.flinkjob.ArrowBatchUDTF`
+
+1. **SQL 使用示例**
+
+```sql
+-- 将数据序列化为 Arrow IPC 格式写入 Kafka
+INSERT INTO kafka_sink
+SELECT T.arrow_data
+FROM source_table,
+LATERAL TABLE(ArrowBatchUDTF(ROW(user_id, item_id, label, features))) AS T(arrow_data);
+```
+
+3. **配置参数**: 在 Flink Deployment Configuration 中添加 `pipeline.global-job-parameters`
+
+```yaml
+pipeline.global-job-parameters: |
+  'arrow.batch.udtf.batch-size:"128"',
+  'arrow.batch.udtf.bytes-limit:"917504"',
+  'arrow.batch.udtf.compression:"ZSTD"',
+  'arrow.batch.udtf.embed-schema:"true"',
+  'arrow.batch.udtf.input-typeinfo:"user_id:BIGINT;item_id:BIGINT;label:FLOAT;embedding:ARRAY<FLOAT>"'
+```
+
+#### 配置参数说明
+
+| 参数                            | 默认值 | 说明                                                                                                                                                                                                                                                                                   |
+| ------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| arrow.batch.udtf.batch-size     | 128    | 累积多少行后序列化为一个 Arrow IPC batch                                                                                                                                                                                                                                               |
+| arrow.batch.udtf.bytes-limit    | 917504 | 单个序列化 batch 的最大字节数，超出会自动拆分。设置为 0 表示不限制。注意：该值需小于 [Kafka 消息大小上限](https://help.aliyun.com/zh/apsaramq-for-kafka/cloud-message-queue-for-kafka/product-overview/terms#dt-w4l-kbb-3df)，Kafka 默认消息大小为 1MB，建议调整 Kafka 消息大小至 10MB |
+| arrow.batch.udtf.compression    | ZSTD   | 压缩编码，支持 ZSTD、LZ4_FRAME、UNCOMPRESSED                                                                                                                                                                                                                                           |
+| arrow.batch.udtf.embed-schema   | false  | 是否在输出中嵌入 schema。设置为 true 时使用 IPC Stream 格式（带 schema），KafkaDataset 可自动推断 schema；设置为 false 时使用 schema-less 格式，需在 KafkaDataset 中配置 input_fields                                                                                                  |
+| arrow.batch.udtf.input-typeinfo | 无     | 输入数据的 schema，格式为 `fieldName:TYPE;fieldName:TYPE;...`，支持的类型同下文`input_fields_str`                                                                                                                                                                                      |
+
 ## data_config配置
 
 ### fg_mode
@@ -329,10 +372,10 @@ data_config {
 支持的类型名:
 
 - 基本类型: INT, INT32, BIGINT, INT64, STRING, FLOAT, DOUBLE
-- 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)
-- 数组类型: ARRAY<INT>, ARRAY<INT32>, ARRAY<BIGINT>, ARRAY<INT64>, ARRAY<STRING>, ARRAY<FLOAT>, ARRAY<DOUBLE>
-- 嵌套数组: ARRAY\<ARRAY<INT>>, ARRAY\<ARRAY<BIGINT>>, ARRAY\<ARRAY<STRING>> 等
-- Map类型: MAP\<STRING,INT>, MAP\<STRING,INT32>, MAP\<STRING,BIGINT>, MAP\<STRING,INT64>, MAP\<BIGINT,STRING>, MAP\<INT64,STRING> 等
+  - 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)
+- 数组类型: ARRAY<INT>, ARRAY<BIGINT>, ARRAY<STRING>, ARRAY<FLOAT>, ARRAY<DOUBLE>
+- 嵌套数组: ARRAY\<ARRAY\<INT>>, ARRAY\<ARRAY\<BIGINT>>, ARRAY\<ARRAY\<FLOAT>>, ARRAY\<ARRAY\<DOUBLE>>, ARRAY\<ARRAY\<STRING>>
+- Map类型: MAP\<STRING,INT>, MAP\<STRING,BIGINT>, MAP\<STRING,FLOAT>, MAP\<STRING,DOUBLE>, MAP\<STRING,STRING>, MAP\<INT,INT>, MAP\<INT,BIGINT>, MAP\<INT,FLOAT>, MAP\<INT,DOUBLE>, MAP\<INT,STRING>, MAP\<BIGINT,INT>, MAP\<BIGINT,BIGINT>, MAP\<BIGINT,FLOAT>, MAP\<BIGINT,DOUBLE>, MAP\<BIGINT,STRING>,等
 - 逗号周围允许空格: `MAP<STRING, BIGINT>` 是有效的
 
 注意: 如果同时设置了`input_fields_str`和`input_fields`，`input_fields_str`优先级更高。
