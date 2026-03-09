@@ -36,8 +36,8 @@ from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
-    TENSORBOARD_SUMMARIES,
     TARGET_REPEAT_INTERLEAVE_KEY,
+    TENSORBOARD_SUMMARIES,
     TRAIN_EVAL_RESULT_FILENAME,
     Mode,
 )
