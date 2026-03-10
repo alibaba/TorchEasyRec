@@ -112,7 +112,7 @@ feature_configs {
   - 词表形式：一行一个词
   - 字典词表形式：一行一个词和编号，词和编号间用空格分隔
 
-- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](./zch.md)
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
@@ -201,7 +201,7 @@ feature_configs {
 
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置。
 - **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
+- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](./autodis.md)
 
 Embedding特征: 支持string类型如`"0.1|0.2|0.3|0.4"`；支持ARRAY\<float>类型如`[0.1,0.2,0.3,0.4]`（建议，性能更好），配置方式如下
 

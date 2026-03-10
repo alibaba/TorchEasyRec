@@ -1,10 +1,10 @@
 # Local Tutorial: TDM召回
 
-### 前置准备
+## 前置准备
 
 TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 
-#### 数据
+### 数据
 
 输入数据以parquet格式为例
 
@@ -12,7 +12,7 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 - 评估样本数据: [taobao_data_recall_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz)
 - 物品池特征数据: [taobao_ad_feature](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz)
 
-#### 配置文件
+### 配置文件
 
 [tdm_taobao_local.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/tdm_taobao_local.config)
 
@@ -28,9 +28,9 @@ tar xf taobao_data_recall_eval.tar.gz -C data
 tar xf taobao_ad_feature.tar.gz -C data
 ```
 
-### 启动命令
+## 启动命令
 
-#### 建初始树
+### 建初始树
 
 ```bash
 python -m tzrec.tools.tdm.init_tree \
@@ -54,7 +54,7 @@ python -m tzrec.tools.tdm.init_tree \
 - --tree_output_dir: (可选) 树的保存目录, 将会在目录下存储`serving_tree`文件用于线上服务
 - --n_cluster: (可选,默认为2)树的分叉数
 
-#### 训练
+### 训练
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
@@ -72,7 +72,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --model_dir: 模型训练目录
 - --edit_config_json: 使用json修改config
 
-#### 导出模型和embedding模块
+### 导出模型和embedding模块
 
 导出命令会自动导出模型和embedding模块, 模型模块会存在model子目录下，embedding模块会存在embedding子目录下
 
@@ -90,7 +90,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --export_dir: 导出到的模型目录
 - --asset_files: 需额拷贝到模型目录的文件。tdm需拷贝serving_tree树文件用于线上服务
 
-#### 导出item embedding
+### 导出item embedding
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
@@ -109,7 +109,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --reserved_columns: 预测结果中要保留的输入列
 - --output_columns: 预测结果中的模型输出列
 
-#### 根据item embedding重新聚类建树
+### 根据item embedding重新聚类建树
 
 ```bash
 python -m tzrec.tools.tdm.cluster_tree \
@@ -133,7 +133,7 @@ python -m tzrec.tools.tdm.cluster_tree \
 - --n_cluster: (可选,默认为2)树的分叉数
 - --parllel: (可选，默认为16)聚类时CPU并行数
 
-#### 重新训练
+### 重新训练
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
@@ -152,7 +152,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --model_dir: 模型训练目录
 - --edit_config_json: 使用json修改config
 
-#### 导出
+### 导出
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
@@ -168,7 +168,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --export_dir: 导出到的模型目录
 - --asset_files: 需额拷贝到模型目录的文件。tdm需拷贝serving_tree树文件用于线上服务
 
-#### Recall评估
+### Recall评估
 
 任意一次训练导出后均可按需评测, 以训练完初始树评测为例:
 
@@ -192,10 +192,10 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --n_cluster:(可选, 默认为2) 数的分叉数量, 应与建树时输入保持一致
 - --reserved_columns: 预测结果中要保留的输入列
 
-#### 注
+### 注
 
 - 如果item_id为string类型，建树、模型训练、评估命令中需设置环境变量USE_HASH_NODE_ID=1来启动对id自动进行hash64操作，一般情况下hash冲突概率极低
 
-#### 参考手册
+### 参考手册
 
 [TorchEasyRec配置参考手册](../reference.md)

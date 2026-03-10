@@ -26,7 +26,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 ## 创建DLC任务
 
-#### 配置文件
+### 配置文件
 
 配置文件以DIN为例 [multi_tower_din_taobao_dlc_mc.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config)
 

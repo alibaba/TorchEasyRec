@@ -191,18 +191,18 @@ class OdpsDatasetTest(unittest.TestCase):
 
     @parameterized.expand([[False], [True]])
     @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         "odps config not found",
     )
     def test_odps_dataset(self, is_orderby_partition=False):
         self._test_odps_dataset(is_orderby_partition=is_orderby_partition)
 
     @unittest.skipIf(
-        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", "") == ""
         or (
-            "ODPS_CONFIG_FILE_PATH" not in os.environ
-            and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ
+            os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+            and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         ),
         "schema odps project not found",
     )
@@ -210,8 +210,8 @@ class OdpsDatasetTest(unittest.TestCase):
         self._test_odps_dataset(is_orderby_partition=False, schema="rec")
 
     @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         "odps config not found",
     )
     def test_odps_dataset_checkpoint_metadata(self):
@@ -269,8 +269,8 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertGreaterEqual(value, 0)
 
     @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         "odps config not found",
     )
     def test_odps_dataset_checkpoint_resume(self):
@@ -356,8 +356,8 @@ class OdpsDatasetTest(unittest.TestCase):
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
     @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         "odps config not found",
     )
     def test_odps_dataset_checkpoint_resume_orderby_partition(self):
@@ -517,18 +517,18 @@ class OdpsDatasetTest(unittest.TestCase):
 
     @parameterized.expand([["bigint"], ["string"], ["int"]])
     @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         "odps config not found",
     )
     def test_odps_dataset_with_sampler(self, id_type="bigint"):
         self._test_odps_dataset_with_sampler(id_type=id_type)
 
     @unittest.skipIf(
-        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
+        os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", "") == ""
         or (
-            "ODPS_CONFIG_FILE_PATH" not in os.environ
-            and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ
+            os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+            and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         ),
         "schema odps project not found",
     )
@@ -560,8 +560,8 @@ class OdpsWriterTest(unittest.TestCase):
         name_func=test_util.parameterized_name_func,
     )
     @unittest.skipIf(
-        "ODPS_CONFIG_FILE_PATH" not in os.environ
-        and "ALIBABA_CLOUD_ECS_METADATA" not in os.environ,
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
         "odps config not found",
     )
     def test_odps_writer(self, partition_spec, default_world_size, writer_world_size):
@@ -617,8 +617,11 @@ class OdpsWriterTest(unittest.TestCase):
             self.assertEqual(reader.count, 1280)
 
     @unittest.skipIf(
-        "CI_ODPS_SCHEMA_PROJECT_NAME" not in os.environ
-        or "ODPS_CONFIG_FILE_PATH" not in os.environ,
+        os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", "") == ""
+        or (
+            os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+            and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
+        ),
         "schema odps project not found",
     )
     def test_odps_writer_has_schema(self):

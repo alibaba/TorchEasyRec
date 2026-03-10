@@ -46,7 +46,7 @@ from torchrec.sparse import jagged_tensor
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot
 from tzrec.acc.trt_utils import export_model_trt
-from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY, Mode
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -791,7 +791,7 @@ def export_rtp_model(
     for node in graph.nodes:
         if node.op == "output":
             for k, v in sorted(node.args[0].items()):
-                if k == TRAGET_REPEAT_INTERLEAVE_KEY:
+                if k == TARGET_REPEAT_INTERLEAVE_KEY:
                     continue
                 output_keys.append(k)
                 output_values.append(v)
