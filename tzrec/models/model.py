@@ -22,7 +22,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 
-from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -334,9 +334,9 @@ class PredictWrapper(BaseModule):
                 result = dict()
                 for c in self._output_cols:
                     result[c] = predictions[c]
-                if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
-                    result[TRAGET_REPEAT_INTERLEAVE_KEY] = predictions[
-                        TRAGET_REPEAT_INTERLEAVE_KEY
+                if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
+                    result[TARGET_REPEAT_INTERLEAVE_KEY] = predictions[
+                        TARGET_REPEAT_INTERLEAVE_KEY
                     ]
             else:
                 result = predictions
