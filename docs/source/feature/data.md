@@ -132,7 +132,7 @@ TorchEasyRec 提供了 Flink UDTF 用于将 Flink 流数据序列化为 Arrow IP
 INSERT INTO kafka_sink
 SELECT T.arrow_data
 FROM source_table,
-LATERAL TABLE(ArrowBatchUDTF(ROW(user_id, item_id, label, features))) AS T(arrow_data);
+LATERAL TABLE(ArrowBatchUDTF(ROW(user_id, item_id, label, embedding))) AS T(arrow_data);
 ```
 
 3. **配置参数**: 在 Flink Deployment Configuration 中添加 `pipeline.global-job-parameters`
