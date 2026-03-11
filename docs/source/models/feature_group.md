@@ -74,16 +74,16 @@ model_config {
             feature_names: "buy_50__ts"
         }
         sequence_encoders {
-            din_encoder: {
+            din_encoder {
                 input: "click_50"
-                attn_mlp: {
+                attn_mlp {
                     hidden_units: [128, 64]
                     activation: "Dice"
                 }
             }
         }
         sequence_encoders {
-            simple_attention: {
+            simple_attention {
                 input: "buy_50"
             }
         }

@@ -23,13 +23,13 @@ input:
 ## 配置说明
 
 ```
-model_config: {
-  feature_groups: {
+model_config {
+  feature_groups {
     group_name: 'dense'
     feature_names: 'price'
     wide_deep: DEEP
   }
-  feature_groups: {
+  feature_groups {
     group_name: 'sparse'
     feature_names: 'user_id'
     feature_names: 'cms_segid'
