@@ -153,10 +153,10 @@ data_config {
 }
 
 # 特征相关参数配置
-feature_configs  {
+feature_configs {
   ...
 }
-feature_configs  {
+feature_configs {
   ...
 }
 
