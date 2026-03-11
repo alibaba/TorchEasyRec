@@ -10,8 +10,8 @@
 ## 配置说明
 
 ```
-model_config: {
-  feature_groups: {
+model_config {
+  feature_groups {
     group_name: 'all'
     feature_names: 'user_id'
     feature_names: 'cms_segid'

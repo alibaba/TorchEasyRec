@@ -342,10 +342,10 @@ pipeline.global-job-parameters: |
 ### input_fields
 
 ```
-input_fields: {
+input_fields {
     input_name: "input1"
 }
-input_fields: {
+input_fields {
     input_name: "input2"
     input_type: DOUBLE
 }

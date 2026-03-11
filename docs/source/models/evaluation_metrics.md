@@ -10,7 +10,7 @@
 
 ```
 model_config {
-    metrics: {
+    metrics {
         auc {
             thresholds: 200
         }
@@ -26,7 +26,7 @@ model_config {
 model_config {
    dbmtl {
      task_towers {
-        metrics: {
+        metrics {
           auc {
             thresholds: 200
           }
@@ -45,7 +45,7 @@ tzrec支持在模型训练过程中对训练集在线计算模型指标，模型
 
 ```
 model_config {
-    train_metrics: {
+    train_metrics {
         auc {
             thresholds: 200
         }
@@ -76,7 +76,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         auc {
             thresholds: 200
         }
@@ -113,7 +113,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         multiclass_auc {
             thresholds: 200
             average:'macro'
@@ -137,7 +137,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         accuracy {
             threshold: 0.5
             top_k: 5
@@ -163,7 +163,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         recall_at_k {
             top_k: 5
         }
@@ -188,7 +188,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         mean_absolute_error {}
     }
 }
@@ -210,7 +210,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         mean_squared_error {}
     }
 }
@@ -229,7 +229,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         grouped_auc {
                grouping_key:  "user_id"
         }
@@ -286,7 +286,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         xauc {
                sample_ratio:  1e-3
                max_pairs: 100
@@ -311,7 +311,7 @@ ______________________________________________________________________
 
 ```
 model_config {
-    metrics: {
+    metrics {
         grouped_xauc {
                grouping_key:  'age'
                max_pairs_per_group: 100
