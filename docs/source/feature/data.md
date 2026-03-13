@@ -1,6 +1,7 @@
 # 数据格式
 
-TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件。
+TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件，同时支持Kafka和Datahub的流式消息。
+TorchEasyRec的OdpsDataset, ParquetDataset, KafkaDataset进一步可支持训练断点续训功能，当训练中断后可以从上次的数据位置继续训练，避免重复处理已消费的数据。
 
 **一个最简单的data config的配置**
 
@@ -74,39 +75,86 @@ data_config {
 
 - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
 
-- CsvDataset: 输入数据为csv格式
+## CsvDataset
 
-  - input_path: 按如下格式设置
+- input_path: 按如下格式设置
 
-    - `${PATH_TO_DATA_DIR}/*.csv`
+  - `${PATH_TO_DATA_DIR}/*.csv`
 
-  - 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
+- 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
 
-  - 需设置 `data_config.with_header`来指定是否有header行，默认为false
+- 需设置 `data_config.with_header`来指定是否有header行，默认为false
 
-  - 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
+- 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
 
-  - 注意:
+- 注意:
 
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
-    - csv格式数据读性能有瓶颈
+  - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
+  - csv格式数据读性能有瓶颈
 
 ## KafkaDataset
 
-输入数据为Kafka消息流, 每条消息为schema-less序列化的Arrow Batch
+输入数据为Kafka 或 [Datahub](https://help.aliyun.com/zh/datahub/product-overview/what-is-datahub) 消息流
+
+- 输入消息流的内容是序列化的ArrowRecordBatch，支持两种序列化格式:
+
+  - schema-less格式 (`record_batch.serialize()`): 需设置`data_config.input_fields`或`data_config.input_fields_str`来指定数据的schema
+  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，但schema会占用消息体大小
 
 - input_path: 按如下格式设置
 
   - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
   - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
-  - KafkaDataset也支持[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)， input_path按如下格式设置
-    - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
-
-- 需设置`data_config.input_fields`来指定数据的schema，Kafka消息中的Arrow Batch不包含schema信息，详见下文input_fields参数说明
 
 - 注意:
 
-  - Kafka分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - 当输入数据为Datahub时，Datahub需设置为[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)， input_path按如下格式设置
+    - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
+  - 当使用 Arrow IPC Stream 格式 (带 schema) 时，每个 Kafka消息应只包含一个 record batch。如果单个消息包含多个 record batches，只有第一个 batch 会被读取，后续 batches 将被忽略。如需发送多个 batches，请将其作为多个独立的 Kafka消息发送。
+
+### 使用 Flink ArrowBatchUDTF 序列化数据
+
+TorchEasyRec 提供了 Flink UDTF 用于将 Flink 流数据序列化为 Arrow IPC 格式，写入 Kafka 供 KafkaDataset 消费。
+
+#### 下载 UDF JAR
+
+- JAR 下载地址: `https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/flink/flink-arrow-batch-udf-0.1.jar`
+
+#### 在阿里云 Flink VVP 中使用
+
+1. **注册 UDF**: 参考[UDF管理文档](https://help.aliyun.com/zh/flink/realtime-flink/user-guide/manage-udfs)注册 ArrowBatchUDTF，类名为 `com.aliyun.pai.flinkjob.ArrowBatchUDTF`
+
+1. **SQL 使用示例**
+
+```sql
+-- 将数据序列化为 Arrow IPC 格式写入 Kafka
+INSERT INTO kafka_sink
+SELECT T.arrow_data
+FROM source_table,
+LATERAL TABLE(ArrowBatchUDTF(ROW(user_id, item_id, label, embedding))) AS T(arrow_data);
+```
+
+3. **配置参数**: 在 Flink Deployment Configuration 中添加 `pipeline.global-job-parameters`
+
+```yaml
+pipeline.global-job-parameters: |
+  'arrow.batch.udtf.batch-size:"128"',
+  'arrow.batch.udtf.bytes-limit:"917504"',
+  'arrow.batch.udtf.compression:"ZSTD"',
+  'arrow.batch.udtf.embed-schema:"true"',
+  'arrow.batch.udtf.input-typeinfo:"user_id:BIGINT;item_id:BIGINT;label:FLOAT;embedding:ARRAY<FLOAT>"'
+```
+
+#### 配置参数说明
+
+| 参数                            | 默认值 | 说明                                                                                                                                                                                                                                                                                   |
+| ------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| arrow.batch.udtf.batch-size     | 128    | 累积多少行后序列化为一个 Arrow IPC batch                                                                                                                                                                                                                                               |
+| arrow.batch.udtf.bytes-limit    | 917504 | 单个序列化 batch 的最大字节数，超出会自动拆分。设置为 0 表示不限制。注意：该值需小于 [Kafka 消息大小上限](https://help.aliyun.com/zh/apsaramq-for-kafka/cloud-message-queue-for-kafka/product-overview/terms#dt-w4l-kbb-3df)，Kafka 默认消息大小为 1MB，建议调整 Kafka 消息大小至 10MB |
+| arrow.batch.udtf.compression    | ZSTD   | 压缩编码，支持 ZSTD、LZ4_FRAME、UNCOMPRESSED                                                                                                                                                                                                                                           |
+| arrow.batch.udtf.embed-schema   | false  | 是否在输出中嵌入 schema。设置为 true 时使用 IPC Stream 格式（带 schema），KafkaDataset 可自动推断 schema；设置为 false 时使用 schema-less 格式，需在 KafkaDataset 中配置 input_fields                                                                                                  |
+| arrow.batch.udtf.input-typeinfo | 无     | 输入数据的 schema，格式为 `fieldName:TYPE;fieldName:TYPE;...`，支持的类型同下文`input_fields_str`                                                                                                                                                                                      |
 
 ## data_config配置
 
@@ -294,10 +342,10 @@ data_config {
 ### input_fields
 
 ```
-input_fields: {
+input_fields {
     input_name: "input1"
 }
-input_fields: {
+input_fields {
     input_name: "input2"
     input_type: DOUBLE
 }
@@ -308,6 +356,29 @@ input_fields: {
   - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING
 - 当使用KafkaDataset：
   - `input_type` 支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING | ARRAY_INT32 | ARRAY_INT64 | ARRAY_FLOAT | ARRAY_DOUBLE | ARRAY_STRING | ARRAY_ARRAY_INT32 | ARRAY_ARRAY_INT64 | ARRAY_ARRAY_FLOAT | ARRAY_ARRAY_DOUBLE | ARRAY_ARRAY_STRING | MAP_STRING_INT32 | MAP_STRING_INT64 | MAP_STRING_FLOAT | MAP_STRING_DOUBLE | MAP_STRING_STRING | MAP_INT64_INT32 | MAP_INT64_INT64 | MAP_INT64_FLOAT | MAP_INT64_DOUBLE | MAP_INT64_STRING | MAP_INT32_INT32 | MAP_INT32_INT64 | MAP_INT32_FLOAT | MAP_INT32_DOUBLE | MAP_INT32_STRING
+
+### input_fields_str
+
+`input_fields_str`是`input_fields`的简化配置格式，格式为: `field_name1:field_type1;field_name2:field_type2;`
+
+示例:
+
+```
+data_config {
+    input_fields_str: "user_id:BIGINT;item_id:BIGINT;label:FLOAT;features:ARRAY<FLOAT>;"
+}
+```
+
+支持的类型名:
+
+- 基本类型: INT, INT32, BIGINT, INT64, STRING, FLOAT, DOUBLE
+  - 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)
+- 数组类型: ARRAY<INT>, ARRAY<BIGINT>, ARRAY<STRING>, ARRAY<FLOAT>, ARRAY<DOUBLE>
+- 嵌套数组: ARRAY\<ARRAY\<INT>>, ARRAY\<ARRAY\<BIGINT>>, ARRAY\<ARRAY\<FLOAT>>, ARRAY\<ARRAY\<DOUBLE>>, ARRAY\<ARRAY\<STRING>>
+- Map类型: MAP\<STRING,INT>, MAP\<STRING,BIGINT>, MAP\<STRING,FLOAT>, MAP\<STRING,DOUBLE>, MAP\<STRING,STRING>, MAP\<INT,INT>, MAP\<INT,BIGINT>, MAP\<INT,FLOAT>, MAP\<INT,DOUBLE>, MAP\<INT,STRING>, MAP\<BIGINT,INT>, MAP\<BIGINT,BIGINT>, MAP\<BIGINT,FLOAT>, MAP\<BIGINT,DOUBLE>, MAP\<BIGINT,STRING>
+- 逗号周围允许空格: `MAP<STRING, BIGINT>` 是有效的
+
+注意: 如果同时设置了`input_fields_str`和`input_fields`，`input_fields_str`优先级更高。
 
 ### 更多配置
 

@@ -24,12 +24,10 @@
 import codecs
 import os
 
-import sphinx_rtd_theme
-
 # -- Project information -----------------------------------------------------
 
 project = "tzrec"
-copyright = "2024-2025, EasyRec Team"
+copyright = "2024-2026, EasyRec Team"
 author = "EasyRec Team"
 
 version_file = "../../tzrec/version.py"
@@ -64,7 +62,6 @@ extensions = [
     "sphinx.ext.mathjax",
     "sphinx.ext.ifconfig",
     "sphinx.ext.viewcode",
-    "sphinx.ext.githubpages",
     "sphinx.ext.napoleon",
     "myst_parser",
 ]
@@ -121,7 +118,6 @@ pygments_style = None
 # a list of builtin themes.
 #
 html_theme = "sphinx_rtd_theme"
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the

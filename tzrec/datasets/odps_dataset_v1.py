@@ -87,7 +87,6 @@ class OdpsDatasetV1(BaseDataset):
             self._data_config.drop_remainder,
             shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
         )
-        self._init_input_fields()
 
     def _init_input_fields(self) -> None:
         """Init input fields info."""

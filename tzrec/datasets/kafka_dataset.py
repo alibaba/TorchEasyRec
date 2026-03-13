@@ -11,16 +11,23 @@
 
 
 import math
+import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
-from tzrec.datasets.utils import FIELD_TYPE_TO_PA
+from tzrec.datasets.utils import (
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
+    FIELD_TYPE_TO_PA,
+    get_input_fields_proto,
+)
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils.logging_util import logger
 
 
 def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
@@ -75,8 +82,9 @@ class KafkaDataset(BaseDataset):
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
 
+        input_fields_list = get_input_fields_proto(self._data_config)
         input_fields = []
-        for f in self._data_config.input_fields:
+        for f in input_fields_list:
             pa_type = FIELD_TYPE_TO_PA.get(f.input_type)
             input_fields.append(pa.field(f.input_name, pa_type))
 
@@ -86,9 +94,8 @@ class KafkaDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._data_config.drop_remainder,
-            input_fields=input_fields,
+            input_fields=input_fields if input_fields else None,
         )
-        self._init_input_fields()
 
 
 class KafkaReader(BaseReader):
@@ -119,28 +126,90 @@ class KafkaReader(BaseReader):
         )
 
         self._drop_columns = []
+        self._has_embedded_schema = False
+
         if input_fields:
             self._full_schema = pa.schema(input_fields)
-            if self._selected_cols:
-                fields = []
-                self._ordered_cols = []
-                for field in input_fields:
-                    if field.name in self._selected_cols:
-                        fields.append(field)
-                        self._ordered_cols.append(field.name)
-                    else:
-                        self._drop_columns.append(field.name)
-                self._schema = pa.schema(fields)
-            else:
-                self._schema = pa.schema(input_fields)
-                self._ordered_cols = [f.name for f in input_fields]
         else:
-            raise ValueError("input_fields must be specified for KafkaReader. ")
+            # Embedded schema mode - peek schema from first message
+            self._full_schema = self._peek_schema_from_kafka()
+            self._has_embedded_schema = True
+
+        if self._selected_cols:
+            fields = []
+            self._ordered_cols = []
+            for field in self._full_schema:
+                if field.name in self._selected_cols:
+                    fields.append(field)
+                    self._ordered_cols.append(field.name)
+                else:
+                    self._drop_columns.append(field.name)
+            self._schema = pa.schema(fields)
+        else:
+            self._schema = self._full_schema
+            self._ordered_cols = [f.name for f in self._full_schema]
 
     @property
     def schema(self) -> pa.Schema:
         """Table schema."""
         return self._schema
+
+    def _peek_schema_from_kafka(self) -> pa.Schema:
+        """Peek at newest Kafka message to extract schema.
+
+        Uses assign() and seek() to directly read the newest message from partition 0,
+        avoiding affecting consumer group.
+
+        Returns:
+            PyArrow schema from the message.
+
+        Raises:
+            ValueError: If no messages available or message doesn't contain
+                valid schema.
+        """
+        topic, config = _parse_kafka_uri(self._input_path)
+        consumer = Consumer(config)
+
+        try:
+            # Directly assign partition 0 (no subscribe, no group coordination)
+            tp = TopicPartition(topic, 0)
+            consumer.assign([tp])
+
+            # Get the high watermark (newest offset) for the partition
+            low, high = consumer.get_watermark_offsets(tp, timeout=60.0)
+            if high <= low:
+                raise ValueError(
+                    "No messages available in Kafka topic to infer schema. "
+                    "Either provide input_fields in config or ensure topic "
+                    "has messages."
+                )
+
+            # Re-assign with specific offset to read the last message
+            tp = TopicPartition(topic, 0, high - 1)
+            consumer.assign([tp])
+
+            # Poll for the message
+            msg = consumer.poll(timeout=10.0)
+            if msg is None:
+                raise ValueError("Failed to read message from Kafka topic after seek.")
+            if msg.error():
+                raise ValueError(f"Error reading Kafka message: {msg.error()}")
+
+            msg_data = msg.value()
+            reader = pa.ipc.open_stream(msg_data)
+            try:
+                schema = reader.schema
+            finally:
+                reader.close()
+            return schema
+        except pa.ArrowInvalid as e:
+            raise ValueError(
+                "Message may not be in Arrow IPC stream format. Failed to read "
+                "schema from Kafka message. You should provide input_fields in "
+                f"config when using serialize record_batch without schema: {e}."
+            ) from e
+        finally:
+            consumer.close()
 
     def _reader(
         self, worker_id: int = 0, num_workers: int = 1
@@ -156,7 +225,24 @@ class KafkaReader(BaseReader):
         """
         topic, config = _parse_kafka_uri(self._input_path)
         consumer = Consumer(config)
-        consumer.subscribe([topic])
+
+        # Define on_assign callback to seek to checkpointed offsets
+        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
+            if self._checkpoint_state:
+                for tp in partitions:
+                    source_key = f"{tp.topic}:{tp.partition}"
+                    if source_key in self._checkpoint_state:
+                        # Resume after last consumed offset
+                        tp.offset = self._checkpoint_state[source_key] + 1
+                    else:
+                        tp.offset = 0
+            consumer.assign(partitions)
+            logger.info(
+                f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "
+                f"assignment: {consumer.assignment()}"
+            )
+
+        consumer.subscribe([topic], on_assign=on_assign)
 
         batch_size_per_msg = None
         try:
@@ -170,19 +256,54 @@ class KafkaReader(BaseReader):
 
                 current_batch_size = 0
                 record_batchs = []
+                # Track checkpoint metadata for each message
+                source_ids = []
+                row_indices = []
+
                 for msg in messages:
+                    msg_error = msg.error()
+                    if msg_error:
+                        logger.error(msg_error)
+                        continue
                     msg_data = msg.value()
-                    record_batch = pa.ipc.read_record_batch(msg_data, self._full_schema)
+                    if self._has_embedded_schema:
+                        # Read with embedded schema using IPC stream reader
+                        # NOTE: Only the first record batch is read from each message.
+                        # If a Kafka message contains multiple record batches in the IPC
+                        # stream format, subsequent batches will be silently dropped.
+                        # Each Kafka message should contain exactly one record batch.
+                        reader = pa.ipc.open_stream(msg_data)
+                        try:
+                            record_batch = reader.read_next_batch()
+                        finally:
+                            reader.close()
+                    else:
+                        # Schema-less message (current behavior)
+                        record_batch = pa.ipc.read_record_batch(
+                            msg_data, self._full_schema
+                        )
                     current_batch_size += len(record_batch)
                     record_batchs.append(record_batch)
 
+                    # Generate checkpoint metadata for each row in this message
+                    partition = msg.partition()
+                    offset = msg.offset()
+                    source_id = f"{topic}:{partition}"
+                    batch_len = len(record_batch)
+                    source_ids.extend([source_id] * batch_len)
+                    # Use offset as the row index (each message has one offset)
+                    row_indices.extend([offset] * batch_len)
+
+                if not record_batchs:
+                    continue
+
                 # estimate batch_size per message
                 if batch_size_per_msg is None:
-                    batch_size_per_msg = current_batch_size / len(record_batch)
+                    batch_size_per_msg = current_batch_size / len(record_batchs)
                 else:
                     batch_size_per_msg = (
                         0.9 * batch_size_per_msg
-                        + 0.1 * current_batch_size / len(record_batch)
+                        + 0.1 * current_batch_size / len(record_batchs)
                     )
 
                 # combine into one record batch
@@ -191,9 +312,20 @@ class KafkaReader(BaseReader):
                     .drop_columns(self._drop_columns)
                     .combine_chunks()
                 )
+
+                # Add checkpoint metadata columns
+                t = t.append_column(
+                    CKPT_SOURCE_ID, pa.array(source_ids, type=pa.string())
+                )
+                t = t.append_column(
+                    CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
+                )
+
                 for batch in t.to_batches():
                     yield batch
-
+        except Exception as e:
+            logger.error(f"KafkaReader exception: {e}", flush=True)
+            raise e
         finally:
             consumer.close()
 

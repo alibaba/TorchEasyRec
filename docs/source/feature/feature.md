@@ -69,7 +69,7 @@ feature_configs {
         feature_name: "cate"
         expression: "item:cate"
         embedding_dim: 32
-        zch: {
+        zch {
             zch_size: 1000000
             eviction_interval: 2
             lfu {}
@@ -112,7 +112,7 @@ feature_configs {
   - 词表形式：一行一个词
   - 字典词表形式：一行一个词和编号，词和编号间用空格分隔
 
-- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](../zch.md)
+- **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](./zch.md)
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
@@ -201,12 +201,12 @@ feature_configs {
 
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置。
 - **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](../autodis.md)
+- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](./autodis.md)
 
-Embedding特征: 支持string类型如`"0.1|0.2|0.3|0.4"`；支持ARRAY<float>类型如`[0.1,0.2,0.3,0.4]`（建议，性能更好），配置方式如下
+Embedding特征: 支持string类型如`"0.1|0.2|0.3|0.4"`；支持ARRAY\<float>类型如`[0.1,0.2,0.3,0.4]`（建议，性能更好），配置方式如下
 
 ```
-feature_configs: {
+feature_configs {
     raw_feature {
         feature_name: "pic_emb"
         expression: "item:pic_emb"
@@ -224,7 +224,7 @@ feature_configs: {
 对输入的离散值进行组合（即笛卡尔积）, 如age + cate:
 
 ```
-feature_configs: {
+feature_configs {
     combo_feature {
         feature_name: "combo_age_cate"
         expression: ["user:age", "item:cate"]
@@ -246,7 +246,7 @@ feature_configs: {
 `key`是一个多值的id，多值分隔符可以由**separator**指定，默认为`\x1d`。
 
 ```
-feature_configs: {
+feature_configs {
     lookup_feature {
         feature_name: "user_cate_cnt"
         map: "user:kv_cate_cnt"
@@ -278,7 +278,7 @@ feature_configs: {
 `match_feature`依赖`nested_map`和`pkey`和`skey`三个字段从kkv中匹配到特征值。`nested_map`是一个多值的kkv map，如`pk1^sk1:0.2,sk2:0.3,sk3:0.5|pk2^sk4:0.1`，`:`为内层kv分割符，`,`为内层多值分隔符，`^`为外层kv分割符，`|`为外层KV分隔符，分隔符不可以指定。生成特征时，使用`pkey`作为主键`skey`作为子健在`nested_map`字段所持有的kkv对中进行匹配，获取最终的特征。
 
 ```
-feature_configs: {
+feature_configs {
     match_feature {
         feature_name: "user_cate_brand_cnt"
         nested_map: "user:kkv_cate_brand_cnt"
@@ -313,7 +313,7 @@ feature_configs: {
 对数值型特征进行运算，如判断当前用户年龄是否>18，用户年龄是否符合物品年龄需求等。
 
 ```
-feature_configs: {
+feature_configs {
     expr_feature {
         feature_name: "combo_age_cate"
         variables: ["user:u_age", "item:i_age"]
@@ -433,7 +433,7 @@ feature_configs: {
 `overlap_feature`会计算`query`和`title`两个字段字词重合比例，`query`和`title`中字词的分割符默认为`\x1d`，可以用多值分隔符由**separator**指定。
 
 ```
-feature_configs: {
+feature_configs {
     overlap_feature {
         feature_name: "user_cate_cnt"
         query: "user:query"
@@ -470,13 +470,13 @@ feature_configs: {
 `tokenize_feature` 对输入字符串分词，返回分词之后的词id。支持tokenize-cpp的分词词典文件。
 
 ```
-feature_configs: {
+feature_configs {
     tokenize_feature {
         feature_name: "title_token"
         expression: "item:title"
         vocab_file: "tokenizer.json"
         embedding_dim: 8
-        text_normalizer: {
+        text_normalizer {
             norm_options: [TEXT_LOWER2UPPER, TEXT_SBC2DBC, TEXT_CHT2CHS, TEXT_FILTER]
         }
     }
@@ -509,7 +509,7 @@ feature_configs: {
 计算两个key-value索引的向量的点积，或两个集合的交集的大小。
 
 ```
-feature_configs: {
+feature_configs {
     kv_dot_product {
         feature_name: "query_doc_sim"
         query: "user:query"
@@ -545,7 +545,7 @@ feature_configs: {
 通过布尔值过滤元素，类似tf.boolean_mask(tensor, mask).
 
 ```
-feature_configs: {
+feature_configs {
     bool_mask_feature {
         feature_name: "query_doc_sim"
         expression: ["user:click_items", "item:is_valid"]
@@ -571,7 +571,7 @@ feature_configs: {
 自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
 
 ```
-feature_configs: {
+feature_configs {
     custom_feature {
         feature_name: "edit_distance"
         operator_name: "EditDistance"
@@ -627,7 +627,7 @@ feature_configs: {
 
 ```
 # 分组序列特征
-feature_configs: {
+feature_configs {
     sequence_feature {
         sequence_name: "click_seq"
         sequence_length: 50
@@ -718,7 +718,7 @@ feature_configs: {
 
 ```
 # 普通特征
-feature_configs: {
+feature_configs {
     sequence_id_feature {
         feature_name: "click_itemid_seq"
         sequence_length: 50
@@ -728,7 +728,7 @@ feature_configs: {
         hash_bucket_size: 100000
     }
 }
-feature_configs: {
+feature_configs {
     sequence_raw_feature {
         feature_name: "click_price_seq"
         sequence_length: 50
@@ -736,7 +736,7 @@ feature_configs: {
         expression: "user:click_price_seq"
     }
 }
-feature_configs: {
+feature_configs {
     sequence_custom_feature {
         feature_name: "seq_expr_1"
         operator_name: "SeqExpr"
@@ -752,7 +752,7 @@ feature_configs: {
         }
     }
 }
-feature_configs: {
+feature_configs {
     sequence_custom_feature {
         feature_name: "seq_expr_2"
         operator_name: "SeqExpr"

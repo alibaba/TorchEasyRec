@@ -28,8 +28,16 @@ from tzrec.protos import data_pb2, feature_pb2
 
 
 class CsvDatasetTest(unittest.TestCase):
-    @parameterized.expand([[True, 10000], [False, 10000], [False, 5000]])
-    def test_csv_dataset(self, with_header, num_rows):
+    @parameterized.expand(
+        [
+            [True, 10000, False],  # with_header, num_rows, use_input_fields_str
+            [False, 10000, False],
+            [False, 5000, False],
+            [False, 10000, True],  # test with input_fields_str
+            [False, 5000, True],  # test with input_fields_str
+        ]
+    )
+    def test_csv_dataset(self, with_header, num_rows, use_input_fields_str):
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(feature_name="id_a")
@@ -72,16 +80,22 @@ class CsvDatasetTest(unittest.TestCase):
                 with_header=with_header,
             )
             if not with_header:
-                data_config.input_fields.extend(
-                    [
-                        data_pb2.Field(input_name="unused"),
-                        data_pb2.Field(input_name="id_a"),
-                        data_pb2.Field(input_name="tag_b"),
-                        data_pb2.Field(input_name="raw_c"),
-                        data_pb2.Field(input_name="raw_d"),
-                        data_pb2.Field(input_name="label"),
-                    ]
-                )
+                if use_input_fields_str:
+                    data_config.input_fields_str = (
+                        "unused:STRING;id_a:STRING;tag_b:STRING;"
+                        "raw_c:INT64;raw_d:DOUBLE;label:INT64"
+                    )
+                else:
+                    data_config.input_fields.extend(
+                        [
+                            data_pb2.Field(input_name="unused"),
+                            data_pb2.Field(input_name="id_a"),
+                            data_pb2.Field(input_name="tag_b"),
+                            data_pb2.Field(input_name="raw_c"),
+                            data_pb2.Field(input_name="raw_d"),
+                            data_pb2.Field(input_name="label"),
+                        ]
+                    )
             dataset = CsvDataset(
                 data_config,
                 features=features,

@@ -10,7 +10,9 @@
 # limitations under the License.
 
 
+import io
 import os
+import time
 import unittest
 
 import pyarrow as pa
@@ -20,11 +22,13 @@ from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
 from confluent_kafka import Producer
+from parameterized import parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.kafka_dataset import KafkaDataset
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
 
@@ -53,17 +57,34 @@ class KafkaDatasetTest(unittest.TestCase):
         except Exception as e:
             logger.error(e)
 
-    def _create_test_table_and_feature_cfgs(self, has_lookup=True):
-        req = alikafka_models.CreateTopicRequest(
+    def _create_test_table_and_feature_cfgs(self, embedded_schema=False):
+        create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
             remark=self.test_topic,
             region_id=self.region,
-            partition_num=12,
+            partition_num=4,
         )
         runtime = util_models.RuntimeOptions()
-        self.client.create_topic_with_options(req, runtime)
+        self.client.create_topic_with_options(create_topic_req, runtime)
 
+        while True:
+            runtime = util_models.RuntimeOptions()
+            get_topic_request = alikafka_models.GetTopicListRequest(
+                instance_id=self.instance_id,
+                region_id=self.region,
+                topic=self.test_topic,
+            )
+            resp = self.client.get_topic_list(get_topic_request)
+            if resp.body.topic_list.topic_vo[0].status == 0:
+                break
+            time.sleep(10)
+
+        input_fields_str = (
+            "unused:STRING;id_a:STRING;tag_b:STRING;raw_c:INT64;"
+            "raw_d:DOUBLE;raw_e:INT32;raw_f:FLOAT;raw_g:ARRAY<FLOAT>;"
+            "map_h:MAP<STRING,INT64>;label:INT64"
+        )
         input_fields = [
             data_pb2.Field(input_name="unused", input_type=data_pb2.STRING),
             data_pb2.Field(input_name="id_a", input_type=data_pb2.STRING),
@@ -78,7 +99,8 @@ class KafkaDatasetTest(unittest.TestCase):
         ]
         config = {"bootstrap.servers": self.brokers}
         producer = Producer(config)
-        for _ in range(1000):
+
+        for _ in range(10000):
             record_batch = pa.record_batch(
                 {
                     "unused": pa.array(["unused"] * 128, type=pa.string()),
@@ -97,7 +119,15 @@ class KafkaDatasetTest(unittest.TestCase):
                     "label": pa.array([0] * 128, type=pa.int64()),
                 }
             )
-            producer.produce(topic=self.test_topic, value=record_batch.serialize())
+            if embedded_schema:
+                # Serialize with embedded schema using IPC stream format
+                sink = io.BytesIO()
+                with pa.ipc.new_stream(sink, record_batch.schema) as writer:
+                    writer.write_batch(record_batch)
+                value = sink.getvalue()
+            else:
+                value = record_batch.serialize()
+            producer.produce(topic=self.test_topic, value=value)
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -134,39 +164,45 @@ class KafkaDatasetTest(unittest.TestCase):
                     feature_name="raw_g", expression="user:raw_g", value_dim=3
                 ),
             ),
+            feature_pb2.FeatureConfig(
+                lookup_feature=feature_pb2.LookupFeature(
+                    feature_name="lookup_h", map="user:map_h", key="item:id_a"
+                ),
+            ),
         ]
-        if has_lookup:
-            feature_cfgs.append(
-                feature_pb2.FeatureConfig(
-                    lookup_feature=feature_pb2.LookupFeature(
-                        feature_name="lookup_h", map="user:map_h", key="item:id_a"
-                    ),
-                )
-            )
-        return feature_cfgs, input_fields
+        return feature_cfgs, input_fields, input_fields_str
 
+    @parameterized.expand([[False, False], [True, False], [True, True]])
     @unittest.skipIf(
-        "CI_ALIKAFKA_INSTANCE_ID" not in os.environ, "ci kafka is not exists."
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )
-    def test_kafka_dataset(self):
-        feature_cfgs, input_fields = self._create_test_table_and_feature_cfgs()
+    def test_kafka_dataset(self, use_input_fields_str, embedded_schema):
+        feature_cfgs, input_fields, input_fields_str = (
+            self._create_test_table_and_feature_cfgs(embedded_schema=embedded_schema)
+        )
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
 
+        data_config = data_pb2.DataConfig(
+            batch_size=8196,
+            dataset_type=data_pb2.DatasetType.KafkaDataset,
+            fg_mode=FgMode.FG_DAG,
+            label_fields=["label"],
+        )
+        if not embedded_schema:
+            if use_input_fields_str:
+                data_config.input_fields_str = input_fields_str
+            else:
+                data_config.input_fields.extend(input_fields)
+
         dataset = KafkaDataset(
-            data_config=data_pb2.DataConfig(
-                batch_size=8196,
-                dataset_type=data_pb2.DatasetType.KafkaDataset,
-                input_fields=input_fields,
-                fg_mode=FgMode.FG_DAG,
-                label_fields=["label"],
-            ),
+            data_config=data_config,
             features=features,
             input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
         )
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
             collate_fn=lambda x: x,
         )
@@ -191,6 +227,128 @@ class KafkaDatasetTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
+
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_kafka_dataset_checkpoint_metadata(self):
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        dataset = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # Verify checkpoint_info is present and has correct format
+        self.assertIsNotNone(batch.checkpoint_info)
+        self.assertIsInstance(batch.checkpoint_info, dict)
+
+        # Checkpoint keys should be in format "{topic}:{partition}"
+        for key, value in batch.checkpoint_info.items():
+            self.assertIn(":", key)
+            topic_part, partition_str = key.rsplit(":", 1)
+            self.assertEqual(topic_part, self.test_topic)
+            self.assertTrue(partition_str.isdigit())
+            # Value should be a non-negative offset
+            self.assertIsInstance(value, int)
+            self.assertGreaterEqual(value, 0)
+
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_kafka_dataset_checkpoint_resume(self):
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        # First, read some batches and capture checkpoint info
+        dataset1 = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+        )
+        dataloader1 = DataLoader(
+            dataset=dataset1,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator1 = iter(dataloader1)
+
+        # Read first batch and capture checkpoint
+        checkpoint_state_acc = {}
+        batch1 = next(iterator1)
+        first_checkpoint_state = batch1.checkpoint_info.copy()
+        update_dataloder_state(checkpoint_state_acc, first_checkpoint_state)
+        self.assertIsNotNone(first_checkpoint_state)
+        self.assertGreater(len(first_checkpoint_state), 0)
+        # Read more batches
+        for _ in range(8):
+            batch1 = next(iterator1)
+            update_dataloder_state(checkpoint_state_acc, batch1.checkpoint_info.copy())
+        del iterator1
+        del dataloader1
+
+        # Now create a new dataset with checkpoint state set
+        dataset2 = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+        )
+        dataloader2 = DataLoader(
+            dataset=dataset2,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        # Set first batch checkpoint state to resume from saved offsets
+        dataloader2.dataset.load_state_dict(first_checkpoint_state)
+        iterator2 = iter(dataloader2)
+
+        # Read batch from resumed dataset
+        batch2 = next(iterator2)
+
+        # The resumed batch should have offsets greater than the checkpoint
+        # (since we resume from checkpoint_offset + 1)
+        for key, new_offset in batch2.checkpoint_info.items():
+            if key in first_checkpoint_state:
+                # New offset should be greater than or equal to first checkpoint offset
+                # (equal if we consumed the next message after checkpoint)
+                self.assertGreaterEqual(new_offset, first_checkpoint_state[key])
+            if key in checkpoint_state_acc:
+                # New offset should be less than or equal to acc checkpoint offset
+                # (equal if we consumed the next message after checkpoint)
+                self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
 
 if __name__ == "__main__":

@@ -1,16 +1,16 @@
 # WideAndDeep
 
-### 简介
+## 简介
 
 WideAndDeep包含Wide和Deep两部分，Wide部分负责记忆，Deep部分负责泛化。Wide部分可以做显式的特征交叉，Deep部分可以实现隐式自动的特征交叉。
 
 ![wide_and_deep.png](../../images/models/wide_and_deep.png)
 
-### 配置说明
+## 配置说明
 
 ```
-model_config:{
-    feature_groups: {
+model_config {
+    feature_groups {
         group_name: "deep"
         feature_names: "hour"
         feature_names: "c1"
@@ -18,7 +18,7 @@ model_config:{
         feature_names: "site_id_app_id"
         wide_deep:DEEP
     }
-    feature_groups: {
+    feature_groups {
         group_name: "wide"
         feature_names: "hour"
         feature_names: "c1"
@@ -53,6 +53,6 @@ model_config:{
 
 [wide_and_deep_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/wide_and_deep_criteo.config)
 
-### 参考论文
+## 参考论文
 
 [WideAndDeep](https://arxiv.org/abs/1606.07792)
