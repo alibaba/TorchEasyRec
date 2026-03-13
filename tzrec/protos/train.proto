@@ -18,6 +18,17 @@ message GradScaler {
     optional uint32 growth_interval = 4 [default = 2000];
 }
 
+message GradClipping {
+    // Clipping type: "norm", "value", or "none"
+    optional string clipping_type = 1 [default = "none"];
+    // Max gradient value/norm threshold
+    optional float max_gradient = 2 [default = 1.0];
+    // Norm type for gradient norm clipping (2.0 for L2, inf for max)
+    optional float norm_type = 3 [default = 2.0];
+    // Enable global gradient clipping for distributed training
+    optional bool enable_global_grad_clip = 4 [default = false];
+}
+
 message TrainConfig {
     // embedding part optimizer
     required SparseOptimizer sparse_optimizer = 1;
@@ -57,5 +68,7 @@ message TrainConfig {
     optional GradScaler grad_scaler = 17;
     // gradient accumulation steps
     optional uint32 gradient_accumulation_steps = 18;
+    // dense gradient clipping config
+    optional GradClipping grad_clipping = 19;
     // TBD: qcomm config
 }

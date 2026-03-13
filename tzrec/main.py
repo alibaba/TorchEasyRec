@@ -29,6 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
+from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
@@ -711,8 +712,23 @@ def train_and_evaluate(
             device=device.type,
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
+    combined_optimizer = CombinedOptimizer(
+        [model.fused_optimizer, dense_optimizer, *part_optimizers]
+    )
+    # Apply gradient clipping for dense parameters if configured
+    if train_config.HasField("grad_clipping"):
+        gc_config = train_config.grad_clipping
+        clipping_type = GradientClipping[gc_config.clipping_type.upper()]
+        if clipping_type != GradientClipping.NONE:
+            combined_optimizer = GradientClippingOptimizer(
+                optimizer=combined_optimizer,
+                clipping=clipping_type,
+                max_gradient=gc_config.max_gradient,
+                norm_type=gc_config.norm_type,
+                enable_global_grad_clip=gc_config.enable_global_grad_clip,
+            )
     optimizer = TZRecOptimizer(
-        CombinedOptimizer([model.fused_optimizer, dense_optimizer, *part_optimizers]),
+        combined_optimizer,
         grad_scaler=grad_scaler,
         gradient_accumulation_steps=train_config.gradient_accumulation_steps,
     )
