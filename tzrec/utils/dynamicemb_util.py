@@ -62,11 +62,11 @@ try:
         KVCounter,
         batched_dynamicemb_compute_kernel,
     )
-    from dynamicemb.dynamicemb_config import DynamicEmbKernel
-    from dynamicemb.dynamicemb_ops import (
+    from dynamicemb.batched_dynamicemb_compute_kernel import (
         BatchedDynamicEmbedding,
         BatchedDynamicEmbeddingBag,
     )
+    from dynamicemb.dynamicemb_config import DynamicEmbKernel
     from dynamicemb.planner import (
         DynamicEmbParameterConstraints,
         DynamicEmbParameterSharding,
