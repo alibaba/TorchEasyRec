@@ -705,9 +705,9 @@ if has_dynamicemb:
         """Patched version that accepts env parameter for torchrec 1.5.0."""
         if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
             # pyre-ignore [16]
-            return super(
-                GroupedPooledEmbeddingsLookup, self
-            )._create_embedding_kernel(config, device, pg, sharding_type, env)
+            return super(GroupedPooledEmbeddingsLookup, self)._create_embedding_kernel(
+                config, device, pg, sharding_type, env
+            )
         else:
             return BatchedDynamicEmbeddingBag(
                 config=config,
