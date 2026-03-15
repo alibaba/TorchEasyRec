@@ -10,7 +10,7 @@ jobs:
     runs-on: tzrec-bench-runner
     timeout-minutes: 960
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.0
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-test:1.1
       options: --gpus all --ipc host
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
