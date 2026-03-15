@@ -2,7 +2,7 @@
 set -e
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
-REPO_NAME=tzrec-test
+REPO_NAME=tzrec-devel
 DOCKER_TAG=1.1
 DOCKER_TAG_SUFFIX=
 
