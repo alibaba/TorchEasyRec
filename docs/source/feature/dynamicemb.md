@@ -6,7 +6,7 @@ DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`ha
 
 ```bash
 # DEVICE 可选: cu126/cu129
-# CYTHON 可选: cp310/cp311/cp312
+# CYTHON 可选: cp310/cp311/cp312 (分别对应 Python 3.10/3.11/3.12)
 pip install https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/dynamicemb-0.0.1%2B20260228.60bd31e.${DEVICE}-${CYTHON}-${CYTHON}-linux_x86_64.whl
 ```
 
