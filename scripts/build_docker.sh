@@ -23,7 +23,7 @@ do
     docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX}
 done
 
-docker images -q ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-cu129-${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
-docker images -q ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-cu129-${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:latest
+docker images -q ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-cu129${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
+docker images -q ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-cu129${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:latest
 docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
 docker push ${REGISTRY}/${REPO_NAME}:latest

@@ -17,7 +17,7 @@ jobs:
       options: --ipc host
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: run_${{ github.run_id }}
