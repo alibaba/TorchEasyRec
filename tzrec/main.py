@@ -718,7 +718,14 @@ def train_and_evaluate(
     # Apply gradient clipping for dense parameters if configured
     if train_config.HasField("grad_clipping"):
         gc_config = train_config.grad_clipping
-        clipping_type = GradientClipping[gc_config.clipping_type.upper()]
+        valid_clipping_types = set(GradientClipping.__members__.keys())
+        clipping_type_str = gc_config.clipping_type.upper()
+        if clipping_type_str not in valid_clipping_types:
+            raise ValueError(
+                f"Invalid clipping_type '{gc_config.clipping_type}'. Valid "
+                f"values are: {', '.join(t.lower() for t in valid_clipping_types)}"
+            )
+        clipping_type = GradientClipping[clipping_type_str]
         if clipping_type != GradientClipping.NONE:
             combined_optimizer = GradientClippingOptimizer(
                 optimizer=combined_optimizer,
