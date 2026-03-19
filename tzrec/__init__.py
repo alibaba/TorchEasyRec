@@ -12,6 +12,14 @@
 import os as _os
 import warnings as _warnings
 
+# Disable ECS metadata credential provider when ALIBABA_CLOUD_ECS_METADATA is not set.
+# This prevents alibabacloud_credentials >= 1.0 from trying to connect to ECS metadata
+# service (100.100.100.200) before trying other credential providers like URI.
+# IMPORTANT: This must be set BEFORE importing alibabacloud_credentials because
+# auth_util.py caches environment variables at import time.
+if not _os.environ.get("ALIBABA_CLOUD_ECS_METADATA"):
+    _os.environ.setdefault("ALIBABA_CLOUD_ECS_METADATA_DISABLED", "true")
+
 # TODO(hongsheng.jhs): remove the warning filter when fbgemm team fix it.
 _warnings.filterwarnings(
     "ignore",
