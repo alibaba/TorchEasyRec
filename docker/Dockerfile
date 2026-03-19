@@ -41,24 +41,26 @@ RUN case ${DEVICE} in \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu126") pip install torch==2.10.0 fbgemm-gpu==1.5.0 --index-url https://download.pytorch.org/whl/cu126 && \
+        "cu126") pip install torch==2.10.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu126 && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.10.0+cu126.dist-info/METADATA && \
+                 pip install fbgemm-gpu==1.5.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu126/repo.html && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.5.0 --index-url https://download.pytorch.org/whl/cu126 && \
+                 pip install torchrec==1.5.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu126 && \
                  pip cache purge ;; \
-        "cu129") pip install torch==2.10.0 fbgemm-gpu==1.5.0 --index-url https://download.pytorch.org/whl/cu129 && \
+        "cu129") pip install torch==2.10.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.10.0+cu129.dist-info/METADATA && \
+                 pip install fbgemm-gpu==1.5.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torch_tensorrt==2.10.0 --index-url https://download.pytorch.org/whl/cu129 --no-deps && \
+                 pip install torch_tensorrt==2.10.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 --no-deps && \
                  pip install packaging typing-extensions dllist psutil "tensorrt_cu12<10.15.0" && \
                  sed -i '/^Requires-Dist: tensorrt</d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch_tensorrt-2.10.0+cu129.dist-info/METADATA && \
-                 pip install torchrec==1.5.0 --index-url https://download.pytorch.org/whl/cu129 && \
+                 pip install torchrec==1.5.0 -f https://download.pytorch.org/whl/cu129 && \
                  pip cache purge ;; \
-        * )      pip install torch==2.10.0 fbgemm-gpu==1.5.0 --index-url https://download.pytorch.org/whl/cpu && \
+        * )      pip install torch==2.10.0 fbgemm-gpu==1.5.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.5.0 --index-url https://download.pytorch.org/whl/cpu && \
+                 pip install torchrec==1.5.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
                  pip cache purge ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
