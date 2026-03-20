@@ -188,18 +188,18 @@ class DataParser:
         if is_input_tile():
             # When making offline predictions, we set the tile_size to 1.
             # During online serving, we will set the tile_size to batch_size
-            output_data["batch_size"] = torch.tensor(1)
-            # flag = False
-            # for k, v in input_data.items():
-            #     if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
-            #         if k in self.user_feats:
-            #             input_data[k] = v.take([0])
-            #     else:
-            #         if k in self.user_inputs:
-            #             input_data[k] = v.take([0])
-            #     if not flag:
-            #         output_data["batch_size"] = torch.tensor(v.__len__())
-            #         flag = True
+            # output_data["batch_size"] = torch.tensor(1)
+            flag = False
+            for k, v in input_data.items():
+                if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+                    if k in self.user_feats:
+                        input_data[k] = v.take([0])
+                else:
+                    if k in self.user_inputs:
+                        input_data[k] = v.take([0])
+                if not flag:
+                    output_data["batch_size"] = torch.tensor(v.__len__())
+                    flag = True
 
         if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_BUCKETIZE):
             self._parse_feature_fg_handler(input_data, output_data)
