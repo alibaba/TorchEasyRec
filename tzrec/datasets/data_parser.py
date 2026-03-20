@@ -186,9 +186,16 @@ class DataParser:
         """
         output_data = {}
         if is_input_tile():
-            # When making offline predictions, we set the tile_size to 1.
-            # During online serving, we will set the tile_size to batch_size
-            # output_data["batch_size"] = torch.tensor(1)
+            # When is_input_tile is True during export, we consistently use v.take([0])
+            # instead of setting tile_size to 1 as in the old approach.
+            # This is because when INPUT_TILE_3_ONLINE=1, the sequential tensor (seq_t)
+            # is retrieved via jt.values() rather than jt.to_padded_dense(seq_len) in
+            # embedding.py. Setting tile_size to 1 would result in an incorrect output
+            # shape of [1, sum(seq_len), dim].
+            #
+            # Old Approach:
+            #   # for offline prediction: tile_size was set to 1.
+            #   output_data["batch_size"] = torch.tensor(1)
             flag = False
             for k, v in input_data.items():
                 if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
