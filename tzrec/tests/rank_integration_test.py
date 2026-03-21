@@ -41,6 +41,7 @@ class RankIntegrationTest(unittest.TestCase):
                 shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
         os.environ.pop("USE_RTP", None)
+        os.environ.pop("INPUT_TILE_3_ONLINE", None)
 
     def _test_rank_nofg(self, pipeline_config_path, reserved_columns, output_columns):
         self.success = utils.test_train_eval(pipeline_config_path, self.test_dir)
@@ -798,6 +799,30 @@ class RankIntegrationTest(unittest.TestCase):
     def test_multi_tower_din_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+        )
+
+    def test_multi_tower_din_with_fg_train_eval_export_input_tile_3_online(self):
+        """Test INPUT_TILE=3 with INPUT_TILE_3_ONLINE=1 (jagged tensor mode)."""
+        pipeline_config_path = "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+
+        self.success = utils.test_train_eval(
+            pipeline_config_path,
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+
+        # export with INPUT_TILE=3 and INPUT_TILE_3_ONLINE=1
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="QUANT_EMB=1 INPUT_TILE=3 INPUT_TILE_3_ONLINE=1",
+            )
+
+        self.assertTrue(self.success)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
     @unittest.skipIf(*gpu_unavailable)
