@@ -48,6 +48,18 @@ def is_input_tile_emb() -> bool:
     return False
 
 
+def is_input_tile_3_online() -> bool:
+    """Judge is the sequential tensor use jt.values() directly or not.
+
+    If INPUT_TILE_3_ONLINE=1, sequential tensor use jt.values() directly,
+    offline prediction for the model will not be supported.
+    """
+    input_tile_3_online = os.environ.get("INPUT_TILE_3_ONLINE")
+    if input_tile_3_online and input_tile_3_online[0] == "1":
+        return True
+    return False
+
+
 def is_aot() -> bool:
     """Judge is inductor or not."""
     is_aot = os.environ.get("ENABLE_AOT")

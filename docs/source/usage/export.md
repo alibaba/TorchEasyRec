@@ -41,5 +41,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间，默认关闭。必须在TorchEasyRec Processor的fg_mode=normal下使用
   - **INPUT_TILE=2**：user侧特征fg仅计算一次
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
+- INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
+  - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
 - ENABLE_AOT:
   - **ENABLE_AOT=1**: 使用AOT(Ahead Of Time)编译优化导出优化的模型(experimental)

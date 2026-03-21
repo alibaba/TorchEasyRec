@@ -1314,9 +1314,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     results[f"{group_name}.sequence_length"] = sequence_length
 
                 if (
-                    int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1
-                    or self._group_to_is_jagged[group_name]
-                ):
+                    int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1 and info.is_user
+                ) or self._group_to_is_jagged[group_name]:
                     seq_t = jt.values()
                 else:
                     seq_t = jt.to_padded_dense(group_sequence_length)
