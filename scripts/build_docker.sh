@@ -3,9 +3,9 @@ set -e
 #!/usr/bin/env bash
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
-REPO_NAME=tzrec-test
+REPO_NAME=tzrec-devel
 DOCKER_TAG=1.1
-DOCKER_TAG_SUFFIX=-u1
+DOCKER_TAG_SUFFIX=
 
 rm -rf docker/requirements*
 cp -r requirements*.txt docker/
