@@ -58,7 +58,8 @@ RUN case ${DEVICE} in \
                  sed -i '/^Requires-Dist: tensorrt</d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch_tensorrt-2.10.0+cu129.dist-info/METADATA && \
                  pip install torchrec==1.5.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 && \
                  pip cache purge ;; \
-        * )      pip install torch==2.10.0 fbgemm-gpu==1.5.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
+        * )      pip install torch==2.10.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
+                 pip install fbgemm-gpu==1.5.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cpu/repo.html && \
                  pip install torchmetrics==1.0.3 tensordict && \
                  pip install torchrec==1.5.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
                  pip cache purge ;; \
