@@ -75,7 +75,7 @@ class RankModel(BaseModel):
         self._num_class = model_config.num_class
         self._label_name = labels[0] if len(labels) > 0 else ""
         self._sample_weight_name = (
-            sample_weights[0] if sample_weights else sample_weights
+            sample_weights[0] if sample_weights else None
         )
         self._loss_collection = OrderedDict()
         self.embedding_group = None
