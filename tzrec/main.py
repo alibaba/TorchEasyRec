@@ -996,7 +996,9 @@ def _write_predictions(
         repeat_offsets = pa.array(
             torch.ops.fbgemm.asynchronous_complete_cumsum(
                 predictions[TARGET_REPEAT_INTERLEAVE_KEY]
-            ).numpy()
+            )
+            .detach()
+            .numpy()
         )
 
     for c in output_cols:
@@ -1005,7 +1007,7 @@ def _write_predictions(
         v = predictions[c]
         if torch.is_floating_point(v):
             v = v.float()
-        v = v.tolist() if v.ndim > 1 else v.numpy()
+        v = v.tolist() if v.ndim > 1 else v.detach().numpy()
         if repeat_offsets is None:
             output_dict[c] = pa.array(v)
         else:
