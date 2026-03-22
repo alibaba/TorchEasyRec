@@ -1198,43 +1198,50 @@ def predict(
     forward_t_list = []
     write_t = None
     i_step = 0
-    while True:
-        try:
-            batch = next(infer_iterator)
+    try:
+        while True:
+            try:
+                batch = next(infer_iterator)
 
-            if i_step == 0:
-                # lazy init writer and create write and forward thread
-                predictions, reserves = _forward(batch)
-                if output_cols is None:
-                    output_cols = sorted(predictions.keys())
-                _write_predictions(writer, predictions, reserves, output_cols)
-                for _ in range(predict_threads):
-                    t = Thread(target=_forward_loop)
-                    t.start()
-                    forward_t_list.append(t)
-                write_t = Thread(target=_write_loop, args=(output_cols,))
-                write_t.start()
-            else:
-                data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
+                if i_step == 0:
+                    # lazy init writer and create write and forward thread
+                    predictions, reserves = _forward(batch)
+                    if output_cols is None:
+                        output_cols = sorted(predictions.keys())
+                    _write_predictions(writer, predictions, reserves, output_cols)
+                    for _ in range(predict_threads):
+                        t = Thread(target=_forward_loop)
+                        t.start()
+                        forward_t_list.append(t)
+                    write_t = Thread(target=_write_loop, args=(output_cols,))
+                    write_t.start()
+                else:
+                    data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
 
-            if is_local_rank_zero:
-                plogger.log(i_step)
-            if is_profiling:
-                prof.step()
-            i_step += 1
-            if predict_steps is not None and i_step >= predict_steps:
+                if is_local_rank_zero:
+                    plogger.log(i_step)
+                if is_profiling:
+                    prof.step()
+                i_step += 1
+                if predict_steps is not None and i_step >= predict_steps:
+                    break
+            except StopIteration:
                 break
-        except StopIteration:
-            break
-
-    for _ in range(predict_threads):
-        data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
-    for t in forward_t_list:
-        t.join()
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+    finally:
+        for _ in range(len(forward_t_list)):
+            try:
+                data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception:
+                pass
+        for t in forward_t_list:
+            t.join()
+        if write_t is not None:
+            try:
+                pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception:
+                pass
+            write_t.join()
+        writer.close()
 
     if is_profiling:
         prof.stop()
