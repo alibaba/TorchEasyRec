@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import os
 from typing import List, Optional, Tuple, Type, cast
@@ -47,6 +48,8 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, DataType
 
 from tzrec.protos import feature_pb2
 
+logger = logging.getLogger(__name__)
+
 has_dynamicemb = False
 try:
     import dynamicemb
@@ -69,8 +72,8 @@ try:
     )
 
     has_dynamicemb = True
-except Exception:
-    pass
+except Exception as e:
+    logger.debug(f"Failed to import dynamicemb: {e}")
 
 
 def _next_power_of_2(n: int) -> int:

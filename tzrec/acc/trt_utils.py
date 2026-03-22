@@ -28,8 +28,8 @@ try:
     import torch_tensorrt
 
     has_tensorrt = True
-except Exception:
-    pass
+except Exception as e:
+    logger.debug(f"Failed to import torch_tensorrt: {e}")
 
 
 def trt_convert(

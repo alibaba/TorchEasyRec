@@ -33,11 +33,15 @@ _warnings.filterwarnings(
 if "OMP_NUM_THREADS" not in _os.environ:
     _os.environ["OMP_NUM_THREADS"] = "1"
 
+import logging as _logging_early  # NOQA
+
+_init_logger = _logging_early.getLogger(__name__)
+
 try:
     # import graphlearn before set GLOG_logtostderr, prevent graphlearn's glog to stderr
     import graphlearn as _gl  # NOQA
-except Exception:
-    pass
+except Exception as _e:
+    _init_logger.debug("Failed to import graphlearn: %s", _e)
 
 # make pyfg's glog to stderr
 if "GLOG_logtostderr" not in _os.environ:
@@ -45,8 +49,8 @@ if "GLOG_logtostderr" not in _os.environ:
 
 try:
     import pyfg as _pyfg  # NOQA
-except Exception:
-    pass
+except Exception as _e:
+    _init_logger.debug("Failed to import pyfg: %s", _e)
 
 import logging as _logging  # NOQA
 import torch as _torch  # NOQA
