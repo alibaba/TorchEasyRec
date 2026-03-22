@@ -15,10 +15,10 @@ pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu126
-pip install fbgemm-gpu==1.4.0 --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129
+pip install fbgemm-gpu==1.5.0 --index-url https://download.pytorch.org/whl/cu129
 pip install torchmetrics==1.0.3 tensordict
-pip install torchrec==1.4.0
+pip install torchrec==1.5.0 --index-url https://download.pytorch.org/whl/cu129
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
@@ -33,7 +33,9 @@ pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyu
 注：
 
 ```
-GPU版本（CUDA 12.6) 镜像地址：
+GPU版本（CUDA 12.9) 镜像地址:
+  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu129
+GPU版本（CUDA 12.6 - 不包含TensorRT) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu126
 CPU版本 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cpu
