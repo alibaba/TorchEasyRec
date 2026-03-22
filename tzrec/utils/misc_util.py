@@ -66,10 +66,9 @@ def run_cmd(cmd_str, log_file, env=None, timeout=None):
 
 def get_free_port(host: str = "127.0.0.1") -> int:
     """Get free port in localhost."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind((host, 0))
-    port = sock.getsockname()[1]
-    sock.close()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        port = sock.getsockname()[1]
     return port
 
 
