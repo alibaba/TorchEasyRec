@@ -507,7 +507,9 @@ class ConvertConfig(object):
                         tmp_fg_json = self.feature_to_fg[input_name]
                         feature.expression.append(tmp_fg_json["expression"])
                     else:
-                        raise ValueError(f"{cfg} input_names:{input_name} not in fg json")
+                        raise ValueError(
+                            f"{cfg} input_names:{input_name} not in fg json"
+                        )
                 feature.embedding_dim = cfg.embedding_dim
                 feature.hash_bucket_size = cfg.hash_bucket_size
                 feature_config.ClearField("feature")
