@@ -996,7 +996,9 @@ def _write_predictions(
         repeat_offsets = pa.array(
             torch.ops.fbgemm.asynchronous_complete_cumsum(
                 predictions[TARGET_REPEAT_INTERLEAVE_KEY]
-            ).detach().numpy()
+            )
+            .detach()
+            .numpy()
         )
 
     for c in output_cols:
