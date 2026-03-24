@@ -35,7 +35,7 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
                 C: dimension (K,1)
                 G: multi loss grad. dimension (K,M)
         """
-        GGT = torch.matmul(G, G.T).detach().data.cpu().numpy()  # (K, K)
+        GGT = torch.matmul(G, G.T).detach().cpu().numpy()  # (K, K)
         e = np.mat(np.ones(np.shape(W)))  # (K, 1)
         m_up = np.hstack((GGT, e))  # (K, K+1)
         m_down = np.hstack(
