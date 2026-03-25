@@ -14,9 +14,12 @@ import os
 from typing import List, Optional, Tuple, Type, cast
 
 import torch
+from torch import distributed as dist
 from torch import nn
+from torchrec.distributed.embedding_kernel import BaseEmbedding
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.planner import (
@@ -39,6 +42,7 @@ from torchrec.distributed.types import (
     ModuleSharder,
     ParameterSharding,
     PipelineType,
+    ShardingEnv,
     ShardingPlan,
     ShardingType,
     ShardMetadata,
@@ -58,10 +62,18 @@ try:
         KVCounter,
         batched_dynamicemb_compute_kernel,
     )
+    from dynamicemb.batched_dynamicemb_compute_kernel import (
+        BatchedDynamicEmbedding,
+        BatchedDynamicEmbeddingBag,
+    )
     from dynamicemb.dynamicemb_config import DynamicEmbKernel
     from dynamicemb.planner import (
         DynamicEmbParameterConstraints,
         DynamicEmbParameterSharding,
+    )
+    from dynamicemb.planner.rw_sharding import (
+        GroupedEmbeddingsLookup,
+        GroupedPooledEmbeddingsLookup,
     )
     from dynamicemb.shard import (
         DynamicEmbeddingBagCollectionSharder,
@@ -653,4 +665,56 @@ if has_dynamicemb:
     # pyre-ignore [9]
     batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table = (
         _get_dynamicemb_options_per_table
+    )
+
+    # Monkey-patch for torchrec 1.5.0 compatibility
+    # The base class now passes 'env' parameter to _create_embedding_kernel
+    def _grouped_embeddings_lookup_create_embedding_kernel(
+        self,  # pyre-ignore [2]
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup],
+        device: Optional[torch.device],
+        env: Optional[ShardingEnv] = None,
+    ) -> BaseEmbedding:
+        """Patched version that accepts env parameter for torchrec 1.5.0."""
+        if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
+            # pyre-ignore [16]
+            return super(GroupedEmbeddingsLookup, self)._create_embedding_kernel(
+                config=config, pg=pg, device=device, env=env
+            )
+        else:
+            self._need_prefetch = True
+            return BatchedDynamicEmbedding(
+                config=config,
+                pg=pg,
+                device=device,
+            )
+
+    GroupedEmbeddingsLookup._create_embedding_kernel = (
+        _grouped_embeddings_lookup_create_embedding_kernel
+    )
+
+    def _grouped_pooled_embeddings_lookup_create_embedding_kernel(
+        self,  # pyre-ignore [2]
+        config: GroupedEmbeddingConfig,
+        device: Optional[torch.device],
+        pg: Optional[dist.ProcessGroup],
+        sharding_type: Optional[ShardingType],
+        env: Optional[ShardingEnv] = None,
+    ) -> BaseEmbedding:
+        """Patched version that accepts env parameter for torchrec 1.5.0."""
+        if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
+            # pyre-ignore [16]
+            return super(GroupedPooledEmbeddingsLookup, self)._create_embedding_kernel(
+                config, device, pg, sharding_type, env
+            )
+        else:
+            return BatchedDynamicEmbeddingBag(
+                config=config,
+                pg=pg,
+                device=device,
+            )
+
+    GroupedPooledEmbeddingsLookup._create_embedding_kernel = (
+        _grouped_pooled_embeddings_lookup_create_embedding_kernel
     )

@@ -20,7 +20,12 @@ import pyfg
 import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
-from tzrec.acc.utils import is_cuda_export, is_input_tile, is_input_tile_emb
+from tzrec.acc.utils import (
+    is_cuda_export,
+    is_input_tile,
+    is_input_tile_3_online,
+    is_input_tile_emb,
+)
 from tzrec.constant import Mode
 from tzrec.datasets.utils import (
     HARD_NEG_INDICES,
@@ -186,20 +191,26 @@ class DataParser:
         """
         output_data = {}
         if is_input_tile():
-            # When making offline predictions, we set the tile_size to 1.
-            # During online serving, we will set the tile_size to batch_size
-            output_data["batch_size"] = torch.tensor(1)
-            # flag = False
-            # for k, v in input_data.items():
-            #     if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
-            #         if k in self.user_feats:
-            #             input_data[k] = v.take([0])
-            #     else:
-            #         if k in self.user_inputs:
-            #             input_data[k] = v.take([0])
-            #     if not flag:
-            #         output_data["batch_size"] = torch.tensor(v.__len__())
-            #         flag = True
+            if is_input_tile_3_online():
+                # When INPUT_TILE_3_ONLINE=1, the sequential tensor (seq_t) is retrieved
+                # via jt.values() rather than jt.to_padded_dense(seq_len) in
+                # embedding.py. Setting tile_size to 1 would result in an incorrect
+                # output shape of [1, sum(seq_len), dim]. so we use v.take([0])
+                # instead of setting tile_size to 1
+                flag = False
+                for k, v in input_data.items():
+                    if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+                        if k in self.user_feats:
+                            input_data[k] = v.take([0])
+                    else:
+                        if k in self.user_inputs:
+                            input_data[k] = v.take([0])
+                    if not flag:
+                        output_data["batch_size"] = torch.tensor(v.__len__())
+                        flag = True
+            else:
+                # For offline predict, len(data) is batch_size, tile_size need set to 1.
+                output_data["batch_size"] = torch.tensor(1)
 
         if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_BUCKETIZE):
             self._parse_feature_fg_handler(input_data, output_data)
