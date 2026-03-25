@@ -129,7 +129,7 @@ def export_model_normal(
         dist.init_process_group("gloo")
 
     # make dataparser to get user feats before create model
-    data_config = pipeline_config.data_config
+    data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model._features)
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
@@ -644,7 +644,7 @@ def export_rtp_model(
         raise ValueError("checkpoint path should be specified.")
 
     # make dataparser to get user feats before create model
-    data_config = pipeline_config.data_config
+    data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model._features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
