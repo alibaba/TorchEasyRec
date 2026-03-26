@@ -1,6 +1,7 @@
-______________________________________________________________________
-
-## allowed-tools: Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:\*) description: Review a pull request
+---
+allowed-tools: Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)
+description: Review a pull request
+---
 
 Perform a comprehensive code review using subagents for key areas:
 
