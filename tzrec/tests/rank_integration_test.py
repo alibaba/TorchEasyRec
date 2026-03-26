@@ -516,7 +516,9 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(input_tile_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2"))
+            os.path.exists(
+                os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2")
+            )
         )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
