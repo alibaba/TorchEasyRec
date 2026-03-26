@@ -60,38 +60,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Verify MCP server prerequisites
-          echo "=== MCP Server Diagnostics ==="
-          which bun && bun --version || echo "WARN: bun not found"
-          which npx && npx --version || echo "WARN: npx not found"
-          ls -la /opt/claude-code-action/src/mcp/github-inline-comment-server.ts 2>&1 || echo "WARN: MCP server file not found"
-          echo "=== End Diagnostics ==="
-
           # MCP config for inline comment server
           MCP_CONFIG_FILE=$(mktemp --suffix=.json)
           trap 'rm -f "$MCP_CONFIG_FILE"' EXIT
-          cat > "$MCP_CONFIG_FILE" <<'MCPJSON'
+          cat > "$MCP_CONFIG_FILE" <<MCPEOF
           {
             "mcpServers": {
               "github_inline_comment": {
-                "command": "npx",
-                "args": ["tsx", "/opt/claude-code-action/src/mcp/github-inline-comment-server.ts"],
+                "command": "bun",
+                "args": ["run", "/opt/claude-code-action/src/mcp/github-inline-comment-server.ts"],
                 "env": {
-                  "GITHUB_TOKEN_PLACEHOLDER": "placeholder",
-                  "REPO_OWNER_PLACEHOLDER": "placeholder",
-                  "REPO_NAME_PLACEHOLDER": "placeholder",
-                  "PR_NUMBER_PLACEHOLDER": "placeholder"
+                  "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+                  "REPO_OWNER": "${REVIEW_OWNER}",
+                  "REPO_NAME": "${REVIEW_REPO_NAME}",
+                  "PR_NUMBER": "${REVIEW_PR_NUM}"
                 }
               }
             }
           }
-          MCPJSON
-          # Replace placeholders with actual values (heredoc is single-quoted to avoid premature expansion)
-          sed -i "s|GITHUB_TOKEN_PLACEHOLDER|${GITHUB_TOKEN}|g" "$MCP_CONFIG_FILE"
-          sed -i "s|REPO_OWNER_PLACEHOLDER|${REVIEW_OWNER}|g" "$MCP_CONFIG_FILE"
-          sed -i "s|REPO_NAME_PLACEHOLDER|${REVIEW_REPO_NAME}|g" "$MCP_CONFIG_FILE"
-          sed -i "s|PR_NUMBER_PLACEHOLDER|${REVIEW_PR_NUM}|g" "$MCP_CONFIG_FILE"
-          echo "MCP config:" && cat "$MCP_CONFIG_FILE"
+          MCPEOF
 
           claude -p \
             --output-format stream-json \
