@@ -6,13 +6,15 @@
 # ---- Runner One-Time Setup ----
 # SSH into tzrec-codereview-runner as the runner user and run:
 #
-#   # Install Claude Code and bun
-#   npm install -g @anthropic-ai/claude-code
-#   npm install -g bun
+#   # Install bun
+#   curl -fsSL https://bun.sh/install | bash
 #
-#   # Clone claude-code-action for MCP inline comment server
+#   # Install Claude Code
+#   curl -fsSL https://claude.ai/install.sh | sh
+#
+#   # Clone claude-code-action and install deps (for MCP inline comment server)
 #   git clone https://github.com/anthropics/claude-code-action.git /opt/claude-code-action
-#   cd /opt/claude-code-action && npm install
+#   cd /opt/claude-code-action && bun install
 #
 #   # Login (stores OAuth credentials for headless use)
 #   claude /login
