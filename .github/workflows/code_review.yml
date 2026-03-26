@@ -18,8 +18,8 @@
 #   # Install Claude Code
 #   curl -fsSL https://claude.ai/install.sh | sh
 #
-#   # Clone claude-code-action and install deps (for MCP inline comment server)
-#   git clone https://github.com/anthropics/claude-code-action.git /opt/claude-code-action
+#   # Clone claude-code-action at pinned version and install deps (for MCP inline comment server)
+#   git clone --branch v1 https://github.com/anthropics/claude-code-action.git /opt/claude-code-action
 #   cd /opt/claude-code-action && bun install
 #
 #   # Configure MCP server for inline PR comments (~/.claude/mcp.json)
