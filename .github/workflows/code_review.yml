@@ -1,7 +1,13 @@
 # Claude Code Review Workflow
 #
-# Triggered when a review is requested on a PR.
+# Triggered by adding the "claude-review" label to a PR.
 # Uses stored OAuth credentials on self-hosted runner (no ANTHROPIC_API_KEY needed).
+#
+# Usage:
+#   1. Contributor opens PR
+#   2. Collaborator adds "claude-review" label when ready for review
+#   3. Workflow triggers, removes the label, runs Claude review
+#   4. Want to re-review after changes? Add the label again
 #
 # ---- Runner One-Time Setup ----
 # SSH into tzrec-codereview-runner as the runner user and run:
@@ -42,8 +48,8 @@
 name: Code Review
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize]
+  pull_request_target:
+    types: [labeled]
 
 concurrency:
   group: codereview-${{ github.event.pull_request.number }}
@@ -51,19 +57,43 @@ concurrency:
 
 jobs:
   review:
+    if: github.event.label.name == 'claude-review'
     runs-on: tzrec-codereview-runner
     timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+      - name: Remove label to allow re-triggering later
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label claude-review
+
+      # Checkout trusted .claude/ files from base branch (not the PR author's code)
+      - name: Checkout trusted agent files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .claude
+          path: trusted-claude
+
+      # Checkout PR code for review
+      - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
+          path: pr-code
+
+      # Copy trusted agent files into PR checkout
+      - name: Use trusted agent files
+        run: cp -r trusted-claude/.claude pr-code/.claude
 
       - name: RunCodeReview
+        working-directory: pr-code
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
