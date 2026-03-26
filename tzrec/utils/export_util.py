@@ -56,6 +56,7 @@ from tzrec.features.feature import (
     create_fg_json,
 )
 from tzrec.modules.utils import BaseModule
+from tzrec.protos.model_pb2 import Kernel
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
@@ -78,9 +79,13 @@ def export_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    hstu_item_id: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = env_util.use_rtp()
+
+    # Get kernel from model_config, default to PYTORCH
+    hstu_kernel = Kernel.Name(pipeline_config.model_config.kernel)
 
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
@@ -97,6 +102,8 @@ def export_model(
         save_dir=local_path,
         assets=assets,
         use_local_cache_dir=use_local_cache_dir,
+        hstu_item_id=hstu_item_id,
+        hstu_kernel=hstu_kernel,
     )
     if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
@@ -111,6 +118,8 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    hstu_item_id: Optional[str] = None,
+    hstu_kernel: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
@@ -230,7 +239,13 @@ def export_model_normal(
         with open(os.path.join(save_dir, "fg.json"), "w") as f:
             json.dump(fg_json, f, indent=4)
         with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(acc_utils.export_acc_config(), f, indent=4)
+            json.dump(
+                acc_utils.export_acc_config(
+                    hstu_item_id=hstu_item_id, hstu_kernel=hstu_kernel
+                ),
+                f,
+                indent=4,
+            )
 
         if assets is not None:
             for asset in assets:
@@ -600,6 +615,7 @@ def export_rtp_model(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
+    hstu_item_id: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""

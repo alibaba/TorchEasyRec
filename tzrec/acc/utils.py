@@ -13,7 +13,7 @@
 import json
 import os
 from typing import Dict
-
+from typing import Optional
 import torch
 
 from tzrec.protos.train_pb2 import TrainConfig
@@ -199,8 +199,15 @@ def write_mapping_file_for_input_tile(
         f.write(remap_str)
 
 
-def export_acc_config() -> Dict[str, str]:
-    """Export acc config for model online inference."""
+def export_acc_config(
+    hstu_item_id: Optional[str] = None, hstu_kernel: Optional[str] = None
+) -> Dict[str, str]:
+    """Export acc config for model online inference.
+
+    Args:
+        hstu_item_id (str, optional): feature name of candidate item id for HSTU model.
+        hstu_kernel (str, optional): kernel type for HSTU model, default is "PYTORCH".
+    """
     # use int64 sparse id as input
     acc_config = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
@@ -213,6 +220,10 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "ENABLE_AOT" in os.environ:
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
+    if hstu_item_id is not None:
+        acc_config["hstu_item_id"] = hstu_item_id
+        # hstu_kernel defaults to "pytorch" if not specified
+        acc_config["hstu_kernel"] = hstu_kernel.lower() if hstu_kernel else "pytorch"
     return acc_config
 
 
