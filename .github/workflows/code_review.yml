@@ -84,5 +84,5 @@ jobs:
             --output-format stream-json \
             --verbose \
             --mcp-config "$MCP_CONFIG_FILE" \
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Read,Grep,Glob,Agent" \
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent" \
             -- "/review-pr REPO: ${REVIEW_REPO} PR_NUMBER: ${REVIEW_PR_NUM}"
