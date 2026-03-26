@@ -28,8 +28,8 @@
 name: Code Review
 
 on:
-  pull_request_target:
-    types: [review_requested]
+  pull_request:
+    types: [opened, reopened, synchronize]
 
 concurrency:
   group: codereview-${{ github.event.pull_request.number }}
