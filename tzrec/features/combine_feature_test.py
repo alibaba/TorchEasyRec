@@ -28,15 +28,7 @@ from tzrec.utils import test_util
 
 
 class CombineFeatureTest(unittest.TestCase):
-    @parameterized.expand(
-        [
-            [["1\x032", "", "3"], [1, 2, 0, 3], [2, 1, 1]],
-            [[1, 2, None, 3], [1, 2, 0, 3], [1, 1, 1, 1]],
-        ]
-    )
-    def test_fg_encoded_combine_feature(
-        self, input_feat, expected_values, expected_lengths
-    ):
+    def test_fg_encoded_combine_feature(self):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
@@ -50,60 +42,68 @@ class CombineFeatureTest(unittest.TestCase):
         self.assertEqual(combine_feat.is_sparse, True)
         self.assertEqual(combine_feat.inputs, ["combine_feat"])
 
-        input_data = {"combine_feat": pa.array(input_feat)}
+        input_data = {"combine_feat": pa.array([1, 2, None, 3])}
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 2, 0, 3]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 1, 1]))
 
-    def test_combine_feature_dense(self):
+    @parameterized.expand(
+        [
+            ["sum"],
+            ["mean"],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_combine_feature_dense(self, combiner):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                fg_encoded_default_value="0",
+                expression="user:combine_input",
+                default_value="0",
+                combiner=combiner,
             )
         )
-        combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
+        combine_feat = combine_feature_lib.CombineFeature(
+            combine_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(combine_feat.output_dim, 1)
         self.assertEqual(combine_feat.is_sparse, False)
-        self.assertEqual(combine_feat.inputs, ["combine_feat"])
+        self.assertEqual(combine_feat.inputs, ["combine_input"])
         self.assertEqual(combine_feat.emb_bag_config, None)
         self.assertEqual(combine_feat.emb_config, None)
 
         input_data = {
-            "combine_feat": pa.array([1.0, 0.0, -1.0, 3.0, None]),
+            "combine_input": pa.array(["1.0\x1d2.0", "3.0", "", None]),
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
-        self.assertTrue(
-            np.allclose(
-                parsed_feat.values, np.array([[1.0], [0.0], [-1.0], [3.0], [0.0]])
-            )
-        )
 
     @parameterized.expand(
         [
-            ["sum", [2, 1, 0, 4], [1, 1, 1, 1]],
-            ["mean", [2, 1, 0, 4], [1, 1, 1, 1]],
+            ["sum"],
+            ["mean"],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_with_boundary(
-        self, combiner, expected_values, expected_lengths
-    ):
+    def test_combine_feature_with_boundary(self, combiner):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
                 boundaries=[-0.5, 0.5, 1.5, 2.5],
                 embedding_dim=16,
-                fg_encoded_default_value="0",
+                expression="user:combine_input",
+                default_value="0",
                 combiner=combiner,
             )
         )
-        combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
+        combine_feat = combine_feature_lib.CombineFeature(
+            combine_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(combine_feat.output_dim, 16)
         self.assertEqual(combine_feat.is_sparse, True)
         self.assertEqual(combine_feat.num_embeddings, 5)
+        self.assertEqual(combine_feat.inputs, ["combine_input"])
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=5,
             embedding_dim=16,
@@ -115,38 +115,37 @@ class CombineFeatureTest(unittest.TestCase):
             repr(combine_feat.emb_bag_config), repr(expected_emb_bag_config)
         )
 
-        # In FG_NONE mode, input is pre-encoded bucket indices
         input_data = {
-            "combine_feat": pa.array([2, 1, 0, 4]),
+            "combine_input": pa.array(["1.0\x1d2.0", "0.0", "", None]),
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [
-            ["sum", [1, 0, 0], [1, 1, 1]],
-            ["mean", [1, 0, 0], [1, 1, 1]],
+            ["sum"],
+            ["mean"],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_with_num_buckets(
-        self, combiner, expected_values, expected_lengths
-    ):
+    def test_combine_feature_with_num_buckets(self, combiner):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
                 num_buckets=10,
                 embedding_dim=16,
-                fg_encoded_default_value="0",
+                expression="user:combine_input",
+                default_value="0",
                 combiner=combiner,
             )
         )
-        combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
+        combine_feat = combine_feature_lib.CombineFeature(
+            combine_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(combine_feat.output_dim, 16)
         self.assertEqual(combine_feat.is_sparse, True)
         self.assertEqual(combine_feat.num_embeddings, 10)
+        self.assertEqual(combine_feat.inputs, ["combine_input"])
         expected_emb_bag_config = EmbeddingBagConfig(
             num_embeddings=10,
             embedding_dim=16,
@@ -159,61 +158,58 @@ class CombineFeatureTest(unittest.TestCase):
         )
 
         input_data = {
-            "combine_feat": pa.array([1, None, None]),
+            "combine_input": pa.array(["1\x1d2", "3", "", None]),
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [
-            ["sum", [1, 0, 0], [1, 1, 1]],
-            ["mean", [1, 0, 0], [1, 1, 1]],
+            ["sum"],
+            ["mean"],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_with_value_map(
-        self, combiner, expected_values, expected_lengths
-    ):
+    def test_combine_feature_with_value_map(self, combiner):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
                 num_buckets=10,
                 embedding_dim=16,
-                fg_encoded_default_value="0",
+                expression="user:combine_input",
+                default_value="0",
                 value_map={"tag1": 1.0, "tag2": 2.0, "tag3": 3.0},
                 combiner=combiner,
             )
         )
-        combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
+        combine_feat = combine_feature_lib.CombineFeature(
+            combine_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
         self.assertEqual(combine_feat.output_dim, 16)
         self.assertEqual(combine_feat.is_sparse, True)
+        self.assertEqual(combine_feat.inputs, ["combine_input"])
 
         input_data = {
-            "combine_feat": pa.array([1, None, None]),
+            "combine_input": pa.array(["tag1\x1dtag2", "tag3", "", None]),
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [
-            ["sum", [1, 0, 0], [1, 1, 1]],
-            ["mean", [1, 0, 0], [1, 1, 1]],
+            ["sum"],
+            ["mean"],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_sequence_combine_feature_with_value_map(
-        self, combiner, expected_values, expected_lengths
-    ):
+    def test_sequence_combine_feature_with_value_map(self, combiner):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
                 num_buckets=10,
                 embedding_dim=16,
-                fg_encoded_default_value="0",
+                expression="user:combine_input",
+                default_value="0",
                 value_map={"tag1": 1.0, "tag2": 2.0},
                 combiner=combiner,
             )
@@ -224,6 +220,7 @@ class CombineFeatureTest(unittest.TestCase):
             sequence_name="click_50_seq",
             sequence_delim=";",
             sequence_length=50,
+            fg_mode=FgMode.FG_NORMAL,
         )
         self.assertEqual(seq_feat.output_dim, 16)
         self.assertEqual(seq_feat.is_sparse, True)
@@ -232,12 +229,10 @@ class CombineFeatureTest(unittest.TestCase):
         self.assertEqual(seq_feat.value_dim, 1)
 
         input_data = {
-            "click_50_seq__combine_feat": pa.array(["1", None, None]),
+            "click_50_seq__combine_input": pa.array(["tag1\x1dtag2;tag1", "tag2", ""]),
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__combine_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [

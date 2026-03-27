@@ -243,6 +243,13 @@ feature_configs {
 
 注意: CombineFeature不支持`hash_bucket_size`、`zch`、`dynamicemb`、`vocab_list`、`vocab_dict`、`vocab_file`配置，仅支持`num_buckets`和`boundaries`两种离散化方式。
 
+**输入示例**
+
+| 字段   | 值              | 说明                                                |
+| ------ | --------------- | --------------------------------------------------- |
+| tag    | "tag1\\x1dtag2" | 多值输入，通过value_map分别映射为1.0和2.0后聚合     |
+| weight | "1.5\\x1d2.5"   | 不使用value_map时，多值连续值输入，通过combiner聚合 |
+
 使用`value_map`和`num_buckets`的离散化用法：
 
 ```
@@ -252,6 +259,7 @@ feature_configs {
         expression: "user:tag"
         embedding_dim: 16
         num_buckets: 100
+        combiner: "sum"
         value_map: [{key:"tag1" value:1.0}, {key:"tag2" value:2.0}]
     }
 }
@@ -262,37 +270,14 @@ feature_configs {
 ```
 feature_configs {
     combine_feature {
-        feature_name: "tag_feat"
-        expression: "user:tag"
+        feature_name: "weight_list"
+        expression: "user:weight"
         boundaries: [0.1, 0.5, 1.0, 2.0, 5.0]
         embedding_dim: 8
+        combiner: "sum"
     }
 }
 ```
-
-序列特征用法：
-
-```
-feature_configs {
-    sequence_combine_feature {
-        feature_name: "event_list"
-        expression: "user:event"
-        embedding_dim: 16
-        num_buckets: 100
-        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
-        sequence_length: 50
-        sequence_delim: ";"
-    }
-}
-```
-
-**输入示例**
-
-| 字段 | 值     | 说明                                  |
-| ---- | ------ | ------------------------------------- |
-| tag  | "tag1" | 单值输入，通过value_map映射为1.0      |
-| tag  | "tag2" | 单值输入，通过value_map映射为2.0      |
-| tag  | 3.14   | 不使用value_map时，直接作为连续值输入 |
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 - **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
@@ -300,16 +285,6 @@ feature_configs {
 - **num_buckets**: 离散化桶数量，仅当输入是integer类型时使用
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
 - **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
-
-如果输出为离散值（设置了`num_buckets`或`boundaries`），可设置:
-
-- 其余配置同IdFeature
-
-如果输出为连续值，可设置:
-
-- 其余配置同RawFeature
-
-NOTE: `num_buckets`和`boundaries`只能指定其中之一，不支持`hash_bucket_size`、`vocab_list`、`vocab_dict`、`vocab_file`、`zch`、`dynamicemb`
 
 ## LookupFeature: 字典查询特征
 
@@ -760,6 +735,16 @@ feature_configs {
                 boundaries: [0, 1, 2, 3, 4]
             }
         }
+        features {
+            combine_feature {
+                feature_name: "event_type"
+                expression: "user:event"
+                embedding_dim: 16
+                num_buckets: 10
+                combiner: "sum"
+                value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+            }
+        }
     }
 }
 ```
@@ -840,6 +825,18 @@ feature_configs {
                 }
             }
         }
+    }
+}
+feature_configs {
+    sequence_combine_feature {
+        feature_name: "event_list"
+        expression: "user:event"
+        embedding_dim: 16
+        num_buckets: 10
+        combiner: "sum"
+        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+        sequence_length: 50
+        sequence_delim: ";"
     }
 }
 ```
