@@ -30,5 +30,6 @@ repos:
     rev: 0.7.22
     hooks:
     - id: mdformat
+      exclude: ^\.claude/
       additional_dependencies:
       - mdformat-tables
