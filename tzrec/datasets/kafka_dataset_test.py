@@ -25,12 +25,48 @@ from confluent_kafka import Producer
 from parameterized import parameterized
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.kafka_dataset import KafkaDataset
+from tzrec.datasets.kafka_dataset import KafkaDataset, _parse_kafka_uri
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
+
+
+class ParseKafkaUriTest(unittest.TestCase):
+    """Unit tests for _parse_kafka_uri."""
+
+    def test_parse_without_start_timestamp(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&auto.offset.reset=earliest"
+        topic, params, start_ts = _parse_kafka_uri(uri)
+        self.assertEqual(topic, "topic")
+        self.assertEqual(params["bootstrap.servers"], "broker:9092")
+        self.assertEqual(params["group.id"], "g1")
+        self.assertIsNone(start_ts)
+        self.assertNotIn("start.timestamp.ms", params)
+
+    def test_parse_with_start_timestamp(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=1711929600000"
+        topic, params, start_ts = _parse_kafka_uri(uri)
+        self.assertEqual(topic, "topic")
+        self.assertEqual(start_ts, 1711929600000)
+        # start.timestamp.ms should be removed from consumer params
+        self.assertNotIn("start.timestamp.ms", params)
+
+    def test_parse_with_zero_timestamp(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=0"
+        _, _, start_ts = _parse_kafka_uri(uri)
+        self.assertEqual(start_ts, 0)
+
+    def test_parse_with_negative_timestamp_raises(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=-1"
+        with self.assertRaises(ValueError):
+            _parse_kafka_uri(uri)
+
+    def test_parse_with_non_integer_timestamp_raises(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=abc"
+        with self.assertRaises(ValueError):
+            _parse_kafka_uri(uri)
 
 
 class KafkaDatasetTest(unittest.TestCase):
@@ -128,6 +164,7 @@ class KafkaDatasetTest(unittest.TestCase):
             else:
                 value = record_batch.serialize()
             producer.produce(topic=self.test_topic, value=value)
+        producer.flush()
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -349,6 +386,82 @@ class KafkaDatasetTest(unittest.TestCase):
                 # New offset should be less than or equal to acc checkpoint offset
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
+
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_kafka_dataset_start_timestamp(self):
+        """Test that start.timestamp.ms skips messages produced before the timestamp."""
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        # Record the timestamp (ms) after the first batch of messages is produced
+        # by _create_test_table_and_feature_cfgs, then produce a second batch.
+        # The start timestamp should cause the consumer to skip the first batch.
+        start_ts_ms = int(time.time() * 1000)
+        time.sleep(2)
+
+        # Produce a second batch of messages after the timestamp boundary
+        config = {"bootstrap.servers": self.brokers}
+        producer = Producer(config)
+        second_batch_count = 100
+        for _ in range(second_batch_count):
+            record_batch = pa.record_batch(
+                {
+                    "unused": pa.array(["unused"] * 128, type=pa.string()),
+                    "id_a": pa.array(["1"] * 128, type=pa.string()),
+                    "tag_b": pa.array(["2\x1d3"] * 128, type=pa.string()),
+                    "raw_c": pa.array([4] * 128, type=pa.int64()),
+                    "raw_d": pa.array([5.0] * 128, type=pa.float64()),
+                    "raw_e": pa.array([3] * 128, type=pa.int32()),
+                    "raw_f": pa.array([4.0] * 128, type=pa.float32()),
+                    "raw_g": pa.array(
+                        [[1.0, 2.0, 3.0]] * 128, type=pa.list_(pa.float32())
+                    ),
+                    "map_h": pa.array(
+                        [{"1": 1, "2": 2}] * 128,
+                        type=pa.map_(pa.string(), pa.int64()),
+                    ),
+                    "label": pa.array([1] * 128, type=pa.int64()),
+                }
+            )
+            producer.produce(topic=self.test_topic, value=record_batch.serialize())
+        producer.flush()
+
+        # Use start.timestamp.ms to skip the first batch of 10000 messages
+        dataset = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id=tzrec_test_group"
+                f"&auto.offset.reset=earliest"
+                f"&start.timestamp.ms={start_ts_ms}"
+            ),
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # Verify labels are from the second batch (label=1, not label=0).
+        # The first batch produced by _create_test_table_and_feature_cfgs uses
+        # label=0, and the second batch produced above uses label=1.
+        data_dict = batch.to_dict()
+        labels = data_dict["label"]
+        for label in labels:
+            self.assertEqual(label, 1)
 
 
 if __name__ == "__main__":
