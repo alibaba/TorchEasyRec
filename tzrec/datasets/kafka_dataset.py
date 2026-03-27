@@ -81,6 +81,8 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
 
     if "debug" not in params:
         params["debug"] = "assignor,conf"
+    if "enable.auto.commit" not in params:
+        params["enable.auto.commit"] = "false"
     params["bootstrap.servers"] = broker
 
     return topic, params, start_timestamp_ms
@@ -258,10 +260,6 @@ class KafkaReader(BaseReader):
                     tp.offset = self._checkpoint_state[source_key] + 1
                 elif start_timestamp_ms is not None:
                     ts_partitions.append(tp)
-                elif self._checkpoint_state:
-                    # Resume mode but partition not yet in checkpoint,
-                    # start from beginning to avoid using committed offsets
-                    tp.offset = 0
                 else:
                     tp.offset = OFFSET_INVALID
 
