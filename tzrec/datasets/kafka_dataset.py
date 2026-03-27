@@ -254,7 +254,7 @@ class KafkaReader(BaseReader):
                 elif start_timestamp_ms is not None:
                     ts_partitions.append(tp)
                 else:
-                    tp.offset = 0
+                    tp.offset = -1001  # OFFSET_INVALID
 
             if ts_partitions:
                 for tp in ts_partitions:
