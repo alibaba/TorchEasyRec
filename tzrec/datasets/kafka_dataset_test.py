@@ -164,6 +164,7 @@ class KafkaDatasetTest(unittest.TestCase):
             else:
                 value = record_batch.serialize()
             producer.produce(topic=self.test_topic, value=value)
+        producer.flush()
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
