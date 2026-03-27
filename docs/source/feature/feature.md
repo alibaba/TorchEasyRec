@@ -1,6 +1,6 @@
 # 特征
 
-TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、CustomFeature、SequenceFeature。
+TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、CombineFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、CustomFeature、SequenceFeature。
 
 **共用配置**
 
@@ -236,6 +236,44 @@ feature_configs {
 
 - expression: 特征FG所依赖组合字段的来源，数量 >= 2
 - 其余配置同IdFeature，NOTE: ComboFeature不包含`num_buckets`配置
+
+## CombineFeature: 组合映射特征
+
+通过`value_map`映射输入值到浮点值，支持离散（sparse）和连续（dense）两种输出模式。当设置了`boundaries`、`hash_bucket_size`、`vocab_list`等分箱配置时为离散输出，否则为连续输出。
+
+```
+feature_configs {
+    combine_feature {
+        feature_name: "user_combine"
+        expression: "user:uid"
+        embedding_dim: 16
+        hash_bucket_size: 1000
+        value_map: [{key:"ua" value:1.0}, {key:"ub" value:2.0}]
+    }
+}
+```
+
+序列特征用法：
+
+```
+feature_configs {
+    sequence_combine_feature {
+        feature_name: "seq_combine"
+        expression: "user:uid"
+        embedding_dim: 16
+        hash_bucket_size: 1000
+        value_map: [{key:"ua" value:1.0}, {key:"ub" value:2.0}]
+        sequence_length: 50
+        sequence_delim: ";"
+    }
+}
+```
+
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
+- **value_map**: 输入值到浮点值的映射，与其他分箱方式（如`hash_bucket_size`）配合使用
+- **boundaries**: 分箱/分桶的边界值
+- **normalizer**: 连续值变换方式，同RawFeature
+- 其余配置同MatchFeature
 
 ## LookupFeature: 字典查询特征
 
