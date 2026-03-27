@@ -1,7 +1,55 @@
+# Claude Code Review Workflow
+#
+# Triggered by adding the "claude-review" label to a PR.
+# Uses stored OAuth credentials on self-hosted runner (no ANTHROPIC_API_KEY needed).
+#
+# Usage:
+#   1. Contributor opens PR
+#   2. Collaborator adds "claude-review" label when ready for review
+#   3. Workflow triggers, removes the label, runs Claude review
+#   4. Want to re-review after changes? Add the label again
+#
+# ---- Runner One-Time Setup ----
+# SSH into tzrec-codereview-runner as the runner user and run:
+#
+#   # Install bun
+#   curl -fsSL https://bun.sh/install | bash
+#
+#   # Install Claude Code
+#   curl -fsSL https://claude.ai/install.sh | sh
+#
+#   # Clone claude-code-action at pinned version and install deps (for MCP inline comment server)
+#   git clone --branch v1 https://github.com/anthropics/claude-code-action.git /opt/claude-code-action
+#   cd /opt/claude-code-action && bun install
+#
+#   # Configure MCP server for inline PR comments (~/.claude/mcp.json)
+#   mkdir -p ~/.claude && cat > ~/.claude/mcp.json << 'EOF'
+#   {
+#     "mcpServers": {
+#       "github_inline_comment": {
+#         "command": "bun",
+#         "args": ["run", "/opt/claude-code-action/src/mcp/github-inline-comment-server.ts"]
+#       }
+#     }
+#   }
+#   EOF
+#
+#   # Login (stores OAuth credentials for headless use)
+#   claude /login
+#
+#   # Verify headless mode works without API key
+#   unset ANTHROPIC_API_KEY && unset ANTHROPIC_BASE_URL
+#   claude -p "Say hello"
+#
+# If auth fails after a long period, re-run `claude /login` on the runner.
+# Do NOT use --bare flag — it disables OAuth/keychain reads.
+# ---- End Setup ----
+
 name: Code Review
+
 on:
   pull_request_target:
-    types: [review_requested]
+    types: [labeled]
 
 concurrency:
   group: codereview-${{ github.event.pull_request.number }}
@@ -9,68 +57,63 @@ concurrency:
 
 jobs:
   review:
+    if: github.event.label.name == 'claude-review'
     runs-on: tzrec-codereview-runner
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+      - name: Remove label to allow re-triggering later
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label claude-review
+
+      # Checkout trusted .claude/ files from base branch (not the PR author's code)
+      - name: Checkout trusted agent files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .claude
+          path: trusted-claude
+
+      # Checkout PR code for review
+      - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
+          path: pr-code
+
+      # Copy trusted agent files into PR checkout
+      - name: Use trusted agent files
+        run: cp -r trusted-claude/.claude pr-code/.claude
 
       - name: RunCodeReview
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
-
-            **CRITICAL RESTRICTIONS:**
-            1. **NO POSITIVE COMMENTS OR PRAISE:** Only identify problems and issues
-            2. **NO CODE EXECUTION:** Rely exclusively on reading file contents and static analysis. You cannot run `python`, `bash`, or any shell commands other than `gh` tools. Do not attempt to verify code by executing it.
-            3. **ONLY COMMENT ON CHANGED LINES:** When creating inline comments, you MUST only comment on lines that are part of the actual diff. Use `gh pr diff` to identify the exact lines that changed before creating comments.
-
-            Perform a comprehensive code review focusing exclusively on identifying problems:
-
-            1. **Code Quality Issues**
-               - Violations of clean code principles and best practices
-               - Missing or inadequate error handling
-               - Unhandled edge cases
-               - Poor code readability or maintainability problems
-
-            2. **Security Vulnerabilities**
-               - Potential security risks
-               - Inadequate input sanitization
-               - Authentication/authorization flaws
-               - Data exposure risks
-
-            3. **Performance Problems**
-               - Performance bottlenecks
-               - Inefficient database queries
-               - Memory leaks or resource management issues
-               - Suboptimal algorithms
-
-            4. **Testing Deficiencies**
-               - Inadequate test coverage
-               - Poor test quality
-               - Missing test scenarios
-               - Flaky or unreliable tests
-
-            5. **Documentation Gaps**
-               - Missing or inaccurate code documentation
-               - Incomplete README updates for new features
-               - Incomplete documentation updates in docs/source directory for new features
-
-            Provide detailed feedback using inline comments for specific issues.
-            Use top-level comments for general problem observations.
-
-          claude_args: |
-            --model ${{ secrets.ANTHROPIC_MODEL }}
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
-          show_full_output: true
+        working-directory: pr-code
         env:
-          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # No ANTHROPIC_API_KEY — uses stored OAuth from `claude /login` on the runner
+          # MCP server inherits env vars (GITHUB_TOKEN, REPO_OWNER, REPO_NAME, PR_NUMBER)
+        run: |
+          set -euo pipefail
+
+          # Resolve full bun path (bun installed to ~/.bun/bin/ — not in Claude's subprocess PATH)
+          BUN_PATH="$(which bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
+          echo "bun path: $BUN_PATH ($("$BUN_PATH" --version))"
+
+          MCP_CONFIG="{\"mcpServers\":{\"github_inline_comment\":{\"command\":\"${BUN_PATH}\",\"args\":[\"run\",\"/opt/claude-code-action/src/mcp/github-inline-comment-server.ts\"]}}}"
+
+          claude -p \
+            --output-format stream-json \
+            --verbose \
+            --mcp-config "$MCP_CONFIG" \
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent" \
+            -- "/review-pr REPO: ${{ github.repository }} PR_NUMBER: ${PR_NUMBER}"
