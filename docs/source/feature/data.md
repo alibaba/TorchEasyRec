@@ -105,6 +105,8 @@ data_config {
 
   - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
   - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
+  - 支持`start.timestamp.ms`参数，指定从某个时间戳（毫秒）开始消费，消费者会从各分区中时间戳 >= 该值的最早offset开始读取。当同时存在checkpoint时，checkpoint优先级更高。示例:
+    - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest&start.timestamp.ms=1711929600000`
 
 - 注意:
 
