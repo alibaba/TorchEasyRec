@@ -25,12 +25,43 @@ from confluent_kafka import Producer
 from parameterized import parameterized
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.kafka_dataset import KafkaDataset
+from tzrec.datasets.kafka_dataset import KafkaDataset, _parse_kafka_uri
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
+
+
+class ParseKafkaUriTest(unittest.TestCase):
+    """Unit tests for _parse_kafka_uri."""
+
+    def test_parse_without_start_timestamp(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&auto.offset.reset=earliest"
+        topic, params, start_ts = _parse_kafka_uri(uri)
+        self.assertEqual(topic, "topic")
+        self.assertEqual(params["bootstrap.servers"], "broker:9092")
+        self.assertEqual(params["group.id"], "g1")
+        self.assertIsNone(start_ts)
+        self.assertNotIn("start.timestamp.ms", params)
+
+    def test_parse_with_start_timestamp(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=1711929600000"
+        topic, params, start_ts = _parse_kafka_uri(uri)
+        self.assertEqual(topic, "topic")
+        self.assertEqual(start_ts, 1711929600000)
+        # start.timestamp.ms should be removed from consumer params
+        self.assertNotIn("start.timestamp.ms", params)
+
+    def test_parse_with_zero_timestamp(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=0"
+        _, _, start_ts = _parse_kafka_uri(uri)
+        self.assertEqual(start_ts, 0)
+
+    def test_parse_with_negative_timestamp_raises(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=-1"
+        with self.assertRaises(ValueError):
+            _parse_kafka_uri(uri)
 
 
 class KafkaDatasetTest(unittest.TestCase):
