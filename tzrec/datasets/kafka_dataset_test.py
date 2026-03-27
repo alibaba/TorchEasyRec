@@ -454,21 +454,13 @@ class KafkaDatasetTest(unittest.TestCase):
         iterator = iter(dataloader)
         batch = next(iterator)
 
-        # Verify we got data (the consumer started successfully)
-        self.assertIsNotNone(batch)
-        self.assertIsNotNone(batch.checkpoint_info)
-        self.assertGreater(len(batch.checkpoint_info), 0)
-
-        # The offsets from start.timestamp.ms should skip the first 10000 messages.
-        # With 4 partitions and 10000 messages, each partition has ~2500 messages
-        # (offsets 0..~2499). The start timestamp consumer should begin at or after
-        # offset ~2500 on each partition.
-        for key, offset in batch.checkpoint_info.items():
-            topic_part, partition_str = key.rsplit(":", 1)
-            self.assertEqual(topic_part, self.test_topic)
-            # The offset should be beyond the first batch (10000 msgs / 4 partitions)
-            # Use a conservative threshold to account for uneven distribution
-            self.assertGreaterEqual(offset, 1000)
+        # Verify labels are from the second batch (label=1, not label=0).
+        # The first batch produced by _create_test_table_and_feature_cfgs uses
+        # label=0, and the second batch produced above uses label=1.
+        data_dict = batch.to_dict()
+        labels = data_dict["label"]
+        for label in labels:
+            self.assertEqual(label, 1)
 
 
 if __name__ == "__main__":

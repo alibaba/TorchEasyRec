@@ -265,9 +265,11 @@ class KafkaReader(BaseReader):
                 for tp in ts_partitions:
                     tp.offset = start_timestamp_ms
                 resolved = consumer.offsets_for_times(ts_partitions, timeout=30.0)
-                for tp, resolved_tp in zip(ts_partitions, resolved):
-                    if resolved_tp.offset >= 0:
-                        tp.offset = resolved_tp.offset
+                resolved_map = {(r.topic, r.partition): r.offset for r in resolved}
+                for tp in ts_partitions:
+                    res_offset = resolved_map.get((tp.topic, tp.partition))
+                    if res_offset is not None and res_offset >= 0:
+                        tp.offset = res_offset
                     else:
                         logger.warning(
                             f"No offset found for timestamp "
