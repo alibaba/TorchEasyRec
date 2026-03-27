@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import OFFSET_INVALID, Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
@@ -70,7 +70,12 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
     start_timestamp_ms: Optional[int] = None
     raw_ts = params.pop("start.timestamp.ms", None)
     if raw_ts is not None:
-        start_timestamp_ms = int(raw_ts)
+        try:
+            start_timestamp_ms = int(raw_ts)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"start.timestamp.ms must be a valid integer, got: {raw_ts!r}"
+            ) from e
         if start_timestamp_ms < 0:
             raise ValueError("start.timestamp.ms must be a non-negative integer")
 
@@ -254,26 +259,23 @@ class KafkaReader(BaseReader):
                 elif start_timestamp_ms is not None:
                     ts_partitions.append(tp)
                 else:
-                    tp.offset = -1001  # OFFSET_INVALID
+                    tp.offset = OFFSET_INVALID
 
             if ts_partitions:
                 for tp in ts_partitions:
                     tp.offset = start_timestamp_ms
                 resolved = consumer.offsets_for_times(ts_partitions, timeout=30.0)
-                resolved_map = {(r.topic, r.partition): r.offset for r in resolved}
-                for tp in partitions:
-                    key = (tp.topic, tp.partition)
-                    if key in resolved_map:
-                        if resolved_map[key] >= 0:
-                            tp.offset = resolved_map[key]
-                        else:
-                            logger.warning(
-                                f"No offset found for timestamp "
-                                f"{start_timestamp_ms} on "
-                                f"{tp.topic}:{tp.partition}, "
-                                f"falling back to auto.offset.reset"
-                            )
-                            tp.offset = -1001  # OFFSET_INVALID
+                for tp, resolved_tp in zip(ts_partitions, resolved):
+                    if resolved_tp.offset >= 0:
+                        tp.offset = resolved_tp.offset
+                    else:
+                        logger.warning(
+                            f"No offset found for timestamp "
+                            f"{start_timestamp_ms} on "
+                            f"{tp.topic}:{tp.partition}, "
+                            f"falling back to auto.offset.reset"
+                        )
+                        tp.offset = OFFSET_INVALID
 
             consumer.assign(partitions)
             logger.info(

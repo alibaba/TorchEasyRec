@@ -63,6 +63,11 @@ class ParseKafkaUriTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_kafka_uri(uri)
 
+    def test_parse_with_non_integer_timestamp_raises(self):
+        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=abc"
+        with self.assertRaises(ValueError):
+            _parse_kafka_uri(uri)
+
 
 class KafkaDatasetTest(unittest.TestCase):
     def setUp(self):
