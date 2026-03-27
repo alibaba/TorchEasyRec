@@ -386,6 +386,90 @@ class KafkaDatasetTest(unittest.TestCase):
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_kafka_dataset_start_timestamp(self):
+        """Test that start.timestamp.ms skips messages produced before the timestamp."""
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        # Record the timestamp (ms) after the first batch of messages is produced
+        # by _create_test_table_and_feature_cfgs, then produce a second batch.
+        # The start timestamp should cause the consumer to skip the first batch.
+        start_ts_ms = int(time.time() * 1000)
+        time.sleep(2)
+
+        # Produce a second batch of messages after the timestamp boundary
+        config = {"bootstrap.servers": self.brokers}
+        producer = Producer(config)
+        second_batch_count = 100
+        for _ in range(second_batch_count):
+            record_batch = pa.record_batch(
+                {
+                    "unused": pa.array(["unused"] * 128, type=pa.string()),
+                    "id_a": pa.array(["1"] * 128, type=pa.string()),
+                    "tag_b": pa.array(["2\x1d3"] * 128, type=pa.string()),
+                    "raw_c": pa.array([4] * 128, type=pa.int64()),
+                    "raw_d": pa.array([5.0] * 128, type=pa.float64()),
+                    "raw_e": pa.array([3] * 128, type=pa.int32()),
+                    "raw_f": pa.array([4.0] * 128, type=pa.float32()),
+                    "raw_g": pa.array(
+                        [[1.0, 2.0, 3.0]] * 128, type=pa.list_(pa.float32())
+                    ),
+                    "map_h": pa.array(
+                        [{"1": 1, "2": 2}] * 128,
+                        type=pa.map_(pa.string(), pa.int64()),
+                    ),
+                    "label": pa.array([1] * 128, type=pa.int64()),
+                }
+            )
+            producer.produce(topic=self.test_topic, value=record_batch.serialize())
+        producer.flush()
+
+        # Use start.timestamp.ms to skip the first batch of 10000 messages
+        dataset = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id=tzrec_test_group"
+                f"&auto.offset.reset=earliest"
+                f"&start.timestamp.ms={start_ts_ms}"
+            ),
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # Verify we got data (the consumer started successfully)
+        self.assertIsNotNone(batch)
+        self.assertIsNotNone(batch.checkpoint_info)
+        self.assertGreater(len(batch.checkpoint_info), 0)
+
+        # The offsets from start.timestamp.ms should skip the first 10000 messages.
+        # With 4 partitions and 10000 messages, each partition has ~2500 messages
+        # (offsets 0..~2499). The start timestamp consumer should begin at or after
+        # offset ~2500 on each partition.
+        for key, offset in batch.checkpoint_info.items():
+            topic_part, partition_str = key.rsplit(":", 1)
+            self.assertEqual(topic_part, self.test_topic)
+            # The offset should be beyond the first batch (10000 msgs / 4 partitions)
+            # Use a conservative threshold to account for uneven distribution
+            self.assertGreaterEqual(offset, 1000)
+
 
 if __name__ == "__main__":
     unittest.main()
