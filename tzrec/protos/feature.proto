@@ -301,26 +301,20 @@ message ComboFeature {
 }
 
 message CombineFeature {
-    // feature name, e.g. user_item_combine
+    // feature name, e.g. tag_feat
     required string feature_name = 1;
-    // feature input, e.g. user:uid
+    // feature input, e.g. user:tag
     required string expression = 2;
     // embedding name, feature with same embedding name will share embedding
     optional string embedding_name = 3;
     // embedding dimension
     optional uint32 embedding_dim = 4;
-    // number of hash size for sparse combine value
-    optional uint64 hash_bucket_size = 5;
-    // value map for mapping input values to float values
+    // value map for mapping input string values to float values
     map<string, float> value_map = 6;
     // boundaries for bucktize numeric combine value
     repeated float boundaries = 7;
     // number of id enumerators for sparse combine value
     optional uint64 num_buckets = 8;
-    // id vocabulary list for sparse combine value
-    repeated string vocab_list = 9;
-    // id vocabulary dict
-    map<string, uint64> vocab_dict = 10;
     // embedding pooling type, available is {sum | mean}
     optional string pooling = 11 [default = "sum"];
     // fg default value, default value before bucktize
@@ -337,26 +331,11 @@ message CombineFeature {
     optional string init_fn = 15;
     // mask value in training progress
     optional bool use_mask = 16;
-    // zero collision hash
-    optional ZeroCollisionHash zch = 17;
-    // id vocabulary file path
-    optional string vocab_file = 18;
-    // vocab file relative directory
-    optional string asset_dir = 19;
-    // dynamic embedding
-    optional DynamicEmbedding dynamicemb = 20;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
-    // out-of-vocab(OOV) id bucketize value when use vocab_list or vocab_dict
-    // when use default_bucketize_value, we will not add additional bucketize_value of
-    // `default_value`=0, bucketize_value of <OOV>=1 into vocab_list or vocab_dict
-    optional uint64 default_bucketize_value = 31;
-    // value_type after fg before bucketize, you can specify it for better performance.
-    // e.g. fg_value_type = int64 when use num_buckets
-    optional string fg_value_type = 32;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
     // only used as fg dag intermediate result or not

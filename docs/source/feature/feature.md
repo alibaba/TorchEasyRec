@@ -239,16 +239,33 @@ feature_configs {
 
 ## CombineFeature: 组合映射特征
 
-通过`value_map`映射输入值到浮点值，支持离散（sparse）和连续（dense）两种输出模式。当设置了`boundaries`、`hash_bucket_size`、`vocab_list`等分箱配置时为离散输出，否则为连续输出。
+通过`value_map`映射输入值到浮点值，支持离散（sparse）和连续（dense）两种输出模式。当设置了`boundaries`或`num_buckets`分箱配置时为离散输出，否则为连续输出。
+
+注意: CombineFeature不支持`hash_bucket_size`、`zch`、`dynamicemb`、`vocab_list`、`vocab_dict`、`vocab_file`配置，仅支持`num_buckets`和`boundaries`两种离散化方式。
+
+使用`value_map`和`num_buckets`的离散化用法：
 
 ```
 feature_configs {
     combine_feature {
-        feature_name: "user_combine"
-        expression: "user:uid"
+        feature_name: "tag_feat"
+        expression: "user:tag"
         embedding_dim: 16
-        hash_bucket_size: 1000
-        value_map: [{key:"ua" value:1.0}, {key:"ub" value:2.0}]
+        num_buckets: 100
+        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+    }
+}
+```
+
+不使用`value_map`的连续值用法：
+
+```
+feature_configs {
+    combine_feature {
+        feature_name: "tag_feat"
+        expression: "user:tag"
+        boundaries: [0.1, 0.5, 1.0, 2.0, 5.0]
+        embedding_dim: 8
     }
 }
 ```
@@ -258,22 +275,44 @@ feature_configs {
 ```
 feature_configs {
     sequence_combine_feature {
-        feature_name: "seq_combine"
-        expression: "user:uid"
+        feature_name: "event_list"
+        expression: "user:event"
         embedding_dim: 16
-        hash_bucket_size: 1000
-        value_map: [{key:"ua" value:1.0}, {key:"ub" value:2.0}]
+        num_buckets: 100
+        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
         sequence_length: 50
         sequence_delim: ";"
     }
 }
 ```
 
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- **value_map**: 输入值到浮点值的映射，与其他分箱方式（如`hash_bucket_size`）配合使用
-- **boundaries**: 分箱/分桶的边界值
-- **normalizer**: 连续值变换方式，同RawFeature
-- 其余配置同MatchFeature
+**输入示例**
+
+| 字段 | 值      | 说明                                  |
+| ---- | ------- | ------------------------------------- |
+| tag  | "click" | 单值输入，通过value_map映射为1.0      |
+| tag  | "buy"   | 单值输入，通过value_map映射为2.0      |
+| tag  | 3.14    | 不使用value_map时，直接作为连续值输入 |
+
+**配置说明**
+
+- **feature_name**: 特征名/特征输出名
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为\[`user`, `item`, `context`, `feature`, `const`\]
+- **embedding_dim**: 特征嵌入维度，离散化模式下必填
+- **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
+- **num_buckets**: 离散化桶数量，仅当输入是integer类型时使用
+- **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
+- **pooling**: 多值特征嵌入池化方式，默认为`sum`，可以选`sum`/`mean`
+- **default_value**: 特征默认值，默认为空字符串
+- **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`
+- **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
+- **embedding_name**: 特征嵌入名，如需两个特征共享嵌入，可将嵌入名设置相同
+- **init_fn**: 特征嵌入初始化方式，如`nn.init.uniform_,a=-0.01,b=0.01`
+- **trainable**: Embedding Variable是否可训练，默认为true
+- **fg_encoded_default_value**: FG编码后数据的默认值，当fg_mode=FG_NONE时可以设置
+- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度
+- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
+- NOTE: `num_buckets`和`boundaries`只能指定其中之一
 
 ## LookupFeature: 字典查询特征
 

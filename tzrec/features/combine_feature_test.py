@@ -89,11 +89,11 @@ class CombineFeatureTest(unittest.TestCase):
             repr(combine_feat.emb_bag_config), repr(expected_emb_bag_config)
         )
 
-    def test_combine_feature_with_hash_bucket_size(self):
+    def test_combine_feature_with_num_buckets(self):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                hash_bucket_size=100,
+                num_buckets=100,
                 embedding_dim=16,
                 expression="user:combine_input",
                 default_value="0",
@@ -114,15 +114,19 @@ class CombineFeatureTest(unittest.TestCase):
             repr(combine_feat.emb_bag_config), repr(expected_emb_bag_config)
         )
 
+        # Verify fg_json value_type is int64 for num_buckets
+        fg_jsons = combine_feat._fg_json()
+        self.assertEqual(fg_jsons[0]["value_type"], "int64")
+
     def test_combine_feature_with_value_map(self):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                hash_bucket_size=100,
+                num_buckets=100,
                 embedding_dim=16,
                 expression="user:combine_input",
                 default_value="0",
-                value_map={"ua": 1.0, "ub": 2.0, "uc": 3.0},
+                value_map={"click": 1.0, "buy": 2.0, "cart": 3.0},
             )
         )
         combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
@@ -133,18 +137,21 @@ class CombineFeatureTest(unittest.TestCase):
         fg_jsons = combine_feat._fg_json()
         self.assertEqual(fg_jsons[0]["feature_type"], "combine_feature")
         self.assertIn("value_map", fg_jsons[0])
-        self.assertEqual(fg_jsons[0]["value_map"], {"ua": 1.0, "ub": 2.0, "uc": 3.0})
-        self.assertEqual(fg_jsons[0]["hash_bucket_size"], 100)
+        self.assertEqual(
+            fg_jsons[0]["value_map"], {"click": 1.0, "buy": 2.0, "cart": 3.0}
+        )
+        self.assertEqual(fg_jsons[0]["num_buckets"], 100)
+        self.assertEqual(fg_jsons[0]["value_type"], "int64")
 
     def test_sequence_combine_feature_with_value_map(self):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                hash_bucket_size=100,
+                num_buckets=100,
                 embedding_dim=16,
                 expression="user:combine_input",
                 default_value="0",
-                value_map={"ua": 1.0, "ub": 2.0},
+                value_map={"click": 1.0, "buy": 2.0},
             )
         )
         seq_feat = combine_feature_lib.CombineFeature(
@@ -164,7 +171,7 @@ class CombineFeatureTest(unittest.TestCase):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                hash_bucket_size=100,
+                num_buckets=100,
                 embedding_dim=16,
                 expression="user:combine_input",
                 default_value="0",
@@ -179,16 +186,16 @@ class CombineFeatureTest(unittest.TestCase):
         self.assertEqual(fg_cfg["feature_type"], "combine_feature")
         self.assertEqual(fg_cfg["feature_name"], "combine_feat")
         self.assertEqual(fg_cfg["expression"], "user:combine_input")
-        self.assertEqual(fg_cfg["hash_bucket_size"], 100)
+        self.assertEqual(fg_cfg["num_buckets"], 100)
         self.assertEqual(fg_cfg["value_map"], {"a": 1.0, "b": 2.0})
-        self.assertEqual(fg_cfg["value_type"], "string")
+        self.assertEqual(fg_cfg["value_type"], "int64")
         self.assertEqual(fg_cfg["value_dim"], 1)
 
     def test_fg_json_sequence_prefix(self):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             sequence_combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                hash_bucket_size=100,
+                num_buckets=100,
                 embedding_dim=16,
                 expression="user:combine_input",
                 default_value="0",
