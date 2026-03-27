@@ -15,10 +15,16 @@ import unittest
 import numpy as np
 import pyarrow as pa
 from parameterized import parameterized
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
+from torchrec.modules.embedding_configs import (
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+    PoolingType,
+)
 
 from tzrec.features import combine_feature as combine_feature_lib
+from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
+from tzrec.utils import test_util
 
 
 class CombineFeatureTest(unittest.TestCase):
@@ -54,24 +60,44 @@ class CombineFeatureTest(unittest.TestCase):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                expression="user:combine_input",
-                default_value="0",
+                fg_encoded_default_value="0",
             )
         )
         combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
         self.assertEqual(combine_feat.output_dim, 1)
         self.assertEqual(combine_feat.is_sparse, False)
+        self.assertEqual(combine_feat.inputs, ["combine_feat"])
         self.assertEqual(combine_feat.emb_bag_config, None)
         self.assertEqual(combine_feat.emb_config, None)
 
-    def test_combine_feature_with_boundary(self):
+        input_data = {
+            "combine_feat": pa.array([1.0, 0.0, -1.0, 3.0, None]),
+        }
+        parsed_feat = combine_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "combine_feat")
+        self.assertTrue(
+            np.allclose(
+                parsed_feat.values, np.array([[1.0], [0.0], [-1.0], [3.0], [0.0]])
+            )
+        )
+
+    @parameterized.expand(
+        [
+            ["sum", [2, 1, 0, 4], [1, 1, 1, 1]],
+            ["mean", [2, 1, 0, 4], [1, 1, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_combine_feature_with_boundary(
+        self, combiner, expected_values, expected_lengths
+    ):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
                 boundaries=[-0.5, 0.5, 1.5, 2.5],
                 embedding_dim=16,
-                expression="user:combine_input",
-                default_value="0",
+                fg_encoded_default_value="0",
+                combiner=combiner,
             )
         )
         combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
@@ -89,22 +115,40 @@ class CombineFeatureTest(unittest.TestCase):
             repr(combine_feat.emb_bag_config), repr(expected_emb_bag_config)
         )
 
-    def test_combine_feature_with_num_buckets(self):
+        # In FG_NONE mode, input is pre-encoded bucket indices
+        input_data = {
+            "combine_feat": pa.array([2, 1, 0, 4]),
+        }
+        parsed_feat = combine_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
+    @parameterized.expand(
+        [
+            ["sum", [1, 0, 0], [1, 1, 1]],
+            ["mean", [1, 0, 0], [1, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_combine_feature_with_num_buckets(
+        self, combiner, expected_values, expected_lengths
+    ):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                num_buckets=100,
+                num_buckets=10,
                 embedding_dim=16,
-                expression="user:combine_input",
-                default_value="0",
+                fg_encoded_default_value="0",
+                combiner=combiner,
             )
         )
         combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
         self.assertEqual(combine_feat.output_dim, 16)
         self.assertEqual(combine_feat.is_sparse, True)
-        self.assertEqual(combine_feat.num_embeddings, 100)
+        self.assertEqual(combine_feat.num_embeddings, 10)
         expected_emb_bag_config = EmbeddingBagConfig(
-            num_embeddings=100,
+            num_embeddings=10,
             embedding_dim=16,
             name="combine_feat_emb",
             feature_names=["combine_feat"],
@@ -114,44 +158,64 @@ class CombineFeatureTest(unittest.TestCase):
             repr(combine_feat.emb_bag_config), repr(expected_emb_bag_config)
         )
 
-        # Verify fg_json value_type is int64 for num_buckets
-        fg_jsons = combine_feat._fg_json()
-        self.assertEqual(fg_jsons[0]["value_type"], "int64")
+        input_data = {
+            "combine_feat": pa.array([1, None, None]),
+        }
+        parsed_feat = combine_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
-    def test_combine_feature_with_value_map(self):
+    @parameterized.expand(
+        [
+            ["sum", [1, 0, 0], [1, 1, 1]],
+            ["mean", [1, 0, 0], [1, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_combine_feature_with_value_map(
+        self, combiner, expected_values, expected_lengths
+    ):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                num_buckets=100,
+                num_buckets=10,
                 embedding_dim=16,
-                expression="user:combine_input",
-                default_value="0",
-                value_map={"click": 1.0, "buy": 2.0, "cart": 3.0},
+                fg_encoded_default_value="0",
+                value_map={"tag1": 1.0, "tag2": 2.0, "tag3": 3.0},
+                combiner=combiner,
             )
         )
         combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
         self.assertEqual(combine_feat.output_dim, 16)
         self.assertEqual(combine_feat.is_sparse, True)
 
-        # Verify value_map is included in fg_json
-        fg_jsons = combine_feat._fg_json()
-        self.assertEqual(fg_jsons[0]["feature_type"], "combine_feature")
-        self.assertIn("value_map", fg_jsons[0])
-        self.assertEqual(
-            fg_jsons[0]["value_map"], {"click": 1.0, "buy": 2.0, "cart": 3.0}
-        )
-        self.assertEqual(fg_jsons[0]["num_buckets"], 100)
-        self.assertEqual(fg_jsons[0]["value_type"], "int64")
+        input_data = {
+            "combine_feat": pa.array([1, None, None]),
+        }
+        parsed_feat = combine_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
-    def test_sequence_combine_feature_with_value_map(self):
+    @parameterized.expand(
+        [
+            ["sum", [1, 0, 0], [1, 1, 1]],
+            ["mean", [1, 0, 0], [1, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_sequence_combine_feature_with_value_map(
+        self, combiner, expected_values, expected_lengths
+    ):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
-                num_buckets=100,
+                num_buckets=10,
                 embedding_dim=16,
-                expression="user:combine_input",
-                default_value="0",
-                value_map={"click": 1.0, "buy": 2.0},
+                fg_encoded_default_value="0",
+                value_map={"tag1": 1.0, "tag2": 2.0},
+                combiner=combiner,
             )
         )
         seq_feat = combine_feature_lib.CombineFeature(
@@ -167,52 +231,63 @@ class CombineFeatureTest(unittest.TestCase):
         self.assertEqual(seq_feat.name, "click_50_seq__combine_feat")
         self.assertEqual(seq_feat.value_dim, 1)
 
-    def test_fg_json_output(self):
-        combine_feat_cfg = feature_pb2.FeatureConfig(
-            combine_feature=feature_pb2.CombineFeature(
-                feature_name="combine_feat",
-                num_buckets=100,
-                embedding_dim=16,
-                expression="user:combine_input",
-                default_value="0",
-                value_map={"a": 1.0, "b": 2.0},
-            )
-        )
-        combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
+        input_data = {
+            "click_50_seq__combine_feat": pa.array(["1", None, None]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq__combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
 
-        fg_jsons = combine_feat._fg_json()
-        self.assertEqual(len(fg_jsons), 1)
-        fg_cfg = fg_jsons[0]
-        self.assertEqual(fg_cfg["feature_type"], "combine_feature")
-        self.assertEqual(fg_cfg["feature_name"], "combine_feat")
-        self.assertEqual(fg_cfg["expression"], "user:combine_input")
-        self.assertEqual(fg_cfg["num_buckets"], 100)
-        self.assertEqual(fg_cfg["value_map"], {"a": 1.0, "b": 2.0})
-        self.assertEqual(fg_cfg["value_type"], "int64")
-        self.assertEqual(fg_cfg["value_dim"], 1)
-
-    def test_fg_json_sequence_prefix(self):
+    @parameterized.expand(
+        [
+            ["", [1, 0, 0], [1, 1, 1], [1, 1, 1]],
+            ["0", [1, 0, 0], [1, 1, 1], [1, 1, 1]],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_combine_feature(
+        self,
+        default_value,
+        expected_values,
+        expected_lengths,
+        expected_seq_lengths,
+    ):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             sequence_combine_feature=feature_pb2.CombineFeature(
-                feature_name="combine_feat",
-                num_buckets=100,
+                feature_name="seq_combine_feat",
+                num_buckets=10,
                 embedding_dim=16,
-                expression="user:combine_input",
-                default_value="0",
-                sequence_length=50,
+                expression="user:seq_combine_input",
                 sequence_delim=";",
+                sequence_length=50,
+                default_value=default_value,
             )
         )
         seq_feat = combine_feature_lib.CombineFeature(
             seq_feat_cfg,
             is_sequence=True,
+            fg_mode=FgMode.FG_NORMAL,
         )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["seq_combine_input"])
+        expected_emb_config = EmbeddingConfig(
+            num_embeddings=10,
+            embedding_dim=16,
+            name="seq_combine_feat_emb",
+            feature_names=["seq_combine_feat"],
+        )
+        self.assertEqual(repr(seq_feat.emb_config), repr(expected_emb_config))
 
-        # fg_json() should prefix "sequence_" for standalone sequence
-        fg_jsons = seq_feat.fg_json()
-        self.assertEqual(fg_jsons[0]["feature_type"], "sequence_combine_feature")
-        self.assertEqual(fg_jsons[0]["sequence_delim"], ";")
-        self.assertEqual(fg_jsons[0]["sequence_length"], 50)
+        input_data = {"seq_combine_input": pa.array(["1", "", None])}
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "seq_combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
 
 
 if __name__ == "__main__":

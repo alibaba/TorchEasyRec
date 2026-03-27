@@ -331,6 +331,8 @@ message CombineFeature {
     optional string init_fn = 15;
     // mask value in training progress
     optional bool use_mask = 16;
+    // combine value combiner type, available is {sum | mean | min | max}
+    optional string combiner = 22 [default = "sum"];
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.

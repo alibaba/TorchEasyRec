@@ -85,6 +85,7 @@ class CombineFeature(BaseFeature):
             "expression": self.config.expression,
             "value_type": "float",
             "need_prefix": False,
+            "combiner": self.config.combiner.lower(),
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator

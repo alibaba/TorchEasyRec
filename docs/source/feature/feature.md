@@ -252,7 +252,7 @@ feature_configs {
         expression: "user:tag"
         embedding_dim: 16
         num_buckets: 100
-        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+        value_map: [{key:"tag1" value:1.0}, {key:"tag2" value:2.0}]
     }
 }
 ```
@@ -288,31 +288,28 @@ feature_configs {
 
 **输入示例**
 
-| 字段 | 值      | 说明                                  |
-| ---- | ------- | ------------------------------------- |
-| tag  | "click" | 单值输入，通过value_map映射为1.0      |
-| tag  | "buy"   | 单值输入，通过value_map映射为2.0      |
-| tag  | 3.14    | 不使用value_map时，直接作为连续值输入 |
+| 字段 | 值     | 说明                                  |
+| ---- | ------ | ------------------------------------- |
+| tag  | "tag1" | 单值输入，通过value_map映射为1.0      |
+| tag  | "tag2" | 单值输入，通过value_map映射为2.0      |
+| tag  | 3.14   | 不使用value_map时，直接作为连续值输入 |
 
-**配置说明**
-
-- **feature_name**: 特征名/特征输出名
-- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`，`input_side`可以取值为\[`user`, `item`, `context`, `feature`, `const`\]
-- **embedding_dim**: 特征嵌入维度，离散化模式下必填
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 - **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
+- **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`/`min`/`max`
 - **num_buckets**: 离散化桶数量，仅当输入是integer类型时使用
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
-- **pooling**: 多值特征嵌入池化方式，默认为`sum`，可以选`sum`/`mean`
-- **default_value**: 特征默认值，默认为空字符串
-- **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`
 - **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
-- **embedding_name**: 特征嵌入名，如需两个特征共享嵌入，可将嵌入名设置相同
-- **init_fn**: 特征嵌入初始化方式，如`nn.init.uniform_,a=-0.01,b=0.01`
-- **trainable**: Embedding Variable是否可训练，默认为true
-- **fg_encoded_default_value**: FG编码后数据的默认值，当fg_mode=FG_NONE时可以设置
-- **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度
-- **mlp**: 由一层MLP变换特征到`embedding_dim`维度
-- NOTE: `num_buckets`和`boundaries`只能指定其中之一
+
+如果输出为离散值（设置了`num_buckets`或`boundaries`），可设置:
+
+- 其余配置同IdFeature
+
+如果输出为连续值，可设置:
+
+- 其余配置同RawFeature
+
+NOTE: `num_buckets`和`boundaries`只能指定其中之一，不支持`hash_bucket_size`、`vocab_list`、`vocab_dict`、`vocab_file`、`zch`、`dynamicemb`
 
 ## LookupFeature: 字典查询特征
 
