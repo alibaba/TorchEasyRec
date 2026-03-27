@@ -12,8 +12,8 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict
-from typing import Optional
+from typing import Dict, Optional
+
 import torch
 
 from tzrec.protos.train_pb2 import TrainConfig
