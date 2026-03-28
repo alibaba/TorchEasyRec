@@ -50,12 +50,12 @@ class CombineFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["sum"],
-            ["mean"],
+            ["sum", [[3.0], [3.0], [0.0], [0.0]]],
+            ["mean", [[1.5], [3.0], [0.0], [0.0]]],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_dense(self, combiner):
+    def test_combine_feature_dense(self, combiner, expected_values):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
@@ -78,15 +78,18 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
+        self.assertTrue(np.allclose(parsed_feat.values, np.array(expected_values)))
 
     @parameterized.expand(
         [
-            ["sum"],
-            ["mean"],
+            ["sum", [4, 1, 1, 1], [1, 1, 1, 1]],
+            ["mean", [3, 1, 1, 1], [1, 1, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_with_boundary(self, combiner):
+    def test_combine_feature_with_boundary(
+        self, combiner, expected_values, expected_lengths
+    ):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
@@ -120,15 +123,19 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [
-            ["sum"],
-            ["mean"],
+            ["sum", [3, 3, 0, 0], [1, 1, 1, 1]],
+            ["mean", [1, 3, 0, 0], [1, 1, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_with_num_buckets(self, combiner):
+    def test_combine_feature_with_num_buckets(
+        self, combiner, expected_values, expected_lengths
+    ):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
@@ -162,15 +169,19 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [
-            ["sum"],
-            ["mean"],
+            ["sum", [3, 3, 0, 0], [1, 1, 1, 1]],
+            ["mean", [1, 3, 0, 0], [1, 1, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_combine_feature_with_value_map(self, combiner):
+    def test_combine_feature_with_value_map(
+        self, combiner, expected_values, expected_lengths
+    ):
         combine_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
@@ -194,15 +205,19 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
     @parameterized.expand(
         [
-            ["sum"],
-            ["mean"],
+            ["sum", [1, 2, 1, 2, 0], [1, 1, 1, 1, 1], [3, 1, 1]],
+            ["mean", [1, 2, 1, 2, 0], [1, 1, 1, 1, 1], [3, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
-    def test_sequence_combine_feature_with_value_map(self, combiner):
+    def test_sequence_combine_feature_with_value_map(
+        self, combiner, expected_values, expected_lengths, expected_seq_lengths
+    ):
         seq_feat_cfg = feature_pb2.FeatureConfig(
             combine_feature=feature_pb2.CombineFeature(
                 feature_name="combine_feat",
@@ -233,6 +248,11 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__combine_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array(expected_lengths))
+        self.assertTrue(
+            np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
+        )
 
     @parameterized.expand(
         [
