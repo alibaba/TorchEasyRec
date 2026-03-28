@@ -256,13 +256,15 @@ class CombineFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["", [1, 0, 0], [1, 1, 1], [1, 1, 1]],
-            ["0", [1, 0, 0], [1, 1, 1], [1, 1, 1]],
+            ["sum", "0", [3, 3, 4, 0], [1, 1, 1, 1], [2, 1, 1]],
+            ["sum", "", [3, 3, 4, 0], [1, 1, 1, 1], [2, 1, 1]],
+            ["mean", "0", [1, 3, 4, 0], [1, 1, 1, 1], [2, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
     def test_simple_sequence_combine_feature(
         self,
+        combiner,
         default_value,
         expected_values,
         expected_lengths,
@@ -277,6 +279,7 @@ class CombineFeatureTest(unittest.TestCase):
                 sequence_delim=";",
                 sequence_length=50,
                 default_value=default_value,
+                combiner=combiner,
             )
         )
         seq_feat = combine_feature_lib.CombineFeature(
@@ -295,7 +298,7 @@ class CombineFeatureTest(unittest.TestCase):
         )
         self.assertEqual(repr(seq_feat.emb_config), repr(expected_emb_config))
 
-        input_data = {"seq_combine_input": pa.array(["1", "", None])}
+        input_data = {"seq_combine_input": pa.array(["1\x1d2;3", "4", ""])}
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "seq_combine_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
