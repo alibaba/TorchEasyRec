@@ -210,8 +210,8 @@ class CombineFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ["sum", [1, 2, 1, 2, 0], [1, 1, 1, 1, 1], [3, 1, 1]],
-            ["mean", [1, 2, 1, 2, 0], [1, 1, 1, 1, 1], [3, 1, 1]],
+            ["sum", [3, 1, 2, 0], [1, 1, 1, 1], [2, 1, 1]],
+            ["mean", [1, 1, 2, 0], [1, 1, 1, 1], [2, 1, 1]],
         ],
         name_func=test_util.parameterized_name_func,
     )
