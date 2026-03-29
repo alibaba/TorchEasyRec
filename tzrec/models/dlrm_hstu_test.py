@@ -63,6 +63,7 @@ class DlrmHSTUTest(unittest.TestCase):
             [model_pb2.FeatureGroupType.DEEP, model_pb2.FeatureGroupType.SEQUENCE]
         ),
         sequence_timestamp_is_ascending=st.sampled_from([True, False]),
+        task_weight=st.sampled_from([1.0, 0.5]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -77,6 +78,7 @@ class DlrmHSTUTest(unittest.TestCase):
         enable_global_average_loss,
         contextual_group_type,
         sequence_timestamp_is_ascending,
+        task_weight,
     ) -> None:
         # JIT_SCRIPT only support PYTORCH kernel now.
         assume(
@@ -228,6 +230,7 @@ class DlrmHSTUTest(unittest.TestCase):
                         grouped_auc=metric_pb2.GroupedAUC(grouping_key="user_id")
                     )
                 ],
+                weight=task_weight,
             ),
             tower_pb2.FusionSubTaskConfig(
                 task_name="is_comment",

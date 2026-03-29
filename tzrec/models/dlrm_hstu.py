@@ -269,6 +269,10 @@ class DlrmHSTU(RankModel):
                         suffix=f"_{task_name}",
                     )
                 )
+                if task_cfg.weight != 1.0:
+                    loss_type = loss_cfg.WhichOneof("loss")
+                    loss_name = loss_type + f"_{task_name}"
+                    losses[loss_name] = losses[loss_name] * task_cfg.weight
         losses.update(self._loss_collection)
         return losses
 
