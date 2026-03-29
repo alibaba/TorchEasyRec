@@ -232,6 +232,10 @@ class RankModel(BaseModel):
         if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
             pred = predictions["logits" + suffix]
             label = label.to(torch.float32)
+            if loss_type == "binary_cross_entropy":
+                label_smoothing = loss_cfg.binary_cross_entropy.label_smoothing
+                if label_smoothing > 0:
+                    label = label * (1.0 - label_smoothing) + 0.5 * label_smoothing
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         elif loss_type == "softmax_cross_entropy":
             pred = predictions["logits" + suffix]
