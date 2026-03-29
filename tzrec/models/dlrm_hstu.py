@@ -258,21 +258,17 @@ class DlrmHSTU(RankModel):
                 loss_weight = label.size(0) / avg_batch_size
 
             for loss_cfg in task_cfg.losses:
-                losses.update(
-                    self._loss_impl(
-                        predictions,
-                        batch,
-                        label,
-                        loss_weight,
-                        loss_cfg,
-                        num_class=task_cfg.num_class,
-                        suffix=f"_{task_name}",
-                    )
+                task_losses = self._loss_impl(
+                    predictions,
+                    batch,
+                    label,
+                    loss_weight,
+                    loss_cfg,
+                    num_class=task_cfg.num_class,
+                    suffix=f"_{task_name}",
                 )
-                if task_cfg.weight != 1.0:
-                    loss_type = loss_cfg.WhichOneof("loss")
-                    loss_name = loss_type + f"_{task_name}"
-                    losses[loss_name] = losses[loss_name] * task_cfg.weight
+                task_losses = {k: v * task_cfg.weight for k, v in task_losses.items()}
+                losses.update(task_losses)
         losses.update(self._loss_collection)
         return losses
 
