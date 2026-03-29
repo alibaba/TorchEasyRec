@@ -232,3 +232,23 @@ ______________________________________________________________________
 **原因：** kv特征的key包含":"导致报错
 
 **解决方法：** 检查特征表string类型字段是否包含":"，进行数据清洗。
+
+______________________________________________________________________
+
+**Q14: Hopper GPU上HSTU注意力反向传播autotuning崩溃**
+
+**报错信息：**
+
+```
+File "/opt/conda/lib/python3.11/site-packages/triton/testing.py", line 150, in do_bench
+    di.synchronize()
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+
+**原因：** Triton v3.6.0在Hopper GPU（如H20）上存在WGMMA（Warp Group Matrix Multiply-Accumulate）代码生成Bug。在RS WGMMA路径中缺少寄存器同步指令，导致`_hstu_attn_bwd`内核在autotuning阶段出现非法内存访问。
+
+**解决方法：** 安装修复后的Triton wheel：
+
+```bash
+pip install --force-reinstall --no-deps "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
+```
