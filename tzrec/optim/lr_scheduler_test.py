@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import math
 import unittest
 
 import torch
@@ -81,6 +82,110 @@ class LRSchedulerTest(unittest.TestCase):
         for lr_gt in lr_gts:
             lr.step()
             self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
+
+    def test_cosine_annealing_lr(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.CosineAnnealingLR(opt, T_max=4, by_epoch=True)
+        self.assertTrue(lr.by_epoch)
+        # step 0->1: t=1, cos(pi*1/4)
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 1->2: t=2, cos(pi*2/4) = cos(pi/2) = 0 -> lr = 0.005
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.005)
+        # step 2->3: t=3, cos(pi*3/4)
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 3 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 3->4: t=4, cos(pi) = -1 -> lr = 0.0
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.0)
+
+    def test_cosine_annealing_lr_with_warmup(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.CosineAnnealingLR(
+            opt, T_max=4, warmup_size=2, warmup_learning_rate=0.002
+        )
+        self.assertFalse(lr.by_epoch)
+        # warmup step 0->1: scale=0.5, lr=0.002+(0.01-0.002)*0.5=0.006
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.006)
+        # warmup step 1->2: scale=1.0, lr=0.01
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
+        # cosine step t=1: cos(pi*1/4)
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+
+    def test_cosine_annealing_warm_restarts_lr(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.CosineAnnealingWarmRestartsLR(opt, T_0=3)
+        # Period of 3, T_mult=1 so fixed period
+        # step 1: t=1, cos(pi*1/3)
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 3))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 2: t=2, cos(pi*2/3)
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 2 / 3))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 3: restart, t=0 -> cos(0) = 1 -> lr=0.01
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
+        # step 4: t=1 again
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 3))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+
+    def test_cosine_annealing_warm_restarts_lr_with_T_mult(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.CosineAnnealingWarmRestartsLR(opt, T_0=2, T_mult=2)
+        # Period 0: T_i=2, steps 0-1
+        # step 1: elapsed=1, T_cur=1, T_i=2
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 2))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 2: elapsed=2, restart, Period 1: T_i=4, T_cur=0
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
+        # step 3: elapsed=3, T_cur=1, T_i=4
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 4: elapsed=4, T_cur=2, T_i=4
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 2 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 5: elapsed=5, T_cur=3, T_i=4
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 3 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 6: elapsed=6, restart, Period 2: T_i=8, T_cur=0
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
+
+    def test_cosine_annealing_warm_restarts_lr_with_warmup(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.CosineAnnealingWarmRestartsLR(
+            opt, T_0=3, warmup_size=2, warmup_learning_rate=0.002
+        )
+        # warmup step 0->1: scale=0.5
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.006)
+        # warmup step 1->2: scale=1.0
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
+        # cosine elapsed=1, T_cur=1, T_i=3
+        lr.step()
+        expected = 0.5 * 0.01 * (1 + math.cos(math.pi * 1 / 3))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
 
 
 if __name__ == "__main__":
