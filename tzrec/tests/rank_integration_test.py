@@ -510,13 +510,15 @@ class RankIntegrationTest(unittest.TestCase):
 
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
+            os.path.exists(
+                os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2")
+            )
         )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
@@ -945,7 +947,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
 
     @unittest.skipIf(

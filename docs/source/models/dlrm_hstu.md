@@ -307,6 +307,21 @@ model_config {
 [dlrm_hstu_kuairand.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_hstu_kuairand.config)
 注: 如遇到训练不稳定问题，可优先考虑调整混合精度相关的配置: 去除train_config中的mixed_precision，去除feature_configs中的data_type，设置train_config.cuda_matmul_allow_tf32=true
 
+### 模型导出
+
+hstu模型导出时， 需要设置命令行参数hstu_item_id， 指定输入模型的candidate item_id 序列的列名。
+
+例如:
+
+```
+torchrun --master_addr=localhost --master_port=32555 \
+    --nnodes=1 --nproc-per-node=1 --node_rank=0 \
+    -m tzrec.export \
+    --pipeline_config_path experiments/dlrm_hstu/pipeline.config \
+    --hstu_item_id cand_seq___video_id \
+    --export_dir experiments/dltm_hstu/export
+```
+
 ## 参考论文
 
 [HSTU](https://arxiv.org/abs/2402.17152)
