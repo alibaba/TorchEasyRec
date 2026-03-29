@@ -264,6 +264,9 @@ def _log_train(
             for i, g in enumerate(param_groups):
                 summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
 
+        params = {
+            k: p for k, p in params.items() if isinstance(p, ShardedTensor) or p.grad
+        }
         if "global_gradient_norm" in tb_summaries:
             global_grad_norm = torch.nn.utils.get_total_norm(
                 [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
