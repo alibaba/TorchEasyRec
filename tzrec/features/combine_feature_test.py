@@ -78,7 +78,7 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = combine_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "combine_feat")
-        self.assertTrue(np.allclose(parsed_feat.values, np.array(expected_values)))
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
 
     @parameterized.expand(
         [
@@ -291,7 +291,7 @@ class CombineFeatureTest(unittest.TestCase):
         }
         parsed_feat = seq_feat.parse(input_data)
         self.assertEqual(parsed_feat.name, "click_50_seq__combine_feat")
-        self.assertTrue(np.allclose(parsed_feat.values, np.array(expected_values)))
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )

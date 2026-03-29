@@ -315,7 +315,8 @@ message CombineFeature {
     repeated float boundaries = 7;
     // number of id enumerators for sparse combine value
     optional uint64 num_buckets = 8;
-    // embedding pooling type, available is {sum | mean}
+    // embedding pooling type, available is {sum | mean}. Controls embedding bag aggregation.
+    // NOTE: distinct from 'combiner' which controls FG-level multi-value aggregation.
     optional string pooling = 11 [default = "sum"];
     // fg default value, default value before bucktize
     optional string default_value = 12 [default = ""];
@@ -332,6 +333,7 @@ message CombineFeature {
     // mask value in training progress
     optional bool use_mask = 16;
     // combine value combiner type, available is {sum | mean | min | max}
+    // Controls FG-level multi-value aggregation before bucketization.
     optional string combiner = 22 [default = "sum"];
 
     // default value when fg_mode = FG_NONE,
