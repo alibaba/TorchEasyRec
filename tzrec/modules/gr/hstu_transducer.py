@@ -80,7 +80,7 @@ class HSTUTransducer(BaseModule):
             output_embedding_dim=stu["embedding_dim"],
         )
         stu = dict(stu)
-        if not stu.get("contextual_seq_len", 0):
+        if "contextual_seq_len" not in stu:
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
         self._stu_module: STU = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
