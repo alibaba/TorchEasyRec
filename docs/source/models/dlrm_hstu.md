@@ -319,7 +319,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     -m tzrec.export \
     --pipeline_config_path experiments/dlrm_hstu/pipeline.config \
     --hstu_item_id cand_seq___video_id \
-    --export_dir experiments/dltm_hstu/export
+    --export_dir experiments/dlrm_hstu/export
 ```
 
 ## 参考论文
