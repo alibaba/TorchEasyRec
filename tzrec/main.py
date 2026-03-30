@@ -1061,8 +1061,7 @@ def predict(
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
 
-    device_and_backend = init_process_group()
-    device: torch.device = device_and_backend[0]
+    device, backend = init_process_group()
 
     fs, local_path = url_to_fs(scripted_model_path)
     if fs is not None:
@@ -1079,6 +1078,9 @@ def predict(
     )
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
+
+    train_config = pipeline_config.train_config
+    acc_utils.allow_tf32(train_config, backend)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
