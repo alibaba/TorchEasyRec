@@ -70,9 +70,6 @@ class HSTUTransducer(BaseModule):
         listwise: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
-        self._stu_module: STU = STUStack(
-            stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
-        )
         self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
             input_preprocessor,
             uih_embedding_dim=uih_embedding_dim,
@@ -81,6 +78,12 @@ class HSTUTransducer(BaseModule):
             max_contextual_seq_len=max_contextual_seq_len,
             contextual_group_name=contextual_group_name,
             output_embedding_dim=stu["embedding_dim"],
+        )
+        stu = dict(stu)
+        if "contextual_seq_len" not in stu:
+            stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
+        self._stu_module: STU = STUStack(
+            stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
             output_postprocessor, embedding_dim=stu["embedding_dim"]
