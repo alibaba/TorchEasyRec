@@ -470,7 +470,7 @@ class DlrmHSTUTest(unittest.TestCase):
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["user_id", "video_id", "item_video_id"],
-            values=torch.tensor(list(range(14))),
+            values=torch.tensor(list(range(13))),
             lengths=torch.tensor([1, 1, 2, 3, 2, 4]),
         )
         sequence_dense_features = {
