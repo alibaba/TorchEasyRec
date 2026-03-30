@@ -470,8 +470,8 @@ class DlrmHSTUTest(unittest.TestCase):
 
         sparse_feature = KeyedJaggedTensor.from_lengths_sync(
             keys=["user_id", "video_id", "item_video_id"],
-            values=torch.tensor(list(range(10))),
-            lengths=torch.tensor([1, 1, 2, 2, 2, 2]),
+            values=torch.tensor(list(range(14))),
+            lengths=torch.tensor([1, 1, 2, 3, 2, 4]),
         )
         sequence_dense_features = {
             "action_timestamp": JaggedTensor(
@@ -479,8 +479,8 @@ class DlrmHSTUTest(unittest.TestCase):
                 lengths=torch.tensor([2, 3]),
             ),
             "item_query_time": JaggedTensor(
-                values=torch.tensor([[6], [7], [8], [9]]),
-                lengths=torch.tensor([2, 2]),
+                values=torch.tensor([[6], [7], [8], [9], [10], [11]]),
+                lengths=torch.tensor([2, 4]),
             ),
             "action_weight": JaggedTensor(
                 values=torch.tensor([[0], [1], [0], [1], [0]]),
@@ -489,8 +489,8 @@ class DlrmHSTUTest(unittest.TestCase):
         }
         jagged_labels = {
             "item_action_weight": JaggedTensor(
-                values=torch.tensor([0, 1, 0, 1]),
-                lengths=torch.tensor([2, 2]),
+                values=torch.tensor([0, 1, 0, 0, 1, 0]),
+                lengths=torch.tensor([2, 4]),
             ),
         }
         batch = Batch(
