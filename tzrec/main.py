@@ -298,11 +298,11 @@ def _log_train(
                         summary_writer.add_histogram(
                             tag=name, values=param, global_step=step
                         )
-                    if "gradient" in tb_summaries:
+                    if "gradient" in tb_summaries and param.grad is not None:
                         summary_writer.add_histogram(
                             tag=f"{name}/gradient", values=param.grad, global_step=step
                         )
-                    if "gradient_norm" in tb_summaries:
+                    if "gradient_norm" in tb_summaries and param.grad is not None:
                         grad_norm = torch.norm(param.grad)
                         summary_writer.add_scalar(
                             tag=f"{name}/gradient_norm",
