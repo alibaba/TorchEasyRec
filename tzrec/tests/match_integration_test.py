@@ -446,7 +446,9 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                hstu_item_id="item_id",
             )
         self.assertTrue(self.success)
         self.assertTrue(

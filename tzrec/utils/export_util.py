@@ -72,6 +72,9 @@ from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
+# HSTU-related model types that require hstu_item_id parameter
+_HSTU_MODEL_TYPES = {"dlrm_hstu", "hstu_match"}
+
 
 def export_model(
     pipeline_config: EasyRecConfig,
@@ -86,6 +89,16 @@ def export_model(
 
     # Get kernel from model_config, default to PYTORCH
     hstu_kernel = Kernel.Name(pipeline_config.model_config.kernel)
+
+    # Check if the model is HSTU-based and requires hstu_item_id
+    model_type = config_util.which_msg(pipeline_config.model_config, "model")
+    if model_type in _HSTU_MODEL_TYPES and hstu_item_id is None:
+        raise ValueError(
+            f"HSTU model (type: {model_type}) requires --hstu_item_id parameter. "
+            "Please specify the feature name of candidate item id column via "
+            "--hstu_item_id argument, e.g., --hstu_item_id=item_id. "
+            "This is used to identify the target item's column name."
+        )
 
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
