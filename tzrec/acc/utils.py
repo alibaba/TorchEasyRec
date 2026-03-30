@@ -206,7 +206,7 @@ def export_acc_config(
 
     Args:
         hstu_item_id (str, optional): feature name of candidate item id for HSTU model.
-        hstu_kernel (str, optional): kernel type for HSTU model, default is "PYTORCH".
+        hstu_kernel (str, optional): kernel type for HSTU model, default is "pytorch".
     """
     # use int64 sparse id as input
     acc_config = {"SPARSE_INT64": "1"}
