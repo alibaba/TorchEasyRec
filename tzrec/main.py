@@ -955,6 +955,7 @@ def export(
                     checkpoint_path,
                     tower_export_dir,
                     assets=assets,
+                    hstu_item_id=hstu_item_id,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():

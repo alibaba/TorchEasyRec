@@ -950,6 +950,19 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
+        # Verify model_acc.json contains HSTU-related fields
+        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
+        self.assertTrue(os.path.exists(model_acc_path))
+        with open(model_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq__video_id")
+            self.assertEqual(acc_cfg["hstu_kernel"], "triton")
+            self.assertEqual(acc_cfg["ENABLE_AOT"], "1")
+        # Verify output_field_names.json is created for AOT export
+        output_names_path = os.path.join(
+            self.test_dir, "export/aoti/output_field_names.json"
+        )
+        self.assertTrue(os.path.exists(output_names_path))
 
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
@@ -1037,6 +1050,13 @@ class RankIntegrationTest(unittest.TestCase):
                 hstu_item_id="cand_seq_video_id",
             )
         self.assertTrue(self.success)
+        # Verify model_acc.json contains HSTU-related fields
+        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
+        self.assertTrue(os.path.exists(model_acc_path))
+        with open(model_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq_video_id")
+            self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
 
 
 if __name__ == "__main__":
