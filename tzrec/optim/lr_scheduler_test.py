@@ -102,6 +102,28 @@ class LRSchedulerTest(unittest.TestCase):
         # step 3->4: t=4, cos(pi) = -1 -> lr = 0.0
         lr.step()
         self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.0)
+        # step beyond T_max: lr stays clamped at min_learning_rate (0.0)
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.0)
+
+    def test_cosine_annealing_lr_with_min_lr(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.CosineAnnealingLR(opt, T_max=4, min_learning_rate=0.002)
+        # step 1: t=1
+        lr.step()
+        expected = 0.002 + (0.01 - 0.002) * 0.5 * (1 + math.cos(math.pi * 1 / 4))
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], expected)
+        # step 2: t=2, cos(pi/2)=0 -> lr = 0.002 + 0.008*0.5 = 0.006
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.006)
+        # step 4: t=4, cos(pi)=-1 -> lr = 0.002
+        lr.step()
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.002)
+        # beyond T_max: stays at min_learning_rate
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.002)
 
     def test_cosine_annealing_lr_with_warmup(self) -> None:
         params = [torch.tensor([1.0, 2.0])]

@@ -183,6 +183,8 @@ class CosineAnnealingLR(BaseLR):
         warmup_size: int = 0,
         by_epoch: bool = False,
     ) -> None:
+        if T_max <= 0:
+            raise ValueError(f"T_max must be positive, got {T_max}")
         self._T_max = T_max
         self._min_learning_rate = min_learning_rate
         self._warmup_learning_rate = warmup_learning_rate
@@ -234,6 +236,8 @@ class CosineAnnealingWarmRestartsLR(BaseLR):
         warmup_size: int = 0,
         by_epoch: bool = False,
     ) -> None:
+        if T_0 <= 0:
+            raise ValueError(f"T_0 must be positive, got {T_0}")
         self._T_0 = T_0
         self._T_mult = T_mult
         self._min_learning_rate = min_learning_rate
@@ -259,8 +263,9 @@ class CosineAnnealingWarmRestartsLR(BaseLR):
             n = math.floor(
                 math.log(elapsed / self._T_0 * (self._T_mult - 1) + 1, self._T_mult)
             )
-            T_i = self._T_0 * (self._T_mult**n)
-            cycle_start = self._T_0 * (self._T_mult**n - 1) // (self._T_mult - 1)
+            mult_n = self._T_mult**n
+            T_i = self._T_0 * mult_n
+            cycle_start = self._T_0 * (mult_n - 1) // (self._T_mult - 1)
             T_cur = elapsed - cycle_start
         cos_scale = 0.5 * (1 + math.cos(math.pi * T_cur / T_i))
         return [
