@@ -535,12 +535,11 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
         )
 
-        # disable tf32 for consistent TRT comparison, TRT uses strict FP32
-        # via enabled_precisions={torch.float32} and ignores PyTorch TF32 settings
+        # set tf32 config for consistent TRT comparison
         test_config_path = os.path.join(self.test_dir, "pipeline.config")
         pipeline_config = config_util.load_pipeline_config(test_config_path)
-        pipeline_config.train_config.cudnn_allow_tf32 = False
-        pipeline_config.train_config.cuda_matmul_allow_tf32 = False
+        pipeline_config.train_config.cudnn_allow_tf32 = True
+        pipeline_config.train_config.cuda_matmul_allow_tf32 = True
         config_util.save_message(pipeline_config, test_config_path)
 
         trt_dir = os.path.join(self.test_dir, "trt")
