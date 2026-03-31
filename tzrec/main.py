@@ -265,10 +265,16 @@ def _log_train(
                 summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
 
         if "global_gradient_norm" in tb_summaries:
-            global_grad_norm = torch.nn.utils.get_total_norm(
-                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
-            )
-            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+            grads = [
+                p.grad
+                for p in params.values()
+                if p.grad is not None and not isinstance(p, ShardedTensor)
+            ]
+            if grads:
+                global_grad_norm = torch.nn.utils.get_total_norm(grads)
+                summary_writer.add_scalar(
+                    "global_gradient_norm", global_grad_norm, step
+                )
 
         if (
             "gradient_norm" in tb_summaries
@@ -292,11 +298,11 @@ def _log_train(
                         summary_writer.add_histogram(
                             tag=name, values=param, global_step=step
                         )
-                    if "gradient" in tb_summaries:
+                    if "gradient" in tb_summaries and param.grad is not None:
                         summary_writer.add_histogram(
                             tag=f"{name}/gradient", values=param.grad, global_step=step
                         )
-                    if "gradient_norm" in tb_summaries:
+                    if "gradient_norm" in tb_summaries and param.grad is not None:
                         grad_norm = torch.norm(param.grad)
                         summary_writer.add_scalar(
                             tag=f"{name}/gradient_norm",
