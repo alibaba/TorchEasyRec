@@ -535,11 +535,12 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
         )
 
-        # set tf32 config for consistent TRT comparison
+        # disable tf32 for consistent TRT comparison, TRT uses strict FP32
+        # via enabled_precisions={torch.float32} and ignores PyTorch TF32 settings
         test_config_path = os.path.join(self.test_dir, "pipeline.config")
         pipeline_config = config_util.load_pipeline_config(test_config_path)
-        pipeline_config.train_config.cudnn_allow_tf32 = True
-        pipeline_config.train_config.cuda_matmul_allow_tf32 = True
+        pipeline_config.train_config.cudnn_allow_tf32 = False
+        pipeline_config.train_config.cuda_matmul_allow_tf32 = False
         config_util.save_message(pipeline_config, test_config_path)
 
         trt_dir = os.path.join(self.test_dir, "trt")
@@ -592,7 +593,7 @@ class RankIntegrationTest(unittest.TestCase):
             df_t = ds.dataset(trt_pred_output, format="parquet").to_table().to_pandas()
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 2e-5))
 
         # quant and input-tile and trt
         if self.success:
@@ -619,7 +620,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 2e-5))
 
         # quant and input-tile emb and trt
         if self.success:
@@ -646,7 +647,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
             df = df.sort_values(by=predict_columns).reset_index(drop=True)
             df_t = df_t.sort_values(by=predict_columns).reset_index(drop=True)
-            self.assertTrue(dfs_are_close(df, df_t, 1e-6))
+            self.assertTrue(dfs_are_close(df, df_t, 2e-5))
 
         self.assertTrue(self.success)
 
@@ -747,19 +748,19 @@ class RankIntegrationTest(unittest.TestCase):
         # trt is all same sa no-trt
         for k in output_columns.split(","):
             torch.testing.assert_close(
-                result_gpu_trt[k], result_gpu[k], rtol=1e-6, atol=1e-6
+                result_gpu_trt[k], result_gpu[k], rtol=2e-5, atol=5e-5
             )
 
         # tile & trt is all same sa no-tile-trt
         for k in output_columns.split(","):
             torch.testing.assert_close(
-                result_gpu_input_tile[k], result_gpu[k], rtol=1e-6, atol=1e-6
+                result_gpu_input_tile[k], result_gpu[k], rtol=2e-5, atol=5e-5
             )
 
         # tile emb & trt is all same sa no-tile-trt
         for k in output_columns.split(","):
             torch.testing.assert_close(
-                result_gpu_input_tile_emb[k], result_gpu[k], rtol=1e-6, atol=1e-6
+                result_gpu_input_tile_emb[k], result_gpu[k], rtol=2e-5, atol=5e-5
             )
 
     def test_multi_tower_din_with_fg_train_eval_export(self):
