@@ -21,8 +21,6 @@ message DSSM {
 
 message HSTUMatch {
     required HSTUMatchTower hstu_tower = 1;
-    // user and item tower output dimension
-    required int32 output_dim = 2;
     // similarity method
     optional Similarity similarity = 3 [default=INNER_PRODUCT];
     // similarity scaling factor
