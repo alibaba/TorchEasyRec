@@ -413,6 +413,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._side_inputs = None
         self._vocab_list = None
         self._vocab_dict = None
+        self._default_value = None
         self._is_sequence = is_sequence
         self._is_grouped_seq = False
 
@@ -545,10 +546,17 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def default_value(self) -> str:
         """Effective default value for the feature."""
-        val = self.config.default_value
-        if self.is_sequence and not val:
-            return "0"
-        return val
+        if self._default_value is None:
+            val = self.config.default_value
+            if self.is_sequence and not val:
+                logger.warning(
+                    f"Sequence{self.__class__.__name__}[{self.name}] "
+                    "not support empty default value now. reset to zero."
+                )
+                self._default_value = "0"
+            else:
+                self._default_value = val
+        return self._default_value
 
     @property
     def is_grouped_sequence(self) -> bool:
