@@ -232,3 +232,56 @@ ______________________________________________________________________
 **原因：** kv特征的key包含":"导致报错
 
 **解决方法：** 检查特征表string类型字段是否包含":"，进行数据清洗。
+
+______________________________________________________________________
+
+**Q14: 版本升级后序列特征vocab_list行为变化**
+
+**问题描述：** 从0.9.x或1.0.3-1.1.4升级后，序列特征（如SequenceIdFeature）的vocab_list首元素发生变化。
+
+**原因：** 在1.0.3版本中，`SequenceIdFeature`被合并到`IdFeature`（通过设置`sequence_length`），但`IdFeature`的proto `default_value`默认值为`""`，与原`SequenceIdFeature`的默认值`"0"`不同，导致vocab_list首元素从`"0"`变为`""`。1.1.5版本修复了此问题。
+
+**升级指南：**
+
+- **1.0.2及更早版本（含0.9.x）用户：** 可直接升级到1.0.18或1.1.5+，序列特征的`default_value`行为与旧版本一致，无需额外修改。
+
+- **1.0.3至1.1.4用户：** 升级到1.1.5+后，未显式设置`default_value`的序列特征的vocab_list首元素将从`""`变为`"0"`。如需保持与旧版本完全一致的行为，可通过显式设置`default_bucketize_value`来自行控制vocab_list。示例如下：
+
+  旧版本（1.0.3-1.1.4）配置，未显式设置`default_value`时，内部自动生成的vocab_list为 `["", "<OOV>", "cat", "dog", "bird"]`，其中index0为空字符串`""`，index1为`"<OOV>"`：
+
+  ```protobuf
+  feature_config {
+    id_feature {
+      feature_name: "item_id"
+      expression: "item:item_id"
+      embedding_dim: 16
+      vocab_list: ["cat", "dog", "bird"]
+      sequence_length: 50
+      sequence_delim: ";"
+    }
+  }
+  ```
+
+  升级到1.1.5+后，如需保持与旧版本一致的vocab_list映射（即index0为`""`，index1为`"<OOV>"`），需将`""`和`"<OOV>"`手动加入vocab_list，并设置`default_bucketize_value: 1`：
+
+  ```protobuf
+  feature_config {
+    id_feature {
+      feature_name: "item_id"
+      expression: "item:item_id"
+      embedding_dim: 16
+      vocab_list: ["", "<OOV>", "cat", "dog", "bird"]
+      default_bucketize_value: 1
+      sequence_length: 50
+      sequence_delim: ";"
+    }
+  }
+  ```
+
+  设置`default_bucketize_value`后，系统不再自动在vocab_list前插入`default_value`和`"<OOV>"`，而是直接使用用户配置的vocab_list，OOV值将映射到`default_bucketize_value`指定的索引。
+
+**版本查询方式：**
+
+```bash
+pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+```
