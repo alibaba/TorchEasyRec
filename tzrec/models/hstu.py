@@ -191,6 +191,9 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         features: List[BaseFeature],
     ) -> None:
         super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        # Override _group_name: parent sets it from tower_config.input ("uih"),
+        # but item tower needs to read from the candidate feature group.
+        self._group_name = feature_group.group_name
         cand_dim = sum(feature_group_dims)
         self._item_projection: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(cand_dim, output_dim),
@@ -244,7 +247,7 @@ class HSTUMatch(MatchModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         assert model_config.WhichOneof("model") == "hstu_match", (
-            "invalid model config: %s" % self._base_model_config.WhichOneof("model")
+            "invalid model config: %s" % model_config.WhichOneof("model")
         )
         assert isinstance(self._model_config, match_model_pb2.HSTUMatch)
 
