@@ -949,6 +949,9 @@ class BaseFeature(object, metaclass=_meta_cls):
         fg_cfgs = self._fg_json()
         if self.is_sequence:
             for fg_cfg in fg_cfgs:
+                # defensive: sub-feature entries (e.g. text_normalizer in
+                # TokenizeFeature) may not have default_value in their dict,
+                # pyfg asserts non-empty default_value for sequence features.
                 if not fg_cfg.get("default_value"):
                     fg_cfg["default_value"] = "0"
                 if not self._is_grouped_seq:
