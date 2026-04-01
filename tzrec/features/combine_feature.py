@@ -81,7 +81,7 @@ class CombineFeature(BaseFeature):
         fg_cfg = {
             "feature_type": "combine_feature",
             "feature_name": self.config.feature_name,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "expression": self.config.expression,
             "value_type": "float",
             "need_prefix": False,
