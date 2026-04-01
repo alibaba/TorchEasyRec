@@ -718,3 +718,22 @@ if has_dynamicemb:
     GroupedPooledEmbeddingsLookup._create_embedding_kernel = (
         _grouped_pooled_embeddings_lookup_create_embedding_kernel
     )
+
+    from torchrec.sparse import jagged_tensor_validator as _jtv
+
+    _orig_validate_feature_range = _jtv._validate_feature_range
+
+    def _validate_feature_range_with_dynamicemb(kjt, configs):
+        """Skip range check for dynamicemb features.
+
+        DynamicEmb uses hash tables that accept arbitrary uint64 keys.
+        max_capacity is a storage limit, not a valid key range.
+        """
+        filtered_configs = [
+            c for c in configs if not getattr(c, "use_dynamicemb", False)
+        ]
+        if not filtered_configs:
+            return True
+        return _orig_validate_feature_range(kjt, filtered_configs)
+
+    _jtv._validate_feature_range = _validate_feature_range_with_dynamicemb

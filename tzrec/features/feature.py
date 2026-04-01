@@ -604,6 +604,10 @@ class BaseFeature(object, metaclass=_meta_cls):
             )
             # pyre-ignore [16]
             emb_bag_config.trainable = self.config.trainable
+            # pyre-ignore [16]
+            emb_bag_config.use_dynamicemb = hasattr(
+                self.config, "dynamicemb"
+            ) and self.config.HasField("dynamicemb")
             return emb_bag_config
         else:
             return None
@@ -626,6 +630,10 @@ class BaseFeature(object, metaclass=_meta_cls):
             )
             # pyre-ignore [16]
             emb_config.trainable = self.config.trainable
+            # pyre-ignore [16]
+            emb_config.use_dynamicemb = hasattr(
+                self.config, "dynamicemb"
+            ) and self.config.HasField("dynamicemb")
             return emb_config
         else:
             return None
