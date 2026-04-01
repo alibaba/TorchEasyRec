@@ -1,12 +1,12 @@
 # Dynamic Embedding
 
-DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding使用[HierarchicalKV](https://github.com/NVIDIA-Merlin/HierarchicalKV) 作为Hash表的后端，相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
+DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding 相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
 注：目前使用DynamicEmbedding还处于实验阶段，配置和接口都可能调整，暂只支持训练和评估，暂不包含在官方提供的镜像环境中，使用前需要额外安装如下whl包
 
 ```bash
 # DEVICE 可选: cu126/cu129 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb-0.0.1+20260321.60bd31e.${DEVICE} -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb-0.0.1+20260331.bea6b4b.${DEVICE} -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
