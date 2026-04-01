@@ -941,6 +941,8 @@ class BaseFeature(object, metaclass=_meta_cls):
         fg_cfgs = self._fg_json()
         if self.is_sequence:
             for fg_cfg in fg_cfgs:
+                if not fg_cfg.get("default_value"):
+                    fg_cfg["default_value"] = "0"
                 if not self._is_grouped_seq:
                     fg_cfg["sequence_delim"] = self.sequence_delim
                     fg_cfg["sequence_length"] = self.sequence_length
