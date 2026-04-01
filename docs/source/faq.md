@@ -237,12 +237,18 @@ ______________________________________________________________________
 
 **Q14: 版本升级后序列特征vocab_list行为变化**
 
-**问题描述：** 从0.9.x或1.0.x升级到1.1.5+后，序列特征（如SequenceIdFeature）的vocab_list首元素发生变化。
+**问题描述：** 从0.9.x或1.0.3-1.1.4升级后，序列特征（如SequenceIdFeature）的vocab_list首元素发生变化。
 
 **原因：** 在1.0.3版本中，`SequenceIdFeature`被合并到`IdFeature`（通过设置`sequence_length`），但`IdFeature`的proto `default_value`默认值为`""`，与原`SequenceIdFeature`的默认值`"0"`不同，导致vocab_list首元素从`"0"`变为`""`。1.1.5版本修复了此问题。
 
 **升级指南：**
 
-- **1.0.2及更早版本（含0.9.x）用户：** 可直接升级到1.1.5+，序列特征的`default_value`行为与旧版本一致，无需额外修改。
+- **1.0.2及更早版本（含0.9.x）用户：** 可直接升级到1.0.18或1.1.5+，序列特征的`default_value`行为与旧版本一致，无需额外修改。
 
 - **1.0.3至1.1.4用户：** 升级到1.1.5+后，未显式设置`default_value`的序列特征的vocab_list首元素将从`""`变为`"0"`。如需保持与旧版本完全一致的行为，可通过显式设置`default_bucketize_value`来自行控制vocab_list。
+
+**版本查询方式：**
+
+```bash
+pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+```
