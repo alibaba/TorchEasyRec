@@ -134,7 +134,7 @@ class TokenizeFeature(IdFeature):
         fg_cfg = {
             "feature_type": "tokenize_feature",
             "feature_name": self.config.feature_name,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "vocab_file": self.vocab_file,
             "expression": expression,
             "tokenizer_type": self.config.tokenizer_type,

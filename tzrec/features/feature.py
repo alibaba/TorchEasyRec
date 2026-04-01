@@ -413,6 +413,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._side_inputs = None
         self._vocab_list = None
         self._vocab_dict = None
+        self._default_value = None
         self._is_sequence = is_sequence
         self._is_grouped_seq = False
 
@@ -541,6 +542,21 @@ class BaseFeature(object, metaclass=_meta_cls):
     def is_sequence(self) -> bool:
         """Feature is sequence or not."""
         return self._is_sequence
+
+    @property
+    def default_value(self) -> str:
+        """Effective default value for the feature."""
+        if self._default_value is None:
+            val = self.config.default_value
+            if self.is_sequence and not val:
+                logger.warning(
+                    f"Sequence{self.__class__.__name__}[{self.name}] "
+                    "not support empty default value now. reset to zero."
+                )
+                self._default_value = "0"
+            else:
+                self._default_value = val
+        return self._default_value
 
     @property
     def is_grouped_sequence(self) -> bool:
@@ -933,11 +949,10 @@ class BaseFeature(object, metaclass=_meta_cls):
         fg_cfgs = self._fg_json()
         if self.is_sequence:
             for fg_cfg in fg_cfgs:
-                if fg_cfg.get("default_value", "") == "":
-                    logger.warning(
-                        f"Sequence{self.__class__.__name__}[{self.name}]  "
-                        "not support empty default value now. reset to zero."
-                    )
+                # defensive: sub-feature entries (e.g. text_normalizer in
+                # TokenizeFeature) may not have default_value in their dict,
+                # pyfg asserts non-empty default_value for sequence features.
+                if not fg_cfg.get("default_value"):
                     fg_cfg["default_value"] = "0"
                 if not self._is_grouped_seq:
                     fg_cfg["sequence_delim"] = self.sequence_delim
@@ -999,12 +1014,12 @@ class BaseFeature(object, metaclass=_meta_cls):
                     self._vocab_list = list(self.config.vocab_list)
                 else:
                     vocab_list = list(self.config.vocab_list)
-                    if self.config.default_value in vocab_list:
+                    if self.default_value in vocab_list:
                         logger.warning(
                             f"default_value of {self.__class__.__name__}[{self.name}] "
-                            f"will be mapped to {vocab_list.index(self.config.default_value) + 2} rather than 0"  # NOQA
+                            f"will be mapped to {vocab_list.index(self.default_value) + 2} rather than 0"  # NOQA
                         )
-                    self._vocab_list = [self.config.default_value, "<OOV>"] + vocab_list
+                    self._vocab_list = [self.default_value, "<OOV>"] + vocab_list
             else:
                 self._vocab_list = []
         return self._vocab_list
@@ -1027,13 +1042,13 @@ class BaseFeature(object, metaclass=_meta_cls):
                             f"{self.__class__.__name__}[{self.name}] should "
                             "start from 2. index0 is default_value, index1 is <OOV>."
                         )
-                    if self.config.default_value:
-                        if self.config.default_value in vocab_dict:
+                    if self.default_value:
+                        if self.default_value in vocab_dict:
                             logger.warning(
-                                f"{self.config.default_value} of {self.__class__.__name__}[{self.name}] "  # NOQA
-                                f"will be mapped to 0 rather than {vocab_dict[self.config.default_value]}"  # NOQA
+                                f"{self.default_value} of {self.__class__.__name__}[{self.name}] "  # NOQA
+                                f"will be mapped to 0 rather than {vocab_dict[self.default_value]}"  # NOQA
                             )
-                        vocab_dict[self.config.default_value] = 0
+                        vocab_dict[self.default_value] = 0
                     self._vocab_dict = vocab_dict
             else:
                 self._vocab_dict = {}
