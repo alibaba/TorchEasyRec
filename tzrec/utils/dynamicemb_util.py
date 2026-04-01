@@ -60,6 +60,7 @@ try:
         DynamicEmbScoreStrategy,
         FrequencyAdmissionStrategy,
         KVCounter,
+        align_to_table_size,
         batched_dynamicemb_compute_kernel,
     )
     from dynamicemb.batched_dynamicemb_compute_kernel import (
@@ -83,26 +84,6 @@ try:
     has_dynamicemb = True
 except Exception:
     pass
-
-
-def _next_power_of_2(n: int) -> int:
-    # Handle the case where n is 0
-    if n == 0:
-        return 1
-
-    # If n is already a power of 2, return n
-    if (n & (n - 1)) == 0:
-        return n
-
-    # Find the next power of 2
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32  # This line is necessary for 64-bit integers
-    return n + 1
 
 
 def _build_dynamicemb_initializer(
@@ -180,7 +161,7 @@ def build_dynamicemb_constraints(
 
     init_capacity = None
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
-        init_capacity = _next_power_of_2(dynamicemb_cfg.init_capacity_per_rank)
+        init_capacity = align_to_table_size(dynamicemb_cfg.init_capacity_per_rank)
 
     admission_counter = None
     admit_strategy = None
@@ -195,7 +176,7 @@ def build_dynamicemb_constraints(
             )
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             admission_counter = KVCounter(
-                capacity=_next_power_of_2(int(counter_capacity / world_size)),
+                capacity=align_to_table_size(int(counter_capacity / world_size)),
                 bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
             )
             admit_strategy = FrequencyAdmissionStrategy(
@@ -301,7 +282,7 @@ if has_dynamicemb:
         if cache_ratio is None:
             cache_ratio = 1.0
         return math.ceil(
-            _next_power_of_2(size[0])
+            align_to_table_size(size[0])
             * (
                 _round_up(
                     math.ceil(size[1] * (1 + optimizer_multipler) * element_size),
@@ -372,11 +353,13 @@ if has_dynamicemb:
                     )
                 )
 
-                # align to next_power_of_2
-                num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
+                # align to DEMB_TABLE_ALIGN_SIZE
+                num_aligned_embedding_per_rank = align_to_table_size(shards[0].size[0])
                 num_embeddings_per_shard = shards[0].size[0]
                 if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
-                    num_aligned_embedding_per_rank = dynamicemb_options.bucket_capacity
+                    num_aligned_embedding_per_rank = align_to_table_size(
+                        dynamicemb_options.bucket_capacity
+                    )
                 if num_embeddings_per_shard != num_aligned_embedding_per_rank:
                     dynamicemb_options.num_aligned_embedding_per_rank = (
                         num_aligned_embedding_per_rank
