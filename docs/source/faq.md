@@ -255,9 +255,7 @@ ______________________________________________________________________
       feature_name: "item_id"
       expression: "item:item_id"
       embedding_dim: 16
-      vocab_list: "cat"
-      vocab_list: "dog"
-      vocab_list: "bird"
+      vocab_list: ["cat", "dog", "bird"]
       sequence_length: 50
       sequence_delim: ";"
     }
@@ -272,11 +270,7 @@ ______________________________________________________________________
       feature_name: "item_id"
       expression: "item:item_id"
       embedding_dim: 16
-      vocab_list: ""
-      vocab_list: "<OOV>"
-      vocab_list: "cat"
-      vocab_list: "dog"
-      vocab_list: "bird"
+      vocab_list: ["", "<OOV>", "cat", "dog", "bird"]
       default_bucketize_value: 1
       sequence_length: 50
       sequence_delim: ";"
