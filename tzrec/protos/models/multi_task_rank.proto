@@ -71,6 +71,8 @@ message DlrmHSTU {
     optional bool enable_global_average_loss = 5 [default = true];
     // timestamp of sequence is ascending or descending
     optional bool sequence_timestamp_is_ascending = 6 [default = true];
+    // concat all contextual features on channel dim as one token
+    optional bool concat_contextual_features = 7 [default = false];
 }
 
 message PEPNet {
