@@ -118,8 +118,7 @@ class HSTUMatchUserTower(MatchTowerWoEG):
             grouped_features: dictionary of embedded features from EmbeddingGroup.
 
         Returns:
-            user embeddings. Training: (sum_uih_len, D) jagged, one per position.
-            Inference: (B, D), last position embedding per user.
+            user embeddings of shape (B, D), last position embedding per user.
         """
         # 1. Preprocess: project UIH + optional contextual/actions
         (
@@ -160,9 +159,8 @@ class HSTUMatchUserTower(MatchTowerWoEG):
             seq_timestamps=seq_timestamps,
         )
 
-        if not self.training:
-            # Inference: extract last position embedding per user → (B, D)
-            user_emb = user_emb[seq_offsets[1:] - 1]
+        # Extract last position embedding per user → (B, D)
+        user_emb = user_emb[seq_offsets[1:] - 1]
 
         return user_emb
 
