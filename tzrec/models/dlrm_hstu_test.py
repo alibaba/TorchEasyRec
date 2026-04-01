@@ -45,6 +45,7 @@ def _build_model(
     enable_global_average_loss: bool = False,
     sequence_timestamp_is_ascending: bool = False,
     task_weight: float = 1.0,
+    concat_contextual_features: bool = False,
 ) -> DlrmHSTU:
     """Build a DlrmHSTU model with standard test configuration."""
     feature_cfgs = [
@@ -259,6 +260,7 @@ def _build_model(
             max_seq_len=100,
             enable_global_average_loss=enable_global_average_loss,
             sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
+            concat_contextual_features=concat_contextual_features,
         ),
     )
     dlrm_hstu = DlrmHSTU(
@@ -350,6 +352,7 @@ class DlrmHSTUTest(unittest.TestCase):
         ),
         sequence_timestamp_is_ascending=st.sampled_from([True, False]),
         task_weight=st.sampled_from([1.0, 0.5]),
+        concat_contextual_features=st.sampled_from([True, False]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -365,6 +368,7 @@ class DlrmHSTUTest(unittest.TestCase):
         contextual_group_type,
         sequence_timestamp_is_ascending,
         task_weight,
+        concat_contextual_features,
     ) -> None:
         # JIT_SCRIPT only support PYTORCH kernel now.
         assume(
@@ -380,6 +384,7 @@ class DlrmHSTUTest(unittest.TestCase):
             enable_global_average_loss=enable_global_average_loss,
             sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
             task_weight=task_weight,
+            concat_contextual_features=concat_contextual_features,
         )
         dlrm_hstu.set_kernel(kernel)
         batch = _build_batch(device=device, has_watchtime=has_watchtime)
