@@ -443,9 +443,10 @@ class UnifiedAOTIModelWrapper(nn.Module):
 
         Args:
             data (dict): a dict of input data for Batch.
-            device (torch.device): inference device (unused, baked into AOTI model).
+            device (torch.device): inference device for moving input data.
 
         Return:
             predictions (dict): a dict of predicted result.
         """
+        data = {k: v.to(device, non_blocking=True) for k, v in data.items()}
         return self.model(data)

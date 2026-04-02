@@ -145,42 +145,49 @@ def _build_dynamic_shapes(
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
+    Infers the batch size from a .lengths tensor, then assigns:
+    - batch Dim to tensors whose dim 0 matches the batch size
+    - shared Dims to non-batch tensors with the same dim-0 size (same data group)
+
     Args:
         data: input tensor dict from Batch.to_dict().
 
     Returns:
         dynamic_shapes dict for torch.export.export().
     """
+    # Infer batch size from a .lengths tensor
+    batch_size = None
+    for key, tensor in data.items():
+        if key.endswith(".lengths") and tensor.dim() == 1:
+            batch_size = tensor.size(0)
+            break
+
     batch = torch.export.Dim("batch", min=1, max=499999999)
     dynamic_shapes = {}
+
+    # Group non-batch tensors by dim-0 size — features in the same data group
+    # share the same nnz, so they must share the same Dim.
+    size_to_dim: Dict[int, torch.export.Dim] = {}
+    dim_counter = 0
 
     for key, tensor in data.items():
         if tensor.dim() == 0:
             # Scalar tensors (e.g., batch_size for INPUT_TILE) - no dynamic dims
             continue
-        elif key.endswith(".lengths") or key.endswith(".key_lengths"):
-            # Lengths tensors: (batch,) or (batch * num_features,)
+
+        dim0_size = tensor.size(0)
+
+        if batch_size is not None and dim0_size == batch_size:
+            # Dim 0 matches batch size — use shared batch Dim
             dynamic_shapes[key] = {0: batch}
-        elif key.endswith(".values"):
-            # Could be dense (batch, dim) or sparse (nnz,)
-            if tensor.dim() == 1:
-                # Sparse values: data-dependent size
-                dim_name = key.replace(".", "_").replace("-", "_")
-                dynamic_shapes[key] = {
-                    0: torch.export.Dim(f"nnz_{dim_name}", min=1, max=999999993)
-                }
-            else:
-                # Dense values: (batch, dim) or (batch, seq_len, dim)
-                dynamic_shapes[key] = {0: batch}
-        elif key.endswith(".weights"):
-            # Sparse weights: same size as corresponding .values
-            dim_name = key.replace(".", "_").replace("-", "_")
-            dynamic_shapes[key] = {
-                0: torch.export.Dim(f"nnz_{dim_name}", min=1, max=999999993)
-            }
         else:
-            # Labels, sample_weights, etc.: (batch,) or (batch, dim)
-            dynamic_shapes[key] = {0: batch}
+            # Dim 0 is data-dependent — share Dim with same-sized tensors
+            if dim0_size not in size_to_dim:
+                size_to_dim[dim0_size] = torch.export.Dim(
+                    f"s_{dim_counter}", min=1, max=999999993
+                )
+                dim_counter += 1
+            dynamic_shapes[key] = {0: size_to_dim[dim0_size]}
 
     return dynamic_shapes
 
@@ -228,6 +235,22 @@ def export_unified_model_aot(
         if node.op == "call_function" and node.target in fx_mark_targets:
             full_graph.erase_node(node)
 
+    # Bake device into the graph as a string constant, removing it as an input.
+    # torch.export doesn't support torch.device as input, but the graph's .to()
+    # calls work fine with string device specs like "cuda:0".
+    device_str = str(device)
+    device_node = None
+    for node in full_graph.nodes:
+        if node.op == "placeholder" and node.target == "device":
+            device_node = node
+    if device_node is not None:
+        for user in list(device_node.users):
+            user.args = tuple(device_str if a is device_node else a for a in user.args)
+            user.kwargs = {
+                k: device_str if v is device_node else v for k, v in user.kwargs.items()
+            }
+        full_graph.erase_node(device_node)
+
     full_gm = torch.fx.GraphModule(model, full_graph)
     full_gm.graph.eliminate_dead_code()
     full_gm = _prune_unused_param_and_buffer(full_gm)
@@ -237,8 +260,11 @@ def export_unified_model_aot(
     with open(os.path.join(save_dir, "gm_unified.code"), "w") as f:
         f.write(full_gm.code)
 
+    # Move data to the target device (AOTI models always run on CUDA)
+    data_on_device = {k: v.to(device) for k, v in data.items()}
+
     # Verify the unified model produces correct output
-    result = full_gm(data, device=device)
+    result = full_gm(data_on_device)
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
 
@@ -253,9 +279,8 @@ def export_unified_model_aot(
     ):
         exported_pg = torch.export.export(
             full_gm,
-            args=(data,),
-            kwargs={"device": device},
-            dynamic_shapes={"data": dynamic_shapes},
+            args=(data_on_device,),
+            dynamic_shapes=(dynamic_shapes,),
         )
 
     # Compile with AOTI
