@@ -130,16 +130,6 @@ def export_model_aot(
     return save_dir
 
 
-def _prune_unused_param_and_buffer(
-    gm: torch.fx.GraphModule,
-) -> torch.fx.GraphModule:
-    """Prune unused parameters and buffers in GraphModule."""
-    # Import here to avoid circular dependency
-    from tzrec.utils.export_util import _prune_unused_param_and_buffer
-
-    return _prune_unused_param_and_buffer(gm)
-
-
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
@@ -161,6 +151,12 @@ def _build_dynamic_shapes(
         if key.endswith(".lengths") and tensor.dim() == 1:
             batch_size = tensor.size(0)
             break
+
+    if batch_size is None:
+        raise ValueError(
+            "Cannot infer batch size: no '.lengths' tensor found in input data. "
+            "Unified AOTI export requires at least one sparse/sequence feature."
+        )
 
     batch = torch.export.Dim("batch", min=1, max=499999999)
     dynamic_shapes = {}
@@ -205,12 +201,9 @@ def export_unified_model_aot(
         data (Dict[str, torch.Tensor]): sample input data.
         save_dir (str): model save dir.
     """
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
+    os.makedirs(save_dir, exist_ok=True)
     graph_dir = os.path.join(save_dir, "graph")
-    if not os.path.exists(graph_dir):
-        os.makedirs(graph_dir)
+    os.makedirs(graph_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -234,6 +227,8 @@ def export_unified_model_aot(
     }
     for node in list(full_graph.nodes):
         if node.op == "call_function" and node.target in fx_mark_targets:
+            if node.users:
+                node.replace_all_uses_with(None)
             full_graph.erase_node(node)
 
     # Bake device into the graph as a string constant, removing it as an input.
@@ -254,6 +249,9 @@ def export_unified_model_aot(
 
     full_gm = torch.fx.GraphModule(model, full_graph)
     full_gm.graph.eliminate_dead_code()
+
+    from tzrec.utils.export_util import _prune_unused_param_and_buffer
+
     full_gm = _prune_unused_param_and_buffer(full_gm)
 
     with open(os.path.join(graph_dir, "gm_unified.graph"), "w") as f:
