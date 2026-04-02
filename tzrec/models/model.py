@@ -420,3 +420,32 @@ class CombinedModelWrapper(nn.Module):
         sparse_out, _ = self.sparse_model(data, device)
         outputs = self.dense_model(sparse_out)
         return outputs
+
+
+class UnifiedAOTIModelWrapper(nn.Module):
+    """Model inference wrapper for unified AOTI model (sparse+dense fused).
+
+    Args:
+        model (nn.Module): unified AOTInductor compiled model.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+
+        Args:
+            data (dict): a dict of input data for Batch.
+            device (torch.device): inference device (unused, baked into AOTI model).
+
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        return self.model(data)
