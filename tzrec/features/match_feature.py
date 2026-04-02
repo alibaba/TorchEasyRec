@@ -126,7 +126,7 @@ class MatchFeature(BaseFeature):
             "category": self.config.pkey,
             "item": self.config.skey,
             "matchType": "hit",
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "value_type": "float",
             "needDiscrete": self.config.need_discrete,
             "show_category": self.config.show_pkey,
