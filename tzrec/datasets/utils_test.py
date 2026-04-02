@@ -14,16 +14,14 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from tzrec.datasets.utils import (
     _normalize_type_str,
     calc_remaining_intervals,
     calc_slice_intervals,
     calc_slice_position,
+    combine_neg_as_candidate_sequence,
     get_input_fields_proto,
-    process_hstu_neg_sample,
-    process_hstu_seq_data,
 )
 from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
@@ -206,80 +204,33 @@ class DatasetUtilsTest(unittest.TestCase):
 
         self.assertEqual(total_rows, 400)  # All remaining rows accounted for
 
-    def test_process_hstu_seq_data(self):
-        """Test processing sequence data for HSTU match model."""
-        input_data = {"sequence": pa.array(["1;2;3;4", "5;6;7;8", "9;10;11;12"])}
+    def test_combine_neg_as_candidate_sequence(self):
+        """Test combining positive and negative items into candidate sequences."""
+        pos_data = pa.array(["1", "2", "3"])
+        neg_data = pa.array(["101", "102", "103", "104", "105", "106"])
 
-        split, slice_result, training_seq = process_hstu_seq_data(
-            input_data=input_data, seq_attr="sequence", seq_str_delim=";"
-        )
-
-        # Verify results
-        # Test original split sequences
-        expected_split_values = [
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-            "7",
-            "8",
-            "9",
-            "10",
-            "11",
-            "12",
-        ]
-        self.assertEqual(pc.list_flatten(split).to_pylist(), expected_split_values)
-
-        # Test sliced sequences (target items)
-        expected_slice_values = ["2", "3", "4", "6", "7", "8", "10", "11", "12"]
-        self.assertEqual(slice_result.to_pylist(), expected_slice_values)
-
-        # Test training sequences
-        expected_training_seqs = ["1;2;3", "5;6;7", "9;10;11"]
-        self.assertEqual(training_seq.to_pylist(), expected_training_seqs)
-
-    def test_process_hstu_neg_sample(self):
-        """Test processing negative samples for HSTU match model."""
-        input_data = {"sequence": pa.array(["1", "2", "3"])}
-        neg_samples = pa.array(["101", "102", "103", "104", "105", "106"])
-
-        result = process_hstu_neg_sample(
-            input_data=input_data,
-            v=neg_samples,
+        result = combine_neg_as_candidate_sequence(
+            pos_data=pos_data,
+            neg_data=neg_data,
             neg_sample_num=2,
-            seq_str_delim=";",
-            seq_attr="sequence",
+            seq_delim=";",
         )
+        expected = ["1;101;102", "2;103;104", "3;105;106"]
+        self.assertEqual(result.to_pylist(), expected)
 
-        expected_results = [
-            "1;101;102",
-            "2;103;104",
-            "3;105;106",
-        ]
-        self.assertEqual(result.to_pylist(), expected_results)
+    def test_combine_neg_as_candidate_sequence_different_delim(self):
+        """Test candidate sequence combination with different delimiter."""
+        pos_data = pa.array(["1", "2"])
+        neg_data = pa.array(["10", "20", "30", "40"])
 
-    def test_process_hstu_neg_sample_with_different_delim(self):
-        """Test negative sampling with different delimiter."""
-        input_data = {"sequence": pa.array(["1", "2", "3"])}
-
-        neg_samples = pa.array(["101", "102", "103", "104", "105", "106"])
-
-        result = process_hstu_neg_sample(
-            input_data=input_data,
-            v=neg_samples,
+        result = combine_neg_as_candidate_sequence(
+            pos_data=pos_data,
+            neg_data=neg_data,
             neg_sample_num=2,
-            seq_str_delim="|",
-            seq_attr="sequence",
+            seq_delim="|",
         )
-
-        expected_results = [
-            "1|101|102",
-            "2|103|104",
-            "3|105|106",
-        ]
-        self.assertEqual(result.to_pylist(), expected_results)
+        expected = ["1|10|20", "2|30|40"]
+        self.assertEqual(result.to_pylist(), expected)
 
     def test_normalize_type_str_basic_types(self):
         """Test normalizing basic types."""

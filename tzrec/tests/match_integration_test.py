@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
+from tzrec.utils.test_util import gpu_unavailable
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -431,6 +432,7 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
+    @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_fg_mock.config",
