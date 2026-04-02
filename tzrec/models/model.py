@@ -448,5 +448,7 @@ class UnifiedAOTIModelWrapper(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
+        # Sort keys to match the export-time dict order (pytree spec)
+        data = OrderedDict(sorted(data.items()))
         data = {k: v.to(device, non_blocking=True) for k, v in data.items()}
         return self.model(data)

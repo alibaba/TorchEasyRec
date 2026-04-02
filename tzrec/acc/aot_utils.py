@@ -173,6 +173,7 @@ def _build_dynamic_shapes(
     for key, tensor in data.items():
         if tensor.dim() == 0:
             # Scalar tensors (e.g., batch_size for INPUT_TILE) - no dynamic dims
+            dynamic_shapes[key] = {}
             continue
 
         dim0_size = tensor.size(0)
