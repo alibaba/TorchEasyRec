@@ -1206,43 +1206,51 @@ def predict(
     forward_t_list = []
     write_t = None
     i_step = 0
-    while True:
-        try:
-            batch = next(infer_iterator)
+    try:
+        while True:
+            try:
+                batch = next(infer_iterator)
 
-            if i_step == 0:
-                # lazy init writer and create write and forward thread
-                predictions, reserves = _forward(batch)
-                if output_cols is None:
-                    output_cols = sorted(predictions.keys())
-                _write_predictions(writer, predictions, reserves, output_cols)
-                for _ in range(predict_threads):
-                    t = Thread(target=_forward_loop)
+                if i_step == 0:
+                    # lazy init writer and create write and forward thread
+                    predictions, reserves = _forward(batch)
+                    if output_cols is None:
+                        output_cols = sorted(predictions.keys())
+                    _write_predictions(writer, predictions, reserves, output_cols)
+                    for _ in range(predict_threads):
+                        t = Thread(target=_forward_loop)
+                        t.start()
+                        forward_t_list.append(t)
+                    t = Thread(target=_write_loop, args=(output_cols,))
                     t.start()
-                    forward_t_list.append(t)
-                write_t = Thread(target=_write_loop, args=(output_cols,))
-                write_t.start()
-            else:
-                data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
+                    write_t = t
+                else:
+                    data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
 
-            if is_local_rank_zero:
-                plogger.log(i_step)
-            if is_profiling:
-                prof.step()
-            i_step += 1
-            if predict_steps is not None and i_step >= predict_steps:
+                if is_local_rank_zero:
+                    plogger.log(i_step)
+                if is_profiling:
+                    prof.step()
+                i_step += 1
+                if predict_steps is not None and i_step >= predict_steps:
+                    break
+            except StopIteration:
                 break
-        except StopIteration:
-            break
-
-    for _ in range(predict_threads):
-        data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
-    for t in forward_t_list:
-        t.join()
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+    finally:
+        for _ in range(len(forward_t_list)):
+            try:
+                data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception:
+                pass
+        for t in forward_t_list:
+            t.join()
+        if write_t is not None:
+            try:
+                pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception:
+                pass
+            write_t.join()
+        writer.close()
 
     if is_profiling:
         prof.stop()
@@ -1410,33 +1418,42 @@ def predict_checkpoint(
     if is_local_rank_zero:
         plogger = ProgressLogger(desc=f"Predicting{desc_suffix}")
 
+    write_t = None
     with torch.no_grad():
         i_step = 0
-        for i_step in step_iter:
-            try:
-                predictions, batch = pipeline.progress(iterator)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                if i_step == 0:
-                    # lazy init writer and create write thread
-                    output_cols = sorted(predictions.keys())
-                    _write_predictions(writer, predictions, batch.reserves, output_cols)
-                    write_t = Thread(target=_write_loop, args=(output_cols,))
-                    write_t.start()
-                elif not batch.dummy:
-                    pred_queue.put(
-                        (predictions, batch.reserves), timeout=PREDICT_QUEUE_TIMEOUT
-                    )
-                if plogger and i_step % 100 == 0:
-                    plogger.log(i_step)
-            except StopIteration:
-                break
-        if plogger is not None:
-            plogger.log(i_step)
-
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+        try:
+            for i_step in step_iter:
+                try:
+                    predictions, batch = pipeline.progress(iterator)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    if i_step == 0:
+                        # lazy init writer and create write thread
+                        output_cols = sorted(predictions.keys())
+                        _write_predictions(
+                            writer, predictions, batch.reserves, output_cols
+                        )
+                        t = Thread(target=_write_loop, args=(output_cols,))
+                        t.start()
+                        write_t = t
+                    elif not batch.dummy:
+                        pred_queue.put(
+                            (predictions, batch.reserves),
+                            timeout=PREDICT_QUEUE_TIMEOUT,
+                        )
+                    if plogger and i_step % 100 == 0:
+                        plogger.log(i_step)
+                except StopIteration:
+                    break
+            if plogger is not None:
+                plogger.log(i_step)
+        finally:
+            if write_t is not None:
+                try:
+                    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+                except Exception:
+                    pass
+                write_t.join()
+            writer.close()
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")
