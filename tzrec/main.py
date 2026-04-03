@@ -265,10 +265,16 @@ def _log_train(
                 summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
 
         if "global_gradient_norm" in tb_summaries:
-            global_grad_norm = torch.nn.utils.get_total_norm(
-                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
-            )
-            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+            grads = [
+                p.grad
+                for p in params.values()
+                if p.grad is not None and not isinstance(p, ShardedTensor)
+            ]
+            if grads:
+                global_grad_norm = torch.nn.utils.get_total_norm(grads)
+                summary_writer.add_scalar(
+                    "global_gradient_norm", global_grad_norm, step
+                )
 
         if (
             "gradient_norm" in tb_summaries
@@ -292,11 +298,11 @@ def _log_train(
                         summary_writer.add_histogram(
                             tag=name, values=param, global_step=step
                         )
-                    if "gradient" in tb_summaries:
+                    if "gradient" in tb_summaries and param.grad is not None:
                         summary_writer.add_histogram(
                             tag=f"{name}/gradient", values=param.grad, global_step=step
                         )
-                    if "gradient_norm" in tb_summaries:
+                    if "gradient_norm" in tb_summaries and param.grad is not None:
                         grad_norm = torch.norm(param.grad)
                         summary_writer.add_scalar(
                             tag=f"{name}/gradient_norm",
@@ -1061,8 +1067,7 @@ def predict(
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
 
-    device_and_backend = init_process_group()
-    device: torch.device = device_and_backend[0]
+    device, backend = init_process_group()
 
     fs, local_path = url_to_fs(scripted_model_path)
     if fs is not None:
@@ -1079,6 +1084,9 @@ def predict(
     )
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
+
+    train_config = pipeline_config.train_config
+    acc_utils.allow_tf32(train_config, backend)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)

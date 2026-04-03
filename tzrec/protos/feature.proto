@@ -300,6 +300,70 @@ message ComboFeature {
     repeated string sequence_fields = 103;
 }
 
+message CombineFeature {
+    // feature name, e.g. tag_feat
+    required string feature_name = 1;
+    // feature input, e.g. user:tag
+    required string expression = 2;
+    // embedding name, feature with same embedding name will share embedding
+    optional string embedding_name = 3;
+    // embedding dimension
+    optional uint32 embedding_dim = 4;
+    // value map for mapping input string values to float values
+    map<string, float> value_map = 6;
+    // boundaries for bucktize numeric combine value
+    repeated float boundaries = 7;
+    // number of id enumerators for sparse combine value
+    optional uint64 num_buckets = 8;
+    // embedding pooling type, available is {sum | mean}. Controls embedding bag aggregation.
+    // NOTE: distinct from 'combiner' which controls FG-level multi-value aggregation.
+    optional string pooling = 11 [default = "sum"];
+    // fg default value, default value before bucktize
+    optional string default_value = 12 [default = ""];
+    // fg multi-value separator
+    optional string separator = 13 [default = "\x1d"];
+    // fg normalizer, e.g.
+    // method=log10,threshold=1e-10,default=-10
+    // method=zscore,mean=0.0,standard_deviation=10.0
+    // method=minmax,min=2.1,max=2.2
+    // method=expression,expr=sign(x)
+    optional string normalizer = 14;
+    // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
+    optional string init_fn = 15;
+    // mask value in training progress
+    optional bool use_mask = 16;
+    // combine value combiner type, available is {sum | mean | min | max}
+    // Controls FG-level multi-value aggregation before bucketization.
+    optional string combiner = 22 [default = "sum"];
+
+    // default value when fg_mode = FG_NONE,
+    // when use pai-fg, you do not need to set the param.
+    // when use own fg and data contain null value, you can set the param for fill null
+    optional string fg_encoded_default_value = 30;
+    // embedding param trainable or not
+    optional bool trainable = 33 [default = true];
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+    // embedding data type
+    optional string data_type = 35 [default = 'FP32'];
+
+    oneof dense_emb {
+        // autodis embedding
+        AutoDisEmbedding autodis = 40;
+        // mlp embedding
+        MLPEmbedding mlp = 41;
+    }
+    // embedding param constraints
+    optional ParameterConstraints embedding_constraints = 50;
+
+    // max sequence length, only take effect when use it as sequence
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+    // specify sequence type fields in inputs. default is item side inputs.
+    repeated string sequence_fields = 103;
+}
+
 message LookupFeature {
     // feature name, e.g. kv_os_click_count
     required string feature_name = 1;
@@ -923,6 +987,7 @@ message FeatureConfig {
         CustomFeature custom_feature = 10;
         KvDotProduct kv_dot_product = 11;
         BoolMaskFeature bool_mask_feature = 12;
+        CombineFeature combine_feature = 13;
 
         IdFeature sequence_id_feature = 101;
         RawFeature sequence_raw_feature = 102;
@@ -935,6 +1000,7 @@ message FeatureConfig {
         CustomFeature sequence_custom_feature = 110;
         KvDotProduct sequence_kv_dot_product = 111;
         BoolMaskFeature sequence_bool_mask_feature = 112;
+        CombineFeature sequence_combine_feature = 113;
     }
 }
 
@@ -952,5 +1018,6 @@ message SeqFeatureConfig {
         CustomFeature custom_feature = 10;
         KvDotProduct kv_dot_product = 11;
         BoolMaskFeature bool_mask_feature = 12;
+        CombineFeature combine_feature = 13;
     }
 }

@@ -534,6 +534,14 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
         )
+
+        # set tf32 config for consistent TRT comparison
+        test_config_path = os.path.join(self.test_dir, "pipeline.config")
+        pipeline_config = config_util.load_pipeline_config(test_config_path)
+        pipeline_config.train_config.cudnn_allow_tf32 = True
+        pipeline_config.train_config.cuda_matmul_allow_tf32 = True
+        config_util.save_message(pipeline_config, test_config_path)
+
         trt_dir = os.path.join(self.test_dir, "trt")
         input_tile_trt_dir = os.path.join(self.test_dir, "input_tile_trt")
         input_tile_emb_trt_dir = os.path.join(self.test_dir, "input_tile_emb_trt")

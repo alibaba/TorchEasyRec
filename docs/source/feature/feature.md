@@ -1,6 +1,6 @@
 # 特征
 
-TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、CustomFeature、SequenceFeature。
+TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、CombineFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、CustomFeature、SequenceFeature。
 
 **共用配置**
 
@@ -236,6 +236,55 @@ feature_configs {
 
 - expression: 特征FG所依赖组合字段的来源，数量 >= 2
 - 其余配置同IdFeature，NOTE: ComboFeature不包含`num_buckets`配置
+
+## CombineFeature: 组合映射特征
+
+通过`value_map`映射输入值到浮点值，支持离散（sparse）和连续（dense）两种输出模式。当设置了`boundaries`或`num_buckets`分箱配置时为离散输出，否则为连续输出。
+
+注意: CombineFeature不支持`hash_bucket_size`、`zch`、`dynamicemb`、`vocab_list`、`vocab_dict`、`vocab_file`配置，仅支持`num_buckets`和`boundaries`两种离散化方式。
+
+**输入示例**
+
+| 字段   | 值              | 说明                                                |
+| ------ | --------------- | --------------------------------------------------- |
+| tag    | "tag1\\x1dtag2" | 多值输入，通过value_map分别映射为1.0和2.0后聚合     |
+| weight | "1.5\\x1d2.5"   | 不使用value_map时，多值连续值输入，通过combiner聚合 |
+
+使用`value_map`和`num_buckets`的离散化用法：
+
+```
+feature_configs {
+    combine_feature {
+        feature_name: "tag_feat"
+        expression: "user:tag"
+        embedding_dim: 16
+        num_buckets: 100
+        combiner: "sum"
+        value_map: [{key:"tag1" value:1.0}, {key:"tag2" value:2.0}]
+    }
+}
+```
+
+不使用`value_map`的连续值用法：
+
+```
+feature_configs {
+    combine_feature {
+        feature_name: "weight_list"
+        expression: "user:weight"
+        boundaries: [0.1, 0.5, 1.0, 2.0, 5.0]
+        embedding_dim: 8
+        combiner: "sum"
+    }
+}
+```
+
+- **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
+- **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
+- **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`/`min`/`max`
+- **num_buckets**: 离散化桶数量，设置后输出为离散整数值（value_type为int64），值范围为\[0, num_buckets)
+- **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
+- **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
 
 ## LookupFeature: 字典查询特征
 
@@ -686,6 +735,16 @@ feature_configs {
                 boundaries: [0, 1, 2, 3, 4]
             }
         }
+        features {
+            combine_feature {
+                feature_name: "event_type"
+                expression: "user:event"
+                embedding_dim: 16
+                num_buckets: 10
+                combiner: "sum"
+                value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+            }
+        }
     }
 }
 ```
@@ -766,6 +825,18 @@ feature_configs {
                 }
             }
         }
+    }
+}
+feature_configs {
+    sequence_combine_feature {
+        feature_name: "event_list"
+        expression: "user:event"
+        embedding_dim: 16
+        num_buckets: 10
+        combiner: "sum"
+        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+        sequence_length: 50
+        sequence_delim: ";"
     }
 }
 ```
