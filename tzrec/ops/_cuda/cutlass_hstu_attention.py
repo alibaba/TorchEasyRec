@@ -18,6 +18,7 @@ from hstu_attn import hstu_attn_varlen_func
 logger = logging.getLogger(__name__)
 
 _triton_fallback_warned = False
+_cached_fallback_warned = False
 
 
 def _needs_triton_fallback(
@@ -152,6 +153,14 @@ def cutlass_cached_hstu_mha(
     Falls back to Triton implementation since the CUTLASS kernel does not
     support the delta-query pattern with separate q/k sequence lengths.
     """
+    global _cached_fallback_warned
+    if not _cached_fallback_warned:
+        logger.warning(
+            "CUTLASS kernel does not support cached/delta attention, "
+            "falling back to Triton kernel."
+        )
+        _cached_fallback_warned = True
+
     from tzrec.ops._triton.triton_hstu_attention import triton_cached_hstu_mha
 
     return triton_cached_hstu_mha(
