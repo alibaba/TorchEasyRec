@@ -487,6 +487,69 @@ class HSTUAttentionTest(unittest.TestCase):
             real_delta_out,
         )
 
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(4, 8),
+        heads=st.integers(1, 4),
+        max_uih_len=st.sampled_from([20, 100, 128, 256]),
+        max_targets=st.sampled_from([20, 512]),
+        attn_dim=st.sampled_from([32, 64, 128]),
+        causal=st.sampled_from([True]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
+        has_max_attn_len=st.sampled_from([True, False]),
+        contextual_seq_len=st.sampled_from([0, 10]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_attn_cutlass(self, *args, **kwargs) -> None:
+        hidden_dim = kwargs.pop("attn_dim")
+        test_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            test_backward=True,
+            ref_kernel=Kernel.PYTORCH,
+            real_kernel=Kernel.CUTLASS,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(4, 8),
+        heads=st.integers(1, 4),
+        max_uih_len=st.sampled_from([100, 128, 256]),
+        max_targets=st.sampled_from([20, 512]),
+        delta_size=st.sampled_from([20, 512]),
+        attn_dim=st.sampled_from([32, 64, 128]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
+        has_max_attn_len=st.sampled_from([False, True]),
+        contextual_seq_len=st.sampled_from([0, 10]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_delta_attn_cutlass(self, *args, **kwargs) -> None:
+        hidden_dim = kwargs.pop("attn_dim")
+        test_delta_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            ref_kernel=Kernel.PYTORCH,
+            real_kernel=Kernel.CUTLASS,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

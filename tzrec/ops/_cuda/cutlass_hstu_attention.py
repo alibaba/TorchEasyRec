@@ -1,0 +1,90 @@
+# Copyright (c) 2025, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Optional
+
+import torch
+from hstu_attn import hstu_attn_varlen_func
+
+
+@torch.fx.wrap
+def cutlass_hstu_mha(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    causal: bool = True,
+    num_targets: Optional[torch.Tensor] = None,
+    max_attn_len: int = 0,
+    contextual_seq_len: int = 0,
+) -> torch.Tensor:
+    """CUTLASS-based HSTU multi-head attention.
+
+    Args:
+        max_seq_len: maximum sequence length in the batch.
+        alpha: scaling factor for attention scores.
+        q: query tensor of shape (total, nheads, attn_dim).
+        k: key tensor of shape (total, nheads, attn_dim).
+        v: value tensor of shape (total, nheads, hidden_dim).
+        seq_offsets: cumulative sequence offsets of shape (batch_size + 1,).
+        causal: whether to apply causal masking.
+        num_targets: number of target tokens per batch element.
+        max_attn_len: maximum attention window length (0 means unlimited).
+        contextual_seq_len: number of contextual tokens per sequence.
+
+    Returns:
+        output tensor of shape (total, nheads, hidden_dim).
+    """
+    if q.shape[2] != v.shape[2]:
+        raise ValueError(
+            f"CUTLASS hstu_attn requires attention_dim == hidden_dim, "
+            f"got q.shape[2]={q.shape[2]} != v.shape[2]={v.shape[2]}"
+        )
+
+    cu_seqlens = seq_offsets.to(torch.int32)
+
+    if causal:
+        if max_attn_len > 0:
+            window_size = (max_attn_len, 0)
+        else:
+            window_size = (-1, 0)
+    else:
+        window_size = (-1, -1)
+
+    num_contexts = None
+    if contextual_seq_len > 0:
+        batch_size = seq_offsets.size(0) - 1
+        num_contexts = torch.full(
+            (batch_size,),
+            contextual_seq_len,
+            dtype=torch.int32,
+            device=q.device,
+        )
+
+    if num_targets is not None:
+        num_targets = num_targets.to(torch.int32)
+
+    return hstu_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seq_len,
+        max_seq_len,
+        num_contexts=num_contexts,
+        num_targets=num_targets,
+        window_size=window_size,
+        alpha=alpha,
+        scaling_seqlen=max_seq_len,
+    )
