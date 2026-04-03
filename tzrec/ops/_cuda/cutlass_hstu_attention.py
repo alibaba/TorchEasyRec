@@ -9,10 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Optional
 
 import torch
 from hstu_attn import hstu_attn_varlen_func
+
+logger = logging.getLogger(__name__)
+
+_triton_fallback_warned = False
 
 
 def _needs_triton_fallback(
@@ -25,9 +30,18 @@ def _needs_triton_fallback(
     The CUTLASS kernel does not support combining local window attention
     (max_attn_len > 0) with context or target masking.
     """
+    global _triton_fallback_warned
     has_local_window = max_attn_len > 0
     has_context_or_target = contextual_seq_len > 0 or num_targets is not None
-    return has_local_window and has_context_or_target
+    needs_fallback = has_local_window and has_context_or_target
+    if needs_fallback and not _triton_fallback_warned:
+        logger.warning(
+            "CUTLASS kernel does not support combining local window attention "
+            "(max_attn_len > 0) with context/target masking, "
+            "falling back to Triton kernel."
+        )
+        _triton_fallback_warned = True
+    return needs_fallback
 
 
 @torch.fx.wrap
