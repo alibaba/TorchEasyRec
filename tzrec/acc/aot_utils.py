@@ -132,25 +132,34 @@ def export_model_aot(
 
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
-) -> tuple:
+    features: Any,
+) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
-    Uses key-suffix structural knowledge to classify tensors:
+    Uses structural knowledge from feature metadata and key suffixes:
     - .lengths → batch dim (always)
-    - .values with a matching .lengths sibling → data-dependent (own Dim)
+    - .values where all lengths==1 (single-value feature) → batch dim
+    - .values where lengths vary (multi-value/sequence) → data-dependent Dim,
+      grouped by (data_group, sequence_name) from feature metadata
     - .values without a .lengths sibling → batch dim (dense feature)
-    - .weights → data-dependent (own Dim)
-    - .key_lengths → data-dependent (own Dim)
+    - .weights → shares Dim with corresponding .values (same prefix)
+    - .key_lengths → data-dependent (own Dim per data_group)
     - scalars → no dynamic dims
     - everything else (labels, sample_weights) → batch dim
 
     Args:
         data: input tensor dict from Batch.to_dict().
+        features: list of BaseFeature from model._features.
 
     Returns:
-        Tuple of (dynamic_shapes dict, dim_name_map dict) where dim_name_map
-        maps Dim name strings to Dim objects for constraint resolution.
+        dynamic_shapes dict for torch.export.export().
     """
+    # Build feature name → data_group for sparse features.
+    feature_to_data_group: Dict[str, str] = {}
+    for feat in features:
+        if hasattr(feat, "data_group") and hasattr(feat, "name") and feat.is_sparse:
+            feature_to_data_group[feat.name] = feat.data_group
+
     # Collect prefixes that have a .lengths sibling — these are sparse/sequence
     lengths_prefixes = set()
     for key in data:
@@ -163,10 +172,34 @@ def _build_dynamic_shapes(
             "Unified AOTI export requires at least one sparse/sequence feature."
         )
 
+    # Classify each feature with a .lengths sibling:
+    # - single-value: all lengths == 1, so nnz == batch_size (structural guarantee)
+    # - multi-value: varying lengths, group by (data_group, lengths_content)
+    #   Features in the same KJT (data_group) with identical per-sample lengths
+    #   share a Dim — they're in the same sequence and always have the same nnz.
+    single_value_prefixes = set()
+    prefix_to_lengths_group: Dict[str, str] = {}
+
+    for key, tensor in data.items():
+        if not key.endswith(".lengths"):
+            continue
+        prefix = key[: -len(".lengths")]
+        if tensor.dim() == 1 and torch.all(tensor == 1).item():
+            single_value_prefixes.add(prefix)
+        else:
+            data_group = feature_to_data_group.get(prefix, prefix)
+            lengths_sig = tuple(tensor.tolist())
+            prefix_to_lengths_group[prefix] = f"{data_group}:{lengths_sig}"
+
     batch = torch.export.Dim("batch", min=1, max=499999999)
     dynamic_shapes = {}
-    dim_name_map: Dict[str, torch.export.Dim] = {"batch": batch}
+
+    # Shared Dims for features with matching (data_group, lengths) patterns
+    group_to_dim: Dict[str, torch.export.Dim] = {}
     dim_counter = 0
+
+    # Track prefix → Dim so .weights can share with .values
+    prefix_to_dim: Dict[str, torch.export.Dim] = {}
 
     for key, tensor in data.items():
         if tensor.dim() == 0:
@@ -184,71 +217,45 @@ def _build_dynamic_shapes(
         is_sparse_weights = key.endswith(".weights") and prefix in lengths_prefixes
         is_key_lengths = key.endswith(".key_lengths")
 
-        if is_sparse_values or is_sparse_weights or is_key_lengths:
-            # Data-dependent dim — each gets its own independent Dim
-            dim_name = f"s_{dim_counter}"
-            dim = torch.export.Dim(dim_name, min=1, max=999999993)
+        if is_sparse_values:
+            if prefix in single_value_prefixes:
+                # Single-value feature: nnz always equals batch_size
+                dynamic_shapes[key] = {0: batch}
+                prefix_to_dim[prefix] = batch
+            else:
+                # Multi-value / sequence: group by (data_group, lengths)
+                group = prefix_to_lengths_group.get(prefix, prefix)
+                if group not in group_to_dim:
+                    group_to_dim[group] = torch.export.Dim(
+                        f"g_{dim_counter}", min=1, max=999999993
+                    )
+                    dim_counter += 1
+                dim = group_to_dim[group]
+                dynamic_shapes[key] = {0: dim}
+                prefix_to_dim[prefix] = dim
+        elif is_sparse_weights:
+            # Share Dim with the corresponding .values (same prefix, same nnz)
+            dim = prefix_to_dim.get(prefix)
+            if dim is None:
+                dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
+                dim_counter += 1
+                prefix_to_dim[prefix] = dim
             dynamic_shapes[key] = {0: dim}
-            dim_name_map[dim_name] = dim
-            dim_counter += 1
+        elif is_key_lengths:
+            # Multi-value sequence key_lengths: data-dependent, own Dim
+            group = prefix_to_lengths_group.get(prefix, prefix)
+            kl_group = f"kl_{group}"
+            if kl_group not in group_to_dim:
+                group_to_dim[kl_group] = torch.export.Dim(
+                    f"g_{dim_counter}", min=1, max=999999993
+                )
+                dim_counter += 1
+            dynamic_shapes[key] = {0: group_to_dim[kl_group]}
         else:
             # Batch dim: .lengths, dense .values, labels, sample_weights, etc.
             dynamic_shapes[key] = {0: batch}
 
-    return dynamic_shapes, dim_name_map
-
-
-def _apply_suggested_dim_fixes(
-    dynamic_shapes: Dict[str, Dict[int, torch.export.Dim]],
-    dim_name_map: Dict[str, torch.export.Dim],
-    error_msg: str,
-) -> bool:
-    """Parse torch.export constraint violation and merge Dims as suggested.
-
-    When torch.export detects that two independently-named Dims must always be
-    equal (e.g., features in the same data group share nnz), it emits
-    "Suggested fixes:" with lines like "s_0 = s_1". This function parses
-    those lines and merges the Dims in dynamic_shapes.
-
-    Args:
-        dynamic_shapes: the dynamic shapes dict to modify in-place.
-        dim_name_map: mapping from Dim name string to Dim object.
-        error_msg: the UserError message from torch.export.
-
-    Returns True if any fixes were applied, False otherwise.
-    """
-    import re
-
-    # Extract suggested fixes section
-    fixes_match = re.search(r"Suggested fixes:\s*\n((?:\s+\S+ = \S+\n?)+)", error_msg)
-    if not fixes_match:
-        return False
-
-    fixes_text = fixes_match.group(1)
-    # Parse lines like "  s_0 = s_1"
-    fix_pairs = re.findall(r"(\S+)\s*=\s*(\S+)", fixes_text)
-    if not fix_pairs:
-        return False
-
-    # For each fix pair, replace all occurrences of dim_b with dim_a
-    applied = False
-    for dim_name_a, dim_name_b in fix_pairs:
-        dim_a = dim_name_map.get(dim_name_a)
-        dim_b = dim_name_map.get(dim_name_b)
-        if dim_a is None or dim_b is None:
-            continue
-        if dim_a is dim_b:
-            continue
-        # Replace dim_b with dim_a everywhere
-        for key in dynamic_shapes:
-            for axis, dim in list(dynamic_shapes[key].items()):
-                if dim is dim_b:
-                    dynamic_shapes[key][axis] = dim_a
-                    applied = True
-        # Update mapping so chained fixes work (s_0 = s_1, s_1 = s_2)
-        dim_name_map[dim_name_b] = dim_a
-
-    return applied
+    return dynamic_shapes
 
 
 def export_unified_model_aot(
@@ -329,38 +336,19 @@ def export_unified_model_aot(
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
 
-    # Build dynamic shapes for the full input
-    dynamic_shapes, dim_name_map = _build_dynamic_shapes(data)
+    # Build dynamic shapes using feature metadata for correct Dim grouping
+    dynamic_shapes = _build_dynamic_shapes(data, features=model._features)
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
-    # Export with torch.export, retrying if constraint violations suggest
-    # merging Dims (features in the same data group share nnz).
+    # Export with torch.export
     logger.info("exporting unified model with torch.export...")
-    max_retries = 5
-    exported_pg = None
-    for attempt in range(max_retries):
-        try:
-            with torch._inductor.config.patch(
-                {"unsafe_ignore_unsupported_triton_autotune_args": True}
-            ):
-                exported_pg = torch.export.export(
-                    full_gm,
-                    args=(data_on_device,),
-                    dynamic_shapes=(dynamic_shapes,),
-                )
-            break
-        except torch._dynamo.exc.UserError as e:
-            error_msg = str(e)
-            if _apply_suggested_dim_fixes(dynamic_shapes, dim_name_map, error_msg):
-                logger.info(
-                    "Applied suggested Dim fixes (attempt %d), retrying export...",
-                    attempt + 1,
-                )
-            else:
-                raise
-    if exported_pg is None:
-        raise RuntimeError(
-            f"torch.export failed after {max_retries} constraint resolution attempts"
+    with torch._inductor.config.patch(
+        {"unsafe_ignore_unsupported_triton_autotune_args": True}
+    ):
+        exported_pg = torch.export.export(
+            full_gm,
+            args=(data_on_device,),
+            dynamic_shapes=(dynamic_shapes,),
         )
 
     # Compile with AOTI
