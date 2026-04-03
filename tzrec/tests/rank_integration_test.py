@@ -510,13 +510,15 @@ class RankIntegrationTest(unittest.TestCase):
 
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
+            os.path.exists(
+                os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2")
+            )
         )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
@@ -930,6 +932,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="ENABLE_AOT=1",
+                hstu_item_id="cand_seq__video_id",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
@@ -953,8 +956,21 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
+        # Verify model_acc.json contains HSTU-related fields
+        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
+        self.assertTrue(os.path.exists(model_acc_path))
+        with open(model_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq__video_id")
+            self.assertEqual(acc_cfg["hstu_kernel"], "triton")
+            self.assertEqual(acc_cfg["ENABLE_AOT"], "1")
+        # Verify output_field_names.json is created for AOT export
+        output_names_path = os.path.join(
+            self.test_dir, "export/aoti/output_field_names.json"
+        )
+        self.assertTrue(os.path.exists(output_names_path))
 
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
@@ -1039,8 +1055,16 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="MAX_EXPORT_BATCH_SIZE=1 USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",  # NOQA
+                hstu_item_id="cand_seq_video_id",
             )
         self.assertTrue(self.success)
+        # Verify model_acc.json contains HSTU-related fields
+        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
+        self.assertTrue(os.path.exists(model_acc_path))
+        with open(model_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq_video_id")
+            self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
 
 
 if __name__ == "__main__":
