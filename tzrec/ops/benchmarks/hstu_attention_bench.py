@@ -44,6 +44,8 @@ def _get_kernel(provider: str) -> Kernel:
         return Kernel.TRITON
     elif provider == "pytorch":
         return Kernel.PYTORCH
+    elif provider == "cutlass":
+        return Kernel.CUTLASS
     else:
         raise ValueError(f"Unknown provider {provider}")
 
@@ -93,6 +95,7 @@ def _flops(
 @click.option("--bench-backward", type=bool, default=True)
 @click.option("--bench-forward", type=bool, default=True)
 @click.option("--bench-pytorch", type=bool, default=False)
+@click.option("--bench-cutlass", type=bool, default=False)
 @click.option("--report-flops", type=bool, default=False)
 @click.option("--return-result", type=bool, default=False)
 @click.option("--max-attn-len", type=int, default=0)
@@ -112,6 +115,7 @@ def main(  # noqa: C901
     bench_backward: bool,
     bench_forward: bool,
     bench_pytorch: bool,
+    bench_cutlass: bool,
     report_flops: bool,
     return_result: bool,
     max_attn_len: int,
@@ -132,6 +136,10 @@ def main(  # noqa: C901
     line_vals = ["triton"]
     line_names = ["Triton"]
     styles = [("red", "-")]
+    if bench_cutlass:
+        line_vals.append("cutlass")
+        line_names.append("CUTLASS")
+        styles.append(("blue", "-"))
     if bench_pytorch:
         line_vals.append("pytorch")
         line_names.append("PyTorch")
@@ -252,7 +260,7 @@ def main(  # noqa: C901
             q = q.requires_grad_(True)
             k = k.requires_grad_(True)
             v = v.requires_grad_(True)
-        assert provider in ["triton", "pytorch"]
+        assert provider in ["triton", "pytorch", "cutlass"]
         if has_delta_q:
             fn = lambda: delta_hstu_mha(  # noqa E731
                 max_seq_len=seq_len,
