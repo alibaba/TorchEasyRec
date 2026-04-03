@@ -13,6 +13,7 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
+import logging
 from typing import Optional
 
 import torch
@@ -24,6 +25,11 @@ from tzrec.ops._pytorch.pt_hstu_attention import (
     pytorch_hstu_mha,
 )
 from tzrec.ops.utils import switch_to_contiguous_if_needed
+
+logger = logging.getLogger(__name__)
+
+_cutlass_local_window_fallback_warned = False
+_cutlass_cached_fallback_warned = False
 
 
 def hstu_mha(
@@ -70,6 +76,22 @@ def hstu_mha(
         k = switch_to_contiguous_if_needed(k)
         v = switch_to_contiguous_if_needed(v)
         seq_offsets = seq_offsets.contiguous()
+
+    if kernel == Kernel.CUTLASS:
+        # CUTLASS kernel does not support combining local window attention
+        # (max_attn_len > 0) with context/target masking, fall back to Triton.
+        _has_local_window = max_attn_len > 0
+        _has_ctx_or_tgt = contextual_seq_len > 0 or num_targets is not None
+        if _has_local_window and _has_ctx_or_tgt:
+            global _cutlass_local_window_fallback_warned
+            if not _cutlass_local_window_fallback_warned:
+                logger.warning(
+                    "CUTLASS kernel does not support combining local "
+                    "window attention (max_attn_len > 0) with "
+                    "context/target masking, falling back to Triton."
+                )
+                _cutlass_local_window_fallback_warned = True
+            kernel = Kernel.TRITON
 
     if kernel == Kernel.CUTLASS:
         from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
@@ -146,7 +168,18 @@ def delta_hstu_mha(
         torch._assert(k.shape[2] == D, "wrong k shape[2]")
         torch._assert(v.dim() == 3, "v must be 3-D")
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
-    if kernel in [Kernel.TRITON, Kernel.CUTLASS]:
+    if kernel == Kernel.CUTLASS:
+        # CUTLASS kernel does not support delta-query pattern, fall back to Triton.
+        global _cutlass_cached_fallback_warned
+        if not _cutlass_cached_fallback_warned:
+            logger.warning(
+                "CUTLASS kernel does not support cached/delta attention, "
+                "falling back to Triton."
+            )
+            _cutlass_cached_fallback_warned = True
+        kernel = Kernel.TRITON
+
+    if kernel in [Kernel.TRITON]:
         if not is_fx_tracing():
             torch._assert(delta_q.is_cuda, "q must be CUDA tensor")
             torch._assert(seq_offsets.is_cuda, "seq_offsets must be CUDA tensor")
@@ -157,7 +190,7 @@ def delta_hstu_mha(
         k = switch_to_contiguous_if_needed(k)
         v = switch_to_contiguous_if_needed(v)
 
-    if kernel in [Kernel.TRITON, Kernel.CUTLASS]:
+    if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_hstu_attention import triton_cached_hstu_mha
 
         return triton_cached_hstu_mha(

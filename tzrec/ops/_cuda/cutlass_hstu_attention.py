@@ -9,40 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from typing import Optional
 
 import torch
 from hstu_attn import hstu_attn_varlen_func
-
-logger = logging.getLogger(__name__)
-
-_triton_fallback_warned = False
-_cached_fallback_warned = False
-
-
-def _needs_triton_fallback(
-    max_attn_len: int,
-    contextual_seq_len: int,
-    num_targets: Optional[torch.Tensor],
-) -> bool:
-    """Check if we need to fall back to triton.
-
-    The CUTLASS kernel does not support combining local window attention
-    (max_attn_len > 0) with context or target masking.
-    """
-    global _triton_fallback_warned
-    has_local_window = max_attn_len > 0
-    has_context_or_target = contextual_seq_len > 0 or num_targets is not None
-    needs_fallback = has_local_window and has_context_or_target
-    if needs_fallback and not _triton_fallback_warned:
-        logger.warning(
-            "CUTLASS kernel does not support combining local window attention "
-            "(max_attn_len > 0) with context/target masking, "
-            "falling back to Triton kernel."
-        )
-        _triton_fallback_warned = True
-    return needs_fallback
 
 
 @torch.fx.wrap
@@ -75,26 +45,11 @@ def cutlass_hstu_mha(
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
     """
-    if _needs_triton_fallback(max_attn_len, contextual_seq_len, num_targets):
-        from tzrec.ops._triton.triton_hstu_attention import triton_hstu_mha
-
-        return triton_hstu_mha(
-            max_seq_len=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            causal=causal,
-            num_targets=num_targets,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
+    if q.shape[2] != v.shape[2]:
+        raise ValueError(
+            f"CUTLASS hstu_attn requires attention_dim == hidden_dim, "
+            f"got q.shape[2]={q.shape[2]} != v.shape[2]={v.shape[2]}"
         )
-
-    assert q.shape[2] == v.shape[2], (
-        f"CUTLASS hstu_attn requires attention_dim == hidden_dim, "
-        f"got q.shape[2]={q.shape[2]} != v.shape[2]={v.shape[2]}"
-    )
 
     cu_seqlens = seq_offsets.to(torch.int32)
 
@@ -132,46 +87,4 @@ def cutlass_hstu_mha(
         window_size=window_size,
         alpha=alpha,
         scaling_seqlen=max_seq_len,
-    )
-
-
-@torch.fx.wrap
-def cutlass_cached_hstu_mha(
-    max_seq_len: int,
-    alpha: float,
-    delta_q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    seq_offsets: torch.Tensor,
-    num_targets: Optional[torch.Tensor] = None,
-    max_attn_len: int = 0,
-    contextual_seq_len: int = 0,
-    enable_tma: bool = False,
-) -> torch.Tensor:
-    """Cached HSTU attention for delta queries.
-
-    Falls back to Triton implementation since the CUTLASS kernel does not
-    support the delta-query pattern with separate q/k sequence lengths.
-    """
-    global _cached_fallback_warned
-    if not _cached_fallback_warned:
-        logger.warning(
-            "CUTLASS kernel does not support cached/delta attention, "
-            "falling back to Triton kernel."
-        )
-        _cached_fallback_warned = True
-
-    from tzrec.ops._triton.triton_hstu_attention import triton_cached_hstu_mha
-
-    return triton_cached_hstu_mha(
-        max_seq_len=max_seq_len,
-        alpha=alpha,
-        delta_q=delta_q,
-        k=k,
-        v=v,
-        seq_offsets=seq_offsets,
-        num_targets=num_targets,
-        max_attn_len=max_attn_len,
-        contextual_seq_len=contextual_seq_len,
-        enable_tma=enable_tma,
     )
