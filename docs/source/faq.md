@@ -305,3 +305,28 @@ torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 ```bash
 pip install --force-reinstall --no-deps "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
 ```
+
+______________________________________________________________________
+
+**Q16: 使用CUTLASS kernel后端**
+
+如需使用CUTLASS后端加速HSTU注意力计算，需先安装hstu_attn包：
+
+```bash
+pip install "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/hstu/cu129/hstu_attn-0.1.0%2Bbea6b4b.cu12.9-cp311-cp311-linux_x86_64.whl"
+```
+
+然后在模型配置中设置`kernel: CUTLASS`：
+
+```
+model_config {
+    ...
+    kernel: CUTLASS
+}
+```
+
+**注意事项：**
+
+- CUTLASS后端要求`attention_dim`等于`hidden_dim`
+- 支持Ampere（A100）、Ada（L20）和Hopper（H100、H20）GPU
+- 缓存推理（cached inference）会自动回退到Triton实现
