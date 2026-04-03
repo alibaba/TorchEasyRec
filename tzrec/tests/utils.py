@@ -128,36 +128,6 @@ class IdMockInput(MockInput):
         return pa.array(data)
 
 
-class HSTUIdMockInput(MockInput):
-    """Mock sparse id input data class."""
-
-    def __init__(
-        self,
-        name: str,
-        is_multi: bool = False,
-        num_ids: Optional[int] = None,
-        vocab_list: Optional[List[str]] = None,
-        multival_sep: str = chr(3),
-    ) -> None:
-        super().__init__(name)
-        self.is_multi = is_multi
-        self.num_ids = num_ids
-        self.vocab_list = vocab_list
-        self.multival_sep = multival_sep
-
-    def create_data(self, num_rows: int, has_null: bool = True) -> pa.Array:
-        """Create mock data."""
-        # string
-        # num_multi_rows = random.randint(num_rows // 3, 2 * num_rows // 3)
-        num_multi_id = 3
-        data_multi = _create_random_id_data(
-            (num_rows, num_multi_id), self.num_ids, self.vocab_list
-        ).astype(str)
-        data_multi = list(map(lambda x: self.multival_sep.join(x), data_multi))
-        random.shuffle(data_multi)
-        return pa.array(data_multi)
-
-
 class SeqIdMockInput(MockInput):
     """Mock sparse id sequence input data class."""
 
@@ -694,7 +664,6 @@ def build_mock_input_with_fg(
     features: List[BaseFeature],
     user_id: str = "",
     item_id: str = "",
-    is_hstu: bool = False,
 ) -> Dict[str, MockInput]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
@@ -818,23 +787,14 @@ def build_mock_input_with_fg(
                         if isinstance(inputs[side][sub_name], IdMockInput):
                             inputs[side][sub_name].is_multi = False
                 else:
-                    if is_hstu:
-                        # hstu require number of sequence item is over 2
-                        inputs[side][input_name] = HSTUIdMockInput(
-                            input_name,
-                            is_multi=True,
-                            num_ids=feature.num_embeddings,
-                            multival_sep=feature.sequence_delim,
-                        )
-                    else:
-                        inputs[side][input_name] = IdMockInput(
-                            input_name,
-                            is_multi=True,
-                            num_ids=10
-                            if isinstance(feature, CustomFeature)
-                            else feature.num_embeddings,
-                            multival_sep=feature.sequence_delim,
-                        )
+                    inputs[side][input_name] = IdMockInput(
+                        input_name,
+                        is_multi=True,
+                        num_ids=10
+                        if isinstance(feature, CustomFeature)
+                        else feature.num_embeddings,
+                        multival_sep=feature.sequence_delim,
+                    )
     return inputs["user"], inputs["item"]
 
 
@@ -844,7 +804,6 @@ def load_config_for_test(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
-    is_hstu: bool = False,
     num_rows: Optional[int] = None,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
@@ -881,9 +840,7 @@ def load_config_for_test(
             num_parts=num_parts,
         )
     else:
-        user_inputs, item_inputs = build_mock_input_with_fg(
-            features, user_id, item_id, is_hstu
-        )
+        user_inputs, item_inputs = build_mock_input_with_fg(features, user_id, item_id)
         _, item_t = create_mock_data(
             os.path.join(test_dir, "item_data"),
             item_inputs,
@@ -979,7 +936,7 @@ def load_config_for_test(
                 item_id,
                 # hstu only uses item_id as negative sample, \
                 # as sampler_config.attr_fields is sequence
-                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
+                neg_fields=list(sampler_config.attr_fields),
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
@@ -992,7 +949,7 @@ def load_config_for_test(
                 os.path.join(test_dir, "item_gl"),
                 item_inputs,
                 item_id,
-                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
+                neg_fields=list(sampler_config.attr_fields),
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
@@ -1032,7 +989,6 @@ def test_train_eval(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
-    is_hstu: bool = False,
     env_str: str = "",
     num_rows: Optional[int] = None,
 ) -> bool:
@@ -1043,7 +999,6 @@ def test_train_eval(
         user_id,
         item_id,
         cate_id,
-        is_hstu,
         num_rows=num_rows,
     )
 
