@@ -43,7 +43,7 @@ torch.fx.wrap(fx_int_item)
 class HSTUMatchUserTower(MatchTowerWoEG):
     """HSTU Match model user tower using modern STU module.
 
-    Processes UIH (User Interaction History) sequences through SequencePreprocessor,
+    Processes UIH (User Interaction History) sequences through UIHPreprocessor,
     HSTUPositionalEncoder, and STUStack to produce user embeddings. During training,
     returns one embedding per UIH position (autoregressive). During inference, returns
     the last position embedding per user for ANN retrieval.
@@ -218,7 +218,7 @@ class HSTUMatch(MatchModel):
     """HSTU Match model for two-tower retrieval.
 
     Uses modern STUStack for user sequence encoding with native jagged sequences.
-    User tower processes UIH through SequencePreprocessor + STU. Item tower
+    User tower processes UIH through UIHPreprocessor + STU. Item tower
     projects and normalizes candidate embeddings. Similarity via dot product.
 
     Feature groups:

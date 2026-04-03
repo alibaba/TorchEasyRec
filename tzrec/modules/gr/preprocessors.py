@@ -486,7 +486,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         return self._max_contextual_seq_len
 
 
-class SequencePreprocessor(InputPreprocessor):
+class UIHPreprocessor(InputPreprocessor):
     """Preprocessor for sequence-only models without candidate concatenation.
 
     Processes UIH (User Interaction History) sequences with optional contextual
@@ -729,7 +729,7 @@ def create_input_preprocessor(
         )
     elif preprocessor_type == "contextual_interleave_preprocessor":
         return ContextualInterleavePreprocessor(**config_dict)
-    elif preprocessor_type == "sequence_preprocessor":
-        return SequencePreprocessor(**config_dict)
+    elif preprocessor_type == "uih_preprocessor":
+        return UIHPreprocessor(**config_dict)
     else:
         raise RuntimeError(f"Unknown preprocessor type: {preprocessor_type}")

@@ -64,7 +64,7 @@ def _build_model_config():
                         num_position_buckets=512,
                     ),
                     input_preprocessor=module_pb2.GRInputPreprocessor(
-                        sequence_preprocessor=module_pb2.GRSequencePreprocessor(),
+                        uih_preprocessor=module_pb2.GRUIHPreprocessor(),
                     ),
                     output_postprocessor=module_pb2.GROutputPostprocessor(
                         l2norm_postprocessor=module_pb2.GRL2NormPostprocessor(),
