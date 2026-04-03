@@ -207,11 +207,13 @@ class HSTUMatchItemTower(MatchTowerWoEG):
             grouped_features: dictionary of embedded features from EmbeddingGroup.
 
         Returns:
-            L2-normalized item embeddings of shape (sum_candidates, D).
+            item embeddings of shape (sum_candidates, D).
         """
         cand_emb = grouped_features[self._group_name]
         item_emb = self._item_projection(cand_emb)
-        return F.normalize(item_emb, p=2.0, dim=-1, eps=1e-6)
+        if self._similarity == simi_pb2.Similarity.COSINE:
+            item_emb = F.normalize(item_emb, p=2.0, dim=-1, eps=1e-6)
+        return item_emb
 
 
 class HSTUMatch(MatchModel):
