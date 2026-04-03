@@ -75,6 +75,7 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         contextual_group_name: str = "contextual",
     ) -> None:
         super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        self._pass_grouped_features = True
         hstu_cfg = tower_config.hstu
         uih_dim = sum(feature_group_dims)
         stu_dim = hstu_cfg.stu.embedding_dim
@@ -192,6 +193,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         # Override _group_name: parent sets it from tower_config.input ("uih"),
         # but item tower needs to read from the candidate feature group.
         self._group_name = feature_group.group_name
+        self._pass_grouped_features = True
         cand_dim = sum(feature_group_dims)
         self._item_projection: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(cand_dim, output_dim),
@@ -207,7 +209,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             L2-normalized item embeddings of shape (sum_candidates, D).
         """
-        cand_emb = grouped_features[f"{self._group_name}.sequence"]
+        cand_emb = grouped_features[self._group_name]
         item_emb = self._item_projection(cand_emb)
         return F.normalize(item_emb, p=2.0, dim=-1, eps=1e-6)
 
@@ -268,7 +270,7 @@ class HSTUMatch(MatchModel):
         cand_features = self.get_features_in_feature_groups([cand_fg])
 
         uih_dims = self.embedding_group.group_dims(tower_cfg.input + ".sequence")
-        cand_dims = self.embedding_group.group_dims("candidate.sequence")
+        cand_dims = self.embedding_group.group_dims("candidate")
 
         # Optional contextual features
         contextual_feature_dim = 0

@@ -12,7 +12,6 @@
 import unittest
 
 import torch
-from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP, Batch
@@ -43,8 +42,8 @@ def _build_model_config():
         ),
         model_pb2.FeatureGroupConfig(
             group_name="candidate",
-            feature_names=["candidate_ids"],
-            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+            feature_names=["item_id"],
+            group_type=model_pb2.FeatureGroupType.DEEP,
         ),
     ]
     return model_pb2.ModelConfig(
@@ -94,16 +93,14 @@ def _build_features():
             )
         ),
         feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="candidate_ids",
-                sequence_length=10,
+            id_feature=feature_pb2.IdFeature(
+                feature_name="item_id",
                 embedding_dim=48,
-                num_buckets=3953,
-                embedding_name="historical_ids",
+                num_buckets=1000,
             )
         ),
     ]
-    return create_features(feature_cfgs)
+    return create_features(feature_cfgs, neg_fields=["item_id"])
 
 
 def _build_model(device):
@@ -126,17 +123,19 @@ def _build_batch(device):
     """Build test batch with 2 users.
 
     UIH: user1 has 3 items, user2 has 4 items.
-    Candidates: 2 positive (1 per user) + 2 negative items.
+    Candidates: 2 pos (1 per user) + 2 neg items.
     """
+    # BASE: UIH sequences + positive items
     sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=["historical_ids", "candidate_ids"],
-        values=torch.tensor([1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]),
-        lengths=torch.tensor([3, 4, 2, 2]),  # uih: [3,4], candidate: [2,2]
+        keys=["historical_ids"],
+        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+        lengths=torch.tensor([3, 4]),
     )
+    # NEG: positive items (first batch_size) + negative items
     neg_sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=["candidate_ids"],
-        values=torch.tensor([20, 21, 22, 23]),
-        lengths=torch.tensor([2, 2]),
+        keys=["item_id"],
+        values=torch.tensor([10, 11, 20, 21]),
+        lengths=torch.tensor([1, 1, 1, 1]),  # 2 pos + 2 neg, each 1 item
     )
     return Batch(
         sparse_features={
@@ -180,21 +179,20 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertIn("recall@1", metric_result)
 
     @unittest.skipIf(*gpu_unavailable)
-    @parameterized.expand([[TestGraphType.FX_TRACE]])
-    def test_hstu_match_export(self, graph_type) -> None:
+    def test_hstu_match_export(self) -> None:
         """Test HSTUMatch export: FX trace for serving."""
         device = torch.device("cuda")
         hstu = _build_model(device)
         batch = _build_batch(device)
 
         hstu.eval()
-        hstu = create_test_model(hstu, graph_type)
+        hstu = create_test_model(hstu, TestGraphType.FX_TRACE)
         predictions = hstu(batch)
 
         self.assertIn("similarity", predictions)
         sim = predictions["similarity"]
         self.assertEqual(sim.dim(), 2)
-        self.assertEqual(sim.size(0), 2)  # batch_size
+        self.assertEqual(sim.size(0), 2)
 
     @unittest.skipIf(*gpu_unavailable)
     def test_hstu_match_predict(self) -> None:
@@ -210,7 +208,7 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertIn("similarity", predictions)
         sim = predictions["similarity"]
         self.assertEqual(sim.dim(), 2)
-        self.assertEqual(sim.size(0), 2)  # batch_size
+        self.assertEqual(sim.size(0), 2)
         self.assertFalse(torch.isnan(sim).any())
 
 

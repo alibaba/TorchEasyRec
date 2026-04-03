@@ -220,6 +220,7 @@ class MatchTowerWoEG(nn.Module):
         self._similarity = similarity
         self._feature_group = feature_group
         self._features = features
+        self._pass_grouped_features = False
 
 
 class MatchModel(BaseModel):
@@ -492,8 +493,9 @@ class TowerWoEGWrapper(nn.Module):
             embedding (dict): tower output embedding.
         """
         grouped_features = self.embedding_group(batch)
-        return {
-            f"{self._tower_name}_emb": getattr(self, self._tower_name)(
-                grouped_features[self._group_name]
-            )
-        }
+        tower = getattr(self, self._tower_name)
+        if tower._pass_grouped_features:
+            tower_input = grouped_features
+        else:
+            tower_input = grouped_features[self._group_name]
+        return {f"{self._tower_name}_emb": tower(tower_input)}
