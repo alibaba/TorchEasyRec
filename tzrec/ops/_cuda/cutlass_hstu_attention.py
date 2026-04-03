@@ -15,6 +15,21 @@ import torch
 from hstu_attn import hstu_attn_varlen_func
 
 
+def _needs_triton_fallback(
+    max_attn_len: int,
+    contextual_seq_len: int,
+    num_targets: Optional[torch.Tensor],
+) -> bool:
+    """Check if we need to fall back to triton.
+
+    The CUTLASS kernel does not support combining local window attention
+    (max_attn_len > 0) with context or target masking.
+    """
+    has_local_window = max_attn_len > 0
+    has_context_or_target = contextual_seq_len > 0 or num_targets is not None
+    return has_local_window and has_context_or_target
+
+
 @torch.fx.wrap
 def cutlass_hstu_mha(
     max_seq_len: int,
@@ -45,6 +60,22 @@ def cutlass_hstu_mha(
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
     """
+    if _needs_triton_fallback(max_attn_len, contextual_seq_len, num_targets):
+        from tzrec.ops._triton.triton_hstu_attention import triton_hstu_mha
+
+        return triton_hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=causal,
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+        )
+
     assert q.shape[2] == v.shape[2], (
         f"CUTLASS hstu_attn requires attention_dim == hidden_dim, "
         f"got q.shape[2]={q.shape[2]} != v.shape[2]={v.shape[2]}"
