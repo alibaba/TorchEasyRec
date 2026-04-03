@@ -168,8 +168,31 @@ model_config {
 - kernel: 算子实现，可选TRITON/PYTORCH/CUTLASS
 
   - TRITON: 基于Triton的实现，通常比PYTORCH快2-3x，节省2-3x显存
-  - CUTLASS: 基于CUTLASS的CUDA融合算子实现，需安装hstu_attn包，要求attention_dim等于hidden_dim，支持Ampere/Ada/Hopper GPU
+  - CUTLASS: 基于CUTLASS的CUDA融合算子实现，支持Ampere/Ada/Hopper GPU
   - PYTORCH: 纯PyTorch实现，兼容性最好
+
+#### 使用CUTLASS kernel后端
+
+如需使用CUTLASS后端加速HSTU注意力计算，需先安装hstu_attn包：
+
+```bash
+pip install "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/hstu/cu129/hstu_attn-0.1.0%2Bbea6b4b.cu12.9-cp311-cp311-linux_x86_64.whl"
+```
+
+然后在模型配置中设置`kernel: CUTLASS`：
+
+```
+model_config {
+    ...
+    kernel: CUTLASS
+}
+```
+
+注意事项：
+
+- CUTLASS后端要求`attention_dim`等于`hidden_dim`
+- 支持Ampere（A100）、Ada（L20）和Hopper（H100、H20）GPU
+- 缓存推理（cached inference）会自动回退到Triton实现
 
 ### MTGR Style 配置方式
 
