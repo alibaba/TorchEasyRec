@@ -1221,8 +1221,9 @@ def predict(
                         t = Thread(target=_forward_loop)
                         t.start()
                         forward_t_list.append(t)
-                    write_t = Thread(target=_write_loop, args=(output_cols,))
-                    write_t.start()
+                    t = Thread(target=_write_loop, args=(output_cols,))
+                    t.start()
+                    write_t = t
                 else:
                     data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
 
@@ -1432,8 +1433,9 @@ def predict_checkpoint(
                         _write_predictions(
                             writer, predictions, batch.reserves, output_cols
                         )
-                        write_t = Thread(target=_write_loop, args=(output_cols,))
-                        write_t.start()
+                        t = Thread(target=_write_loop, args=(output_cols,))
+                        t.start()
+                        write_t = t
                     elif not batch.dummy:
                         pred_queue.put(
                             (predictions, batch.reserves),
