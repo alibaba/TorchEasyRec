@@ -133,34 +133,58 @@ def export_model_aot(
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
+    model_config: Any,
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
-    Uses structural knowledge from feature metadata and key suffixes:
+    Uses structural knowledge from feature configs and model config:
     - .lengths → batch dim (always)
-    - .values where all lengths==1 (single-value feature) → batch dim
-    - .values where lengths vary (multi-value/sequence) → data-dependent Dim,
-      grouped by (data_group, sequence_name) from feature metadata
+    - .values for non-sequence single-value sparse features → batch dim
+    - .values for sequence features → data-dependent Dim, shared by features
+      in the same FeatureGroupConfig (JAGGED_SEQUENCE/SEQUENCE) or SeqGroupConfig
     - .values without a .lengths sibling → batch dim (dense feature)
     - .weights → shares Dim with corresponding .values (same prefix)
-    - .key_lengths → data-dependent (own Dim per data_group)
+    - .key_lengths → data-dependent (own Dim)
     - scalars → no dynamic dims
     - everything else (labels, sample_weights) → batch dim
 
     Args:
         data: input tensor dict from Batch.to_dict().
         features: list of BaseFeature from model._features.
+        model_config: ModelConfig proto with feature_groups.
 
     Returns:
         dynamic_shapes dict for torch.export.export().
     """
-    # Build feature name → data_group for sparse features.
-    feature_to_data_group: Dict[str, str] = {}
-    for feat in features:
-        if hasattr(feat, "data_group") and hasattr(feat, "name") and feat.is_sparse:
-            feature_to_data_group[feat.name] = feat.data_group
+    from tzrec.protos.model_pb2 import FeatureGroupType
 
-    # Collect prefixes that have a .lengths sibling — these are sparse/sequence
+    # Step 1: From feature metadata, identify sequence features.
+    seq_feat_names: set = set()
+    for feat in features:
+        if feat.is_sequence:
+            seq_feat_names.add(feat.name)
+
+    # Step 2: From model config's feature_groups, determine which sequence
+    # features share the same sequence structure (and thus the same nnz).
+    feat_to_seq_dim_group: Dict[str, str] = {}
+    for fg in model_config.feature_groups:
+        if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
+            # In JAGGED_SEQUENCE groups, all sequence features share a single
+            # jagged structure → same nnz → share Dim.
+            for name in fg.feature_names:
+                if name in seq_feat_names:
+                    feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
+        # SEQUENCE (DIN-style) groups: standalone sequence features have
+        # independent lengths, so don't auto-share. Only grouped sequence
+        # features (from SequenceFeature config via sequence_groups) share nnz.
+        for sg in fg.sequence_groups:
+            for name in sg.feature_names:
+                # Only sequence features in seq_groups share nnz — non-sequence
+                # features mixed into seq_groups are candidates, not sequences.
+                if name in seq_feat_names and name not in feat_to_seq_dim_group:
+                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
+
+    # Step 3: Collect prefixes with .lengths siblings (sparse/sequence features)
     lengths_prefixes = set()
     for key in data:
         if key.endswith(".lengths"):
@@ -172,41 +196,18 @@ def _build_dynamic_shapes(
             "Unified AOTI export requires at least one sparse/sequence feature."
         )
 
-    # Classify each feature with a .lengths sibling:
-    # - single-value: all lengths == 1, so nnz == batch_size (structural guarantee)
-    # - multi-value: varying lengths, group by (data_group, lengths_content)
-    #   Features in the same KJT (data_group) with identical per-sample lengths
-    #   share a Dim — they're in the same sequence and always have the same nnz.
-    single_value_prefixes = set()
-    prefix_to_lengths_group: Dict[str, str] = {}
-
-    for key, tensor in data.items():
-        if not key.endswith(".lengths"):
-            continue
-        prefix = key[: -len(".lengths")]
-        if tensor.dim() == 1 and torch.all(tensor == 1).item():
-            single_value_prefixes.add(prefix)
-        else:
-            data_group = feature_to_data_group.get(prefix, prefix)
-            lengths_sig = tuple(tensor.tolist())
-            prefix_to_lengths_group[prefix] = f"{data_group}:{lengths_sig}"
-
+    # Step 4: Build dynamic shapes
     batch = torch.export.Dim("batch", min=1, max=499999999)
     dynamic_shapes = {}
-
-    # Shared Dims for features with matching (data_group, lengths) patterns
     group_to_dim: Dict[str, torch.export.Dim] = {}
-    dim_counter = 0
-
-    # Track prefix → Dim so .weights can share with .values
     prefix_to_dim: Dict[str, torch.export.Dim] = {}
+    dim_counter = 0
 
     for key, tensor in data.items():
         if tensor.dim() == 0:
             dynamic_shapes[key] = {}
             continue
 
-        # Determine prefix for matching .values/.lengths/.weights
         prefix = key
         for suffix in (".values", ".lengths", ".weights", ".key_lengths"):
             if key.endswith(suffix):
@@ -218,13 +219,9 @@ def _build_dynamic_shapes(
         is_key_lengths = key.endswith(".key_lengths")
 
         if is_sparse_values:
-            if prefix in single_value_prefixes:
-                # Single-value feature: nnz always equals batch_size
-                dynamic_shapes[key] = {0: batch}
-                prefix_to_dim[prefix] = batch
-            else:
-                # Multi-value / sequence: group by (data_group, lengths)
-                group = prefix_to_lengths_group.get(prefix, prefix)
+            if prefix in feat_to_seq_dim_group:
+                # Sequence feature: share Dim with same-group features
+                group = feat_to_seq_dim_group[prefix]
                 if group not in group_to_dim:
                     group_to_dim[group] = torch.export.Dim(
                         f"g_{dim_counter}", min=1, max=999999993
@@ -233,8 +230,13 @@ def _build_dynamic_shapes(
                 dim = group_to_dim[group]
                 dynamic_shapes[key] = {0: dim}
                 prefix_to_dim[prefix] = dim
+            else:
+                # Multi-value non-sequence or ungrouped: own Dim
+                dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
+                dim_counter += 1
+                dynamic_shapes[key] = {0: dim}
+                prefix_to_dim[prefix] = dim
         elif is_sparse_weights:
-            # Share Dim with the corresponding .values (same prefix, same nnz)
             dim = prefix_to_dim.get(prefix)
             if dim is None:
                 dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
@@ -242,17 +244,10 @@ def _build_dynamic_shapes(
                 prefix_to_dim[prefix] = dim
             dynamic_shapes[key] = {0: dim}
         elif is_key_lengths:
-            # Multi-value sequence key_lengths: data-dependent, own Dim
-            group = prefix_to_lengths_group.get(prefix, prefix)
-            kl_group = f"kl_{group}"
-            if kl_group not in group_to_dim:
-                group_to_dim[kl_group] = torch.export.Dim(
-                    f"g_{dim_counter}", min=1, max=999999993
-                )
-                dim_counter += 1
-            dynamic_shapes[key] = {0: group_to_dim[kl_group]}
+            dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
+            dim_counter += 1
+            dynamic_shapes[key] = {0: dim}
         else:
-            # Batch dim: .lengths, dense .values, labels, sample_weights, etc.
             dynamic_shapes[key] = {0: batch}
 
     return dynamic_shapes
@@ -337,7 +332,11 @@ def export_unified_model_aot(
     logger.info(f"Unified Model Outputs: {result_info}")
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
-    dynamic_shapes = _build_dynamic_shapes(data, features=model._features)
+    dynamic_shapes = _build_dynamic_shapes(
+        data,
+        features=model._features,
+        model_config=model.model._base_model_config,
+    )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
     # Export with torch.export
