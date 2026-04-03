@@ -161,6 +161,7 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         )
 
         # Extract last position embedding per user → (B, D)
+        # Assumes all sequences are non-empty (guaranteed by EmbeddingGroup).
         user_emb = user_emb[seq_offsets[1:] - 1]
 
         return user_emb
@@ -169,7 +170,8 @@ class HSTUMatchUserTower(MatchTowerWoEG):
 class HSTUMatchItemTower(MatchTowerWoEG):
     """HSTU Match model item tower.
 
-    Projects candidate embeddings to STU embedding dimension and L2 normalizes.
+    Projects candidate embeddings to STU embedding dimension. Applies L2
+    normalization only when similarity method is COSINE.
 
     Args:
         tower_config (HSTUMatchTower): tower config.

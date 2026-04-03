@@ -53,15 +53,7 @@ class InputPreprocessor(BaseModule):
     @abc.abstractmethod
     def forward(
         self,
-        max_uih_len: int,
-        max_targets: int,
-        total_uih_len: int,
-        total_targets: int,
-        seq_lengths: torch.Tensor,
-        seq_timestamps: torch.Tensor,
-        seq_embeddings: torch.Tensor,
-        num_targets: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
+        grouped_features: Dict[str, torch.Tensor],
     ) -> Tuple[
         int,
         int,
@@ -75,22 +67,14 @@ class InputPreprocessor(BaseModule):
         """Forward the module.
 
         Args:
-            max_uih_len (int): maximum user history sequence length.
-            max_targets (int): maximum candidates length.
-            total_uih_len (int): total user history sequence length.
-            total_targets (int): total candidates length.
-            seq_lengths (torch.Tensor): input sequence lengths.
-            seq_timestamps (torch.Tensor): input sequence timestamp tensor.
-            seq_embeddings (torch.Tensor): input sequence embedding tensor.
-            num_targets (torch.Tensor): number of targets.
-            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+            grouped_features (Dict[str, torch.Tensor]): embedding group features.
 
         Returns:
             output_max_seq_len (int): output maximum sequence length.
             output_total_uih_len (int): output total user history sequence length.
             output_total_targets (int): output total candidates length.
             output_seq_lengths (torch.Tensor): output sequence lengths.
-            output_seq_offsets (torch.Tensor): output sequence lengths.
+            output_seq_offsets (torch.Tensor): output sequence offsets.
             output_seq_timestamps (torch.Tensor): output sequence timestamp tensor.
             output_seq_embeddings (torch.Tensor): output sequence embedding tensor.
             output_num_targets (torch.Tensor): output number of targets.
@@ -627,6 +611,8 @@ class UIHPreprocessor(InputPreprocessor):
 
         # Optional: action embeddings
         if self._action_encoder_cfg is not None:
+            # target_offsets is unused when total_targets=0 (no candidates in
+            # UIH-only mode), so we pass uih_offsets as a placeholder.
             action_embeddings = self._action_encoder(
                 seq_actions=grouped_features["uih_action.sequence"].to(torch.int64),
                 max_uih_len=max_uih_len,
