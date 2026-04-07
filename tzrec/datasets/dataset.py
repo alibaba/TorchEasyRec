@@ -376,12 +376,14 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
             else:
-                # If item_id_field is a sequence feature, the sampler can't
-                # process multi-value strings (it casts the whole array to
-                # int64). Extract a single representative value (the first
-                # item) for the sampler. The original (possibly multi-value)
-                # data is preserved for combining with sampled negatives.
-                saved_pos: Dict[str, pa.Array] = {}
+                # If item_id_field is a sequence feature, each item in the
+                # row's sequence is a positive that should get its own
+                # negatives. Flatten per-row positives into a single 1D
+                # array, call the sampler so each positive is treated as a
+                # separate query, then combine_neg_as_candidate_sequence
+                # interleaves them per row:
+                # [pos1, neg1_1, ..., pos2, neg2_1, ..., posK, negK_n].
+                multi_pos_lists: Optional[pa.Array] = None
                 if (
                     self._sampler_item_id_field is not None
                     and self._sampler_item_id_field in self._seq_field_delims
@@ -389,28 +391,41 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     seq_delim = self._seq_field_delims[self._sampler_item_id_field]
                     raw = input_data[self._sampler_item_id_field]
                     if pa.types.is_string(raw.type):
-                        saved_pos[self._sampler_item_id_field] = raw
-                        # Take first item from each (possibly multi-value) row
-                        split = pc.split_pattern(raw, seq_delim)
-                        input_data[self._sampler_item_id_field] = pc.list_element(
-                            split, 0
+                        multi_pos_lists = pc.split_pattern(raw, seq_delim)
+                        flat_pos = pc.list_flatten(multi_pos_lists)
+                        sampler_bs = self._sampler._batch_size
+                        assert len(flat_pos) <= sampler_bs, (
+                            f"Total positives {len(flat_pos)} across rows "
+                            f"exceeds sampler batch_size {sampler_bs}. Reduce "
+                            f"batch_size or per-row sequence length."
                         )
+                        input_data[self._sampler_item_id_field] = flat_pos
 
                 sampled = self._sampler.get(input_data)
 
-                # Restore original (possibly multi-value) data for combine
-                for k, original in saved_pos.items():
-                    input_data[k] = original
+                if multi_pos_lists is not None:
+                    # Restore the list-array form so combine_neg sees the
+                    # original per-row grouping of positives.
+                    input_data[self._sampler_item_id_field] = multi_pos_lists
 
                 for k, v in sampled.items():
                     if k in input_data:
                         seq_delim = self._seq_field_delims.get(k)
                         if seq_delim is not None:
-                            # neg_per_pos = total_negatives // batch_size
-                            neg_per_pos = len(v) // len(input_data[k])
+                            pos_for_combine = input_data[k]
+                            if pa.types.is_list(pos_for_combine.type):
+                                num_pos = len(pc.list_flatten(pos_for_combine))
+                            else:
+                                num_pos = len(pos_for_combine)
+                            # Sampler returns batch_size * expand_factor negs
+                            # (with padding); slice to the valid prefix.
+                            neg_per_pos = len(v) // self._sampler._batch_size
+                            if neg_per_pos < 1:
+                                neg_per_pos = 1
+                            valid_negs = v.slice(0, num_pos * neg_per_pos)
                             input_data[k] = combine_neg_as_candidate_sequence(
-                                input_data[k],
-                                v,
+                                pos_for_combine,
+                                valid_negs,
                                 neg_per_pos,
                                 seq_delim,
                             )

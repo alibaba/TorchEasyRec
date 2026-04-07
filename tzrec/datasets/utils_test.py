@@ -233,9 +233,27 @@ class DatasetUtilsTest(unittest.TestCase):
         self.assertEqual(result.to_pylist(), expected)
 
     def test_combine_neg_as_candidate_sequence_multivalue_pos(self):
-        """Test combine when pos_data already has multi-value sequences."""
-        pos_data = pa.array(["1;2", "3;4;5"])
-        neg_data = pa.array(["10", "20", "30", "40"])
+        """Each item in multi-value pos sequence gets its own negatives."""
+        pos_data = pa.array(["1;2", "3;4;5"])  # 5 positives total
+        neg_data = pa.array(["10", "20", "30", "40", "50"])  # 1 neg per pos
+
+        result = combine_neg_as_candidate_sequence(
+            pos_data=pos_data,
+            neg_data=neg_data,
+            neg_sample_num=1,
+            seq_delim=";",
+        )
+        # row1: pos=1 → "1;10", pos=2 → "2;20" → "1;10;2;20"
+        # row2: pos=3 → "3;30", pos=4 → "4;40", pos=5 → "5;50"
+        #       → "3;30;4;40;5;50"
+        expected = ["1;10;2;20", "3;30;4;40;5;50"]
+        self.assertEqual(result.to_pylist(), expected)
+
+    def test_combine_neg_as_candidate_sequence_multivalue_pos_multi_neg(self):
+        """Multi-value pos with multiple negatives per positive."""
+        pos_data = pa.array(["1;2", "3"])  # 3 positives total
+        # neg_sample_num=2 → need 6 negatives
+        neg_data = pa.array(["10", "20", "30", "40", "50", "60"])
 
         result = combine_neg_as_candidate_sequence(
             pos_data=pos_data,
@@ -243,7 +261,9 @@ class DatasetUtilsTest(unittest.TestCase):
             neg_sample_num=2,
             seq_delim=";",
         )
-        expected = ["1;2;10;20", "3;4;5;30;40"]
+        # row1: pos=1 → "1;10;20", pos=2 → "2;30;40" → "1;10;20;2;30;40"
+        # row2: pos=3 → "3;50;60"
+        expected = ["1;10;20;2;30;40", "3;50;60"]
         self.assertEqual(result.to_pylist(), expected)
 
     def test_normalize_type_str_basic_types(self):

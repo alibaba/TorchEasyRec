@@ -13,7 +13,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -511,39 +510,54 @@ def combine_neg_as_candidate_sequence(
 ) -> pa.Array:
     """Combine positive and negative items into candidate sequences.
 
-    For each sample, joins the positive item with its negative items using the
-    sequence delimiter. Used when candidate features are sequence_id_features
-    in a JAGGED_SEQUENCE group.
+    Each row's positive items are flattened and each positive gets its own
+    set of `neg_sample_num` negatives. The result interleaves per position:
+    "pos1;neg1_1;...;neg1_n;pos2;neg2_1;...;posK;negK_n".
+
+    Used when candidate features are sequence_id_features in a JAGGED_SEQUENCE
+    group. Supports both single-value positives ("123") and multi-value
+    positives ("1;2;3") per row.
 
     Args:
-        pos_data: positive item IDs, one per sample. Shape: (B,).
-        neg_data: negative item IDs. Shape: (B * neg_sample_num,).
+        pos_data: positive items per row. Either a 1D array of strings (each
+            row may contain a delimited sequence) or a list array.
+        neg_data: flat array of negative items, ordered by positive.
+            Length = total_positives * neg_sample_num.
         neg_sample_num: number of negative samples per positive.
         seq_delim: delimiter for joining items into a sequence string.
 
     Returns:
-        pa.Array of strings, each containing "pos;neg1;neg2;..." per sample.
+        pa.Array of strings, each row's candidate sequence.
 
     Example:
-        pos_data = ["1", "2"]
-        neg_data = ["3", "4", "5", "6"]
-        neg_sample_num = 2
+        pos_data = ["1", "2;3"]
+        neg_data = ["10", "20", "30"]  # 1 neg per pos, total 3 positives
+        neg_sample_num = 1
         seq_delim = ";"
-        result = ["1;3;4", "2;5;6"]
+        result = ["1;10", "2;20;3;30"]
     """
-    neg_str = neg_data.cast(pa.string())
-    neg_offsets = pa.array(
-        np.concatenate(
-            [
-                np.array([0]),
-                np.arange(neg_sample_num, len(neg_str) + 1, neg_sample_num),
-            ]
-        )
-    )
-    neg_lists = pa.ListArray.from_arrays(neg_offsets, neg_str)
-    neg_joined = pc.binary_join(neg_lists, seq_delim)
-    pos_str = pos_data.cast(pa.string())
-    return pc.binary_join_element_wise(pos_str, neg_joined, seq_delim)
+    # Normalize pos_data to a list array (each row → list of positives)
+    if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
+        pos_lists = pos_data
+    else:
+        pos_lists = pc.split_pattern(pos_data.cast(pa.string()), seq_delim)
+
+    counts = pc.list_value_length(pos_lists).to_pylist()
+    pos_flat = pc.list_flatten(pos_lists).cast(pa.string()).to_pylist()
+    neg_str_list = neg_data.cast(pa.string()).to_pylist()
+
+    result: List[str] = []
+    pos_offset = 0
+    neg_offset = 0
+    for k_i in counts:
+        parts: List[str] = []
+        for _ in range(k_i):
+            parts.append(pos_flat[pos_offset])
+            parts.extend(neg_str_list[neg_offset : neg_offset + neg_sample_num])
+            pos_offset += 1
+            neg_offset += neg_sample_num
+        result.append(seq_delim.join(parts))
+    return pa.array(result)
 
 
 def calc_slice_position(
