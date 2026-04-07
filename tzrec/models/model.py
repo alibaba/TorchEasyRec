@@ -10,6 +10,7 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import threading
 from collections import OrderedDict
 from queue import Queue
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -401,6 +402,11 @@ class CombinedModelWrapper(nn.Module):
         super().__init__()
         self.sparse_model = sparse_model
         self.dense_model = dense_model
+        # AOTI compiled models are not safe to call from multiple Python
+        # threads concurrently. The predict pipeline runs multiple
+        # _forward_loop threads, so we serialize the AOTI dense_model call.
+        # Use object.__setattr__ to bypass nn.Module's strict __setattr__.
+        object.__setattr__(self, "_lock", threading.Lock())
 
     def forward(
         self,
@@ -418,7 +424,8 @@ class CombinedModelWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         sparse_out, _ = self.sparse_model(data, device)
-        outputs = self.dense_model(sparse_out)
+        with self._lock:
+            outputs = self.dense_model(sparse_out)
         return outputs
 
 
@@ -432,6 +439,13 @@ class UnifiedAOTIModelWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
+        # AOTI compiled models are not safe to call from multiple Python
+        # threads concurrently — concurrent calls deadlock inside the
+        # AOTI runtime / op redispatch layer. The predict pipeline runs
+        # multiple _forward_loop threads, so we serialize calls here.
+        # Use object.__setattr__ to bypass nn.Module's strict __setattr__,
+        # which only allows tensors, parameters, and submodules.
+        object.__setattr__(self, "_lock", threading.Lock())
 
     def forward(
         self,
@@ -451,4 +465,5 @@ class UnifiedAOTIModelWrapper(nn.Module):
         # Sort keys to match the export-time dict order (pytree spec)
         data = OrderedDict(sorted(data.items()))
         data = {k: v.to(device, non_blocking=True) for k, v in data.items()}
-        return self.model(data)
+        with self._lock:
+            return self.model(data)
