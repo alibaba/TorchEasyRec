@@ -94,7 +94,7 @@ message DynamicEmbedding {
     // the initializer args for evaluation mode. default is
     // default is constant initialization with value 0.0.
     optional DynamicEmbInitializerArgs eval_initializer_args = 2;
-    // strategy to set the score for each indices in forward and backward per table. TIMESTAMP | STEP | CUSTOMIZED | LFU
+    // strategy to set the score for each indices in forward and backward per table. TIMESTAMP | STEP | CUSTOMIZED | LFU | NO_EVICTION
     optional string score_strategy = 4 [default = "STEP"];
     // max number of embedding rows
     required uint64 max_capacity = 5;
@@ -104,6 +104,10 @@ message DynamicEmbedding {
     optional uint64 init_capacity_per_rank = 7;
     // init table path
     optional string init_table = 8;
+    // hash-table bucket capacity. default 128 (matches dynamicemb
+    // DEFAULT_BUCKET_CAPACITY). larger buckets trade probe cost for
+    // higher load factor.
+    optional uint64 bucket_capacity = 9;
     oneof admission_strategy {
         DynamicEmbFrequencyAdmissionStrategy frequency_admission_strategy = 100;
     }
