@@ -1250,7 +1250,10 @@ def predict(
             except Exception as e:
                 logger.warning(f"Failed to send sentinel to pred_queue: {e}")
             write_t.join()
-        writer.close()
+        try:
+            writer.close()
+        except Exception as e:
+            logger.warning(f"Failed to close writer: {e}")
 
     if is_profiling:
         prof.stop()
@@ -1454,6 +1457,9 @@ def predict_checkpoint(
                 except Exception as e:
                     logger.warning(f"Failed to send sentinel to pred_queue: {e}")
                 write_t.join()
-            writer.close()
+            try:
+                writer.close()
+            except Exception as e:
+                logger.warning(f"Failed to close writer: {e}")
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")
