@@ -88,7 +88,9 @@ def export_model_aot(
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
     with torch.no_grad():
-        aoti_output_keys = list(dense_model(sparse_output).keys())
+        _out = dense_model(sparse_output)
+        aoti_output_keys = list(_out.keys())
+        del _out
 
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(

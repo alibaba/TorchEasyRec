@@ -223,7 +223,7 @@ def export_acc_config(
     if hstu_item_id is not None:
         acc_config["hstu_item_id"] = hstu_item_id
     if hstu_kernel is not None:
-        acc_config["hstu_kernel"] = hstu_kernel.lower() if hstu_kernel else "pytorch"
+        acc_config["hstu_kernel"] = hstu_kernel.lower()
     return acc_config
 
 
