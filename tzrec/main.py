@@ -1243,13 +1243,17 @@ def predict(
             except Exception as e:
                 logger.warning(f"Failed to send sentinel to data_queue: {e}")
         for t in forward_t_list:
-            t.join()
+            t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+            if t.is_alive():
+                logger.warning(f"Forward thread {t.name} did not terminate in time.")
         if write_t is not None:
             try:
                 pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
             except Exception as e:
                 logger.warning(f"Failed to send sentinel to pred_queue: {e}")
-            write_t.join()
+            write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+            if write_t.is_alive():
+                logger.warning("Write thread did not terminate in time.")
         try:
             writer.close()
         except Exception as e:
@@ -1456,7 +1460,9 @@ def predict_checkpoint(
                     pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
                 except Exception as e:
                     logger.warning(f"Failed to send sentinel to pred_queue: {e}")
-                write_t.join()
+                write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+                if write_t.is_alive():
+                    logger.warning("Write thread did not terminate in time.")
             try:
                 writer.close()
             except Exception as e:
