@@ -14,7 +14,7 @@ import unittest
 import torch
 from torchrec import KeyedJaggedTensor
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP, Batch
+from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.hstu import HSTUMatch
 from tzrec.models.model import TrainWrapper
@@ -43,7 +43,7 @@ def _build_model_config():
         model_pb2.FeatureGroupConfig(
             group_name="candidate",
             feature_names=["item_id"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
+            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
     ]
     return model_pb2.ModelConfig(
@@ -93,14 +93,16 @@ def _build_features():
             )
         ),
         feature_pb2.FeatureConfig(
-            id_feature=feature_pb2.IdFeature(
+            sequence_id_feature=feature_pb2.IdFeature(
                 feature_name="item_id",
+                sequence_length=10,
+                sequence_delim=";",
                 embedding_dim=48,
                 num_buckets=1000,
             )
         ),
     ]
-    return create_features(feature_cfgs, neg_fields=["item_id"])
+    return create_features(feature_cfgs)
 
 
 def _build_model(device):
@@ -123,25 +125,16 @@ def _build_batch(device):
     """Build test batch with 2 users.
 
     UIH: user1 has 3 items, user2 has 4 items.
-    Candidates: 2 pos (1 per user) + 2 neg items.
+    Candidates: each user has a sequence of [pos, neg] (after combine_neg).
     """
-    # BASE: UIH sequences + positive items
+    # BASE: UIH sequences + per-user candidate sequences (pos+neg)
     sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=["historical_ids"],
-        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
-        lengths=torch.tensor([3, 4]),
-    )
-    # NEG: positive items (first batch_size) + negative items
-    neg_sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=["item_id"],
-        values=torch.tensor([10, 11, 20, 21]),
-        lengths=torch.tensor([1, 1, 1, 1]),  # 2 pos + 2 neg, each 1 item
+        keys=["historical_ids", "item_id"],
+        values=torch.tensor([1, 2, 3, 4, 5, 6, 7, 100, 200, 101, 201]),
+        lengths=torch.tensor([3, 4, 2, 2]),
     )
     return Batch(
-        sparse_features={
-            BASE_DATA_GROUP: sparse_feature,
-            NEG_DATA_GROUP: neg_sparse_feature,
-        },
+        sparse_features={BASE_DATA_GROUP: sparse_feature},
         labels={"label": torch.tensor([1, 1])},
     ).to(device)
 

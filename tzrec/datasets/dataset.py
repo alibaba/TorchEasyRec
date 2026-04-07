@@ -379,10 +379,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     if k in input_data:
                         seq_delim = self._seq_field_delims.get(k)
                         if seq_delim is not None:
+                            # neg_per_pos = total_negatives // batch_size
+                            neg_per_pos = len(v) // len(input_data[k])
                             input_data[k] = combine_neg_as_candidate_sequence(
                                 input_data[k],
                                 v,
-                                self._sampler._num_sample,
+                                neg_per_pos,
                                 seq_delim,
                             )
                         else:

@@ -40,6 +40,28 @@ from tzrec.utils.fx_util import fx_int_item
 torch.fx.wrap(fx_int_item)
 
 
+@torch.fx.wrap
+def _jagged_candidate_sim(
+    user_emb: torch.Tensor, item_emb: torch.Tensor
+) -> torch.Tensor:
+    """Compute per-user similarity for JAGGED_SEQUENCE candidates.
+
+    Each user has the same number of candidates (1 pos + num_neg). The item
+    embeddings are organized as: [pos_1, neg_1_1, ..., neg_1_k, pos_2, ...].
+
+    Args:
+        user_emb: (B, D) user embeddings.
+        item_emb: (B * (1 + num_neg), D) candidate embeddings.
+
+    Returns:
+        similarity (B, 1 + num_neg), first column is positive.
+    """
+    batch_size = user_emb.size(0)
+    num_cand = item_emb.size(0) // batch_size
+    item_emb = item_emb.view(batch_size, num_cand, -1)
+    return torch.bmm(item_emb, user_emb.unsqueeze(-1)).squeeze(-1)
+
+
 class HSTUMatchUserTower(MatchTowerWoEG):
     """HSTU Match model user tower using modern STU module.
 
@@ -211,7 +233,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             item embeddings of shape (sum_candidates, D).
         """
-        cand_emb = grouped_features[self._group_name]
+        cand_emb = grouped_features[f"{self._group_name}.sequence"]
         item_emb = self._item_projection(cand_emb)
         if self._similarity == simi_pb2.Similarity.COSINE:
             item_emb = F.normalize(item_emb, p=2.0, dim=-1, eps=1e-6)
@@ -274,7 +296,7 @@ class HSTUMatch(MatchModel):
         cand_features = self.get_features_in_feature_groups([cand_fg])
 
         uih_dims = self.embedding_group.group_dims(tower_cfg.input + ".sequence")
-        cand_dims = self.embedding_group.group_dims("candidate")
+        cand_dims = self.embedding_group.group_dims("candidate.sequence")
 
         # Optional contextual features
         contextual_feature_dim = 0
@@ -333,5 +355,5 @@ class HSTUMatch(MatchModel):
         user_emb = self.user_tower(grouped_features)
         item_emb = self.item_tower(grouped_features)
 
-        ui_sim = self.sim(user_emb, item_emb) / self._temperature
+        ui_sim = _jagged_candidate_sim(user_emb, item_emb) / self._temperature
         return {"similarity": ui_sim}
