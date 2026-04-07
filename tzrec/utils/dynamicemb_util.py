@@ -617,16 +617,6 @@ if has_dynamicemb:
             for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
         ]
 
-    # NOTE: previously we monkey-patched
-    # batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table to
-    # preserve the planner-computed ``local_hbm_for_values`` after dynamicemb
-    # recomputed it from ``num_aligned_embedding_per_rank``. Starting with the
-    # fused-storage refactor (NVIDIA recsys-examples PR #343), the upstream
-    # function is a pass-through that simply returns
-    # ``table.fused_params["dynamicemb_options"]`` and
-    # ``num_aligned_embedding_per_rank`` was removed from
-    # ``DynamicEmbTableOptions``. The patch is no longer needed.
-
     # Monkey-patch for torchrec 1.5.0 compatibility
     # The base class now passes 'env' parameter to _create_embedding_kernel
     def _grouped_embeddings_lookup_create_embedding_kernel(
