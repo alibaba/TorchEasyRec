@@ -18,13 +18,7 @@ from torch import nn
 from torchrec.distributed.train_pipeline.utils import Tracer
 
 from tzrec.models.model import CombinedModelWrapper, UnifiedAOTIModelWrapper
-from tzrec.utils.fx_util import (
-    fx_mark_keyed_tensor,
-    fx_mark_seq_len,
-    fx_mark_seq_tensor,
-    fx_mark_tensor,
-    symbolic_trace,
-)
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
 
@@ -291,14 +285,10 @@ def export_unified_model_aot(
         f.write(str(full_graph))
 
     # Remove fx_mark_* no-op nodes (they are split markers, not needed for unified)
-    fx_mark_targets = {
-        fx_mark_keyed_tensor,
-        fx_mark_tensor,
-        fx_mark_seq_tensor,
-        fx_mark_seq_len,
-    }
     for node in list(full_graph.nodes):
-        if node.op == "call_function" and node.target in fx_mark_targets:
+        if node.op == "call_function" and getattr(
+            node.target, "__name__", ""
+        ).startswith("fx_mark_"):
             if node.users:
                 node.replace_all_uses_with(None)
             full_graph.erase_node(node)
