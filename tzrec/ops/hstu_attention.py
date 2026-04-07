@@ -60,23 +60,6 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if kernel in [Kernel.TRITON, Kernel.CUTLASS]:
-        if not is_fx_tracing():
-            torch._assert(q.is_cuda, "q must be CUDA tensor")
-            torch._assert(k.is_cuda, "k must be CUDA tensor")
-            torch._assert(v.is_cuda, "v must be CUDA tensor")
-            torch._assert(seq_offsets.is_cuda, "seq_offsets must be CUDA tensor")
-            torch._assert(
-                dropout_pr < 1e-6, "dropout for triton/cutlass not implemented"
-            )
-            torch._assert(
-                min_full_attn_seq_len == 0, "min_full_attn_seq_len not implemented"
-            )
-        q = switch_to_contiguous_if_needed(q)
-        k = switch_to_contiguous_if_needed(k)
-        v = switch_to_contiguous_if_needed(v)
-        seq_offsets = seq_offsets.contiguous()
-
     if kernel == Kernel.CUTLASS:
         # CUTLASS kernel does not support combining local window attention
         # (max_attn_len > 0) with context/target masking, fall back to Triton.
@@ -94,21 +77,49 @@ def hstu_mha(
             kernel = Kernel.TRITON
 
     if kernel == Kernel.CUTLASS:
+        # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf, so
+        # it must be called directly without surrounding control-flow
+        # preprocessing (which would break FX symbolic tracing).
+        # Cast to bf16 unconditionally: the CUTLASS kernel only supports
+        # fp16/bf16, and unconditional casts are FX-traceable (no control
+        # flow). Cast the output back to the input dtype so downstream
+        # layers see the original dtype.
         from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
 
-        return cutlass_hstu_mha(
+        orig_dtype = v.dtype
+        q_bf16 = q.to(torch.bfloat16)
+        k_bf16 = k.to(torch.bfloat16)
+        v_bf16 = v.to(torch.bfloat16)
+        out = cutlass_hstu_mha(
             max_seq_len=max_seq_len,
             alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
+            q=q_bf16,
+            k=k_bf16,
+            v=v_bf16,
             seq_offsets=seq_offsets,
             causal=causal,
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
         )
-    elif kernel == Kernel.TRITON:
+        return out.to(orig_dtype)
+
+    if kernel == Kernel.TRITON:
+        if not is_fx_tracing():
+            torch._assert(q.is_cuda, "q must be CUDA tensor")
+            torch._assert(k.is_cuda, "k must be CUDA tensor")
+            torch._assert(v.is_cuda, "v must be CUDA tensor")
+            torch._assert(seq_offsets.is_cuda, "seq_offsets must be CUDA tensor")
+            torch._assert(dropout_pr < 1e-6, "dropout for triton path not implemented")
+            torch._assert(
+                min_full_attn_seq_len == 0, "min_full_attn_seq_len not implemented"
+            )
+        q = switch_to_contiguous_if_needed(q)
+        k = switch_to_contiguous_if_needed(k)
+        v = switch_to_contiguous_if_needed(v)
+        seq_offsets = seq_offsets.contiguous()
+
+    if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_hstu_attention import triton_hstu_mha
 
         return triton_hstu_mha(

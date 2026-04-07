@@ -203,6 +203,7 @@ def _backward(ctx, grad_output):
 _cutlass_hstu_mha_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
+@torch.fx.wrap
 def cutlass_hstu_mha(
     max_seq_len: int,
     alpha: float,
@@ -237,7 +238,16 @@ def cutlass_hstu_mha(
             f"CUTLASS hstu_attn requires attention_dim == hidden_dim, "
             f"got q.shape[2]={q.shape[2]} != v.shape[2]={v.shape[2]}"
         )
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"CUTLASS hstu_attn only supports fp16 and bf16, got {q.dtype}. "
+            f"Set train_config.mixed_precision to 'BF16' or 'FP16'."
+        )
 
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    seq_offsets = seq_offsets.contiguous()
     cu_seqlens = seq_offsets.to(torch.int32)
 
     if causal:
