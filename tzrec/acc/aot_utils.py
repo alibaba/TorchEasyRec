@@ -305,7 +305,12 @@ def export_unified_model_aot(
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
-    # Move data to the target device (AOTI models always run on CUDA)
+    # Trace with tensors already on the target device so the compiled
+    # graph's input device matches what UnifiedAOTIModelWrapper feeds at
+    # predict time. The wrapper must pre-move data to CUDA in order to
+    # initialize a CUDA context on predict worker threads (fresh Python
+    # threads have no context and the compiled graph's stream access
+    # fails otherwise), so export must agree on CUDA input too.
     data_on_device = {k: v.to(device) for k, v in data.items()}
 
     # Verify the unified model produces correct output
