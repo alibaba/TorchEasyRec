@@ -926,10 +926,14 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
         if self.success:
+            # DLRM-HSTU uses Triton kernels which have runtime issues with
+            # the unified AOTI export (slow Triton autotuning, complex jagged
+            # ops). Use the two-stage export (UNIFIED_AOT=0) for HSTU until
+            # upstream torch.export/AOTI support for Triton+HSTU improves.
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="ENABLE_AOT=1",
+                env_str="ENABLE_AOT=1 UNIFIED_AOT=0",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")

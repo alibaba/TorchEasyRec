@@ -44,7 +44,7 @@ from torchrec.quant.embedding_modules import (
 from torchrec.sparse import jagged_tensor
 
 from tzrec.acc import utils as acc_utils
-from tzrec.acc.aot_utils import export_unified_model_aot
+from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.dataset import (
@@ -204,7 +204,15 @@ def export_model_normal(
             result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            export_unified_model_aot(model, data, save_dir)
+            # UNIFIED_AOT=1 (default): fused sparse+dense AOTI model.
+            # UNIFIED_AOT=0: legacy two-stage export (sparse JIT + dense AOTI).
+            # Escape hatch for models where unified export hits runtime issues
+            # (e.g., DLRM-HSTU with Triton kernels and many dynamic Dims).
+            if os.environ.get("UNIFIED_AOT", "1") == "1":
+                export_unified_model_aot(model, data, save_dir)
+            else:
+                sparse, dense, meta_info = split_model(data, model, save_dir)
+                export_model_aot(sparse, dense, data, meta_info, save_dir)
         else:
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
