@@ -789,6 +789,47 @@ class RankIntegrationTest(unittest.TestCase):
             comp_cpu_gpu_pred_result=True,
         )
 
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+        "needs >= 2 GPUs to exercise different world sizes",
+    )
+    def test_multi_tower_din_zch_finetune_world_size_change(self):
+        # First train on 1 GPU, then finetune from that checkpoint on 2 GPUs.
+        # Regression test for the assertion in MCH validate_state caused by
+        # _output_segments_tensor being clobbered when the saved world size
+        # differs from the current world size.
+        prev_nproc = os.environ.get("TEST_NPROC_PER_NODE")
+        try:
+            os.environ["TEST_NPROC_PER_NODE"] = "1"
+            self.success = utils.test_train_eval(
+                "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+                os.path.join(self.test_dir, "1"),
+                user_id="user_id",
+                item_id="item_id",
+            )
+            self.assertTrue(self.success)
+
+            os.environ["TEST_NPROC_PER_NODE"] = "2"
+            self.success = utils.test_train_eval(
+                "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+                os.path.join(self.test_dir, "2"),
+                user_id="user_id",
+                item_id="item_id",
+                args_str=(
+                    f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}"
+                ),
+            )
+            self.assertTrue(self.success)
+            _, steps = checkpoint_util.latest_checkpoint(
+                os.path.join(self.test_dir, "2/train")
+            )
+            self.assertGreater(steps, 0)
+        finally:
+            if prev_nproc is None:
+                os.environ.pop("TEST_NPROC_PER_NODE", None)
+            else:
+                os.environ["TEST_NPROC_PER_NODE"] = prev_nproc
+
     def test_multi_tower_din_with_fg_export_quant(self):
         self._test_rank_with_fg_quant(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
