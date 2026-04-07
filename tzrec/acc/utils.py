@@ -79,6 +79,26 @@ def is_unified_aot() -> bool:
     return bool(unified_aot) and unified_aot[0] == "1"
 
 
+def is_unified_aot_predict(model_path: str) -> bool:
+    """Judge whether the exported model uses unified AOTI in predict.
+
+    Prefers the explicit UNIFIED_AOT field in model_acc.json. Falls back
+    to file presence (legacy two-stage exports produce
+    scripted_sparse_model.pt; unified exports do not) when the acc.json
+    is missing or does not contain UNIFIED_AOT — this keeps unit tests
+    that bypass the full export pipeline working.
+    """
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if os.path.exists(acc_json_path):
+        with open(acc_json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        unified_aot = data.get("UNIFIED_AOT")
+        if unified_aot is not None:
+            return bool(unified_aot) and unified_aot[0] == "1"
+    sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
+    return not os.path.exists(sparse_model_path)
+
+
 def is_aot_predict(model_path: str) -> bool:
     """Judge is aot or not in predict."""
     with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
@@ -223,6 +243,8 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "ENABLE_AOT" in os.environ:
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
+        # Record unified AOT mode (default 1) so predict can detect it.
+        acc_config["UNIFIED_AOT"] = "1" if is_unified_aot() else "0"
     return acc_config
 
 

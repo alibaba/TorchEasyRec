@@ -17,6 +17,7 @@ import torch
 from torch import nn
 from torchrec.distributed.train_pipeline.utils import Tracer
 
+from tzrec.acc.utils import is_unified_aot_predict
 from tzrec.models.model import CombinedModelWrapper, UnifiedAOTIModelWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
@@ -36,13 +37,20 @@ def load_model_aot(
     Return:
         AOTInductor model wrapper.
     """
-    sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
     aoti_model_path = os.path.join(model_path, "aoti_model.pt2")
 
-    if os.path.exists(sparse_model_path):
+    if is_unified_aot_predict(model_path):
+        # Unified single-model path
+        model = torch._inductor.aoti_load_package(
+            aoti_model_path,
+            device_index=device.index,
+        )
+        return UnifiedAOTIModelWrapper(model)
+    else:
         # Legacy two-stage path: sparse JIT + dense AOTI
         sparse_model: torch.jit.ScriptModule = torch.jit.load(
-            sparse_model_path, map_location=device
+            os.path.join(model_path, "scripted_sparse_model.pt"),
+            map_location=device,
         )
         dense_model: torch.export.pt2_archive._package.AOTICompiledModel = (
             torch._inductor.aoti_load_package(
@@ -51,13 +59,6 @@ def load_model_aot(
             )
         )
         return CombinedModelWrapper(sparse_model, dense_model)
-    else:
-        # Unified single-model path
-        model = torch._inductor.aoti_load_package(
-            aoti_model_path,
-            device_index=device.index,
-        )
-        return UnifiedAOTIModelWrapper(model)
 
 
 def export_model_aot(
@@ -255,6 +256,24 @@ def _build_dynamic_shapes(
     return dynamic_shapes
 
 
+class _DataOnlyWrapper(nn.Module):
+    """Adapter that fixes the device argument of the wrapped model.
+
+    `ScriptWrapper.forward(data, device)` takes a `device` argument that
+    `torch.export.export` cannot accept (torch.device is not a supported
+    pytree leaf). We bind device to a constant here so the traced graph
+    has only `data` as input.
+    """
+
+    def __init__(self, model: nn.Module, device: str) -> None:
+        super().__init__()
+        self.model = model
+        self._device = device
+
+    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return self.model(data, self._device)
+
+
 def export_unified_model_aot(
     model: nn.Module,
     data: Dict[str, torch.Tensor],
@@ -276,10 +295,14 @@ def export_unified_model_aot(
     model.set_is_inference(True)
     model.eval()
 
+    # Wrap the model so the trace sees only `data` as input — `device` is
+    # bound as a constant attribute of the wrapper and inlined by the tracer.
+    trace_root = _DataOnlyWrapper(model, str(device))
+
     # Trace the full model
     logger.info("tracing full model for unified AOTI export...")
     tracer = Tracer()
-    full_graph = tracer.trace(model)
+    full_graph = tracer.trace(trace_root)
 
     with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
         f.write(str(full_graph))
@@ -293,23 +316,7 @@ def export_unified_model_aot(
                 node.replace_all_uses_with(None)
             full_graph.erase_node(node)
 
-    # Bake device into the graph as a string constant, removing it as an input.
-    # torch.export doesn't support torch.device as input, but the graph's .to()
-    # calls work fine with string device specs like "cuda:0".
-    device_str = str(device)
-    device_node = None
-    for node in full_graph.nodes:
-        if node.op == "placeholder" and node.target == "device":
-            device_node = node
-    if device_node is not None:
-        for user in list(device_node.users):
-            user.args = tuple(device_str if a is device_node else a for a in user.args)
-            user.kwargs = {
-                k: device_str if v is device_node else v for k, v in user.kwargs.items()
-            }
-        full_graph.erase_node(device_node)
-
-    full_gm = torch.fx.GraphModule(model, full_graph)
+    full_gm = torch.fx.GraphModule(trace_root, full_graph)
     full_gm.graph.eliminate_dead_code()
 
     from tzrec.utils.export_util import _prune_unused_param_and_buffer
