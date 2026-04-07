@@ -206,6 +206,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._selected_input_names |= set(data_config.sample_weight_fields)
         if data_config.HasField("sample_cost_field"):
             self._selected_input_names.add(data_config.sample_cost_field)
+        self._sampler_item_id_field: Optional[str] = None
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -213,6 +214,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 "item_id_field"
             ):
                 self._selected_input_names.add(sampler_config.item_id_field)
+                self._sampler_item_id_field = sampler_config.item_id_field
             if hasattr(sampler_config, "user_id_field") and sampler_config.HasField(
                 "user_id_field"
             ):
@@ -374,7 +376,32 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
             else:
+                # If item_id_field is a sequence feature, the sampler can't
+                # process multi-value strings (it casts the whole array to
+                # int64). Extract a single representative value (the first
+                # item) for the sampler. The original (possibly multi-value)
+                # data is preserved for combining with sampled negatives.
+                saved_pos: Dict[str, pa.Array] = {}
+                if (
+                    self._sampler_item_id_field is not None
+                    and self._sampler_item_id_field in self._seq_field_delims
+                ):
+                    seq_delim = self._seq_field_delims[self._sampler_item_id_field]
+                    raw = input_data[self._sampler_item_id_field]
+                    if pa.types.is_string(raw.type):
+                        saved_pos[self._sampler_item_id_field] = raw
+                        # Take first item from each (possibly multi-value) row
+                        split = pc.split_pattern(raw, seq_delim)
+                        input_data[self._sampler_item_id_field] = pc.list_element(
+                            split, 0
+                        )
+
                 sampled = self._sampler.get(input_data)
+
+                # Restore original (possibly multi-value) data for combine
+                for k, original in saved_pos.items():
+                    input_data[k] = original
+
                 for k, v in sampled.items():
                     if k in input_data:
                         seq_delim = self._seq_field_delims.get(k)

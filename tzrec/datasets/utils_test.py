@@ -232,6 +232,20 @@ class DatasetUtilsTest(unittest.TestCase):
         expected = ["1|10|20", "2|30|40"]
         self.assertEqual(result.to_pylist(), expected)
 
+    def test_combine_neg_as_candidate_sequence_multivalue_pos(self):
+        """Test combine when pos_data already has multi-value sequences."""
+        pos_data = pa.array(["1;2", "3;4;5"])
+        neg_data = pa.array(["10", "20", "30", "40"])
+
+        result = combine_neg_as_candidate_sequence(
+            pos_data=pos_data,
+            neg_data=neg_data,
+            neg_sample_num=2,
+            seq_delim=";",
+        )
+        expected = ["1;2;10;20", "3;4;5;30;40"]
+        self.assertEqual(result.to_pylist(), expected)
+
     def test_normalize_type_str_basic_types(self):
         """Test normalizing basic types."""
         self.assertEqual(_normalize_type_str("int32"), "INT32")
