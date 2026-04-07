@@ -72,8 +72,10 @@ from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
-# HSTU-related model types that require hstu_item_id parameter
+# All HSTU-based model types (for hstu_kernel detection)
 _HSTU_MODEL_TYPES = {"dlrm_hstu", "hstu_match"}
+# HSTU model types that require hstu_item_id (ranking models only)
+_HSTU_ITEM_ID_REQUIRED_TYPES = {"dlrm_hstu"}
 
 
 def export_model(
@@ -87,12 +89,15 @@ def export_model(
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = env_util.use_rtp()
 
-    # Get kernel from model_config, default to PYTORCH
-    hstu_kernel = Kernel.Name(pipeline_config.model_config.kernel)
-
     # Check if the model is HSTU-based and requires hstu_item_id
     model_type = config_util.which_msg(pipeline_config.model_config, "model")
-    if model_type in _HSTU_MODEL_TYPES and hstu_item_id is None:
+    # Get kernel from model_config, default to PYTORCH
+    hstu_kernel = (
+        Kernel.Name(pipeline_config.model_config.kernel)
+        if model_type in _HSTU_MODEL_TYPES
+        else None
+    )
+    if model_type in _HSTU_ITEM_ID_REQUIRED_TYPES and hstu_item_id is None:
         raise ValueError(
             f"HSTU model (type: {model_type}) requires --hstu_item_id parameter. "
             "Please specify the feature name of candidate item id column via "

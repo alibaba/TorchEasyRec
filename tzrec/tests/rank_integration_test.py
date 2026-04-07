@@ -963,6 +963,10 @@ class RankIntegrationTest(unittest.TestCase):
             self.test_dir, "export/aoti/output_field_names.json"
         )
         self.assertTrue(os.path.exists(output_names_path))
+        with open(output_names_path) as f:
+            output_names = json.load(f)
+            self.assertIsInstance(output_names, list)
+            self.assertGreater(len(output_names), 0)
 
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,

@@ -449,7 +449,6 @@ class MatchIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                hstu_item_id="item_id",
             )
         self.assertTrue(self.success)
         self.assertTrue(
@@ -458,19 +457,19 @@ class MatchIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
-        # Verify model_acc.json contains HSTU-related fields for user tower
+        # Verify model_acc.json contains HSTU kernel for user tower
         user_acc_path = os.path.join(self.test_dir, "export/user/model_acc.json")
         self.assertTrue(os.path.exists(user_acc_path))
         with open(user_acc_path) as f:
             acc_cfg = json.load(f)
-            self.assertEqual(acc_cfg["hstu_item_id"], "item_id")
+            self.assertNotIn("hstu_item_id", acc_cfg)
             self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
-        # Verify model_acc.json contains HSTU-related fields for item tower
+        # Verify model_acc.json contains HSTU kernel for item tower
         item_acc_path = os.path.join(self.test_dir, "export/item/model_acc.json")
         self.assertTrue(os.path.exists(item_acc_path))
         with open(item_acc_path) as f:
             acc_cfg = json.load(f)
-            self.assertEqual(acc_cfg["hstu_item_id"], "item_id")
+            self.assertNotIn("hstu_item_id", acc_cfg)
             self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
 
 

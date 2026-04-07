@@ -222,7 +222,7 @@ def export_acc_config(
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
     if hstu_item_id is not None:
         acc_config["hstu_item_id"] = hstu_item_id
-        # hstu_kernel defaults to "pytorch" if not specified
+    if hstu_kernel is not None:
         acc_config["hstu_kernel"] = hstu_kernel.lower() if hstu_kernel else "pytorch"
     return acc_config
 
