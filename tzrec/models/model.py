@@ -423,9 +423,10 @@ class CombinedModelWrapper(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        # sparse_model (JIT) is called with CPU data and moves it to
-        # device internally; that also initializes the CUDA context on
-        # fresh worker threads, so the dense_model call below is safe.
+        # Force CUDA context creation on the calling thread — see
+        # UnifiedAOTIModelWrapper.forward for why torch.cuda.set_device
+        # is needed instead of torch.cuda.device().
+        torch.cuda.set_device(device)
         sparse_out, _ = self.sparse_model(data, device)
         with self._lock:
             outputs = self.dense_model(sparse_out)
@@ -460,24 +461,24 @@ class UnifiedAOTIModelWrapper(nn.Module):
 
         Args:
             data (dict): a dict of input data for Batch.
-            device (torch.device): target CUDA device. Required to establish
-                a CUDA context on _forward_loop worker threads — the compiled
-                AOTI graph calls CUDA streams directly and a fresh Python
-                thread has no context unless torch.cuda is touched first.
+            device (torch.device): target CUDA device.
 
         Return:
             predictions (dict): a dict of predicted result.
         """
         # Sort keys to match the export-time dict order (pytree spec).
-        # Data stays on CPU — the compiled graph handles the CPU→CUDA
-        # transfer via ScriptWrapper.get_batch → batch.to(device).
+        # Data stays on CPU here — the compiled graph moves it via the
+        # efficient batch-level Batch.to(device) inside ScriptWrapper.
         data = OrderedDict(sorted(data.items()))
-        # Move data to device to ensure a CUDA context on the calling
-        # thread. Predict worker threads are spawned fresh with no CUDA
-        # context, and the compiled AOTI graph needs one to acquire its
-        # CUDA stream — `torch.cuda.device(device)` and zero-sized allocs
-        # aren't enough to actually create the context. The data transfer
-        # itself is cheap and doubles as the context-init trigger.
-        data = {k: v.to(device, non_blocking=True) for k, v in data.items()}
+        # Force CUDA context creation on the calling thread. Predict
+        # worker threads are spawned fresh with no primary context, and
+        # the compiled AOTI graph crashes with 'CUDA driver error:
+        # invalid device context' when it tries to acquire a CUDA stream.
+        # torch.cuda.set_device uses the force=true code path that always
+        # calls cudaSetDevice (Module.cpp:67), which eagerly creates the
+        # primary context in CUDA 12. `torch.cuda.device(device)` is NOT
+        # sufficient — it calls ExchangeDevice which early-returns when
+        # current==target without invoking cudaSetDevice.
+        torch.cuda.set_device(device)
         with self._lock:
             return self.model(data)

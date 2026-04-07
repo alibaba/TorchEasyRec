@@ -305,16 +305,11 @@ def export_unified_model_aot(
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
-    # Trace with tensors already on the target device so the compiled
-    # graph's input device matches what UnifiedAOTIModelWrapper feeds at
-    # predict time. The wrapper must pre-move data to CUDA in order to
-    # initialize a CUDA context on predict worker threads (fresh Python
-    # threads have no context and the compiled graph's stream access
-    # fails otherwise), so export must agree on CUDA input too.
-    data_on_device = {k: v.to(device) for k, v in data.items()}
-
-    # Verify the unified model produces correct output
-    result = full_gm(data_on_device)
+    # Verify the unified model produces correct output. Pass CPU data —
+    # the graph (via ScriptWrapper.get_batch → Batch.to(device)) handles
+    # the CPU→CUDA transfer at the efficient batch level, avoiding
+    # per-tensor H2D copies on the caller side.
+    result = full_gm(data)
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
 
@@ -326,14 +321,14 @@ def export_unified_model_aot(
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
-    # Export with torch.export
+    # Export with torch.export (CPU inputs; graph handles its own H2D).
     logger.info("exporting unified model with torch.export...")
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
     ):
         exported_pg = torch.export.export(
             full_gm,
-            args=(data_on_device,),
+            args=(data,),
             dynamic_shapes=(dynamic_shapes,),
         )
 
