@@ -308,21 +308,8 @@ def export_unified_model_aot(
     with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
         f.write(str(full_graph))
 
-    # Remove fx_mark_* no-op nodes (they are split markers, not needed for unified)
-    for node in list(full_graph.nodes):
-        if node.op == "call_function" and getattr(
-            node.target, "__name__", ""
-        ).startswith("fx_mark_"):
-            if node.users:
-                node.replace_all_uses_with(None)
-            full_graph.erase_node(node)
-
     full_gm = torch.fx.GraphModule(trace_root, full_graph)
     full_gm.graph.eliminate_dead_code()
-
-    from tzrec.utils.export_util import _prune_unused_param_and_buffer
-
-    full_gm = _prune_unused_param_and_buffer(full_gm)
 
     with open(os.path.join(graph_dir, "gm_unified.graph"), "w") as f:
         f.write(str(full_gm.graph))
