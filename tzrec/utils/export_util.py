@@ -628,7 +628,6 @@ def export_rtp_model(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
-    hstu_item_id: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""

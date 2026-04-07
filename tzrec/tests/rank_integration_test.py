@@ -1050,13 +1050,6 @@ class RankIntegrationTest(unittest.TestCase):
                 hstu_item_id="cand_seq_video_id",
             )
         self.assertTrue(self.success)
-        # Verify model_acc.json contains HSTU-related fields
-        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
-        self.assertTrue(os.path.exists(model_acc_path))
-        with open(model_acc_path) as f:
-            acc_cfg = json.load(f)
-            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq_video_id")
-            self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
 
 
 if __name__ == "__main__":
