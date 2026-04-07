@@ -1240,15 +1240,15 @@ def predict(
         for _ in range(len(forward_t_list)):
             try:
                 data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send sentinel to data_queue: {e}")
         for t in forward_t_list:
             t.join()
         if write_t is not None:
             try:
                 pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send sentinel to pred_queue: {e}")
             write_t.join()
         writer.close()
 
@@ -1451,8 +1451,8 @@ def predict_checkpoint(
             if write_t is not None:
                 try:
                     pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to send sentinel to pred_queue: {e}")
                 write_t.join()
             writer.close()
 
