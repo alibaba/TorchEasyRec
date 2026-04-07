@@ -158,21 +158,29 @@ def _build_dynamic_shapes(
     """
     from tzrec.protos.model_pb2 import FeatureGroupType
 
-    # Step 1: From feature metadata, identify sequence features.
+    # Step 1: Group grouped sequence features by their sequence_name.
+    # Features in the same SequenceFeature config share per-sample lengths,
+    # so their .values always have the same nnz — they must share a Dim.
+    # This takes precedence over FeatureGroupConfig because it reflects the
+    # authoritative data structure (shared sequence), not model organization.
+    feat_to_seq_dim_group: Dict[str, str] = {}
     seq_feat_names: set = set()
     for feat in features:
         if feat.is_sequence:
             seq_feat_names.add(feat.name)
+            if getattr(feat, "_is_grouped_seq", False):
+                seq_name = getattr(feat, "sequence_name", None)
+                if seq_name:
+                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
 
-    # Step 2: From model config's feature_groups, determine which sequence
-    # features share the same sequence structure (and thus the same nnz).
-    feat_to_seq_dim_group: Dict[str, str] = {}
+    # Step 2: For standalone sequence features not yet grouped, fall back to
+    # model_config.feature_groups structure.
     for fg in model_config.feature_groups:
         if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
             # In JAGGED_SEQUENCE groups, all sequence features share a single
             # jagged structure → same nnz → share Dim.
             for name in fg.feature_names:
-                if name in seq_feat_names:
+                if name in seq_feat_names and name not in feat_to_seq_dim_group:
                     feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
         # SEQUENCE (DIN-style) groups: standalone sequence features have
         # independent lengths, so don't auto-share. Only grouped sequence
