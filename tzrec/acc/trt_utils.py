@@ -18,7 +18,11 @@ from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from tzrec.acc.utils import get_max_export_batch_size, is_debug_trt
-from tzrec.models.model import CombinedModelWrapper
+from tzrec.models.model import (
+    AutocastWrapper,
+    CombinedModelWrapper,
+    DenseAutocastWrapper,
+)
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
@@ -104,6 +108,7 @@ def export_model_trt(
     dense_model: nn.Module,
     data: Dict[str, torch.Tensor],
     save_dir: str,
+    mixed_precision: Optional[str] = None,
 ) -> None:
     """Export trt model.
 
@@ -112,14 +117,31 @@ def export_model_trt(
         dense_model (nn.Module): the dense part
         data (Dict[str, torch.Tensor]): the test data
         save_dir (str): model save dir
+        mixed_precision (Optional[str]): "BF16", "FP16", or None. When set,
+            sparse and dense sub-graphs are wrapped in autocast so that AMP
+            is preserved through jit.script and torch.export.
     """
-    emb_ebc, _ = sparse_model(data, "cuda:0")
+    autocast_dtype: Optional[torch.dtype] = None
+    if mixed_precision == "BF16":
+        autocast_dtype = torch.bfloat16
+    elif mixed_precision == "FP16":
+        autocast_dtype = torch.float16
+
+    with torch.amp.autocast(
+        device_type="cuda",
+        dtype=autocast_dtype,
+        enabled=autocast_dtype is not None,
+    ):
+        emb_ebc, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
 
     with open(os.path.join(save_dir, "gm_sparse.code"), "w") as f:
         f.write(sparse_model_traced.code)
 
-    sparse_model_scripted = torch.jit.script(sparse_model_traced)
+    sparse_to_script: nn.Module = sparse_model_traced
+    if mixed_precision:
+        sparse_to_script = AutocastWrapper(sparse_model_traced, mixed_precision)
+    sparse_model_scripted = torch.jit.script(sparse_to_script)
 
     # dynamic shapes
     max_batch_size = get_max_export_batch_size()
@@ -153,8 +175,11 @@ def export_model_trt(
     for i, k in enumerate(key_list):
         dynamic_shapes[dense_arg_name].update({k: dynamic_shapes_list[i]})
 
+    dense_to_export: nn.Module = dense_layer
+    if mixed_precision:
+        dense_to_export = DenseAutocastWrapper(dense_layer, mixed_precision)
     exp_program = torch.export.export(
-        dense_layer, (emb_ebc,), dynamic_shapes=dynamic_shapes
+        dense_to_export, (emb_ebc,), dynamic_shapes=dynamic_shapes
     )
     dense_layer_trt = trt_convert(exp_program, (emb_ebc,))
     # logger.info("dense trt res: %s", dense_layer_trt(emb_ebc))

@@ -77,32 +77,29 @@ def hstu_mha(
             kernel = Kernel.TRITON
 
     if kernel == Kernel.CUTLASS:
-        # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf, so
-        # it must be called directly without surrounding control-flow
-        # preprocessing (which would break FX symbolic tracing).
-        # Cast to bf16 unconditionally: the CUTLASS kernel only supports
-        # fp16/bf16, and unconditional casts are FX-traceable (no control
-        # flow). Cast the output back to the input dtype so downstream
-        # layers see the original dtype.
+        # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf so
+        # we call it directly without going through the contiguous/assertion
+        # preprocessing block below (which has control flow that would
+        # break FX symbolic tracing). The CUTLASS kernel requires fp16/bf16
+        # inputs; we rely on the AutocastWrapper applied in
+        # tzrec/acc/aot_utils.py and trt_utils.py (driven by
+        # train_config.mixed_precision) to ensure q/k/v are bf16/fp16 when
+        # reaching this dispatch. cutlass_hstu_mha itself raises a clear
+        # error if it's somehow called with fp32.
         from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
 
-        orig_dtype = v.dtype
-        q_bf16 = q.to(torch.bfloat16)
-        k_bf16 = k.to(torch.bfloat16)
-        v_bf16 = v.to(torch.bfloat16)
-        out = cutlass_hstu_mha(
+        return cutlass_hstu_mha(
             max_seq_len=max_seq_len,
             alpha=alpha,
-            q=q_bf16,
-            k=k_bf16,
-            v=v_bf16,
+            q=q,
+            k=k,
+            v=v,
             seq_offsets=seq_offsets,
             causal=causal,
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
         )
-        return out.to(orig_dtype)
 
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
