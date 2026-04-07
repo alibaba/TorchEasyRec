@@ -916,8 +916,7 @@ class RankIntegrationTest(unittest.TestCase):
         df2 = df2.sort_values(by=predict_columns).reset_index(drop=True)
         self.assertTrue(dfs_are_close(df1, df2, 1e-6))
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_rank_dlrm_hstu_train_eval_export(self):
+    def _test_rank_dlrm_hstu_train_eval_export(self, export_env_str: str):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config", self.test_dir
         )
@@ -926,14 +925,10 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
         if self.success:
-            # DLRM-HSTU uses Triton kernels which have runtime issues with
-            # the unified AOTI export (slow Triton autotuning, complex jagged
-            # ops). Use the two-stage export (UNIFIED_AOT=0) for HSTU until
-            # upstream torch.export/AOTI support for Triton+HSTU improves.
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="ENABLE_AOT=1 UNIFIED_AOT=0",
+                env_str=export_env_str,
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
@@ -958,6 +953,36 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(self.success)
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export(self):
+        # DLRM-HSTU uses Triton kernels which have runtime issues with
+        # the unified AOTI export (slow Triton autotuning, complex jagged
+        # ops). Use the two-stage export (UNIFIED_AOT=0) for HSTU until
+        # upstream torch.export/AOTI support for Triton+HSTU improves.
+        self._test_rank_dlrm_hstu_train_eval_export(
+            export_env_str="ENABLE_AOT=1 UNIFIED_AOT=0"
+        )
+        # Two-stage export must produce both the JIT sparse model and the
+        # AOTI dense model.
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
+            )
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export_unified_aot(self):
+        # Verify the unified AOTI export path (UNIFIED_AOT=1) for DLRM-HSTU.
+        self._test_rank_dlrm_hstu_train_eval_export(
+            export_env_str="ENABLE_AOT=1 UNIFIED_AOT=1"
+        )
+        # Unified export must NOT produce the legacy JIT sparse model file.
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
+            )
         )
 
     @unittest.skipIf(
