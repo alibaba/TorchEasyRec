@@ -15,7 +15,6 @@ from typing import Any, Dict, Union
 
 import torch
 from torch import nn
-from torchrec.distributed.train_pipeline.utils import Tracer
 
 from tzrec.acc.utils import is_unified_aot_predict
 from tzrec.models.model import CombinedModelWrapper, UnifiedAOTIModelWrapper
@@ -287,8 +286,6 @@ def export_unified_model_aot(
         save_dir (str): model save dir.
     """
     os.makedirs(save_dir, exist_ok=True)
-    graph_dir = os.path.join(save_dir, "graph")
-    os.makedirs(graph_dir, exist_ok=True)
 
     # AOTInductor export requires CUDA.
     device = torch.device("cuda:0")
@@ -300,20 +297,12 @@ def export_unified_model_aot(
     # bound as a constant attribute of the wrapper and inlined by the tracer.
     trace_root = _DataOnlyWrapper(model, str(device))
 
-    # Trace the full model
+    # Trace the full model. The torchrec-aware symbolic_trace decomposes
+    # quantized EBC ops (e.g. fbgemm.bounds_check_indices) into primitives,
+    # which is required for torch.export.export() to functionalize them.
     logger.info("tracing full model for unified AOTI export...")
-    tracer = Tracer()
-    full_graph = tracer.trace(trace_root)
-
-    with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
-        f.write(str(full_graph))
-
-    full_gm = torch.fx.GraphModule(trace_root, full_graph)
-    full_gm.graph.eliminate_dead_code()
-
-    with open(os.path.join(graph_dir, "gm_unified.graph"), "w") as f:
-        f.write(str(full_gm.graph))
-    with open(os.path.join(save_dir, "gm_unified.code"), "w") as f:
+    full_gm = symbolic_trace(trace_root)
+    with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
     # Move data to the target device (AOTI models always run on CUDA)
