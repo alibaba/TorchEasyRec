@@ -69,6 +69,16 @@ def is_aot() -> bool:
         return False
 
 
+def is_unified_aot() -> bool:
+    """Judge whether to use the unified AOTI export.
+
+    UNIFIED_AOT=1 (default): fused sparse+dense AOTI model.
+    UNIFIED_AOT=0: legacy two-stage export (sparse JIT + dense AOTI).
+    """
+    unified_aot = os.environ.get("UNIFIED_AOT", "1")
+    return bool(unified_aot) and unified_aot[0] == "1"
+
+
 def is_aot_predict(model_path: str) -> bool:
     """Judge is aot or not in predict."""
     with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
