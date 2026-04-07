@@ -24,6 +24,17 @@ from tzrec.models.model import (
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
+# Eagerly register custom ops referenced by AOT-packaged models so that
+# torch._inductor.aoti_load_package() can resolve them by name. AOT packages
+# reference ops via their qualified name (e.g. ``tzrec::cutlass_hstu_mha_fwd``)
+# and PyTorch only knows about an op once its registering module has been
+# imported. Wrap in try/except so this stays optional for environments
+# without the corresponding native dependencies installed.
+try:
+    from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
+except ImportError:
+    pass
+
 
 def load_model_aot(model_path: str, device: torch.device) -> CombinedModelWrapper:
     """Load AOTInductor model.
