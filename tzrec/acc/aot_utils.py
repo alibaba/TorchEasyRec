@@ -15,6 +15,7 @@ from typing import Any, Dict, Union
 
 import torch
 from torch import nn
+from torchrec.distributed.train_pipeline.utils import Tracer
 
 from tzrec.acc.utils import is_unified_aot_predict
 from tzrec.models.model import CombinedModelWrapper, UnifiedAOTIModelWrapper
@@ -286,6 +287,8 @@ def export_unified_model_aot(
         save_dir (str): model save dir.
     """
     os.makedirs(save_dir, exist_ok=True)
+    graph_dir = os.path.join(save_dir, "graph")
+    os.makedirs(graph_dir, exist_ok=True)
 
     # AOTInductor export requires CUDA.
     device = torch.device("cuda:0")
@@ -293,15 +296,31 @@ def export_unified_model_aot(
     model.set_is_inference(True)
     model.eval()
 
-    # Wrap the model so the export sees only `data` as input — `device` is
-    # bound as a constant attribute of the wrapper.
+    # Wrap the model so the trace sees only `data` as input — `device` is
+    # bound as a constant attribute of the wrapper and inlined by the tracer.
     trace_root = _DataOnlyWrapper(model, str(device))
+
+    # Trace the full model
+    logger.info("tracing full model for unified AOTI export...")
+    tracer = Tracer()
+    full_graph = tracer.trace(trace_root)
+
+    with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+        f.write(str(full_graph))
+
+    full_gm = torch.fx.GraphModule(trace_root, full_graph)
+    full_gm.graph.eliminate_dead_code()
+
+    with open(os.path.join(graph_dir, "gm_unified.graph"), "w") as f:
+        f.write(str(full_gm.graph))
+    with open(os.path.join(save_dir, "gm_unified.code"), "w") as f:
+        f.write(full_gm.code)
 
     # Move data to the target device (AOTI models always run on CUDA)
     data_on_device = {k: v.to(device) for k, v in data.items()}
 
-    # Verify the wrapped model produces correct output
-    result = trace_root(data_on_device)
+    # Verify the unified model produces correct output
+    result = full_gm(data_on_device)
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
 
@@ -319,7 +338,7 @@ def export_unified_model_aot(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
     ):
         exported_pg = torch.export.export(
-            trace_root,
+            full_gm,
             args=(data_on_device,),
             dynamic_shapes=(dynamic_shapes,),
         )
