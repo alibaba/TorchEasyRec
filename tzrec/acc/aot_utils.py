@@ -290,7 +290,8 @@ def export_unified_model_aot(
     graph_dir = os.path.join(save_dir, "graph")
     os.makedirs(graph_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # AOTInductor export requires CUDA.
+    device = torch.device("cuda:0")
 
     model.set_is_inference(True)
     model.eval()
