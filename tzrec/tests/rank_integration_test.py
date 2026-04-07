@@ -1055,6 +1055,24 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
+    def test_dlrm_hstu_export_without_hstu_item_id_raises(self):
+        pipeline_config = config_util.load_pipeline_config(
+            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config"
+        )
+        from unittest.mock import MagicMock
+
+        from tzrec.utils.export_util import export_model
+
+        with self.assertRaises(ValueError) as ctx:
+            export_model(
+                pipeline_config=pipeline_config,
+                model=MagicMock(),
+                checkpoint_path=None,
+                save_dir=self.test_dir,
+                hstu_item_id=None,
+            )
+        self.assertIn("hstu_item_id", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
