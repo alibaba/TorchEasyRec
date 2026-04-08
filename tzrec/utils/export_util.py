@@ -192,34 +192,9 @@ def export_model_normal(
         model.eval()
 
         data = batch.to_dict(sparse_dtype=torch.int64)
-        # Resolve the mixed-precision mode to apply during the export eager
-        # run and dense-side torch.export. export_config.mixed_precision
-        # overrides train_config.mixed_precision when set; empty falls back
-        # to the train_config value.
-        export_mp = ""
-        if pipeline_config.HasField("export_config"):
-            export_mp = pipeline_config.export_config.mixed_precision
-        mixed_precision = export_mp or pipeline_config.train_config.mixed_precision
-        autocast_dtype: Optional[torch.dtype] = None
-        if mixed_precision == "BF16":
-            autocast_dtype = torch.bfloat16
-        elif mixed_precision == "FP16":
-            autocast_dtype = torch.float16
-        if acc_utils.is_trt():
-            data = OrderedDict(sorted(data.items()))
-            with torch.amp.autocast(
-                device_type="cuda",
-                dtype=autocast_dtype,
-                enabled=autocast_dtype is not None,
-            ):
-                result = model(data, "cuda:0")
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            sparse, dense, _ = split_model(data, model, save_dir)
-            export_model_trt(
-                sparse, dense, data, save_dir, mixed_precision=mixed_precision
-            )
-        elif acc_utils.is_aot():
+        mixed_precision = acc_utils.resolve_mixed_precision(pipeline_config)
+        autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if acc_utils.is_trt() or acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
             with torch.amp.autocast(
                 device_type="cuda",
@@ -230,14 +205,19 @@ def export_model_normal(
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
             sparse, dense, meta_info = split_model(data, model, save_dir)
-            export_model_aot(
-                sparse,
-                dense,
-                data,
-                meta_info,
-                save_dir,
-                mixed_precision=mixed_precision,
-            )
+            if acc_utils.is_trt():
+                export_model_trt(
+                    sparse, dense, data, save_dir, mixed_precision=mixed_precision
+                )
+            else:
+                export_model_aot(
+                    sparse,
+                    dense,
+                    data,
+                    meta_info,
+                    save_dir,
+                    mixed_precision=mixed_precision,
+                )
         else:
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}

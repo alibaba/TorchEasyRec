@@ -22,6 +22,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 
+from tzrec.acc import utils as acc_utils
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
@@ -236,16 +237,7 @@ class TrainWrapper(BaseModule):
         self._device_type = "cpu"
         if device is not None:
             self._device_type = device.type
-        if mixed_precision is None or len(mixed_precision) == 0:
-            self._mixed_dtype = None
-        elif mixed_precision == "FP16":
-            self._mixed_dtype = torch.float16
-        elif mixed_precision == "BF16":
-            self._mixed_dtype = torch.bfloat16
-        else:
-            raise ValueError(
-                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
-            )
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         self.pareto = None
         if (
             hasattr(self.model, "_use_pareto_loss_weight")
@@ -300,16 +292,7 @@ class PredictWrapper(BaseModule):
         self._device_type = "cpu"
         if device is not None:
             self._device_type = device.type
-        if mixed_precision is None or len(mixed_precision) == 0:
-            self._mixed_dtype = None
-        elif mixed_precision == "FP16":
-            self._mixed_dtype = torch.float16
-        elif mixed_precision == "BF16":
-            self._mixed_dtype = torch.bfloat16
-        else:
-            raise ValueError(
-                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
-            )
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         self._output_cols = output_cols
 
     def forward(
@@ -403,6 +386,13 @@ class DenseAutocastWrapper(nn.Module):
     sparse/dense split.
 
     The forward takes a single dict argument matching the dense_gm signature.
+
+    Note on the ``_mixed_dtype_id: Final[int]`` encoding: ``torch.jit.script``
+    only honors ``torch.autocast(dtype=...)`` when ``dtype`` is a compile-time
+    literal. We therefore store an integer flag (``Final[int]``) set in
+    ``__init__`` and branch on it in ``forward`` so each branch's
+    ``torch.autocast(dtype=torch.bfloat16|torch.float16)`` is a literal.
+    Storing the dtype directly as an attribute would not be script-friendly.
 
     Args:
         inner (nn.Module): inner dense module to wrap.
