@@ -207,6 +207,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if data_config.HasField("sample_cost_field"):
             self._selected_input_names.add(data_config.sample_cost_field)
         self._sampler_item_id_field: Optional[str] = None
+        self._sampler_user_id_field: Optional[str] = None
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -219,6 +220,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 "user_id_field"
             ):
                 self._selected_input_names.add(sampler_config.user_id_field)
+                self._sampler_user_id_field = sampler_config.user_id_field
         # if set selected_input_names to None,
         # all columns will be reserved.
         if (
@@ -376,14 +378,14 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
             else:
-                # If item_id_field is a sequence feature, each item in the
-                # row's sequence is a positive that should get its own
-                # negatives. Flatten per-row positives into a single 1D
-                # array, call the sampler so each positive is treated as a
-                # separate query, then combine_neg_as_candidate_sequence
-                # interleaves them per row:
-                # [pos1, neg1_1, ..., pos2, neg2_1, ..., posK, negK_n].
+                # If item_id_field is a sequence feature, flatten per-row
+                # positives into a 1D array so the sampler treats each
+                # positive as a separate query. Expand user_id in the same
+                # way for samplers that rely on it (V2, HardNeg, HardNegV2).
+                # The sampler computes expand_factor dynamically from the
+                # actual input length, so no padding or batch_size limit.
                 multi_pos_lists: Optional[pa.Array] = None
+                saved_user_ids: Optional[pa.Array] = None
                 if (
                     self._sampler_item_id_field is not None
                     and self._sampler_item_id_field in self._seq_field_delims
@@ -393,20 +395,28 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     if pa.types.is_string(raw.type):
                         multi_pos_lists = pc.split_pattern(raw, seq_delim)
                         flat_pos = pc.list_flatten(multi_pos_lists)
-                        sampler_bs = self._sampler._batch_size
-                        assert len(flat_pos) <= sampler_bs, (
-                            f"Total positives {len(flat_pos)} across rows "
-                            f"exceeds sampler batch_size {sampler_bs}. Reduce "
-                            f"batch_size or per-row sequence length."
-                        )
                         input_data[self._sampler_item_id_field] = flat_pos
+
+                        # Expand user_id to match flat positives (step 4).
+                        if self._sampler_user_id_field is not None and (
+                            self._sampler_user_id_field in input_data
+                        ):
+                            counts_np = pc.list_value_length(multi_pos_lists).to_numpy()
+                            row_indices = pa.array(
+                                np.repeat(np.arange(len(counts_np)), counts_np)
+                            )
+                            saved_user_ids = input_data[self._sampler_user_id_field]
+                            input_data[self._sampler_user_id_field] = pc.take(
+                                saved_user_ids, row_indices
+                            )
 
                 sampled = self._sampler.get(input_data)
 
+                # Restore multi-value form so combine_neg sees original grouping.
                 if multi_pos_lists is not None:
-                    # Restore the list-array form so combine_neg sees the
-                    # original per-row grouping of positives.
                     input_data[self._sampler_item_id_field] = multi_pos_lists
+                if saved_user_ids is not None:
+                    input_data[self._sampler_user_id_field] = saved_user_ids
 
                 for k, v in sampled.items():
                     if k in input_data:
@@ -417,11 +427,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                                 num_pos = len(pc.list_flatten(pos_for_combine))
                             else:
                                 num_pos = len(pos_for_combine)
-                            # Sampler returns batch_size * expand_factor negs
-                            # (with padding); slice to the valid prefix.
-                            neg_per_pos = len(v) // self._sampler._batch_size
-                            if neg_per_pos < 1:
-                                neg_per_pos = 1
+                            # Sampler returns num_pos * expand_factor negs.
+                            neg_per_pos = max(1, len(v) // max(1, num_pos))
                             valid_negs = v.slice(0, num_pos * neg_per_pos)
                             input_data[k] = combine_neg_as_candidate_sequence(
                                 pos_for_combine,
