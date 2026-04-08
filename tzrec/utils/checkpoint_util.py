@@ -39,6 +39,22 @@ from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
+def _is_resharded_mc_buffer(fqn: str) -> bool:
+    """Whether a state_dict key is a MCH buffer that needs value-aware reshard.
+
+    Everything under ``._managed_collision_modules.`` except the globally
+    replicated, non-rank-specific counters that torchrec excludes from
+    ``sharded_parameter_names()`` (currently ``_current_iter_tensor``).
+    ``_output_segments_tensor`` is replicated but *rank-specific*, so it is
+    included here and must not be loaded from a non-aligned checkpoint.
+    """
+    if "._managed_collision_modules." not in fqn:
+        return False
+    if fqn.endswith("._current_iter_tensor"):
+        return False
+    return True
+
+
 class PartialLoadPlanner(DefaultLoadPlanner):
     """Support restore partial states.
 
@@ -94,7 +110,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
 
         # pyre-ignore [16]
         for fqn, obj in self.state_dict.items():
-            if self._skip_mc_module_state and "._managed_collision_modules." in fqn:
+            if self._skip_mc_module_state and _is_resharded_mc_buffer(fqn):
                 continue
 
             meta_fqn = fqn
