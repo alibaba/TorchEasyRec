@@ -13,7 +13,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -503,129 +502,62 @@ class Batch(Pipelineable):
         return tensor_dict
 
 
-def process_hstu_seq_data(
-    input_data: Dict[str, pa.Array],
-    seq_attr: str,
-    seq_str_delim: str,
-) -> Tuple[pa.Array, pa.Array, pa.Array]:
-    """Process sequence data for HSTU match model.
-
-    Args:
-        input_data: Dictionary containing input arrays
-        seq_attr: Name of the sequence attribute field
-        seq_str_delim: Delimiter used to separate sequence items
-
-    Returns:
-        Tuple containing:
-        - input_data_k_split: pa.Array, Original sequence items
-        - input_data_k_split_slice: pa.Array, Target items for autoregressive training
-        - pre_seq_filter_reshaped_joined: pa.Array,
-        Training sequence for autoregressive training
-    """
-    # default sequence data is string
-    if pa.types.is_string(input_data[seq_attr].type):
-        input_data_k_split = pc.split_pattern(input_data[seq_attr], seq_str_delim)
-        # Get target items for training for autoregressive training
-        # Example: [1,2,3,4,5] -> [2,3,4,5]
-        input_data_k_split_slice = pc.list_flatten(
-            pc.list_slice(input_data_k_split, start=1)
-        )
-
-        # Directly extract the training sequence for autoregressive training
-        # Operation target example: [1,2,3,4,5] -> [1,2,3,4]
-        # (corresponding target: [2,3,4,5])
-        # As this can not be achieved by pyarrow.compute, and for loop is costly
-        # we need to do this using pa.ListArray.from_arrays using offsets
-        # 1. transfer to numpy and filter out the last item
-        pre_seq = pc.list_flatten(input_data_k_split).to_numpy(zero_copy_only=False)
-        # Mark last items of each seq with '-1'
-        pre_seq[input_data_k_split.offsets.to_numpy()[1:] - 1] = "-1"
-        # Filter out -1 marker elements
-        mask = pre_seq != "-1"
-        pre_seq_filter = pre_seq[mask]
-        # 2. create offsets for reshaping filtered sequence
-        # The offsets should be created extract the training sequence
-        # Example: if the original offsets are [0,2,5,9], after filter,
-        # for the offsets should be [0, 1, 3, 6]
-        # that is, [0] + [2-1, 5-2, 9-3]
-        pre_seq_filter_offsets = pa.array(
-            np.concatenate(
-                [
-                    np.array([0]),
-                    input_data_k_split.offsets[1:].to_numpy(zero_copy_only=False)
-                    - np.arange(
-                        1,
-                        len(
-                            input_data_k_split.offsets[1:].to_numpy(
-                                zero_copy_only=False
-                            )
-                        )
-                        + 1,
-                    ),
-                ]
-            )
-        )
-        pre_seq_filter_reshaped = pa.ListArray.from_arrays(
-            pre_seq_filter_offsets, pre_seq_filter
-        )
-        # Join filtered sequence with delimiter
-        pre_seq_filter_reshaped_joined = pc.binary_join(
-            pre_seq_filter_reshaped, seq_str_delim
-        )
-
-        return (
-            input_data_k_split,
-            input_data_k_split_slice,
-            pre_seq_filter_reshaped_joined,
-        )
-
-
-def process_hstu_neg_sample(
-    input_data: Dict[str, pa.Array],
-    v: pa.Array,
+def combine_neg_as_candidate_sequence(
+    pos_data: pa.Array,
+    neg_data: pa.Array,
     neg_sample_num: int,
-    seq_str_delim: str,
-    seq_attr: str,
+    seq_delim: str,
 ) -> pa.Array:
-    """Process negative samples for HSTU match model.
+    """Combine positive and negative items into candidate sequences.
+
+    Each row's positive items are flattened and each positive gets its own
+    set of `neg_sample_num` negatives. The result interleaves per position:
+    "pos1;neg1_1;...;neg1_n;pos2;neg2_1;...;posK;negK_n".
+
+    Used when candidate features are sequence_id_features in a JAGGED_SEQUENCE
+    group. Supports both single-value positives ("123") and multi-value
+    positives ("1;2;3") per row.
 
     Args:
-        input_data: Dict[str, pa.Array], Dictionary containing input arrays
-        v: pa.Array, negative samples.
-        neg_sample_num: int, number of negative samples.
-        seq_str_delim: str, delimiter for sequence string.
-        seq_attr: str, attribute name of sequence.
+        pos_data: positive items per row. Either a 1D array of strings (each
+            row may contain a delimited sequence) or a list array.
+        neg_data: flat array of negative items, ordered by positive.
+            Length = total_positives * neg_sample_num.
+        neg_sample_num: number of negative samples per positive.
+        seq_delim: delimiter for joining items into a sequence string.
 
     Returns:
-        pa.Array: Processed negative samples
+        pa.Array of strings, each row's candidate sequence.
+
+    Example:
+        pos_data = ["1", "2;3"]
+        neg_data = ["10", "20", "30"]  # 1 neg per pos, total 3 positives
+        neg_sample_num = 1
+        seq_delim = ";"
+        result = ["1;10", "2;20;3;30"]
     """
-    # The goal is to make neg samples concat to the training sequence
-    # Example:
-    # input_data[seq_attr] = ["1;2;3"]
-    # neg_sample_num = 2
-    # v = [4,5,6,7,8,9]
-    # then the output should be [[1,4,5], [2,6,7], [3,8,9]]
-    v_str = v.cast(pa.string())
-    filtered_v_offsets = pa.array(
-        np.concatenate(
-            [
-                np.array([0]),
-                np.arange(neg_sample_num, len(v_str) + 1, neg_sample_num),
-            ]
-        )
-    )
-    # Reshape v for each input_data[seq_attr]
-    # Example:[4,5,6,7,8,9] -> [[4,5], [6,7], [8,9]]
-    filtered_v_palist = pa.ListArray.from_arrays(filtered_v_offsets, v_str)
-    # Using string for join, as not found operation for ListArray achieving this
-    # Example: [[4,5], [6,7], [8,9]] -> ["4;5", "6;7", "8;9"]
-    sampled_joined = pc.binary_join(filtered_v_palist, seq_str_delim)
-    # Combine training sequence and target items
-    # Example: ["1;2;3"] + ["4;5", "6;7", "8;9"]
-    # -> ["1;4;5", "2;6;7", "3;8;9"]
-    return pc.binary_join_element_wise(
-        input_data[seq_attr], sampled_joined, seq_str_delim
-    )
+    # Normalize pos_data to a list array (each row → list of positives)
+    if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
+        pos_lists = pos_data
+    else:
+        pos_lists = pc.split_pattern(pos_data.cast(pa.string()), seq_delim)
+
+    counts = pc.list_value_length(pos_lists).to_pylist()
+    pos_flat = pc.list_flatten(pos_lists).cast(pa.string()).to_pylist()
+    neg_str_list = neg_data.cast(pa.string()).to_pylist()
+
+    result: List[str] = []
+    pos_offset = 0
+    neg_offset = 0
+    for k_i in counts:
+        parts: List[str] = []
+        for _ in range(k_i):
+            parts.append(pos_flat[pos_offset])
+            parts.extend(neg_str_list[neg_offset : neg_offset + neg_sample_num])
+            pos_offset += 1
+            neg_offset += neg_sample_num
+        result.append(seq_delim.join(parts))
+    return pa.array(result)
 
 
 def calc_slice_position(

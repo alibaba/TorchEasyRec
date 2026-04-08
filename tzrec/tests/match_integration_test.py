@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
+from tzrec.utils.test_util import gpu_unavailable
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -431,14 +432,13 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
-    @unittest.skip("skip hstu match test")
+    @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_fg_mock.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
-            is_hstu=True,
         )
         if self.success:
             self.success = utils.test_eval(
@@ -447,6 +447,15 @@ class MatchIntegrationTest(unittest.TestCase):
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/item"),
+                predict_input_path=os.path.join(self.test_dir, r"eval_data/\*.parquet"),
+                predict_output_path=os.path.join(self.test_dir, "predict_result"),
+                reserved_columns="item_id",
+                output_columns="item_tower_emb",
+                test_dir=self.test_dir,
             )
         self.assertTrue(self.success)
         self.assertTrue(

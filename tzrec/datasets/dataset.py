@@ -30,8 +30,7 @@ from tzrec.datasets.utils import (
     CKPT_SOURCE_ID,
     Batch,
     RecordBatchTensor,
-    process_hstu_neg_sample,
-    process_hstu_seq_data,
+    combine_neg_as_candidate_sequence,
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
@@ -177,7 +176,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._reserved_columns = reserved_columns or []
         self._mode = mode
         self._debug_level = debug_level
-        self._enable_hstu = data_config.enable_hstu
         self.sampler_type = (
             self._data_config.WhichOneof("sampler")
             if self._data_config.HasField("sampler")
@@ -208,6 +206,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._selected_input_names |= set(data_config.sample_weight_fields)
         if data_config.HasField("sample_cost_field"):
             self._selected_input_names.add(data_config.sample_cost_field)
+        self._sampler_item_id_field: Optional[str] = None
+        self._sampler_user_id_field: Optional[str] = None
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -215,10 +215,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 "item_id_field"
             ):
                 self._selected_input_names.add(sampler_config.item_id_field)
+                self._sampler_item_id_field = sampler_config.item_id_field
             if hasattr(sampler_config, "user_id_field") and sampler_config.HasField(
                 "user_id_field"
             ):
                 self._selected_input_names.add(sampler_config.user_id_field)
+                self._sampler_user_id_field = sampler_config.user_id_field
         # if set selected_input_names to None,
         # all columns will be reserved.
         if (
@@ -237,6 +239,14 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         self._sampler = None
         self._sampler_inited = False
+
+        # Build mapping of field_name → sequence_delim for candidate sequence
+        # auto-detection during negative sampling.
+        self._seq_field_delims: Dict[str, str] = {}
+        for feature in features:
+            if hasattr(feature, "sequence_delim") and feature.sequence_delim:
+                for input_name in feature.inputs:
+                    self._seq_field_delims[input_name] = feature.sequence_delim
 
         self._reader = None
 
@@ -367,49 +377,67 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
-            elif self._enable_hstu:
-                seq_attr = self._sampler._item_id_field
-
-                (
-                    input_data_k_split,
-                    input_data_k_split_slice,
-                    pre_seq_filter_reshaped_joined,
-                ) = process_hstu_seq_data(
-                    input_data=input_data,
-                    seq_attr=seq_attr,
-                    seq_str_delim=self._sampler.item_id_delim,
-                )
-                if self._mode == Mode.TRAIN:
-                    # Training using all possible target items
-                    input_data[seq_attr] = input_data_k_split_slice
-                elif self._mode == Mode.EVAL:
-                    # Evaluation using the last item for previous sequence
-                    input_data[seq_attr] = input_data_k_split.values.take(
-                        pa.array(input_data_k_split.offsets.to_numpy()[1:] - 1)
-                    )
-                sampled = self._sampler.get(input_data)
-                # To keep consistent with other process, use two functions
-                for k, v in sampled.items():
-                    if k in input_data:
-                        combined = process_hstu_neg_sample(
-                            input_data,
-                            v,
-                            self._sampler._num_sample,
-                            self._sampler.item_id_delim,
-                            seq_attr,
-                        )
-                        # Combine here to make embddings of both user sequence
-                        # and target item are the same
-                        input_data[k] = pa.concat_arrays(
-                            [pre_seq_filter_reshaped_joined, combined]
-                        )
-                    else:
-                        input_data[k] = v
             else:
+                # If item_id_field is a sequence feature, flatten per-row
+                # positives into a 1D array so the sampler treats each
+                # positive as a separate query. Expand user_id in the same
+                # way for samplers that rely on it (V2, HardNeg, HardNegV2).
+                # The sampler computes expand_factor dynamically from the
+                # actual input length, so no padding or batch_size limit.
+                multi_pos_lists: Optional[pa.Array] = None
+                saved_user_ids: Optional[pa.Array] = None
+                if (
+                    self._sampler_item_id_field is not None
+                    and self._sampler_item_id_field in self._seq_field_delims
+                ):
+                    seq_delim = self._seq_field_delims[self._sampler_item_id_field]
+                    raw = input_data[self._sampler_item_id_field]
+                    if pa.types.is_string(raw.type):
+                        multi_pos_lists = pc.split_pattern(raw, seq_delim)
+                        flat_pos = pc.list_flatten(multi_pos_lists)
+                        input_data[self._sampler_item_id_field] = flat_pos
+
+                        # Expand user_id to match flat positives (step 4).
+                        if self._sampler_user_id_field is not None and (
+                            self._sampler_user_id_field in input_data
+                        ):
+                            counts_np = pc.list_value_length(multi_pos_lists).to_numpy()
+                            row_indices = pa.array(
+                                np.repeat(np.arange(len(counts_np)), counts_np)
+                            )
+                            saved_user_ids = input_data[self._sampler_user_id_field]
+                            input_data[self._sampler_user_id_field] = pc.take(
+                                saved_user_ids, row_indices
+                            )
+
                 sampled = self._sampler.get(input_data)
+
+                # Restore multi-value form so combine_neg sees original grouping.
+                if multi_pos_lists is not None:
+                    input_data[self._sampler_item_id_field] = multi_pos_lists
+                if saved_user_ids is not None:
+                    input_data[self._sampler_user_id_field] = saved_user_ids
+
                 for k, v in sampled.items():
                     if k in input_data:
-                        input_data[k] = pa.concat_arrays([input_data[k], v])
+                        seq_delim = self._seq_field_delims.get(k)
+                        if seq_delim is not None:
+                            pos_for_combine = input_data[k]
+                            if pa.types.is_list(pos_for_combine.type):
+                                num_pos = len(pc.list_flatten(pos_for_combine))
+                            else:
+                                num_pos = len(pos_for_combine)
+                            # Sampler returns num_pos * expand_factor negs.
+                            neg_per_pos = max(1, len(v) // max(1, num_pos))
+                            valid_negs = v.slice(0, num_pos * neg_per_pos)
+                            input_data[k] = combine_neg_as_candidate_sequence(
+                                pos_for_combine,
+                                valid_negs,
+                                neg_per_pos,
+                                seq_delim,
+                            )
+                        else:
+                            input_data[k] = pa.concat_arrays([input_data[k], v])
                     else:
                         input_data[k] = v
 

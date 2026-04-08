@@ -14,7 +14,7 @@ import math
 import os
 import random
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -82,17 +82,19 @@ class IdMockInput(MockInput):
         num_ids: Optional[int] = None,
         vocab_list: Optional[List[str]] = None,
         multival_sep: str = chr(3),
+        as_string: bool = False,
     ) -> None:
         super().__init__(name)
         self.is_multi = is_multi
         self.num_ids = num_ids
         self.vocab_list = vocab_list
         self.multival_sep = multival_sep
+        self.as_string = as_string
 
     def create_data(self, num_rows: int, has_null: bool = True) -> pa.Array:
         """Create mock data."""
         if not self.is_multi:
-            # int64
+            # int64 (or string if as_string=True)
             num_valid_rows = (
                 random.randint(num_rows // 2, num_rows) if has_null else num_rows
             )
@@ -101,6 +103,8 @@ class IdMockInput(MockInput):
             )
             data = data + [None] * (num_rows - num_valid_rows)
             random.shuffle(data)
+            if self.as_string:
+                data = [str(x) if x is not None else None for x in data]
         else:
             # string
             num_multi_rows = random.randint(num_rows // 3, 2 * num_rows // 3)
@@ -126,36 +130,6 @@ class IdMockInput(MockInput):
             )
             random.shuffle(data)
         return pa.array(data)
-
-
-class HSTUIdMockInput(MockInput):
-    """Mock sparse id input data class."""
-
-    def __init__(
-        self,
-        name: str,
-        is_multi: bool = False,
-        num_ids: Optional[int] = None,
-        vocab_list: Optional[List[str]] = None,
-        multival_sep: str = chr(3),
-    ) -> None:
-        super().__init__(name)
-        self.is_multi = is_multi
-        self.num_ids = num_ids
-        self.vocab_list = vocab_list
-        self.multival_sep = multival_sep
-
-    def create_data(self, num_rows: int, has_null: bool = True) -> pa.Array:
-        """Create mock data."""
-        # string
-        # num_multi_rows = random.randint(num_rows // 3, 2 * num_rows // 3)
-        num_multi_id = 3
-        data_multi = _create_random_id_data(
-            (num_rows, num_multi_id), self.num_ids, self.vocab_list
-        ).astype(str)
-        data_multi = list(map(lambda x: self.multival_sep.join(x), data_multi))
-        random.shuffle(data_multi)
-        return pa.array(data_multi)
 
 
 class SeqIdMockInput(MockInput):
@@ -513,7 +487,13 @@ def create_mock_data(
     input_data = {}
     for inp in inputs.values():
         if inp.name == unique_id:
-            input_data[inp.name] = pa.array(list(range(num_rows)))
+            ids = pa.array(list(range(num_rows)))
+            # If the input is configured for string output (e.g., a
+            # sequence_id_feature used as sampler item_id), cast to string
+            # so joins on this key remain type-consistent.
+            if isinstance(inp, IdMockInput) and getattr(inp, "as_string", False):
+                ids = ids.cast(pa.string())
+            input_data[inp.name] = ids
         elif isinstance(inp, SeqMockInput):
             input_data.update(inp.create_sequence_data(num_rows, join_t))
         else:
@@ -694,7 +674,7 @@ def build_mock_input_with_fg(
     features: List[BaseFeature],
     user_id: str = "",
     item_id: str = "",
-    is_hstu: bool = False,
+    neg_fields: Optional[Set[str]] = None,
 ) -> Dict[str, MockInput]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
@@ -818,13 +798,21 @@ def build_mock_input_with_fg(
                         if isinstance(inputs[side][sub_name], IdMockInput):
                             inputs[side][sub_name].is_multi = False
                 else:
-                    if is_hstu:
-                        # hstu require number of sequence item is over 2
-                        inputs[side][input_name] = HSTUIdMockInput(
+                    if neg_fields and input_name in neg_fields:
+                        # Sampler-targeted sequence features must have
+                        # single-value mock data because the sampler casts
+                        # the field to int64. The candidate sequence is
+                        # created at runtime by combine_neg_as_candidate_sequence.
+                        # Generate as string so the sequence_id_feature parser
+                        # can read it (with delimiter; single value parses as
+                        # one-element sequence).
+                        inputs[side][input_name] = IdMockInput(
                             input_name,
-                            is_multi=True,
-                            num_ids=feature.num_embeddings,
-                            multival_sep=feature.sequence_delim,
+                            is_multi=False,
+                            num_ids=10
+                            if isinstance(feature, CustomFeature)
+                            else feature.num_embeddings,
+                            as_string=True,
                         )
                     else:
                         inputs[side][input_name] = IdMockInput(
@@ -844,7 +832,6 @@ def load_config_for_test(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
-    is_hstu: bool = False,
     num_rows: Optional[int] = None,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
@@ -881,8 +868,17 @@ def load_config_for_test(
             num_parts=num_parts,
         )
     else:
+        # Determine sampler attr_fields so mock generator can produce
+        # single-value data for sequence features that the sampler will
+        # use as item_id (sampler casts field values to int64).
+        sampler_neg_fields: Set[str] = set()
+        if data_config.HasField("sampler"):
+            sampler_type_name = data_config.WhichOneof("sampler")
+            sampler_cfg = getattr(data_config, sampler_type_name)
+            if hasattr(sampler_cfg, "attr_fields"):
+                sampler_neg_fields = set(sampler_cfg.attr_fields)
         user_inputs, item_inputs = build_mock_input_with_fg(
-            features, user_id, item_id, is_hstu
+            features, user_id, item_id, neg_fields=sampler_neg_fields
         )
         _, item_t = create_mock_data(
             os.path.join(test_dir, "item_data"),
@@ -979,7 +975,7 @@ def load_config_for_test(
                 item_id,
                 # hstu only uses item_id as negative sample, \
                 # as sampler_config.attr_fields is sequence
-                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
+                neg_fields=list(sampler_config.attr_fields),
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
@@ -992,7 +988,7 @@ def load_config_for_test(
                 os.path.join(test_dir, "item_gl"),
                 item_inputs,
                 item_id,
-                neg_fields=[item_id] if is_hstu else list(sampler_config.attr_fields),
+                neg_fields=list(sampler_config.attr_fields),
                 attr_delimiter=sampler_config.attr_delimiter,
                 num_rows=data_config.batch_size * num_parts * 4,
             )
@@ -1032,7 +1028,6 @@ def test_train_eval(
     user_id: str = "",
     item_id: str = "",
     cate_id: str = "",
-    is_hstu: bool = False,
     env_str: str = "",
     num_rows: Optional[int] = None,
 ) -> bool:
@@ -1043,7 +1038,6 @@ def test_train_eval(
         user_id,
         item_id,
         cate_id,
-        is_hstu,
         num_rows=num_rows,
     )
 
