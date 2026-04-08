@@ -105,15 +105,19 @@ def export_model_aot(
 
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
-    with torch.no_grad():
-        _out = dense_model(sparse_output)
-        aoti_output_keys = list(_out.keys())
-        del _out
     # Wrap the dense module so torch.export captures the autocast region
     # as a `wrap_with_autocast` HOP that AOT Inductor lowers correctly.
     dense_to_export: nn.Module = dense_model
     if mixed_precision:
         dense_to_export = DenseAutocastWrapper(dense_model, mixed_precision)
+
+    # Dry-run the wrapped module to capture output field names. Must run
+    # through dense_to_export (not dense_model) so the autocast context is
+    # active — kernels like CUTLASS HSTU attention reject fp32 inputs.
+    with torch.no_grad():
+        _out = dense_to_export(sparse_output)
+        aoti_output_keys = list(_out.keys())
+        del _out
 
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(

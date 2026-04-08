@@ -990,6 +990,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="ENABLE_AOT=1",
+                hstu_item_id="cand_seq__video_id",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         if self.success:
