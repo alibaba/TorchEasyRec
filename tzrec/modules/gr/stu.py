@@ -25,6 +25,7 @@ from tzrec.ops.hstu_compute import (
     hstu_compute_output,
     hstu_compute_uqvk,
     hstu_preprocess_and_attention,
+    sub_op_kernel,
 )
 from tzrec.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged
 from tzrec.utils import env_util
@@ -417,7 +418,7 @@ class STULayer(STU):
                 linear_dim=self._hidden_dim,
                 concat_ux=True,
                 training=self.training,
-                kernel=self.kernel(),
+                kernel=sub_op_kernel(self.kernel()),
                 recompute_y_in_backward=self._recompute_y,
             )
 
@@ -450,7 +451,7 @@ class STULayer(STU):
                 hidden_dim=self._hidden_dim,
                 uvqk_weight=self._uvqk_weight.to(delta_x.dtype),
                 uvqk_bias=self._uvqk_beta.to(delta_x.dtype),
-                kernel=self.kernel(),
+                kernel=sub_op_kernel(self.kernel()),
             )
         k, v, max_seq_len, seq_offsets = self.construct_full_kv(
             delta_k=delta_k.flatten(1, 2),
@@ -495,7 +496,7 @@ class STULayer(STU):
                 linear_dim=self._hidden_dim,
                 concat_ux=True,
                 training=self.training,
-                kernel=self.kernel(),
+                kernel=sub_op_kernel(self.kernel()),
                 recompute_y_in_backward=self._recompute_y,
             )
 
