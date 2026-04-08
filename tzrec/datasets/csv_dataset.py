@@ -15,7 +15,7 @@ import os
 import random
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -185,16 +185,25 @@ class CsvWriter(BaseWriter):
         super().__init__(output_path)
         self._writer = None
 
-    def write(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def write(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Write a batch of data."""
+        # pa.RecordBatch.from_arrays only accepts pa.Array, so collapse any
+        # ChunkedArray columns into a single contiguous Array first.
+        output_arrays = []
+        for v in output_dict.values():
+            if isinstance(v, pa.ChunkedArray):
+                v = v.combine_chunks()
+            output_arrays.append(v)
         if not self._lazy_inited:
             schema = []
-            for k, v in output_dict.items():
+            for k, v in zip(output_dict.keys(), output_arrays):
                 schema.append((k, v.type))
             self._writer = csv.CSVWriter(self._output_path, schema=pa.schema(schema))
             self._lazy_inited = True
         record_batch = pa.RecordBatch.from_arrays(
-            list(output_dict.values()),
+            output_arrays,
             list(output_dict.keys()),
         )
         self._writer.write(record_batch)
