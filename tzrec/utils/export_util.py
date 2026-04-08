@@ -192,23 +192,35 @@ def export_model_normal(
         model.eval()
 
         data = batch.to_dict(sparse_dtype=torch.int64)
-        if acc_utils.is_trt():
+        mixed_precision = acc_utils.resolve_mixed_precision(pipeline_config)
+        autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if acc_utils.is_trt() or acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
-            result = model(data, "cuda:0")
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_dtype is not None,
+            ):
+                result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense, _ = split_model(data, model, save_dir)
-            export_model_trt(sparse, dense, data, save_dir)
-        elif acc_utils.is_aot():
-            data = OrderedDict(sorted(data.items()))
-            result = model(data, "cuda:0")
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            if acc_utils.is_unified_aot():
+            if acc_utils.is_trt():
+                sparse, dense, meta_info = split_model(data, model, save_dir)
+                export_model_trt(
+                    sparse, dense, data, save_dir, mixed_precision=mixed_precision
+                )
+            elif acc_utils.is_unified_aot():
                 export_unified_model_aot(model, data, save_dir)
             else:
                 sparse, dense, meta_info = split_model(data, model, save_dir)
-                export_model_aot(sparse, dense, data, meta_info, save_dir)
+                export_model_aot(
+                    sparse,
+                    dense,
+                    data,
+                    meta_info,
+                    save_dir,
+                    mixed_precision=mixed_precision,
+                )
         else:
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}

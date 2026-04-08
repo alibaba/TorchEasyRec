@@ -957,13 +957,9 @@ class RankIntegrationTest(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export(self):
-        # DLRM-HSTU uses Triton kernels which have runtime issues with
-        # the unified AOTI export (slow Triton autotuning, complex jagged
-        # ops). Use the two-stage export (UNIFIED_AOT=0) for HSTU until
-        # upstream torch.export/AOTI support for Triton+HSTU improves.
-        self._test_rank_dlrm_hstu_train_eval_export(
-            export_env_str="ENABLE_AOT=1 UNIFIED_AOT=0"
-        )
+        # Default path: UNIFIED_AOT defaults to disabled, uses legacy
+        # two-stage export (sparse JIT + dense AOTI).
+        self._test_rank_dlrm_hstu_train_eval_export(export_env_str="ENABLE_AOT=1")
         # Two-stage export must produce both the JIT sparse model and the
         # AOTI dense model.
         self.assertTrue(
@@ -984,6 +980,40 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
             )
         )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_cutlass_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dlrm_hstu_cutlass_kuairand_1k.config", self.test_dir
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+            )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,cand_seq__video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+                # The cutlass custom op path is not safe to call concurrently
+                # through an AOT-Inductor compiled model yet (hstu_attn_cuda's
+                # pybind11 binding does not release the GIL and the AOTI
+                # runtime then deadlocks between the two predict forward
+                # worker threads). Restrict predict to a single worker until
+                # the underlying multi-threading issue is addressed upstream.
+                predict_threads=1,
+            )
+        self.assertTrue(self.success)
 
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,

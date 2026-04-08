@@ -18,7 +18,7 @@ from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from tzrec.acc.utils import get_max_export_batch_size, is_debug_trt
-from tzrec.models.model import CombinedModelWrapper
+from tzrec.models.model import CombinedModelWrapper, DenseAutocastWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
@@ -104,6 +104,7 @@ def export_model_trt(
     dense_model: nn.Module,
     data: Dict[str, torch.Tensor],
     save_dir: str,
+    mixed_precision: Optional[str] = None,
 ) -> None:
     """Export trt model.
 
@@ -112,6 +113,10 @@ def export_model_trt(
         dense_model (nn.Module): the dense part
         data (Dict[str, torch.Tensor]): the test data
         save_dir (str): model save dir
+        mixed_precision (Optional[str]): "BF16", "FP16", or None. When set,
+            only the dense sub-graph is wrapped in a DenseAutocastWrapper
+            before torch.export. The sparse sub-graph is only embedding
+            lookups and doesn't benefit from AMP.
     """
     emb_ebc, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
@@ -153,8 +158,11 @@ def export_model_trt(
     for i, k in enumerate(key_list):
         dynamic_shapes[dense_arg_name].update({k: dynamic_shapes_list[i]})
 
+    dense_to_export: nn.Module = dense_layer
+    if mixed_precision:
+        dense_to_export = DenseAutocastWrapper(dense_layer, mixed_precision)
     exp_program = torch.export.export(
-        dense_layer, (emb_ebc,), dynamic_shapes=dynamic_shapes
+        dense_to_export, (emb_ebc,), dynamic_shapes=dynamic_shapes
     )
     dense_layer_trt = trt_convert(exp_program, (emb_ebc,))
     # logger.info("dense trt res: %s", dense_layer_trt(emb_ebc))
