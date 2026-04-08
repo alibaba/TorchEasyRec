@@ -15,37 +15,23 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
 
 def fix_mch_state(model: nn.Module) -> None:
-    """Rebuild rank-local _output_segments_tensor of mc modules.
-
-    The buffer can be in two bad states by the time we reach export:
-      * a meta tensor (model was built on a meta device and no value was
-        ever materialized);
-      * an all-zeros tensor (init_parameters() materialized it via
-        torch.zeros_like, and PartialLoadPlanner now skips loading this
-        rank-specific buffer from checkpoint).
-
-    In both cases the only safe value is the locally-known segments
-    [_output_global_offset, _output_global_offset + _zch_size], which is
-    sufficient for `validate_state()` because it checks that both ends are
-    present in the segments tensor.
-    """
+    """Fix output_segments_tensor of mc modules may be a meta tensor."""
     for _, m in model.named_modules():
-        if not isinstance(m, MCHManagedCollisionModule):
-            continue
-        # pyre-ignore [16]
-        buf = m._buffers["_output_segments_tensor"]
-        needs_rebuild = buf.is_meta or bool(torch.all(buf == 0).item())
-        if not needs_rebuild:
-            continue
-        output_segments = [
-            m._output_global_offset,
-            m._output_global_offset + m._zch_size,
-        ]
-        m._buffers["_output_segments_tensor"] = torch.tensor(
-            output_segments + [-1] * (1025 - len(output_segments)),
-            dtype=torch.int64,
-            device=m._current_iter_tensor.device,
-        )
+        # fix output_segments_tensor is a meta tensor.
+        if (
+            isinstance(m, MCHManagedCollisionModule)
+            # pyre-ignore [16]
+            and m._buffers["_output_segments_tensor"].is_meta
+        ):
+            output_segments = [
+                m._output_global_offset,
+                m._output_global_offset + m._zch_size,
+            ]
+            m._buffers["_output_segments_tensor"] = torch.tensor(
+                output_segments + [-1] * (1025 - len(output_segments)),
+                dtype=torch.int64,
+                device=m._current_iter_tensor.device,
+            )
 
 
 def init_parameters(module: nn.Module, device: torch.device) -> None:

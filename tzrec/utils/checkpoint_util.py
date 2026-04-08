@@ -37,7 +37,6 @@ from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
-from tzrec.utils.state_dict_util import fix_mch_state
 
 
 class PartialLoadPlanner(DefaultLoadPlanner):
@@ -93,27 +92,11 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                             f"{parts[pattern_idx - 1]}.{new_pattern}.{dim}"
                         ] = f"{parts[pattern_idx - 1]}.{old_pattern}.{parts[pattern_idx + 1]}"  # NOQA
 
-        # `_output_segments_tensor` is a fixed-shape [1025] *replicated*
-        # buffer in MCH (ZCH) ManagedCollisionModule whose contents describe
-        # this rank's partition boundaries. Its shape is identical across
-        # ranks and across world sizes, so dist.checkpoint would silently
-        # overwrite the freshly-initialized local value with the saved one.
-        # When the saved world size differs from the current one, the
-        # `_load_state_dict_post_hook` then fails in `validate_state()`
-        # because `_output_global_offset` (a Python int that is *not* in the
-        # state dict) no longer appears in the loaded segments tensor. The
-        # local buffer is rebuilt by `fix_mch_state(model)` in
-        # `restore_model` for the current world size, so it is always safe
-        # to skip loading this buffer.
-        def _is_output_segments_tensor(fqn: str) -> bool:
-            return fqn.endswith("._output_segments_tensor")
-
         # When loading a checkpoint whose per-rank value range no longer
-        # aligns with the current per-rank value range, the other MCH state
-        # buffers (`_mch_sorted_raw_ids`, `_mch_remapped_ids_mapping`,
-        # `_mch_<metadata>`) cannot be loaded via the default
-        # `ShardedTensor` position-based path. They are wrapped as
-        # `ShardedTensor` by
+        # aligns with the current per-rank value range, the MCH (ZCH) state
+        # buffers under `._managed_collision_modules.` cannot be loaded via
+        # the default `ShardedTensor` position-based path. They are
+        # wrapped as `ShardedTensor` by
         # `ShardedManagedCollisionCollection._initialize_torch_state`
         # (torchrec mc_modules.py:262), and dist.checkpoint will happily do
         # a byte-level position slice across world sizes — but the *values*
@@ -122,22 +105,28 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         # from the saved per-rank range. They only fit each current local
         # range when each saved chunk lies entirely within one current
         # chunk, which for uniform row-wise sharding holds iff
-        # `saved_world_size % cur_world_size == 0`. When that does not
-        # hold, `restore_model` flips this skip on and rebuilds the
-        # buffers via `_redistribute_mch_state`, which routes saved
-        # entries to the rank that owns each entry's global value,
-        # preserving the (raw_id → embedding row) binding. When it does
-        # hold (e.g. 4→2, 4→1, 8→4, or single-rank export of any
-        # multi-rank training checkpoint) position-based loading is
-        # correct and is kept so that user-side MCH modules populated via
-        # `ckpt_param_map_path` remaps still receive their saved state.
+        # `saved_world_size % cur_world_size == 0`. The same divisibility
+        # is what makes loading the rank-specific replicated
+        # `_output_segments_tensor` safe: when it holds, every current
+        # boundary `R*cps` is also a saved boundary `S*sps` (because
+        # `cps == (sps/cps) * sps`), so loading the saved tensor still
+        # contains the values that `validate_state()` checks. When it does
+        # not hold, `restore_model` flips this skip on. The other MCH
+        # buffers are then rebuilt by `_redistribute_mch_state`, which
+        # routes saved entries to the rank that owns each entry's global
+        # value, preserving the (raw_id → embedding row) binding;
+        # `_output_segments_tensor` is left at the locally-correct value
+        # already produced by `rebuild_with_output_id_range`. When the
+        # divisibility does hold (e.g. 4→2, 4→1, 8→4, or single-rank
+        # export of any multi-rank training checkpoint) position-based
+        # loading is correct on its own and is kept so that user-side MCH
+        # modules populated via `ckpt_param_map_path` remaps still receive
+        # their saved state.
         def _is_mc_state_buffer(fqn: str) -> bool:
             return "._managed_collision_modules." in fqn
 
         # pyre-ignore [16]
         for fqn, obj in self.state_dict.items():
-            if _is_output_segments_tensor(fqn):
-                continue
             if self._skip_mc_module_state and _is_mc_state_buffer(fqn):
                 continue
 
@@ -603,14 +592,6 @@ def restore_model(
             "(ZCH) state will be redistributed by value to preserve "
             "per-position ZCH semantics across the world size change."
         )
-
-    # `_output_segments_tensor` describes this rank's partition boundaries
-    # and must be locally rebuilt for the current world size before any load
-    # path that calls `validate_state()` (e.g. nn.Module.load_state_dict's
-    # post-hook in MCHManagedCollisionModule). Doing it here is also a
-    # safeguard for the export path, where init_parameters() materializes
-    # the buffer with zeros and then PartialLoadPlanner skips loading it.
-    fix_mch_state(model)
 
     meta = {}
     if os.path.exists(meta_path):
