@@ -367,6 +367,26 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
+                if use_sample_mask:
+                    num_pos = len(list(pos_sampled.values())[0])
+                    num_neg = len(list(neg_sampled.values())[0])
+                    total = len(list(input_data.values())[0])
+                    batch_size = total - num_pos - num_neg
+                    # Rows after _expand_tdm_sample are laid out as
+                    # [orig_targets | pos_sampled | neg_sampled]. Mask the
+                    # positives (orig + pos_sampled) with sample_mask_prob and
+                    # the negatives with negative_sample_mask_prob. TDM features
+                    # are never is_neg, so only C_SAMPLE_MASK needs to be set.
+                    input_data[C_SAMPLE_MASK] = pa.array(
+                        np.concatenate(
+                            [
+                                np.random.random(batch_size + num_pos)
+                                < self._data_config.sample_mask_prob,
+                                np.random.random(num_neg)
+                                < self._data_config.negative_sample_mask_prob,
+                            ]
+                        )
+                    )
             elif self._enable_hstu:
                 seq_attr = self._sampler._item_id_field
 
@@ -405,6 +425,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         )
                     else:
                         input_data[k] = v
+                if use_sample_mask:
+                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+                        [
+                            input_data[C_SAMPLE_MASK],
+                            pa.array(
+                                np.random.random(len(list(sampled.values())[0]))
+                                < self._data_config.negative_sample_mask_prob
+                            ),
+                        ]
+                    )
             else:
                 sampled = self._sampler.get(input_data)
                 for k, v in sampled.items():
@@ -412,17 +442,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         input_data[k] = pa.concat_arrays([input_data[k], v])
                     else:
                         input_data[k] = v
-
-            if use_sample_mask:
-                input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-                    [
-                        input_data[C_SAMPLE_MASK],
-                        pa.array(
-                            np.random.random(len(list(sampled.values())[0]))
-                            < self._data_config.negative_sample_mask_prob
-                        ),
-                    ]
-                )
+                if use_sample_mask:
+                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+                        [
+                            input_data[C_SAMPLE_MASK],
+                            pa.array(
+                                np.random.random(len(list(sampled.values())[0]))
+                                < self._data_config.negative_sample_mask_prob
+                            ),
+                        ]
+                    )
 
         # TODO(hongsheng.jhs): add additional field like hard_negative
         output_data = self._data_parser.parse(input_data)
