@@ -108,26 +108,28 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         def _is_output_segments_tensor(fqn: str) -> bool:
             return fqn.endswith("._output_segments_tensor")
 
-        # When loading a checkpoint saved with a *smaller* world size, the
-        # other MCH state buffers (`_mch_sorted_raw_ids`,
-        # `_mch_remapped_ids_mapping`, `_mch_<metadata>`) cannot be loaded
-        # via the default `ShardedTensor` position-based path. They are
-        # wrapped as `ShardedTensor` by
+        # When loading a checkpoint whose per-rank value range no longer
+        # aligns with the current per-rank value range, the other MCH state
+        # buffers (`_mch_sorted_raw_ids`, `_mch_remapped_ids_mapping`,
+        # `_mch_<metadata>`) cannot be loaded via the default
+        # `ShardedTensor` position-based path. They are wrapped as
+        # `ShardedTensor` by
         # `ShardedManagedCollisionCollection._initialize_torch_state`
         # (torchrec mc_modules.py:262), and dist.checkpoint will happily do
         # a byte-level position slice across world sizes — but the *values*
         # inside `_mch_remapped_ids_mapping` are global slot indices in
         # `arange(output_global_offset, output_global_offset + zch_size)`
-        # from the saved per-rank range, which only fit each current local
-        # range when `cur_per_rank_zch >= saved_per_rank_zch` (i.e. the
-        # current world size is `<=` the saved one). When the current world
-        # size is strictly larger we skip these buffers here and rebuild
-        # them via `_redistribute_mch_state` in `restore_model`, which
-        # routes saved entries to the rank that owns each entry's global
-        # value, preserving the (raw_id → embedding row) binding. In the
-        # opposite direction (e.g. single-rank export of a multi-rank
-        # training checkpoint) position-based loading is correct and must
-        # be kept so that user-side MCH modules populated via
+        # from the saved per-rank range. They only fit each current local
+        # range when each saved chunk lies entirely within one current
+        # chunk, which for uniform row-wise sharding holds iff
+        # `saved_world_size % cur_world_size == 0`. When that does not
+        # hold, `restore_model` flips this skip on and rebuilds the
+        # buffers via `_redistribute_mch_state`, which routes saved
+        # entries to the rank that owns each entry's global value,
+        # preserving the (raw_id → embedding row) binding. When it does
+        # hold (e.g. 4→2, 4→1, 8→4, or single-rank export of any
+        # multi-rank training checkpoint) position-based loading is
+        # correct and is kept so that user-side MCH modules populated via
         # `ckpt_param_map_path` remaps still receive their saved state.
         def _is_mc_state_buffer(fqn: str) -> bool:
             return "._managed_collision_modules." in fqn
@@ -561,20 +563,25 @@ def restore_model(
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
 
-    # Detect whether the current world size is *larger* than the world size
-    # the checkpoint was saved with by counting the per-rank `.distcp`
-    # shards under the model checkpoint dir. Only this direction needs
-    # value-aware redistribution of MCH (ZCH) state: the saved
-    # `_mch_remapped_ids_mapping` values live in the saved rank's per-rank
-    # range `[offset, offset + saved_per_rank_zch)`, which is *larger* than
-    # the current per-rank range when `cur > saved`, so position-based
-    # `ShardedTensor` slicing would fill the current local buffer with
-    # global values that fall outside the local range and crash the FBGEMM
-    # / CUDA gather kernel. When `cur <= saved` (e.g. single-rank export of
-    # a multi-rank training checkpoint), each current local range still
-    # contains all relevant saved values, so the stock position-based load
-    # path is correct and avoids touching user-side MCH modules loaded via
-    # `ckpt_param_map_path` remaps.
+    # Detect whether the saved checkpoint world size is compatible with the
+    # current world size by counting the per-rank `.distcp` shards under
+    # the model checkpoint dir. Position-based `ShardedTensor` slicing of
+    # the MCH (ZCH) state buffers is only safe when each saved per-rank
+    # value range (`[S*sps, (S+1)*sps)`) lies entirely inside one current
+    # per-rank value range (`[R*cps, (R+1)*cps)`) — otherwise the loaded
+    # `_mch_remapped_ids_mapping` ends up holding global slot indices that
+    # fall outside the current local range and crashes the FBGEMM / CUDA
+    # gather kernel. For uniform row-wise sharding this is equivalent to
+    # `saved_world_size % cur_world_size == 0` (the saved per-rank zch is
+    # then a multiple of the current per-rank zch and saved chunks align
+    # to current chunk boundaries). When the divisibility does not hold —
+    # including the common `cur > saved` direction (e.g. 1→2 finetune) and
+    # the rarer non-divisible shrinking direction (e.g. 4→3 or 6→4) — fall
+    # back to value-aware `_redistribute_mch_state`. When it does hold
+    # (e.g. 4→2, 4→1, 8→4, or single-rank export of any multi-rank
+    # training checkpoint) the stock load path is correct and is preferred
+    # so that user-side MCH modules populated via `ckpt_param_map_path`
+    # remaps still receive their saved state.
     saved_world_size: Optional[int] = None
     if os.path.exists(model_ckpt_path):
         try:
@@ -585,14 +592,16 @@ def restore_model(
             )
     cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
     needs_mch_redistribution = (
-        saved_world_size is not None and cur_world_size > saved_world_size
+        saved_world_size is not None
+        and saved_world_size != cur_world_size
+        and saved_world_size % cur_world_size != 0
     )
     if needs_mch_redistribution and is_local_rank_zero:
         logger.warning(
-            f"Checkpoint world size ({saved_world_size}) is smaller than "
-            f"current world size ({cur_world_size}); MCH (ZCH) state will "
-            "be redistributed by value to preserve per-position ZCH "
-            "semantics across the world size change."
+            f"Checkpoint world size ({saved_world_size}) is not a multiple "
+            f"divisor of the current world size ({cur_world_size}); MCH "
+            "(ZCH) state will be redistributed by value to preserve "
+            "per-position ZCH semantics across the world size change."
         )
 
     # `_output_segments_tensor` describes this rank's partition boundaries
