@@ -11,14 +11,25 @@
 
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
 
-from tzrec.models.model import CombinedModelWrapper
+from tzrec.models.model import CombinedModelWrapper, DenseAutocastWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
+
+# Eagerly register custom ops referenced by AOT-packaged models so that
+# torch._inductor.aoti_load_package() can resolve them by name. AOT packages
+# reference ops via their qualified name (e.g. ``tzrec::cutlass_hstu_mha_fwd``)
+# and PyTorch only knows about an op once its registering module has been
+# imported. Wrap in try/except so this stays optional for environments
+# without the corresponding native dependencies installed.
+try:
+    from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
+except ImportError:
+    pass
 
 
 def load_model_aot(model_path: str, device: torch.device) -> CombinedModelWrapper:
@@ -49,6 +60,7 @@ def export_model_aot(
     data: Dict[str, torch.Tensor],
     meta_info: Dict[str, Any],
     save_dir: str,
+    mixed_precision: Optional[str] = None,
 ) -> str:
     """Export AOTInductor model.
 
@@ -58,6 +70,12 @@ def export_model_aot(
         data (Dict[str, torch.Tensor]): the test data
         meta_info (Dict[str, Any]): split meta info
         save_dir (str): model save dir
+        mixed_precision (Optional[str]): "BF16", "FP16", or None. When set,
+            the dense sub-graph is wrapped in a DenseAutocastWrapper so that
+            torch.export captures the autocast region as a wrap_with_autocast
+            Higher Order Op. The sparse sub-graph is left untouched because
+            it is only embedding lookups, which don't benefit from AMP and
+            which would complicate torch.jit.script compilation.
     """
     sparse_output, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
@@ -86,12 +104,20 @@ def export_model_aot(
 
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
+    # Wrap the dense module so torch.export captures the autocast region
+    # as a `wrap_with_autocast` HOP that AOT Inductor lowers correctly.
+    dense_to_export: nn.Module = dense_model
+    if mixed_precision:
+        dense_to_export = DenseAutocastWrapper(dense_model, mixed_precision)
+
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
     ):
         exported_pg = torch.export.export(
-            dense_model, args=(sparse_output,), dynamic_shapes=(dynamic_shapes,)
+            dense_to_export,
+            args=(sparse_output,),
+            dynamic_shapes=(dynamic_shapes,),
         )
     # AsserScalar codegen is not correct.
     with torch._inductor.config.patch(

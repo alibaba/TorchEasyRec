@@ -12,10 +12,11 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 
 
@@ -163,6 +164,41 @@ def ec_quant_dtype() -> torch.dtype:
         )
     else:
         return _quant_str_to_dtype[quant_dtype_str]
+
+
+_MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {
+    "BF16": torch.bfloat16,
+    "FP16": torch.float16,
+}
+
+
+def mixed_precision_to_dtype(mixed_precision: Optional[str]) -> Optional[torch.dtype]:
+    """Convert a TrainConfig.mixed_precision string to a torch dtype.
+
+    Returns ``None`` when ``mixed_precision`` is ``None`` or empty.
+    Raises ``ValueError`` on unknown values so typos fail loudly.
+    """
+    if not mixed_precision:
+        return None
+    if mixed_precision not in _MIXED_PRECISION_TO_DTYPE:
+        raise ValueError(
+            f"Unknown mixed_precision: {mixed_precision}, "
+            f"available types: {list(_MIXED_PRECISION_TO_DTYPE.keys())}"
+        )
+    return _MIXED_PRECISION_TO_DTYPE[mixed_precision]
+
+
+def resolve_mixed_precision(pipeline_config: EasyRecConfig) -> str:
+    """Resolve the mixed_precision mode for export/inference.
+
+    Precedence: ``export_config.mixed_precision`` (when set) overrides
+    ``train_config.mixed_precision``. Empty string means no AMP.
+    """
+    if pipeline_config.HasField("export_config"):
+        export_mp = pipeline_config.export_config.mixed_precision
+        if export_mp:
+            return export_mp
+    return pipeline_config.train_config.mixed_precision
 
 
 def write_mapping_file_for_input_tile(

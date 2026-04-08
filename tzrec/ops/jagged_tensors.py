@@ -35,6 +35,8 @@ def concat_2D_jagged(
     offsets_right: Optional[torch.Tensor] = None,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if not is_fx_tracing():
         torch._assert(values_left.dim() == 2, "values_left must be 2D")
         torch._assert(values_right.dim() == 2, "values_right must be 2D")
@@ -75,6 +77,8 @@ def split_2D_jagged(
     offsets_right: Optional[torch.Tensor] = None,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if not is_fx_tracing():
         torch._assert(values.dim() == 2, "values must be 2D")
         torch._assert(
@@ -137,6 +141,8 @@ def jagged_dense_bmm_broadcast_add(
     jagged has shape (sum_B(M_i), K), dense has shape (B, K, N), and bias has
     shape (B, N), out has shape (sum_B(M_i), N)
     """
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if not is_fx_tracing():
         _, K = jagged.shape
         B, _, N = dense.shape
