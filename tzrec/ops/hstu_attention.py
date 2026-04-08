@@ -13,7 +13,6 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
-import logging
 from typing import Optional
 
 import torch
@@ -25,8 +24,7 @@ from tzrec.ops._pytorch.pt_hstu_attention import (
     pytorch_hstu_mha,
 )
 from tzrec.ops.utils import switch_to_contiguous_if_needed
-
-logger = logging.getLogger(__name__)
+from tzrec.utils.logging_util import logger
 
 _cutlass_local_window_fallback_warned = False
 

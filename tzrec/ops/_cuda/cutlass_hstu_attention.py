@@ -91,7 +91,7 @@ def _cutlass_hstu_mha_fwd_impl(
         None,  # last_page_lens
         None,  # cu_seqlens_t
     )
-    return out[:, :, :head_dim].reshape(-1, num_heads, head_dim).contiguous()
+    return out[:, :, :head_dim].reshape(-1, num_heads, head_dim)
 
 
 def _cutlass_hstu_mha_bwd_impl(
@@ -154,7 +154,11 @@ def _cutlass_hstu_mha_fwd_meta(
     window_size_right: int,
     alpha: float,
 ) -> torch.Tensor:
-    return torch.empty_like(q)
+    # Output shape is (total, nheads, hidden_dim); that matches v, not q.
+    # Under the current attention_dim == hidden_dim constraint q and v are
+    # the same shape, but keying the fake off v makes the meta robust if
+    # that constraint is relaxed later.
+    return torch.empty_like(v)
 
 
 def _cutlass_hstu_mha_bwd_meta(
@@ -279,6 +283,10 @@ def cutlass_hstu_mha(
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
+    The CUTLASS kernel uses int32 cu_seqlens internally, so the cumulative
+    sum ``seq_offsets[-1]`` (total token count in the batch) must fit in
+    int32 (< 2**31 ≈ 2.1B tokens).
+
     Args:
         max_seq_len: maximum sequence length in the batch.
         alpha: scaling factor for attention scores.
@@ -308,7 +316,10 @@ def cutlass_hstu_mha(
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    seq_offsets = seq_offsets.contiguous()
+    # ``.to(torch.int32)`` already allocates a fresh contiguous tensor when
+    # the source isn't contiguous, so an explicit ``.contiguous()`` on
+    # ``seq_offsets`` is redundant. Total token count must fit in int32
+    # (~2.1B), which is well beyond any realistic batch.
     cu_seqlens = seq_offsets.to(torch.int32)
 
     if causal:
