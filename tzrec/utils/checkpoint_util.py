@@ -39,22 +39,6 @@ from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
-def _is_resharded_mc_buffer(fqn: str) -> bool:
-    """Whether a state_dict key is a MCH buffer that needs value-aware reshard.
-
-    Everything under ``._managed_collision_modules.`` except the globally
-    replicated, non-rank-specific counters that torchrec excludes from
-    ``sharded_parameter_names()`` (currently ``_current_iter_tensor``).
-    ``_output_segments_tensor`` is replicated but *rank-specific*, so it is
-    included here and must not be loaded from a non-aligned checkpoint.
-    """
-    if "._managed_collision_modules." not in fqn:
-        return False
-    if fqn.endswith("._current_iter_tensor"):
-        return False
-    return True
-
-
 class PartialLoadPlanner(DefaultLoadPlanner):
     """Support restore partial states.
 
@@ -62,13 +46,12 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         flatten_state_dict (bool): Handle state_dict with nested dicts.
         flatten_sharded_tensors (bool): For FSDP in 2D parallel mode.
         ckpt_param_map_path (str): parameter mapping for checkpoint.
-        skip_mc_module_state (bool): If True, skip loading MCH (ZCH)
-            ManagedCollisionModule state buffers (`_mch_*`,
-            `_output_segments_tensor`, ...). Set this when restoring a
-            checkpoint that was saved with a different world size, because
-            torchrec's `ShardedTensor` resharding for these buffers does a
-            byte-level position slice that does not preserve the per-rank
-            slot-index value semantics.
+        skip_output_segments_tensor (bool): If True, skip loading the
+            MCH (ZCH) ``_output_segments_tensor`` buffer. It is replicated
+            but rank-specific, and loading a saved value whose boundaries
+            do not include the current rank's boundaries would crash
+            ``validate_state()``. Set this when the saved world size is
+            not a multiple divisor of the current world size.
     """
 
     def __init__(
@@ -76,11 +59,11 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         flatten_state_dict: bool = True,
         flatten_sharded_tensors: bool = True,
         ckpt_param_map_path: Optional[str] = None,
-        skip_mc_module_state: bool = False,
+        skip_output_segments_tensor: bool = False,
     ) -> None:
         super().__init__(flatten_state_dict, flatten_sharded_tensors)
         self._ckpt_param_map = dict()
-        self._skip_mc_module_state = skip_mc_module_state
+        self._skip_output_segments_tensor = skip_output_segments_tensor
         if ckpt_param_map_path:
             with open(ckpt_param_map_path) as f:
                 for line in f.readlines():
@@ -110,7 +93,9 @@ class PartialLoadPlanner(DefaultLoadPlanner):
 
         # pyre-ignore [16]
         for fqn, obj in self.state_dict.items():
-            if self._skip_mc_module_state and _is_resharded_mc_buffer(fqn):
+            if self._skip_output_segments_tensor and fqn.endswith(
+                "._output_segments_tensor"
+            ):
                 continue
 
             meta_fqn = fqn
@@ -335,176 +320,129 @@ def _find_mch_modules(
     return out
 
 
-def _read_full_mch_tensors(
-    model_ckpt_path: str,
-    mc_modules: Dict[str, MCHManagedCollisionModule],
-) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Read the full (un-sharded) saved MCH state for each MC module.
+def _redistribute_mch_state(model: nn.Module) -> None:
+    """Value-aware all-to-all redistribution of MCH (ZCH) state.
 
-    Returns a dict: {mc_module_prefix -> {buffer_name -> full_global_tensor}}.
-    Only persistent MCH state buffers (`_mch_*`) are read; rank-specific
-    metadata buffers like `_output_segments_tensor` and `_current_iter_tensor`
-    are skipped (they are handled by `fix_mch_state` and the load planner).
+    Called between the normal DCP load and ``model.load_state_dict``, once
+    each rank already holds a position-based slice of the saved global MCH
+    buffers. Those entries may belong to any rank under the current world
+    size's per-rank value ranges; we permute them via ``all_to_all_single``
+    so every rank ends up owning exactly the entries whose remapped global
+    value falls in its local range, preserving the (raw_id → embedding row)
+    binding end-to-end with O(local_zch_size) extra memory per rank.
+
+    ``model.load_state_dict``'s post-hook then sorts the new local buffers
+    via ``MCHManagedCollisionModule.validate_state``/``_sort_mch_buffers``,
+    so we do not need to sort here.
     """
-    reader = FileSystemReader(model_ckpt_path)
-    meta = reader.read_metadata()
-
-    # Build the request: for each MCH module, find every saved buffer under
-    # its prefix that starts with `_mch_` and request the full global tensor.
-    full_state: Dict[str, torch.Tensor] = {}
-    per_module: Dict[str, Dict[str, torch.Tensor]] = {p: {} for p in mc_modules}
-    for fqn, md in meta.state_dict_metadata.items():
-        if not isinstance(md, TensorStorageMetadata):
-            continue
-        for prefix in mc_modules:
-            mod_prefix = f"{prefix}."
-            if not fqn.startswith(mod_prefix):
-                continue
-            buf_name = fqn[len(mod_prefix) :]
-            if not buf_name.startswith("_mch_"):
-                continue
-            # Allocate a full-sized plain tensor on CPU for the redistribution.
-            t = torch.empty(tuple(md.size), dtype=md.properties.dtype)
-            full_state[fqn] = t
-            per_module[prefix][buf_name] = t
-            break
-
-    if full_state:
-        load(full_state, checkpoint_id=model_ckpt_path)
-
-    return per_module
-
-
-def _redistribute_mch_state(model: nn.Module, model_ckpt_path: str) -> None:
-    """Redistribute MCH (ZCH) state across a non-divisible world size change.
-
-    Reads the full saved `_mch_sorted_raw_ids` / `_mch_remapped_ids_mapping`
-    / eviction metadata for each MCHManagedCollisionModule, reassigns each
-    non-empty saved entry to the rank that owns its global remapped value
-    (`target_rank = saved_remapped_value // local_zch_size`), and writes
-    the kept entries back into the local buffers. This matches the
-    position-based row-wise sharding that `ShardedTensor` already uses for
-    the embedding `weight`, so the (raw_id → embedding row) binding is
-    preserved end-to-end.
-    """
-    cur_rank = dist.get_rank() if dist.is_initialized() else 0
-    cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
-
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return
     mc_modules = _find_mch_modules(model)
     if not mc_modules:
         return
 
-    if cur_rank == 0:
-        saved_world_size = _ckpt_world_size(model_ckpt_path)
-        logger.warning(
-            f"Redistributing MCH (ZCH) state from saved world size "
-            f"{saved_world_size} to current world size {cur_world_size} "
-            f"by value-aware bucketing across {len(mc_modules)} MC modules."
-        )
-
-    full_state = _read_full_mch_tensors(model_ckpt_path, mc_modules)
+    cur_rank = dist.get_rank()
+    world_size = dist.get_world_size()
     iinfo_max = torch.iinfo(torch.int64).max
 
+    if cur_rank == 0:
+        logger.warning(
+            f"Redistributing MCH (ZCH) state via all_to_all_single across "
+            f"{len(mc_modules)} MC modules."
+        )
+
     for prefix, m in mc_modules.items():
-        bufs = full_state.get(prefix)
-        if not bufs:
-            continue
-        if "_mch_sorted_raw_ids" not in bufs or "_mch_remapped_ids_mapping" not in bufs:
-            continue
-
-        saved_raw_ids = bufs["_mch_sorted_raw_ids"]
-        saved_remapped = bufs["_mch_remapped_ids_mapping"]
-        saved_total = saved_raw_ids.numel()
-        local_zch_size: int = m._zch_size
+        cps: int = m._zch_size
         local_offset: int = m._output_global_offset
+        raw_ids_buf = m._buffers["_mch_sorted_raw_ids"]
+        remapped_buf = m._buffers["_mch_remapped_ids_mapping"]
+        local_dev = raw_ids_buf.device
 
-        # Sanity check: global zch_size must be invariant across world sizes.
-        if saved_total != local_zch_size * cur_world_size:
-            logger.warning(
-                f"Skipping MCH redistribution for [{prefix}]: saved global "
-                f"size {saved_total} != local_zch_size {local_zch_size} * "
-                f"world_size {cur_world_size}."
+        # Sharded per-slot eviction metadata (_mch_counts,
+        # _mch_last_access_iter, ...). Non-persistent helpers like
+        # _mch_slots and _delimiter have shape != [cps] so they are
+        # filtered out.
+        metadata_names = [
+            name
+            for name, buf in m._buffers.items()
+            if name.startswith("_mch_")
+            and name not in ("_mch_sorted_raw_ids", "_mch_remapped_ids_mapping")
+            and name not in m._non_persistent_buffers_set
+            and buf is not None
+            and buf.dim() == 1
+            and buf.shape[0] == cps
+        ]
+
+        # Filter valid entries.
+        valid_mask = raw_ids_buf != iinfo_max
+        raw_ids = raw_ids_buf[valid_mask]
+        remapped = remapped_buf[valid_mask]
+        metadata = {name: m._buffers[name][valid_mask] for name in metadata_names}
+
+        # Destination rank for each valid entry = value-based bucket.
+        dest_rank = (remapped // cps).to(torch.int64).clamp_(0, world_size - 1)
+
+        # Sort by dest_rank so sends are contiguous per destination.
+        perm = torch.argsort(dest_rank, stable=True)
+        raw_ids = raw_ids[perm]
+        remapped = remapped[perm]
+        metadata = {name: t[perm] for name, t in metadata.items()}
+        dest_rank = dest_rank[perm]
+
+        # Exchange split sizes.
+        send_counts = torch.bincount(dest_rank, minlength=world_size).to(torch.int64)
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts)
+        send_split = send_counts.tolist()
+        recv_split = recv_counts.tolist()
+        n = int(recv_counts.sum().item())
+        assert n <= cps, (
+            f"MCH [{prefix}] rank {cur_rank}: received {n} > local zch_size {cps}"
+        )
+
+        def _a2a(
+            send_tensor: torch.Tensor,
+            n: int = n,
+            recv_split: List[int] = recv_split,
+            send_split: List[int] = send_split,
+            local_dev: torch.device = local_dev,
+        ) -> torch.Tensor:
+            recv = torch.empty(n, dtype=send_tensor.dtype, device=local_dev)
+            dist.all_to_all_single(
+                recv,
+                send_tensor.contiguous(),
+                output_split_sizes=recv_split,
+                input_split_sizes=send_split,
             )
-            continue
+            return recv
 
-        # Value-based assignment: this rank owns saved entries whose
-        # `_mch_remapped_ids_mapping` value falls in [local_offset,
-        # local_offset + local_zch_size).
-        nonempty_mask = saved_raw_ids != iinfo_max
-        owns_mask = (saved_remapped >= local_offset) & (
-            saved_remapped < local_offset + local_zch_size
+        raw_ids_recv = _a2a(raw_ids)
+        remapped_recv = _a2a(remapped)
+        metadata_recv = {name: _a2a(t) for name, t in metadata.items()}
+
+        # Build new local buffer contents.
+        new_raw = torch.full((cps,), iinfo_max, dtype=torch.int64, device=local_dev)
+        new_raw[:n] = raw_ids_recv
+
+        all_local = torch.arange(
+            local_offset, local_offset + cps, dtype=torch.int64, device=local_dev
         )
-        keep_mask = nonempty_mask & owns_mask
-        my_raw_ids = saved_raw_ids[keep_mask]
-        my_remapped = saved_remapped[keep_mask]
-
-        local_dev = m._current_iter_tensor.device
-
-        # Build new local buffers for this rank.
-        new_raw_ids = torch.full(
-            (local_zch_size,), iinfo_max, dtype=torch.int64, device=local_dev
-        )
-        new_remapped = torch.arange(
-            local_offset,
-            local_offset + local_zch_size,
-            dtype=torch.int64,
-            device=local_dev,
-        )
-
-        n = my_raw_ids.numel()
-        if n > local_zch_size:
-            # Should not happen for clean row-wise sharding, but truncate
-            # defensively to avoid overflowing the local table.
-            logger.warning(
-                f"MCH [{prefix}]: rank {cur_rank} has {n} reassigned entries "
-                f"but local_zch_size={local_zch_size}; truncating."
-            )
-            my_raw_ids = my_raw_ids[:local_zch_size]
-            my_remapped = my_remapped[:local_zch_size]
-            n = local_zch_size
-
+        taken = torch.zeros(cps, dtype=torch.bool, device=local_dev)
         if n > 0:
-            new_raw_ids[:n] = my_raw_ids.to(local_dev)
-            # Place each entry's saved value at the matching position; pad
-            # the empty positions with the local-range values that were not
-            # taken by any kept entry, so the full local range
-            # [local_offset, local_offset + local_zch_size) is still covered
-            # exactly once across positions (preserving the invariant of
-            # `_mch_remapped_ids_mapping` after `_sort_mch_buffers`).
-            kept_values = my_remapped.to(local_dev)
-            new_remapped[:n] = kept_values
-            all_local = torch.arange(
-                local_offset,
-                local_offset + local_zch_size,
-                dtype=torch.int64,
-                device=local_dev,
-            )
-            taken = torch.zeros(local_zch_size, dtype=torch.bool, device=local_dev)
-            taken[kept_values - local_offset] = True
-            unused = all_local[~taken]
-            new_remapped[n:] = unused[: local_zch_size - n]
+            taken[remapped_recv - local_offset] = True
+        unused = all_local[~taken]
+        new_remapped = torch.empty(cps, dtype=torch.int64, device=local_dev)
+        new_remapped[:n] = remapped_recv
+        new_remapped[n:] = unused[: cps - n]
 
-        # Copy into the live buffers.
-        m._buffers["_mch_sorted_raw_ids"].copy_(new_raw_ids)
-        m._buffers["_mch_remapped_ids_mapping"].copy_(new_remapped)
-
-        # Eviction-policy metadata (`_mch_<name>` for LFU/LRU/etc.) is also
-        # per-slot. Reset it for the slots we kept (the saved values are
-        # tied to the saved world's slot positions and don't carry useful
-        # ordering across a different per-rank slot count). For empty slots
-        # leave at zero.
-        for buf_name in m._buffers:
-            if (
-                buf_name.startswith("_mch_")
-                and buf_name not in ("_mch_sorted_raw_ids", "_mch_remapped_ids_mapping")
-                and m._buffers[buf_name] is not None
-                and m._buffers[buf_name].dim() > 0
-                and m._buffers[buf_name].shape[0] == local_zch_size
-            ):
-                m._buffers[buf_name].zero_()
-
-        # Sort the local buffers to keep the binary-search invariant.
-        m._sort_mch_buffers()
+        # In-place copy so state_dict ShardedTensor wrappers pick up the
+        # new values before the upcoming model.load_state_dict.
+        raw_ids_buf.copy_(new_raw)
+        remapped_buf.copy_(new_remapped)
+        for name, recv in metadata_recv.items():
+            new_meta = torch.zeros(cps, dtype=recv.dtype, device=local_dev)
+            new_meta[:n] = recv
+            m._buffers[name].copy_(new_meta)
 
 
 def restore_model(
@@ -552,11 +490,11 @@ def restore_model(
             checkpoint_id=model_ckpt_path,
             planner=PartialLoadPlanner(
                 ckpt_param_map_path=ckpt_param_map_path,
-                skip_mc_module_state=needs_mch_redistribution,
+                skip_output_segments_tensor=needs_mch_redistribution,
             ),
         )
         if needs_mch_redistribution:
-            _redistribute_mch_state(model, model_ckpt_path)
+            _redistribute_mch_state(model)
         model.load_state_dict(state_dict)
     else:
         raise RuntimeError(f"model_ckpt_path[{model_ckpt_path}] not exists.")
