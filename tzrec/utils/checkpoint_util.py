@@ -12,6 +12,7 @@
 import glob
 import json
 import os
+import re
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
@@ -296,6 +297,27 @@ def best_checkpoint(
         return latest_checkpoint(model_dir)
 
 
+_DISTCP_RANK_RE = re.compile(r"__(\d+)_\d+\.distcp$")
+
+
+def _ckpt_world_size(ckpt_dir: str) -> int:
+    """Return the world size that wrote the distributed checkpoint.
+
+    `ckpt_dir` should point at the directory that contains the per-rank
+    `__<rank>_<part>.distcp` shard files (typically
+    ``<model_dir>/model.ckpt-N/model``). The world size is one more than
+    the highest rank found.
+    """
+    ranks: set = set()
+    for name in os.listdir(ckpt_dir):
+        m = _DISTCP_RANK_RE.match(name)
+        if m:
+            ranks.add(int(m.group(1)))
+    if not ranks:
+        raise RuntimeError(f"No .distcp files under {ckpt_dir}")
+    return max(ranks) + 1
+
+
 def _strip_dmp_prefix(name: str) -> str:
     """Strip TorchRec DMP wrapper prefix from a module name."""
     for prefix in (
@@ -538,34 +560,29 @@ def restore_model(
     meta_path = os.path.join(checkpoint_dir, "meta")
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
-    plan_path = os.path.join(checkpoint_dir, "plan")
 
     # Detect whether the current world size is *larger* than the world size
-    # the checkpoint was saved with by inspecting the saved sharding plan.
-    # Only this direction needs value-aware redistribution of MCH (ZCH)
-    # state: the saved `_mch_remapped_ids_mapping` values live in the saved
-    # rank's per-rank range `[offset, offset + saved_per_rank_zch)`, which
-    # is *larger* than the current per-rank range when `cur > saved`, so
-    # position-based `ShardedTensor` slicing would fill the current local
-    # buffer with global values that fall outside the local range and crash
-    # the FBGEMM / CUDA gather kernel. When `cur <= saved` (e.g. single-rank
-    # export of a multi-rank training checkpoint), each current local range
-    # still contains all relevant saved values, so the stock position-based
-    # load path is correct and avoids touching user-side MCH modules loaded
-    # via `ckpt_param_map_path` remaps.
+    # the checkpoint was saved with by counting the per-rank `.distcp`
+    # shards under the model checkpoint dir. Only this direction needs
+    # value-aware redistribution of MCH (ZCH) state: the saved
+    # `_mch_remapped_ids_mapping` values live in the saved rank's per-rank
+    # range `[offset, offset + saved_per_rank_zch)`, which is *larger* than
+    # the current per-rank range when `cur > saved`, so position-based
+    # `ShardedTensor` slicing would fill the current local buffer with
+    # global values that fall outside the local range and crash the FBGEMM
+    # / CUDA gather kernel. When `cur <= saved` (e.g. single-rank export of
+    # a multi-rank training checkpoint), each current local range still
+    # contains all relevant saved values, so the stock position-based load
+    # path is correct and avoids touching user-side MCH modules loaded via
+    # `ckpt_param_map_path` remaps.
     saved_world_size: Optional[int] = None
-    if os.path.exists(plan_path):
+    if os.path.exists(model_ckpt_path):
         try:
-            with open(plan_path, "r") as f:
-                saved_plan = json.load(f)
-            saved_ranks: set = set()
-            for module_plan in saved_plan.values():
-                for param_sharding in module_plan.values():
-                    saved_ranks.update(param_sharding.get("ranks", []))
-            if saved_ranks:
-                saved_world_size = len(saved_ranks)
+            saved_world_size = _ckpt_world_size(model_ckpt_path)
         except Exception as e:
-            logger.warning(f"Failed to inspect saved plan {plan_path}: {e}")
+            logger.warning(
+                f"Failed to detect saved world size from {model_ckpt_path}: {e}"
+            )
     cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
     needs_mch_redistribution = (
         saved_world_size is not None and cur_world_size > saved_world_size
@@ -627,12 +644,18 @@ def restore_model(
             if is_local_rank_zero:
                 logger.info(f"Restoring optimizer state from {optim_ckpt_path}...")
             state_dict = optimizer.state_dict()
+            # The optimizer state only contains trainable-parameter state
+            # (e.g. fused-optimizer accumulators for embedding `weight`),
+            # which is sharded by row position and resharded correctly by
+            # the default position-based path in both directions. The MCH
+            # buffers are registered via `register_buffer`, never appear
+            # in the optimizer state dict, and need no special handling on
+            # this load.
             load(
                 state_dict,
                 checkpoint_id=optim_ckpt_path,
                 planner=PartialLoadPlanner(
                     ckpt_param_map_path=ckpt_param_map_path,
-                    skip_mc_module_state=needs_mch_redistribution,
                 ),
             )
             optimizer.load_state_dict(state_dict)
