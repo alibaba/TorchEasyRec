@@ -38,6 +38,294 @@ from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
 
 
+def _build_model(
+    device: torch.device,
+    has_watchtime: bool = False,
+    contextual_group_type: int = model_pb2.FeatureGroupType.DEEP,
+    enable_global_average_loss: bool = False,
+    sequence_timestamp_is_ascending: bool = False,
+    task_weight: float = 1.0,
+    concat_contextual_features: bool = False,
+) -> DlrmHSTU:
+    """Build a DlrmHSTU model with standard test configuration."""
+    feature_cfgs = [
+        feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="user_id", embedding_dim=16, num_buckets=100
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="user_active_degree",
+                embedding_dim=16,
+                num_buckets=1000,
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="video_id",
+                embedding_dim=16,
+                embedding_name="video_id_emb",
+                num_buckets=1000,
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="video_cat",
+                embedding_dim=16,
+                embedding_name="video_cat_emb",
+                num_buckets=100,
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="item_video_id",
+                embedding_dim=16,
+                embedding_name="video_id_emb",
+                num_buckets=1000,
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="item_video_cat",
+                embedding_dim=16,
+                embedding_name="video_cat_emb",
+                num_buckets=100,
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(feature_name="action_timestamp")
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(feature_name="item_query_time")
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(
+                feature_name="action_weight",
+            )
+        ),
+        feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(feature_name="watch_time")
+        ),
+    ]
+    features = create_features(feature_cfgs)
+    feature_groups = [
+        model_pb2.FeatureGroupConfig(
+            group_name="contextual",
+            feature_names=["user_id", "user_active_degree"],
+            group_type=contextual_group_type,
+        ),
+        model_pb2.FeatureGroupConfig(
+            group_name="uih",
+            feature_names=["video_id", "video_cat"],
+            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+        ),
+        model_pb2.FeatureGroupConfig(
+            group_name="candidate",
+            feature_names=[
+                "item_video_id",
+                "item_video_cat",
+            ],
+            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+        ),
+        model_pb2.FeatureGroupConfig(
+            group_name="uih_timestamp",
+            feature_names=[
+                "action_timestamp",
+            ],
+            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+        ),
+        model_pb2.FeatureGroupConfig(
+            group_name="candidate_timestamp",
+            feature_names=[
+                "item_query_time",
+            ],
+            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+        ),
+        model_pb2.FeatureGroupConfig(
+            group_name="uih_action",
+            feature_names=[
+                "action_weight",
+            ],
+            group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+        ),
+    ]
+    if has_watchtime:
+        feature_groups.append(
+            model_pb2.FeatureGroupConfig(
+                group_name="uih_watchtime",
+                feature_names=[
+                    "watch_time",
+                ],
+                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
+            )
+        )
+
+    task_configs = [
+        tower_pb2.FusionSubTaskConfig(
+            task_name="is_click",
+            label_name="item_action_weight",
+            task_bitmask=1,
+            losses=[
+                loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
+            ],
+            metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
+        ),
+        tower_pb2.FusionSubTaskConfig(
+            task_name="is_like",
+            label_name="item_action_weight",
+            task_bitmask=2,
+            losses=[
+                loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
+            ],
+            metrics=[
+                metric_pb2.MetricConfig(
+                    grouped_auc=metric_pb2.GroupedAUC(grouping_key="user_id")
+                )
+            ],
+            weight=task_weight,
+        ),
+        tower_pb2.FusionSubTaskConfig(
+            task_name="is_comment",
+            label_name="item_action_weight",
+            task_bitmask=4,
+            losses=[
+                loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
+            ],
+            metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
+        ),
+    ]
+    labels = ["item_action_weight"]
+    if has_watchtime:
+        task_configs.append(
+            tower_pb2.FusionSubTaskConfig(
+                task_name="watchtime",
+                label_name="item_target_watchtime",
+                losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
+                metrics=[
+                    metric_pb2.MetricConfig(
+                        mean_absolute_error=metric_pb2.MeanAbsoluteError()
+                    )
+                ],
+            )
+        )
+        labels.append("item_target_watchtime")
+
+    model_config = model_pb2.ModelConfig(
+        feature_groups=feature_groups,
+        dlrm_hstu=multi_task_rank_pb2.DlrmHSTU(
+            hstu=module_pb2.HSTU(
+                stu=module_pb2.STU(
+                    embedding_dim=512,
+                    num_heads=4,
+                    hidden_dim=128,
+                    attention_dim=128,
+                    output_dropout_ratio=0.2,
+                ),
+                positional_encoder=module_pb2.GRPositionalEncoder(
+                    num_position_buckets=8192,
+                    num_time_buckets=2048,
+                    use_time_encoding=True,
+                ),
+                input_preprocessor=module_pb2.GRInputPreprocessor(
+                    contextual_preprocessor=module_pb2.GRContextualPreprocessor(
+                        action_encoder=module_pb2.GRActionEncoder(
+                            simple_action_encoder=module_pb2.GRSimpleActionEncoder(
+                                action_embedding_dim=8, action_weights=[1, 2, 4]
+                            )
+                        ),
+                        action_mlp=module_pb2.GRContextualizedMLP(
+                            simple_mlp=module_pb2.GRSimpleContextualizedMLP(
+                                hidden_dim=256
+                            )
+                        ),
+                        content_encoder=module_pb2.GRContentEncoder(
+                            slice_content_encoder=module_pb2.GRSliceContentEncoder()
+                        ),
+                        content_mlp=module_pb2.GRContextualizedMLP(
+                            simple_mlp=module_pb2.GRSimpleContextualizedMLP(
+                                hidden_dim=256
+                            )
+                        ),
+                    )
+                ),
+                output_postprocessor=module_pb2.GROutputPostprocessor(
+                    layernorm_postprocessor=module_pb2.GRLayerNormPostprocessor()
+                ),
+            ),
+            fusion_mtl_tower=tower_pb2.FusionMTLTower(
+                mlp=module_pb2.MLP(hidden_units=[512], activation="nn.SiLU"),
+                task_configs=task_configs,
+            ),
+            max_seq_len=100,
+            enable_global_average_loss=enable_global_average_loss,
+            sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
+            concat_contextual_features=concat_contextual_features,
+        ),
+    )
+    dlrm_hstu = DlrmHSTU(
+        model_config=model_config,
+        features=features,
+        labels=labels,
+    )
+    init_parameters(dlrm_hstu, device=device)
+    dlrm_hstu.to(device)
+    return dlrm_hstu
+
+
+def _build_batch(
+    device: torch.device,
+    has_watchtime: bool = False,
+) -> Batch:
+    """Build a test Batch with standard test data."""
+    sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+        keys=[
+            "user_id",
+            "user_active_degree",
+            "video_id",
+            "item_video_id",
+            "video_cat",
+            "item_video_cat",
+        ],
+        values=torch.tensor(list(range(26))),
+        lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4]),
+    )
+    sequence_dense_features = {
+        "action_timestamp": JaggedTensor(
+            values=torch.tensor([[1], [2], [3], [4], [5]]),
+            lengths=torch.tensor([2, 3]),
+        ),
+        "item_query_time": JaggedTensor(
+            values=torch.tensor([[6], [7], [8], [9], [10], [11]]),
+            lengths=torch.tensor([2, 4]),
+        ),
+        "action_weight": JaggedTensor(
+            values=torch.tensor([[0], [1], [0], [1], [0]]),
+            lengths=torch.tensor([2, 3]),
+        ),
+        "watch_time": JaggedTensor(
+            values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
+            lengths=torch.tensor([2, 3]),
+        ),
+    }
+    jagged_labels = {
+        "item_action_weight": JaggedTensor(
+            values=torch.tensor([0, 1, 0, 0, 1, 0]),
+            lengths=torch.tensor([2, 4]),
+        ),
+        "item_target_watchtime": JaggedTensor(
+            values=torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+            lengths=torch.tensor([2, 4]),
+        ),
+    }
+    return Batch(
+        sequence_dense_features=sequence_dense_features,
+        sparse_features={BASE_DATA_GROUP: sparse_feature},
+        labels={},
+        jagged_labels=jagged_labels,
+    ).to(device)
+
+
 class DlrmHSTUTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = None
@@ -63,6 +351,8 @@ class DlrmHSTUTest(unittest.TestCase):
             [model_pb2.FeatureGroupType.DEEP, model_pb2.FeatureGroupType.SEQUENCE]
         ),
         sequence_timestamp_is_ascending=st.sampled_from([True, False]),
+        task_weight=st.sampled_from([1.0, 0.5]),
+        concat_contextual_features=st.sampled_from([True, False]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -77,6 +367,8 @@ class DlrmHSTUTest(unittest.TestCase):
         enable_global_average_loss,
         contextual_group_type,
         sequence_timestamp_is_ascending,
+        task_weight,
+        concat_contextual_features,
     ) -> None:
         # JIT_SCRIPT only support PYTORCH kernel now.
         assume(
@@ -85,283 +377,17 @@ class DlrmHSTUTest(unittest.TestCase):
         )
 
         device = torch.device("cuda")
-        feature_cfgs = [
-            feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name="user_id", embedding_dim=16, num_buckets=100
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name="user_active_degree",
-                    embedding_dim=16,
-                    num_buckets=1000,
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.IdFeature(
-                    feature_name="video_id",
-                    embedding_dim=16,
-                    embedding_name="video_id_emb",
-                    num_buckets=1000,
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.IdFeature(
-                    feature_name="video_cat",
-                    embedding_dim=16,
-                    embedding_name="video_cat_emb",
-                    num_buckets=100,
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.IdFeature(
-                    feature_name="item_video_id",
-                    embedding_dim=16,
-                    embedding_name="video_id_emb",
-                    num_buckets=1000,
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_id_feature=feature_pb2.IdFeature(
-                    feature_name="item_video_cat",
-                    embedding_dim=16,
-                    embedding_name="video_cat_emb",
-                    num_buckets=100,
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.RawFeature(
-                    feature_name="action_timestamp"
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.RawFeature(
-                    feature_name="item_query_time"
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.RawFeature(
-                    feature_name="action_weight",
-                )
-            ),
-            feature_pb2.FeatureConfig(
-                sequence_raw_feature=feature_pb2.RawFeature(feature_name="watch_time")
-            ),
-        ]
-        features = create_features(feature_cfgs)
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="contextual",
-                feature_names=["user_id", "user_active_degree"],
-                group_type=contextual_group_type,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="uih",
-                feature_names=["video_id", "video_cat"],
-                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="candidate",
-                feature_names=[
-                    "item_video_id",
-                    "item_video_cat",
-                ],
-                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="uih_timestamp",
-                feature_names=[
-                    "action_timestamp",
-                ],
-                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="candidate_timestamp",
-                feature_names=[
-                    "item_query_time",
-                ],
-                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="uih_action",
-                feature_names=[
-                    "action_weight",
-                ],
-                group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
-            ),
-        ]
-        if has_watchtime:
-            feature_groups.append(
-                model_pb2.FeatureGroupConfig(
-                    group_name="uih_watchtime",
-                    feature_names=[
-                        "watch_time",
-                    ],
-                    group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
-                )
-            )
-
-        task_configs = [
-            tower_pb2.FusionSubTaskConfig(
-                task_name="is_click",
-                label_name="item_action_weight",
-                task_bitmask=1,
-                losses=[
-                    loss_pb2.LossConfig(
-                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
-                    )
-                ],
-                metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
-            ),
-            tower_pb2.FusionSubTaskConfig(
-                task_name="is_like",
-                label_name="item_action_weight",
-                task_bitmask=2,
-                losses=[
-                    loss_pb2.LossConfig(
-                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
-                    )
-                ],
-                metrics=[
-                    metric_pb2.MetricConfig(
-                        grouped_auc=metric_pb2.GroupedAUC(grouping_key="user_id")
-                    )
-                ],
-            ),
-            tower_pb2.FusionSubTaskConfig(
-                task_name="is_comment",
-                label_name="item_action_weight",
-                task_bitmask=4,
-                losses=[
-                    loss_pb2.LossConfig(
-                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
-                    )
-                ],
-                metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
-            ),
-        ]
-        labels = ["item_action_weight"]
-        if has_watchtime:
-            task_configs.append(
-                tower_pb2.FusionSubTaskConfig(
-                    task_name="watchtime",
-                    label_name="item_target_watchtime",
-                    losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],
-                    metrics=[
-                        metric_pb2.MetricConfig(
-                            mean_absolute_error=metric_pb2.MeanAbsoluteError()
-                        )
-                    ],
-                )
-            )
-            labels.append("item_target_watchtime")
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups,
-            dlrm_hstu=multi_task_rank_pb2.DlrmHSTU(
-                hstu=module_pb2.HSTU(
-                    stu=module_pb2.STU(
-                        embedding_dim=512,
-                        num_heads=4,
-                        hidden_dim=128,
-                        attention_dim=128,
-                        output_dropout_ratio=0.2,
-                    ),
-                    positional_encoder=module_pb2.GRPositionalEncoder(
-                        num_position_buckets=8192,
-                        num_time_buckets=2048,
-                        use_time_encoding=True,
-                    ),
-                    input_preprocessor=module_pb2.GRInputPreprocessor(
-                        contextual_preprocessor=module_pb2.GRContextualPreprocessor(
-                            action_encoder=module_pb2.GRActionEncoder(
-                                simple_action_encoder=module_pb2.GRSimpleActionEncoder(
-                                    action_embedding_dim=8, action_weights=[1, 2, 4]
-                                )
-                            ),
-                            action_mlp=module_pb2.GRContextualizedMLP(
-                                simple_mlp=module_pb2.GRSimpleContextualizedMLP(
-                                    hidden_dim=256
-                                )
-                            ),
-                            content_encoder=module_pb2.GRContentEncoder(
-                                slice_content_encoder=module_pb2.GRSliceContentEncoder()
-                            ),
-                            content_mlp=module_pb2.GRContextualizedMLP(
-                                simple_mlp=module_pb2.GRSimpleContextualizedMLP(
-                                    hidden_dim=256
-                                )
-                            ),
-                        )
-                    ),
-                    output_postprocessor=module_pb2.GROutputPostprocessor(
-                        layernorm_postprocessor=module_pb2.GRLayerNormPostprocessor()
-                    ),
-                ),
-                fusion_mtl_tower=tower_pb2.FusionMTLTower(
-                    mlp=module_pb2.MLP(hidden_units=[512], activation="nn.SiLU"),
-                    task_configs=task_configs,
-                ),
-                max_seq_len=100,
-                enable_global_average_loss=enable_global_average_loss,
-                sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
-            ),
-        )
-        dlrm_hstu = DlrmHSTU(
-            model_config=model_config,
-            features=features,
-            labels=labels,
+        dlrm_hstu = _build_model(
+            device=device,
+            has_watchtime=has_watchtime,
+            contextual_group_type=contextual_group_type,
+            enable_global_average_loss=enable_global_average_loss,
+            sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
+            task_weight=task_weight,
+            concat_contextual_features=concat_contextual_features,
         )
         dlrm_hstu.set_kernel(kernel)
-        init_parameters(dlrm_hstu, device=device)
-        dlrm_hstu.to(device)
-
-        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-            keys=[
-                "user_id",
-                "user_active_degree",
-                "video_id",
-                "item_video_id",
-                "video_cat",
-                "item_video_cat",
-            ],
-            values=torch.tensor(list(range(26))),
-            lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4]),
-        )
-        sequence_dense_features = {
-            "action_timestamp": JaggedTensor(
-                values=torch.tensor([[1], [2], [3], [4], [5]]),
-                lengths=torch.tensor([2, 3]),
-            ),
-            "item_query_time": JaggedTensor(
-                values=torch.tensor([[6], [7], [8], [9], [10], [11]]),
-                lengths=torch.tensor([2, 4]),
-            ),
-            "action_weight": JaggedTensor(
-                values=torch.tensor([[0], [1], [0], [1], [0]]),
-                lengths=torch.tensor([2, 3]),
-            ),
-            "watch_time": JaggedTensor(
-                values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
-                lengths=torch.tensor([2, 3]),
-            ),
-        }
-        jagged_labels = {
-            "item_action_weight": JaggedTensor(
-                values=torch.tensor([0, 1, 0, 0, 1, 0]),
-                lengths=torch.tensor([2, 4]),
-            ),
-            "item_target_watchtime": JaggedTensor(
-                values=torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
-                lengths=torch.tensor([2, 4]),
-            ),
-        }
-        batch = Batch(
-            sequence_dense_features=sequence_dense_features,
-            sparse_features={BASE_DATA_GROUP: sparse_feature},
-            labels={},
-            jagged_labels=jagged_labels,
-        ).to(device)
+        batch = _build_batch(device=device, has_watchtime=has_watchtime)
 
         if graph_type == TestGraphType.JIT_SCRIPT:
             dlrm_hstu.set_is_inference(True)
@@ -389,6 +415,41 @@ class DlrmHSTUTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_like"].size(), (6,))
         self.assertEqual(predictions["logits_is_comment"].size(), (6,))
         self.assertEqual(predictions["probs_is_comment"].size(), (6,))
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dlrm_hstu_task_weight(self) -> None:
+        device = torch.device("cuda")
+        task_weight = 0.5
+
+        model_unweighted = _build_model(device=device)
+        model_weighted = _build_model(device=device, task_weight=task_weight)
+
+        # Copy weights so both models produce the same predictions.
+        model_weighted.load_state_dict(model_unweighted.state_dict())
+
+        model_unweighted.init_loss()
+        model_weighted.init_loss()
+
+        batch = _build_batch(device=device)
+
+        predictions = model_unweighted.predict(batch)
+        losses_unweighted = model_unweighted.loss(predictions, batch)
+        losses_weighted = model_weighted.loss(predictions, batch)
+
+        # is_click loss should be identical (weight=1.0 in both).
+        self.assertTrue(
+            torch.allclose(
+                losses_weighted["binary_cross_entropy_is_click"],
+                losses_unweighted["binary_cross_entropy_is_click"],
+            )
+        )
+        # is_like loss should be scaled by task_weight.
+        self.assertTrue(
+            torch.allclose(
+                losses_weighted["binary_cross_entropy_is_like"],
+                losses_unweighted["binary_cross_entropy_is_like"] * task_weight,
+            )
+        )
 
 
 if __name__ == "__main__":

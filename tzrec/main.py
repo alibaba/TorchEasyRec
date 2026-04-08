@@ -265,10 +265,16 @@ def _log_train(
                 summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
 
         if "global_gradient_norm" in tb_summaries:
-            global_grad_norm = torch.nn.utils.get_total_norm(
-                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
-            )
-            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+            grads = [
+                p.grad
+                for p in params.values()
+                if p.grad is not None and not isinstance(p, ShardedTensor)
+            ]
+            if grads:
+                global_grad_norm = torch.nn.utils.get_total_norm(grads)
+                summary_writer.add_scalar(
+                    "global_gradient_norm", global_grad_norm, step
+                )
 
         if (
             "gradient_norm" in tb_summaries
@@ -292,11 +298,11 @@ def _log_train(
                         summary_writer.add_histogram(
                             tag=name, values=param, global_step=step
                         )
-                    if "gradient" in tb_summaries:
+                    if "gradient" in tb_summaries and param.grad is not None:
                         summary_writer.add_histogram(
                             tag=f"{name}/gradient", values=param.grad, global_step=step
                         )
-                    if "gradient_norm" in tb_summaries:
+                    if "gradient_norm" in tb_summaries and param.grad is not None:
                         grad_norm = torch.norm(param.grad)
                         summary_writer.add_scalar(
                             tag=f"{name}/gradient_norm",
@@ -1065,8 +1071,7 @@ def predict(
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
 
-    device_and_backend = init_process_group()
-    device: torch.device = device_and_backend[0]
+    device, backend = init_process_group()
 
     fs, local_path = url_to_fs(scripted_model_path)
     if fs is not None:
@@ -1083,6 +1088,9 @@ def predict(
     )
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
+
+    train_config = pipeline_config.train_config
+    acc_utils.allow_tf32(train_config, backend)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
@@ -1202,43 +1210,58 @@ def predict(
     forward_t_list = []
     write_t = None
     i_step = 0
-    while True:
-        try:
-            batch = next(infer_iterator)
+    try:
+        while True:
+            try:
+                batch = next(infer_iterator)
 
-            if i_step == 0:
-                # lazy init writer and create write and forward thread
-                predictions, reserves = _forward(batch)
-                if output_cols is None:
-                    output_cols = sorted(predictions.keys())
-                _write_predictions(writer, predictions, reserves, output_cols)
-                for _ in range(predict_threads):
-                    t = Thread(target=_forward_loop)
+                if i_step == 0:
+                    # lazy init writer and create write and forward thread
+                    predictions, reserves = _forward(batch)
+                    if output_cols is None:
+                        output_cols = sorted(predictions.keys())
+                    _write_predictions(writer, predictions, reserves, output_cols)
+                    for _ in range(predict_threads):
+                        t = Thread(target=_forward_loop)
+                        t.start()
+                        forward_t_list.append(t)
+                    t = Thread(target=_write_loop, args=(output_cols,))
                     t.start()
-                    forward_t_list.append(t)
-                write_t = Thread(target=_write_loop, args=(output_cols,))
-                write_t.start()
-            else:
-                data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
+                    write_t = t
+                else:
+                    data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
 
-            if is_local_rank_zero:
-                plogger.log(i_step)
-            if is_profiling:
-                prof.step()
-            i_step += 1
-            if predict_steps is not None and i_step >= predict_steps:
+                if is_local_rank_zero:
+                    plogger.log(i_step)
+                if is_profiling:
+                    prof.step()
+                i_step += 1
+                if predict_steps is not None and i_step >= predict_steps:
+                    break
+            except StopIteration:
                 break
-        except StopIteration:
-            break
-
-    for _ in range(predict_threads):
-        data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
-    for t in forward_t_list:
-        t.join()
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+    finally:
+        for _ in range(len(forward_t_list)):
+            try:
+                data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception as e:
+                logger.warning(f"Failed to send sentinel to data_queue: {e}")
+        for t in forward_t_list:
+            t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+            if t.is_alive():
+                logger.warning(f"Forward thread {t.name} did not terminate in time.")
+        if write_t is not None:
+            try:
+                pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception as e:
+                logger.warning(f"Failed to send sentinel to pred_queue: {e}")
+            write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+            if write_t.is_alive():
+                logger.warning("Write thread did not terminate in time.")
+        try:
+            writer.close()
+        except Exception as e:
+            logger.warning(f"Failed to close writer: {e}")
 
     if is_profiling:
         prof.stop()
@@ -1406,33 +1429,47 @@ def predict_checkpoint(
     if is_local_rank_zero:
         plogger = ProgressLogger(desc=f"Predicting{desc_suffix}")
 
+    write_t = None
     with torch.no_grad():
         i_step = 0
-        for i_step in step_iter:
+        try:
+            for i_step in step_iter:
+                try:
+                    predictions, batch = pipeline.progress(iterator)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    if i_step == 0:
+                        # lazy init writer and create write thread
+                        output_cols = sorted(predictions.keys())
+                        _write_predictions(
+                            writer, predictions, batch.reserves, output_cols
+                        )
+                        t = Thread(target=_write_loop, args=(output_cols,))
+                        t.start()
+                        write_t = t
+                    elif not batch.dummy:
+                        pred_queue.put(
+                            (predictions, batch.reserves),
+                            timeout=PREDICT_QUEUE_TIMEOUT,
+                        )
+                    if plogger and i_step % 100 == 0:
+                        plogger.log(i_step)
+                except StopIteration:
+                    break
+            if plogger is not None:
+                plogger.log(i_step)
+        finally:
+            if write_t is not None:
+                try:
+                    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+                except Exception as e:
+                    logger.warning(f"Failed to send sentinel to pred_queue: {e}")
+                write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+                if write_t.is_alive():
+                    logger.warning("Write thread did not terminate in time.")
             try:
-                predictions, batch = pipeline.progress(iterator)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                if i_step == 0:
-                    # lazy init writer and create write thread
-                    output_cols = sorted(predictions.keys())
-                    _write_predictions(writer, predictions, batch.reserves, output_cols)
-                    write_t = Thread(target=_write_loop, args=(output_cols,))
-                    write_t.start()
-                elif not batch.dummy:
-                    pred_queue.put(
-                        (predictions, batch.reserves), timeout=PREDICT_QUEUE_TIMEOUT
-                    )
-                if plogger and i_step % 100 == 0:
-                    plogger.log(i_step)
-            except StopIteration:
-                break
-        if plogger is not None:
-            plogger.log(i_step)
-
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+                writer.close()
+            except Exception as e:
+                logger.warning(f"Failed to close writer: {e}")
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")

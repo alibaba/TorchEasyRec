@@ -187,7 +187,7 @@ class STULayer(STU):
         recompute_uvqk (bool): whether to recompute uvqk in backward
         recompute_y (bool): whether to recompute y in backward
         sort_by_length (bool): whether to sort by length when forwarding
-        contextual_seq_len (bool): sequence length of contextual feature
+        contextual_seq_len (int): sequence length of contextual feature
         is_inference (bool): whether to run in inference mode.
     """
 

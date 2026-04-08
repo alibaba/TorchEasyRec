@@ -40,6 +40,8 @@ def hstu_compute_uqvk(
     uvqk_bias: torch.Tensor,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     normed_x = layer_norm(
         x,
         weight=norm_weight,
@@ -87,6 +89,8 @@ def hstu_compute_output(
     recompute_y_in_backward: bool,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_hstu_linear import (
             triton_hstu_compute_output,

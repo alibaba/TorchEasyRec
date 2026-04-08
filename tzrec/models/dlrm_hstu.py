@@ -122,12 +122,17 @@ class DlrmHSTU(RankModel):
         contextual_feature_dims = self.embedding_group.group_dims(
             self._contextual_group_name
         )
-        if len(set(contextual_feature_dims)) > 1:
-            raise ValueError(
-                "output_dim of features in contextual features_group must be same, "
-                f"but now {set(contextual_feature_dims)}."
-            )
-        contextual_feature_dim = contextual_feature_dims[0]
+        if self._model_config.concat_contextual_features:
+            contextual_feature_dim = sum(contextual_feature_dims)
+            max_contextual_seq_len = 1
+        else:
+            if len(set(contextual_feature_dims)) > 1:
+                raise ValueError(
+                    "output_dim of features in contextual features_group must be "
+                    f"same, but now {set(contextual_feature_dims)}."
+                )
+            contextual_feature_dim = contextual_feature_dims[0]
+            max_contextual_seq_len = len(contextual_feature_dims)
 
         self._task_configs = self._model_config.fusion_mtl_tower.task_configs
         action_weights = []
@@ -140,7 +145,7 @@ class DlrmHSTU(RankModel):
             uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
-            max_contextual_seq_len=len(contextual_feature_dims),
+            max_contextual_seq_len=max_contextual_seq_len,
             contextual_group_name=self._contextual_group_name,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
@@ -258,17 +263,17 @@ class DlrmHSTU(RankModel):
                 loss_weight = label.size(0) / avg_batch_size
 
             for loss_cfg in task_cfg.losses:
-                losses.update(
-                    self._loss_impl(
-                        predictions,
-                        batch,
-                        label,
-                        loss_weight,
-                        loss_cfg,
-                        num_class=task_cfg.num_class,
-                        suffix=f"_{task_name}",
-                    )
+                task_losses = self._loss_impl(
+                    predictions,
+                    batch,
+                    label,
+                    loss_weight,
+                    loss_cfg,
+                    num_class=task_cfg.num_class,
+                    suffix=f"_{task_name}",
                 )
+                task_losses = {k: v * task_cfg.weight for k, v in task_losses.items()}
+                losses.update(task_losses)
         losses.update(self._loss_collection)
         return losses
 

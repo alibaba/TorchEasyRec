@@ -20,7 +20,6 @@ from torchrec.distributed.embedding_kernel import BaseEmbedding
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
-    ShardedEmbeddingTable,
 )
 from torchrec.distributed.planner import (
     constants,
@@ -47,7 +46,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig, DataType
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from tzrec.protos import feature_pb2
 
@@ -60,7 +59,7 @@ try:
         DynamicEmbScoreStrategy,
         FrequencyAdmissionStrategy,
         KVCounter,
-        batched_dynamicemb_compute_kernel,
+        align_to_table_size,
     )
     from dynamicemb.batched_dynamicemb_compute_kernel import (
         BatchedDynamicEmbedding,
@@ -83,26 +82,6 @@ try:
     has_dynamicemb = True
 except Exception:
     pass
-
-
-def _next_power_of_2(n: int) -> int:
-    # Handle the case where n is 0
-    if n == 0:
-        return 1
-
-    # If n is already a power of 2, return n
-    if (n & (n - 1)) == 0:
-        return n
-
-    # Find the next power of 2
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32  # This line is necessary for 64-bit integers
-    return n + 1
 
 
 def _build_dynamicemb_initializer(
@@ -180,7 +159,7 @@ def build_dynamicemb_constraints(
 
     init_capacity = None
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
-        init_capacity = _next_power_of_2(dynamicemb_cfg.init_capacity_per_rank)
+        init_capacity = align_to_table_size(dynamicemb_cfg.init_capacity_per_rank)
 
     admission_counter = None
     admit_strategy = None
@@ -195,7 +174,7 @@ def build_dynamicemb_constraints(
             )
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             admission_counter = KVCounter(
-                capacity=_next_power_of_2(int(counter_capacity / world_size)),
+                capacity=align_to_table_size(int(counter_capacity / world_size)),
                 bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
             )
             admit_strategy = FrequencyAdmissionStrategy(
@@ -209,6 +188,10 @@ def build_dynamicemb_constraints(
             )
         else:
             raise ValueError(f"Unknown AdmissionStrategy: {admission_strategy_type}")
+
+    demb_opt_kwargs = {}
+    if dynamicemb_cfg.HasField("bucket_capacity"):
+        demb_opt_kwargs["bucket_capacity"] = dynamicemb_cfg.bucket_capacity
 
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
         max_capacity=dynamicemb_cfg.max_capacity,
@@ -226,6 +209,7 @@ def build_dynamicemb_constraints(
         score_strategy=score_strategy,
         admit_strategy=admit_strategy,
         admission_counter=admission_counter,
+        **demb_opt_kwargs,
     )
 
     constraints_kwargs = {}
@@ -301,7 +285,7 @@ if has_dynamicemb:
         if cache_ratio is None:
             cache_ratio = 1.0
         return math.ceil(
-            _next_power_of_2(size[0])
+            align_to_table_size(size[0])
             * (
                 _round_up(
                     math.ceil(size[1] * (1 + optimizer_multipler) * element_size),
@@ -371,16 +355,18 @@ if has_dynamicemb:
                         bucket_capacity=dynamicemb_options.bucket_capacity,
                     )
                 )
-
-                # align to next_power_of_2
-                num_aligned_embedding_per_rank = _next_power_of_2(shards[0].size[0])
-                num_embeddings_per_shard = shards[0].size[0]
-                if num_aligned_embedding_per_rank < dynamicemb_options.bucket_capacity:
-                    num_aligned_embedding_per_rank = dynamicemb_options.bucket_capacity
-                if num_embeddings_per_shard != num_aligned_embedding_per_rank:
-                    dynamicemb_options.num_aligned_embedding_per_rank = (
-                        num_aligned_embedding_per_rank
-                    )
+                # Fill in per-shard fields that used to be populated by
+                # dynamicemb's internal ``_get_dynamicemb_options_per_table``.
+                # After the fused-storage refactor (NVIDIA recsys-examples
+                # PR #343) that upstream function became a pass-through
+                # validator, so the caller must set ``dim``, ``max_capacity``
+                # (per-shard row count) and ``embedding_dtype`` directly.
+                dynamicemb_options.dim = shards[0].size[1]
+                dynamicemb_options.max_capacity = shards[0].size[0]
+                if dynamicemb_options.embedding_dtype is None:
+                    dynamicemb_options.embedding_dtype = tensor.dtype
+                if dynamicemb_options.index_type is None:
+                    dynamicemb_options.index_type = torch.int64
 
                 module_plan[sharding_option.name] = DynamicEmbParameterSharding(
                     sharding_spec=sharding_spec,
@@ -631,42 +617,6 @@ if has_dynamicemb:
             for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
         ]
 
-    _dynamicemb_get_dynamicemb_options_per_table = (
-        batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table
-    )
-
-    def _get_dynamicemb_options_per_table(
-        local_row: int,
-        local_col: int,
-        data_type: DataType,
-        optimizer: dynamicemb.EmbOptimType,
-        table: ShardedEmbeddingTable,
-    ) -> dynamicemb.DynamicEmbTableOptions:
-        # pyre-ignore [16]
-        dynamicemb_options = table.fused_params["dynamicemb_options"]
-        bak_local_hbm_for_values = None
-        if dynamicemb_options.num_aligned_embedding_per_rank is not None:
-            bak_local_hbm_for_values = dynamicemb_options.local_hbm_for_values
-
-        dynamicemb_options = _dynamicemb_get_dynamicemb_options_per_table(
-            local_row=local_row,
-            local_col=local_col,
-            data_type=data_type,
-            optimizer=optimizer,
-            table=table,
-        )
-
-        # do not improve the HBM budget, already aligned in planner.
-        if bak_local_hbm_for_values is not None:
-            dynamicemb_options.local_hbm_for_values = bak_local_hbm_for_values
-
-        return dynamicemb_options
-
-    # pyre-ignore [9]
-    batched_dynamicemb_compute_kernel._get_dynamicemb_options_per_table = (
-        _get_dynamicemb_options_per_table
-    )
-
     # Monkey-patch for torchrec 1.5.0 compatibility
     # The base class now passes 'env' parameter to _create_embedding_kernel
     def _grouped_embeddings_lookup_create_embedding_kernel(
@@ -718,3 +668,22 @@ if has_dynamicemb:
     GroupedPooledEmbeddingsLookup._create_embedding_kernel = (
         _grouped_pooled_embeddings_lookup_create_embedding_kernel
     )
+
+    from torchrec.sparse import jagged_tensor_validator as _jtv
+
+    _orig_validate_feature_range = _jtv._validate_feature_range
+
+    def _validate_feature_range_with_dynamicemb(kjt, configs):
+        """Skip range check for dynamicemb features.
+
+        DynamicEmb uses hash tables that accept arbitrary uint64 keys.
+        max_capacity is a storage limit, not a valid key range.
+        """
+        filtered_configs = [
+            c for c in configs if not getattr(c, "use_dynamicemb", False)
+        ]
+        if not filtered_configs:
+            return True
+        return _orig_validate_feature_range(kjt, filtered_configs)
+
+    _jtv._validate_feature_range = _validate_feature_range_with_dynamicemb

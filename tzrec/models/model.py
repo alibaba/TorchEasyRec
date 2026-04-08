@@ -12,7 +12,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Final, Iterable, List, Optional, Tuple
 
 import torch
 import torchmetrics
@@ -22,6 +22,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 
+from tzrec.acc import utils as acc_utils
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
@@ -236,16 +237,7 @@ class TrainWrapper(BaseModule):
         self._device_type = "cpu"
         if device is not None:
             self._device_type = device.type
-        if mixed_precision is None or len(mixed_precision) == 0:
-            self._mixed_dtype = None
-        elif mixed_precision == "FP16":
-            self._mixed_dtype = torch.float16
-        elif mixed_precision == "BF16":
-            self._mixed_dtype = torch.bfloat16
-        else:
-            raise ValueError(
-                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
-            )
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         self.pareto = None
         if (
             hasattr(self.model, "_use_pareto_loss_weight")
@@ -300,16 +292,7 @@ class PredictWrapper(BaseModule):
         self._device_type = "cpu"
         if device is not None:
             self._device_type = device.type
-        if mixed_precision is None or len(mixed_precision) == 0:
-            self._mixed_dtype = None
-        elif mixed_precision == "FP16":
-            self._mixed_dtype = torch.float16
-        elif mixed_precision == "BF16":
-            self._mixed_dtype = torch.bfloat16
-        else:
-            raise ValueError(
-                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
-            )
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         self._output_cols = output_cols
 
     def forward(
@@ -387,6 +370,57 @@ class ScriptWrapper(BaseModule):
         """
         batch = self.get_batch(data, device)
         return self.model.predict(batch)
+
+
+class DenseAutocastWrapper(nn.Module):
+    """Wraps a dense-side module in a torch.autocast context for torch.export.
+
+    Used to wrap the dense GraphModule from split_model before passing to
+    torch.export.export. torch.export captures the `with torch.autocast(...)`
+    region as a `wrap_with_autocast` Higher Order Op in the exported graph,
+    which AOT Inductor lowers to proper dtype casts.
+
+    Only the dense path needs this wrapper: the sparse path is embedding
+    lookups which don't have autocast rules and don't benefit from AMP, and
+    the CUTLASS attention op lives in the dense sub-graph after the
+    sparse/dense split.
+
+    The forward takes a single dict argument matching the dense_gm signature.
+
+    Note on the ``_mixed_dtype_id: Final[int]`` encoding: ``torch.jit.script``
+    only honors ``torch.autocast(dtype=...)`` when ``dtype`` is a compile-time
+    literal. We therefore store an integer flag (``Final[int]``) set in
+    ``__init__`` and branch on it in ``forward`` so each branch's
+    ``torch.autocast(dtype=torch.bfloat16|torch.float16)`` is a literal.
+    Storing the dtype directly as an attribute would not be script-friendly.
+
+    Args:
+        inner (nn.Module): inner dense module to wrap.
+        mixed_precision (Optional[str]): one of "BF16", "FP16", or None.
+    """
+
+    _mixed_dtype_id: Final[int]
+
+    def __init__(self, inner: nn.Module, mixed_precision: Optional[str] = None) -> None:
+        super().__init__()
+        self.inner = inner
+        if mixed_precision == "BF16":
+            self._mixed_dtype_id = 1
+        elif mixed_precision == "FP16":
+            self._mixed_dtype_id = 2
+        else:
+            self._mixed_dtype_id = 0
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Forward through inner module under an autocast context."""
+        if self._mixed_dtype_id == 1:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return self.inner(x)
+        elif self._mixed_dtype_id == 2:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                return self.inner(x)
+        else:
+            return self.inner(x)
 
 
 class CombinedModelWrapper(nn.Module):

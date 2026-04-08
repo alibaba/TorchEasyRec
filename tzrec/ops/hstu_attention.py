@@ -24,6 +24,9 @@ from tzrec.ops._pytorch.pt_hstu_attention import (
     pytorch_hstu_mha,
 )
 from tzrec.ops.utils import switch_to_contiguous_if_needed
+from tzrec.utils.logging_util import logger
+
+_cutlass_local_window_fallback_warned = False
 
 
 def hstu_mha(
@@ -54,8 +57,48 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if kernel in [Kernel.TRITON]:
-        if not is_fx_tracing() and kernel == Kernel.TRITON:
+    if kernel == Kernel.CUTLASS:
+        # CUTLASS kernel does not support combining local window attention
+        # (max_attn_len > 0) with context/target masking, fall back to Triton.
+        _has_local_window = max_attn_len > 0
+        _has_ctx_or_tgt = contextual_seq_len > 0 or num_targets is not None
+        if _has_local_window and _has_ctx_or_tgt:
+            global _cutlass_local_window_fallback_warned
+            if not _cutlass_local_window_fallback_warned:
+                logger.warning(
+                    "CUTLASS kernel does not support combining local "
+                    "window attention (max_attn_len > 0) with "
+                    "context/target masking, falling back to Triton."
+                )
+                _cutlass_local_window_fallback_warned = True
+            kernel = Kernel.TRITON
+
+    if kernel == Kernel.CUTLASS:
+        # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf so
+        # we call it directly without going through the contiguous/assertion
+        # preprocessing block below (which has control flow that would
+        # break FX symbolic tracing). The CUTLASS kernel requires fp16/bf16
+        # inputs; we rely on the DenseAutocastWrapper applied in
+        # tzrec/acc/aot_utils.py and trt_utils.py (driven by
+        # export_config.mixed_precision / train_config.mixed_precision) to
+        # ensure q/k/v are bf16/fp16 when reaching this dispatch.
+        from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
+
+        return cutlass_hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=causal,
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+        )
+
+    if kernel == Kernel.TRITON:
+        if not is_fx_tracing():
             torch._assert(q.is_cuda, "q must be CUDA tensor")
             torch._assert(k.is_cuda, "k must be CUDA tensor")
             torch._assert(v.is_cuda, "v must be CUDA tensor")
@@ -117,6 +160,8 @@ def delta_hstu_mha(
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     L, H, D = delta_q.shape
     B = seq_offsets.size(0) - 1
     DeltaSize = L // B  # NOQA
@@ -129,8 +174,9 @@ def delta_hstu_mha(
         torch._assert(k.shape[2] == D, "wrong k shape[2]")
         torch._assert(v.dim() == 3, "v must be 3-D")
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
+
     if kernel in [Kernel.TRITON]:
-        if not is_fx_tracing() and kernel == Kernel.TRITON:
+        if not is_fx_tracing():
             torch._assert(delta_q.is_cuda, "q must be CUDA tensor")
             torch._assert(seq_offsets.is_cuda, "seq_offsets must be CUDA tensor")
             if num_targets is not None:

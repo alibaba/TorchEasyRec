@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import OFFSET_INVALID, Consumer, TopicPartition
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
@@ -30,16 +30,25 @@ from tzrec.protos import data_pb2
 from tzrec.utils.logging_util import logger
 
 
-def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
+def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
     """Parse kafka URI into configuration dict.
 
     Args:
         uri: kafka URI.
             e.g. kafka://broker:9092/topic?group.id=xxx&auto.offset.reset=earliest
+            Supports an optional ``start.timestamp.ms`` query parameter to begin
+            consuming from the earliest offset whose timestamp is >= the given
+            value (milliseconds since epoch).  Example::
+
+                kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=1711929600000
 
     Returns:
-        topic: kafka topic name
-        params: consumer config params
+        topic: kafka topic name.
+        params: consumer config params (``start.timestamp.ms`` is removed from
+            this dict because it is not a native ``confluent_kafka`` consumer
+            configuration key).
+        start_timestamp_ms: start timestamp in milliseconds, or ``None`` if not
+            specified.
     """
     parsed = urlparse(uri)
     if parsed.scheme != "kafka":
@@ -57,11 +66,26 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any]]:
     if "group.id" not in params:
         raise ValueError("Consumer group not specified in URI (use ?group.id=xxx)")
 
+    # Extract custom start.timestamp.ms parameter (not a confluent_kafka config key)
+    start_timestamp_ms: Optional[int] = None
+    raw_ts = params.pop("start.timestamp.ms", None)
+    if raw_ts is not None:
+        try:
+            start_timestamp_ms = int(raw_ts)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"start.timestamp.ms must be a valid integer, got: {raw_ts!r}"
+            ) from e
+        if start_timestamp_ms < 0:
+            raise ValueError("start.timestamp.ms must be a non-negative integer")
+
     if "debug" not in params:
         params["debug"] = "assignor,conf"
+    if "enable.auto.commit" not in params:
+        params["enable.auto.commit"] = "false"
     params["bootstrap.servers"] = broker
 
-    return topic, params
+    return topic, params, start_timestamp_ms
 
 
 class KafkaDataset(BaseDataset):
@@ -167,7 +191,7 @@ class KafkaReader(BaseReader):
             ValueError: If no messages available or message doesn't contain
                 valid schema.
         """
-        topic, config = _parse_kafka_uri(self._input_path)
+        topic, config, _ = _parse_kafka_uri(self._input_path)
         consumer = Consumer(config)
 
         try:
@@ -223,19 +247,40 @@ class KafkaReader(BaseReader):
         Yields:
             PyArrow RecordBatch
         """
-        topic, config = _parse_kafka_uri(self._input_path)
+        topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
         consumer = Consumer(config)
 
         # Define on_assign callback to seek to checkpointed offsets
         def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-            if self._checkpoint_state:
-                for tp in partitions:
-                    source_key = f"{tp.topic}:{tp.partition}"
-                    if source_key in self._checkpoint_state:
-                        # Resume after last consumed offset
-                        tp.offset = self._checkpoint_state[source_key] + 1
+            ts_partitions = []
+            for tp in partitions:
+                source_key = f"{tp.topic}:{tp.partition}"
+                if self._checkpoint_state and source_key in self._checkpoint_state:
+                    # Resume after last consumed offset
+                    tp.offset = self._checkpoint_state[source_key] + 1
+                elif start_timestamp_ms is not None:
+                    ts_partitions.append(tp)
+                else:
+                    tp.offset = OFFSET_INVALID
+
+            if ts_partitions:
+                for tp in ts_partitions:
+                    tp.offset = start_timestamp_ms
+                resolved = consumer.offsets_for_times(ts_partitions, timeout=30.0)
+                resolved_map = {(r.topic, r.partition): r.offset for r in resolved}
+                for tp in ts_partitions:
+                    res_offset = resolved_map.get((tp.topic, tp.partition))
+                    if res_offset is not None and res_offset >= 0:
+                        tp.offset = res_offset
                     else:
-                        tp.offset = 0
+                        logger.warning(
+                            f"No offset found for timestamp "
+                            f"{start_timestamp_ms} on "
+                            f"{tp.topic}:{tp.partition}, "
+                            f"falling back to auto.offset.reset"
+                        )
+                        tp.offset = OFFSET_INVALID
+
             consumer.assign(partitions)
             logger.info(
                 f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "

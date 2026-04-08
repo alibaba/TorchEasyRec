@@ -34,7 +34,7 @@ message FeatureGroupConfig {
 enum Kernel {
     TRITON = 0;
     PYTORCH = 1;
-    CUDA = 2;
+    CUTLASS = 2;
 }
 
 message ModelConfig {

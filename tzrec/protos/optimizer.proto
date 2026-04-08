@@ -16,6 +16,8 @@ message SparseOptimizer {
         ConstantLR constant_learning_rate = 101;
         ExponentialDecayLR exponential_decay_learning_rate = 102;
         ManualStepLR manual_step_learning_rate = 103;
+        CosineAnnealingLR cosine_annealing_learning_rate = 104;
+        CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
     }
 }
 
@@ -30,6 +32,8 @@ message DenseOptimizer {
         ConstantLR constant_learning_rate = 101;
         ExponentialDecayLR exponential_decay_learning_rate = 102;
         ManualStepLR manual_step_learning_rate = 103;
+        CosineAnnealingLR cosine_annealing_learning_rate = 104;
+        CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
     }
     repeated PartOptimizer part_optimizers = 201;
 }
@@ -46,6 +50,8 @@ message PartOptimizer {
         ConstantLR constant_learning_rate = 101;
         ExponentialDecayLR exponential_decay_learning_rate = 102;
         ManualStepLR manual_step_learning_rate = 103;
+        CosineAnnealingLR cosine_annealing_learning_rate = 104;
+        CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
     }
 }
 
@@ -187,4 +193,32 @@ message ManualStepLR {
     optional bool warmup = 3 [default = false];
     // schedule by epoch or by step.
     optional bool by_epoch = 4 [default = false];
+}
+
+message CosineAnnealingLR {
+    // total number of steps or epochs for cosine annealing
+    optional uint32 T_max = 1;
+    // minimum learning rate
+    optional float min_learning_rate = 2 [default = 0.0];
+    // warmup start learning rate
+    optional float warmup_learning_rate = 3 [default = 0.0];
+    // warmup steps or epochs
+    optional uint32 warmup_size = 4 [default = 0];
+    // schedule by epoch or by step.
+    optional bool by_epoch = 5 [default = false];
+}
+
+message CosineAnnealingWarmRestartsLR {
+    // number of steps or epochs for the first cosine annealing period
+    optional uint32 T_0 = 1;
+    // factor to grow period length after each restart (1 = fixed period)
+    optional uint32 T_mult = 2 [default = 1];
+    // minimum learning rate
+    optional float min_learning_rate = 3 [default = 0.0];
+    // warmup start learning rate
+    optional float warmup_learning_rate = 4 [default = 0.0];
+    // warmup steps or epochs
+    optional uint32 warmup_size = 5 [default = 0];
+    // schedule by epoch or by step.
+    optional bool by_epoch = 6 [default = false];
 }

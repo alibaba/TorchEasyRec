@@ -536,6 +536,14 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
         )
+
+        # set tf32 config for consistent TRT comparison
+        test_config_path = os.path.join(self.test_dir, "pipeline.config")
+        pipeline_config = config_util.load_pipeline_config(test_config_path)
+        pipeline_config.train_config.cudnn_allow_tf32 = True
+        pipeline_config.train_config.cuda_matmul_allow_tf32 = True
+        config_util.save_message(pipeline_config, test_config_path)
+
         trt_dir = os.path.join(self.test_dir, "trt")
         input_tile_trt_dir = os.path.join(self.test_dir, "input_tile_trt")
         input_tile_emb_trt_dir = os.path.join(self.test_dir, "input_tile_emb_trt")
@@ -967,6 +975,40 @@ class RankIntegrationTest(unittest.TestCase):
             output_names = json.load(f)
             self.assertIsInstance(output_names, list)
             self.assertGreater(len(output_names), 0)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_cutlass_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dlrm_hstu_cutlass_kuairand_1k.config", self.test_dir
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+            )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,cand_seq__video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+                # The cutlass custom op path is not safe to call concurrently
+                # through an AOT-Inductor compiled model yet (hstu_attn_cuda's
+                # pybind11 binding does not release the GIL and the AOTI
+                # runtime then deadlocks between the two predict forward
+                # worker threads). Restrict predict to a single worker until
+                # the underlying multi-threading issue is addressed upstream.
+                predict_threads=1,
+            )
+        self.assertTrue(self.success)
 
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,

@@ -165,7 +165,11 @@ model_config {
       - metrics: 任务指标
   - max_seq_len: 最大序列长度
 
-- kernel: 算子实现，可选TRITON/PYTORCH，TRITON通常比PYTORCH快2-3x，节省2-3x显存
+- kernel: 算子实现，可选TRITON/PYTORCH/CUTLASS
+
+  - TRITON: 基于Triton的实现，通常比PYTORCH快2-3x，节省2-3x显存
+  - CUTLASS: 基于CUTLASS的CUDA融合算子实现，需安装hstu_attn包（DEVICE可选cu126/cu129：`pip install hstu_attn-0.1.0+bea6b4b.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/hstu/${DEVICE}/repo.html`），要求`attention_dim`等于`hidden_dim`，支持Ampere/Ada/Hopper GPU
+  - PYTORCH: 纯PyTorch实现，兼容性最好
 
 ### MTGR Style 配置方式
 
