@@ -107,7 +107,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         def _is_output_segments_tensor(fqn: str) -> bool:
             return fqn.endswith("._output_segments_tensor")
 
-        # When loading a checkpoint saved with a different world size, the
+        # When loading a checkpoint saved with a *smaller* world size, the
         # other MCH state buffers (`_mch_sorted_raw_ids`,
         # `_mch_remapped_ids_mapping`, `_mch_<metadata>`) cannot be loaded
         # via the default `ShardedTensor` position-based path. They are
@@ -116,12 +116,18 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         # (torchrec mc_modules.py:262), and dist.checkpoint will happily do
         # a byte-level position slice across world sizes — but the *values*
         # inside `_mch_remapped_ids_mapping` are global slot indices in
-        # `arange(output_global_offset, output_global_offset + zch_size)`,
-        # which only fit each rank's local range when world sizes match.
-        # When world sizes differ we instead skip these buffers here and
-        # rebuild them via `_redistribute_mch_state` in `restore_model`,
-        # which routes saved entries to the rank that owns each entry's
-        # global value, preserving the (raw_id → embedding row) binding.
+        # `arange(output_global_offset, output_global_offset + zch_size)`
+        # from the saved per-rank range, which only fit each current local
+        # range when `cur_per_rank_zch >= saved_per_rank_zch` (i.e. the
+        # current world size is `<=` the saved one). When the current world
+        # size is strictly larger we skip these buffers here and rebuild
+        # them via `_redistribute_mch_state` in `restore_model`, which
+        # routes saved entries to the rank that owns each entry's global
+        # value, preserving the (raw_id → embedding row) binding. In the
+        # opposite direction (e.g. single-rank export of a multi-rank
+        # training checkpoint) position-based loading is correct and must
+        # be kept so that user-side MCH modules populated via
+        # `ckpt_param_map_path` remaps still receive their saved state.
         def _is_mc_state_buffer(fqn: str) -> bool:
             return "._managed_collision_modules." in fqn
 
@@ -534,10 +540,19 @@ def restore_model(
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
     plan_path = os.path.join(checkpoint_dir, "plan")
 
-    # Detect whether the saved checkpoint world size differs from the current
-    # world size by inspecting the saved sharding plan. If they differ, MCH
-    # (ZCH) state buffers must be redistributed by value rather than loaded
-    # via position-based ShardedTensor slicing (see _redistribute_mch_state).
+    # Detect whether the current world size is *larger* than the world size
+    # the checkpoint was saved with by inspecting the saved sharding plan.
+    # Only this direction needs value-aware redistribution of MCH (ZCH)
+    # state: the saved `_mch_remapped_ids_mapping` values live in the saved
+    # rank's per-rank range `[offset, offset + saved_per_rank_zch)`, which
+    # is *larger* than the current per-rank range when `cur > saved`, so
+    # position-based `ShardedTensor` slicing would fill the current local
+    # buffer with global values that fall outside the local range and crash
+    # the FBGEMM / CUDA gather kernel. When `cur <= saved` (e.g. single-rank
+    # export of a multi-rank training checkpoint), each current local range
+    # still contains all relevant saved values, so the stock position-based
+    # load path is correct and avoids touching user-side MCH modules loaded
+    # via `ckpt_param_map_path` remaps.
     saved_world_size: Optional[int] = None
     if os.path.exists(plan_path):
         try:
@@ -552,12 +567,12 @@ def restore_model(
         except Exception as e:
             logger.warning(f"Failed to inspect saved plan {plan_path}: {e}")
     cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
-    world_size_changed = (
-        saved_world_size is not None and saved_world_size != cur_world_size
+    needs_mch_redistribution = (
+        saved_world_size is not None and cur_world_size > saved_world_size
     )
-    if world_size_changed and is_local_rank_zero:
+    if needs_mch_redistribution and is_local_rank_zero:
         logger.warning(
-            f"Checkpoint world size ({saved_world_size}) differs from "
+            f"Checkpoint world size ({saved_world_size}) is smaller than "
             f"current world size ({cur_world_size}); MCH (ZCH) state will "
             "be redistributed by value to preserve per-position ZCH "
             "semantics across the world size change."
@@ -587,10 +602,10 @@ def restore_model(
             checkpoint_id=model_ckpt_path,
             planner=PartialLoadPlanner(
                 ckpt_param_map_path=ckpt_param_map_path,
-                skip_mc_module_state=world_size_changed,
+                skip_mc_module_state=needs_mch_redistribution,
             ),
         )
-        if world_size_changed:
+        if needs_mch_redistribution:
             # The MCH state ShardedTensors were not filled by `load` above
             # (PartialLoadPlanner skipped them). Manually redistribute the
             # full saved state into the per-rank local buffers, preserving
@@ -617,7 +632,7 @@ def restore_model(
                 checkpoint_id=optim_ckpt_path,
                 planner=PartialLoadPlanner(
                     ckpt_param_map_path=ckpt_param_map_path,
-                    skip_mc_module_state=world_size_changed,
+                    skip_mc_module_state=needs_mch_redistribution,
                 ),
             )
             optimizer.load_state_dict(state_dict)
