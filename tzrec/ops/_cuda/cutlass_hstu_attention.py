@@ -9,13 +9,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# We use the low-level torch.library.define / torch.library.impl /
+# register_fake API here instead of @torch.library.custom_op on purpose:
+# custom_op wraps the user function in @torch.compiler.disable AND adds an
+# autograd_impl / forward_no_grad dispatch layer (even without
+# register_autograd). The combination of those wrappers with AOT-Inductor's
+# compiled-model dispatch deadlocks when the predict pipeline calls the AOT
+# model from multiple worker threads. Confirmed via py-spy dump showing two
+# `_forward_loop` threads stuck inside the AOTI `__call__`, one of them
+# blocked inside `_cutlass_hstu_mha_fwd` and the other waiting at the entry
+# of the AOTI `__call__`. Using the low-level API gives us a single-layer
+# dispatch (just our impl) and the deadlock disappears.
+
 from typing import List, Optional
 
 import torch
 
+_LIB = torch.library.Library("tzrec", "FRAGMENT")
 
-@torch.library.custom_op("tzrec::cutlass_hstu_mha_fwd", mutates_args=())
-def _cutlass_hstu_mha_fwd(
+_FWD_SCHEMA = (
+    "cutlass_hstu_mha_fwd("
+    "Tensor q, Tensor k, Tensor v, Tensor cu_seqlens, "
+    "SymInt max_seq_len, SymInt scaling_seqlen, "
+    "Tensor? num_contexts, Tensor? num_targets, "
+    "SymInt target_group_size, SymInt window_size_left, "
+    "SymInt window_size_right, float alpha"
+    ") -> Tensor"
+)
+_BWD_SCHEMA = (
+    "cutlass_hstu_mha_bwd("
+    "Tensor dout, Tensor q, Tensor k, Tensor v, Tensor cu_seqlens, "
+    "Tensor? num_contexts, Tensor? num_targets, "
+    "SymInt max_seq_len, SymInt scaling_seqlen, "
+    "SymInt target_group_size, SymInt window_size_left, "
+    "SymInt window_size_right, float alpha"
+    ") -> Tensor[]"
+)
+
+_LIB.define(_FWD_SCHEMA)
+_LIB.define(_BWD_SCHEMA)
+
+
+def _cutlass_hstu_mha_fwd_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -59,26 +94,7 @@ def _cutlass_hstu_mha_fwd(
     return out[:, :, :head_dim].reshape(-1, num_heads, head_dim).contiguous()
 
 
-@_cutlass_hstu_mha_fwd.register_fake
-def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seq_len: int,
-    scaling_seqlen: int,
-    num_contexts: Optional[torch.Tensor],
-    num_targets: Optional[torch.Tensor],
-    target_group_size: int,
-    window_size_left: int,
-    window_size_right: int,
-    alpha: float,
-) -> torch.Tensor:
-    return torch.empty_like(q)
-
-
-@torch.library.custom_op("tzrec::cutlass_hstu_mha_bwd", mutates_args=())
-def _cutlass_hstu_mha_bwd(
+def _cutlass_hstu_mha_bwd_impl(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -124,8 +140,24 @@ def _cutlass_hstu_mha_bwd(
     return [dq, dk, dv]
 
 
-@_cutlass_hstu_mha_bwd.register_fake
-def _(
+def _cutlass_hstu_mha_fwd_meta(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seq_len: int,
+    scaling_seqlen: int,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    target_group_size: int,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+def _cutlass_hstu_mha_bwd_meta(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -143,64 +175,93 @@ def _(
     return [torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)]
 
 
-def _setup_context(ctx, inputs, output):
-    (
-        q,
-        k,
-        v,
-        cu_seqlens,
-        max_seq_len,
-        scaling_seqlen,
-        num_contexts,
-        num_targets,
-        target_group_size,
-        window_size_left,
-        window_size_right,
-        alpha,
-    ) = inputs
-    ctx.save_for_backward(q, k, v, cu_seqlens, num_contexts, num_targets)
-    ctx.max_seq_len = max_seq_len
-    ctx.scaling_seqlen = scaling_seqlen
-    ctx.target_group_size = target_group_size
-    ctx.window_size_left = window_size_left
-    ctx.window_size_right = window_size_right
-    ctx.alpha = alpha
+_LIB.impl("cutlass_hstu_mha_fwd", _cutlass_hstu_mha_fwd_impl, "CUDA")
+_LIB.impl("cutlass_hstu_mha_bwd", _cutlass_hstu_mha_bwd_impl, "CUDA")
+torch.library.register_fake("tzrec::cutlass_hstu_mha_fwd")(_cutlass_hstu_mha_fwd_meta)
+torch.library.register_fake("tzrec::cutlass_hstu_mha_bwd")(_cutlass_hstu_mha_bwd_meta)
 
 
-def _backward(ctx, grad_output):
-    q, k, v, cu_seqlens, num_contexts, num_targets = ctx.saved_tensors
-    dq, dk, dv = torch.ops.tzrec.cutlass_hstu_mha_bwd(
-        grad_output.contiguous(),
-        q,
-        k,
-        v,
-        cu_seqlens,
-        num_contexts,
-        num_targets,
-        ctx.max_seq_len,
-        ctx.scaling_seqlen,
-        ctx.target_group_size,
-        ctx.window_size_left,
-        ctx.window_size_right,
-        ctx.alpha,
-    )
-    return (
-        dq,  # q
-        dk,  # k
-        dv,  # v
-        None,  # cu_seqlens
-        None,  # max_seq_len
-        None,  # scaling_seqlen
-        None,  # num_contexts
-        None,  # num_targets
-        None,  # target_group_size
-        None,  # window_size_left
-        None,  # window_size_right
-        None,  # alpha
-    )
+class _CutlassHstuMhaFunction(torch.autograd.Function):
+    """Python autograd.Function wrapping the cutlass low-level torch ops.
 
+    Backward is implemented at the Python autograd level (not via
+    ``register_autograd`` on the op) so that the inference dispatch goes
+    straight to the registered impl, avoiding the autograd_impl /
+    forward_no_grad wrapper layer that triggers the multi-threaded AOTI
+    deadlock under predict workloads.
+    """
 
-_cutlass_hstu_mha_fwd.register_autograd(_backward, setup_context=_setup_context)
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seq_len: int,
+        scaling_seqlen: int,
+        num_contexts: Optional[torch.Tensor],
+        num_targets: Optional[torch.Tensor],
+        target_group_size: int,
+        window_size_left: int,
+        window_size_right: int,
+        alpha: float,
+    ) -> torch.Tensor:
+        out = torch.ops.tzrec.cutlass_hstu_mha_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            max_seq_len,
+            scaling_seqlen,
+            num_contexts,
+            num_targets,
+            target_group_size,
+            window_size_left,
+            window_size_right,
+            alpha,
+        )
+        ctx.save_for_backward(q, k, v, cu_seqlens, num_contexts, num_targets)
+        ctx.max_seq_len = max_seq_len
+        ctx.scaling_seqlen = scaling_seqlen
+        ctx.target_group_size = target_group_size
+        ctx.window_size_left = window_size_left
+        ctx.window_size_right = window_size_right
+        ctx.alpha = alpha
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):  # type: ignore[override]
+        q, k, v, cu_seqlens, num_contexts, num_targets = ctx.saved_tensors
+        dq, dk, dv = torch.ops.tzrec.cutlass_hstu_mha_bwd(
+            grad_output.contiguous(),
+            q,
+            k,
+            v,
+            cu_seqlens,
+            num_contexts,
+            num_targets,
+            ctx.max_seq_len,
+            ctx.scaling_seqlen,
+            ctx.target_group_size,
+            ctx.window_size_left,
+            ctx.window_size_right,
+            ctx.alpha,
+        )
+        return (
+            dq,
+            dk,
+            dv,
+            None,  # cu_seqlens
+            None,  # max_seq_len
+            None,  # scaling_seqlen
+            None,  # num_contexts
+            None,  # num_targets
+            None,  # target_group_size
+            None,  # window_size_left
+            None,  # window_size_right
+            None,  # alpha
+        )
 
 
 @torch.fx.wrap
@@ -272,6 +333,25 @@ def cutlass_hstu_mha(
     if num_targets is not None:
         num_targets_int32 = num_targets.to(torch.int32)
 
+    # In autograd-enabled context (training), go through the
+    # _CutlassHstuMhaFunction so backward is wired up. Under no_grad /
+    # inference / FX-traced graphs, we still call the underlying op
+    # directly, which dispatches straight to the CUDA impl.
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        return _CutlassHstuMhaFunction.apply(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            max_seq_len,
+            max_seq_len,  # scaling_seqlen
+            num_contexts_tensor,
+            num_targets_int32,
+            1,  # target_group_size
+            window_size_left,
+            window_size_right,
+            alpha,
+        )
     return torch.ops.tzrec.cutlass_hstu_mha_fwd(
         q,
         k,
