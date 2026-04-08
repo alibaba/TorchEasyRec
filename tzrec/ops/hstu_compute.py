@@ -28,18 +28,6 @@ from tzrec.ops.layer_norm import layer_norm
 from tzrec.ops.mm import addmm
 
 
-def sub_op_kernel(kernel: Kernel) -> Kernel:
-    """Return the kernel to use for non-attention sub-ops inside an HSTU layer.
-
-    ``Kernel.CUTLASS`` only applies to the HSTU attention op itself
-    (``cutlass_hstu_mha``). All other ops in the HSTU layer — layer_norm,
-    addmm (qkv projection), silu, compute_output — fall back to
-    ``Kernel.TRITON`` because CUTLASS has no implementation of them.
-    For any other kernel the value passes through unchanged.
-    """
-    return Kernel.TRITON if kernel == Kernel.CUTLASS else kernel
-
-
 def hstu_compute_uqvk(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -52,6 +40,8 @@ def hstu_compute_uqvk(
     uvqk_bias: torch.Tensor,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     normed_x = layer_norm(
         x,
         weight=norm_weight,
@@ -99,6 +89,8 @@ def hstu_compute_output(
     recompute_y_in_backward: bool,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_hstu_linear import (
             triton_hstu_compute_output,
@@ -215,7 +207,7 @@ def hstu_preprocess_and_attention(
             hidden_dim=hidden_dim,
             uvqk_weight=uvqk_weight,
             uvqk_bias=uvqk_bias,
-            kernel=sub_op_kernel(kernel),
+            kernel=kernel,
         )
         attn_output = hstu_mha(
             max_seq_len=max_seq_len,

@@ -29,7 +29,6 @@ from tzrec.ops.utils import switch_to_contiguous_if_needed
 logger = logging.getLogger(__name__)
 
 _cutlass_local_window_fallback_warned = False
-_cutlass_cached_fallback_warned = False
 
 
 def hstu_mha(
@@ -163,6 +162,8 @@ def delta_hstu_mha(
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     L, H, D = delta_q.shape
     B = seq_offsets.size(0) - 1
     DeltaSize = L // B  # NOQA
@@ -175,16 +176,6 @@ def delta_hstu_mha(
         torch._assert(k.shape[2] == D, "wrong k shape[2]")
         torch._assert(v.dim() == 3, "v must be 3-D")
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
-    if kernel == Kernel.CUTLASS:
-        # CUTLASS kernel does not support delta-query pattern, fall back to Triton.
-        global _cutlass_cached_fallback_warned
-        if not _cutlass_cached_fallback_warned:
-            logger.warning(
-                "CUTLASS kernel does not support cached/delta attention, "
-                "falling back to Triton."
-            )
-            _cutlass_cached_fallback_warned = True
-        kernel = Kernel.TRITON
 
     if kernel in [Kernel.TRITON]:
         if not is_fx_tracing():
