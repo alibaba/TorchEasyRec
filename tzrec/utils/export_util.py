@@ -73,9 +73,9 @@ from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 # All HSTU-based model types (for hstu_kernel detection)
-_HSTU_MODEL_TYPES = {"dlrm_hstu", "hstu_match"}
+_HSTU_MODEL_TYPES = {"DlrmHSTU", "HSTUMatch"}
 # HSTU model types that require hstu_item_id (ranking models only)
-_HSTU_ITEM_ID_REQUIRED_TYPES = {"dlrm_hstu"}
+_HSTU_ITEM_ID_REQUIRED_TYPES = {"DlrmHSTU"}
 
 
 def export_model(
