@@ -980,6 +980,13 @@ class RankIntegrationTest(unittest.TestCase):
                 reserved_columns="user_id,cand_seq__video_id",
                 output_columns="",
                 test_dir=self.test_dir,
+                # The cutlass custom op path is not safe to call concurrently
+                # through an AOT-Inductor compiled model yet (hstu_attn_cuda's
+                # pybind11 binding does not release the GIL and the AOTI
+                # runtime then deadlocks between the two predict forward
+                # worker threads). Restrict predict to a single worker until
+                # the underlying multi-threading issue is addressed upstream.
+                predict_threads=1,
             )
         self.assertTrue(self.success)
 

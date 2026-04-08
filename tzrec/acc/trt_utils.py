@@ -18,11 +18,7 @@ from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from tzrec.acc.utils import get_max_export_batch_size, is_debug_trt
-from tzrec.models.model import (
-    AutocastWrapper,
-    CombinedModelWrapper,
-    DenseAutocastWrapper,
-)
+from tzrec.models.model import CombinedModelWrapper, DenseAutocastWrapper
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
@@ -118,30 +114,17 @@ def export_model_trt(
         data (Dict[str, torch.Tensor]): the test data
         save_dir (str): model save dir
         mixed_precision (Optional[str]): "BF16", "FP16", or None. When set,
-            sparse and dense sub-graphs are wrapped in autocast so that AMP
-            is preserved through jit.script and torch.export.
+            only the dense sub-graph is wrapped in a DenseAutocastWrapper
+            before torch.export. The sparse sub-graph is only embedding
+            lookups and doesn't benefit from AMP.
     """
-    autocast_dtype: Optional[torch.dtype] = None
-    if mixed_precision == "BF16":
-        autocast_dtype = torch.bfloat16
-    elif mixed_precision == "FP16":
-        autocast_dtype = torch.float16
-
-    with torch.amp.autocast(
-        device_type="cuda",
-        dtype=autocast_dtype,
-        enabled=autocast_dtype is not None,
-    ):
-        emb_ebc, _ = sparse_model(data, "cuda:0")
+    emb_ebc, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
 
     with open(os.path.join(save_dir, "gm_sparse.code"), "w") as f:
         f.write(sparse_model_traced.code)
 
-    sparse_to_script: nn.Module = sparse_model_traced
-    if mixed_precision:
-        sparse_to_script = AutocastWrapper(sparse_model_traced, mixed_precision)
-    sparse_model_scripted = torch.jit.script(sparse_to_script)
+    sparse_model_scripted = torch.jit.script(sparse_model_traced)
 
     # dynamic shapes
     max_batch_size = get_max_export_batch_size()

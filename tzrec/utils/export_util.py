@@ -192,12 +192,14 @@ def export_model_normal(
         model.eval()
 
         data = batch.to_dict(sparse_dtype=torch.int64)
-        # Mixed-precision (BF16/FP16) configured at training time should also
-        # apply during the export eager run and the scripted/exported graphs.
-        # We use torch.amp.autocast in eager and an AutocastWrapper around the
-        # FX-traced sub-modules so the autocast survives jit.script and
-        # torch.export (see tzrec/models/model.py:AutocastWrapper).
-        mixed_precision = pipeline_config.train_config.mixed_precision
+        # Resolve the mixed-precision mode to apply during the export eager
+        # run and dense-side torch.export. export_config.mixed_precision
+        # overrides train_config.mixed_precision when set; empty falls back
+        # to the train_config value.
+        export_mp = ""
+        if pipeline_config.HasField("export_config"):
+            export_mp = pipeline_config.export_config.mixed_precision
+        mixed_precision = export_mp or pipeline_config.train_config.mixed_precision
         autocast_dtype: Optional[torch.dtype] = None
         if mixed_precision == "BF16":
             autocast_dtype = torch.bfloat16

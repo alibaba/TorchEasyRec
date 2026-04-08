@@ -389,59 +389,6 @@ class ScriptWrapper(BaseModule):
         return self.model.predict(batch)
 
 
-class AutocastWrapper(nn.Module):
-    """Wraps a sparse-side module in a torch.autocast context.
-
-    This wrapper enables AMP (automatic mixed precision) for a wrapped module
-    in a way that survives torch.fx symbolic_trace + torch.jit.script. The
-    torch.autocast context manager itself is not captured by FX (it's a
-    runtime dispatcher feature), so wrapping the raw model with autocast and
-    then FX-tracing loses the autocast context. By wrapping AFTER FX trace
-    and then scripting the wrapper, the autocast context becomes part of the
-    scripted artifact.
-
-    Note: TorchScript only honors `torch.autocast(dtype=...)` if the dtype is
-    a compile-time constant. We satisfy this by branching on a Final[int]
-    flag set at construction time, with each branch using a literal dtype.
-
-    The forward signature matches ScriptWrapper.forward so this can wrap the
-    FX-traced sparse GraphModule produced by split_model.
-
-    Args:
-        inner (nn.Module): inner module (e.g., FX GraphModule from
-            symbolic_trace) to wrap.
-        mixed_precision (Optional[str]): one of "BF16", "FP16", or None.
-    """
-
-    _mixed_dtype_id: Final[int]
-
-    def __init__(self, inner: nn.Module, mixed_precision: Optional[str] = None) -> None:
-        super().__init__()
-        self.inner = inner
-        if mixed_precision == "BF16":
-            self._mixed_dtype_id = 1
-        elif mixed_precision == "FP16":
-            self._mixed_dtype_id = 2
-        else:
-            self._mixed_dtype_id = 0
-
-    def forward(
-        self,
-        data: Dict[str, torch.Tensor],
-        # pyre-ignore [9]
-        device: torch.device = "cpu",
-    ) -> Any:
-        """Forward through inner module under an autocast context."""
-        if self._mixed_dtype_id == 1:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                return self.inner(data, device)
-        elif self._mixed_dtype_id == 2:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                return self.inner(data, device)
-        else:
-            return self.inner(data, device)
-
-
 class DenseAutocastWrapper(nn.Module):
     """Wraps a dense-side module in a torch.autocast context for torch.export.
 
@@ -449,6 +396,11 @@ class DenseAutocastWrapper(nn.Module):
     torch.export.export. torch.export captures the `with torch.autocast(...)`
     region as a `wrap_with_autocast` Higher Order Op in the exported graph,
     which AOT Inductor lowers to proper dtype casts.
+
+    Only the dense path needs this wrapper: the sparse path is embedding
+    lookups which don't have autocast rules and don't benefit from AMP, and
+    the CUTLASS attention op lives in the dense sub-graph after the
+    sparse/dense split.
 
     The forward takes a single dict argument matching the dense_gm signature.
 
