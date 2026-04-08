@@ -425,16 +425,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         )
                     else:
                         input_data[k] = v
-                if use_sample_mask:
-                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-                        [
-                            input_data[C_SAMPLE_MASK],
-                            pa.array(
-                                np.random.random(len(list(sampled.values())[0]))
-                                < self._data_config.negative_sample_mask_prob
-                            ),
-                        ]
-                    )
             else:
                 sampled = self._sampler.get(input_data)
                 for k, v in sampled.items():
