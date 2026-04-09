@@ -36,7 +36,7 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success and not os.environ.get("KEEP_TEST_DIR"):
+        if self.success:
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
