@@ -364,26 +364,23 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._sampler is not None:
             if isinstance(self._sampler, TDMSampler):
                 pos_sampled, neg_sampled = self._sampler.get(input_data)
-                orig_sample_mask = (
-                    input_data[C_SAMPLE_MASK] if use_sample_mask else None
-                )
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
                 if use_sample_mask:
                     num_pos = len(list(pos_sampled.values())[0])
                     num_neg = len(list(neg_sampled.values())[0])
+                    total = len(list(input_data.values())[0])
+                    batch_size = total - num_pos - num_neg
                     # Rows after _expand_tdm_sample are laid out as
-                    # [orig_targets | pos_sampled | neg_sampled]. Reuse the
-                    # pre-sampler C_SAMPLE_MASK for the original rows, extend
-                    # it with fresh draws for pos_sampled (sample_mask_prob)
-                    # and neg_sampled (negative_sample_mask_prob). TDM features
+                    # [orig_targets | pos_sampled | neg_sampled]. Mask the
+                    # positives (orig + pos_sampled) with sample_mask_prob and
+                    # the negatives with negative_sample_mask_prob. TDM features
                     # are never is_neg, so only C_SAMPLE_MASK needs to be set.
                     input_data[C_SAMPLE_MASK] = pa.array(
                         np.concatenate(
                             [
-                                orig_sample_mask,
-                                np.random.random(num_pos)
+                                np.random.random(batch_size + num_pos)
                                 < self._data_config.sample_mask_prob,
                                 np.random.random(num_neg)
                                 < self._data_config.negative_sample_mask_prob,
