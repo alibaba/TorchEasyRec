@@ -809,8 +809,8 @@ class DatasetTest(unittest.TestCase):
                 dataset_type=data_pb2.DatasetType.OdpsDataset,
                 fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
-                sample_mask_prob=0.9,
-                negative_sample_mask_prob=0.9,
+                sample_mask_prob=0.8,
+                negative_sample_mask_prob=0.3,
                 tdm_sampler=sampler_pb2.TDMSampler(
                     item_input_path=node.name,
                     edge_input_path=edge.name,
