@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import tempfile
@@ -446,7 +447,8 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
             )
         self.assertTrue(self.success)
         self.assertTrue(
@@ -455,6 +457,20 @@ class MatchIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
+        # Verify model_acc.json contains HSTU kernel for user tower
+        user_acc_path = os.path.join(self.test_dir, "export/user/model_acc.json")
+        self.assertTrue(os.path.exists(user_acc_path))
+        with open(user_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertNotIn("hstu_item_id", acc_cfg)
+            self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
+        # Verify model_acc.json contains HSTU kernel for item tower
+        item_acc_path = os.path.join(self.test_dir, "export/item/model_acc.json")
+        self.assertTrue(os.path.exists(item_acc_path))
+        with open(item_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertNotIn("hstu_item_id", acc_cfg)
+            self.assertEqual(acc_cfg["hstu_kernel"], "pytorch")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import json
 import os
 from typing import Any, Dict, Optional, Union
 
@@ -51,7 +52,7 @@ def load_model_aot(
     Return:
         AOTInductor model wrapper.
     """
-    aoti_model_path = os.path.join(model_path, "aoti_model.pt2")
+    aoti_model_path = os.path.join(model_path, "aoti", "aoti_model.pt2")
 
     if is_unified_aot_predict(model_path):
         # Unified single-model path
@@ -131,6 +132,14 @@ def export_model_aot(
     if mixed_precision:
         dense_to_export = DenseAutocastWrapper(dense_model, mixed_precision)
 
+    # Dry-run the wrapped module to capture output field names. Must run
+    # through dense_to_export (not dense_model) so the autocast context is
+    # active — kernels like CUTLASS HSTU attention reject fp32 inputs.
+    with torch.no_grad():
+        _out = dense_to_export(sparse_output)
+        aoti_output_keys = list(_out.keys())
+        del _out
+
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -147,9 +156,21 @@ def export_model_aot(
             "unsafe_ignore_unsupported_triton_autotune_args": True,
         }
     ):
+        aoti_dir = os.path.join(save_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+
+        # Save original model output field names to aoti directory
+        if aoti_output_keys:
+            output_names_path = os.path.join(aoti_dir, "output_field_names.json")
+            with open(output_names_path, "w") as f:
+                json.dump(aoti_output_keys, f, indent=4)
+            logger.info(
+                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
+            )
+
         torch._inductor.aoti_compile_and_package(
             exported_pg,
-            package_path=os.path.join(save_dir, "aoti_model.pt2"),
+            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
         )
     return save_dir
 
@@ -342,6 +363,7 @@ def export_unified_model_aot(
     result = full_gm(data)
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
+    aoti_output_keys = list(result.keys())
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
@@ -370,9 +392,22 @@ def export_unified_model_aot(
             "unsafe_ignore_unsupported_triton_autotune_args": True,
         }
     ):
+        aoti_dir = os.path.join(save_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+
+        # Save original model output field names (matches legacy
+        # export_model_aot behavior).
+        if aoti_output_keys:
+            output_names_path = os.path.join(aoti_dir, "output_field_names.json")
+            with open(output_names_path, "w") as f:
+                json.dump(aoti_output_keys, f, indent=4)
+            logger.info(
+                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
+            )
+
         torch._inductor.aoti_compile_and_package(
             exported_pg,
-            package_path=os.path.join(save_dir, "aoti_model.pt2"),
+            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
         )
 
     logger.info("unified AOTI model exported to %s", save_dir)

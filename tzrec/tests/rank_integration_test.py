@@ -36,7 +36,7 @@ class RankIntegrationTest(unittest.TestCase):
         os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        if self.success:
+        if self.success and not os.environ.get("KEEP_TEST_DIR"):
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
         os.environ.pop("INPUT_TILE", None)
@@ -510,13 +510,15 @@ class RankIntegrationTest(unittest.TestCase):
 
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
+            os.path.exists(
+                os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2")
+            )
         )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
@@ -789,6 +791,47 @@ class RankIntegrationTest(unittest.TestCase):
             comp_cpu_gpu_pred_result=True,
         )
 
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+        "needs >= 2 GPUs to exercise different world sizes",
+    )
+    def test_multi_tower_din_zch_finetune_world_size_change(self):
+        # First train on 1 GPU, then finetune from that checkpoint on 2 GPUs.
+        # Regression test for the assertion in MCH validate_state caused by
+        # _output_segments_tensor being clobbered when the saved world size
+        # differs from the current world size.
+        prev_nproc = os.environ.get("TEST_NPROC_PER_NODE")
+        try:
+            os.environ["TEST_NPROC_PER_NODE"] = "1"
+            self.success = utils.test_train_eval(
+                "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+                os.path.join(self.test_dir, "1"),
+                user_id="user_id",
+                item_id="item_id",
+            )
+            self.assertTrue(self.success)
+
+            os.environ["TEST_NPROC_PER_NODE"] = "2"
+            self.success = utils.test_train_eval(
+                "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+                os.path.join(self.test_dir, "2"),
+                user_id="user_id",
+                item_id="item_id",
+                args_str=(
+                    f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}"
+                ),
+            )
+            self.assertTrue(self.success)
+            _, steps = checkpoint_util.latest_checkpoint(
+                os.path.join(self.test_dir, "2/train")
+            )
+            self.assertGreater(steps, 0)
+        finally:
+            if prev_nproc is None:
+                os.environ.pop("TEST_NPROC_PER_NODE", None)
+            else:
+                os.environ["TEST_NPROC_PER_NODE"] = prev_nproc
+
     def test_multi_tower_din_with_fg_export_quant(self):
         self._test_rank_with_fg_quant(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
@@ -929,6 +972,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str=export_env_str,
+                hstu_item_id="cand_seq__video_id",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
@@ -952,8 +996,25 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
+        # Verify model_acc.json contains HSTU-related fields
+        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
+        self.assertTrue(os.path.exists(model_acc_path))
+        with open(model_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq__video_id")
+            self.assertEqual(acc_cfg["hstu_kernel"], "triton")
+            self.assertEqual(acc_cfg["ENABLE_AOT"], "1")
+        # Verify output_field_names.json is created for AOT export
+        output_names_path = os.path.join(
+            self.test_dir, "export/aoti/output_field_names.json"
+        )
+        self.assertTrue(os.path.exists(output_names_path))
+        with open(output_names_path) as f:
+            output_names = json.load(f)
+            self.assertIsInstance(output_names, list)
+            self.assertGreater(len(output_names), 0)
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export(self):
@@ -995,6 +1056,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="ENABLE_AOT=1",
+                hstu_item_id="cand_seq__video_id",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         if self.success:
@@ -1098,8 +1160,27 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="MAX_EXPORT_BATCH_SIZE=1 USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",  # NOQA
+                hstu_item_id="cand_seq_video_id",
             )
         self.assertTrue(self.success)
+
+    def test_dlrm_hstu_export_without_hstu_item_id_raises(self):
+        pipeline_config = config_util.load_pipeline_config(
+            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config"
+        )
+        from unittest.mock import MagicMock
+
+        from tzrec.utils.export_util import export_model
+
+        with self.assertRaises(ValueError) as ctx:
+            export_model(
+                pipeline_config=pipeline_config,
+                model=MagicMock(),
+                checkpoint_path=None,
+                save_dir=self.test_dir,
+                hstu_item_id=None,
+            )
+        self.assertIn("hstu_item_id", str(ctx.exception))
 
 
 if __name__ == "__main__":
