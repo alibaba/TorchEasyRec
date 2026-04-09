@@ -772,13 +772,7 @@ class OdpsWriter(BaseWriter):
                 self._wait_init_table()
             self._init_writer()
             self._lazy_inited = True
-        # pa.RecordBatch.from_arrays only accepts pa.Array, so collapse any
-        # ChunkedArray columns into a single contiguous Array first.
-        output_arrays = []
-        for v in output_dict.values():
-            if isinstance(v, pa.ChunkedArray):
-                v = v.combine_chunks()
-            output_arrays.append(v)
+        output_arrays = self._flatten_chunked_arrays(output_dict)
         record_batch = pa.RecordBatch.from_arrays(
             output_arrays,
             list(output_dict.keys()),

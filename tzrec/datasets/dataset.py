@@ -605,9 +605,28 @@ class BaseWriter(metaclass=_writer_meta_cls):
         self._lazy_inited = False
         self._output_path = output_path
 
-    def write(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def write(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Write a batch of data."""
         raise NotImplementedError
+
+    @staticmethod
+    def _flatten_chunked_arrays(
+        output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]],
+    ) -> List[pa.Array]:
+        """Collapse ChunkedArray columns into contiguous Arrays.
+
+        ``pa.RecordBatch.from_arrays`` only accepts ``pa.Array``, so any
+        ``pa.ChunkedArray`` column must be combined into a single chunk before
+        constructing the batch.
+        """
+        output_arrays = []
+        for v in output_dict.values():
+            if isinstance(v, pa.ChunkedArray):
+                v = v.combine_chunks()
+            output_arrays.append(v)
+        return output_arrays
 
     def close(self) -> None:
         """Close and commit data."""

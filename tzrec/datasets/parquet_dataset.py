@@ -313,13 +313,7 @@ class ParquetWriter(BaseWriter):
         self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
     ) -> None:
         """Write a batch of data."""
-        # pa.RecordBatch.from_arrays only accepts pa.Array, so collapse any
-        # ChunkedArray columns into a single contiguous Array first.
-        output_arrays = []
-        for v in output_dict.values():
-            if isinstance(v, pa.ChunkedArray):
-                v = v.combine_chunks()
-            output_arrays.append(v)
+        output_arrays = self._flatten_chunked_arrays(output_dict)
         if not self._lazy_inited:
             schema = []
             for k, v in zip(output_dict.keys(), output_arrays):
