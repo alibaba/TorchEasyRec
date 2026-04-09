@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import json
 import os
 from typing import Any, Dict, Optional
 
@@ -47,7 +48,7 @@ def load_model_aot(model_path: str, device: torch.device) -> CombinedModelWrappe
     )
     dense_model: torch.export.pt2_archive._package.AOTICompiledModel = (
         torch._inductor.aoti_load_package(
-            os.path.join(model_path, "aoti_model.pt2"),
+            os.path.join(model_path, "aoti", "aoti_model.pt2"),
             device_index=device.index,
         )
     )
@@ -110,6 +111,14 @@ def export_model_aot(
     if mixed_precision:
         dense_to_export = DenseAutocastWrapper(dense_model, mixed_precision)
 
+    # Dry-run the wrapped module to capture output field names. Must run
+    # through dense_to_export (not dense_model) so the autocast context is
+    # active — kernels like CUTLASS HSTU attention reject fp32 inputs.
+    with torch.no_grad():
+        _out = dense_to_export(sparse_output)
+        aoti_output_keys = list(_out.keys())
+        del _out
+
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -126,8 +135,20 @@ def export_model_aot(
             "unsafe_ignore_unsupported_triton_autotune_args": True,
         }
     ):
+        aoti_dir = os.path.join(save_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+
+        # Save original model output field names to aoti directory
+        if aoti_output_keys:
+            output_names_path = os.path.join(aoti_dir, "output_field_names.json")
+            with open(output_names_path, "w") as f:
+                json.dump(aoti_output_keys, f, indent=4)
+            logger.info(
+                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
+            )
+
         torch._inductor.aoti_compile_and_package(
             exported_pg,
-            package_path=os.path.join(save_dir, "aoti_model.pt2"),
+            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
         )
     return save_dir

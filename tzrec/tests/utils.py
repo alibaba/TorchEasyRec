@@ -1089,6 +1089,7 @@ def test_export(
     export_dir: str = "",
     asset_files: str = "",
     env_str: str = "",
+    hstu_item_id: str = "",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
@@ -1103,7 +1104,9 @@ def test_export(
     if env_str:
         cmd_str = f"{env_str} {cmd_str}"
     if asset_files:
-        cmd_str += f"--asset_files {asset_files}"
+        cmd_str += f"--asset_files {asset_files} "
+    if hstu_item_id:
+        cmd_str += f"--hstu_item_id {hstu_item_id}"
 
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=1800
