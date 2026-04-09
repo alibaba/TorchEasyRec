@@ -476,10 +476,17 @@ class UnifiedAOTIModelWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
-        # Two independent thread-safety issues need to be handled on each
-        # forward call — see the long comment in forward() below. We store
-        # the lock via object.__setattr__ to bypass nn.Module's strict
-        # __setattr__, which only accepts tensors/parameters/submodules.
+        # Python-level lock serializing forward across predict worker
+        # threads. Required even though AOTI's model container has its
+        # own C++ mutex and even with a pre-warmed Triton autotune
+        # cache: the HSTU custom ops escape back to Python via the
+        # proxy executor (torch._library.autograd.forward_no_grad ->
+        # op.redispatch), and Triton's @autotune decorator object has
+        # instance-level mutable state (self.nargs, self.best_config)
+        # that is mutated on every call, not just benchmark runs — so
+        # concurrent callers race regardless of cache state.
+        # Stored via object.__setattr__ to bypass nn.Module's strict
+        # attribute registration.
         object.__setattr__(self, "_lock", threading.Lock())
 
     def forward(
@@ -498,33 +505,15 @@ class UnifiedAOTIModelWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         # Sort keys to match the export-time dict order (pytree spec).
-        # Data stays on CPU here — the compiled graph moves it via the
-        # efficient batch-level Batch.to(device) inside ScriptWrapper.
         data = OrderedDict(sorted(data.items()))
-        # 1. Force CUDA context creation on the calling thread. Predict
-        #    worker threads are spawned fresh with no primary context, and
-        #    the compiled AOTI graph crashes with 'CUDA driver error:
-        #    invalid device context' when it tries to acquire a CUDA stream.
-        #    torch.cuda.set_device uses the force=true code path that always
-        #    calls cudaSetDevice (Module.cpp:67), which eagerly creates the
-        #    primary context in CUDA 12. `torch.cuda.device(device)` is NOT
-        #    sufficient — it calls ExchangeDevice which early-returns when
-        #    current==target without invoking cudaSetDevice.
-        #
-        # 2. Serialize concurrent callers with a Python lock. The AOTI
-        #    container's internal CV-based serialization in model_container.h
-        #    only protects the inner model pool. HSTU-style models that
-        #    dispatch to custom ops via the AOTI proxy executor (e.g.,
-        #    tzrec::cutlass_hstu_*, hstu_mha_triton) take a different path:
-        #    the proxy executor re-enters Python, going through
-        #    torch._library.autograd.forward_no_grad → op.redispatch, which
-        #    is NOT protected by the container CV. Two predict worker threads
-        #    concurrently in that Python-level dispatch deadlock (observed
-        #    via py-spy: both threads stuck inside AOTI __call__, one at the
-        #    outer entry and one at the inner `redispatch`). MultiTowerDIN
-        #    doesn't show this because it has no custom-op path. Holding a
-        #    Python lock around the whole self.model(data) call avoids the
-        #    deadlock at negligible cost (num_runners=1 already serializes).
+        # Force CUDA context creation on the calling thread. Predict
+        # worker threads are spawned fresh with no primary context, and
+        # the compiled AOTI graph crashes with 'CUDA driver error:
+        # invalid device context' when it tries to acquire a CUDA stream.
+        # torch.cuda.set_device uses the force=true code path that always
+        # calls cudaSetDevice, eagerly creating the primary context in
+        # CUDA 12. `torch.cuda.device(device)` is NOT sufficient — it
+        # calls ExchangeDevice which early-returns when current==target.
         torch.cuda.set_device(device)
         with self._lock:
             return self.model(data)

@@ -1199,12 +1199,28 @@ def predict(
             _write_predictions(writer, predictions, reserves, output_cols)
 
     def _forward_loop() -> None:
+        # Give each worker thread its own CUDA context + dedicated stream.
+        # A per-thread stream lets independent kernel launches overlap and
+        # avoids cross-thread stream-interleaving races inside custom ops
+        # that the AOTI proxy executor re-enters via Python (e.g. HSTU
+        # Triton / CUTLASS kernels). torch.cuda.set_device forces
+        # cudaSetDevice with force=true so a fresh Python worker thread
+        # gets a primary CUDA context (torch.cuda.device(...) alone is
+        # not enough — it early-returns when current==target).
+        worker_stream: Optional[torch.cuda.Stream] = None
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+            worker_stream = torch.cuda.Stream(device=device)
         while True:
             batch = data_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
             if batch is None:
                 break
             assert batch is not None
-            pred = _forward(batch)
+            if worker_stream is not None:
+                with torch.cuda.stream(worker_stream):
+                    pred = _forward(batch)
+            else:
+                pred = _forward(batch)
             pred_queue.put(pred, timeout=PREDICT_QUEUE_TIMEOUT)
 
     forward_t_list = []
