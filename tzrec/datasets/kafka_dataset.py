@@ -266,6 +266,7 @@ class KafkaReader(BaseReader):
         is_paused = [False]
         last_consume_time = [time.monotonic()]
         idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
+        stolen_msgs: List = []
 
         # Define on_assign callback to seek to checkpointed offsets
         def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
@@ -315,12 +316,19 @@ class KafkaReader(BaseReader):
                 elapsed = time.monotonic() - last_consume_time[0]
                 if elapsed > idle_threshold:
                     with consumer_lock:
-                        if not is_paused[0]:
-                            assignment = consumer.assignment()
-                            if assignment:
-                                consumer.pause(assignment)
-                            is_paused[0] = True
-                        consumer.poll(0)
+                        # Re-check elapsed inside lock to avoid racing with
+                        # the main thread that updates last_consume_time
+                        # under the same lock before calling consume().
+                        elapsed = time.monotonic() - last_consume_time[0]
+                        if elapsed > idle_threshold:
+                            if not is_paused[0]:
+                                assignment = consumer.assignment()
+                                if assignment:
+                                    consumer.pause(assignment)
+                                is_paused[0] = True
+                            msg = consumer.poll(0)
+                            if msg is not None:
+                                stolen_msgs.append(msg)
                 stop_event.wait(1.0)
 
         heartbeat_thread = threading.Thread(
@@ -339,14 +347,17 @@ class KafkaReader(BaseReader):
                         if assignment:
                             consumer.resume(assignment)
                         is_paused[0] = False
+                    last_consume_time[0] = time.monotonic()
+                    pending = list(stolen_msgs)
+                    stolen_msgs.clear()
 
                 num_messages = (
                     int(math.ceil(self._batch_size / batch_size_per_msg))
                     if batch_size_per_msg
                     else 2
                 )
-                last_consume_time[0] = time.monotonic()
-                messages = consumer.consume(num_messages)
+                messages = pending
+                messages.extend(consumer.consume(num_messages))
 
                 current_batch_size = 0
                 record_batchs = []
