@@ -316,6 +316,39 @@ class TokensAsSequenceTokenizeFeatureTest(unittest.TestCase):
         # seq_lengths = per-sample token count (sample 1 used default "xyz")
         np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([3, 1, 2]))
 
+    @parameterized.expand(
+        [
+            [["1\x032", "", None, "3"], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
+            [[[1, 2], None, None, [3]], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
+        ]
+    )
+    def test_tokens_as_sequence_fg_none(
+        self, input_feat, expected_values, expected_key_lengths, expected_seq_lengths
+    ):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                embedding_dim=16,
+                vocab_file="data/test/tokenizer.json",
+                tokens_as_sequence=True,
+                sequence_length=16,
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(token_feat_cfg)
+        self.assertTrue(token_feat.is_sequence)
+        self.assertEqual(token_feat.value_dim, 1)
+
+        input_data = {"token_feat": pa.array(input_feat)}
+        parsed_feat = token_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(
+            parsed_feat.key_lengths, np.array(expected_key_lengths)
+        )
+        np.testing.assert_allclose(
+            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
+        )
+
     def test_tokens_as_sequence_rejects_sequence_tokenize_oneof(self):
         # tokens_as_sequence is only valid under the `tokenize_feature` oneof.
         token_feat_cfg = feature_pb2.FeatureConfig(
@@ -328,7 +361,7 @@ class TokensAsSequenceTokenizeFeatureTest(unittest.TestCase):
                 sequence_length=16,
             )
         )
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             tokenize_feature_lib.TokenizeFeature(
                 token_feat_cfg, fg_mode=FgMode.FG_NORMAL
             )

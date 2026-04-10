@@ -53,10 +53,11 @@ class TokenizeFeature(IdFeature):
         cfg = getattr(feature_config, fc_type)
         self._tokens_as_sequence = bool(getattr(cfg, "tokens_as_sequence", False))
         if self._tokens_as_sequence:
-            assert fc_type == "tokenize_feature", (
-                "tokens_as_sequence is only valid with the `tokenize_feature` "
-                "oneof entry, not `sequence_tokenize_feature`."
-            )
+            if fc_type != "tokenize_feature":
+                raise ValueError(
+                    "tokens_as_sequence is only valid with the `tokenize_feature` "
+                    "oneof entry, not `sequence_tokenize_feature`."
+                )
             # Auto-enable sequence mode so BaseFeature picks up
             # sequence_delim / sequence_length from the config block.
             kwargs["is_sequence"] = True
@@ -193,7 +194,9 @@ class TokenizeFeature(IdFeature):
             return super().fg_json()
         fg_cfgs = self._fg_json()
         for fg_cfg in fg_cfgs:
-            if not fg_cfg.get("default_value"):
+            if fg_cfg.get("feature_type") == "tokenize_feature" and not fg_cfg.get(
+                "default_value"
+            ):
                 fg_cfg["default_value"] = "0"
         return fg_cfgs
 
