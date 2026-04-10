@@ -132,6 +132,83 @@ class TokenizeFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
+            [["1\x032", "", None, "3"], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
+            [[[1, 2], None, None, [3]], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
+        ]
+    )
+    def test_fg_encoded_tokens_as_sequence(
+        self, input_feat, expected_values, expected_key_lengths, expected_seq_lengths
+    ):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                embedding_dim=16,
+                vocab_file="data/test/tokenizer.json",
+                tokens_as_sequence=True,
+                sequence_length=16,
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(token_feat_cfg)
+
+        input_data = {"token_feat": pa.array(input_feat)}
+        parsed_feat = token_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(
+            parsed_feat.key_lengths, np.array(expected_key_lengths)
+        )
+        np.testing.assert_allclose(
+            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
+        )
+
+    @parameterized.expand(
+        [
+            [
+                "xyz",
+                ["abc efg", "", "hij"],
+                [19758, 299, 16054, 35609, 73, 1944],
+                [1, 1, 1, 1, 1, 1],
+                [3, 1, 2],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_tokens_as_sequence(
+        self,
+        default_value,
+        input_data,
+        expected_values,
+        expected_key_lengths,
+        expected_seq_lengths,
+    ):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                vocab_file="data/test/tokenizer.json",
+                embedding_dim=16,
+                expression="user:token_input",
+                default_value=default_value,
+                tokens_as_sequence=True,
+                sequence_length=16,
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(
+            token_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+
+        input_data = {"token_input": pa.array(input_data)}
+        parsed_feat = token_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(
+            parsed_feat.key_lengths, np.array(expected_key_lengths)
+        )
+        np.testing.assert_allclose(
+            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
+        )
+
+    @parameterized.expand(
+        [
             [
                 "",
                 ["abc efg", "", "hij"],
@@ -249,122 +326,6 @@ class SequenceTokenizeFeatureTest(unittest.TestCase):
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
-
-
-class TokensAsSequenceTokenizeFeatureTest(unittest.TestCase):
-    def test_tokens_as_sequence_properties_and_fg_json(self):
-        token_feat_cfg = feature_pb2.FeatureConfig(
-            tokenize_feature=feature_pb2.TokenizeFeature(
-                feature_name="token_feat",
-                vocab_file="data/test/tokenizer.json",
-                embedding_dim=16,
-                expression="user:token_input",
-                tokens_as_sequence=True,
-                sequence_length=32,
-            )
-        )
-        token_feat = tokenize_feature_lib.TokenizeFeature(
-            token_feat_cfg, fg_mode=FgMode.FG_NORMAL
-        )
-        # sequence mode auto-enabled, but routed as token-level sequence
-        self.assertTrue(token_feat.is_sequence)
-        self.assertTrue(token_feat.is_sparse)
-        self.assertEqual(token_feat.value_dim, 1)
-        self.assertEqual(token_feat.sequence_length, 32)
-        self.assertEqual(token_feat.inputs, ["token_input"])
-        self.assertEqual(token_feat.name, "token_feat")
-
-        # EmbeddingConfig (EC) must be available because the feature routes
-        # through SequenceEmbeddingGroupImpl.
-        emb_config = token_feat.emb_config
-        self.assertIsNotNone(emb_config)
-        self.assertEqual(emb_config.embedding_dim, 16)
-
-        # fg_json must emit plain tokenize_feature (not wrapped).
-        fg_cfg = token_feat.fg_json()[-1]
-        self.assertEqual(fg_cfg["feature_type"], "tokenize_feature")
-        self.assertNotIn("sequence_delim", fg_cfg)
-        self.assertNotIn("sequence_length", fg_cfg)
-        # default_value was empty -> defensively set to "0" for sequence mode.
-        self.assertEqual(fg_cfg["default_value"], "0")
-
-    def test_tokens_as_sequence_parse(self):
-        token_feat_cfg = feature_pb2.FeatureConfig(
-            tokenize_feature=feature_pb2.TokenizeFeature(
-                feature_name="token_feat",
-                vocab_file="data/test/tokenizer.json",
-                embedding_dim=16,
-                expression="user:token_input",
-                default_value="xyz",
-                tokens_as_sequence=True,
-                sequence_length=16,
-            )
-        )
-        token_feat = tokenize_feature_lib.TokenizeFeature(
-            token_feat_cfg, fg_mode=FgMode.FG_NORMAL
-        )
-
-        input_data = {"token_input": pa.array(["abc efg", "", "hij"])}
-        parsed_feat = token_feat.parse(input_data)
-        self.assertEqual(parsed_feat.name, "token_feat")
-        # values = concatenation of per-sample token ids
-        np.testing.assert_allclose(
-            parsed_feat.values, np.array([19758, 299, 16054, 35609, 73, 1944])
-        )
-        # each token is one sequence element, so key_lengths is all ones
-        np.testing.assert_allclose(parsed_feat.key_lengths, np.ones(6, dtype=np.int32))
-        # seq_lengths = per-sample token count (sample 1 used default "xyz")
-        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([3, 1, 2]))
-
-    @parameterized.expand(
-        [
-            [["1\x032", "", None, "3"], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
-            [[[1, 2], None, None, [3]], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
-        ]
-    )
-    def test_tokens_as_sequence_fg_none(
-        self, input_feat, expected_values, expected_key_lengths, expected_seq_lengths
-    ):
-        token_feat_cfg = feature_pb2.FeatureConfig(
-            tokenize_feature=feature_pb2.TokenizeFeature(
-                feature_name="token_feat",
-                embedding_dim=16,
-                vocab_file="data/test/tokenizer.json",
-                tokens_as_sequence=True,
-                sequence_length=16,
-            )
-        )
-        token_feat = tokenize_feature_lib.TokenizeFeature(token_feat_cfg)
-        self.assertTrue(token_feat.is_sequence)
-        self.assertEqual(token_feat.value_dim, 1)
-
-        input_data = {"token_feat": pa.array(input_feat)}
-        parsed_feat = token_feat.parse(input_data)
-        self.assertEqual(parsed_feat.name, "token_feat")
-        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
-        np.testing.assert_allclose(
-            parsed_feat.key_lengths, np.array(expected_key_lengths)
-        )
-        np.testing.assert_allclose(
-            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
-        )
-
-    def test_tokens_as_sequence_rejects_sequence_tokenize_oneof(self):
-        # tokens_as_sequence is only valid under the `tokenize_feature` oneof.
-        token_feat_cfg = feature_pb2.FeatureConfig(
-            sequence_tokenize_feature=feature_pb2.TokenizeFeature(
-                feature_name="token_feat",
-                vocab_file="data/test/tokenizer.json",
-                embedding_dim=16,
-                expression="user:token_input",
-                tokens_as_sequence=True,
-                sequence_length=16,
-            )
-        )
-        with self.assertRaises(ValueError):
-            tokenize_feature_lib.TokenizeFeature(
-                token_feat_cfg, fg_mode=FgMode.FG_NORMAL
-            )
 
 
 if __name__ == "__main__":

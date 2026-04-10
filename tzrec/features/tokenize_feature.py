@@ -44,9 +44,6 @@ class TokenizeFeature(IdFeature):
         feature_config: FeatureConfig,
         **kwargs,
     ) -> None:
-        # pre-set attributes referenced by BaseFeature.__del__ so that a
-        # failure in the assertions below does not raise an unraisable
-        # AttributeError during garbage collection.
         self._fg_op = None
         self._tok_fg_op = None
         fc_type = feature_config.WhichOneof("feature")
@@ -58,8 +55,6 @@ class TokenizeFeature(IdFeature):
                     "tokens_as_sequence is only valid with the `tokenize_feature` "
                     "oneof entry, not `sequence_tokenize_feature`."
                 )
-            # Auto-enable sequence mode so BaseFeature picks up
-            # sequence_delim / sequence_length from the config block.
             kwargs["is_sequence"] = True
         super().__init__(feature_config, **kwargs)
 
@@ -79,9 +74,6 @@ class TokenizeFeature(IdFeature):
     @property
     def value_dim(self) -> int:
         """Fg value dimension of the feature."""
-        # When consumed as a token sequence, each sequence element is a single
-        # token id (value_dim=1), matching how sequence_id_feature flows into
-        # SequenceEmbeddingGroupImpl (no segment_reduce, EC + to_padded_dense).
         if self._tokens_as_sequence:
             return 1
         return 0
@@ -180,16 +172,7 @@ class TokenizeFeature(IdFeature):
         return fg_cfgs
 
     def fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config.
-
-        For ``tokens_as_sequence`` mode, we bypass the sequence-wrapper logic
-        in ``BaseFeature.fg_json`` so that fg emits a plain
-        ``tokenize_feature`` entry whose output ``(values, lengths)`` already
-        describes a per-sample token sequence. The sequence semantics are
-        applied downstream (in ``_parse`` and ``SequenceEmbeddingGroupImpl``)
-        instead of through a ``sequence_tokenize_feature`` fg wrapper (which
-        interprets the input as a delimited list of texts).
-        """
+        """Get fg json config."""
         if not self._tokens_as_sequence:
             return super().fg_json()
         fg_cfgs = self._fg_json()
@@ -201,16 +184,7 @@ class TokenizeFeature(IdFeature):
         return fg_cfgs
 
     def _parse(self, input_data: Dict[str, pa.Array]):
-        """Parse input data for the feature impl.
-
-        In ``tokens_as_sequence`` mode, run the normal (non-sequence) fg path
-        to obtain ``(values, lengths)``, then wrap it as ``SequenceSparseData``
-        with ``key_lengths = ones`` (one id per sequence element) and
-        ``seq_lengths = lengths`` (per-sample token count). Because
-        ``value_dim == 1``, ``SequenceEmbeddingGroupImpl`` will skip the
-        multi-value ``segment_reduce`` branch and feed the per-token
-        embeddings straight into ``to_padded_dense``.
-        """
+        """Parse input data for the feature impl."""
         if not self._tokens_as_sequence:
             return super()._parse(input_data)
 
