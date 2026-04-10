@@ -130,6 +130,33 @@ def export_model(
         shutil.rmtree(local_path)
 
 
+def _move_quantized_modules_to_device(model: nn.Module, device: torch.device) -> None:
+    """Move quantized fbgemm modules to device after CPU quantization.
+
+    torchrec stores fbgemm IntNBitTableBatchedEmbeddingBagsCodegen in a
+    plain list (_emb_modules), not nn.ModuleList, so model.cuda() skips
+    them. Use fbgemm's move_to_device_with_cache() which properly handles
+    weight migration, placement metadata, row alignment, and buffer views.
+
+    Must use cache_load_factor=1.0 to place weights in device HBM
+    (EmbeddingLocation.DEVICE). The default 0.0 places weights in UVM
+    (MANAGED) which is incompatible with the inference forward path.
+    """
+    from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
+        IntNBitTableBatchedEmbeddingBagsCodegen,
+    )
+
+    for m in model.modules():
+        if not hasattr(m, "_emb_modules"):
+            continue
+        for emb in m._emb_modules:
+            if (
+                isinstance(emb, IntNBitTableBatchedEmbeddingBagsCodegen)
+                and emb.current_device != device
+            ):
+                emb.move_to_device_with_cache(device, 1.0)
+
+
 def export_model_normal(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -197,9 +224,10 @@ def export_model_normal(
 
         batch = next(iter(dataloader))
 
-        if acc_utils.is_cuda_export():
-            model = model.cuda()
-
+        # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
+        # for nbit quantization uses int32 pointer arithmetic which
+        # overflows for large embedding tables (>67M rows at dim=32).
+        # The CPU kernel uses int64 and is safe for any table size.
         if acc_utils.is_quant() or acc_utils.is_ec_quant():
             logger.info("quantize embeddings...")
             additional_qconfig_spec_keys = []
@@ -215,6 +243,10 @@ def export_model_normal(
                 additional_mapping=additional_mapping,
             )
             logger.info("finish quantize embeddings...")
+
+        if acc_utils.is_cuda_export():
+            _move_quantized_modules_to_device(model, torch.device("cuda:0"))
+            model = model.cuda()
 
         model.eval()
 
