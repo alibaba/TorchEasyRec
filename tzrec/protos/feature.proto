@@ -750,7 +750,7 @@ message TokenizeFeature {
     // When true, treat the tokenized output of a single text as a sequence
     // of tokens (each token is one sequence element, value_dim=1) so the
     // feature can be fed into sequence_encoder modules (pooling_encoder,
-    // self_attention encoder, DIN, etc.) via EmbeddingCollection instead of
+    // self_attention_encoder, etc.) via EmbeddingCollection instead of
     // being pooled by EmbeddingBagCollection. This is distinct from the
     // `sequence_tokenize_feature` oneof entry, which interprets the input as
     // a `sequence_delim`-separated list of texts.
