@@ -8,7 +8,7 @@ DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`ha
 
 ```bash
 # DEVICE 可选: cu126/cu129 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb-0.0.1+20260407.97b80bf.${DEVICE} -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb==0.0.1+20260407.97b80bf.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
