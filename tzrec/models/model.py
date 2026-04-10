@@ -476,17 +476,18 @@ class UnifiedAOTIModelWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
-        # Prevents GIL + C++ mutex deadlock when the AOTI model has
-        # extern ops (e.g. fbgemm::asynchronous_complete_cumsum) that
-        # go through the proxy executor. The proxy executor's Python
-        # callback path (autograd_impl → forward_no_grad → redispatch)
-        # calls redispatch_boxed which releases the GIL
-        # (python_dispatch.cpp:275). A second worker thread can then
-        # acquire the GIL and enter boxed_run, blocking on the AOTI
-        # container's C++ mutex while holding the GIL — deadlocking
-        # with the first thread that holds the mutex but needs the GIL
-        # back. This lock prevents the second thread from entering
-        # boxed_run at all.
+        # Prevents GIL + C++ mutex deadlock. The AOTI model has extern
+        # ops (fbgemm::asynchronous_complete_cumsum) dispatched through
+        # the proxy executor. redispatch_boxed (python_dispatch.cpp:275)
+        # releases the GIL during dispatch; a second worker thread then
+        # acquires the GIL and enters boxed_run, blocking on the AOTI
+        # container's C++ model-pool mutex while holding the GIL. The
+        # first thread needs the GIL back to return from redispatch →
+        # deadlock. Two-stage export avoids this because the JIT sparse
+        # model releases the GIL (pybind_utils.h:1140) before the dense
+        # AOTI model is called, breaking the lock-ordering cycle.
+        # Upstream fix: py::gil_scoped_release in boxed_run's pybind
+        # wrapper (aoti_package/pybind.cpp).
         # Stored via object.__setattr__ to bypass nn.Module's strict
         # attribute registration.
         object.__setattr__(self, "_lock", threading.Lock())
