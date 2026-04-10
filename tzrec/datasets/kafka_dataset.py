@@ -341,6 +341,15 @@ class KafkaReader(BaseReader):
         batch_size_per_msg = None
         try:
             while True:
+                num_messages = (
+                    int(math.ceil(self._batch_size / batch_size_per_msg))
+                    if batch_size_per_msg
+                    else 2
+                )
+                # Hold consumer_lock during consume() so the heartbeat
+                # thread cannot call pause() concurrently.
+                # rd_kafka_consume_batch_queue() (used by consume()) is
+                # not thread-safe with concurrent pause/resume/seek.
                 with consumer_lock:
                     if is_paused[0]:
                         assignment = consumer.assignment()
@@ -350,14 +359,8 @@ class KafkaReader(BaseReader):
                     last_consume_time[0] = time.monotonic()
                     pending = list(stolen_msgs)
                     stolen_msgs.clear()
-
-                num_messages = (
-                    int(math.ceil(self._batch_size / batch_size_per_msg))
-                    if batch_size_per_msg
-                    else 2
-                )
-                messages = pending
-                messages.extend(consumer.consume(num_messages))
+                    messages = pending
+                    messages.extend(consumer.consume(num_messages, timeout=1.0))
 
                 current_batch_size = 0
                 record_batchs = []
