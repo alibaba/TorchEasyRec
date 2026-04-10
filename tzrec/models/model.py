@@ -476,15 +476,17 @@ class UnifiedAOTIModelWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
-        # Python-level lock serializing forward across predict worker
-        # threads. Required even though AOTI's model container has its
-        # own C++ mutex and even with a pre-warmed Triton autotune
-        # cache: the HSTU custom ops escape back to Python via the
-        # proxy executor (torch._library.autograd.forward_no_grad ->
-        # op.redispatch), and Triton's @autotune decorator object has
-        # instance-level mutable state (self.nargs, self.best_config)
-        # that is mutated on every call, not just benchmark runs — so
-        # concurrent callers race regardless of cache state.
+        # Prevents GIL + C++ mutex deadlock when the AOTI model has
+        # extern ops (e.g. fbgemm::asynchronous_complete_cumsum) that
+        # go through the proxy executor. The proxy executor's Python
+        # callback path (autograd_impl → forward_no_grad → redispatch)
+        # calls redispatch_boxed which releases the GIL
+        # (python_dispatch.cpp:275). A second worker thread can then
+        # acquire the GIL and enter boxed_run, blocking on the AOTI
+        # container's C++ mutex while holding the GIL — deadlocking
+        # with the first thread that holds the mutex but needs the GIL
+        # back. This lock prevents the second thread from entering
+        # boxed_run at all.
         # Stored via object.__setattr__ to bypass nn.Module's strict
         # attribute registration.
         object.__setattr__(self, "_lock", threading.Lock())
