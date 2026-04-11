@@ -328,6 +328,7 @@ def export_unified_model_aot(
     model: nn.Module,
     data: Dict[str, torch.Tensor],
     save_dir: str,
+    mixed_precision: Optional[str] = None,
 ) -> str:
     """Export a unified AOTInductor model (sparse+dense fused).
 
@@ -335,6 +336,7 @@ def export_unified_model_aot(
         model (nn.Module): the full model (ScriptWrapper).
         data (Dict[str, torch.Tensor]): sample input data.
         save_dir (str): model save dir.
+        mixed_precision (Optional[str]): "BF16", "FP16", or None.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -346,7 +348,9 @@ def export_unified_model_aot(
 
     # Wrap the model so the trace sees only `data` as input — `device` is
     # bound as a constant attribute of the wrapper and inlined by the tracer.
-    trace_root = _DataOnlyWrapper(model, str(device))
+    trace_root: nn.Module = _DataOnlyWrapper(model, str(device))
+    if mixed_precision:
+        trace_root = DenseAutocastWrapper(trace_root, mixed_precision)
 
     # Trace the full model. The torchrec-aware symbolic_trace decomposes
     # quantized EBC ops (e.g. fbgemm.bounds_check_indices) into primitives,
