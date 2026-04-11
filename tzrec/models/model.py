@@ -425,16 +425,9 @@ class DenseAutocastWrapper(nn.Module):
 
 
 class CombinedModelWrapper(nn.Module):
-    """Model inference wrapper for model combined with sparse and dense part.
+    """Model inference wrapper for two-stage export (JIT sparse + AOTI dense).
 
-    Must remain `torch.jit.script`-friendly: the TRT export path wraps a
-    CombinedModelWrapper and calls `torch.jit.script` on it
-    (see tzrec/acc/trt_utils.py). Do NOT store non-scriptable attributes
-    (threading.Lock, etc.) or call Python-only APIs here. The legacy AOT
-    two-stage path relies on the sparse_model JIT's own batch.to(device)
-    to initialize the CUDA context on predict worker threads, and has
-    historically not needed an explicit cross-thread lock around the
-    dense AOTI call.
+    Must remain ``torch.jit.script``-friendly (used by TRT export).
 
     Args:
         sparse_model (nn.Module): sparse part scripted model.
@@ -476,20 +469,11 @@ class UnifiedAOTIModelWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
-        # Prevents GIL + C++ mutex deadlock. The AOTI model has extern
-        # ops (fbgemm::asynchronous_complete_cumsum) dispatched through
-        # the proxy executor. redispatch_boxed (python_dispatch.cpp:275)
-        # releases the GIL during dispatch; a second worker thread then
-        # acquires the GIL and enters boxed_run, blocking on the AOTI
-        # container's C++ model-pool mutex while holding the GIL. The
-        # first thread needs the GIL back to return from redispatch →
-        # deadlock. Two-stage export avoids this because the JIT sparse
-        # model releases the GIL (pybind_utils.h:1140) before the dense
-        # AOTI model is called, breaking the lock-ordering cycle.
-        # Upstream fix: py::gil_scoped_release in boxed_run's pybind
-        # wrapper (aoti_package/pybind.cpp).
-        # Stored via object.__setattr__ to bypass nn.Module's strict
-        # attribute registration.
+        # Serializes forward to prevent GIL + C++ mutex deadlock.
+        # AOTI extern ops go through redispatch_boxed which releases the
+        # GIL; a second thread can then hold the GIL while blocking on
+        # the AOTI model-pool mutex, deadlocking with the first thread.
+        # object.__setattr__ bypasses nn.Module's strict registration.
         object.__setattr__(self, "_lock", threading.Lock())
 
     def forward(
@@ -507,16 +491,8 @@ class UnifiedAOTIModelWrapper(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        # Sort keys to match the export-time dict order (pytree spec).
         data = OrderedDict(sorted(data.items()))
-        # Force CUDA context creation on the calling thread. Predict
-        # worker threads are spawned fresh with no primary context, and
-        # the compiled AOTI graph crashes with 'CUDA driver error:
-        # invalid device context' when it tries to acquire a CUDA stream.
-        # torch.cuda.set_device uses the force=true code path that always
-        # calls cudaSetDevice, eagerly creating the primary context in
-        # CUDA 12. `torch.cuda.device(device)` is NOT sufficient — it
-        # calls ExchangeDevice which early-returns when current==target.
+        # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
         with self._lock:
             return self.model(data)
