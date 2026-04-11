@@ -35,7 +35,7 @@ from tzrec.utils.logging_util import logger
 try:
     from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
 except ImportError:
-    pass
+    logger.debug("cutlass_hstu_attention not available; skipping op registration")
 
 
 def load_model_aot(
@@ -364,6 +364,7 @@ def export_unified_model_aot(
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
     aoti_output_keys = list(result.keys())
+    del result
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
