@@ -746,6 +746,15 @@ message TokenizeFeature {
     optional string sequence_delim = 102 [default = ";"];
     // specify sequence type fields in inputs. default is item side inputs.
     repeated string sequence_fields = 103;
+
+    // When true, treat the tokenized output of a single text as a sequence
+    // of tokens (each token is one sequence element, value_dim=1) so the
+    // feature can be fed into sequence_encoder modules (pooling_encoder,
+    // self_attention_encoder, etc.) via EmbeddingCollection instead of
+    // being pooled by EmbeddingBagCollection. This is distinct from the
+    // `sequence_tokenize_feature` oneof entry, which interprets the input as
+    // a `sequence_delim`-separated list of texts.
+    optional bool tokens_as_sequence = 104 [default = false];
 }
 
 

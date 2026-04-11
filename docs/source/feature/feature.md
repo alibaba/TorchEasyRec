@@ -553,6 +553,21 @@ feature_configs {
   | TEXT_SPLITCHRS    | 中文拆成单字(空格分隔) |
   | TEXT_REMOVE_SPACE | 去除空格               |
 
+- **tokens_as_sequence**: 可选，默认为false。当设为true时，将分词结果作为序列（每个token作为一个序列元素，value_dim=1），可直接输入到sequence_encoder模块（如PoolingEncoder、SelfAttentionEncoder等），通过EmbeddingCollection获取每个token的embedding，输出形状为`(B, T, D)`。这与`sequence_tokenize_feature`不同，后者将输入视为以`sequence_delim`分隔的多段文本序列。使用时需同时设置`sequence_length`指定最大序列长度。
+
+  ```
+  feature_configs {
+      tokenize_feature {
+          feature_name: "title_token"
+          expression: "item:title"
+          vocab_file: "tokenizer.json"
+          embedding_dim: 8
+          tokens_as_sequence: true
+          sequence_length: 32
+      }
+  }
+  ```
+
 ## KvDotProduct: KeyValue点积特征
 
 计算两个key-value索引的向量的点积，或两个集合的交集的大小。

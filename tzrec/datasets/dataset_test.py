@@ -736,6 +736,119 @@ class DatasetTest(unittest.TestCase):
         )
         self.assertEqual(batch.labels["label"].size(), (40,))
 
+    def test_dataset_with_tdm_sample_mask(self):
+        node = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(node)
+        node.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(63):
+            node.write(f"{i}\t{1}\t{int(math.log(i + 1, 2))}:{i}:{i + 1000}:{i * 2}\n")
+        node.flush()
+
+        def _ancestor(code):
+            ancs = []
+            while True:
+                code = int((code - 1) / 2)
+                if code <= 0:
+                    break
+                ancs.append(code)
+            return ancs
+
+        edge = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(edge)
+        edge.write("src_id:int64\tdst_id:int\tweight:float\n")
+        for i in range(31, 63):
+            for ancestor in _ancestor(i):
+                edge.write(f"{i}\t{ancestor}\t{1.0}\n")
+        edge.flush()
+
+        def _childern(code):
+            return [2 * code + 1, 2 * code + 2]
+
+        predict_edge = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(predict_edge)
+        predict_edge.write("src_id:int64\tdst_id:int\tweight:float\n")
+        for i in range(7, 15):
+            predict_edge.write(f"0\t{i}\t{1}\n")
+        for i in range(7, 31):
+            for child in _childern(i):
+                predict_edge.write(f"{i}\t{child}\t{1}\n")
+        predict_edge.flush()
+
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="str_c", type=pa.string()),
+            pa.field(name="int_d", type=pa.int64()),
+            pa.field(name="float_d", type=pa.float64()),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="int_a", use_mask=True, fg_encoded_default_value=""
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="str_c")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_d")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_d")
+            ),
+        ]
+        features = create_features(feature_cfgs)
+
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+                label_fields=["label"],
+                sample_mask_prob=0.8,
+                negative_sample_mask_prob=0.3,
+                tdm_sampler=sampler_pb2.TDMSampler(
+                    item_input_path=node.name,
+                    edge_input_path=edge.name,
+                    predict_edge_input_path=predict_edge.name,
+                    attr_fields=["tree_level", "int_a", "float_b", "str_c"],
+                    item_id_field="int_a",
+                    layer_num_sample=[0, 1, 1, 1, 1, 5],
+                    field_delimiter=",",
+                    remain_ratio=0.4,
+                    probability_type="UNIFORM",
+                ),
+            ),
+            features=features,
+            input_path="",
+            mode=Mode.TRAIN,
+            input_fields=input_fields,
+        )
+
+        dataset.launch_sampler_cluster(2)
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+
+        iterator = iter(dataloader)
+        batch = next(iterator)
+        data_dict = batch.to_dict()
+        # After _expand_tdm_sample, every feature has length 40
+        # (batch_size=4 expanded by TDM sampling to 40 rows). float_b has
+        # no use_mask so it is never masked. int_a has use_mask=True so the
+        # high sample_mask_prob / negative_sample_mask_prob should null out
+        # most rows, shrinking its values length well below 40.
+        self.assertEqual(len(data_dict["float_b.values"]), 40)
+        self.assertLess(len(data_dict["int_a.values"]), 40)
+
     def test_dataset_with_list_type_not_null(self):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),

@@ -12,9 +12,14 @@
 import os
 from typing import Any, Dict, List
 
+import numpy as np
+import pyarrow as pa
 import pyfg
 
+from tzrec.datasets.utils import SequenceSparseData
+from tzrec.features.feature import _parse_fg_encoded_sparse_feature_impl
 from tzrec.features.id_feature import IdFeature
+from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, TextNormalizeOption
 
 NORM_OPTION_MAPPING = {
@@ -39,8 +44,19 @@ class TokenizeFeature(IdFeature):
         feature_config: FeatureConfig,
         **kwargs,
     ) -> None:
-        super().__init__(feature_config, **kwargs)
+        self._fg_op = None
         self._tok_fg_op = None
+        fc_type = feature_config.WhichOneof("feature")
+        cfg = getattr(feature_config, fc_type)
+        self._tokens_as_sequence = bool(getattr(cfg, "tokens_as_sequence", False))
+        if self._tokens_as_sequence:
+            if fc_type != "tokenize_feature":
+                raise ValueError(
+                    "tokens_as_sequence is only valid with the `tokenize_feature` "
+                    "oneof entry, not `sequence_tokenize_feature`."
+                )
+            kwargs["is_sequence"] = True
+        super().__init__(feature_config, **kwargs)
 
     @property
     def num_embeddings(self) -> int:
@@ -58,6 +74,8 @@ class TokenizeFeature(IdFeature):
     @property
     def value_dim(self) -> int:
         """Fg value dimension of the feature."""
+        if self._tokens_as_sequence:
+            return 1
         return 0
 
     @property
@@ -152,6 +170,52 @@ class TokenizeFeature(IdFeature):
 
         fg_cfgs.append(fg_cfg)
         return fg_cfgs
+
+    def fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config."""
+        if not self._tokens_as_sequence:
+            return super().fg_json()
+        fg_cfgs = self._fg_json()
+        for fg_cfg in fg_cfgs:
+            if fg_cfg.get("feature_type") == "tokenize_feature" and not fg_cfg.get(
+                "default_value"
+            ):
+                fg_cfg["default_value"] = "0"
+        return fg_cfgs
+
+    def _parse(self, input_data: Dict[str, pa.Array]):
+        """Parse input data for the feature impl."""
+        if not self._tokens_as_sequence:
+            return super()._parse(input_data)
+
+        if self.fg_mode == FgMode.FG_NORMAL:
+            # pyre-ignore [16]
+            fgout, status = self._fg_op.process_arrow(input_data)
+            assert status.ok(), status.message()
+            feat_data = fgout[self.name]
+            values = feat_data.np_values
+            seq_lengths = feat_data.np_lengths
+        elif self.fg_mode == FgMode.FG_NONE:
+            feat = input_data[self.name]
+            sparse = _parse_fg_encoded_sparse_feature_impl(
+                self.name,
+                feat,
+                **self._fg_encoded_kwargs,
+            )
+            values = sparse.values
+            seq_lengths = sparse.lengths
+        else:
+            raise ValueError(
+                f"fg_mode: {self.fg_mode} is not supported for "
+                "tokens_as_sequence TokenizeFeature."
+            )
+
+        return SequenceSparseData(
+            name=self.name,
+            values=values,
+            key_lengths=np.ones(values.shape[0], dtype=np.int32),
+            seq_lengths=seq_lengths,
+        )
 
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""

@@ -367,6 +367,26 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
+                if use_sample_mask:
+                    num_pos = len(list(pos_sampled.values())[0])
+                    num_neg = len(list(neg_sampled.values())[0])
+                    total = len(list(input_data.values())[0])
+                    batch_size = total - num_pos - num_neg
+                    # Rows after _expand_tdm_sample are laid out as
+                    # [orig_targets | pos_sampled | neg_sampled]. Mask the
+                    # positives (orig + pos_sampled) with sample_mask_prob and
+                    # the negatives with negative_sample_mask_prob. TDM features
+                    # are never is_neg, so only C_SAMPLE_MASK needs to be set.
+                    input_data[C_SAMPLE_MASK] = pa.array(
+                        np.concatenate(
+                            [
+                                np.random.random(batch_size + num_pos)
+                                < self._data_config.sample_mask_prob,
+                                np.random.random(num_neg)
+                                < self._data_config.negative_sample_mask_prob,
+                            ]
+                        )
+                    )
             elif self._enable_hstu:
                 seq_attr = self._sampler._item_id_field
 
@@ -412,17 +432,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         input_data[k] = pa.concat_arrays([input_data[k], v])
                     else:
                         input_data[k] = v
-
-            if use_sample_mask:
-                input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-                    [
-                        input_data[C_SAMPLE_MASK],
-                        pa.array(
-                            np.random.random(len(list(sampled.values())[0]))
-                            < self._data_config.negative_sample_mask_prob
-                        ),
-                    ]
-                )
+                if use_sample_mask:
+                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+                        [
+                            input_data[C_SAMPLE_MASK],
+                            pa.array(
+                                np.random.random(len(list(sampled.values())[0]))
+                                < self._data_config.negative_sample_mask_prob
+                            ),
+                        ]
+                    )
 
         # TODO(hongsheng.jhs): add additional field like hard_negative
         output_data = self._data_parser.parse(input_data)
@@ -605,9 +624,28 @@ class BaseWriter(metaclass=_writer_meta_cls):
         self._lazy_inited = False
         self._output_path = output_path
 
-    def write(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def write(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Write a batch of data."""
         raise NotImplementedError
+
+    @staticmethod
+    def _flatten_chunked_arrays(
+        output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]],
+    ) -> List[pa.Array]:
+        """Collapse ChunkedArray columns into contiguous Arrays.
+
+        ``pa.RecordBatch.from_arrays`` only accepts ``pa.Array``, so any
+        ``pa.ChunkedArray`` column must be combined into a single chunk before
+        constructing the batch.
+        """
+        output_arrays = []
+        for v in output_dict.values():
+            if isinstance(v, pa.ChunkedArray):
+                v = v.combine_chunks()
+            output_arrays.append(v)
+        return output_arrays
 
     def close(self) -> None:
         """Close and commit data."""

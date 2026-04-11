@@ -257,6 +257,20 @@ class CsvWriterTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-0.csv")))
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-1.csv")))
 
+    def test_csv_writer_chunked_array(self):
+        os.environ["RANK"] = "0"
+        writer = CsvWriter(self.test_dir)
+        writer.write(
+            {
+                "int_a": pa.chunked_array([pa.array([1, 2, 3]), pa.array([4, 5])]),
+                "float_b": pa.array([0.1, 0.2, 0.3, 0.4, 0.5]),
+            }
+        )
+        writer.close()
+        table = csv.read_csv(os.path.join(self.test_dir, "part-0.csv"))
+        self.assertEqual(table.num_rows, 5)
+        self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
+
 
 if __name__ == "__main__":
     unittest.main()
