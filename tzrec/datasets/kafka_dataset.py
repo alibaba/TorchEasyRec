@@ -299,8 +299,8 @@ class KafkaReader(BaseReader):
                         )
                         tp.offset = OFFSET_INVALID
 
-            consumer.assign(partitions)
             with consumer_lock:
+                consumer.assign(partitions)
                 if is_paused[0]:
                     consumer.pause(consumer.assignment())
             logger.info(
@@ -313,22 +313,30 @@ class KafkaReader(BaseReader):
         def _heartbeat() -> None:
             """Keep consumer alive when generator is blocked at yield."""
             while not stop_event.is_set():
-                elapsed = time.monotonic() - last_consume_time[0]
-                if elapsed > idle_threshold:
-                    with consumer_lock:
-                        # Re-check elapsed inside lock to avoid racing with
-                        # the main thread that updates last_consume_time
-                        # under the same lock before calling consume().
-                        elapsed = time.monotonic() - last_consume_time[0]
-                        if elapsed > idle_threshold:
-                            if not is_paused[0]:
-                                assignment = consumer.assignment()
-                                if assignment:
-                                    consumer.pause(assignment)
-                                is_paused[0] = True
-                            msg = consumer.poll(0)
-                            if msg is not None:
-                                stolen_msgs.append(msg)
+                try:
+                    elapsed = time.monotonic() - last_consume_time[0]
+                    if elapsed > idle_threshold:
+                        with consumer_lock:
+                            # Re-check elapsed inside lock to avoid racing
+                            # with the main thread that updates
+                            # last_consume_time under the same lock.
+                            elapsed = time.monotonic() - last_consume_time[0]
+                            if elapsed > idle_threshold:
+                                if not is_paused[0]:
+                                    assignment = consumer.assignment()
+                                    if assignment:
+                                        consumer.pause(assignment)
+                                    is_paused[0] = True
+                                    logger.debug(
+                                        f"heartbeat: paused {len(assignment)}"
+                                        f" partitions after {elapsed:.1f}s"
+                                        f" idle"
+                                    )
+                                msg = consumer.poll(0)
+                                if msg is not None and not msg.error():
+                                    stolen_msgs.append(msg)
+                except Exception:
+                    logger.warning("heartbeat error", exc_info=True)
                 stop_event.wait(1.0)
 
         heartbeat_thread = threading.Thread(
@@ -356,6 +364,7 @@ class KafkaReader(BaseReader):
                         if assignment:
                             consumer.resume(assignment)
                         is_paused[0] = False
+                        logger.debug("heartbeat: resumed partitions")
                     last_consume_time[0] = time.monotonic()
                     pending = list(stolen_msgs)
                     stolen_msgs.clear()
@@ -437,10 +446,16 @@ class KafkaReader(BaseReader):
         finally:
             stop_event.set()
             heartbeat_thread.join(timeout=5.0)
-            try:
-                consumer.close()
-            except Exception as e:
-                logger.warning(f"consumer.close() failed: {e}")
+            if heartbeat_thread.is_alive():
+                logger.warning(
+                    "Heartbeat thread did not exit within timeout; "
+                    "skipping consumer.close() to avoid race."
+                )
+            else:
+                try:
+                    consumer.close()
+                except Exception as e:
+                    logger.warning(f"consumer.close() failed: {e}")
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1
