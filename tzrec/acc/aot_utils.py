@@ -20,7 +20,7 @@ from torch import nn
 from tzrec.acc.utils import is_unified_aot_predict
 from tzrec.models.model import (
     CombinedModelWrapper,
-    DenseAutocastWrapper,
+    CudaAutocastWrapper,
     UnifiedAOTIModelWrapper,
 )
 from tzrec.utils.fx_util import symbolic_trace
@@ -93,7 +93,7 @@ def export_model_aot(
         meta_info (Dict[str, Any]): split meta info
         save_dir (str): model save dir
         mixed_precision (Optional[str]): "BF16", "FP16", or None. When set,
-            the dense sub-graph is wrapped in a DenseAutocastWrapper so that
+            the dense sub-graph is wrapped in a CudaAutocastWrapper so that
             torch.export captures the autocast region as a wrap_with_autocast
             Higher Order Op. The sparse sub-graph is left untouched because
             it is only embedding lookups, which don't benefit from AMP and
@@ -130,7 +130,7 @@ def export_model_aot(
     # as a `wrap_with_autocast` HOP that AOT Inductor lowers correctly.
     dense_to_export: nn.Module = dense_model
     if mixed_precision:
-        dense_to_export = DenseAutocastWrapper(dense_model, mixed_precision)
+        dense_to_export = CudaAutocastWrapper(dense_model, mixed_precision)
 
     # Dry-run the wrapped module to capture output field names. Must run
     # through dense_to_export (not dense_model) so the autocast context is
@@ -306,24 +306,6 @@ def _build_dynamic_shapes(
     return dynamic_shapes
 
 
-class _DataOnlyWrapper(nn.Module):
-    """Adapter that fixes the device argument of the wrapped model.
-
-    `ScriptWrapper.forward(data, device)` takes a `device` argument that
-    `torch.export.export` cannot accept (torch.device is not a supported
-    pytree leaf). We bind device to a constant here so the traced graph
-    has only `data` as input.
-    """
-
-    def __init__(self, model: nn.Module, device: str) -> None:
-        super().__init__()
-        self.model = model
-        self._device = device
-
-    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return self.model(data, self._device)
-
-
 def export_unified_model_aot(
     model: nn.Module,
     data: Dict[str, torch.Tensor],
@@ -346,11 +328,9 @@ def export_unified_model_aot(
     model.set_is_inference(True)
     model.eval()
 
-    # Wrap the model so the trace sees only `data` as input — `device` is
-    # bound as a constant attribute of the wrapper and inlined by the tracer.
-    trace_root: nn.Module = _DataOnlyWrapper(model, str(device))
-    if mixed_precision:
-        trace_root = DenseAutocastWrapper(trace_root, mixed_precision)
+    # Bind device and optional autocast into a single wrapper so the
+    # traced graph sees only `data` as input.
+    trace_root = CudaAutocastWrapper(model, mixed_precision, device=str(device))
 
     # Trace the full model. The torchrec-aware symbolic_trace decomposes
     # quantized EBC ops (e.g. fbgemm.bounds_check_indices) into primitives,

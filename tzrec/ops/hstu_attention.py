@@ -78,7 +78,7 @@ def hstu_mha(
         # we call it directly without going through the contiguous/assertion
         # preprocessing block below (which has control flow that would
         # break FX symbolic tracing). The CUTLASS kernel requires fp16/bf16
-        # inputs; we rely on the DenseAutocastWrapper applied in
+        # inputs; we rely on the CudaAutocastWrapper applied in
         # tzrec/acc/aot_utils.py and trt_utils.py (driven by
         # export_config.mixed_precision / train_config.mixed_precision) to
         # ensure q/k/v are bf16/fp16 when reaching this dispatch.
