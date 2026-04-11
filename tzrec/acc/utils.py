@@ -95,7 +95,7 @@ def is_unified_aot_predict(model_path: str) -> bool:
             data = json.load(file)
         unified_aot = data.get("UNIFIED_AOT")
         if unified_aot is not None:
-            return str(unified_aot).startswith("1")
+            return bool(unified_aot) and unified_aot[0] == "1"
     sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
     return not os.path.exists(sparse_model_path)
 
