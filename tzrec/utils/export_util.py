@@ -226,8 +226,8 @@ def export_model_normal(
 
         # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
         # for nbit quantization uses int32 pointer arithmetic which
-        # overflows for large embedding tables (>67M rows at dim=32).
-        # The CPU kernel uses int64 and is safe for any table size.
+        # overflows for large embedding tables. The CPU kernel uses
+        # int64 and is safe for any table size.
         if acc_utils.is_quant() or acc_utils.is_ec_quant():
             logger.info("quantize embeddings...")
             additional_qconfig_spec_keys = []
