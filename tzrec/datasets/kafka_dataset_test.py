@@ -487,6 +487,7 @@ class KafkaDatasetTest(unittest.TestCase):
                 f"kafka://{self.brokers}/{self.test_topic}"
                 f"?group.id=tzrec_test_group"
                 f"&auto.offset.reset=earliest"
+                f"&session.timeout.ms=6000"
                 f"&max.poll.interval.ms=10000"
             ),
         )
