@@ -340,10 +340,7 @@ def export_unified_model_aot(
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
-    # Verify the unified model produces correct output. Pass CPU data —
-    # the graph (via ScriptWrapper.get_batch → Batch.to(device)) handles
-    # the CPU→CUDA transfer at the efficient batch level, avoiding
-    # per-tensor H2D copies on the caller side.
+    # Verify the unified model produces correct output.
     result = full_gm(data)
     result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
     logger.info(f"Unified Model Outputs: {result_info}")
@@ -358,30 +355,15 @@ def export_unified_model_aot(
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
-    # Export with torch.export (CPU inputs; graph handles its own H2D).
-    # Jagged sequence models compute total nnz via aten.item(), creating
-    # unbacked symbols. propagate_real_tensors resolves guards on these
-    # by evaluating against concrete values. The fbgemm permute_2D_sparse_data
-    # op has a wrong schema annotation (says no-mutate but actually mutates
-    # weights), so we suppress the mutation check during export.
-    # Jagged sequence models create unbacked symbols from aten.item()
-    # (e.g. total nnz). capture_scalar_outputs=False prevents item() from
-    # producing symbols that torch.export can't guard on.
     logger.info("exporting unified model with torch.export...")
-    _prev_capture = torch._dynamo.config.capture_scalar_outputs
-    torch._dynamo.config.capture_scalar_outputs = False
-    try:
-        with torch._inductor.config.patch(
-            {"unsafe_ignore_unsupported_triton_autotune_args": True}
-        ):
-            exported_pg = torch.export.export(
-                full_gm,
-                args=(data,),
-                dynamic_shapes=(dynamic_shapes,),
-                strict=False,
-            )
-    finally:
-        torch._dynamo.config.capture_scalar_outputs = _prev_capture
+    with torch._inductor.config.patch(
+        {"unsafe_ignore_unsupported_triton_autotune_args": True}
+    ):
+        exported_pg = torch.export.export(
+            full_gm,
+            args=(data,),
+            dynamic_shapes=(dynamic_shapes,),
+        )
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")

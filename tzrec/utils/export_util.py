@@ -268,9 +268,28 @@ def export_model_normal(
                 export_model_trt(
                     sparse, dense, data, save_dir, mixed_precision=mixed_precision
                 )
-            elif acc_utils.is_unified_aot():
+            elif acc_utils.is_unified_aot() and not (
+                acc_utils.is_quant() or acc_utils.is_ec_quant()
+            ):
                 export_unified_model_aot(
                     model, data, save_dir, mixed_precision=mixed_precision
+                )
+            elif acc_utils.is_unified_aot():
+                # Quantized embeddings create data-dependent shapes
+                # (unbacked SymInts from fbgemm ops) that torch.export
+                # cannot handle. Fall back to two-stage export.
+                logger.warning(
+                    "UNIFIED_AOT with quantized embeddings is not supported. "
+                    "Falling back to two-stage export."
+                )
+                sparse, dense, meta_info = split_model(data, model, save_dir)
+                export_model_aot(
+                    sparse,
+                    dense,
+                    data,
+                    meta_info,
+                    save_dir,
+                    mixed_precision=mixed_precision,
                 )
             else:
                 sparse, dense, meta_info = split_model(data, model, save_dir)
