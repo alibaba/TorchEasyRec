@@ -346,10 +346,7 @@ def triton_layer_norm_mul_dropout_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if seed is None:
-        if training:
-            seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
-        else:
-            seed = 0
+        seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     # pyre-ignore[28]
     wrap_triton(_ln_mul_dropout_fwd)[(N,)](
@@ -826,10 +823,7 @@ def triton_group_norm_mul_dropout_fwd(
         )
 
     if seed is None:
-        if training:
-            seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
-        else:
-            seed = 0
+        seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D * BLOCK_H // 256, 1), 8)
     # pyre-ignore[28]
     wrap_triton(_group_norm_mul_dropout_fwd)[(N,)](
