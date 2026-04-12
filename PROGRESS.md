@@ -3,19 +3,18 @@
 ## Completed
 
 - [x] CUTLASS backend: plumb `func` tensor + SLA mask + FP8 dtype relaxation
-  - `cutlass_hstu_attention.py`: added `func` to schemas, impls, autograd, and public wrapper
-  - `build_sla_func_tensor()`: constructs NFUNC=3 int32 tensor for SLA mask intervals
 - [x] PyTorch SLA reference: `pytorch_sla_hstu_mha` in `pt_hstu_attention.py`
-- [x] Proto changes: `sla_k1`, `sla_k2`, `selective_rematerialization` in STU; `attn_truncation_*` in HSTU
-- [x] Attention truncation: `truncate_jagged_tail()` helper + `STUStack` split-layer logic
-- [x] Selective activation rematerialization: `_forward_with_selective_remat` in STULayer
-- [x] Thread `sla_k1`/`sla_k2` from STULayer → hstu_compute → hstu_mha → CUTLASS
-
-## In Progress
-
-- [ ] Tests + integration config
-- [ ] Action-Item Merging preprocessor
-- [ ] Mixture of Transducers
+- [x] Proto changes: `sla_k1`, `sla_k2`, `selective_rematerialization` in STU;
+  `attn_truncation_*` in HSTU; `action_item_merge_preprocessor` oneof
+- [x] Attention truncation: `truncate_jagged_tail()` + `STUStack` split-layer
+- [x] Selective activation rematerialization in STULayer
+- [x] Thread `sla_k1`/`sla_k2` through STULayer -> hstu_compute -> hstu_mha
+- [x] Action-Item Merging: reuses existing `contextual_preprocessor` path
+  (content + action sum when `enable_interleaving=False`); added named
+  alias `action_item_merge_preprocessor` in factory + proto
+- [x] Mixture of Transducers: `MoTHSTUTransducer` in `mot_hstu.py` with
+  sum / concat_mlp fusion over parallel HSTUTransducer channels
+- [x] Tests: SLA parity (CUTLASS vs PyTorch ref), integration config
 
 ## Deferred
 
