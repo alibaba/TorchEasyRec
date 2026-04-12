@@ -262,12 +262,6 @@ def _build_dynamic_shapes(
         if key.endswith(".lengths"):
             lengths_prefixes.add(key[: -len(".lengths")])
 
-    if not lengths_prefixes:
-        raise ValueError(
-            "Cannot infer batch size: no '.lengths' tensor found in input data. "
-            "Unified AOTI export requires at least one sparse/sequence feature."
-        )
-
     # Step 4: Build dynamic shapes
     batch = torch.export.Dim("batch", min=1, max=499999999)
     dynamic_shapes = {}
