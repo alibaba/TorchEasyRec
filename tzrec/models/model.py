@@ -385,8 +385,8 @@ class CudaAutocastWrapper(nn.Module):
     like ``ScriptWrapper`` whose forward takes ``(data, device)``.
 
     ``_mixed_dtype_id: Final[int]`` encodes the dtype so that
-    ``torch.jit.script`` sees each ``torch.autocast(dtype=...)`` as a
-    compile-time literal.
+    ``torch.export`` resolves each if/elif branch statically during
+    tracing.
 
     Args:
         inner (nn.Module): inner module to wrap.
@@ -481,6 +481,7 @@ class UnifiedAOTIModelWrapper(nn.Module):
         # the AOTI model-pool mutex, deadlocking with the first thread.
         # object.__setattr__ bypasses nn.Module's strict registration.
         object.__setattr__(self, "_lock", threading.Lock())
+        object.__setattr__(self, "_key_order", None)
 
     def forward(
         self,
@@ -497,7 +498,9 @@ class UnifiedAOTIModelWrapper(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        data = OrderedDict(sorted(data.items()))
+        if self._key_order is None:
+            object.__setattr__(self, "_key_order", sorted(data.keys()))
+        data = OrderedDict((k, data[k]) for k in self._key_order)
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
         with self._lock:

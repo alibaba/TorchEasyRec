@@ -1041,6 +1041,10 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
             )
         )
+        # model_acc.json must explicitly record UNIFIED_AOT=1.
+        with open(os.path.join(self.test_dir, "export/model_acc.json")) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg.get("UNIFIED_AOT"), "1")
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_cutlass_train_eval_export(self):

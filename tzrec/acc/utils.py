@@ -18,6 +18,7 @@ import torch
 
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.utils.logging_util import logger
 
 
 def is_input_tile() -> bool:
@@ -95,9 +96,15 @@ def is_unified_aot_predict(model_path: str) -> bool:
             data = json.load(file)
         unified_aot = data.get("UNIFIED_AOT")
         if unified_aot is not None:
-            return bool(unified_aot) and unified_aot[0] == "1"
+            return str(unified_aot)[:1] == "1"
     sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
-    return not os.path.exists(sparse_model_path)
+    if not os.path.exists(sparse_model_path):
+        logger.warning(
+            "model_acc.json missing UNIFIED_AOT; falling back to file-presence "
+            "heuristic (no scripted_sparse_model.pt → unified)"
+        )
+        return True
+    return False
 
 
 def is_aot_predict(model_path: str) -> bool:

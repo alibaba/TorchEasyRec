@@ -401,22 +401,13 @@ def export_unified_model_aot(
     # traced graph sees only `data` as input.
     trace_root = CudaAutocastWrapper(model, mixed_precision, device=str(device))
 
-    # Trace the full model. The torchrec-aware symbolic_trace decomposes
-    # quantized EBC ops (e.g. fbgemm.bounds_check_indices) into primitives,
-    # which is required for torch.export.export() to functionalize them.
     logger.info("tracing full model for unified AOTI export...")
     full_gm = symbolic_trace(trace_root)
 
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
-    # Verify the unified model produces correct output. Pass CPU data —
-    # the graph (via ScriptWrapper.get_batch → Batch.to(device)) handles
-    # the CPU→CUDA transfer at the efficient batch level, avoiding
-    # per-tensor H2D copies on the caller side.
     result = full_gm(data)
-    result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-    logger.info(f"Unified Model Outputs: {result_info}")
     aoti_output_keys = list(result.keys())
     del result
 
