@@ -26,6 +26,41 @@ from tzrec.models.model import (
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
+
+class _FusedBatchNormInference(nn.Module):
+    """BatchNorm fused into a simple affine: y = x * scale + shift.
+
+    In eval mode, BatchNorm1d is mathematically:
+        y = (x - running_mean) / sqrt(running_var + eps) * weight + bias
+
+    This pre-computes scale and shift so the forward is just mul + add,
+    avoiding F.batch_norm which has data-dependent guards incompatible
+    with torch.export on unbacked SymInts.
+    """
+
+    def __init__(self, bn: nn.BatchNorm1d) -> None:
+        super().__init__()
+        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+        shift = bn.bias - bn.running_mean * scale
+        self.register_buffer("scale", scale)
+        self.register_buffer("shift", shift)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale + self.shift
+
+
+def _fuse_batchnorm_for_export(module: nn.Module) -> None:
+    """Replace all BatchNorm1d submodules with fused affine for export.
+
+    Must be called after model.eval() and checkpoint restore.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm1d):
+            setattr(module, name, _FusedBatchNormInference(child))
+        else:
+            _fuse_batchnorm_for_export(child)
+
+
 # Eagerly register custom ops referenced by AOT-packaged models so that
 # torch._inductor.aoti_load_package() can resolve them by name. AOT packages
 # reference ops via their qualified name (e.g. ``tzrec::cutlass_hstu_mha_fwd``)
@@ -210,23 +245,39 @@ def _build_dynamic_shapes(
     # authoritative data structure (shared sequence), not model organization.
     feat_to_seq_dim_group: Dict[str, str] = {}
     seq_feat_names: set = set()
+    feat_by_name: Dict[str, Any] = {}
     for feat in features:
+        feat_by_name[feat.name] = feat
         if feat.is_sequence:
             seq_feat_names.add(feat.name)
             if getattr(feat, "_is_grouped_seq", False):
                 seq_name = getattr(feat, "sequence_name", None)
                 if seq_name:
-                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
+                    vdim = getattr(feat, "value_dim", 1)
+                    if vdim == 1:
+                        # Single-valued features share nnz within a sequence.
+                        feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
+                    else:
+                        # Multi-valued (value_dim=0 variable, or >1 fixed multi)
+                        # have their own nnz, so they must NOT share a Dim.
+                        pass
+
+    def _is_single_valued(name: str) -> bool:
+        feat = feat_by_name.get(name)
+        if feat is None:
+            return True
+        return getattr(feat, "value_dim", 1) == 1
 
     # Step 2: For standalone sequence features not yet grouped, fall back to
     # model_config.feature_groups structure.
     for fg in model_config.feature_groups:
         if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
-            # In JAGGED_SEQUENCE groups, all sequence features share a single
-            # jagged structure → same nnz → share Dim.
+            # In JAGGED_SEQUENCE groups, single-valued features share nnz.
+            # Multi-valued features have independent nnz and are NOT grouped.
             for name in fg.feature_names:
                 if name in seq_feat_names and name not in feat_to_seq_dim_group:
-                    feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
+                    if _is_single_valued(name):
+                        feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
         # SEQUENCE (DIN-style) groups: standalone sequence features have
         # independent lengths, so don't auto-share. Only grouped sequence
         # features (from SequenceFeature config via sequence_groups) share nnz.
@@ -235,7 +286,10 @@ def _build_dynamic_shapes(
                 # Only sequence features in seq_groups share nnz — non-sequence
                 # features mixed into seq_groups are candidates, not sequences.
                 if name in seq_feat_names and name not in feat_to_seq_dim_group:
-                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
+                    if _is_single_valued(name):
+                        feat_to_seq_dim_group[name] = (
+                            f"sg_{fg.group_name}_{sg.group_name}"
+                        )
 
     # Step 3: Collect prefixes with .lengths siblings (sparse/sequence features)
     lengths_prefixes = set()
@@ -327,6 +381,12 @@ def export_unified_model_aot(
 
     model.set_is_inference(True)
     model.eval()
+
+    # Fuse BatchNorm1d into simple affine (mul + add) for export.
+    # In eval mode BN is mathematically y = x*scale + shift. The fused
+    # version avoids F.batch_norm which has data-dependent guards
+    # (input.numel() == 0) incompatible with torch.export on unbacked SymInts.
+    _fuse_batchnorm_for_export(model)
 
     # Bind device and optional autocast into a single wrapper so the
     # traced graph sees only `data` as input.
