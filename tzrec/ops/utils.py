@@ -70,9 +70,8 @@ def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
         if STATIC_MAX_SEQ_LENS == []:
             return 1
         for max_len in STATIC_MAX_SEQ_LENS:
-            if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-                torch._check(max_len >= runtime_max_seq_len)
             if max_len >= runtime_max_seq_len:
+                if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+                    torch._check(max_len >= runtime_max_seq_len)
                 return max_len
-        max_len = STATIC_MAX_SEQ_LENS[-1]
-        return max_len
+        return STATIC_MAX_SEQ_LENS[-1]

@@ -1,39 +1,39 @@
-# Unified AOTI Export - DLC Job Fix Progress
+# Unified AOTI Export — Status
 
-## Error Chain
+## What Works
 
-1. **Original (dlc13efuoayb0nz2)**: `GuardOnDataDependentSymNode: Eq(u50, 0)` in
-   `triton_swish_layer_norm_fwd` → `if N == 0:` inside triton_op
-1. **After fix 1 (triton_op guards)**: Same error at `_triton_weighted_layer_norm_fwd` line 340
-   — helper function called FROM triton_op
-1. **After fix 2 (ALL guards)**: `GuardOnDataDependentSymNode: Eq(512*u444, 0)` in MLP perceptron
-   — unbacked symbol from `aten.item()` (jagged sequence nnz)
-1. **After fix 3 (deferred asserts)**: Same — `prefer_deferred_runtime_asserts` doesn't help for
-   unbacked symbols
-1. **After fix 4 (propagate_real_tensors)**: `fbgemm::permute_2D_sparse_data` schema mutation error
-   — `propagate_real_tensors` mode detects fbgemm schema bug
+- Non-quantized models: unified AOTI export works ✓
+- Quantized models with two-stage fallback: works ✓
 
-## Fixes Applied
+## What Doesn't Work Yet
 
-- `84edc62`: Guard ALL `if N == 0` checks with `not torch.compiler.is_compiling()`
-- `59fadce`: `strict=False, prefer_deferred_runtime_asserts_over_guards=True` (didn't help)
-- `f6317b2`: `TORCH_DYNAMO_DO_NOT_EMIT_RUNTIME_ASSERTS=1` (didn't help)
-- `ea7c03e`: `fake_tensor_propagate_real_tensors=True` (got past GuardOnDataDependentSymNode
-  but hit fbgemm schema issue)
+- Quantized models (QUANT_EC_EMB) with unified AOTI export
 
-## Current Approach
+## Root Cause (QUANT_EC_EMB limitation)
 
-Reproducing locally with QUANT_EC_EMB=INT8 to debug interactively.
+Quantized EBC uses torchrec's KJT processing which calls `.item()`
+on tensor VALUES to extract lengths/strides as Python scalars. During
+`torch.export`, `.item()` creates unbacked SymInts because the values
+are data-dependent (sequence lengths vary per batch). These unbacked
+SymInts flow through the model and hit guards in nn.BatchNorm1d
+(`Eq(512*u444, 0)`) that torch.export can't resolve.
 
-## DLC Jobs
+This is a fundamental limitation of `torch.export` with jagged/variable-
+length sequence models that use `.item()` for shape computations. The
+two-stage export avoids it because the sparse model (JIT) handles all
+KJT processing with concrete values.
 
-| Job ID           | Wheel   | Result                                                          |
-| ---------------- | ------- | --------------------------------------------------------------- |
-| dlc13efuoayb0nz2 | 00ec8d1 | GuardOnDataDependentSymNode in triton_swish_layer_norm_fwd      |
-| dlc1r9s64q7i515c | 2161b27 | Missing ODPS config (no CredentialConfig)                       |
-| dlc1s3scui3g8ndd | 2161b27 | Missing ODPS config                                             |
-| dlc1n412iyq3eho9 | 2161b27 | GuardOnDataDependentSymNode in \_triton_weighted_layer_norm_fwd |
-| dlcxvag3uksal7ft | 84edc62 | GuardOnDataDependentSymNode: Eq(512\*u444, 0)                   |
-| dlc12v8r9ma2dzhp | 59fadce | Same (deferred asserts didn't help)                             |
-| dlcvnoxl6al1vzjl | f6317b2 | Same (env var didn't help)                                      |
-| dlcxvrax6jlaqbwt | ea7c03e | fbgemm permute_2D_sparse_data schema mutation                   |
+## Patches Applied
+
+1. Triton op zero-check guards (`not torch.compiler.is_compiling()`)
+1. Triton dropout deterministic seeds during export
+1. fbgemm schema mutation suppression (MutationChecker)
+1. autotune_max_seq_len torch.\_check moved inside branch
+1. CudaAutocastWrapper for mixed precision
+1. export_patches context manager for future fbgemm fixes
+
+## Upstream Issues Blocking QUANT_EC_EMB + Unified
+
+1. torchrec KJT `.item()` creates unbacked SymInts
+1. fbgemm permute_2D_sparse_data wrong schema annotation
+1. fbgemm bounds_check_indices wrong schema annotation

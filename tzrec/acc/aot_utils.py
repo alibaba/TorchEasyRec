@@ -175,6 +175,81 @@ def export_model_aot(
     return save_dir
 
 
+_fbgemm_patched = False
+
+
+def _patch_fbgemm_fake_impls() -> None:
+    """Patch fbgemm fake/meta implementations that create unbacked SymInts.
+
+    ``keyed_jagged_index_select_dim1``'s abstract function calls
+    ``.sum().item()`` to compute ``selected_lengths_sum``. During
+    ``torch.export``, ``.item()`` on a FakeTensor scalar creates an
+    unbacked SymInt that downstream ops can't guard on.
+
+    The fix: drop ``.item()`` so the value stays as a 0-dim tensor
+    (backed SymInt) that ``torch.export`` can trace symbolically.
+    """
+    global _fbgemm_patched
+    if _fbgemm_patched:
+        return
+    _fbgemm_patched = True
+
+    try:
+        from fbgemm_gpu.sparse_ops import (
+            keyed_jagged_index_select_dim1_abstract,
+        )
+    except ImportError:
+        logger.debug("fbgemm_gpu.sparse_ops not available; skipping patch")
+        return
+
+    import inspect
+
+    src = inspect.getsource(keyed_jagged_index_select_dim1_abstract)
+    if ".sum().item()" not in src:
+        logger.debug("fbgemm fake impl already patched or changed; skipping")
+        return
+
+    # Monkey-patch: replace .sum().item() with .sum() in the function
+
+    _orig_fn = keyed_jagged_index_select_dim1_abstract
+
+    def _patched_keyed_jagged_index_select_dim1_abstract(
+        values,
+        lengths,
+        offsets,
+        indices,
+        batch_size,
+        weights=None,
+        selected_lengths_sum=None,
+    ):
+        num_batches = len(lengths) // batch_size
+        torch._check(len(lengths) + 1 == len(offsets))
+        torch._check(len(lengths) % batch_size == 0)
+        if weights is not None:
+            torch._check(values.shape == weights.shape)
+
+        if selected_lengths_sum is None:
+            length_indices = torch.cat(
+                [indices + i * batch_size for i in range(num_batches)]
+            )
+            # Use .sum() without .item() to keep value as backed SymInt
+            selected_lengths_sum = torch.index_select(lengths, 0, length_indices).sum()
+
+        ret = [
+            values.new_empty([selected_lengths_sum]),
+            lengths.new_empty([indices.shape[0] * num_batches]),
+        ]
+        if weights is not None:
+            ret.append(weights.new_empty([selected_lengths_sum]))
+        return ret
+
+    # Can't re-register Meta (torch.library.impl rejects double-reg).
+    # Instead, replace the function's __code__ so the registered wrapper
+    # calls our patched body.
+    _orig_fn.__code__ = _patched_keyed_jagged_index_select_dim1_abstract.__code__
+    logger.info("patched fbgemm keyed_jagged_index_select_dim1 fake impl")
+
+
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
@@ -355,41 +430,45 @@ def export_unified_model_aot(
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
+    from tzrec.acc.torchrec_export_patches import export_patches
+
     logger.info("exporting unified model with torch.export...")
-    with torch._inductor.config.patch(
-        {"unsafe_ignore_unsupported_triton_autotune_args": True}
-    ):
-        exported_pg = torch.export.export(
-            full_gm,
-            args=(data,),
-            dynamic_shapes=(dynamic_shapes,),
-        )
-
-    # Compile with AOTI
-    logger.info("compiling unified model with AOTI...")
-    with torch._inductor.config.patch(
-        {
-            "scalar_asserts": False,
-            "unsafe_ignore_unsupported_triton_autotune_args": True,
-        }
-    ):
-        aoti_dir = os.path.join(save_dir, "aoti")
-        os.makedirs(aoti_dir, exist_ok=True)
-
-        # Save original model output field names (matches legacy
-        # export_model_aot behavior).
-        if aoti_output_keys:
-            output_names_path = os.path.join(aoti_dir, "output_field_names.json")
-            with open(output_names_path, "w") as f:
-                json.dump(aoti_output_keys, f, indent=4)
-            logger.info(
-                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
+    with export_patches():
+        with torch._inductor.config.patch(
+            {"unsafe_ignore_unsupported_triton_autotune_args": True}
+        ):
+            exported_pg = torch.export.export(
+                full_gm,
+                args=(data,),
+                dynamic_shapes=(dynamic_shapes,),
+                strict=False,
             )
 
-        torch._inductor.aoti_compile_and_package(
-            exported_pg,
-            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
-        )
+        # Compile with AOTI (inside export_patches for fbgemm schema)
+        logger.info("compiling unified model with AOTI...")
+        with torch._inductor.config.patch(
+            {
+                "scalar_asserts": False,
+                "unsafe_ignore_unsupported_triton_autotune_args": True,
+            }
+        ):
+            aoti_dir = os.path.join(save_dir, "aoti")
+            os.makedirs(aoti_dir, exist_ok=True)
+
+            if aoti_output_keys:
+                output_names_path = os.path.join(aoti_dir, "output_field_names.json")
+                with open(output_names_path, "w") as f:
+                    json.dump(aoti_output_keys, f, indent=4)
+                logger.info(
+                    "Saved output field names to %s: %s",
+                    output_names_path,
+                    aoti_output_keys,
+                )
+
+            torch._inductor.aoti_compile_and_package(
+                exported_pg,
+                package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
+            )
 
     logger.info("unified AOTI model exported to %s", save_dir)
     return save_dir

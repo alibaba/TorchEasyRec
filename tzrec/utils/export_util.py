@@ -276,11 +276,12 @@ def export_model_normal(
                 )
             elif acc_utils.is_unified_aot():
                 # Quantized embeddings create data-dependent shapes
-                # (unbacked SymInts from fbgemm ops) that torch.export
-                # cannot handle. Fall back to two-stage export.
+                # (unbacked SymInts from torchrec KJT .item() calls)
+                # that torch.export cannot handle. Fall back to
+                # two-stage export.
                 logger.warning(
-                    "UNIFIED_AOT with quantized embeddings is not supported. "
-                    "Falling back to two-stage export."
+                    "UNIFIED_AOT with quantized embeddings uses "
+                    "two-stage export (torch.export limitation)."
                 )
                 sparse, dense, meta_info = split_model(data, model, save_dir)
                 export_model_aot(
