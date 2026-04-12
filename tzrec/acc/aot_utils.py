@@ -26,49 +26,6 @@ from tzrec.models.model import (
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
-
-def _add_unbacked_size_constraints(gm: torch.fx.GraphModule) -> None:
-    """Insert sym_constrain_range(x, min=1) for unbacked SymInts from sum().item().
-
-    During torch.export, lengths.sum().item() produces unbacked SymInts
-    with only the default >= 0 constraint. Downstream ops like F.batch_norm
-    guard on input.numel() != 0 which requires >= 1. The sum of sequence
-    lengths (total nnz) is always >= 1 for a non-empty batch, so the
-    constraint is sound.
-    """
-    graph = gm.graph
-    modified = False
-
-    def _is_item_node(node: torch.fx.Node) -> bool:
-        if node.op != "call_function":
-            return False
-        name = getattr(node.target, "__name__", str(node.target))
-        return "item" in name and "getitem" not in name
-
-    def _is_sum(node: torch.fx.Node) -> bool:
-        if node.op == "call_function":
-            name = getattr(node.target, "__name__", str(node.target))
-            return "sum" in name
-        if node.op == "call_method":
-            return node.target == "sum"
-        return False
-
-    targets = []
-    for node in graph.nodes:
-        if _is_item_node(node) and len(node.args) >= 1:
-            src = node.args[0]
-            if _is_sum(src):
-                targets.append(node)
-    for node in targets:
-        with graph.inserting_after(node):
-            graph.call_function(torch.sym_constrain_range, (node,), {"min": 1})
-        modified = True
-    logger.info("added >= 1 constraints to %d sum().item() nodes", len(targets))
-    if modified:
-        graph.lint()
-        gm.recompile()
-
-
 # Eagerly register custom ops referenced by AOT-packaged models so that
 # torch._inductor.aoti_load_package() can resolve them by name. AOT packages
 # reference ops via their qualified name (e.g. ``tzrec::cutlass_hstu_mha_fwd``)
@@ -399,12 +356,6 @@ def export_unified_model_aot(
     # which is required for torch.export.export() to functionalize them.
     logger.info("tracing full model for unified AOTI export...")
     full_gm = symbolic_trace(trace_root)
-
-    # Add >= 1 constraints for unbacked SymInts from sum/max .item() calls.
-    # These represent total nnz / max seq length from lengths tensors and are
-    # always >= 1 for non-empty batches. Without this, downstream ops like
-    # F.batch_norm guard on numel() != 0, which is unresolvable with >= 0.
-    _add_unbacked_size_constraints(full_gm)
 
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
