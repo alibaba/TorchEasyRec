@@ -170,3 +170,57 @@ def jagged_dense_bmm_broadcast_add(
             dense=dense,
             bias=bias,
         )
+
+
+@torch.fx.wrap
+def truncate_jagged_tail(
+    values: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    tail_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
+    """Truncate each jagged sequence to its last ``tail_len`` tokens.
+
+    For attention-truncation in ULTRA-HSTU: after N1 layers on full sequence L,
+    keep only the last L' = tail_len tokens per user for the remaining N2 layers.
+
+    Args:
+        values: jagged values tensor of shape (total, D).
+        seq_offsets: cumulative offsets of shape (B+1,).
+        seq_lengths: per-sequence lengths of shape (B,).
+        num_targets: per-sequence target counts of shape (B,) or None.
+        tail_len: number of trailing tokens to keep per sequence.
+
+    Returns:
+        truncated_values: jagged values of shape (total_trunc, D).
+        new_offsets: cumulative offsets of shape (B+1,).
+        new_lengths: per-sequence lengths of shape (B,).
+        new_num_targets: clamped target counts (B,) or None.
+        new_max_seq_len: int, equals tail_len.
+    """
+    B = seq_lengths.size(0)
+    new_lengths = torch.clamp(seq_lengths, max=tail_len)
+    # Start position of the tail segment within each original sequence.
+    starts = seq_offsets[:-1] + (seq_lengths - new_lengths)
+    # Build index tensor to gather the tail tokens.
+    arange = torch.arange(tail_len, device=values.device)
+    # (B, tail_len): absolute indices into the jagged values tensor.
+    gather_idx = starts.unsqueeze(1) + arange.unsqueeze(0)  # (B, tail_len)
+    # Clamp to valid range for the gather; padded positions (beyond each
+    # sequence's actual length) will gather a valid but irrelevant row and
+    # are discarded by the dense_to_jagged repacking below.
+    gather_idx = torch.clamp(gather_idx, max=values.size(0) - 1)
+    gathered = values[gather_idx.view(-1)]  # (B * tail_len, D)
+    # Rebuild as jagged: pack only valid positions.
+    gathered = gathered.view(B, tail_len, -1)
+    # For simplicity, use dense_to_jagged to repack.
+    new_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
+    total_trunc = int(new_offsets[-1].item())
+    truncated_values = torch.ops.fbgemm.dense_to_jagged(
+        gathered, [new_offsets], total_trunc
+    )[0]
+    new_num_targets: Optional[torch.Tensor] = None
+    if num_targets is not None:
+        new_num_targets = torch.clamp(num_targets, max=new_lengths)
+    return truncated_values, new_offsets, new_lengths, new_num_targets, tail_len
