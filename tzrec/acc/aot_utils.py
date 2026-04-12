@@ -360,13 +360,16 @@ def export_unified_model_aot(
 
     # Export with torch.export (CPU inputs; graph handles its own H2D).
     # Jagged sequence models compute total nnz via aten.item(), creating
-    # unbacked symbols (u444 etc.). Guards like Eq(512*u444, 0) can't be
-    # resolved statically. fake_tensor_propagate_real_tensors propagates
-    # the concrete example values alongside symbolic shapes, allowing
-    # these guards to be evaluated and transmuted into runtime assertions.
+    # unbacked symbols. propagate_real_tensors resolves guards on these
+    # by evaluating against concrete values. The fbgemm permute_2D_sparse_data
+    # op has a wrong schema annotation (says no-mutate but actually mutates
+    # weights), so we suppress the mutation check during export.
+    # Jagged sequence models create unbacked symbols from aten.item()
+    # (e.g. total nnz). capture_scalar_outputs=False prevents item() from
+    # producing symbols that torch.export can't guard on.
     logger.info("exporting unified model with torch.export...")
-    _prev_propagate = torch._functorch.config.fake_tensor_propagate_real_tensors
-    torch._functorch.config.fake_tensor_propagate_real_tensors = True
+    _prev_capture = torch._dynamo.config.capture_scalar_outputs
+    torch._dynamo.config.capture_scalar_outputs = False
     try:
         with torch._inductor.config.patch(
             {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -378,7 +381,7 @@ def export_unified_model_aot(
                 strict=False,
             )
     finally:
-        torch._functorch.config.fake_tensor_propagate_real_tensors = _prev_propagate
+        torch._dynamo.config.capture_scalar_outputs = _prev_capture
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
