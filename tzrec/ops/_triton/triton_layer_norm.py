@@ -806,7 +806,7 @@ def triton_swish_layer_norm_fwd(
     BLOCK_D = triton.next_power_of_2(D)
     num_warps = min(max(BLOCK_D // 256, 1), 8)
 
-    if N == 0:
+    if not torch.compiler.is_compiling() and N == 0:
         return y, mean, rstd, BLOCK_D, num_warps
 
     # pyre-ignore[28]
@@ -863,7 +863,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
         _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
+        if not torch.compiler.is_compiling() and N == 0:
             dweight.zero_()
             dbias.zero_()
             return dx, dweight, dbias, None

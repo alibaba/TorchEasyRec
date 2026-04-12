@@ -1524,7 +1524,7 @@ def triton_hstu_attention_fwd(
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
     has_sort_by_length_indices = sort_by_length_indices is not None
-    if L == 0:
+    if not torch.compiler.is_compiling() and L == 0:
         return out
 
     desc_q = q

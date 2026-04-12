@@ -249,7 +249,7 @@ def triton_addmm_fwd(
 
     # Allocate output
     z = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    if M == 0 or N == 0:
+    if not torch.compiler.is_compiling() and (M == 0 or N == 0):
         return z
 
     grid = lambda meta: (  # noqa E731
