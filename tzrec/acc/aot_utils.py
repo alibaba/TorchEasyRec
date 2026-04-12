@@ -206,18 +206,20 @@ def _pad_empty_sparse_values(
             continue
         values = data[values_key]
         lengths = data[lengths_key]
-        if values.numel() == 0 and lengths.numel() > 0:
-            # Add a dummy value and assign it to the first sample.
-            data[values_key] = torch.zeros(1, dtype=values.dtype, device=values.device)
+        if values.numel() < 2 and lengths.numel() > 0:
+            # Pad to at least 2 elements — torch.export specializes on
+            # sizes 0 and 1 as special cases but treats >= 2 as dynamic.
+            pad_n = 2 - values.numel()
+            data[values_key] = torch.zeros(2, dtype=values.dtype, device=values.device)
             new_lengths = lengths.clone()
-            new_lengths[0] = 1
+            new_lengths[0] = new_lengths[0] + pad_n
             data[lengths_key] = new_lengths
             # Also pad .weights if present.
             weights_key = f"{prefix}.weights"
             if weights_key in data:
                 weights = data[weights_key]
                 data[weights_key] = torch.ones(
-                    1, dtype=weights.dtype, device=weights.device
+                    2, dtype=weights.dtype, device=weights.device
                 )
 
     return data
