@@ -359,6 +359,9 @@ def export_unified_model_aot(
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
     # Export with torch.export (CPU inputs; graph handles its own H2D).
+    # prefer_deferred_runtime_asserts_over_guards: jagged sequence models
+    # have data-dependent shapes (total nnz from aten.item) that create
+    # guards torch.export can't resolve statically; defer them to runtime.
     logger.info("exporting unified model with torch.export...")
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -367,6 +370,8 @@ def export_unified_model_aot(
             full_gm,
             args=(data,),
             dynamic_shapes=(dynamic_shapes,),
+            strict=False,
+            prefer_deferred_runtime_asserts_over_guards=True,
         )
 
     # Compile with AOTI
