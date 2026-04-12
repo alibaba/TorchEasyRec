@@ -360,14 +360,13 @@ def export_unified_model_aot(
 
     # Export with torch.export (CPU inputs; graph handles its own H2D).
     # Jagged sequence models compute total nnz via aten.item(), creating
-    # unbacked symbols. Guards like Eq(512*u444, 0) can't be resolved
-    # statically. We suppress these guards entirely: they're safe because
-    # the model never sees truly empty sequences in production.
+    # unbacked symbols (u444 etc.). Guards like Eq(512*u444, 0) can't be
+    # resolved statically. fake_tensor_propagate_real_tensors propagates
+    # the concrete example values alongside symbolic shapes, allowing
+    # these guards to be evaluated and transmuted into runtime assertions.
     logger.info("exporting unified model with torch.export...")
-    import os as _os
-
-    _prev = _os.environ.get("TORCH_DYNAMO_DO_NOT_EMIT_RUNTIME_ASSERTS")
-    _os.environ["TORCH_DYNAMO_DO_NOT_EMIT_RUNTIME_ASSERTS"] = "1"
+    _prev_propagate = torch._functorch.config.fake_tensor_propagate_real_tensors
+    torch._functorch.config.fake_tensor_propagate_real_tensors = True
     try:
         with torch._inductor.config.patch(
             {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -377,13 +376,9 @@ def export_unified_model_aot(
                 args=(data,),
                 dynamic_shapes=(dynamic_shapes,),
                 strict=False,
-                prefer_deferred_runtime_asserts_over_guards=True,
             )
     finally:
-        if _prev is None:
-            _os.environ.pop("TORCH_DYNAMO_DO_NOT_EMIT_RUNTIME_ASSERTS", None)
-        else:
-            _os.environ["TORCH_DYNAMO_DO_NOT_EMIT_RUNTIME_ASSERTS"] = _prev
+        torch._functorch.config.fake_tensor_propagate_real_tensors = _prev_propagate
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
