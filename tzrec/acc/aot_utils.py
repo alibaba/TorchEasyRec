@@ -28,45 +28,42 @@ from tzrec.utils.logging_util import logger
 
 
 def _add_unbacked_size_constraints(gm: torch.fx.GraphModule) -> None:
-    """Insert torch._check(x >= 1) for unbacked SymInts from .item() on sums/maxes.
+    """Insert sym_constrain_range(x, min=1) for unbacked SymInts from sum().item().
 
-    During torch.export, aten.sum().item() and aten.max().item() on lengths
-    tensors produce unbacked SymInts with only the default >= 0 constraint.
-    Downstream ops (e.g. F.batch_norm) guard on input.numel() != 0 which
-    requires >= 1.  These sums/maxes represent total nnz or max sequence
-    length — always >= 1 for a non-empty batch — so the constraint is sound.
+    During torch.export, lengths.sum().item() produces unbacked SymInts
+    with only the default >= 0 constraint. Downstream ops like F.batch_norm
+    guard on input.numel() != 0 which requires >= 1. The sum of sequence
+    lengths (total nnz) is always >= 1 for a non-empty batch, so the
+    constraint is sound.
     """
     graph = gm.graph
     modified = False
 
-    # Collect nodes to modify first, then insert in reverse order to
-    # maintain topological ordering (inserting after node X doesn't
-    # disturb nodes collected earlier in the list).
     def _is_item_node(node: torch.fx.Node) -> bool:
         if node.op != "call_function":
             return False
         name = getattr(node.target, "__name__", str(node.target))
         return "item" in name and "getitem" not in name
 
-    def _is_sum_or_max(node: torch.fx.Node) -> bool:
+    def _is_sum(node: torch.fx.Node) -> bool:
         if node.op == "call_function":
             name = getattr(node.target, "__name__", str(node.target))
-            return "sum" in name or "max" in name
+            return "sum" in name
         if node.op == "call_method":
-            return node.target in ("sum", "max")
+            return node.target == "sum"
         return False
 
     targets = []
     for node in graph.nodes:
         if _is_item_node(node) and len(node.args) >= 1:
             src = node.args[0]
-            if _is_sum_or_max(src):
+            if _is_sum(src):
                 targets.append(node)
     for node in targets:
         with graph.inserting_after(node):
             graph.call_function(torch.sym_constrain_range, (node,), {"min": 1})
         modified = True
-    logger.info("added >= 1 constraints to %d sum/max .item() nodes", len(targets))
+    logger.info("added >= 1 constraints to %d sum().item() nodes", len(targets))
     if modified:
         graph.lint()
         gm.recompile()
