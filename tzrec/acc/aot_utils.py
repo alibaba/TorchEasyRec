@@ -27,38 +27,49 @@ from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
 
-class _FusedBatchNormInference(nn.Module):
-    """BatchNorm fused into a simple affine: y = x * scale + shift.
+def _add_unbacked_size_constraints(gm: torch.fx.GraphModule) -> None:
+    """Insert torch._check(x >= 1) for unbacked SymInts from .item() on sums/maxes.
 
-    In eval mode, BatchNorm1d is mathematically:
-        y = (x - running_mean) / sqrt(running_var + eps) * weight + bias
-
-    This pre-computes scale and shift so the forward is just mul + add,
-    avoiding F.batch_norm which has data-dependent guards incompatible
-    with torch.export on unbacked SymInts.
+    During torch.export, aten.sum().item() and aten.max().item() on lengths
+    tensors produce unbacked SymInts with only the default >= 0 constraint.
+    Downstream ops (e.g. F.batch_norm) guard on input.numel() != 0 which
+    requires >= 1.  These sums/maxes represent total nnz or max sequence
+    length — always >= 1 for a non-empty batch — so the constraint is sound.
     """
+    graph = gm.graph
+    modified = False
 
-    def __init__(self, bn: nn.BatchNorm1d) -> None:
-        super().__init__()
-        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
-        shift = bn.bias - bn.running_mean * scale
-        self.register_buffer("scale", scale)
-        self.register_buffer("shift", shift)
+    # Collect nodes to modify first, then insert in reverse order to
+    # maintain topological ordering (inserting after node X doesn't
+    # disturb nodes collected earlier in the list).
+    def _is_item_node(node: torch.fx.Node) -> bool:
+        if node.op != "call_function":
+            return False
+        name = getattr(node.target, "__name__", str(node.target))
+        return "item" in name and "getitem" not in name
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.scale + self.shift
+    def _is_sum_or_max(node: torch.fx.Node) -> bool:
+        if node.op == "call_function":
+            name = getattr(node.target, "__name__", str(node.target))
+            return "sum" in name or "max" in name
+        if node.op == "call_method":
+            return node.target in ("sum", "max")
+        return False
 
-
-def _fuse_batchnorm_for_export(module: nn.Module) -> None:
-    """Replace all BatchNorm1d submodules with fused affine for export.
-
-    Must be called after model.eval() and checkpoint restore.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.BatchNorm1d):
-            setattr(module, name, _FusedBatchNormInference(child))
-        else:
-            _fuse_batchnorm_for_export(child)
+    targets = []
+    for node in graph.nodes:
+        if _is_item_node(node) and len(node.args) >= 1:
+            src = node.args[0]
+            if _is_sum_or_max(src):
+                targets.append(node)
+    for node in targets:
+        with graph.inserting_after(node):
+            graph.call_function(torch.sym_constrain_range, (node,), {"min": 1})
+        modified = True
+    logger.info("added >= 1 constraints to %d sum/max .item() nodes", len(targets))
+    if modified:
+        graph.lint()
+        gm.recompile()
 
 
 # Eagerly register custom ops referenced by AOT-packaged models so that
@@ -382,12 +393,6 @@ def export_unified_model_aot(
     model.set_is_inference(True)
     model.eval()
 
-    # Fuse BatchNorm1d into simple affine (mul + add) for export.
-    # In eval mode BN is mathematically y = x*scale + shift. The fused
-    # version avoids F.batch_norm which has data-dependent guards
-    # (input.numel() == 0) incompatible with torch.export on unbacked SymInts.
-    _fuse_batchnorm_for_export(model)
-
     # Bind device and optional autocast into a single wrapper so the
     # traced graph sees only `data` as input.
     trace_root = CudaAutocastWrapper(model, mixed_precision, device=str(device))
@@ -397,6 +402,13 @@ def export_unified_model_aot(
     # which is required for torch.export.export() to functionalize them.
     logger.info("tracing full model for unified AOTI export...")
     full_gm = symbolic_trace(trace_root)
+
+    # Add >= 1 constraints for unbacked SymInts from sum/max .item() calls.
+    # These represent total nnz / max seq length from lengths tensors and are
+    # always >= 1 for non-empty batches. Without this, downstream ops like
+    # F.batch_norm guard on numel() != 0, which is unresolvable with >= 0.
+    _add_unbacked_size_constraints(full_gm)
+
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
