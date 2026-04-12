@@ -12,7 +12,7 @@
 
 import json
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Set, Union
 
 import torch
 from torch import nn
@@ -175,6 +175,54 @@ def export_model_aot(
     return save_dir
 
 
+def _pad_empty_sparse_values(
+    data: Dict[str, torch.Tensor],
+    seq_feat_names: Set[str],
+) -> Dict[str, torch.Tensor]:
+    """Pad 0-size non-sequence sparse .values tensors to have at least 1 element.
+
+    When a non-sequence sparse feature has all-zero lengths in the example
+    batch, its .values tensor has size 0. torch.export traces the code with
+    this concrete size and specializes on 0, making the dimension incompatible
+    with a dynamic Dim spec. To avoid this, we inject a dummy value and set
+    one length entry to 1 so the total nnz becomes >= 1.
+
+    Only non-sequence sparse features are padded; sequence features are left
+    as-is.
+
+    This must be called AFTER model verification and BEFORE torch.export.
+    """
+    lengths_prefixes = set()
+    for key in data:
+        if key.endswith(".lengths"):
+            lengths_prefixes.add(key[: -len(".lengths")])
+
+    for prefix in lengths_prefixes:
+        if prefix in seq_feat_names:
+            continue
+        values_key = f"{prefix}.values"
+        lengths_key = f"{prefix}.lengths"
+        if values_key not in data or lengths_key not in data:
+            continue
+        values = data[values_key]
+        lengths = data[lengths_key]
+        if values.numel() == 0 and lengths.numel() > 0:
+            # Add a dummy value and assign it to the first sample.
+            data[values_key] = torch.zeros(1, dtype=values.dtype, device=values.device)
+            new_lengths = lengths.clone()
+            new_lengths[0] = 1
+            data[lengths_key] = new_lengths
+            # Also pad .weights if present.
+            weights_key = f"{prefix}.weights"
+            if weights_key in data:
+                weights = data[weights_key]
+                data[weights_key] = torch.ones(
+                    1, dtype=weights.dtype, device=weights.device
+                )
+
+    return data
+
+
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
@@ -296,16 +344,22 @@ def _build_dynamic_shapes(
                 dim = group_to_dim[group]
                 dynamic_shapes[key] = {0: dim}
                 prefix_to_dim[prefix] = dim
-            else:
-                # Multi-value non-sequence or ungrouped: own Dim
+            elif prefix in seq_feat_names:
+                # Ungrouped sequence feature: own Dim, min=1
                 dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
+                dim_counter += 1
+                dynamic_shapes[key] = {0: dim}
+                prefix_to_dim[prefix] = dim
+            else:
+                # Non-sequence sparse feature: own Dim, min=0
+                dim = torch.export.Dim(f"g_{dim_counter}", min=0, max=999999993)
                 dim_counter += 1
                 dynamic_shapes[key] = {0: dim}
                 prefix_to_dim[prefix] = dim
         elif is_sparse_weights:
             dim = prefix_to_dim.get(prefix)
             if dim is None:
-                dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
+                dim = torch.export.Dim(f"g_{dim_counter}", min=0, max=999999993)
                 dim_counter += 1
                 prefix_to_dim[prefix] = dim
             dynamic_shapes[key] = {0: dim}
@@ -363,6 +417,11 @@ def export_unified_model_aot(
     logger.info(f"Unified Model Outputs: {result_info}")
     aoti_output_keys = list(result.keys())
     del result
+
+    # Pad any 0-size non-sequence sparse .values tensors so torch.export
+    # doesn't specialize on the empty size (which conflicts with dynamic Dims).
+    seq_feat_names = {f.name for f in model._features if f.is_sequence}
+    data = _pad_empty_sparse_values(data, seq_feat_names)
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
