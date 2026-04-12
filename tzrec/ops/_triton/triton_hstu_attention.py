@@ -1627,7 +1627,7 @@ def triton_hstu_attention_bwd(
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
     dv = switch_to_contiguous_if_needed(dv)
-    if dout.shape[0] == 0:
+    if not torch.compiler.is_compiling() and dout.shape[0] == 0:
         return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
     Z = seq_offsets.numel() - 1
     _, H, DimQ = q.shape

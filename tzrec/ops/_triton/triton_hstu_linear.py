@@ -398,7 +398,7 @@ def triton_layer_norm_mul_dropout_bwd(
             y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
         else:
             y = torch.empty_like(x)
-    if N == 0:
+    if not torch.compiler.is_compiling() and N == 0:
         return (
             torch.zeros_like(x),
             torch.zeros_like(u),
@@ -882,7 +882,7 @@ def triton_group_norm_mul_dropout_bwd(
             )
         else:
             y = torch.empty((N, num_heads * linear_dim), dtype=x.dtype, device=x.device)
-    if N == 0:
+    if not torch.compiler.is_compiling() and N == 0:
         return (
             torch.zeros_like(x),
             torch.zeros_like(u),

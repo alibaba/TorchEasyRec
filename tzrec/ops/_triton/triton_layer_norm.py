@@ -337,7 +337,7 @@ def _triton_weighted_layer_norm_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
-    if N == 0:
+    if not torch.compiler.is_compiling() and N == 0:
         return y, mean, rstd, BLOCK_D, num_warps
     if learnable:
         # pyre-ignore[28]
@@ -425,7 +425,7 @@ def triton_weighted_layer_norm_bwd(
         _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
+        if not torch.compiler.is_compiling() and N == 0:
             dweight.zero_()
             dbias.zero_()
             return dx, dweight, dbias
@@ -471,7 +471,7 @@ def triton_weighted_layer_norm_bwd(
     else:
         N, D = x.shape
         dx = torch.empty_like(x)
-        if N == 0:
+        if not torch.compiler.is_compiling() and N == 0:
             return dx, None, None
         # pyre-ignore[28]
         _layer_norm_bwd_dx[(N,)](
