@@ -223,3 +223,60 @@ def pytorch_cached_hstu_mha(
     qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
     attn_output = torch.einsum("bhxd,bhdv->bhxv", qk_attn, full_v)
     return attn_output.transpose(1, 2).reshape(-1, H, V)
+
+
+@torch.fx.wrap
+def _get_sla_attn_mask(
+    device: torch.device,
+    N: int,
+    seq_lengths: torch.Tensor,
+    sla_k1: int,
+    sla_k2: int,
+) -> torch.Tensor:
+    """Build Semi-Local Attention mask: causal + local K1 + global prefix K2.
+
+    M[i,j] = 1 iff j <= i AND ((i - j) < K1 OR j < K2).
+    """
+    row_ids = torch.arange(N, device=device).view(N, 1)  # (N, 1)
+    col_ids = torch.arange(N, device=device).view(1, N)  # (1, N)
+    causal = col_ids <= row_ids
+    local_window = (row_ids - col_ids) < sla_k1
+    global_prefix = col_ids < sla_k2
+    mask = causal & (local_window | global_prefix)
+    # Zero out positions beyond each sequence's actual length.
+    B = seq_lengths.size(0)
+    seq_mask = col_ids.view(1, 1, N) < seq_lengths.view(B, 1, 1)
+    return mask.unsqueeze(0) & seq_mask  # (B, N, N)
+
+
+@torch.fx.wrap
+def pytorch_sla_hstu_mha(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    sla_k1: int,
+    sla_k2: int,
+) -> torch.Tensor:
+    """PyTorch reference impl of HSTU attention with Semi-Local Attention mask."""
+    L, H, _ = q.shape
+    V = v.shape[2]
+    q, k, v = _pad_qkv(q, k, v, seq_offsets, max_seq_len)
+    qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
+    qk_attn = F.silu(qk_attn) / max_seq_len
+    valid_attn_mask = _get_sla_attn_mask(
+        device=q.device,
+        N=max_seq_len,
+        seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
+        sla_k1=sla_k1,
+        sla_k2=sla_k2,
+    )
+    qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
+    attn_dense = torch.einsum("bhxd,bhdv->bhxv", qk_attn, v)
+    return torch.ops.fbgemm.dense_to_jagged(
+        attn_dense.transpose(1, 2).flatten(2, 3),
+        [seq_offsets],
+        L,
+    )[0].view(L, H, V)
