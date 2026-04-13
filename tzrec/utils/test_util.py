@@ -78,6 +78,7 @@ def create_test_model(
     if graph_type == TestGraphType.AOT_INDUCTOR:
         model = ScriptWrapper(model)
         assert data is not None
+        assert test_dir, "test_dir must be specified for AOT_INDUCTOR"
         sparse, dense, meta_info = split_model(data, model, test_dir)
         export_model_aot(sparse, dense, data, meta_info, test_dir)
         model = load_model_aot(test_dir, torch.device("cuda:0"))
