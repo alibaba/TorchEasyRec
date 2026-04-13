@@ -18,6 +18,7 @@ import torch
 
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.utils.logging_util import logger
 
 
 def is_input_tile() -> bool:
@@ -68,6 +69,42 @@ def is_aot() -> bool:
         return True
     else:
         return False
+
+
+def is_unified_aot() -> bool:
+    """Judge whether to use the unified AOTI export.
+
+    UNIFIED_AOT=1: fused sparse+dense AOTI model.
+    UNIFIED_AOT=0 (default): legacy two-stage export (sparse JIT + dense AOTI).
+    """
+    unified_aot = os.environ.get("UNIFIED_AOT", "0")
+    return bool(unified_aot) and unified_aot[0] == "1"
+
+
+def is_unified_aot_predict(model_path: str) -> bool:
+    """Judge whether the exported model uses unified AOTI in predict.
+
+    Prefers the explicit UNIFIED_AOT field in model_acc.json. Falls back
+    to file presence (legacy two-stage exports produce
+    scripted_sparse_model.pt; unified exports do not) when the acc.json
+    is missing or does not contain UNIFIED_AOT — this keeps unit tests
+    that bypass the full export pipeline working.
+    """
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if os.path.exists(acc_json_path):
+        with open(acc_json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        unified_aot = data.get("UNIFIED_AOT")
+        if unified_aot is not None:
+            return str(unified_aot)[:1] == "1"
+    sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
+    if not os.path.exists(sparse_model_path):
+        logger.warning(
+            "model_acc.json missing UNIFIED_AOT; falling back to file-presence "
+            "heuristic (no scripted_sparse_model.pt → unified)"
+        )
+        return True
+    return False
 
 
 def is_aot_predict(model_path: str) -> bool:
@@ -256,6 +293,8 @@ def export_acc_config(
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "ENABLE_AOT" in os.environ:
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
+        # Record unified AOT mode (default 0) so predict can detect it.
+        acc_config["UNIFIED_AOT"] = "1" if is_unified_aot() else "0"
     if hstu_item_id is not None:
         acc_config["hstu_item_id"] = hstu_item_id
     if hstu_kernel is not None:

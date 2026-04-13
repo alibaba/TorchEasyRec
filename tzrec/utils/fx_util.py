@@ -65,6 +65,7 @@ def fx_int_item(x: torch.Tensor) -> int:
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         int_item = x.item()
         torch._check_is_size(int_item, max=2**31)
+        torch._check(int_item > 0)
     else:
         int_item = int(x.item())
     # pyre-ignore[7]

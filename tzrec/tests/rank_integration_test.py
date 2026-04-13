@@ -959,8 +959,7 @@ class RankIntegrationTest(unittest.TestCase):
         df2 = df2.sort_values(by=predict_columns).reset_index(drop=True)
         self.assertTrue(dfs_are_close(df1, df2, 1e-6))
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_rank_dlrm_hstu_train_eval_export(self):
+    def _test_rank_dlrm_hstu_train_eval_export(self, export_env_str: str):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config", self.test_dir
         )
@@ -972,7 +971,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="ENABLE_AOT=1",
+                env_str=export_env_str,
                 hstu_item_id="cand_seq__video_id",
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
@@ -1016,6 +1015,36 @@ class RankIntegrationTest(unittest.TestCase):
             output_names = json.load(f)
             self.assertIsInstance(output_names, list)
             self.assertGreater(len(output_names), 0)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export(self):
+        # Default path: UNIFIED_AOT defaults to disabled, uses legacy
+        # two-stage export (sparse JIT + dense AOTI).
+        self._test_rank_dlrm_hstu_train_eval_export(export_env_str="ENABLE_AOT=1")
+        # Two-stage export must produce both the JIT sparse model and the
+        # AOTI dense model.
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
+            )
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export_unified_aot(self):
+        # Verify the unified AOTI export path (UNIFIED_AOT=1) for DLRM-HSTU.
+        self._test_rank_dlrm_hstu_train_eval_export(
+            export_env_str="ENABLE_AOT=1 UNIFIED_AOT=1"
+        )
+        # Unified export must NOT produce the legacy JIT sparse model file.
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
+            )
+        )
+        # model_acc.json must explicitly record UNIFIED_AOT=1.
+        with open(os.path.join(self.test_dir, "export/model_acc.json")) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg.get("UNIFIED_AOT"), "1")
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_cutlass_train_eval_export(self):

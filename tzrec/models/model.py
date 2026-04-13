@@ -10,6 +10,7 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import threading
 from collections import OrderedDict
 from queue import Queue
 from typing import Any, Dict, Final, Iterable, List, Optional, Tuple
@@ -372,38 +373,39 @@ class ScriptWrapper(BaseModule):
         return self.model.predict(batch)
 
 
-class DenseAutocastWrapper(nn.Module):
-    """Wraps a dense-side module in a torch.autocast context for torch.export.
+class CudaAutocastWrapper(nn.Module):
+    """Wraps a module in a torch.autocast context for torch.export.
 
-    Used to wrap the dense GraphModule from split_model before passing to
-    torch.export.export. torch.export captures the `with torch.autocast(...)`
-    region as a `wrap_with_autocast` Higher Order Op in the exported graph,
-    which AOT Inductor lowers to proper dtype casts.
+    torch.export captures ``with torch.autocast(...)`` as a
+    ``wrap_with_autocast`` Higher Order Op that AOT Inductor lowers to
+    proper dtype casts. CUTLASS HSTU attention requires bf16/fp16 inputs.
 
-    Only the dense path needs this wrapper: the sparse path is embedding
-    lookups which don't have autocast rules and don't benefit from AMP, and
-    the CUTLASS attention op lives in the dense sub-graph after the
-    sparse/dense split.
+    When ``device`` is set, it is passed as a second positional argument
+    to ``inner.forward(x, device)`` — this binds the device for models
+    like ``ScriptWrapper`` whose forward takes ``(data, device)``.
 
-    The forward takes a single dict argument matching the dense_gm signature.
-
-    Note on the ``_mixed_dtype_id: Final[int]`` encoding: ``torch.jit.script``
-    only honors ``torch.autocast(dtype=...)`` when ``dtype`` is a compile-time
-    literal. We therefore store an integer flag (``Final[int]``) set in
-    ``__init__`` and branch on it in ``forward`` so each branch's
-    ``torch.autocast(dtype=torch.bfloat16|torch.float16)`` is a literal.
-    Storing the dtype directly as an attribute would not be script-friendly.
+    ``_mixed_dtype_id: Final[int]`` encodes the dtype so that
+    ``torch.export`` resolves each if/elif branch statically during
+    tracing.
 
     Args:
-        inner (nn.Module): inner dense module to wrap.
+        inner (nn.Module): inner module to wrap.
         mixed_precision (Optional[str]): one of "BF16", "FP16", or None.
+        device (str): device string to pass to inner, empty means no device arg.
     """
 
     _mixed_dtype_id: Final[int]
+    _device: Final[str]
 
-    def __init__(self, inner: nn.Module, mixed_precision: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        inner: nn.Module,
+        mixed_precision: Optional[str] = None,
+        device: str = "",
+    ) -> None:
         super().__init__()
         self.inner = inner
+        self._device = device
         if mixed_precision == "BF16":
             self._mixed_dtype_id = 1
         elif mixed_precision == "FP16":
@@ -411,20 +413,27 @@ class DenseAutocastWrapper(nn.Module):
         else:
             self._mixed_dtype_id = 0
 
+    def _call_inner(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if self._device != "":
+            return self.inner(x, self._device)
+        return self.inner(x)
+
     def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Forward through inner module under an autocast context."""
         if self._mixed_dtype_id == 1:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                return self.inner(x)
+                return self._call_inner(x)
         elif self._mixed_dtype_id == 2:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                return self.inner(x)
+                return self._call_inner(x)
         else:
-            return self.inner(x)
+            return self._call_inner(x)
 
 
 class CombinedModelWrapper(nn.Module):
-    """Model inference wrapper for model combined with sparse and dense part.
+    """Model inference wrapper for two-stage export (JIT sparse + AOTI dense).
+
+    Must remain ``torch.jit.script``-friendly (used by TRT export).
 
     Args:
         sparse_model (nn.Module): sparse part scripted model.
@@ -454,3 +463,45 @@ class CombinedModelWrapper(nn.Module):
         sparse_out, _ = self.sparse_model(data, device)
         outputs = self.dense_model(sparse_out)
         return outputs
+
+
+class UnifiedAOTIModelWrapper(nn.Module):
+    """Model inference wrapper for unified AOTI model (sparse+dense fused).
+
+    Args:
+        model (nn.Module): unified AOTInductor compiled model.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+        # Serializes forward to prevent GIL + C++ mutex deadlock.
+        # AOTI extern ops go through redispatch_boxed which releases the
+        # GIL; a second thread can then hold the GIL while blocking on
+        # the AOTI model-pool mutex, deadlocking with the first thread.
+        # object.__setattr__ bypasses nn.Module's strict registration.
+        object.__setattr__(self, "_lock", threading.Lock())
+        object.__setattr__(self, "_key_order", None)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+
+        Args:
+            data (dict): a dict of input data for Batch.
+            device (torch.device): target CUDA device.
+
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        if self._key_order is None:
+            object.__setattr__(self, "_key_order", sorted(data.keys()))
+        data = OrderedDict((k, data[k]) for k in self._key_order)
+        # Force CUDA primary context creation on worker threads.
+        torch.cuda.set_device(device)
+        with self._lock:
+            return self.model(data)
