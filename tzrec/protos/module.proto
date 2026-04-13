@@ -201,8 +201,6 @@ message GRInputPreprocessor {
         GRContextualPreprocessor contextual_preprocessor = 20;
         // input preprocessor with interleave targets
         GRContextualInterleavePreprocessor contextual_interleave_preprocessor = 21;
-        // ULTRA-HSTU action-item merging: x_i = item_i + action_i (no interleaving)
-        GRContextualPreprocessor action_item_merge_preprocessor = 22;
     }
 }
 

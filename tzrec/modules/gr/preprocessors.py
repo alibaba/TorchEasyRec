@@ -508,12 +508,5 @@ def create_input_preprocessor(
         )
     elif preprocessor_type == "contextual_interleave_preprocessor":
         return ContextualInterleavePreprocessor(**config_dict)
-    elif preprocessor_type == "action_item_merge_preprocessor":
-        # ULTRA-HSTU action-item merging: x_i = item_i + action_i.
-        # This is equivalent to contextual_preprocessor (interleaving=False)
-        # with an action encoder configured.
-        return ContextualInterleavePreprocessor(
-            **config_dict, enable_interleaving=False
-        )
     else:
         raise RuntimeError(f"Unknown preprocessor type: {preprocessor_type}")
