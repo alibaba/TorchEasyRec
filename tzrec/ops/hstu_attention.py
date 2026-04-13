@@ -81,6 +81,14 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
+    if kernel == Kernel.CUTLASS and sla_k1 == 0 and sla_k2 == 0:
+        # Without SLA, the CUTLASS kernel's local-window path (Is_local)
+        # cannot combine with context/target masking — fall back to Triton.
+        _has_local_window = max_attn_len > 0
+        _has_ctx_or_tgt = contextual_seq_len > 0 or num_targets is not None
+        if _has_local_window and _has_ctx_or_tgt:
+            kernel = Kernel.TRITON
+
     if kernel == Kernel.CUTLASS:
         # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf so
         # we call it directly without going through the contiguous/assertion
