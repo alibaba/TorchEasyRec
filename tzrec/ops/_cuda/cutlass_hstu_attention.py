@@ -277,47 +277,84 @@ class _CutlassHstuMhaFunction(torch.autograd.Function):
 
 
 def build_sla_func_tensor(
-    batch_size: int,
     nheads: int,
-    max_seqlen_q: int,
     sla_k1: int,
     sla_k2: int,
-    device: torch.device,
+    seq_offsets: torch.Tensor,
+    num_targets: Optional[torch.Tensor] = None,
+    contextual_seq_len: int = 0,
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """Build the NFUNC=3 func tensor for Semi-Local Attention (SLA).
 
-    The HSTU CUTLASS kernel uses a table-driven arbitrary-mask API where the
-    func tensor has shape (B, H, NFUNC, Lq) with dtype int32.  NFUNC=3 encodes
-    two disjoint column intervals per query row i:
-      Interval 0 (global prefix): [0, col_max(0))
-      Interval 1 (local causal):  [col_min(0), col_max(1))
+    The HSTU CUTLASS kernel's arbitrary-mask path addresses the func tensor
+    via ``func_ptr + cu_seqlens[b]``, requiring a jagged layout of shape
+    ``(nheads, 3, total_q)`` where ``total_q = seq_offsets[-1]``.
 
-    For SLA: M[i,j] = 1 iff j <= i AND ((i-j) < K1 OR j < K2).
+    NFUNC=3 encodes two disjoint column-intervals per query row:
+      Interval 0: ``[0, col_max0)``
+      Interval 1: ``[col_min0, col_max1)``
+
+    For **history tokens** (position < seq_len - num_targets):
+      SLA mask = causal ∩ (local-K1 ∪ global-prefix).
+      ``effective_k2 = max(sla_k2, contextual_seq_len)``
+      ``col_max0 = min(effective_k2, pos + 1)``
+      ``col_min0 = max(effective_k2, pos - K1 + 1)``
+      ``col_max1 = pos + 1``
+
+    For **target tokens** (position >= seq_len - num_targets):
+      See all history but not other targets.
+      ``col_max0 = H_b``, ``col_min0 = H_b``, ``col_max1 = H_b``
+      where ``H_b = seq_len - num_targets`` is the history boundary.
 
     Args:
-        batch_size: number of sequences in the batch.
         nheads: number of attention heads.
-        max_seqlen_q: maximum query sequence length.
         sla_k1: local causal window size.
         sla_k2: global prefix length.
-        device: target device.
+        seq_offsets: int32 cumulative sequence offsets of shape (B+1,).
+        num_targets: int32 target counts per batch element (B,), or None.
+        contextual_seq_len: number of contextual tokens per sequence.
+        device: target device (inferred from seq_offsets if None).
 
     Returns:
-        func tensor of shape (batch_size, nheads, 3, max_seqlen_q), int32.
+        func tensor of shape (nheads, 3, total_q), dtype int32.
     """
-    idx = torch.arange(max_seqlen_q, device=device, dtype=torch.int32)
-    # Interval 0: global prefix [0, min(K2, i+1))
-    col_max0 = torch.minimum(idx + 1, torch.full_like(idx, sla_k2))
-    # Interval 1: local causal [max(K2, i-K1+1), i+1)
-    col_min0 = torch.clamp(idx - sla_k1 + 1, min=sla_k2)
-    col_max1 = idx + 1
-    # Kernel reads interleaved: [max(0), min(0), max(1)]
-    row = torch.stack([col_max0, col_min0, col_max1], dim=0)  # (3, Lq)
-    return (
-        row.view(1, 1, 3, max_seqlen_q)
-        .expand(batch_size, nheads, 3, max_seqlen_q)
-        .contiguous()
-    )
+    if device is None:
+        device = seq_offsets.device
+    seq_offsets_i32 = seq_offsets.to(torch.int32)
+    total_q = int(seq_offsets_i32[-1].item())
+    effective_k2 = max(sla_k2, contextual_seq_len)
+
+    # Map each jagged position to its batch element and local position.
+    pos_global = torch.arange(total_q, device=device, dtype=torch.int32)
+    batch_ids = torch.searchsorted(seq_offsets_i32[1:], pos_global, right=True)
+    pos_local = pos_global - seq_offsets_i32[batch_ids]
+
+    seq_lengths = seq_offsets_i32[1:] - seq_offsets_i32[:-1]  # (B,)
+    L = seq_lengths[batch_ids]  # per-position sequence length
+
+    if num_targets is not None:
+        T = num_targets.to(torch.int32)[batch_ids]  # per-position target count
+    else:
+        T = torch.zeros_like(pos_local)
+    H_boundary = L - T  # per-position history boundary
+
+    is_history = pos_local < H_boundary
+
+    # History tokens: SLA intervals
+    ek2 = torch.tensor(effective_k2, device=device, dtype=torch.int32)
+    hist_col_max0 = torch.minimum(pos_local + 1, ek2.expand_as(pos_local))
+    hist_col_min0 = torch.clamp(pos_local - sla_k1 + 1, min=effective_k2)
+    hist_col_max1 = pos_local + 1
+
+    # Target tokens: see all history [0, H_b), nothing else
+    col_max0 = torch.where(is_history, hist_col_max0, H_boundary)
+    col_min0 = torch.where(is_history, hist_col_min0, H_boundary)
+    col_max1 = torch.where(is_history, hist_col_max1, H_boundary)
+
+    # Stack as (3, total_q) then expand to (nheads, 3, total_q)
+    func_2d = torch.stack([col_max0, col_min0, col_max1], dim=0)  # (3, total_q)
+    return func_2d.unsqueeze(0).expand(nheads, 3, total_q).contiguous()
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -381,20 +418,38 @@ def cutlass_hstu_mha(
     v = v.contiguous()
     cu_seqlens = seq_offsets.to(torch.int32)
 
-    # SLA mode: use the arbitrary-mask NFUNC path; the func tensor supersedes
-    # the fixed window_size / num_contexts / num_targets mask parameters.
+    # SLA mode: the func tensor fully describes the mask (SLA + contextual
+    # prefix + target isolation).  We still pass num_contexts / num_targets
+    # to the kernel for potential scaling effects, but masking is entirely
+    # driven by the NFUNC intervals.
     func: Optional[torch.Tensor] = None
     if sla_k1 > 0 or sla_k2 > 0:
         batch_size = seq_offsets.size(0) - 1
         nheads = q.size(1)
-        func = build_sla_func_tensor(
-            batch_size, nheads, max_seq_len, sla_k1, sla_k2, q.device
-        )
-        # Under SLA the mask is fully described by the func tensor, so we
-        # use full causal window and disable context/target fixed masks.
-        window_size_left, window_size_right = -1, 0
-        num_contexts_tensor: Optional[torch.Tensor] = None
+
         num_targets_int32: Optional[torch.Tensor] = None
+        if num_targets is not None:
+            num_targets_int32 = num_targets.to(torch.int32)
+
+        func = build_sla_func_tensor(
+            nheads=nheads,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            seq_offsets=cu_seqlens,
+            num_targets=num_targets_int32,
+            contextual_seq_len=contextual_seq_len,
+            device=q.device,
+        )
+        window_size_left, window_size_right = -1, 0
+
+        num_contexts_tensor: Optional[torch.Tensor] = None
+        if contextual_seq_len > 0:
+            num_contexts_tensor = torch.full(
+                (batch_size,),
+                contextual_seq_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
     else:
         # Legacy fixed-mask path (unchanged from PR #465).
         if causal:

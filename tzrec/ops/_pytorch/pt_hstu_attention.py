@@ -232,21 +232,38 @@ def _get_sla_attn_mask(
     seq_lengths: torch.Tensor,
     sla_k1: int,
     sla_k2: int,
+    num_targets: Optional[torch.Tensor] = None,
+    contextual_seq_len: int = 0,
 ) -> torch.Tensor:
-    """Build Semi-Local Attention mask: causal + local K1 + global prefix K2.
+    """Build SLA mask with contextual prefix and target isolation.
 
-    M[i,j] = 1 iff j <= i AND ((i - j) < K1 OR j < K2).
+    History tokens: M[i,j] = 1 iff j<=i AND ((i-j)<K1 OR j<effective_k2).
+    Target tokens:  M[i,j] = 1 iff j < (seq_len - num_targets).
+    effective_k2 = max(sla_k2, contextual_seq_len).
     """
-    row_ids = torch.arange(N, device=device).view(N, 1)  # (N, 1)
-    col_ids = torch.arange(N, device=device).view(1, N)  # (1, N)
+    effective_k2 = max(sla_k2, contextual_seq_len)
+    B = seq_lengths.size(0)
+    row_ids = torch.arange(N, device=device).view(1, N, 1)  # (1, N, 1)
+    col_ids = torch.arange(N, device=device).view(1, 1, N)  # (1, 1, N)
+
     causal = col_ids <= row_ids
     local_window = (row_ids - col_ids) < sla_k1
-    global_prefix = col_ids < sla_k2
-    mask = causal & (local_window | global_prefix)
-    # Zero out positions beyond each sequence's actual length.
-    B = seq_lengths.size(0)
-    seq_mask = col_ids.view(1, 1, N) < seq_lengths.view(B, 1, 1)
-    return mask.unsqueeze(0) & seq_mask  # (B, N, N)
+    global_prefix = col_ids < effective_k2
+    sla_mask = causal & (local_window | global_prefix)
+
+    # Sequence-length mask: zero out cols beyond each sequence's length.
+    col_valid = col_ids < seq_lengths.view(B, 1, 1)
+
+    if num_targets is not None:
+        history_boundary = (seq_lengths - num_targets).view(B, 1, 1)  # (B, 1, 1)
+        is_target_row = row_ids >= history_boundary  # (B, N, 1)
+        # Target rows see [0, history_boundary) only.
+        target_mask = col_ids < history_boundary
+        mask = torch.where(is_target_row, target_mask, sla_mask)
+    else:
+        mask = sla_mask
+
+    return mask & col_valid  # (B, N, N)
 
 
 @torch.fx.wrap
@@ -259,8 +276,10 @@ def pytorch_sla_hstu_mha(
     seq_offsets: torch.Tensor,
     sla_k1: int,
     sla_k2: int,
+    num_targets: Optional[torch.Tensor] = None,
+    contextual_seq_len: int = 0,
 ) -> torch.Tensor:
-    """PyTorch reference impl of HSTU attention with Semi-Local Attention mask."""
+    """PyTorch reference impl of HSTU attention with SLA + target isolation."""
     L, H, _ = q.shape
     V = v.shape[2]
     q, k, v = _pad_qkv(q, k, v, seq_offsets, max_seq_len)
@@ -272,6 +291,8 @@ def pytorch_sla_hstu_mha(
         seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
         sla_k1=sla_k1,
         sla_k2=sla_k2,
+        num_targets=num_targets,
+        contextual_seq_len=contextual_seq_len,
     )
     qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
     attn_dense = torch.einsum("bhxd,bhdv->bhxv", qk_attn, v)
