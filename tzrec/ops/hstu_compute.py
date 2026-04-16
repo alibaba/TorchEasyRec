@@ -28,27 +28,16 @@ from tzrec.ops.layer_norm import layer_norm
 from tzrec.ops.mm import addmm
 
 
-def hstu_compute_uqvk(
-    x: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_bias: torch.Tensor,
-    norm_eps: float,
+def _uvqk_proj(
+    normed_x: torch.Tensor,
     num_heads: int,
     attn_dim: int,
     hidden_dim: int,
     uvqk_weight: torch.Tensor,
     uvqk_bias: torch.Tensor,
-    kernel: Kernel = Kernel.PYTORCH,
+    kernel: Kernel,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if kernel == Kernel.CUTLASS:
-        kernel = Kernel.TRITON
-    normed_x = layer_norm(
-        x,
-        weight=norm_weight,
-        bias=norm_bias,
-        eps=norm_eps,
-        kernel=kernel,
-    )
+    """UVQK linear projection + split + SiLU on u (no layer norm)."""
     # NOTE: for AMD training, we go with torch.addmm instead of the triton
     # version before Triton on AMD achieves on-par perf with NV GPU.
     if torch.version.hip and kernel == Kernel.TRITON:
@@ -70,6 +59,101 @@ def hstu_compute_uqvk(
     k = k.view(-1, num_heads, attn_dim)
     v = v.view(-1, num_heads, hidden_dim)
     return u, q, k, v
+
+
+def _hstu_compute_uqvk_impl(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    norm_eps: float,
+    num_heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+    uvqk_weight: torch.Tensor,
+    uvqk_bias: torch.Tensor,
+    kernel: Kernel,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vanilla LN + UVQK projection (no rematerialization)."""
+    normed_x = layer_norm(
+        x, weight=norm_weight, bias=norm_bias, eps=norm_eps, kernel=kernel
+    )
+    return _uvqk_proj(
+        normed_x, num_heads, attn_dim, hidden_dim, uvqk_weight, uvqk_bias, kernel
+    )
+
+
+def hstu_compute_uqvk(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    norm_eps: float,
+    num_heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+    uvqk_weight: torch.Tensor,
+    uvqk_bias: torch.Tensor,
+    kernel: Kernel = Kernel.PYTORCH,
+    recompute_normed_x_in_backward: bool = False,
+    recompute_uvqk_in_backward: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """LN + UVQK projection with optional selective rematerialization.
+
+    The recompute flags only have effect under ``torch.is_grad_enabled()``;
+    they are no-ops in inference. Recompute granularity:
+
+    - ``recompute_uvqk_in_backward``: checkpoint the entire LN + projection
+      so neither normed_x nor UVQK is saved (UVQK is the larger tensor;
+      recomputing it implicitly recomputes normed_x as a byproduct, which
+      subsumes ``recompute_normed_x_in_backward`` when both are True).
+    - ``recompute_normed_x_in_backward`` only: checkpoint just the layer
+      norm so normed_x is recomputed but UVQK is saved.
+    """
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
+    use_remat = torch.is_grad_enabled()
+
+    if recompute_uvqk_in_backward and use_remat:
+        return torch.utils.checkpoint.checkpoint(
+            _hstu_compute_uqvk_impl,
+            x,
+            norm_weight,
+            norm_bias,
+            norm_eps,
+            num_heads,
+            attn_dim,
+            hidden_dim,
+            uvqk_weight,
+            uvqk_bias,
+            kernel,
+            use_reentrant=False,
+        )
+
+    if recompute_normed_x_in_backward and use_remat:
+        normed_x = torch.utils.checkpoint.checkpoint(
+            layer_norm,
+            x,
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=norm_eps,
+            kernel=kernel,
+            use_reentrant=False,
+        )
+        return _uvqk_proj(
+            normed_x, num_heads, attn_dim, hidden_dim, uvqk_weight, uvqk_bias, kernel
+        )
+
+    return _hstu_compute_uqvk_impl(
+        x,
+        norm_weight,
+        norm_bias,
+        norm_eps,
+        num_heads,
+        attn_dim,
+        hidden_dim,
+        uvqk_weight,
+        uvqk_bias,
+        kernel,
+    )
 
 
 def hstu_compute_output(
@@ -199,41 +283,25 @@ def hstu_preprocess_and_attention(
         k = None
         v = None
     else:
-        # The Triton fused path honors recompute_uvqk_in_backward natively;
-        # for the non-fused (CUTLASS, PyTorch) path, wrap hstu_compute_uqvk
-        # in torch.utils.checkpoint so the same flag delivers memory savings
-        # on every backend. Recomputing UQVK also recomputes normed_x as a
-        # byproduct (covering recompute_normed_x_in_backward implicitly).
-        # Y is handled separately by recompute_y_in_backward in
-        # hstu_compute_output.
-        if recompute_uvqk_in_backward and torch.is_grad_enabled():
-            u, q, k, v = torch.utils.checkpoint.checkpoint(
-                hstu_compute_uqvk,
-                x,
-                norm_weight,
-                norm_bias,
-                norm_eps,
-                num_heads,
-                attn_dim,
-                hidden_dim,
-                uvqk_weight,
-                uvqk_bias,
-                kernel,
-                use_reentrant=False,
-            )
-        else:
-            u, q, k, v = hstu_compute_uqvk(
-                x=x,
-                norm_weight=norm_weight,
-                norm_bias=norm_bias,
-                norm_eps=norm_eps,
-                num_heads=num_heads,
-                attn_dim=attn_dim,
-                hidden_dim=hidden_dim,
-                uvqk_weight=uvqk_weight,
-                uvqk_bias=uvqk_bias,
-                kernel=kernel,
-            )
+        # The Triton fused path honors the recompute flags natively; for the
+        # non-fused (CUTLASS, PyTorch) path, hstu_compute_uqvk applies the
+        # equivalent rematerialization via torch.utils.checkpoint internally.
+        # The output side (Y) is handled separately by
+        # recompute_y_in_backward in hstu_compute_output.
+        u, q, k, v = hstu_compute_uqvk(
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            norm_eps=norm_eps,
+            num_heads=num_heads,
+            attn_dim=attn_dim,
+            hidden_dim=hidden_dim,
+            uvqk_weight=uvqk_weight,
+            uvqk_bias=uvqk_bias,
+            kernel=kernel,
+            recompute_normed_x_in_backward=recompute_normed_x_in_backward,
+            recompute_uvqk_in_backward=recompute_uvqk_in_backward,
+        )
         attn_output = hstu_mha(
             max_seq_len=max_seq_len,
             alpha=attn_alpha,
