@@ -28,22 +28,13 @@ from tzrec.ops.layer_norm import layer_norm
 from tzrec.ops.mm import addmm
 
 
-def _uvqk_proj(
-    normed_x: torch.Tensor,
+def _split_silu(
+    uvqk: torch.Tensor,
     num_heads: int,
     attn_dim: int,
     hidden_dim: int,
-    uvqk_weight: torch.Tensor,
-    uvqk_bias: torch.Tensor,
-    kernel: Kernel,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """UVQK linear projection + split + SiLU on u (no layer norm)."""
-    # NOTE: for AMD training, we go with torch.addmm instead of the triton
-    # version before Triton on AMD achieves on-par perf with NV GPU.
-    if torch.version.hip and kernel == Kernel.TRITON:
-        uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
-    else:
-        uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
+    """Split UVQK into u, v, q, k and apply SiLU on u."""
     u, v, q, k = torch.split(
         uvqk,
         [
@@ -61,6 +52,51 @@ def _uvqk_proj(
     return u, q, k, v
 
 
+def _ln_then_addmm(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    norm_eps: float,
+    uvqk_weight: torch.Tensor,
+    uvqk_bias: torch.Tensor,
+    kernel: Kernel,
+) -> torch.Tensor:
+    """LN + addmm, returning UVQK only.
+
+    Used inside checkpoint for the recompute_normed_x_only case so normed_x
+    isn't saved as addmm's activation.
+    """
+    normed_x = layer_norm(
+        x, weight=norm_weight, bias=norm_bias, eps=norm_eps, kernel=kernel
+    )
+    # NOTE: for AMD training, we go with torch.addmm instead of the triton
+    # version before Triton on AMD achieves on-par perf with NV GPU.
+    if torch.version.hip and kernel == Kernel.TRITON:
+        return torch.addmm(uvqk_bias, normed_x, uvqk_weight)
+    return addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
+
+
+def _addmm_split_silu(
+    normed_x: torch.Tensor,
+    num_heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+    uvqk_weight: torch.Tensor,
+    uvqk_bias: torch.Tensor,
+    kernel: Kernel,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Addmm + split + SiLU.
+
+    Used inside checkpoint for the recompute_uvqk_only case so UVQK isn't
+    saved as a forward activation.
+    """
+    if torch.version.hip and kernel == Kernel.TRITON:
+        uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
+    else:
+        uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
+    return _split_silu(uvqk, num_heads, attn_dim, hidden_dim)
+
+
 def _hstu_compute_uqvk_impl(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -73,11 +109,11 @@ def _hstu_compute_uqvk_impl(
     uvqk_bias: torch.Tensor,
     kernel: Kernel,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vanilla LN + UVQK projection (no rematerialization)."""
+    """Vanilla LN + addmm + split + silu (no rematerialization)."""
     normed_x = layer_norm(
         x, weight=norm_weight, bias=norm_bias, eps=norm_eps, kernel=kernel
     )
-    return _uvqk_proj(
+    return _addmm_split_silu(
         normed_x, num_heads, attn_dim, hidden_dim, uvqk_weight, uvqk_bias, kernel
     )
 
@@ -96,23 +132,30 @@ def hstu_compute_uqvk(
     recompute_normed_x_in_backward: bool = False,
     recompute_uvqk_in_backward: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """LN + UVQK projection with optional selective rematerialization.
+    """LN + UVQK projection with selective rematerialization.
 
-    The recompute flags only have effect under ``torch.is_grad_enabled()``;
-    they are no-ops in inference. Recompute granularity:
+    Mirrors the Triton fused kernel's per-flag granularity via four
+    distinct checkpoint placements:
 
-    - ``recompute_uvqk_in_backward``: checkpoint the entire LN + projection
-      so neither normed_x nor UVQK is saved (UVQK is the larger tensor;
-      recomputing it implicitly recomputes normed_x as a byproduct, which
-      subsumes ``recompute_normed_x_in_backward`` when both are True).
-    - ``recompute_normed_x_in_backward`` only: checkpoint just the layer
-      norm so normed_x is recomputed but UVQK is saved.
+    - (False, False): vanilla — both normed_x and UVQK are saved.
+    - (True,  False): checkpoint LN+addmm → normed_x is recomputed
+      (cannot be saved as addmm's activation since addmm is inside the
+      checkpoint), UVQK is saved (downstream split/silu/attention
+      consumers reference it).
+    - (False, True ): LN runs vanilla saving normed_x, then checkpoint
+      addmm+split+silu → UVQK is recomputed in backward.
+    - (True,  True ): checkpoint the full LN+addmm+split+silu chain →
+      both recomputed.
+
+    The flags are no-ops outside ``torch.is_grad_enabled()`` (inference).
     """
     if kernel == Kernel.CUTLASS:
         kernel = Kernel.TRITON
     use_remat = torch.is_grad_enabled()
+    rn = recompute_normed_x_in_backward and use_remat
+    ru = recompute_uvqk_in_backward and use_remat
 
-    if recompute_uvqk_in_backward and use_remat:
+    if rn and ru:
         return torch.utils.checkpoint.checkpoint(
             _hstu_compute_uqvk_impl,
             x,
@@ -128,18 +171,34 @@ def hstu_compute_uqvk(
             use_reentrant=False,
         )
 
-    if recompute_normed_x_in_backward and use_remat:
-        normed_x = torch.utils.checkpoint.checkpoint(
-            layer_norm,
+    if rn:
+        uvqk = torch.utils.checkpoint.checkpoint(
+            _ln_then_addmm,
             x,
-            weight=norm_weight,
-            bias=norm_bias,
-            eps=norm_eps,
-            kernel=kernel,
+            norm_weight,
+            norm_bias,
+            norm_eps,
+            uvqk_weight,
+            uvqk_bias,
+            kernel,
             use_reentrant=False,
         )
-        return _uvqk_proj(
-            normed_x, num_heads, attn_dim, hidden_dim, uvqk_weight, uvqk_bias, kernel
+        return _split_silu(uvqk, num_heads, attn_dim, hidden_dim)
+
+    if ru:
+        normed_x = layer_norm(
+            x, weight=norm_weight, bias=norm_bias, eps=norm_eps, kernel=kernel
+        )
+        return torch.utils.checkpoint.checkpoint(
+            _addmm_split_silu,
+            normed_x,
+            num_heads,
+            attn_dim,
+            hidden_dim,
+            uvqk_weight,
+            uvqk_bias,
+            kernel,
+            use_reentrant=False,
         )
 
     return _hstu_compute_uqvk_impl(
