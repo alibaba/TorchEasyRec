@@ -156,6 +156,7 @@ def hstu_preprocess_and_attention(
     enable_tma: bool = False,
     sla_k1: int = 0,
     sla_k2: int = 0,
+    selective_rematerialization: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -199,18 +200,39 @@ def hstu_preprocess_and_attention(
         k = None
         v = None
     else:
-        u, q, k, v = hstu_compute_uqvk(
-            x=x,
-            norm_weight=norm_weight,
-            norm_bias=norm_bias,
-            norm_eps=norm_eps,
-            num_heads=num_heads,
-            attn_dim=attn_dim,
-            hidden_dim=hidden_dim,
-            uvqk_weight=uvqk_weight,
-            uvqk_bias=uvqk_bias,
-            kernel=kernel,
-        )
+        # Selective activation rematerialization: for the non-fused path
+        # (CUTLASS, PyTorch) the Triton fused kernel's native recompute flags
+        # are not used, so we wrap hstu_compute_uqvk in torch.utils.checkpoint
+        # to avoid saving U/Q/K/V / layer-norm stats. The output side is
+        # already handled by recompute_y_in_backward in hstu_compute_output.
+        if selective_rematerialization and torch.is_grad_enabled():
+            u, q, k, v = torch.utils.checkpoint.checkpoint(
+                hstu_compute_uqvk,
+                x,
+                norm_weight,
+                norm_bias,
+                norm_eps,
+                num_heads,
+                attn_dim,
+                hidden_dim,
+                uvqk_weight,
+                uvqk_bias,
+                kernel,
+                use_reentrant=False,
+            )
+        else:
+            u, q, k, v = hstu_compute_uqvk(
+                x=x,
+                norm_weight=norm_weight,
+                norm_bias=norm_bias,
+                norm_eps=norm_eps,
+                num_heads=num_heads,
+                attn_dim=attn_dim,
+                hidden_dim=hidden_dim,
+                uvqk_weight=uvqk_weight,
+                uvqk_bias=uvqk_bias,
+                kernel=kernel,
+            )
         attn_output = hstu_mha(
             max_seq_len=max_seq_len,
             alpha=attn_alpha,

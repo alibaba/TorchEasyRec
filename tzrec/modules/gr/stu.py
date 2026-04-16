@@ -373,16 +373,6 @@ class STULayer(STU):
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
-        if self._selective_remat and self.training:
-            return self._forward_with_selective_remat(
-                x,
-                x_offsets,
-                max_seq_len,
-                num_targets,
-                max_kv_caching_len,
-                kv_caching_lengths,
-            )
-
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,
@@ -409,6 +399,7 @@ class STULayer(STU):
                 enable_tma=self._enable_tma,
                 sla_k1=self._sla_k1,
                 sla_k2=self._sla_k2,
+                selective_rematerialization=self._selective_remat,
             )
 
         self.update_kv_cache(
@@ -437,88 +428,6 @@ class STULayer(STU):
                 training=self.training,
                 kernel=self.kernel(),
                 recompute_y_in_backward=self._recompute_y,
-            )
-
-    def _forward_with_selective_remat(
-        self,
-        x: torch.Tensor,
-        x_offsets: torch.Tensor,
-        max_seq_len: int,
-        num_targets: torch.Tensor,
-        max_kv_caching_len: int = 0,
-        kv_caching_lengths: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward with selective activation rematerialization.
-
-        Checkpoints the U/Q/K/V projection and the output projection
-        blocks, but NOT the attention kernel (whose backward is already
-        efficient in the CUTLASS backend).
-        """
-        from tzrec.ops.hstu_attention import hstu_mha
-
-        with record_function("## stu_remat_uqvk ##"):
-            u, q, k, v = torch.utils.checkpoint.checkpoint(
-                hstu_compute_uqvk,
-                x,
-                self._input_norm_weight.to(x.dtype),
-                self._input_norm_bias.to(x.dtype),
-                1e-6,
-                self._num_heads,
-                self._attention_dim,
-                self._hidden_dim,
-                self._uvqk_weight.to(x.dtype),
-                self._uvqk_beta.to(x.dtype),
-                self.kernel(),
-                use_reentrant=False,
-            )
-
-        self.update_kv_cache(
-            max_seq_len=max_seq_len,
-            seq_offsets=x_offsets,
-            k=k,
-            v=v,
-            max_kv_caching_len=max_kv_caching_len,
-            kv_caching_lengths=kv_caching_lengths,
-        )
-
-        with record_function("## stu_remat_mha ##"):
-            attn_output = hstu_mha(
-                max_seq_len=max_seq_len,
-                alpha=self._attn_alpha,
-                q=q,
-                k=k,
-                v=v,
-                seq_offsets=x_offsets,
-                causal=self._causal,
-                num_targets=num_targets if self._target_aware else None,
-                max_attn_len=self._max_attn_len,
-                contextual_seq_len=self._contextual_seq_len,
-                sort_by_length=self._sort_by_length,
-                kernel=self.kernel(),
-                enable_tma=self._enable_tma,
-                sla_k1=self._sla_k1,
-                sla_k2=self._sla_k2,
-            ).view(-1, self._hidden_dim * self._num_heads)
-
-        with record_function("## stu_remat_output ##"):
-            return torch.utils.checkpoint.checkpoint(
-                hstu_compute_output,
-                attn_output,
-                u,
-                x,
-                self._output_norm_weight.to(x.dtype),
-                self._output_norm_bias.to(x.dtype),
-                1e-6,
-                self._output_dropout_ratio,
-                self._output_weight.to(x.dtype),
-                self._use_group_norm,
-                self._num_heads,
-                self._hidden_dim,
-                True,  # concat_ux
-                self.training,
-                self.kernel(),
-                self._recompute_y,
-                use_reentrant=False,
             )
 
     def cached_forward(
