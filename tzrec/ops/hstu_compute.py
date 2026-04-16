@@ -156,7 +156,6 @@ def hstu_preprocess_and_attention(
     enable_tma: bool = False,
     sla_k1: int = 0,
     sla_k2: int = 0,
-    selective_rematerialization: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -200,12 +199,14 @@ def hstu_preprocess_and_attention(
         k = None
         v = None
     else:
-        # Selective activation rematerialization: for the non-fused path
-        # (CUTLASS, PyTorch) the Triton fused kernel's native recompute flags
-        # are not used, so we wrap hstu_compute_uqvk in torch.utils.checkpoint
-        # to avoid saving U/Q/K/V / layer-norm stats. The output side is
-        # already handled by recompute_y_in_backward in hstu_compute_output.
-        if selective_rematerialization and torch.is_grad_enabled():
+        # The Triton fused path honors recompute_uvqk_in_backward natively;
+        # for the non-fused (CUTLASS, PyTorch) path, wrap hstu_compute_uqvk
+        # in torch.utils.checkpoint so the same flag delivers memory savings
+        # on every backend. Recomputing UQVK also recomputes normed_x as a
+        # byproduct (covering recompute_normed_x_in_backward implicitly).
+        # Y is handled separately by recompute_y_in_backward in
+        # hstu_compute_output.
+        if recompute_uvqk_in_backward and torch.is_grad_enabled():
             u, q, k, v = torch.utils.checkpoint.checkpoint(
                 hstu_compute_uqvk,
                 x,

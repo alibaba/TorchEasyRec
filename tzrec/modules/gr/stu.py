@@ -215,7 +215,6 @@ class STULayer(STU):
         contextual_seq_len: int = 0,
         sla_k1: int = 0,
         sla_k2: int = 0,
-        selective_rematerialization: bool = False,
         is_inference: bool = False,
     ) -> None:
         super().__init__(
@@ -239,7 +238,6 @@ class STULayer(STU):
         self._contextual_seq_len: int = contextual_seq_len
         self._sla_k1: int = sla_k1
         self._sla_k2: int = sla_k2
-        self._selective_remat: bool = selective_rematerialization
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -399,7 +397,6 @@ class STULayer(STU):
                 enable_tma=self._enable_tma,
                 sla_k1=self._sla_k1,
                 sla_k2=self._sla_k2,
-                selective_rematerialization=self._selective_remat,
             )
 
         self.update_kv_cache(

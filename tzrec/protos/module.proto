@@ -259,8 +259,6 @@ message STU {
     optional uint32 sla_k1 = 14;
     // Semi-Local Attention: global prefix length (0 = disabled)
     optional uint32 sla_k2 = 15;
-    // whether to use selective activation rematerialization
-    optional bool selective_rematerialization = 16 [default = false];
 }
 
 message GRPositionalEncoder {
