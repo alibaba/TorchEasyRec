@@ -559,17 +559,29 @@ class STUStack(STU):
                 and self._truncate_split_layer > 0
                 and self._truncate_tail_len > 0
             ):
-                from tzrec.ops.jagged_tensors import truncate_jagged_tail
-
-                x, x_offsets, seq_lengths, num_targets, max_seq_len = (
-                    truncate_jagged_tail(
-                        values=x,
-                        seq_offsets=x_offsets,
-                        seq_lengths=seq_lengths,
-                        num_targets=num_targets,
-                        tail_len=self._truncate_tail_len,
-                    )
+                # Attention truncation: keep only the last tail_len tokens per
+                # sequence by splitting into head (drop) + tail (keep) and
+                # taking the right (tail) output.
+                new_lengths = torch.clamp(seq_lengths, max=self._truncate_tail_len)
+                head_lengths = seq_lengths - new_lengths
+                offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    head_lengths
                 )
+                offsets_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    new_lengths
+                )
+                _, x = split_2D_jagged(
+                    values=x,
+                    max_seq_len=max_seq_len,
+                    offsets_left=offsets_head,
+                    offsets_right=offsets_tail,
+                    kernel=self.kernel(),
+                )
+                x_offsets = offsets_tail
+                seq_lengths = new_lengths
+                if num_targets is not None:
+                    num_targets = torch.clamp(num_targets, max=new_lengths)
+                max_seq_len = self._truncate_tail_len
             x = layer(
                 x=x,
                 x_offsets=x_offsets,
