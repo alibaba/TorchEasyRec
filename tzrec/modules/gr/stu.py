@@ -213,6 +213,8 @@ class STULayer(STU):
         recompute_y: bool = True,
         sort_by_length: bool = True,
         contextual_seq_len: int = 0,
+        sla_k1: int = 0,
+        sla_k2: int = 0,
         is_inference: bool = False,
     ) -> None:
         super().__init__(
@@ -234,6 +236,8 @@ class STULayer(STU):
         self._recompute_y: bool = recompute_y
         self._sort_by_length: bool = sort_by_length
         self._contextual_seq_len: int = contextual_seq_len
+        self._sla_k1: int = sla_k1
+        self._sla_k2: int = sla_k2
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -391,6 +395,8 @@ class STULayer(STU):
                 prefill=kv_caching_lengths is not None,
                 kernel=self.kernel(),
                 enable_tma=self._enable_tma,
+                sla_k1=self._sla_k1,
+                sla_k2=self._sla_k2,
             )
 
         self.update_kv_cache(
@@ -501,20 +507,28 @@ class STULayer(STU):
 
 
 class STUStack(STU):
-    """Stack of STU layers.
+    """Stack of STU layers with optional attention truncation.
 
     Args:
         stu_list (List[STU]): list of STU layers.
+        truncate_split_layer (int): after this many layers, truncate to tail.
+            0 means disabled (all layers run on full sequence).
+        truncate_tail_len (int): number of trailing tokens to keep after
+            truncation. Only used when truncate_split_layer > 0.
         is_inference (bool): whether to run in inference mode.
     """
 
     def __init__(
         self,
         stu_list: List[STU],
+        truncate_split_layer: int = 0,
+        truncate_tail_len: int = 0,
         is_inference: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._stu_layers: torch.nn.ModuleList = torch.nn.ModuleList(modules=stu_list)
+        self._truncate_split_layer: int = truncate_split_layer
+        self._truncate_tail_len: int = truncate_tail_len
 
     def forward(
         self,
@@ -538,7 +552,36 @@ class STUStack(STU):
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
-        for layer in self._stu_layers:
+        seq_lengths = x_offsets[1:] - x_offsets[:-1]
+        for i, layer in enumerate(self._stu_layers):
+            if (
+                i == self._truncate_split_layer
+                and self._truncate_split_layer > 0
+                and self._truncate_tail_len > 0
+            ):
+                # Attention truncation: keep only the last tail_len tokens per
+                # sequence by splitting into head (drop) + tail (keep) and
+                # taking the right (tail) output.
+                new_lengths = torch.clamp(seq_lengths, max=self._truncate_tail_len)
+                head_lengths = seq_lengths - new_lengths
+                offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    head_lengths
+                )
+                offsets_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    new_lengths
+                )
+                _, x = split_2D_jagged(
+                    values=x,
+                    max_seq_len=max_seq_len,
+                    offsets_left=offsets_head,
+                    offsets_right=offsets_tail,
+                    kernel=self.kernel(),
+                )
+                x_offsets = offsets_tail
+                seq_lengths = new_lengths
+                if num_targets is not None:
+                    num_targets = torch.clamp(num_targets, max=new_lengths)
+                max_seq_len = self._truncate_tail_len
             x = layer(
                 x=x,
                 x_offsets=x_offsets,

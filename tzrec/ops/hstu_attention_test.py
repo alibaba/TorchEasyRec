@@ -524,5 +524,144 @@ class HSTUAttentionTest(unittest.TestCase):
     # delta/cached path is already covered by ``test_delta_attn_triton``.
 
 
+def test_sla_attn(
+    batch_size: int,
+    heads: int,
+    max_uih_len: int,
+    max_targets: int,
+    attn_dim: int,
+    sla_k1: int,
+    sla_k2: int,
+    has_multiple_targets: bool,
+    contextual_seq_len: int,
+    dtype: torch.dtype,
+    test_backward: bool,
+    real_kernel: Kernel,
+    atol: Optional[float] = None,
+    rtol: Optional[float] = None,
+) -> None:
+    """Test SLA with contextual prefix and target isolation."""
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    from tzrec.ops._pytorch.pt_hstu_attention import pytorch_sla_hstu_mha
+    from tzrec.ops.hstu_attention import hstu_mha
+
+    alpha = 1.0 / (attn_dim**0.5)
+    lengths = torch.randint(
+        max_uih_len // 2, max_uih_len + 1, size=(batch_size,), device="cuda"
+    )
+    num_targets = torch.randint(1, max_targets + 1, size=(batch_size,), device="cuda")
+    lengths = lengths + num_targets + contextual_seq_len
+    max_seq_len = max_uih_len + max_targets + contextual_seq_len
+    seq_offsets = torch.zeros((batch_size + 1,), dtype=torch.int64, device="cuda")
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+
+    L = int(seq_offsets[-1].item())
+    q = (
+        torch.empty((L, heads, attn_dim), dtype=dtype, device="cuda")
+        .uniform_(-0.1, 0.1)
+        .requires_grad_(test_backward)
+    )
+    k = (
+        torch.empty((L, heads, attn_dim), dtype=dtype, device="cuda")
+        .uniform_(-0.1, 0.1)
+        .requires_grad_(test_backward)
+    )
+    v = (
+        torch.empty((L, heads, attn_dim), dtype=dtype, device="cuda")
+        .uniform_(-0.1, 0.1)
+        .requires_grad_(test_backward)
+    )
+
+    tgt = num_targets if has_multiple_targets else None
+
+    # Reference: pure PyTorch with explicit SLA + target mask
+    ref_out = pytorch_sla_hstu_mha(
+        max_seq_len=max_seq_len,
+        alpha=alpha,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        sla_k1=sla_k1,
+        sla_k2=sla_k2,
+        num_targets=tgt,
+        contextual_seq_len=contextual_seq_len,
+    )
+
+    if test_backward:
+        dout = torch.randn_like(ref_out)
+        ref_out.backward(dout)
+        ref_dv, v.grad = v.grad.clone(), None
+        ref_dk, k.grad = k.grad.clone(), None
+        ref_dq, q.grad = q.grad.clone(), None
+
+    # Real: kernel under test with SLA params
+    q2 = q.detach().clone().requires_grad_(test_backward)
+    k2 = k.detach().clone().requires_grad_(test_backward)
+    v2 = v.detach().clone().requires_grad_(test_backward)
+    real_out = hstu_mha(
+        max_seq_len=max_seq_len,
+        alpha=alpha,
+        q=q2,
+        k=k2,
+        v=v2,
+        seq_offsets=seq_offsets,
+        causal=True,
+        num_targets=tgt,
+        contextual_seq_len=contextual_seq_len,
+        kernel=real_kernel,
+        sla_k1=sla_k1,
+        sla_k2=sla_k2,
+    )
+
+    torch.testing.assert_close(
+        ref_out,
+        real_out,
+        atol=atol or 2e-2,
+        rtol=rtol or 1e-2,
+    )
+
+    if test_backward:
+        real_out.backward(dout.detach().clone())
+        torch.testing.assert_close(ref_dq, q2.grad, atol=atol or 5e-2, rtol=0.1)
+        torch.testing.assert_close(ref_dk, k2.grad, atol=atol or 5e-2, rtol=0.1)
+        torch.testing.assert_close(ref_dv, v2.grad, atol=atol or 5e-2, rtol=0.1)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+class HstuSLAAttnTest(unittest.TestCase):
+    @unittest.skipIf(*gpu_unavailable)
+    @given(
+        batch_size=st.sampled_from([1, 4]),
+        heads=st.sampled_from([1, 4]),
+        max_uih_len=st.sampled_from([64, 128]),
+        max_targets=st.sampled_from([1, 4]),
+        attn_dim=st.sampled_from([32, 64]),
+        sla_k1=st.sampled_from([16, 32]),
+        sla_k2=st.sampled_from([4, 8]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        contextual_seq_len=st.sampled_from([0, 4]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_sla_attn_cutlass(self, *args, **kwargs) -> None:
+        hidden_dim = kwargs.pop("attn_dim")
+        test_sla_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            test_backward=True,
+            real_kernel=Kernel.CUTLASS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
