@@ -12,7 +12,7 @@
 
 import json
 import os
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from torch import nn
@@ -36,6 +36,84 @@ try:
     from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
 except ImportError:
     logger.debug("cutlass_hstu_attention not available; skipping op registration")
+
+
+def _build_aoti_output_field_names(
+    exported_pg: "torch.export.ExportedProgram",
+    eager_output_keys: List[str],
+) -> List[str]:
+    """Align user-facing output names with the AOTI output-handle layout.
+
+    ``torch._inductor.aoti_compile_and_package`` compiles the graph inside
+    ``exported_pg``. The resulting AOTI wrapper emits one ``output_handles[i]``
+    per leaf in ``exported_pg.graph_signature.output_specs``. That list can be
+    **longer** than the eager module's return dict because
+    ``torch.export.export`` also surfaces buffer-mutation results, token
+    outputs, gradient-to-parameter signals, etc. as extra outputs.
+
+    The runtime (TorchRecProcessor) names the emitted tensors positionally
+    using ``output_field_names.json``, so the JSON **must** have one entry per
+    AOTI output handle. We therefore walk ``output_specs`` in order, assign
+    the eager dict keys only to ``USER_OUTPUT`` slots, and fill every other
+    slot with an ignorable ``_unused_*`` placeholder.
+
+    Args:
+        exported_pg: Result of ``torch.export.export(...)``.
+        eager_output_keys: Keys of the eager forward's return dict, in
+            dict-iteration order (which is the order ``torch.export`` flattens
+            them in).
+
+    Returns:
+        List of names, one per AOTI output handle, with USER_OUTPUT slots
+        carrying the eager keys in order and all other slots filled with
+        ``_unused_<idx>_<kind>`` placeholders.
+
+    Raises:
+        RuntimeError: If the number of USER_OUTPUT slots does not match
+            ``len(eager_output_keys)``; this indicates the eager dict and
+            the exported program disagree on the user-visible outputs and the
+            exported model cannot be reliably consumed downstream.
+    """
+    output_specs = exported_pg.graph_signature.output_specs
+
+    # Identify USER_OUTPUT slots robustly across torch versions.
+    def _is_user_output(spec: Any) -> bool:
+        kind = getattr(spec, "kind", None)
+        if kind is None:
+            return False
+        # Enum path (current torch): kind.name == "USER_OUTPUT".
+        name = getattr(kind, "name", None)
+        if isinstance(name, str):
+            return name == "USER_OUTPUT"
+        # String fallback.
+        return str(kind).endswith("USER_OUTPUT")
+
+    user_output_positions = [
+        i for i, spec in enumerate(output_specs) if _is_user_output(spec)
+    ]
+
+    if len(user_output_positions) != len(eager_output_keys):
+        raise RuntimeError(
+            "AOTI output-name alignment failed: exported program has "
+            f"{len(user_output_positions)} USER_OUTPUT slots "
+            f"(out of {len(output_specs)} total) but eager forward returned "
+            f"{len(eager_output_keys)} keys ({eager_output_keys}). "
+            "The eager dict and the torch.export graph disagree on "
+            "user-visible outputs; refusing to emit a mislabeled "
+            "output_field_names.json."
+        )
+
+    names: List[str] = []
+    user_iter = iter(eager_output_keys)
+    for i, spec in enumerate(output_specs):
+        if _is_user_output(spec):
+            names.append(next(user_iter))
+        else:
+            kind = getattr(spec, "kind", None)
+            kind_name = getattr(kind, "name", None) or str(kind) or "other"
+            names.append(f"_unused_{i}_{kind_name.lower()}")
+
+    return names
 
 
 def load_model_aot(
@@ -137,7 +215,7 @@ def export_model_aot(
     # active — kernels like CUTLASS HSTU attention reject fp32 inputs.
     with torch.no_grad():
         _out = dense_to_export(sparse_output)
-        aoti_output_keys = list(_out.keys())
+        eager_output_keys = list(_out.keys())
         del _out
 
     # pre_hook requires running arbitrary code at runtime
@@ -149,6 +227,16 @@ def export_model_aot(
             args=(sparse_output,),
             dynamic_shapes=(dynamic_shapes,),
         )
+
+    # Align names with AOTI output-handle layout: the exported program may
+    # emit extra outputs (buffer mutations, tokens, ...) in addition to the
+    # eager dict's user-visible outputs. The runtime indexes into
+    # output_field_names.json positionally, so it must have exactly one
+    # entry per AOTI output handle.
+    aoti_output_field_names = _build_aoti_output_field_names(
+        exported_pg, eager_output_keys
+    )
+
     # AsserScalar codegen is not correct.
     with torch._inductor.config.patch(
         {
@@ -159,13 +247,15 @@ def export_model_aot(
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
 
-        # Save original model output field names to aoti directory
-        if aoti_output_keys:
+        # Save output field names to aoti directory (one per AOTI output
+        # handle; non-USER_OUTPUT slots are filled with _unused_* placeholders).
+        if aoti_output_field_names:
             output_names_path = os.path.join(aoti_dir, "output_field_names.json")
             with open(output_names_path, "w") as f:
-                json.dump(aoti_output_keys, f, indent=4)
+                json.dump(aoti_output_field_names, f, indent=4)
             logger.info(
-                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
+                f"Saved output field names to {output_names_path}: "
+                f"{aoti_output_field_names}"
             )
 
         torch._inductor.aoti_compile_and_package(
@@ -408,7 +498,7 @@ def export_unified_model_aot(
         f.write(full_gm.code)
 
     result = full_gm(data)
-    aoti_output_keys = list(result.keys())
+    eager_output_keys = list(result.keys())
     del result
 
     # Pad any 0-size non-sequence sparse .values tensors so torch.export
@@ -435,6 +525,11 @@ def export_unified_model_aot(
             dynamic_shapes=(dynamic_shapes,),
         )
 
+    # Align names with AOTI output-handle layout (see _build_aoti_output_field_names).
+    aoti_output_field_names = _build_aoti_output_field_names(
+        exported_pg, eager_output_keys
+    )
+
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
     with torch._inductor.config.patch(
@@ -446,14 +541,15 @@ def export_unified_model_aot(
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
 
-        # Save original model output field names (matches legacy
-        # export_model_aot behavior).
-        if aoti_output_keys:
+        # Save output field names (one per AOTI output handle; non-USER_OUTPUT
+        # slots are filled with _unused_* placeholders).
+        if aoti_output_field_names:
             output_names_path = os.path.join(aoti_dir, "output_field_names.json")
             with open(output_names_path, "w") as f:
-                json.dump(aoti_output_keys, f, indent=4)
+                json.dump(aoti_output_field_names, f, indent=4)
             logger.info(
-                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
+                f"Saved output field names to {output_names_path}: "
+                f"{aoti_output_field_names}"
             )
 
         torch._inductor.aoti_compile_and_package(
