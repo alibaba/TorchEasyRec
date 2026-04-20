@@ -651,27 +651,114 @@ class HstuSLAAttnTest(unittest.TestCase):
         max_uih_len=st.sampled_from([64, 128]),
         max_targets=st.sampled_from([1, 4]),
         attn_dim=st.sampled_from([32, 64]),
-        sla_k1=st.sampled_from([16, 32]),
-        sla_k2=st.sampled_from([4, 8]),
+        # Include sla_k1==0 (pure global-prefix) and sla_k2==0 (pure
+        # local-window) asymmetric cases in addition to the original
+        # both-nonzero combinations.
+        sla_k1=st.sampled_from([0, 16, 32]),
+        sla_k2=st.sampled_from([0, 4, 8]),
         has_multiple_targets=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 4]),
-        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
+        # Sample both bf16 and fp16 -- fp8 is deferred to ultra-hstu-fp8.
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=20,
+        max_examples=60,
         deadline=None,
     )
     # pyre-ignore[2]
-    def test_sla_attn_cutlass(self, *args, **kwargs) -> None:
+    def test_sla_attn_cutlass(
+        self,
+        sla_k1: int,
+        sla_k2: int,
+        *args,
+        **kwargs,
+    ) -> None:
+        # Skip the degenerate (0, 0) point -- that's the no-SLA path.
+        if sla_k1 == 0 and sla_k2 == 0:
+            return
         hidden_dim = kwargs.pop("attn_dim")
         test_sla_attn(
             *args,
             **kwargs,
             attn_dim=hidden_dim,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
             test_backward=True,
             real_kernel=Kernel.CUTLASS,
         )
+
+
+class HstuAttnNegativeTests(unittest.TestCase):
+    """Reject invalid inputs loudly (T2, T3)."""
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_float32_rejected_by_cutlass(self) -> None:
+        """T3: CUTLASS dispatch must reject unsupported dtypes."""
+        from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
+
+        q = torch.randn(8, 2, 16, device="cuda", dtype=torch.float32)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "supports fp16 and bf16"):
+            cutlass_hstu_mha(
+                max_seq_len=4,
+                alpha=0.25,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_negative_sla_params_rejected(self) -> None:
+        """C2: build_sla_func_tensor rejects negative params."""
+        from tzrec.ops._cuda.cutlass_hstu_attention import build_sla_func_tensor
+
+        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            build_sla_func_tensor(
+                nheads=2,
+                sla_k1=-1,
+                sla_k2=4,
+                seq_offsets=seq_offsets,
+                total_q=8,
+            )
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            build_sla_func_tensor(
+                nheads=2,
+                sla_k1=8,
+                sla_k2=4,
+                seq_offsets=seq_offsets,
+                total_q=8,
+                contextual_seq_len=-3,
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_attn_func_requires_cutlass(self) -> None:
+        """C4: hstu_mha rejects attn_func on non-CUTLASS kernels."""
+        from tzrec.ops.hstu_attention import hstu_mha
+
+        q = torch.randn(8, 2, 16, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        # Minimal valid func tensor shape -- content doesn't matter; the
+        # dispatch check runs before any kernel call.
+        attn_func = torch.zeros((2, 3, 8), dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "Kernel.CUTLASS"):
+            hstu_mha(
+                max_seq_len=4,
+                alpha=0.25,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                causal=True,
+                kernel=Kernel.TRITON,
+                attn_func=attn_func,
+            )
 
 
 if __name__ == "__main__":
