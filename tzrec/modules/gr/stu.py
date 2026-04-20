@@ -557,9 +557,10 @@ class STUStack(STU):
         x: torch.Tensor,
         x_offsets: torch.Tensor,
         max_seq_len: int,
-        num_targets: torch.Tensor,
+        num_targets: Optional[torch.Tensor],
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
+        attn_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward stack of stu layer.
 
@@ -567,14 +568,26 @@ class STUStack(STU):
             x (torch.Tensor): input sequence embedding tensor.
             x_offsets (torch.Tensor): input sequence offsets.
             max_seq_len (int): maximum sequence length.
-            num_targets (torch.Tensor): number of targets.
+            num_targets (Optional[torch.Tensor]): number of targets per batch
+                element (None in listwise-training mode).
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+            attn_func: accepted for signature parity with ``STULayer.forward``.
+                STUStack builds its own per-layer ``attn_func`` (memoized on
+                SLA config + offsets identity), so any caller-supplied value
+                is overwritten on the first iteration that needs it.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
         seq_lengths = x_offsets[1:] - x_offsets[:-1]
+        # Hoist SLA func construction out of the per-layer attention op so
+        # a stack of N layers doesn't rebuild the same (nheads, 3, total_q)
+        # tensor N times per forward.  We memoize on the SLA config +
+        # current offsets identity and only rebuild when those change (in
+        # particular, once across the truncation boundary).
+        cur_attn_func: Optional[torch.Tensor] = attn_func
+        attn_func_sig: Optional[tuple] = None
         for i, layer in enumerate(self._stu_layers):
             if (
                 i == self._truncate_split_layer
@@ -604,6 +617,39 @@ class STUStack(STU):
                 if num_targets is not None:
                     num_targets = torch.clamp(num_targets, max=new_lengths)
                 max_seq_len = self._truncate_tail_len
+
+            sla_k1 = getattr(layer, "_sla_k1", 0)
+            sla_k2 = getattr(layer, "_sla_k2", 0)
+            if sla_k1 > 0 or sla_k2 > 0:
+                ctx_len = getattr(layer, "_contextual_seq_len", 0)
+                nheads = getattr(layer, "_num_heads", 0)
+                tgt_aware = getattr(layer, "_target_aware", False)
+                sig = (
+                    sla_k1,
+                    sla_k2,
+                    ctx_len,
+                    nheads,
+                    tgt_aware,
+                    id(x_offsets),
+                )
+                if sig != attn_func_sig:
+                    from tzrec.ops._cuda.cutlass_hstu_attention import (
+                        build_sla_func_tensor,
+                    )
+
+                    cur_attn_func = build_sla_func_tensor(
+                        nheads=nheads,
+                        sla_k1=sla_k1,
+                        sla_k2=sla_k2,
+                        seq_offsets=x_offsets,
+                        num_targets=num_targets if tgt_aware else None,
+                        contextual_seq_len=ctx_len,
+                    )
+                    attn_func_sig = sig
+            else:
+                cur_attn_func = None
+                attn_func_sig = None
+
             x = layer(
                 x=x,
                 x_offsets=x_offsets,
@@ -611,6 +657,7 @@ class STUStack(STU):
                 num_targets=num_targets,
                 max_kv_caching_len=max_kv_caching_len,
                 kv_caching_lengths=kv_caching_lengths,
+                attn_func=cur_attn_func,
             )
         return x
 
