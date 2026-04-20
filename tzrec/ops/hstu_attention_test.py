@@ -608,6 +608,7 @@ def test_sla_attn(
         sla_k1=sla_k1,
         sla_k2=sla_k2,
         seq_offsets=seq_offsets,
+        total_q=L,
         num_targets=tgt,
         contextual_seq_len=contextual_seq_len,
     )

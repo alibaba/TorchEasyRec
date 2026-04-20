@@ -281,6 +281,7 @@ def build_sla_func_tensor(
     sla_k1: int,
     sla_k2: int,
     seq_offsets: torch.Tensor,
+    total_q: int,
     num_targets: Optional[torch.Tensor] = None,
     contextual_seq_len: int = 0,
     device: Optional[torch.device] = None,
@@ -289,7 +290,7 @@ def build_sla_func_tensor(
 
     The HSTU CUTLASS kernel's arbitrary-mask path addresses the func tensor
     via ``func_ptr + cu_seqlens[b]``, requiring a jagged layout of shape
-    ``(nheads, 3, total_q)`` where ``total_q = seq_offsets[-1]``.
+    ``(nheads, 3, total_q)``.
 
     NFUNC=3 encodes two disjoint column-intervals per query row:
       Interval 0: ``[0, col_max0)``
@@ -312,6 +313,9 @@ def build_sla_func_tensor(
         sla_k1: local causal window size.
         sla_k2: global prefix length.
         seq_offsets: int32 cumulative sequence offsets of shape (B+1,).
+        total_q: total jagged tokens in the batch (= ``seq_offsets[-1]``).
+            Taken from the caller's tensor metadata (e.g. ``q.size(0)``)
+            to avoid a D->H ``.item()`` sync per forward.
         num_targets: int32 target counts per batch element (B,), or None.
         contextual_seq_len: number of contextual tokens per sequence.
         device: target device (inferred from seq_offsets if None).
@@ -327,8 +331,12 @@ def build_sla_func_tensor(
         )
     if device is None:
         device = seq_offsets.device
-    seq_offsets_i32 = seq_offsets.to(torch.int32)
-    total_q = int(seq_offsets_i32[-1].item())
+    # Only cast when needed; callers (STUStack, STULayer) already supply
+    # int32 offsets from fbgemm's cumsum.
+    if seq_offsets.dtype != torch.int32:
+        seq_offsets_i32 = seq_offsets.to(torch.int32)
+    else:
+        seq_offsets_i32 = seq_offsets
     effective_k2 = max(sla_k2, contextual_seq_len)
 
     # Map each jagged position to its batch element and local position.
@@ -350,9 +358,9 @@ def build_sla_func_tensor(
 
     is_history = pos_local < H_boundary
 
-    # History tokens: SLA intervals
-    ek2 = torch.tensor(effective_k2, device=device, dtype=torch.int32)
-    hist_col_max0 = torch.minimum(pos_local + 1, ek2.expand_as(pos_local))
+    # History tokens: SLA intervals.  ``torch.clamp(..., max=effective_k2)``
+    # avoids the host-tensor + expand_as roundtrip used previously.
+    hist_col_max0 = torch.clamp(pos_local + 1, max=effective_k2)
     hist_col_min0 = torch.clamp(pos_local - sla_k1 + 1, min=effective_k2)
     hist_col_max1 = pos_local + 1
 

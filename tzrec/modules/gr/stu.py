@@ -391,6 +391,7 @@ class STULayer(STU):
                 sla_k1=self._sla_k1,
                 sla_k2=self._sla_k2,
                 seq_offsets=x_offsets,
+                total_q=x.size(0),
                 num_targets=num_targets if self._target_aware else None,
                 contextual_seq_len=self._contextual_seq_len,
             )
@@ -656,6 +657,7 @@ class STUStack(STU):
                         sla_k1=sla_k1,
                         sla_k2=sla_k2,
                         seq_offsets=x_offsets,
+                        total_q=x.size(0),
                         num_targets=num_targets if tgt_aware else None,
                         contextual_seq_len=ctx_len,
                     )
