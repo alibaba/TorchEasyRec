@@ -715,6 +715,17 @@ class STUStack(STU):
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
+        if self._truncate_tail_len > 0 and self._truncate_split_layer > 0:
+            # The cached / delta path operates per-layer on a rolling KV
+            # cache; mid-stack truncation would drop prefix tokens that the
+            # post-truncation layers still reference via the cache, causing
+            # train/serve skew. Refuse the config rather than silently
+            # diverge -- proper support is a follow-up.
+            raise NotImplementedError(
+                "STUStack attention truncation is not supported in "
+                "cached_forward (serving path). Either disable truncation "
+                "or use the non-cached forward path."
+            )
         for layer in self._stu_layers:
             delta_x = layer.cached_forward(
                 delta_x=delta_x,
