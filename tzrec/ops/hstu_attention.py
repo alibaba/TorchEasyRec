@@ -43,8 +43,7 @@ def hstu_mha(
     sort_by_length: bool = False,
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
-    sla_k1: int = 0,
-    sla_k2: int = 0,
+    attn_func: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """HSTU multi-head attention with kernel backend dispatch.
 
@@ -65,8 +64,9 @@ def hstu_mha(
         sort_by_length: sort sequences by length (TRITON only).
         kernel: backend kernel to use (PYTORCH, TRITON, CUTLASS).
         enable_tma: enable TMA (TRITON only).
-        sla_k1: Semi-Local Attention local causal window size (0 = disabled).
-        sla_k2: Semi-Local Attention global prefix length (0 = disabled).
+        attn_func: pre-built arbitrary-mask func tensor of shape
+            ``(nheads, 3, total_q)``, int32 — selects the CUTLASS NFUNC
+            mask path. Only supported when ``kernel=Kernel.CUTLASS``.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -81,9 +81,16 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if kernel == Kernel.CUTLASS and sla_k1 == 0 and sla_k2 == 0:
-        # Without SLA, the CUTLASS kernel's local-window path (Is_local)
-        # cannot combine with context/target masking — fall back to Triton.
+    if attn_func is not None and kernel != Kernel.CUTLASS:
+        raise ValueError(
+            "attn_func (arbitrary-mask NFUNC path) is only supported on "
+            f"Kernel.CUTLASS; got kernel={kernel}."
+        )
+
+    if kernel == Kernel.CUTLASS and attn_func is None:
+        # Without an arbitrary mask, the CUTLASS kernel's local-window path
+        # (Is_local) cannot combine with context/target masking — fall back
+        # to Triton in that combination.
         _has_local_window = max_attn_len > 0
         _has_ctx_or_tgt = contextual_seq_len > 0 or num_targets is not None
         if _has_local_window and _has_ctx_or_tgt:
@@ -94,8 +101,8 @@ def hstu_mha(
         # we call it directly without going through the contiguous/assertion
         # preprocessing block below (which has control flow that would
         # break FX symbolic tracing). The CUTLASS kernel requires fp16/bf16
-        # (or fp8 on Hopper) inputs; we rely on the CudaAutocastWrapper
-        # applied in tzrec/acc/aot_utils.py and trt_utils.py (driven by
+        # inputs; we rely on the CudaAutocastWrapper applied in
+        # tzrec/acc/aot_utils.py and trt_utils.py (driven by
         # export_config.mixed_precision / train_config.mixed_precision) to
         # ensure q/k/v are in a supported dtype when reaching this dispatch.
         from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
@@ -111,8 +118,7 @@ def hstu_mha(
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
-            sla_k1=sla_k1,
-            sla_k2=sla_k2,
+            attn_func=attn_func,
         )
 
     if kernel == Kernel.TRITON:

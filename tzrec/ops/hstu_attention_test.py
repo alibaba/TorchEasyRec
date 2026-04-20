@@ -596,10 +596,21 @@ def test_sla_attn(
         ref_dk, k.grad = k.grad.clone(), None
         ref_dq, q.grad = q.grad.clone(), None
 
-    # Real: kernel under test with SLA params
+    # Real: kernel under test with SLA params.  Build the NFUNC mask
+    # tensor via the SLA helper and pass it as attn_func.
+    from tzrec.ops._cuda.cutlass_hstu_attention import build_sla_func_tensor
+
     q2 = q.detach().clone().requires_grad_(test_backward)
     k2 = k.detach().clone().requires_grad_(test_backward)
     v2 = v.detach().clone().requires_grad_(test_backward)
+    attn_func = build_sla_func_tensor(
+        nheads=heads,
+        sla_k1=sla_k1,
+        sla_k2=sla_k2,
+        seq_offsets=seq_offsets,
+        num_targets=tgt,
+        contextual_seq_len=contextual_seq_len,
+    )
     real_out = hstu_mha(
         max_seq_len=max_seq_len,
         alpha=alpha,
@@ -611,8 +622,7 @@ def test_sla_attn(
         num_targets=tgt,
         contextual_seq_len=contextual_seq_len,
         kernel=real_kernel,
-        sla_k1=sla_k1,
-        sla_k2=sla_k2,
+        attn_func=attn_func,
     )
 
     torch.testing.assert_close(

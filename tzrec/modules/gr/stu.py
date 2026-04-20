@@ -354,9 +354,10 @@ class STULayer(STU):
         x: torch.Tensor,
         x_offsets: torch.Tensor,
         max_seq_len: int,
-        num_targets: torch.Tensor,
+        num_targets: Optional[torch.Tensor],
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
+        attn_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward the layer.
 
@@ -364,13 +365,35 @@ class STULayer(STU):
             x (torch.Tensor): input sequence embedding tensor.
             x_offsets (torch.Tensor): input sequence offsets.
             max_seq_len (int): maximum sequence length.
-            num_targets (torch.Tensor): number of targets.
+            num_targets (Optional[torch.Tensor]): number of targets per batch
+                element (None in listwise-training mode).
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+            attn_func (Optional[torch.Tensor]): pre-built arbitrary-mask func
+                tensor for the CUTLASS NFUNC path. When ``None`` and SLA is
+                enabled on this layer (``self._sla_k1 > 0 or self._sla_k2 >
+                0``), it is built from ``self._sla_*`` / ``x_offsets`` /
+                ``num_targets``. When supplied by the caller (typically
+                ``STUStack.forward`` which hoists construction to batch
+                scope) the build is skipped.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
+        if attn_func is None and (self._sla_k1 > 0 or self._sla_k2 > 0):
+            from tzrec.ops._cuda.cutlass_hstu_attention import (
+                build_sla_func_tensor,
+            )
+
+            attn_func = build_sla_func_tensor(
+                nheads=self._num_heads,
+                sla_k1=self._sla_k1,
+                sla_k2=self._sla_k2,
+                seq_offsets=x_offsets,
+                num_targets=num_targets if self._target_aware else None,
+                contextual_seq_len=self._contextual_seq_len,
+            )
+
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,
@@ -395,8 +418,7 @@ class STULayer(STU):
                 prefill=kv_caching_lengths is not None,
                 kernel=self.kernel(),
                 enable_tma=self._enable_tma,
-                sla_k1=self._sla_k1,
-                sla_k2=self._sla_k2,
+                attn_func=attn_func,
             )
 
         self.update_kv_cache(

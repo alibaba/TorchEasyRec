@@ -319,6 +319,12 @@ def build_sla_func_tensor(
     Returns:
         func tensor of shape (nheads, 3, total_q), dtype int32.
     """
+    if sla_k1 < 0 or sla_k2 < 0 or contextual_seq_len < 0:
+        raise ValueError(
+            f"SLA params must be non-negative; got "
+            f"sla_k1={sla_k1}, sla_k2={sla_k2}, "
+            f"contextual_seq_len={contextual_seq_len}"
+        )
     if device is None:
         device = seq_offsets.device
     seq_offsets_i32 = seq_offsets.to(torch.int32)
@@ -375,14 +381,23 @@ def cutlass_hstu_mha(
     num_targets: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
-    sla_k1: int = 0,
-    sla_k2: int = 0,
+    attn_func: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
-    Supports standard causal/local/context/target masks via the fixed mask
-    parameters, and Semi-Local Attention (SLA) via the arbitrary-mask NFUNC
-    path when ``sla_k1 > 0 or sla_k2 > 0``.
+    Supports two mask modes:
+
+    - Standard fixed-mask path (``attn_func=None``): causal/local/
+      context/target masking driven by ``causal``, ``max_attn_len``,
+      ``contextual_seq_len`` and ``num_targets``.
+    - Arbitrary-mask NFUNC path (``attn_func`` provided): the kernel
+      interprets ``attn_func`` as a jagged ``(nheads, 3, total_q)`` int32
+      tensor encoding two disjoint column-intervals per query row. The
+      caller is responsible for constructing it (see
+      ``build_sla_func_tensor`` for the SLA case). In this mode the
+      kernel forces ``window_size_left=-1, window_size_right=0`` so
+      ``causal`` and ``max_attn_len`` are redundant and must be left at
+      their defaults (``causal=True, max_attn_len=0``).
 
     The CUTLASS kernel uses int32 cu_seqlens internally, so the cumulative
     sum ``seq_offsets[-1]`` (total token count in the batch) must fit in
@@ -395,12 +410,15 @@ def cutlass_hstu_mha(
         k: key tensor of shape (total, nheads, attn_dim).
         v: value tensor of shape (total, nheads, hidden_dim).
         seq_offsets: cumulative sequence offsets of shape (batch_size + 1,).
-        causal: whether to apply causal masking.
+        causal: whether to apply causal masking (fixed-mask path only).
         num_targets: number of target tokens per batch element.
-        max_attn_len: maximum attention window length (0 means unlimited).
+        max_attn_len: maximum attention window length (fixed-mask path;
+            0 means unlimited).
         contextual_seq_len: number of contextual tokens per sequence.
-        sla_k1: Semi-Local Attention local causal window size (0 = disabled).
-        sla_k2: Semi-Local Attention global prefix length (0 = disabled).
+        attn_func: pre-built arbitrary-mask func tensor of shape
+            ``(nheads, 3, total_q)``, int32. When provided, selects the
+            NFUNC mask path; ``causal`` and ``max_attn_len`` must be at
+            defaults.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -415,64 +433,49 @@ def cutlass_hstu_mha(
             f"CUTLASS hstu_attn supports fp16 and bf16, got {q.dtype}. "
             f"Set train_config.mixed_precision to 'BF16' or 'FP16'."
         )
-    if sla_k1 < 0 or sla_k2 < 0 or contextual_seq_len < 0:
+    if contextual_seq_len < 0:
         raise ValueError(
-            f"SLA params must be non-negative; got "
-            f"sla_k1={sla_k1}, sla_k2={sla_k2}, "
-            f"contextual_seq_len={contextual_seq_len}"
+            f"contextual_seq_len must be non-negative; got {contextual_seq_len}"
         )
-    sla_enabled = sla_k1 > 0 or sla_k2 > 0
-    if sla_enabled and not causal:
-        raise ValueError(
-            "SLA (sla_k1>0 or sla_k2>0) requires causal=True; "
-            "the SLA mask is defined only for causal attention."
-        )
-    if sla_enabled and max_attn_len > 0:
-        raise ValueError(
-            "SLA (sla_k1>0 or sla_k2>0) is mutually exclusive with "
-            f"max_attn_len (got max_attn_len={max_attn_len}); the local "
-            "causal window is already encoded by sla_k1."
-        )
+    if attn_func is not None:
+        if not causal:
+            raise ValueError(
+                "attn_func requires causal=True; the NFUNC mask path "
+                "forces window_size_right=0 so causal=False has no effect."
+            )
+        if max_attn_len > 0:
+            raise ValueError(
+                f"attn_func is mutually exclusive with max_attn_len "
+                f"(got max_attn_len={max_attn_len}); any local window "
+                "must be encoded by the func tensor itself."
+            )
 
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
     cu_seqlens = seq_offsets.to(torch.int32)
 
-    # SLA mode: the func tensor fully describes the mask (SLA + contextual
-    # prefix + target isolation).  We still pass num_contexts / num_targets
-    # to the kernel for potential scaling effects, but masking is entirely
-    # driven by the NFUNC intervals.
-    func: Optional[torch.Tensor] = None
-    if sla_k1 > 0 or sla_k2 > 0:
+    num_targets_int32: Optional[torch.Tensor] = None
+    if num_targets is not None:
+        num_targets_int32 = num_targets.to(torch.int32)
+
+    num_contexts_tensor: Optional[torch.Tensor] = None
+    if contextual_seq_len > 0:
         batch_size = seq_offsets.size(0) - 1
-        nheads = q.size(1)
-
-        num_targets_int32: Optional[torch.Tensor] = None
-        if num_targets is not None:
-            num_targets_int32 = num_targets.to(torch.int32)
-
-        func = build_sla_func_tensor(
-            nheads=nheads,
-            sla_k1=sla_k1,
-            sla_k2=sla_k2,
-            seq_offsets=cu_seqlens,
-            num_targets=num_targets_int32,
-            contextual_seq_len=contextual_seq_len,
+        num_contexts_tensor = torch.full(
+            (batch_size,),
+            contextual_seq_len,
+            dtype=torch.int32,
             device=q.device,
         )
-        window_size_left, window_size_right = -1, 0
 
-        num_contexts_tensor: Optional[torch.Tensor] = None
-        if contextual_seq_len > 0:
-            num_contexts_tensor = torch.full(
-                (batch_size,),
-                contextual_seq_len,
-                dtype=torch.int32,
-                device=q.device,
-            )
+    if attn_func is not None:
+        # NFUNC mask path: the func tensor fully describes the mask. The
+        # kernel forces window_size_left=-1, window_size_right=0; causal /
+        # max_attn_len are already validated to be at defaults.
+        window_size_left, window_size_right = -1, 0
     else:
-        # Legacy fixed-mask path (unchanged from PR #465).
+        # Fixed-mask path (unchanged from PR #465).
         if causal:
             if max_attn_len > 0:
                 window_size_left, window_size_right = max_attn_len, 0
@@ -480,20 +483,6 @@ def cutlass_hstu_mha(
                 window_size_left, window_size_right = -1, 0
         else:
             window_size_left, window_size_right = -1, -1
-
-        num_contexts_tensor = None
-        if contextual_seq_len > 0:
-            batch_size = seq_offsets.size(0) - 1
-            num_contexts_tensor = torch.full(
-                (batch_size,),
-                contextual_seq_len,
-                dtype=torch.int32,
-                device=q.device,
-            )
-
-        num_targets_int32 = None
-        if num_targets is not None:
-            num_targets_int32 = num_targets.to(torch.int32)
 
     if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
         return _CutlassHstuMhaFunction.apply(
@@ -509,7 +498,7 @@ def cutlass_hstu_mha(
             window_size_left,
             window_size_right,
             alpha,
-            func,
+            attn_func,
         )
     return torch.ops.tzrec.cutlass_hstu_mha_fwd(
         q,
@@ -524,5 +513,5 @@ def cutlass_hstu_mha(
         window_size_left,
         window_size_right,
         alpha,
-        func,
+        attn_func,
     )
