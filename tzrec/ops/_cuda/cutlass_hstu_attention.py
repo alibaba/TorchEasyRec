@@ -357,7 +357,7 @@ def build_sla_func_tensor(
     return func_2d.unsqueeze(0).expand(nheads, 3, total_q).contiguous()
 
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 
 @torch.fx.wrap
