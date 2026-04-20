@@ -13,6 +13,7 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -26,6 +27,27 @@ from tzrec.ops._pytorch.pt_hstu_linear import (
 from tzrec.ops.hstu_attention import hstu_mha
 from tzrec.ops.layer_norm import layer_norm
 from tzrec.ops.mm import addmm
+from tzrec.utils.logging_util import logger
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_cutlass_to_triton_uqvk() -> None:
+    logger.warning(
+        "hstu_compute_uqvk: Kernel.CUTLASS has no CUTLASS implementation "
+        "for UQVK projection; silently using Kernel.TRITON for the LN + "
+        "addmm primitives. Rematerialization flags "
+        "(recompute_uvqk_in_backward / recompute_normed_x_in_backward) "
+        "still apply. This warning is emitted once per process."
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_cutlass_to_triton_output() -> None:
+    logger.warning(
+        "hstu_compute_output: Kernel.CUTLASS has no CUTLASS implementation "
+        "for the output projection; silently using Kernel.TRITON. This "
+        "warning is emitted once per process."
+    )
 
 
 def _split_silu(
@@ -150,6 +172,7 @@ def hstu_compute_uqvk(
     The flags are no-ops outside ``torch.is_grad_enabled()`` (inference).
     """
     if kernel == Kernel.CUTLASS:
+        _warn_cutlass_to_triton_uqvk()
         kernel = Kernel.TRITON
     use_remat = torch.is_grad_enabled()
     rn = recompute_normed_x_in_backward and use_remat
@@ -233,6 +256,7 @@ def hstu_compute_output(
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
     if kernel == Kernel.CUTLASS:
+        _warn_cutlass_to_triton_output()
         kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_hstu_linear import (

@@ -13,6 +13,7 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
+import functools
 from typing import Optional
 
 import torch
@@ -24,6 +25,19 @@ from tzrec.ops._pytorch.pt_hstu_attention import (
     pytorch_hstu_mha,
 )
 from tzrec.ops.utils import switch_to_contiguous_if_needed
+from tzrec.utils.logging_util import logger
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_cutlass_fallback_local_target() -> None:
+    logger.warning(
+        "hstu_mha: requested kernel=Kernel.CUTLASS with max_attn_len>0 "
+        "combined with contextual_seq_len>0 or num_targets!=None -- the "
+        "CUTLASS Is_local dispatch does not support context/target masks "
+        "in this combination. Falling back to Kernel.TRITON for this run. "
+        "Benchmarks / memory reports for CUTLASS will not reflect this "
+        "call site."
+    )
 
 
 def hstu_mha(
@@ -95,6 +109,7 @@ def hstu_mha(
         _has_ctx_or_tgt = contextual_seq_len > 0 or num_targets is not None
         if _has_local_window and _has_ctx_or_tgt:
             kernel = Kernel.TRITON
+            _warn_cutlass_fallback_local_target()
 
     if kernel == Kernel.CUTLASS:
         # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf so
