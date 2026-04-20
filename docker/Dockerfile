@@ -40,31 +40,32 @@ RUN case ${DEVICE} in \
                  rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
-RUN case ${DEVICE} in \
-        "cu126") pip install torch==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu126 && \
-                 pip install fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu126/repo.html && \
+RUN retry_pip() { for i in 1 2 3 4 5 6 7 8; do pip install "$@" && return 0; echo "pip install retry $i failed, sleeping..."; sleep 15; done; return 1; }; \
+    case ${DEVICE} in \
+        "cu126") retry_pip torch==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu126 && \
+                 retry_pip fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu126/repo.html && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.11.0+cu126.dist-info/METADATA && \
-                 pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torch_tensorrt==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu126 --no-deps && \
-                 pip install packaging typing-extensions dllist psutil "tensorrt_cu12<10.15.0" && \
+                 retry_pip torchmetrics==1.0.3 tensordict && \
+                 retry_pip torch_tensorrt==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu126 --no-deps && \
+                 retry_pip packaging typing-extensions dllist psutil "tensorrt_cu12<10.15.0" && \
                  sed -i '/^Requires-Dist: tensorrt</d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch_tensorrt-2.11.0+cu126.dist-info/METADATA && \
-                 pip install torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html && \
+                 retry_pip torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
-        "cu129") pip install torch==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 && \
-                 pip install fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html && \
+        "cu129") retry_pip torch==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 && \
+                 retry_pip fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i '/^Requires-Dist: nvidia-/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.11.0+cu129.dist-info/METADATA && \
-                 pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torch_tensorrt==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 --no-deps && \
-                 pip install packaging typing-extensions dllist psutil "tensorrt_cu12<10.15.0" && \
+                 retry_pip torchmetrics==1.0.3 tensordict && \
+                 retry_pip torch_tensorrt==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cu129 --no-deps && \
+                 retry_pip packaging typing-extensions dllist psutil "tensorrt_cu12<10.15.0" && \
                  sed -i '/^Requires-Dist: tensorrt</d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch_tensorrt-2.11.0+cu129.dist-info/METADATA && \
-                 pip install torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html && \
+                 retry_pip torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
-        * )      pip install torch==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
-                 pip install fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cpu/repo.html && \
-                 pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html && \
+        * )      retry_pip torch==2.11.0 -f https://mirrors.aliyun.com/pytorch-wheels/cpu && \
+                 retry_pip fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cpu/repo.html && \
+                 retry_pip torchmetrics==1.0.3 tensordict && \
+                 retry_pip torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
     esac && \
     /opt/conda/bin/conda clean -ya
@@ -78,7 +79,8 @@ ADD requirements /root/requirements
 ADD requirements.txt /root/requirements.txt
 ADD requirements-${DEVICE}.txt /root/requirements-${DEVICE}.txt
 RUN cd /root && \
-    pip install -r requirements-${DEVICE}.txt && \
+    for i in 1 2 3 4 5 6 7 8; do pip install -r requirements-${DEVICE}.txt && break || (echo "pip -r retry $i failed, sleeping..." && sleep 15); done && \
+    pip show torch | grep -q "^Version: 2.11.0" && \
     rm -rf requirements requirements.txt requirements-*.txt && \
     /opt/conda/bin/conda clean -ya
 
