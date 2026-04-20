@@ -165,15 +165,22 @@ class HSTUTransducer(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
+        """Run the STU stack and return truncated metadata alongside x.
+
+        Returns:
+            ``(seq_embeddings, seq_offsets, num_targets, max_seq_len)`` -- when
+            attention truncation is enabled, the metadata reflects the
+            post-truncation state so downstream splits stay aligned with
+            ``seq_embeddings``.
+        """
         with record_function("hstu"):
-            seq_embeddings = self._stu_module(
+            return self._stu_module(
                 max_seq_len=max_seq_len,
                 x=seq_embeddings,
                 x_offsets=seq_offsets,
                 num_targets=(None if self._listwise_training else num_targets),
             )
-        return seq_embeddings
 
     def _postprocess(
         self,
@@ -260,7 +267,12 @@ class HSTUTransducer(BaseModule):
             num_targets,
         ) = self._preprocess(grouped_features)
 
-        encoded_embeddings = self._hstu_compute(
+        (
+            encoded_embeddings,
+            post_stu_seq_offsets,
+            post_stu_num_targets,
+            post_stu_max_seq_len,
+        ) = self._hstu_compute(
             max_seq_len=max_seq_len,
             seq_lengths=seq_lengths,
             seq_offsets=seq_offsets,
@@ -268,6 +280,34 @@ class HSTUTransducer(BaseModule):
             seq_embeddings=seq_embeddings,
             num_targets=num_targets,
         )
+
+        # If STUStack truncated mid-stack, the returned offsets / num_targets
+        # / max_seq_len describe the truncated embeddings. Realign the
+        # downstream postprocessing inputs (seq_lengths, seq_timestamps,
+        # total_uih_len, total_targets) so that _postprocess's jagged splits
+        # index the truncated x with matching offsets.
+        if post_stu_seq_offsets is not seq_offsets:
+            orig_seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+            new_seq_lengths = post_stu_seq_offsets[1:] - post_stu_seq_offsets[:-1]
+            head_lengths = orig_seq_lengths - new_seq_lengths
+            offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(head_lengths)
+            _, truncated_timestamps = split_2D_jagged(
+                values=seq_timestamps.unsqueeze(-1),
+                max_seq_len=max_seq_len,
+                offsets_left=offsets_head,
+                offsets_right=post_stu_seq_offsets,
+                kernel=self.kernel(),
+            )
+            seq_timestamps = truncated_timestamps.squeeze(-1)
+            seq_lengths = new_seq_lengths
+            seq_offsets = post_stu_seq_offsets
+            max_seq_len = post_stu_max_seq_len
+            if post_stu_num_targets is not None:
+                num_targets = post_stu_num_targets
+            # total_uih_len / total_targets are only used as Triton output-
+            # shape hints; recompute from the truncated state.
+            total_targets = int(num_targets.sum().item())
+            total_uih_len = int(post_stu_seq_offsets[-1].item()) - total_targets
 
         encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
             max_seq_len=max_seq_len,
