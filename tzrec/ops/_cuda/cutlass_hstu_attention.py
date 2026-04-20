@@ -337,7 +337,10 @@ def build_sla_func_tensor(
         T = num_targets.to(torch.int32)[batch_ids]  # per-position target count
     else:
         T = torch.zeros_like(pos_local)
-    H_boundary = L - T  # per-position history boundary
+    # Clamp so pathological inputs (num_targets[b] > seq_lengths[b]) can't
+    # produce a negative history boundary that would collapse every row's
+    # intervals to an empty set and silently yield NaN attention output.
+    H_boundary = torch.clamp(L - T, min=0)
 
     is_history = pos_local < H_boundary
 
@@ -409,8 +412,26 @@ def cutlass_hstu_mha(
         )
     if q.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
-            f"CUTLASS hstu_attn supports fp16, bf16, and fp8_e4m3, got {q.dtype}. "
-            f"Set train_config.mixed_precision to 'BF16', 'FP16', or 'FP8'."
+            f"CUTLASS hstu_attn supports fp16 and bf16, got {q.dtype}. "
+            f"Set train_config.mixed_precision to 'BF16' or 'FP16'."
+        )
+    if sla_k1 < 0 or sla_k2 < 0 or contextual_seq_len < 0:
+        raise ValueError(
+            f"SLA params must be non-negative; got "
+            f"sla_k1={sla_k1}, sla_k2={sla_k2}, "
+            f"contextual_seq_len={contextual_seq_len}"
+        )
+    sla_enabled = sla_k1 > 0 or sla_k2 > 0
+    if sla_enabled and not causal:
+        raise ValueError(
+            "SLA (sla_k1>0 or sla_k2>0) requires causal=True; "
+            "the SLA mask is defined only for causal attention."
+        )
+    if sla_enabled and max_attn_len > 0:
+        raise ValueError(
+            "SLA (sla_k1>0 or sla_k2>0) is mutually exclusive with "
+            f"max_attn_len (got max_attn_len={max_attn_len}); the local "
+            "causal window is already encoded by sla_k1."
         )
 
     q = q.contiguous()
