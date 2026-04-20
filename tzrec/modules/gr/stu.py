@@ -61,9 +61,10 @@ class STU(BaseModule, abc.ABC):
         x: torch.Tensor,
         x_offsets: torch.Tensor,
         max_seq_len: int,
-        num_targets: torch.Tensor,
+        num_targets: Optional[torch.Tensor],
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
+        attn_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward the layer.
 
@@ -71,9 +72,11 @@ class STU(BaseModule, abc.ABC):
             x (torch.Tensor): input sequence embedding tensor.
             x_offsets (torch.Tensor): input sequence offsets.
             max_seq_len (int): maximum sequence length.
-            num_targets (torch.Tensor): number of targets.
+            num_targets (Optional[torch.Tensor]): number of targets per batch
+                element (None in listwise-training mode).
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
+            attn_func (Optional[torch.Tensor]): pre-built NFUNC mask tensor.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
@@ -553,6 +556,18 @@ class STUStack(STU):
         self._stu_layers: torch.nn.ModuleList = torch.nn.ModuleList(modules=stu_list)
         self._truncate_split_layer: int = truncate_split_layer
         self._truncate_tail_len: int = truncate_tail_len
+        # Without this check, truncate_split_layer >= len(stu_list) silently
+        # no-ops (the loop never hits the split index) and truncation is
+        # lost without any signal.
+        if self._truncate_tail_len > 0 and not (
+            0 < self._truncate_split_layer < len(self._stu_layers)
+        ):
+            raise ValueError(
+                f"truncate_split_layer must be in (0, {len(self._stu_layers)}) "
+                f"when truncate_tail_len > 0; got truncate_split_layer="
+                f"{self._truncate_split_layer}, truncate_tail_len="
+                f"{self._truncate_tail_len}."
+            )
 
     def forward(
         self,
@@ -563,7 +578,7 @@ class STUStack(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
         attn_func: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
         """Forward stack of stu layer.
 
         Args:
@@ -580,7 +595,12 @@ class STUStack(STU):
                 is overwritten on the first iteration that needs it.
 
         Returns:
-            torch.Tensor: output sequence embedding tensor.
+            A 4-tuple ``(x, x_offsets, num_targets, max_seq_len)``.  When
+            attention truncation is enabled (``truncate_tail_len > 0``) the
+            three metadata fields reflect the post-truncation state so that
+            downstream consumers (e.g. ``HSTUTransducer._postprocess``) see
+            offsets/lengths matching the returned ``x``.  When truncation is
+            disabled the metadata equals the inputs.
         """
         seq_lengths = x_offsets[1:] - x_offsets[:-1]
         # SLA (sla_k1 > 0 or sla_k2 > 0) is only supported on the CUTLASS
@@ -675,7 +695,7 @@ class STUStack(STU):
                 kv_caching_lengths=kv_caching_lengths,
                 attn_func=cur_attn_func,
             )
-        return x
+        return x, x_offsets, num_targets, max_seq_len
 
     def cached_forward(
         self,

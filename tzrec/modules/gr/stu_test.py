@@ -133,13 +133,13 @@ class StuTest(unittest.TestCase):
             dtype=dtype,
         ).requires_grad_(True)
         x_triton = x.clone().detach().requires_grad_()
-        stu_output = stu(
+        stu_output, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
         )
-        stu_triton_output = stu_triton(
+        stu_triton_output, _, _, _ = stu_triton(
             x=x_triton,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -230,7 +230,7 @@ class StuTest(unittest.TestCase):
             device=device,
             dtype=dtype,
         ).requires_grad_(True)
-        stu_output = stu(
+        stu_output, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -254,7 +254,7 @@ class StuTest(unittest.TestCase):
             swapped_dense_x,
             [x_offsets],
         )[0].requires_grad_(True)
-        swapped_stu_output = stu(
+        swapped_stu_output, _, _, _ = stu(
             x=swapped_x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -383,7 +383,7 @@ class StuTest(unittest.TestCase):
         ).requires_grad_(True)
 
         # default forward().
-        ref_y = stu(
+        ref_y, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -411,7 +411,7 @@ class StuTest(unittest.TestCase):
             offsets_right=None,
             kernel=Kernel.TRITON,
         )
-        _ = stu(
+        _, _, _, _ = stu(
             x=prime_x,
             x_offsets=prime_offsets,
             max_seq_len=max_seq_len,
