@@ -427,5 +427,246 @@ class StuTest(unittest.TestCase):
         torch.testing.assert_close(ref_delta_y, delta_y)
 
 
+class STUStackTruncationTest(unittest.TestCase):
+    """Cover the mid-stack truncation block in STUStack.forward.
+
+    The truncation branch rewrites ``x`` / ``x_offsets`` / ``num_targets``
+    / ``max_seq_len`` and has no coverage from ``StuTest`` (which leaves
+    ``truncate_*`` at their defaults).
+    """
+
+    def _make_stack(
+        self,
+        num_layers: int,
+        truncate_split_layer: int,
+        truncate_tail_len: int,
+    ):
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        embedding_dim, num_heads, hidden_dim, attn_dim = 16, 2, 32, 32
+        stu_layers: List[STU] = [
+            STULayer(
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                hidden_dim=hidden_dim,
+                attention_dim=attn_dim,
+                output_dropout_ratio=0.0,
+                causal=True,
+                target_aware=True,
+                max_attn_len=None,
+                attn_alpha=None,
+                use_group_norm=False,
+                recompute_normed_x=False,
+                recompute_uvqk=False,
+                recompute_y=False,
+                sort_by_length=False,
+                contextual_seq_len=0,
+                is_inference=False,
+            )
+            for _ in range(num_layers)
+        ]
+        stack = STUStack(
+            stu_list=stu_layers,
+            truncate_split_layer=truncate_split_layer,
+            truncate_tail_len=truncate_tail_len,
+            is_inference=False,
+        )
+        stack.set_kernel(Kernel.PYTORCH)
+        return stack, embedding_dim
+
+    def test_init_validates_split_layer_bounds(self) -> None:
+        """C8: truncate_split_layer must be in (0, num_layers)."""
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        layer_kwargs = dict(
+            embedding_dim=16,
+            num_heads=2,
+            hidden_dim=32,
+            attention_dim=32,
+            output_dropout_ratio=0.0,
+            causal=True,
+            target_aware=True,
+            max_attn_len=None,
+            attn_alpha=None,
+            use_group_norm=False,
+            recompute_normed_x=False,
+            recompute_uvqk=False,
+            recompute_y=False,
+            sort_by_length=False,
+            contextual_seq_len=0,
+            is_inference=False,
+        )
+        stu_list: List[STU] = [STULayer(**layer_kwargs) for _ in range(3)]
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=0,  # invalid: must be > 0
+                truncate_tail_len=4,
+            )
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=3,  # invalid: must be < len(stu_list)
+                truncate_tail_len=4,
+            )
+        # Valid configurations must not raise.
+        STUStack(stu_list=stu_list, truncate_split_layer=1, truncate_tail_len=4)
+        # truncate_tail_len == 0 disables truncation; split_layer is free.
+        STUStack(stu_list=stu_list, truncate_split_layer=99, truncate_tail_len=0)
+
+    def _forward_and_check_truncation(
+        self,
+        x_lengths: torch.Tensor,
+        num_targets_val,
+        truncate_tail_len: int,
+    ):
+        stack, D = self._make_stack(
+            num_layers=3,
+            truncate_split_layer=1,
+            truncate_tail_len=truncate_tail_len,
+        )
+        B = x_lengths.size(0)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        total = int(x_offsets[-1].item())
+        x = torch.randn(total, D)
+        max_seq_len = int(x_lengths.max().item())
+        num_targets = (
+            torch.full((B,), num_targets_val, dtype=torch.int64)
+            if num_targets_val is not None
+            else None
+        )
+        out, new_offsets, new_num_targets, new_max_seq_len = stack(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        return (
+            out,
+            new_offsets,
+            new_num_targets,
+            new_max_seq_len,
+            x_lengths,
+            num_targets,
+        )
+
+    def test_truncation_applied_when_seq_longer_than_tail(self) -> None:
+        """Sequences longer than tail_len are truncated; shorter ones pass."""
+        x_lengths = torch.tensor([12, 20, 5, 30], dtype=torch.int64)
+        tail_len = 8
+        (
+            out,
+            new_offsets,
+            new_num_targets,
+            new_max_seq_len,
+            orig_lengths,
+            _,
+        ) = self._forward_and_check_truncation(x_lengths, 2, tail_len)
+        expected_lengths = torch.clamp(x_lengths, max=tail_len)
+        new_lengths = new_offsets[1:] - new_offsets[:-1]
+        self.assertEqual(new_max_seq_len, tail_len)
+        torch.testing.assert_close(new_lengths, expected_lengths)
+        # Total tokens in x matches sum of new lengths.
+        self.assertEqual(out.size(0), int(expected_lengths.sum().item()))
+        # num_targets is clamped when it exceeds the truncated length.
+        assert new_num_targets is not None
+        torch.testing.assert_close(
+            new_num_targets,
+            torch.clamp(torch.full_like(new_lengths, 2), max=new_lengths),
+        )
+
+    def test_truncation_no_op_when_all_shorter(self) -> None:
+        """Sequences all shorter than tail_len: x unchanged in shape."""
+        x_lengths = torch.tensor([3, 5, 2], dtype=torch.int64)
+        tail_len = 16
+        out, new_offsets, _, new_max_seq_len, _, _ = self._forward_and_check_truncation(
+            x_lengths, 1, tail_len
+        )
+        orig_total = int(x_lengths.sum().item())
+        self.assertEqual(out.size(0), orig_total)
+        # max_seq_len is still updated to tail_len (post-truncation cap).
+        self.assertEqual(new_max_seq_len, tail_len)
+
+    def test_num_targets_clamped(self) -> None:
+        """num_targets > new_length gets clamped to new_length."""
+        x_lengths = torch.tensor([12, 20, 6], dtype=torch.int64)
+        tail_len = 4
+        # num_targets=10 exceeds tail_len=4; should be clamped to 4 for all.
+        _, new_offsets, new_num_targets, _, _, _ = self._forward_and_check_truncation(
+            x_lengths, 10, tail_len
+        )
+        assert new_num_targets is not None
+        new_lengths = new_offsets[1:] - new_offsets[:-1]
+        expected = torch.clamp(torch.full_like(new_lengths, 10), max=new_lengths)
+        torch.testing.assert_close(new_num_targets, expected)
+
+    def test_num_targets_none_is_preserved(self) -> None:
+        """num_targets=None stays None through truncation."""
+        x_lengths = torch.tensor([10, 14, 6], dtype=torch.int64)
+        tail_len = 5
+        _, _, new_num_targets, _, _, _ = self._forward_and_check_truncation(
+            x_lengths, None, tail_len
+        )
+        self.assertIsNone(new_num_targets)
+
+    def test_return_signature_is_four_tuple(self) -> None:
+        """Forward always returns a 4-tuple.
+
+        Even when truncation is disabled; callers must unpack.
+        """
+        stack, D = self._make_stack(
+            num_layers=2,
+            truncate_split_layer=0,
+            truncate_tail_len=0,
+        )
+        x_lengths = torch.tensor([4, 6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), D)
+        out = stack(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=6,
+            num_targets=torch.tensor([1, 2], dtype=torch.int64),
+        )
+        self.assertEqual(len(out), 4)
+        returned_x, returned_offsets, returned_num_targets, returned_max = out
+        # No truncation: offsets/max are the inputs, num_targets preserved.
+        torch.testing.assert_close(returned_offsets, x_offsets)
+        self.assertEqual(returned_max, 6)
+        self.assertEqual(returned_x.size(0), x.size(0))
+        assert returned_num_targets is not None
+
+    def test_sla_on_non_cutlass_kernel_raises(self) -> None:
+        """C4: STUStack surfaces SLA-with-non-CUTLASS as a loud error."""
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        stu_list: List[STU] = [
+            STULayer(
+                embedding_dim=16,
+                num_heads=2,
+                hidden_dim=32,
+                attention_dim=32,
+                causal=True,
+                target_aware=True,
+                sla_k1=8,
+                sla_k2=4,
+                contextual_seq_len=0,
+                is_inference=False,
+            )
+        ]
+        stack = STUStack(stu_list=stu_list)
+        stack.set_kernel(Kernel.PYTORCH)  # not CUTLASS
+        x_lengths = torch.tensor([6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), 16)
+        with self.assertRaisesRegex(ValueError, "SLA requires Kernel.CUTLASS"):
+            stack(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=6,
+                num_targets=torch.tensor([1], dtype=torch.int64),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
