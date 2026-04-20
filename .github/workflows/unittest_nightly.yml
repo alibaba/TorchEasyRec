@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 480
     container:
       image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-test:1.2
-      options: --gpus all --ipc host
+      options: --gpus all --ipc host --ulimit memlock=-1
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
         uses: actions/checkout@v4

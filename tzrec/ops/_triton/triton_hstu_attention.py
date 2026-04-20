@@ -20,7 +20,6 @@ import torch
 import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
-from triton.language.extra.libdevice import fast_dividef
 from triton.runtime.autotuner import autotune as triton_autotune
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -325,7 +324,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
             (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
         )
     scale = tl.where(invalid_mask, (1.0 / MAX_SEQ_LEN), 0.0)
-    silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * scale
+    silu = qk * tl.sigmoid(qk) * scale
     v = None
     if ENABLE_TMA:
         v = V.load(
@@ -752,7 +751,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
             other=0.0,
         )
     qk_trans = tl.dot(k, q_trans, allow_tf32=ALLOW_TF32) * alpha
-    sig_trans = fast_dividef(1.0, 1.0 + tl.exp(-qk_trans))
+    sig_trans = tl.sigmoid(qk_trans)
     silu_trans = qk_trans * sig_trans * (1.0 / MAX_SEQ_LEN)
     pos_offs_m_minus_n = pos_offs_m[None, :] - pos_offs_n[:, None]
     if not CAUSAL:

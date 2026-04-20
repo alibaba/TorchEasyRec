@@ -778,8 +778,29 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         global_constraints: Optional[ParameterConstraints] = None,
     ) -> None:
         if not estimator:
+            perf_estimator = EmbeddingPerfEstimator(
+                topology=topology, constraints=constraints
+            )
+            if has_dynamicemb:
+                # torchrec 1.6 raises ValueError when its hardware-aware perf
+                # estimator sees an unrecognized compute kernel. dynamicemb
+                # registers its own CUSTOMIZED_KERNEL which is not in torchrec's
+                # kernel_bw_lookup, so we inject a bandwidth override for it —
+                # approximated as fused_uvm_caching-like since dynamicemb is
+                # HBM+HKV caching.
+                inner_cfg = perf_estimator._estimator._config
+                customized_bw = (
+                    0.2 * topology.hbm_mem_bw + 0.8 * topology.hbm_to_ddr_mem_bw
+                ) / 10
+                inner_cfg.kernel_device_bandwidths = {
+                    **inner_cfg.kernel_device_bandwidths,
+                    (
+                        "cuda",
+                        EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+                    ): customized_bw,
+                }
             estimator: List[ShardEstimator] = [
-                EmbeddingPerfEstimator(topology=topology, constraints=constraints),
+                perf_estimator,
                 EmbeddingStorageEstimator(topology=topology, constraints=constraints),
             ]
         super().__init__(
