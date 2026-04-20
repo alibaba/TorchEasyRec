@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-set -e
-#!/usr/bin/env bash
+set -eo pipefail
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 REPO_NAME=tzrec-test
