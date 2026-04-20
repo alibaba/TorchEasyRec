@@ -20,6 +20,7 @@ import torch
 from torch.autograd.profiler import record_function
 
 from tzrec.modules.utils import BaseModule
+from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention import delta_hstu_mha
 from tzrec.ops.hstu_compute import (
     hstu_compute_output,
@@ -581,6 +582,19 @@ class STUStack(STU):
             torch.Tensor: output sequence embedding tensor.
         """
         seq_lengths = x_offsets[1:] - x_offsets[:-1]
+        # SLA (sla_k1 > 0 or sla_k2 > 0) is only supported on the CUTLASS
+        # kernel.  Surface a loud error instead of silently dropping the
+        # mask when a layer's kernel and SLA config disagree.
+        for layer in self._stu_layers:
+            if (
+                getattr(layer, "_sla_k1", 0) > 0 or getattr(layer, "_sla_k2", 0) > 0
+            ) and layer.kernel() != Kernel.CUTLASS:
+                raise ValueError(
+                    f"STULayer has SLA enabled (sla_k1="
+                    f"{getattr(layer, '_sla_k1', 0)}, sla_k2="
+                    f"{getattr(layer, '_sla_k2', 0)}) but kernel is "
+                    f"{layer.kernel()}.  SLA requires Kernel.CUTLASS."
+                )
         # Hoist SLA func construction out of the per-layer attention op so
         # a stack of N layers doesn't rebuild the same (nheads, 3, total_q)
         # tensor N times per forward.  We memoize on the SLA config +
