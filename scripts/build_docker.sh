@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-set -e
-#!/usr/bin/env bash
+set -eo pipefail
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
-REPO_NAME=tzrec-devel
-DOCKER_TAG=1.1
+REPO_NAME=tzrec-test
+DOCKER_TAG=1.2
 DOCKER_TAG_SUFFIX=
 
 rm -rf docker/requirements*
@@ -19,6 +18,4 @@ do
 done
 
 docker images -q ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-cu129${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
-docker images -q ${REGISTRY}${REPO_NAME}:${DOCKER_TAG}-cu129${DOCKER_TAG_SUFFIX} | xargs -I {} docker tag {} ${REGISTRY}/${REPO_NAME}:latest
 docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}${DOCKER_TAG_SUFFIX}
-docker push ${REGISTRY}/${REPO_NAME}:latest
