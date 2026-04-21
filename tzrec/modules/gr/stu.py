@@ -377,28 +377,14 @@ class STULayer(STU):
                 element (None in listwise-training mode).
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
-            attn_func (Optional[torch.Tensor]): pre-built arbitrary-mask func
-                tensor for the CUTLASS NFUNC path. When ``None`` and SLA is
-                enabled on this layer (``self._sla_k1 > 0 or self._sla_k2 >
-                0``), it is built from ``self._sla_*`` / ``x_offsets`` /
-                ``num_targets``. When supplied by the caller (typically
-                ``STUStack.forward`` which hoists construction to batch
-                scope) the build is skipped.
+            attn_func (Optional[torch.Tensor]): pre-built NFUNC mask tensor
+                for the CUTLASS arbitrary-mask path.  ``STUStack.forward``
+                is responsible for constructing it when SLA is enabled on
+                the layer; STULayer itself does not auto-build.
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
-        if attn_func is None and (self._sla_k1 > 0 or self._sla_k2 > 0):
-            attn_func = build_sla_func_tensor(
-                nheads=self._num_heads,
-                sla_k1=self._sla_k1,
-                sla_k2=self._sla_k2,
-                seq_offsets=x_offsets,
-                total_q=x.size(0),
-                num_targets=num_targets if self._target_aware else None,
-                contextual_seq_len=self._contextual_seq_len,
-            )
-
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,

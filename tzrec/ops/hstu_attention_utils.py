@@ -193,7 +193,6 @@ def apply_stu_truncation(
 
     if contextual_seq_len > 0:
         B = seq_lengths.size(0)
-        # Step 1: peel off [contextual | rest-of-sequence].
         offsets_prefix = (
             torch.arange(B + 1, device=x.device, dtype=x_offsets.dtype)
             * contextual_seq_len
@@ -206,8 +205,6 @@ def apply_stu_truncation(
             offsets_right=offsets_rest,
             kernel=kernel,
         )
-        # Step 2: drop the UIH head of the rest; keep the rest tail
-        # (kept UIH + targets).
         rest_tail_lengths = new_lengths - contextual_seq_len
         offsets_rest_head = torch.ops.fbgemm.asynchronous_complete_cumsum(drop_count)
         offsets_rest_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
@@ -220,8 +217,6 @@ def apply_stu_truncation(
             offsets_right=offsets_rest_tail,
             kernel=kernel,
         )
-        # Step 3: re-join [contextual | rest_tail].  ``max_seq_len - C``
-        # is a safe upper bound on the rest-tail length per sample.
         x = concat_2D_jagged(
             values_left=x_prefix,
             values_right=x_rest_kept,

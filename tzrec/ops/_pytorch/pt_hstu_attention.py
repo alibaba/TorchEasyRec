@@ -147,7 +147,7 @@ def _decode_attn_func_to_mask(
     torch._assert(three == 3, "attn_func must have shape (H, 3, total_q)")
     # Fold (H, 3) into channels so we can use jagged_to_padded_dense with
     # the (total_q, C) 2D layout; unfold after padding.
-    padded_flat = attn_func.permute(2, 0, 1).reshape(total_q, H * 3).to(torch.int32)
+    padded_flat = attn_func.permute(2, 0, 1).reshape(total_q, H * 3)
     padded = torch.ops.fbgemm.jagged_to_padded_dense(
         values=padded_flat,
         offsets=[seq_offsets],
