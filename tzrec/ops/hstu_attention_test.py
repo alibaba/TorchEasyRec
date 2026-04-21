@@ -523,6 +523,171 @@ class HSTUAttentionTest(unittest.TestCase):
     # CUTLASS implementation and falls back to Triton internally. The
     # delta/cached path is already covered by ``test_delta_attn_triton``.
 
+    @unittest.skipIf(*gpu_unavailable)
+    @given(
+        batch_size=st.sampled_from([1, 4]),
+        heads=st.sampled_from([1, 4]),
+        max_uih_len=st.sampled_from([64, 128]),
+        max_targets=st.sampled_from([1, 4]),
+        attn_dim=st.sampled_from([32, 64]),
+        # Include sla_k1==0 (pure global-prefix) and sla_k2==0 (pure
+        # local-window) asymmetric cases in addition to the original
+        # both-nonzero combinations.
+        sla_k1=st.sampled_from([0, 16, 32]),
+        sla_k2=st.sampled_from([0, 4, 8]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        contextual_seq_len=st.sampled_from([0, 4]),
+        # Sample both bf16 and fp16 -- fp8 is deferred to ultra-hstu-fp8.
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=60,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_sla_attn_cutlass(
+        self,
+        sla_k1: int,
+        sla_k2: int,
+        *args,
+        **kwargs,
+    ) -> None:
+        """SLA parity: CUTLASS NFUNC path vs PyTorch reference."""
+        # Skip the degenerate (0, 0) point -- that's the no-SLA path.
+        if sla_k1 == 0 and sla_k2 == 0:
+            return
+        hidden_dim = kwargs.pop("attn_dim")
+        test_sla_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            test_backward=True,
+            real_kernel=Kernel.CUTLASS,
+        )
+
+    def test_sla_matches_fixed_causal_when_k1_spans_full_window(self) -> None:
+        """CPU coverage of ``pytorch_hstu_mha(attn_func=...)``.
+
+        An SLA func with ``sla_k1 >= N, sla_k2 = 0`` and no targets /
+        contextual prefix must reproduce plain causal attention. Runs
+        without CUDA so every CI lane exercises the NFUNC decode.
+        """
+        from tzrec.ops._pytorch.pt_hstu_attention import pytorch_hstu_mha
+        from tzrec.ops.attention_utils import build_sla_func_tensor
+
+        torch.manual_seed(0)
+        H, D = 2, 16
+        lengths = torch.tensor([5, 7], dtype=torch.int64)
+        seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        L = int(seq_offsets[-1].item())
+        q = torch.randn(L, H, D)
+        k = torch.randn(L, H, D)
+        v = torch.randn(L, H, D)
+        N = int(lengths.max().item())
+        alpha = 1.0 / (D**0.5)
+
+        out_fixed = pytorch_hstu_mha(
+            max_seq_len=N,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=True,
+        )
+        attn_func = build_sla_func_tensor(
+            nheads=H,
+            sla_k1=N,
+            sla_k2=0,
+            seq_offsets=seq_offsets,
+            total_q=L,
+        )
+        out_sla = pytorch_hstu_mha(
+            max_seq_len=N,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            attn_func=attn_func,
+        )
+        torch.testing.assert_close(out_sla, out_fixed)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_float32_rejected_by_cutlass(self) -> None:
+        """T3: CUTLASS dispatch must reject unsupported dtypes."""
+        from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
+
+        q = torch.randn(8, 2, 16, device="cuda", dtype=torch.float32)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "supports fp16 and bf16"):
+            cutlass_hstu_mha(
+                max_seq_len=4,
+                alpha=0.25,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_negative_sla_params_rejected(self) -> None:
+        """C2: build_sla_func_tensor rejects negative params."""
+        from tzrec.ops.attention_utils import build_sla_func_tensor
+
+        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            build_sla_func_tensor(
+                nheads=2,
+                sla_k1=-1,
+                sla_k2=4,
+                seq_offsets=seq_offsets,
+                total_q=8,
+            )
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            build_sla_func_tensor(
+                nheads=2,
+                sla_k1=8,
+                sla_k2=4,
+                seq_offsets=seq_offsets,
+                total_q=8,
+                contextual_seq_len=-3,
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_attn_func_rejected_on_triton(self) -> None:
+        """C4: hstu_mha rejects attn_func on Kernel.TRITON.
+
+        CUTLASS (production) and PYTORCH (reference) both honor the
+        NFUNC path; only Triton has no arbitrary-mask kernel.
+        """
+        from tzrec.ops.hstu_attention import hstu_mha
+
+        q = torch.randn(8, 2, 16, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        # Minimal valid func tensor shape -- content doesn't matter; the
+        # dispatch check runs before any kernel call.
+        attn_func = torch.zeros((2, 3, 8), dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
+            hstu_mha(
+                max_seq_len=4,
+                alpha=0.25,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                causal=True,
+                kernel=Kernel.TRITON,
+                attn_func=attn_func,
+            )
+
 
 def test_sla_attn(
     batch_size: int,
@@ -543,8 +708,8 @@ def test_sla_attn(
     """Test SLA with contextual prefix and target isolation."""
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    from tzrec.ops._cuda.cutlass_hstu_attention import build_sla_func_tensor
     from tzrec.ops._pytorch.pt_hstu_attention import pytorch_hstu_mha
+    from tzrec.ops.attention_utils import build_sla_func_tensor
     from tzrec.ops.hstu_attention import hstu_mha
 
     alpha = 1.0 / (attn_dim**0.5)
@@ -638,186 +803,6 @@ def test_sla_attn(
 
     gc.collect()
     torch.cuda.empty_cache()
-
-
-class HstuSLAAttnTest(unittest.TestCase):
-    @unittest.skipIf(*gpu_unavailable)
-    @given(
-        batch_size=st.sampled_from([1, 4]),
-        heads=st.sampled_from([1, 4]),
-        max_uih_len=st.sampled_from([64, 128]),
-        max_targets=st.sampled_from([1, 4]),
-        attn_dim=st.sampled_from([32, 64]),
-        # Include sla_k1==0 (pure global-prefix) and sla_k2==0 (pure
-        # local-window) asymmetric cases in addition to the original
-        # both-nonzero combinations.
-        sla_k1=st.sampled_from([0, 16, 32]),
-        sla_k2=st.sampled_from([0, 4, 8]),
-        has_multiple_targets=st.sampled_from([True, False]),
-        contextual_seq_len=st.sampled_from([0, 4]),
-        # Sample both bf16 and fp16 -- fp8 is deferred to ultra-hstu-fp8.
-        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
-    )
-    @settings(
-        verbosity=Verbosity.verbose,
-        max_examples=60,
-        deadline=None,
-    )
-    # pyre-ignore[2]
-    def test_sla_attn_cutlass(
-        self,
-        sla_k1: int,
-        sla_k2: int,
-        *args,
-        **kwargs,
-    ) -> None:
-        # Skip the degenerate (0, 0) point -- that's the no-SLA path.
-        if sla_k1 == 0 and sla_k2 == 0:
-            return
-        hidden_dim = kwargs.pop("attn_dim")
-        test_sla_attn(
-            *args,
-            **kwargs,
-            attn_dim=hidden_dim,
-            sla_k1=sla_k1,
-            sla_k2=sla_k2,
-            test_backward=True,
-            real_kernel=Kernel.CUTLASS,
-        )
-
-
-class PytorchAttnFuncTest(unittest.TestCase):
-    """Exercise ``pytorch_hstu_mha(attn_func=...)`` on CPU.
-
-    Runs without CUDA so the SLA decode path gets coverage on every CI
-    lane, not just GPU lanes.  Compares against the legacy fixed-mask
-    path: an SLA func with ``sla_k1`` large enough to span the full
-    window and ``sla_k2=0`` must reproduce plain causal attention.
-    """
-
-    def test_sla_matches_fixed_causal_when_k1_spans_full_window(self) -> None:
-        from tzrec.ops._cuda.cutlass_hstu_attention import (
-            build_sla_func_tensor,
-        )
-        from tzrec.ops._pytorch.pt_hstu_attention import pytorch_hstu_mha
-
-        torch.manual_seed(0)
-        H, D = 2, 16
-        lengths = torch.tensor([5, 7], dtype=torch.int64)
-        seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-        L = int(seq_offsets[-1].item())
-        q = torch.randn(L, H, D)
-        k = torch.randn(L, H, D)
-        v = torch.randn(L, H, D)
-        N = int(lengths.max().item())
-        alpha = 1.0 / (D**0.5)
-
-        # Fixed-mask reference: plain causal.
-        out_fixed = pytorch_hstu_mha(
-            max_seq_len=N,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            causal=True,
-        )
-
-        # SLA with K1 >= N reproduces plain causal (every causal key is
-        # inside the local window); no contextual, no targets.
-        attn_func = build_sla_func_tensor(
-            nheads=H,
-            sla_k1=N,
-            sla_k2=0,
-            seq_offsets=seq_offsets,
-            total_q=L,
-        )
-        out_sla = pytorch_hstu_mha(
-            max_seq_len=N,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            attn_func=attn_func,
-        )
-        torch.testing.assert_close(out_sla, out_fixed)
-
-
-class HstuAttnNegativeTests(unittest.TestCase):
-    """Reject invalid inputs loudly (T2, T3)."""
-
-    @unittest.skipIf(*gpu_unavailable)
-    def test_float32_rejected_by_cutlass(self) -> None:
-        """T3: CUTLASS dispatch must reject unsupported dtypes."""
-        from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
-
-        q = torch.randn(8, 2, 16, device="cuda", dtype=torch.float32)
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
-        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
-        with self.assertRaisesRegex(ValueError, "supports fp16 and bf16"):
-            cutlass_hstu_mha(
-                max_seq_len=4,
-                alpha=0.25,
-                q=q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-            )
-
-    @unittest.skipIf(*gpu_unavailable)
-    def test_negative_sla_params_rejected(self) -> None:
-        """C2: build_sla_func_tensor rejects negative params."""
-        from tzrec.ops._cuda.cutlass_hstu_attention import build_sla_func_tensor
-
-        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
-        with self.assertRaisesRegex(ValueError, "non-negative"):
-            build_sla_func_tensor(
-                nheads=2,
-                sla_k1=-1,
-                sla_k2=4,
-                seq_offsets=seq_offsets,
-                total_q=8,
-            )
-        with self.assertRaisesRegex(ValueError, "non-negative"):
-            build_sla_func_tensor(
-                nheads=2,
-                sla_k1=8,
-                sla_k2=4,
-                seq_offsets=seq_offsets,
-                total_q=8,
-                contextual_seq_len=-3,
-            )
-
-    @unittest.skipIf(*gpu_unavailable)
-    def test_attn_func_rejected_on_triton(self) -> None:
-        """C4: hstu_mha rejects attn_func on Kernel.TRITON.
-
-        CUTLASS (production) and PYTORCH (reference) both honor the
-        NFUNC path; only Triton has no arbitrary-mask kernel.
-        """
-        from tzrec.ops.hstu_attention import hstu_mha
-
-        q = torch.randn(8, 2, 16, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
-        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
-        # Minimal valid func tensor shape -- content doesn't matter; the
-        # dispatch check runs before any kernel call.
-        attn_func = torch.zeros((2, 3, 8), dtype=torch.int32, device="cuda")
-        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
-            hstu_mha(
-                max_seq_len=4,
-                alpha=0.25,
-                q=q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-                causal=True,
-                kernel=Kernel.TRITON,
-                attn_func=attn_func,
-            )
 
 
 if __name__ == "__main__":

@@ -385,9 +385,7 @@ class STULayer(STU):
             torch.Tensor: output sequence embedding tensor.
         """
         if attn_func is None and (self._sla_k1 > 0 or self._sla_k2 > 0):
-            from tzrec.ops._cuda.cutlass_hstu_attention import (
-                build_sla_func_tensor,
-            )
+            from tzrec.ops.attention_utils import build_sla_func_tensor
 
             attn_func = build_sla_func_tensor(
                 nheads=self._num_heads,
@@ -670,9 +668,7 @@ class STUStack(STU):
                     id(x_offsets),
                 )
                 if sig != attn_func_sig:
-                    from tzrec.ops._cuda.cutlass_hstu_attention import (
-                        build_sla_func_tensor,
-                    )
+                    from tzrec.ops.attention_utils import build_sla_func_tensor
 
                     cur_attn_func = build_sla_func_tensor(
                         nheads=nheads,
