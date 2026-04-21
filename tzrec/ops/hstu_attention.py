@@ -95,10 +95,11 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if attn_func is not None and kernel != Kernel.CUTLASS:
+    if attn_func is not None and kernel == Kernel.TRITON:
         raise ValueError(
-            "attn_func (arbitrary-mask NFUNC path) is only supported on "
-            f"Kernel.CUTLASS; got kernel={kernel}."
+            "attn_func (arbitrary-mask NFUNC path) is not supported on "
+            "Kernel.TRITON. Use Kernel.CUTLASS for production training or "
+            "Kernel.PYTORCH for the reference implementation."
         )
 
     if kernel == Kernel.CUTLASS and attn_func is None:
@@ -183,6 +184,7 @@ def hstu_mha(
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             min_full_attn_seq_len=min_full_attn_seq_len,
+            attn_func=attn_func,
         )
 
 

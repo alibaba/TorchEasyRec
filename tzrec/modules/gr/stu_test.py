@@ -636,8 +636,12 @@ class STUStackTruncationTest(unittest.TestCase):
         self.assertEqual(returned_x.size(0), x.size(0))
         assert returned_num_targets is not None
 
-    def test_sla_on_non_cutlass_kernel_raises(self) -> None:
-        """C4: STUStack surfaces SLA-with-non-CUTLASS as a loud error."""
+    def test_sla_on_triton_kernel_raises(self) -> None:
+        """C4: STUStack surfaces SLA-on-Kernel.TRITON as a loud error.
+
+        CUTLASS and PyTorch both support the NFUNC path; Triton does
+        not, so SLA + Kernel.TRITON must raise before any kernel call.
+        """
         from tzrec.modules.gr.stu import STU, STULayer, STUStack
 
         stu_list: List[STU] = [
@@ -655,11 +659,11 @@ class STUStackTruncationTest(unittest.TestCase):
             )
         ]
         stack = STUStack(stu_list=stu_list)
-        stack.set_kernel(Kernel.PYTORCH)  # not CUTLASS
+        stack.set_kernel(Kernel.TRITON)  # not supported for SLA
         x_lengths = torch.tensor([6], dtype=torch.int64)
         x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
         x = torch.randn(int(x_offsets[-1].item()), 16)
-        with self.assertRaisesRegex(ValueError, "SLA requires Kernel.CUTLASS"):
+        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
             stack(
                 x=x,
                 x_offsets=x_offsets,
