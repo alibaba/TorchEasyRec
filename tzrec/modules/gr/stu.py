@@ -566,6 +566,113 @@ class STUStack(STU):
                 f"{self._truncate_split_layer}, truncate_tail_len="
                 f"{self._truncate_tail_len}."
             )
+        # The contextual prefix must fit inside the kept tail (with at
+        # least one slot for UIH/targets). The prefix is preserved through
+        # truncation, so a tail too short to hold it is a config error.
+        if self._truncate_tail_len > 0:
+            ctx_len = getattr(self._stu_layers[0], "_contextual_seq_len", 0)
+            if ctx_len >= self._truncate_tail_len:
+                raise ValueError(
+                    f"truncate_tail_len ({self._truncate_tail_len}) must be "
+                    f"strictly greater than contextual_seq_len ({ctx_len}); "
+                    f"the contextual prefix is preserved by truncation and "
+                    f"the tail must leave room for at least one UIH/target "
+                    f"token."
+                )
+
+    def _apply_truncation(
+        self,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        num_targets: Optional[torch.Tensor],
+        max_seq_len: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        int,
+    ]:
+        """Drop the UIH head while preserving the contextual prefix.
+
+        The pre-truncation layout per sample is
+        ``[contextual(C) | UIH(U) | targets(T)]`` with ``L_b = C + U + T``.
+        With ``new_length_b = min(L_b, tail_len)``, the kept layout is
+        ``[contextual | last (new_length_b - C) of UIH+targets]``.
+
+        This is a three-part keep-drop-keep slice per sample, so it is
+        implemented as ``split_2D_jagged`` (peel off the prefix) +
+        ``split_2D_jagged`` (drop the rest's head) + ``concat_2D_jagged``
+        (re-join). When ``contextual_seq_len == 0`` the prefix step is
+        skipped and a single split suffices.
+
+        Returns the post-truncation tuple
+        ``(x, x_offsets, seq_lengths, num_targets, max_seq_len)``.
+        """
+        new_lengths = torch.clamp(seq_lengths, max=self._truncate_tail_len)
+        contextual_seq_len: int = getattr(self._stu_layers[0], "_contextual_seq_len", 0)
+        if contextual_seq_len > 0:
+            B = seq_lengths.size(0)
+            # Step 1: peel off [contextual | rest-of-sequence].
+            offsets_prefix = (
+                torch.arange(B + 1, device=x.device, dtype=x_offsets.dtype)
+                * contextual_seq_len
+            )
+            offsets_rest = x_offsets - offsets_prefix
+            x_prefix, x_rest = split_2D_jagged(
+                values=x,
+                max_seq_len=max_seq_len,
+                offsets_left=offsets_prefix,
+                offsets_right=offsets_rest,
+                kernel=self.kernel(),
+            )
+            # Step 2: drop the head of the rest; keep its tail.
+            rest_head_lengths = seq_lengths - new_lengths
+            rest_tail_lengths = new_lengths - contextual_seq_len
+            offsets_rest_head = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                rest_head_lengths
+            )
+            offsets_rest_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                rest_tail_lengths
+            )
+            _, x_rest_kept = split_2D_jagged(
+                values=x_rest,
+                max_seq_len=max_seq_len - contextual_seq_len,
+                offsets_left=offsets_rest_head,
+                offsets_right=offsets_rest_tail,
+                kernel=self.kernel(),
+            )
+            # Step 3: re-join [contextual | rest_tail].
+            x = concat_2D_jagged(
+                values_left=x_prefix,
+                values_right=x_rest_kept,
+                max_len_left=contextual_seq_len,
+                max_len_right=self._truncate_tail_len - contextual_seq_len,
+                offsets_left=offsets_prefix,
+                offsets_right=offsets_rest_tail,
+                kernel=self.kernel(),
+            )
+            x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
+        else:
+            head_lengths = seq_lengths - new_lengths
+            offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(head_lengths)
+            offsets_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
+            _, x = split_2D_jagged(
+                values=x,
+                max_seq_len=max_seq_len,
+                offsets_left=offsets_head,
+                offsets_right=offsets_tail,
+                kernel=self.kernel(),
+            )
+            x_offsets = offsets_tail
+        seq_lengths = new_lengths
+        if num_targets is not None:
+            # Targets live in the kept rest-tail; clamp so the reported
+            # num_targets never exceeds the available (post-truncation)
+            # slots.
+            num_targets = torch.clamp(num_targets, max=new_lengths - contextual_seq_len)
+        return x, x_offsets, seq_lengths, num_targets, self._truncate_tail_len
 
     def forward(
         self,
@@ -629,29 +736,15 @@ class STUStack(STU):
                 and self._truncate_split_layer > 0
                 and self._truncate_tail_len > 0
             ):
-                # Attention truncation: keep only the last tail_len tokens per
-                # sequence by splitting into head (drop) + tail (keep) and
-                # taking the right (tail) output.
-                new_lengths = torch.clamp(seq_lengths, max=self._truncate_tail_len)
-                head_lengths = seq_lengths - new_lengths
-                offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    head_lengths
+                x, x_offsets, seq_lengths, num_targets, max_seq_len = (
+                    self._apply_truncation(
+                        x=x,
+                        x_offsets=x_offsets,
+                        seq_lengths=seq_lengths,
+                        num_targets=num_targets,
+                        max_seq_len=max_seq_len,
+                    )
                 )
-                offsets_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    new_lengths
-                )
-                _, x = split_2D_jagged(
-                    values=x,
-                    max_seq_len=max_seq_len,
-                    offsets_left=offsets_head,
-                    offsets_right=offsets_tail,
-                    kernel=self.kernel(),
-                )
-                x_offsets = offsets_tail
-                seq_lengths = new_lengths
-                if num_targets is not None:
-                    num_targets = torch.clamp(num_targets, max=new_lengths)
-                max_seq_len = self._truncate_tail_len
 
             sla_k1 = getattr(layer, "_sla_k1", 0)
             sla_k2 = getattr(layer, "_sla_k2", 0)

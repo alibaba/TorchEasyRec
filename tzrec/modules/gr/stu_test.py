@@ -440,6 +440,7 @@ class STUStackTruncationTest(unittest.TestCase):
         num_layers: int,
         truncate_split_layer: int,
         truncate_tail_len: int,
+        contextual_seq_len: int = 0,
     ):
         from tzrec.modules.gr.stu import STU, STULayer, STUStack
 
@@ -460,7 +461,7 @@ class STUStackTruncationTest(unittest.TestCase):
                 recompute_uvqk=False,
                 recompute_y=False,
                 sort_by_length=False,
-                contextual_seq_len=0,
+                contextual_seq_len=contextual_seq_len,
                 is_inference=False,
             )
             for _ in range(num_layers)
@@ -635,6 +636,116 @@ class STUStackTruncationTest(unittest.TestCase):
         self.assertEqual(returned_max, 6)
         self.assertEqual(returned_x.size(0), x.size(0))
         assert returned_num_targets is not None
+
+    def test_init_rejects_tail_len_at_or_below_contextual(self) -> None:
+        """truncate_tail_len must be strictly greater than contextual_seq_len."""
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        stu_list: List[STU] = [
+            STULayer(
+                embedding_dim=16,
+                num_heads=2,
+                hidden_dim=32,
+                attention_dim=32,
+                contextual_seq_len=8,
+                is_inference=False,
+            )
+            for _ in range(3)
+        ]
+        # tail_len equal to contextual_seq_len leaves no room for UIH/targets.
+        with self.assertRaisesRegex(ValueError, "contextual_seq_len"):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=1,
+                truncate_tail_len=8,
+            )
+        # tail_len smaller than contextual_seq_len would chop the prefix.
+        with self.assertRaisesRegex(ValueError, "contextual_seq_len"):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=1,
+                truncate_tail_len=4,
+            )
+        # Strictly-greater is fine.
+        STUStack(
+            stu_list=stu_list,
+            truncate_split_layer=1,
+            truncate_tail_len=12,
+        )
+
+    def test_truncation_preserves_contextual_prefix(self) -> None:
+        """Apply ``_apply_truncation`` directly and verify content.
+
+        Marks each token slot with a unique id so we can check, after
+        truncation, that:
+          - the first ``contextual_seq_len`` tokens of each sample are
+            unchanged (prefix preserved);
+          - the trailing tokens equal the ORIGINAL trailing tokens of the
+            same sample (tail kept, head dropped).
+        """
+        contextual_seq_len = 3
+        tail_len = 8
+        stack, D = self._make_stack(
+            num_layers=2,
+            truncate_split_layer=1,
+            truncate_tail_len=tail_len,
+            contextual_seq_len=contextual_seq_len,
+        )
+        # Three samples: lengths 6, 12, 20 (only the latter two get truncated
+        # at tail_len=8).
+        x_lengths = torch.tensor([6, 12, 20], dtype=torch.int64)
+        seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        total_in = int(seq_offsets[-1].item())
+        # Mark each token row with its global position so we can identify
+        # which original rows survived.
+        x = torch.arange(total_in, dtype=torch.float32).view(total_in, 1).repeat(1, D)
+        max_seq_len = int(x_lengths.max().item())
+        num_targets = torch.tensor([2, 3, 4], dtype=torch.int64)
+
+        (
+            out_x,
+            out_offsets,
+            out_seq_lengths,
+            out_num_targets,
+            out_max,
+        ) = stack._apply_truncation(
+            x=x,
+            x_offsets=seq_offsets,
+            seq_lengths=x_lengths,
+            num_targets=num_targets,
+            max_seq_len=max_seq_len,
+        )
+
+        expected_lengths = torch.clamp(x_lengths, max=tail_len)
+        actual_lengths = out_offsets[1:] - out_offsets[:-1]
+        torch.testing.assert_close(actual_lengths, expected_lengths)
+        torch.testing.assert_close(out_seq_lengths, expected_lengths)
+        self.assertEqual(out_max, tail_len)
+        # num_targets clamped to (new_length - contextual_seq_len) = the
+        # tail capacity for UIH+targets.
+        torch.testing.assert_close(
+            out_num_targets,
+            torch.clamp(num_targets, max=expected_lengths - contextual_seq_len),
+        )
+
+        # Per-sample content check: kept rows should be
+        #   prefix:  global positions [seq_offsets[b], seq_offsets[b] + C)
+        #   tail:    global positions [seq_offsets[b+1] - (new - C), seq_offsets[b+1])
+        for b in range(x_lengths.size(0)):
+            new_len = int(expected_lengths[b].item())
+            sample_start = int(out_offsets[b].item())
+            # Prefix.
+            for j in range(contextual_seq_len):
+                got = out_x[sample_start + j, 0].item()
+                expected = float(int(seq_offsets[b].item()) + j)
+                self.assertEqual(got, expected, f"sample {b} prefix slot {j}")
+            # Tail.
+            tail_count = new_len - contextual_seq_len
+            orig_end = int(seq_offsets[b + 1].item())
+            for k in range(tail_count):
+                got = out_x[sample_start + contextual_seq_len + k, 0].item()
+                expected = float(orig_end - tail_count + k)
+                self.assertEqual(got, expected, f"sample {b} tail slot {k}")
 
     def test_sla_on_triton_kernel_raises(self) -> None:
         """C4: STUStack surfaces SLA-on-Kernel.TRITON as a loud error.
