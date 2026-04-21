@@ -576,7 +576,7 @@ class HSTUAttentionTest(unittest.TestCase):
         without CUDA so every CI lane exercises the NFUNC decode.
         """
         from tzrec.ops._pytorch.pt_hstu_attention import pytorch_hstu_mha
-        from tzrec.ops.attention_utils import build_sla_func_tensor
+        from tzrec.ops.hstu_attention_utils import build_sla_func_tensor
 
         torch.manual_seed(0)
         H, D = 2, 16
@@ -638,7 +638,7 @@ class HSTUAttentionTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     def test_negative_sla_params_rejected(self) -> None:
         """C2: build_sla_func_tensor rejects negative params."""
-        from tzrec.ops.attention_utils import build_sla_func_tensor
+        from tzrec.ops.hstu_attention_utils import build_sla_func_tensor
 
         seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
         with self.assertRaisesRegex(ValueError, "non-negative"):
@@ -709,8 +709,8 @@ def test_sla_attn(
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     from tzrec.ops._pytorch.pt_hstu_attention import pytorch_hstu_mha
-    from tzrec.ops.attention_utils import build_sla_func_tensor
     from tzrec.ops.hstu_attention import hstu_mha
+    from tzrec.ops.hstu_attention_utils import build_sla_func_tensor
 
     alpha = 1.0 / (attn_dim**0.5)
     lengths = torch.randint(

@@ -22,6 +22,10 @@ from torch.autograd.profiler import record_function
 from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention import delta_hstu_mha
+from tzrec.ops.hstu_attention_utils import (
+    apply_truncation,
+    build_sla_func_tensor,
+)
 from tzrec.ops.hstu_compute import (
     hstu_compute_output,
     hstu_compute_uqvk,
@@ -385,8 +389,6 @@ class STULayer(STU):
             torch.Tensor: output sequence embedding tensor.
         """
         if attn_func is None and (self._sla_k1 > 0 or self._sla_k2 > 0):
-            from tzrec.ops.attention_utils import build_sla_func_tensor
-
             attn_func = build_sla_func_tensor(
                 nheads=self._num_heads,
                 sla_k1=self._sla_k1,
@@ -580,100 +582,6 @@ class STUStack(STU):
                     f"token."
                 )
 
-    def _apply_truncation(
-        self,
-        x: torch.Tensor,
-        x_offsets: torch.Tensor,
-        seq_lengths: torch.Tensor,
-        num_targets: Optional[torch.Tensor],
-        max_seq_len: int,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        int,
-    ]:
-        """Drop the UIH head while preserving the contextual prefix.
-
-        The pre-truncation layout per sample is
-        ``[contextual(C) | UIH(U) | targets(T)]`` with ``L_b = C + U + T``.
-        With ``new_length_b = min(L_b, tail_len)``, the kept layout is
-        ``[contextual | last (new_length_b - C) of UIH+targets]``.
-
-        This is a three-part keep-drop-keep slice per sample, so it is
-        implemented as ``split_2D_jagged`` (peel off the prefix) +
-        ``split_2D_jagged`` (drop the rest's head) + ``concat_2D_jagged``
-        (re-join). When ``contextual_seq_len == 0`` the prefix step is
-        skipped and a single split suffices.
-
-        Returns the post-truncation tuple
-        ``(x, x_offsets, seq_lengths, num_targets, max_seq_len)``.
-        """
-        new_lengths = torch.clamp(seq_lengths, max=self._truncate_tail_len)
-        contextual_seq_len: int = getattr(self._stu_layers[0], "_contextual_seq_len", 0)
-        if contextual_seq_len > 0:
-            B = seq_lengths.size(0)
-            # Step 1: peel off [contextual | rest-of-sequence].
-            offsets_prefix = (
-                torch.arange(B + 1, device=x.device, dtype=x_offsets.dtype)
-                * contextual_seq_len
-            )
-            offsets_rest = x_offsets - offsets_prefix
-            x_prefix, x_rest = split_2D_jagged(
-                values=x,
-                max_seq_len=max_seq_len,
-                offsets_left=offsets_prefix,
-                offsets_right=offsets_rest,
-                kernel=self.kernel(),
-            )
-            # Step 2: drop the head of the rest; keep its tail.
-            rest_head_lengths = seq_lengths - new_lengths
-            rest_tail_lengths = new_lengths - contextual_seq_len
-            offsets_rest_head = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                rest_head_lengths
-            )
-            offsets_rest_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                rest_tail_lengths
-            )
-            _, x_rest_kept = split_2D_jagged(
-                values=x_rest,
-                max_seq_len=max_seq_len - contextual_seq_len,
-                offsets_left=offsets_rest_head,
-                offsets_right=offsets_rest_tail,
-                kernel=self.kernel(),
-            )
-            # Step 3: re-join [contextual | rest_tail].
-            x = concat_2D_jagged(
-                values_left=x_prefix,
-                values_right=x_rest_kept,
-                max_len_left=contextual_seq_len,
-                max_len_right=self._truncate_tail_len - contextual_seq_len,
-                offsets_left=offsets_prefix,
-                offsets_right=offsets_rest_tail,
-                kernel=self.kernel(),
-            )
-            x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
-        else:
-            head_lengths = seq_lengths - new_lengths
-            offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(head_lengths)
-            offsets_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
-            _, x = split_2D_jagged(
-                values=x,
-                max_seq_len=max_seq_len,
-                offsets_left=offsets_head,
-                offsets_right=offsets_tail,
-                kernel=self.kernel(),
-            )
-            x_offsets = offsets_tail
-        seq_lengths = new_lengths
-        if num_targets is not None:
-            # Targets live in the kept rest-tail; clamp so the reported
-            # num_targets never exceeds the available (post-truncation)
-            # slots.
-            num_targets = torch.clamp(num_targets, max=new_lengths - contextual_seq_len)
-        return x, x_offsets, seq_lengths, num_targets, self._truncate_tail_len
-
     def forward(
         self,
         x: torch.Tensor,
@@ -736,14 +644,17 @@ class STUStack(STU):
                 and self._truncate_split_layer > 0
                 and self._truncate_tail_len > 0
             ):
-                x, x_offsets, seq_lengths, num_targets, max_seq_len = (
-                    self._apply_truncation(
-                        x=x,
-                        x_offsets=x_offsets,
-                        seq_lengths=seq_lengths,
-                        num_targets=num_targets,
-                        max_seq_len=max_seq_len,
-                    )
+                x, x_offsets, seq_lengths, num_targets, max_seq_len = apply_truncation(
+                    x=x,
+                    x_offsets=x_offsets,
+                    seq_lengths=seq_lengths,
+                    num_targets=num_targets,
+                    max_seq_len=max_seq_len,
+                    truncate_tail_len=self._truncate_tail_len,
+                    contextual_seq_len=getattr(
+                        self._stu_layers[0], "_contextual_seq_len", 0
+                    ),
+                    kernel=self.kernel(),
                 )
 
             sla_k1 = getattr(layer, "_sla_k1", 0)
@@ -761,8 +672,6 @@ class STUStack(STU):
                     id(x_offsets),
                 )
                 if sig != attn_func_sig:
-                    from tzrec.ops.attention_utils import build_sla_func_tensor
-
                     cur_attn_func = build_sla_func_tensor(
                         nheads=nheads,
                         sla_k1=sla_k1,
