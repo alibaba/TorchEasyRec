@@ -26,6 +26,7 @@ from tzrec.modules.gr.postprocessors import (
 from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
 from tzrec.modules.gr.stu import STU, STULayer, STUStack
 from tzrec.modules.utils import BaseModule
+from tzrec.ops.hstu_attention_utils import apply_stu_truncation
 from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
@@ -281,21 +282,22 @@ class HSTUTransducer(BaseModule):
         )
 
         # If STUStack truncated mid-stack, the returned offsets / max_seq_len
-        # describe the truncated embeddings. Realign the downstream
-        # postprocessing inputs (seq_lengths, seq_timestamps, total_uih_len)
-        # so that _postprocess's jagged splits index the truncated x with
-        # matching offsets. ``num_targets`` / ``total_targets`` are
-        # preserved by apply_stu_truncation, so they stay valid as-is.
+        # describe the truncated embeddings.  Replay the same truncation on
+        # ``seq_timestamps`` so the downstream postprocessor's jagged splits
+        # index the truncated x with matching offsets. ``num_targets`` /
+        # ``total_targets`` are preserved by ``apply_stu_truncation``, so
+        # they stay valid as-is.
         if post_stu_seq_offsets is not seq_offsets:
-            orig_seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
-            new_seq_lengths = post_stu_seq_offsets[1:] - post_stu_seq_offsets[:-1]
-            head_lengths = orig_seq_lengths - new_seq_lengths
-            offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(head_lengths)
-            _, truncated_timestamps = split_2D_jagged(
-                values=seq_timestamps.unsqueeze(-1),
+            truncated_timestamps, _, new_seq_lengths, _ = apply_stu_truncation(
+                x=seq_timestamps.unsqueeze(-1),
+                x_offsets=seq_offsets,
+                seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
+                num_targets=num_targets,
                 max_seq_len=max_seq_len,
-                offsets_left=offsets_head,
-                offsets_right=post_stu_seq_offsets,
+                truncate_tail_len=self._stu_module._truncate_tail_len,
+                contextual_seq_len=getattr(
+                    self._stu_module._stu_layers[0], "_contextual_seq_len", 0
+                ),
                 kernel=self.kernel(),
             )
             seq_timestamps = truncated_timestamps.squeeze(-1)
