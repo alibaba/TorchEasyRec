@@ -270,7 +270,10 @@ class HSTUTransducer(BaseModule):
         (
             encoded_embeddings,
             post_stu_seq_offsets,
-            post_stu_num_targets,
+            # num_targets is preserved intact by apply_stu_truncation, so
+            # STUStack returns the same tensor (or None in listwise mode)
+            # that we passed in -- ignore the echoed value.
+            _,
             post_stu_max_seq_len,
         ) = self._hstu_compute(
             max_seq_len=max_seq_len,
@@ -302,8 +305,6 @@ class HSTUTransducer(BaseModule):
             seq_lengths = new_seq_lengths
             seq_offsets = post_stu_seq_offsets
             max_seq_len = post_stu_max_seq_len
-            if post_stu_num_targets is not None:
-                num_targets = post_stu_num_targets
             # total_uih_len / total_targets are only used as Triton output-
             # shape hints; recompute from the truncated state.
             total_targets = int(num_targets.sum().item())
