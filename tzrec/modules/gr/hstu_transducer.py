@@ -165,14 +165,16 @@ class HSTUTransducer(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """Run the STU stack and return truncated metadata alongside x.
 
         Returns:
-            ``(seq_embeddings, seq_offsets, num_targets, max_seq_len)`` -- when
-            attention truncation is enabled, the metadata reflects the
-            post-truncation state so downstream splits stay aligned with
-            ``seq_embeddings``.
+            ``(seq_embeddings, seq_offsets, max_seq_len)`` -- when
+            attention truncation is enabled, the offsets and max reflect
+            the post-truncation state so downstream splits stay aligned
+            with ``seq_embeddings``.  ``num_targets`` is preserved intact
+            across truncation, so the caller's input tensor is still
+            valid post-call.
         """
         with record_function("hstu"):
             return self._stu_module(
@@ -267,28 +269,23 @@ class HSTUTransducer(BaseModule):
             num_targets,
         ) = self._preprocess(grouped_features)
 
-        (
-            encoded_embeddings,
-            post_stu_seq_offsets,
-            # num_targets is preserved intact by apply_stu_truncation, so
-            # STUStack returns the same tensor (or None in listwise mode)
-            # that we passed in -- ignore the echoed value.
-            _,
-            post_stu_max_seq_len,
-        ) = self._hstu_compute(
-            max_seq_len=max_seq_len,
-            seq_lengths=seq_lengths,
-            seq_offsets=seq_offsets,
-            seq_timestamps=seq_timestamps,
-            seq_embeddings=seq_embeddings,
-            num_targets=num_targets,
+        encoded_embeddings, post_stu_seq_offsets, post_stu_max_seq_len = (
+            self._hstu_compute(
+                max_seq_len=max_seq_len,
+                seq_lengths=seq_lengths,
+                seq_offsets=seq_offsets,
+                seq_timestamps=seq_timestamps,
+                seq_embeddings=seq_embeddings,
+                num_targets=num_targets,
+            )
         )
 
-        # If STUStack truncated mid-stack, the returned offsets / num_targets
-        # / max_seq_len describe the truncated embeddings. Realign the
-        # downstream postprocessing inputs (seq_lengths, seq_timestamps,
-        # total_uih_len, total_targets) so that _postprocess's jagged splits
-        # index the truncated x with matching offsets.
+        # If STUStack truncated mid-stack, the returned offsets / max_seq_len
+        # describe the truncated embeddings. Realign the downstream
+        # postprocessing inputs (seq_lengths, seq_timestamps, total_uih_len)
+        # so that _postprocess's jagged splits index the truncated x with
+        # matching offsets. ``num_targets`` / ``total_targets`` are
+        # preserved by apply_stu_truncation, so they stay valid as-is.
         if post_stu_seq_offsets is not seq_offsets:
             orig_seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
             new_seq_lengths = post_stu_seq_offsets[1:] - post_stu_seq_offsets[:-1]
@@ -305,9 +302,8 @@ class HSTUTransducer(BaseModule):
             seq_lengths = new_seq_lengths
             seq_offsets = post_stu_seq_offsets
             max_seq_len = post_stu_max_seq_len
-            # total_uih_len / total_targets are only used as Triton output-
-            # shape hints; recompute from the truncated state.
-            total_targets = int(num_targets.sum().item())
+            # total_uih_len (Triton output-shape hint) shrank; total_targets
+            # is unchanged because targets are preserved intact.
             total_uih_len = int(post_stu_seq_offsets[-1].item()) - total_targets
 
         encoded_embeddings, encoded_candidate_embeddings = self._postprocess(

@@ -178,7 +178,7 @@ class ApplyStuTruncationTest(unittest.TestCase):
         """All U_b <= tail_len and no contextual/targets: output identical."""
         lengths = [3, 5, 2]
         x, offsets = self._id_marked_input(lengths)
-        out_x, out_offsets, out_lens, out_num, out_max = apply_stu_truncation(
+        out_x, out_offsets, _out_lens, out_max = apply_stu_truncation(
             x=x,
             x_offsets=offsets,
             seq_lengths=offsets[1:] - offsets[:-1],
@@ -195,7 +195,7 @@ class ApplyStuTruncationTest(unittest.TestCase):
         lengths = [4, 10, 7]
         tail = 5
         x, offsets = self._id_marked_input(lengths)
-        out_x, out_offsets, _, _, out_max = apply_stu_truncation(
+        out_x, out_offsets, _, out_max = apply_stu_truncation(
             x=x,
             x_offsets=offsets,
             seq_lengths=offsets[1:] - offsets[:-1],
@@ -217,16 +217,13 @@ class ApplyStuTruncationTest(unittest.TestCase):
                 )
 
     def test_targets_always_preserved(self) -> None:
-        """Target rows survive intact regardless of ``tail_len``.
-
-        ``num_targets`` is returned unchanged (no clamping).
-        """
+        """Target rows survive intact regardless of ``tail_len``."""
         lengths = [8, 12]
         targets = [3, 5]
         tail = 2  # UIH cap so small that targets would be lost under clamping
         x, offsets = self._id_marked_input(lengths)
         num_targets = torch.tensor(targets, dtype=torch.int64)
-        out_x, out_offsets, _, out_num, out_max = apply_stu_truncation(
+        out_x, out_offsets, _, out_max = apply_stu_truncation(
             x=x,
             x_offsets=offsets,
             seq_lengths=offsets[1:] - offsets[:-1],
@@ -234,8 +231,6 @@ class ApplyStuTruncationTest(unittest.TestCase):
             max_seq_len=int(max(lengths)),
             truncate_tail_len=tail,
         )
-        # num_targets unchanged.
-        torch.testing.assert_close(out_num, num_targets)
         # new_len = min(U_b, tail) + T_b = min(L_b - T_b, tail) + T_b.
         expected_lens = [min(L - T, tail) + T for L, T in zip(lengths, targets)]
         actual_lens = (out_offsets[1:] - out_offsets[:-1]).tolist()
@@ -264,7 +259,7 @@ class ApplyStuTruncationTest(unittest.TestCase):
         x, offsets = self._id_marked_input(lengths)
         seq_lengths = offsets[1:] - offsets[:-1]
         num_targets = torch.tensor(targets, dtype=torch.int64)
-        out_x, out_offsets, _, out_num, out_max = apply_stu_truncation(
+        out_x, out_offsets, _, out_max = apply_stu_truncation(
             x=x,
             x_offsets=offsets,
             seq_lengths=seq_lengths,
@@ -273,7 +268,6 @@ class ApplyStuTruncationTest(unittest.TestCase):
             truncate_tail_len=tail,
             contextual_seq_len=ctx,
         )
-        torch.testing.assert_close(out_num, num_targets)  # targets preserved
         for b, (L, T) in enumerate(zip(lengths, targets)):
             U = L - ctx - T
             new_uih = min(U, tail)
@@ -308,36 +302,6 @@ class ApplyStuTruncationTest(unittest.TestCase):
             ),
         )
 
-    def test_num_targets_unchanged(self) -> None:
-        """``num_targets`` is returned as-is (not clamped)."""
-        lengths = [10, 14]
-        x, offsets = self._id_marked_input(lengths)
-        num_targets = torch.tensor([8, 1], dtype=torch.int64)
-        _, _, _, out_num, _ = apply_stu_truncation(
-            x=x,
-            x_offsets=offsets,
-            seq_lengths=offsets[1:] - offsets[:-1],
-            num_targets=num_targets,
-            max_seq_len=int(max(lengths)),
-            truncate_tail_len=1,
-            contextual_seq_len=2,
-        )
-        torch.testing.assert_close(out_num, num_targets)
-
-    def test_num_targets_none_is_preserved(self) -> None:
-        lengths = [10, 14]
-        x, offsets = self._id_marked_input(lengths)
-        _, _, _, out_num, _ = apply_stu_truncation(
-            x=x,
-            x_offsets=offsets,
-            seq_lengths=offsets[1:] - offsets[:-1],
-            num_targets=None,
-            max_seq_len=int(max(lengths)),
-            truncate_tail_len=6,
-            contextual_seq_len=2,
-        )
-        self.assertIsNone(out_num)
-
     def test_truncate_tail_len_zero_drops_all_uih(self) -> None:
         """``truncate_tail_len == 0`` drops every UIH token.
 
@@ -348,7 +312,7 @@ class ApplyStuTruncationTest(unittest.TestCase):
         ctx = 2
         x, offsets = self._id_marked_input(lengths)
         num_targets = torch.tensor(targets, dtype=torch.int64)
-        out_x, out_offsets, _, out_num, _ = apply_stu_truncation(
+        out_x, out_offsets, _, _ = apply_stu_truncation(
             x=x,
             x_offsets=offsets,
             seq_lengths=offsets[1:] - offsets[:-1],
@@ -361,7 +325,6 @@ class ApplyStuTruncationTest(unittest.TestCase):
         expected_lens = [ctx + T for T in targets]
         actual_lens = (out_offsets[1:] - out_offsets[:-1]).tolist()
         self.assertEqual(actual_lens, expected_lens)
-        torch.testing.assert_close(out_num, num_targets)
 
     def test_validation_raises_on_negative_params(self) -> None:
         x, offsets = self._id_marked_input([6])

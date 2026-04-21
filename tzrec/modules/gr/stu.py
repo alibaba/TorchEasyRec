@@ -564,7 +564,7 @@ class STUStack(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
         attn_func: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """Forward stack of stu layer.
 
         Args:
@@ -581,12 +581,13 @@ class STUStack(STU):
                 is overwritten on the first iteration that needs it.
 
         Returns:
-            A 4-tuple ``(x, x_offsets, num_targets, max_seq_len)``.  When
-            attention truncation is enabled (``truncate_tail_len > 0``) the
-            three metadata fields reflect the post-truncation state so that
-            downstream consumers (e.g. ``HSTUTransducer._postprocess``) see
-            offsets/lengths matching the returned ``x``.  When truncation is
-            disabled the metadata equals the inputs.
+            ``(x, x_offsets, max_seq_len)``.  When attention truncation is
+            enabled (``truncate_tail_len > 0``) the offsets / max reflect
+            the post-truncation state so downstream splits stay aligned
+            with the returned ``x``; when disabled they equal the inputs.
+            ``num_targets`` is not echoed back -- ``apply_stu_truncation``
+            preserves targets intact, so the caller's input tensor is
+            still valid post-truncation.
         """
         seq_lengths = x_offsets[1:] - x_offsets[:-1]
         # SLA (sla_k1 > 0 or sla_k2 > 0) runs on the CUTLASS production
@@ -617,19 +618,17 @@ class STUStack(STU):
                 and self._truncate_split_layer > 0
                 and self._truncate_tail_len > 0
             ):
-                x, x_offsets, seq_lengths, num_targets, max_seq_len = (
-                    apply_stu_truncation(
-                        x=x,
-                        x_offsets=x_offsets,
-                        seq_lengths=seq_lengths,
-                        num_targets=num_targets,
-                        max_seq_len=max_seq_len,
-                        truncate_tail_len=self._truncate_tail_len,
-                        contextual_seq_len=getattr(
-                            self._stu_layers[0], "_contextual_seq_len", 0
-                        ),
-                        kernel=self.kernel(),
-                    )
+                x, x_offsets, seq_lengths, max_seq_len = apply_stu_truncation(
+                    x=x,
+                    x_offsets=x_offsets,
+                    seq_lengths=seq_lengths,
+                    num_targets=num_targets,
+                    max_seq_len=max_seq_len,
+                    truncate_tail_len=self._truncate_tail_len,
+                    contextual_seq_len=getattr(
+                        self._stu_layers[0], "_contextual_seq_len", 0
+                    ),
+                    kernel=self.kernel(),
                 )
 
             sla_k1 = getattr(layer, "_sla_k1", 0)
@@ -670,7 +669,7 @@ class STUStack(STU):
                 kv_caching_lengths=kv_caching_lengths,
                 attn_func=cur_attn_func,
             )
-        return x, x_offsets, num_targets, max_seq_len
+        return x, x_offsets, max_seq_len
 
     def cached_forward(
         self,

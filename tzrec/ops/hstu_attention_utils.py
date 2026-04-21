@@ -134,7 +134,7 @@ def apply_stu_truncation(
     truncate_tail_len: int,
     contextual_seq_len: int = 0,
     kernel: Kernel = Kernel.PYTORCH,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Truncate the UIH portion of each jagged sample to ``truncate_tail_len``.
 
     Sample layout is ``[contextual(C) | UIH(U_b) | targets(T_b)]`` with
@@ -155,6 +155,9 @@ def apply_stu_truncation(
     (re-join).  When ``contextual_seq_len == 0`` the prefix step is
     skipped and a single split suffices.
 
+    ``num_targets`` is passed in but not returned: targets always
+    survive intact, so the caller's original tensor is still valid.
+
     Args:
         x: jagged values of shape ``(total, D)``.
         x_offsets: cumulative offsets ``(B + 1,)``.
@@ -169,10 +172,9 @@ def apply_stu_truncation(
         kernel: backend for the underlying jagged ops.
 
     Returns:
-        ``(x, x_offsets, seq_lengths, num_targets, max_seq_len)`` with
-        post-truncation values.  ``num_targets`` is returned unchanged
-        (targets always survive).  ``max_seq_len`` is the tight
-        post-truncation maximum ``max(new_L_b)``.
+        ``(x, x_offsets, seq_lengths, max_seq_len)`` with post-truncation
+        values.  ``max_seq_len`` is the tight post-truncation maximum
+        ``max(new_L_b)``.
     """
     if truncate_tail_len < 0:
         raise ValueError(
@@ -241,4 +243,4 @@ def apply_stu_truncation(
     # Tight post-truncation max (one D->H sync per call).  Tighter than
     # the input ``max_seq_len`` so downstream padding shrinks accordingly.
     new_max_seq_len = int(new_lengths.max().item())
-    return x, x_offsets, new_lengths, num_targets, new_max_seq_len
+    return x, x_offsets, new_lengths, new_max_seq_len
