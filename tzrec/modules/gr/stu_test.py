@@ -551,55 +551,56 @@ class STUStackTruncationTest(unittest.TestCase):
             num_targets,
         )
 
-    def test_truncation_applied_when_seq_longer_than_tail(self) -> None:
-        """Sequences longer than tail_len are truncated; shorter ones pass."""
+    def test_truncation_applied_when_uih_longer_than_tail(self) -> None:
+        """UIH > tail_len is truncated; contextual prefix and targets survive."""
         x_lengths = torch.tensor([12, 20, 5, 30], dtype=torch.int64)
-        tail_len = 8
+        tail_len = 8  # UIH cap
+        num_targets_val = 2
         (
             out,
             new_offsets,
             new_num_targets,
             new_max_seq_len,
             orig_lengths,
-            _,
-        ) = self._forward_and_check_truncation(x_lengths, 2, tail_len)
-        expected_lengths = torch.clamp(x_lengths, max=tail_len)
+            orig_num_targets,
+        ) = self._forward_and_check_truncation(x_lengths, num_targets_val, tail_len)
+        # contextual_seq_len == 0 in the default _make_stack. So
+        #   U_b        = L_b - T_b
+        #   new_uih_b  = min(U_b, tail_len)
+        #   new_len_b  = new_uih_b + T_b
+        uih = x_lengths - num_targets_val
+        new_uih = torch.clamp(uih, max=tail_len)
+        expected_lengths = new_uih + num_targets_val
         new_lengths = new_offsets[1:] - new_offsets[:-1]
-        self.assertEqual(new_max_seq_len, tail_len)
         torch.testing.assert_close(new_lengths, expected_lengths)
-        # Total tokens in x matches sum of new lengths.
         self.assertEqual(out.size(0), int(expected_lengths.sum().item()))
-        # num_targets is clamped when it exceeds the truncated length.
+        self.assertEqual(new_max_seq_len, int(expected_lengths.max().item()))
+        # Targets always preserved -- num_targets returned unchanged.
         assert new_num_targets is not None
-        torch.testing.assert_close(
-            new_num_targets,
-            torch.clamp(torch.full_like(new_lengths, 2), max=new_lengths),
-        )
+        torch.testing.assert_close(new_num_targets, orig_num_targets)
 
-    def test_truncation_no_op_when_all_shorter(self) -> None:
-        """Sequences all shorter than tail_len: x unchanged in shape."""
+    def test_truncation_no_op_when_uih_fits(self) -> None:
+        """UIH <= tail_len for every sample: no row dropped."""
         x_lengths = torch.tensor([3, 5, 2], dtype=torch.int64)
-        tail_len = 16
+        tail_len = 16  # generous UIH cap
         out, new_offsets, _, new_max_seq_len, _, _ = self._forward_and_check_truncation(
             x_lengths, 1, tail_len
         )
         orig_total = int(x_lengths.sum().item())
         self.assertEqual(out.size(0), orig_total)
-        # max_seq_len is still updated to tail_len (post-truncation cap).
-        self.assertEqual(new_max_seq_len, tail_len)
+        # Tight max: equals the original max (no truncation happened).
+        self.assertEqual(new_max_seq_len, int(x_lengths.max().item()))
 
-    def test_num_targets_clamped(self) -> None:
-        """num_targets > new_length gets clamped to new_length."""
+    def test_num_targets_always_preserved(self) -> None:
+        """``num_targets`` is returned unchanged regardless of tail_len."""
         x_lengths = torch.tensor([12, 20, 6], dtype=torch.int64)
         tail_len = 4
-        # num_targets=10 exceeds tail_len=4; should be clamped to 4 for all.
-        _, new_offsets, new_num_targets, _, _, _ = self._forward_and_check_truncation(
-            x_lengths, 10, tail_len
+        num_targets_val = 3
+        _, _, new_num_targets, _, _, orig_num_targets = (
+            self._forward_and_check_truncation(x_lengths, num_targets_val, tail_len)
         )
         assert new_num_targets is not None
-        new_lengths = new_offsets[1:] - new_offsets[:-1]
-        expected = torch.clamp(torch.full_like(new_lengths, 10), max=new_lengths)
-        torch.testing.assert_close(new_num_targets, expected)
+        torch.testing.assert_close(new_num_targets, orig_num_targets)
 
     def test_num_targets_none_is_preserved(self) -> None:
         """num_targets=None stays None through truncation."""
@@ -636,42 +637,6 @@ class STUStackTruncationTest(unittest.TestCase):
         self.assertEqual(returned_max, 6)
         self.assertEqual(returned_x.size(0), x.size(0))
         assert returned_num_targets is not None
-
-    def test_init_rejects_tail_len_at_or_below_contextual(self) -> None:
-        """truncate_tail_len must be strictly greater than contextual_seq_len."""
-        from tzrec.modules.gr.stu import STU, STULayer, STUStack
-
-        stu_list: List[STU] = [
-            STULayer(
-                embedding_dim=16,
-                num_heads=2,
-                hidden_dim=32,
-                attention_dim=32,
-                contextual_seq_len=8,
-                is_inference=False,
-            )
-            for _ in range(3)
-        ]
-        # tail_len equal to contextual_seq_len leaves no room for UIH/targets.
-        with self.assertRaisesRegex(ValueError, "contextual_seq_len"):
-            STUStack(
-                stu_list=stu_list,
-                truncate_split_layer=1,
-                truncate_tail_len=8,
-            )
-        # tail_len smaller than contextual_seq_len would chop the prefix.
-        with self.assertRaisesRegex(ValueError, "contextual_seq_len"):
-            STUStack(
-                stu_list=stu_list,
-                truncate_split_layer=1,
-                truncate_tail_len=4,
-            )
-        # Strictly-greater is fine.
-        STUStack(
-            stu_list=stu_list,
-            truncate_split_layer=1,
-            truncate_tail_len=12,
-        )
 
     def test_sla_on_triton_kernel_raises(self) -> None:
         """C4: STUStack surfaces SLA-on-Kernel.TRITON as a loud error.

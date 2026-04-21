@@ -23,7 +23,7 @@ from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention import delta_hstu_mha
 from tzrec.ops.hstu_attention_utils import (
-    apply_truncation,
+    apply_stu_truncation,
     build_sla_func_tensor,
 )
 from tzrec.ops.hstu_compute import (
@@ -568,19 +568,6 @@ class STUStack(STU):
                 f"{self._truncate_split_layer}, truncate_tail_len="
                 f"{self._truncate_tail_len}."
             )
-        # The contextual prefix must fit inside the kept tail (with at
-        # least one slot for UIH/targets). The prefix is preserved through
-        # truncation, so a tail too short to hold it is a config error.
-        if self._truncate_tail_len > 0:
-            ctx_len = getattr(self._stu_layers[0], "_contextual_seq_len", 0)
-            if ctx_len >= self._truncate_tail_len:
-                raise ValueError(
-                    f"truncate_tail_len ({self._truncate_tail_len}) must be "
-                    f"strictly greater than contextual_seq_len ({ctx_len}); "
-                    f"the contextual prefix is preserved by truncation and "
-                    f"the tail must leave room for at least one UIH/target "
-                    f"token."
-                )
 
     def forward(
         self,
@@ -644,17 +631,19 @@ class STUStack(STU):
                 and self._truncate_split_layer > 0
                 and self._truncate_tail_len > 0
             ):
-                x, x_offsets, seq_lengths, num_targets, max_seq_len = apply_truncation(
-                    x=x,
-                    x_offsets=x_offsets,
-                    seq_lengths=seq_lengths,
-                    num_targets=num_targets,
-                    max_seq_len=max_seq_len,
-                    truncate_tail_len=self._truncate_tail_len,
-                    contextual_seq_len=getattr(
-                        self._stu_layers[0], "_contextual_seq_len", 0
-                    ),
-                    kernel=self.kernel(),
+                x, x_offsets, seq_lengths, num_targets, max_seq_len = (
+                    apply_stu_truncation(
+                        x=x,
+                        x_offsets=x_offsets,
+                        seq_lengths=seq_lengths,
+                        num_targets=num_targets,
+                        max_seq_len=max_seq_len,
+                        truncate_tail_len=self._truncate_tail_len,
+                        contextual_seq_len=getattr(
+                            self._stu_layers[0], "_contextual_seq_len", 0
+                        ),
+                        kernel=self.kernel(),
+                    )
                 )
 
             sla_k1 = getattr(layer, "_sla_k1", 0)

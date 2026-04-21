@@ -124,7 +124,7 @@ def build_sla_func_tensor(
     return func_2d.unsqueeze(0).expand(nheads, 3, total_q).contiguous()
 
 
-def apply_truncation(
+def apply_stu_truncation(
     x: torch.Tensor,
     x_offsets: torch.Tensor,
     seq_lengths: torch.Tensor,
@@ -135,19 +135,24 @@ def apply_truncation(
     contextual_seq_len: int = 0,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
-    """Drop the UIH head while preserving the contextual prefix.
+    """Truncate the UIH portion of each jagged sample to ``truncate_tail_len``.
 
-    Pre-truncation layout per sample is
-    ``[contextual(C) | UIH(U) | targets(T)]`` with ``L_b = C + U + T``.
-    Returns the post-truncation tuple
-    ``(x, x_offsets, seq_lengths, num_targets, max_seq_len)`` keeping
-    ``[contextual | last (new_length_b - C) tokens of UIH+targets]`` per
-    sample, where ``new_length_b = min(L_b, truncate_tail_len)``.
+    Sample layout is ``[contextual(C) | UIH(U_b) | targets(T_b)]`` with
+    ``L_b = C + U_b + T_b``.  ``truncate_tail_len`` caps the UIH portion
+    only; the contextual prefix and all targets are preserved as full
+    structural elements.
 
-    The result is a three-part keep-drop-keep slice per sample, so it is
-    implemented as ``split_2D_jagged`` (peel off the prefix) +
-    ``split_2D_jagged`` (drop the rest's head) + ``concat_2D_jagged``
-    (re-join). When ``contextual_seq_len == 0`` the prefix step is
+    Per sample:
+      ``new_uih_b = min(U_b, truncate_tail_len)``
+      ``drop_b    = U_b - new_uih_b``  (always ``>= 0``)
+      ``new_L_b   = C + new_uih_b + T_b  = L_b - drop_b``
+
+    The kept layout is
+    ``[contextual | last new_uih_b tokens of UIH | targets]``.
+
+    Implemented as ``split_2D_jagged`` (peel off the prefix) +
+    ``split_2D_jagged`` (drop the UIH head) + ``concat_2D_jagged``
+    (re-join).  When ``contextual_seq_len == 0`` the prefix step is
     skipped and a single split suffices.
 
     Args:
@@ -155,26 +160,37 @@ def apply_truncation(
         x_offsets: cumulative offsets ``(B + 1,)``.
         seq_lengths: per-sample lengths ``(B,)``.
         num_targets: per-sample target counts ``(B,)`` or ``None``.
-        max_seq_len: padded max length of the input.
-        truncate_tail_len: keep-cap; must be > ``contextual_seq_len``.
+        max_seq_len: padded max length of the input batch.
+        truncate_tail_len: maximum UIH tokens kept per sample.  Must be
+            non-negative; ``0`` drops all UIH (only contextual and
+            targets survive).
         contextual_seq_len: number of leading contextual tokens to
             preserve (uniform across the batch).
         kernel: backend for the underlying jagged ops.
 
     Returns:
         ``(x, x_offsets, seq_lengths, num_targets, max_seq_len)`` with
-        post-truncation values. ``num_targets`` is clamped to
-        ``new_length - contextual_seq_len`` so the reported count never
-        exceeds the available post-truncation slots.
+        post-truncation values.  ``num_targets`` is returned unchanged
+        (targets always survive).  ``max_seq_len`` is the tight
+        post-truncation maximum ``max(new_L_b)``.
     """
-    if truncate_tail_len <= contextual_seq_len:
+    if truncate_tail_len < 0:
         raise ValueError(
-            f"truncate_tail_len ({truncate_tail_len}) must be strictly "
-            f"greater than contextual_seq_len ({contextual_seq_len}); the "
-            f"contextual prefix is preserved by truncation and the tail "
-            f"must leave room for at least one UIH/target token."
+            f"truncate_tail_len must be non-negative; got {truncate_tail_len}"
         )
-    new_lengths = torch.clamp(seq_lengths, max=truncate_tail_len)
+    if contextual_seq_len < 0:
+        raise ValueError(
+            f"contextual_seq_len must be non-negative; got {contextual_seq_len}"
+        )
+    # UIH-only cap: drop_b = U_b - min(U_b, truncate_tail_len).
+    if num_targets is not None:
+        uih_lengths = seq_lengths - contextual_seq_len - num_targets
+    else:
+        uih_lengths = seq_lengths - contextual_seq_len
+    new_uih_lengths = torch.clamp(uih_lengths, max=truncate_tail_len)
+    drop_count = uih_lengths - new_uih_lengths
+    new_lengths = seq_lengths - drop_count
+
     if contextual_seq_len > 0:
         B = seq_lengths.size(0)
         # Step 1: peel off [contextual | rest-of-sequence].
@@ -190,12 +206,10 @@ def apply_truncation(
             offsets_right=offsets_rest,
             kernel=kernel,
         )
-        # Step 2: drop the head of the rest; keep its tail.
-        rest_head_lengths = seq_lengths - new_lengths
+        # Step 2: drop the UIH head of the rest; keep the rest tail
+        # (kept UIH + targets).
         rest_tail_lengths = new_lengths - contextual_seq_len
-        offsets_rest_head = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            rest_head_lengths
-        )
+        offsets_rest_head = torch.ops.fbgemm.asynchronous_complete_cumsum(drop_count)
         offsets_rest_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(
             rest_tail_lengths
         )
@@ -206,20 +220,20 @@ def apply_truncation(
             offsets_right=offsets_rest_tail,
             kernel=kernel,
         )
-        # Step 3: re-join [contextual | rest_tail].
+        # Step 3: re-join [contextual | rest_tail].  ``max_seq_len - C``
+        # is a safe upper bound on the rest-tail length per sample.
         x = concat_2D_jagged(
             values_left=x_prefix,
             values_right=x_rest_kept,
             max_len_left=contextual_seq_len,
-            max_len_right=truncate_tail_len - contextual_seq_len,
+            max_len_right=max_seq_len - contextual_seq_len,
             offsets_left=offsets_prefix,
             offsets_right=offsets_rest_tail,
             kernel=kernel,
         )
         x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
     else:
-        head_lengths = seq_lengths - new_lengths
-        offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(head_lengths)
+        offsets_head = torch.ops.fbgemm.asynchronous_complete_cumsum(drop_count)
         offsets_tail = torch.ops.fbgemm.asynchronous_complete_cumsum(new_lengths)
         _, x = split_2D_jagged(
             values=x,
@@ -229,7 +243,7 @@ def apply_truncation(
             kernel=kernel,
         )
         x_offsets = offsets_tail
-    seq_lengths = new_lengths
-    if num_targets is not None:
-        num_targets = torch.clamp(num_targets, max=new_lengths - contextual_seq_len)
-    return x, x_offsets, seq_lengths, num_targets, truncate_tail_len
+    # Tight post-truncation max (one D->H sync per call).  Tighter than
+    # the input ``max_seq_len`` so downstream padding shrinks accordingly.
+    new_max_seq_len = int(new_lengths.max().item())
+    return x, x_offsets, new_lengths, num_targets, new_max_seq_len
