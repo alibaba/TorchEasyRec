@@ -280,6 +280,7 @@ def cutlass_hstu_mha(
     num_targets: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
@@ -298,6 +299,9 @@ def cutlass_hstu_mha(
         num_targets: number of target tokens per batch element.
         max_attn_len: maximum attention window length (0 means unlimited).
         contextual_seq_len: number of contextual tokens per sequence.
+        scaling_seqlen: divisor used to scale the attention output inside
+            the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
+            the behavior matches the legacy code path.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -344,6 +348,9 @@ def cutlass_hstu_mha(
     if num_targets is not None:
         num_targets_int32 = num_targets.to(torch.int32)
 
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seq_len
+
     # In autograd-enabled context (training), go through the
     # _CutlassHstuMhaFunction so backward is wired up. Under no_grad /
     # inference / FX-traced graphs, we still call the underlying op
@@ -355,7 +362,7 @@ def cutlass_hstu_mha(
             v,
             cu_seqlens,
             max_seq_len,
-            max_seq_len,  # scaling_seqlen
+            scaling_seqlen,
             num_contexts_tensor,
             num_targets_int32,
             1,  # target_group_size
@@ -369,7 +376,7 @@ def cutlass_hstu_mha(
         v,
         cu_seqlens,
         max_seq_len,
-        max_seq_len,  # scaling_seqlen
+        scaling_seqlen,
         num_contexts_tensor,
         num_targets_int32,
         1,  # target_group_size
