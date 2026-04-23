@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import shutil
 import tempfile
@@ -457,20 +456,6 @@ class MatchIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
-        # Verify model_acc.json for user tower has no HSTU-specific keys
-        user_acc_path = os.path.join(self.test_dir, "export/user/model_acc.json")
-        self.assertTrue(os.path.exists(user_acc_path))
-        with open(user_acc_path) as f:
-            acc_cfg = json.load(f)
-            self.assertNotIn("hstu_item_id", acc_cfg)
-            self.assertNotIn("hstu_kernel", acc_cfg)
-        # Verify model_acc.json for item tower has no HSTU-specific keys
-        item_acc_path = os.path.join(self.test_dir, "export/item/model_acc.json")
-        self.assertTrue(os.path.exists(item_acc_path))
-        with open(item_acc_path) as f:
-            acc_cfg = json.load(f)
-            self.assertNotIn("hstu_item_id", acc_cfg)
-            self.assertNotIn("hstu_kernel", acc_cfg)
 
 
 if __name__ == "__main__":

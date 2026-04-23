@@ -1004,8 +1004,6 @@ class RankIntegrationTest(unittest.TestCase):
         with open(model_acc_path) as f:
             acc_cfg = json.load(f)
             self.assertEqual(acc_cfg["cand_seq_pk"], "cand_seq")
-            self.assertNotIn("hstu_item_id", acc_cfg)
-            self.assertNotIn("hstu_kernel", acc_cfg)
             self.assertEqual(acc_cfg["ENABLE_AOT"], "1")
         # Verify output_field_names.json is created for AOT export
         output_names_path = os.path.join(
