@@ -56,7 +56,6 @@ from tzrec.features.feature import (
     create_fg_json,
 )
 from tzrec.modules.utils import BaseModule
-from tzrec.protos.model_pb2 import Kernel
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
@@ -72,11 +71,6 @@ from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
-# All HSTU-based model types (for hstu_kernel detection)
-_HSTU_MODEL_TYPES = {"DlrmHSTU", "HSTUMatch"}
-# HSTU model types that require hstu_item_id (ranking models only)
-_HSTU_ITEM_ID_REQUIRED_TYPES = {"DlrmHSTU"}
-
 
 def export_model(
     pipeline_config: EasyRecConfig,
@@ -84,26 +78,10 @@ def export_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    hstu_item_id: Optional[str] = None,
+    additional_export_config: Optional[Dict[str, str]] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = env_util.use_rtp()
-
-    # Check if the model is HSTU-based and requires hstu_item_id
-    model_type = config_util.which_msg(pipeline_config.model_config, "model")
-    # Get kernel from model_config, default to PYTORCH
-    hstu_kernel = (
-        Kernel.Name(pipeline_config.model_config.kernel)
-        if model_type in _HSTU_MODEL_TYPES
-        else None
-    )
-    if model_type in _HSTU_ITEM_ID_REQUIRED_TYPES and hstu_item_id is None:
-        raise ValueError(
-            f"HSTU model (type: {model_type}) requires --hstu_item_id parameter. "
-            "Please specify the feature name of candidate item id column via "
-            "--hstu_item_id argument, e.g., --hstu_item_id=item_id. "
-            "This is used to identify the target item's column name."
-        )
 
     impl = export_rtp_model if use_rtp else export_model_normal
     fs, local_path = url_to_fs(save_dir)
@@ -120,8 +98,7 @@ def export_model(
         save_dir=local_path,
         assets=assets,
         use_local_cache_dir=use_local_cache_dir,
-        hstu_item_id=hstu_item_id,
-        hstu_kernel=hstu_kernel,
+        additional_export_config=additional_export_config,
     )
     if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
@@ -163,8 +140,7 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    hstu_item_id: Optional[str] = None,
-    hstu_kernel: Optional[str] = None,
+    additional_export_config: Optional[Dict[str, str]] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
@@ -308,7 +284,7 @@ def export_model_normal(
         with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
             json.dump(
                 acc_utils.export_acc_config(
-                    hstu_item_id=hstu_item_id, hstu_kernel=hstu_kernel
+                    additional_export_config=additional_export_config
                 ),
                 f,
                 indent=4,

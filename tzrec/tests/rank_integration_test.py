@@ -972,7 +972,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str=export_env_str,
-                hstu_item_id="cand_seq__video_id",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
@@ -1003,8 +1003,9 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(os.path.exists(model_acc_path))
         with open(model_acc_path) as f:
             acc_cfg = json.load(f)
-            self.assertEqual(acc_cfg["hstu_item_id"], "cand_seq__video_id")
-            self.assertEqual(acc_cfg["hstu_kernel"], "triton")
+            self.assertEqual(acc_cfg["cand_seq_pk"], "cand_seq")
+            self.assertNotIn("hstu_item_id", acc_cfg)
+            self.assertNotIn("hstu_kernel", acc_cfg)
             self.assertEqual(acc_cfg["ENABLE_AOT"], "1")
         # Verify output_field_names.json is created for AOT export
         output_names_path = os.path.join(
@@ -1060,7 +1061,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="ENABLE_AOT=1",
-                hstu_item_id="cand_seq__video_id",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         if self.success:
@@ -1164,27 +1165,9 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="MAX_EXPORT_BATCH_SIZE=1 USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",  # NOQA
-                hstu_item_id="cand_seq_video_id",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         self.assertTrue(self.success)
-
-    def test_dlrm_hstu_export_without_hstu_item_id_raises(self):
-        pipeline_config = config_util.load_pipeline_config(
-            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config"
-        )
-        from unittest.mock import MagicMock
-
-        from tzrec.utils.export_util import export_model
-
-        with self.assertRaises(ValueError) as ctx:
-            export_model(
-                pipeline_config=pipeline_config,
-                model=MagicMock(),
-                checkpoint_path=None,
-                save_dir=self.test_dir,
-                hstu_item_id=None,
-            )
-        self.assertIn("hstu_item_id", str(ctx.exception))
 
 
 if __name__ == "__main__":
