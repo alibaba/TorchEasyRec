@@ -280,6 +280,7 @@ class HSTUAttentionTest(unittest.TestCase):
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
         enable_tma=st.sampled_from(get_test_enable_tma()),
+        scaling_seqlen=st.sampled_from([-1, 512, 2048]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -503,6 +504,7 @@ class HSTUAttentionTest(unittest.TestCase):
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
+        scaling_seqlen=st.sampled_from([-1, 512, 2048]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -525,74 +527,6 @@ class HSTUAttentionTest(unittest.TestCase):
     # NOTE: no ``test_delta_attn_cutlass`` — ``delta_hstu_mha`` has no
     # CUTLASS implementation and falls back to Triton internally. The
     # delta/cached path is already covered by ``test_delta_attn_triton``.
-
-    @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
-    @given(
-        batch_size=st.integers(2, 4),
-        heads=st.sampled_from([1, 2]),
-        max_uih_len=st.sampled_from([64, 128]),
-        max_targets=st.sampled_from([20]),
-        attn_dim=st.sampled_from([32, 64]),
-        hidden_dim=st.sampled_from([32, 64]),
-        causal=st.just(True),
-        has_multiple_targets=st.just(False),
-        has_max_attn_len=st.just(False),
-        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
-        contextual_seq_len=st.just(0),
-        scaling_seqlen=st.sampled_from([-1, 512, 2048]),
-    )
-    @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
-    # pyre-ignore[2]
-    def test_attn_triton_scaling_seqlen(self, *args, **kwargs) -> None:
-        """Parity Triton vs PyTorch across scaling_seqlen values.
-
-        Sweeps scaling_seqlen in [-1, 512, 2048] (the -1 case preserves
-        legacy behavior). Covers fwd + bwd.
-        """
-        test_attn(
-            *args,
-            **kwargs,
-            test_backward=True,
-            ref_kernel=Kernel.PYTORCH,
-            real_kernel=Kernel.TRITON,
-            enable_tma=False,
-        )
-
-    @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
-    @given(
-        batch_size=st.integers(2, 4),
-        heads=st.sampled_from([1, 2]),
-        max_uih_len=st.sampled_from([64, 128]),
-        max_targets=st.sampled_from([20]),
-        attn_dim=st.sampled_from([32, 64]),
-        causal=st.just(True),
-        has_multiple_targets=st.just(False),
-        has_max_attn_len=st.just(False),
-        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
-        contextual_seq_len=st.just(0),
-        scaling_seqlen=st.sampled_from([-1, 512, 2048]),
-    )
-    @settings(verbosity=Verbosity.verbose, max_examples=6, deadline=None)
-    # pyre-ignore[2]
-    def test_attn_cutlass_scaling_seqlen(self, *args, **kwargs) -> None:
-        """Parity CUTLASS vs PyTorch across scaling_seqlen values.
-
-        Same sweep as the Triton variant; CUTLASS requires attn_dim equal
-        to hidden_dim.
-        """
-        hidden_dim = kwargs.pop("attn_dim")
-        test_attn(
-            *args,
-            **kwargs,
-            attn_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            test_backward=True,
-            ref_kernel=Kernel.PYTORCH,
-            real_kernel=Kernel.CUTLASS,
-            enable_tma=False,
-        )
 
     @unittest.skipIf(*gpu_unavailable)
     def test_scaling_seqlen_invariance(self) -> None:
