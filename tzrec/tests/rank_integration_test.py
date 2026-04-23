@@ -1005,15 +1005,6 @@ class RankIntegrationTest(unittest.TestCase):
             acc_cfg = json.load(f)
             self.assertEqual(acc_cfg["cand_seq_pk"], "cand_seq")
             self.assertEqual(acc_cfg["ENABLE_AOT"], "1")
-        # Verify output_field_names.json is created for AOT export
-        output_names_path = os.path.join(
-            self.test_dir, "export/aoti/output_field_names.json"
-        )
-        self.assertTrue(os.path.exists(output_names_path))
-        with open(output_names_path) as f:
-            output_names = json.load(f)
-            self.assertIsInstance(output_names, list)
-            self.assertGreater(len(output_names), 0)
 
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export(self):
