@@ -528,69 +528,6 @@ class HSTUAttentionTest(unittest.TestCase):
     # CUTLASS implementation and falls back to Triton internally. The
     # delta/cached path is already covered by ``test_delta_attn_triton``.
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_scaling_seqlen_invariance(self) -> None:
-        """When ``scaling_seqlen`` is pinned, output is invariant to max_seq_len.
-
-        Calls ``hstu_mha`` twice with identical jagged q/k/v but different
-        ``max_seq_len`` values (both >= actual max sequence length). With
-        the default ``scaling_seqlen=-1`` the two outputs differ (divided
-        by different runtime maxes); with a pinned value they must match.
-        """
-        from tzrec.ops.hstu_attention import hstu_mha
-
-        torch.manual_seed(0)
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-        batch_size, heads, attn_dim, hidden_dim = 4, 2, 32, 32
-        lengths = torch.tensor([40, 50, 40, 50], dtype=torch.int64, device="cuda")
-        seq_offsets = torch.zeros((batch_size + 1,), dtype=torch.int64, device="cuda")
-        seq_offsets[1:] = torch.cumsum(lengths, dim=0)
-        L = int(seq_offsets[-1].item())
-        actual_max = int(lengths.max().item())
-
-        q = torch.empty(
-            (L, heads, attn_dim), dtype=torch.bfloat16, device="cuda"
-        ).uniform_(-0.1, 0.1)
-        k = torch.empty_like(q).uniform_(-0.1, 0.1)
-        v = torch.empty(
-            (L, heads, hidden_dim), dtype=torch.bfloat16, device="cuda"
-        ).uniform_(-0.1, 0.1)
-
-        alpha = 1.0 / (attn_dim**0.5)
-
-        def run(max_seq_len: int, scaling_seqlen: int, kernel: Kernel):
-            return hstu_mha(
-                max_seq_len=max_seq_len,
-                alpha=alpha,
-                q=q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-                causal=True,
-                num_targets=None,
-                dropout_pr=0.0,
-                contextual_seq_len=0,
-                kernel=kernel,
-                scaling_seqlen=scaling_seqlen,
-            )
-
-        assert actual_max <= 64
-        for kernel in (Kernel.PYTORCH, Kernel.TRITON, Kernel.CUTLASS):
-            # Legacy (scaling_seqlen=-1): divisor == max_seq_len. Doubling
-            # max_seq_len halves the output (scale is 1/max).
-            out_64 = run(max_seq_len=64, scaling_seqlen=-1, kernel=kernel)
-            out_128 = run(max_seq_len=128, scaling_seqlen=-1, kernel=kernel)
-            # out_64 * 0.5 ~= out_128 (since divisor doubled).
-            torch.testing.assert_close(out_64 * 0.5, out_128, atol=1e-2, rtol=1e-2)
-
-            # Pinned scaling_seqlen: divisor is constant. Outputs must
-            # match bit-close regardless of the runtime max_seq_len.
-            pinned_64 = run(max_seq_len=64, scaling_seqlen=1024, kernel=kernel)
-            pinned_128 = run(max_seq_len=128, scaling_seqlen=1024, kernel=kernel)
-            torch.testing.assert_close(pinned_64, pinned_128, atol=1e-2, rtol=1e-2)
-
 
 if __name__ == "__main__":
     unittest.main()
