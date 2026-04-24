@@ -188,6 +188,11 @@ class STULayer(STU):
         recompute_y (bool): whether to recompute y in backward
         sort_by_length (bool): whether to sort by length when forwarding
         contextual_seq_len (int): sequence length of contextual feature
+        scaling_seqlen (int): sequence length used as the divisor in the
+            attention output scaling. ``-1`` means fall back to the runtime
+            ``max_seq_len`` (legacy behavior). When set to a fixed value
+            (typically the model's config ``max_seq_len``), attention output
+            is invariant to batch-level seq-length.
         is_inference (bool): whether to run in inference mode.
     """
 
@@ -213,6 +218,7 @@ class STULayer(STU):
         recompute_y: bool = True,
         sort_by_length: bool = True,
         contextual_seq_len: int = 0,
+        scaling_seqlen: int = -1,
         is_inference: bool = False,
     ) -> None:
         super().__init__(
@@ -234,6 +240,7 @@ class STULayer(STU):
         self._recompute_y: bool = recompute_y
         self._sort_by_length: bool = sort_by_length
         self._contextual_seq_len: int = contextual_seq_len
+        self._scaling_seqlen: int = scaling_seqlen
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -391,6 +398,7 @@ class STULayer(STU):
                 prefill=kv_caching_lengths is not None,
                 kernel=self.kernel(),
                 enable_tma=self._enable_tma,
+                scaling_seqlen=self._scaling_seqlen,
             )
 
         self.update_kv_cache(
@@ -479,6 +487,7 @@ class STULayer(STU):
                 contextual_seq_len=self._contextual_seq_len,
                 kernel=self.kernel(),
                 enable_tma=self._enable_tma,
+                scaling_seqlen=self._scaling_seqlen,
             ).view(-1, self._hidden_dim * self._num_heads)
         with record_function("## stu_compute_output ##"):
             return hstu_compute_output(

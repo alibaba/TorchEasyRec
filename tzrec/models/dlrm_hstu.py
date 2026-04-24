@@ -140,13 +140,16 @@ class DlrmHSTU(RankModel):
             if task_cfg.HasField("task_bitmask"):
                 action_weights.append(task_cfg.task_bitmask)
 
-        # construct HSTU
+        # construct HSTU. Pin the attention-output scaling divisor to the
+        # configured max_seq_len so that attention output is invariant to
+        # batch-level seq-length.
         self._hstu_transducer: HSTUTransducer = HSTUTransducer(
             uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
             max_contextual_seq_len=max_contextual_seq_len,
             contextual_group_name=self._contextual_group_name,
+            scaling_seqlen=self._model_config.max_seq_len,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
             listwise=False,

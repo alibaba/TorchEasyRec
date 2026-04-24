@@ -131,14 +131,17 @@ def pytorch_hstu_mha(
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seq_len
     L, H, _ = q.shape
     V = v.shape[2]
     q, k, v = _pad_qkv(
         q, k, v, seq_offsets, max_seq_len
     )  # [B, H, N, D) and [B, H, N, V]
     qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
-    qk_attn = F.silu(qk_attn) / max_seq_len
+    qk_attn = F.silu(qk_attn) / scaling_seqlen
     valid_attn_mask = _get_valid_attn_mask(
         device=q.device,
         causal=causal,
@@ -172,7 +175,10 @@ def pytorch_cached_hstu_mha(
     num_targets: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seq_len
     L, H, D = delta_q.shape
     _, _, V = v.shape
     B = seq_offsets.size(0) - 1
@@ -199,7 +205,7 @@ def pytorch_cached_hstu_mha(
         .transpose(1, 2)
     )
     qk_attn = torch.einsum("bhxa,bhya->bhxy", delta_q, full_k) * alpha
-    qk_attn = F.silu(qk_attn) / max_seq_len
+    qk_attn = F.silu(qk_attn) / scaling_seqlen
     full_valid_attn_mask = _get_valid_attn_mask(
         device=delta_q.device,
         causal=True,

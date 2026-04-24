@@ -46,6 +46,7 @@ def hstu_mha(
     sort_by_length: bool = False,
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     _, H, _ = q.shape
     if not is_fx_tracing():
@@ -95,6 +96,7 @@ def hstu_mha(
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
+            scaling_seqlen=scaling_seqlen,
         )
 
     if kernel == Kernel.TRITON:
@@ -128,6 +130,7 @@ def hstu_mha(
             contextual_seq_len=contextual_seq_len,
             sort_by_length=sort_by_length,
             enable_tma=enable_tma,
+            scaling_seqlen=scaling_seqlen,
         )
     else:
         return pytorch_hstu_mha(
@@ -144,6 +147,7 @@ def hstu_mha(
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             min_full_attn_seq_len=min_full_attn_seq_len,
+            scaling_seqlen=scaling_seqlen,
         )
 
 
@@ -159,6 +163,7 @@ def delta_hstu_mha(
     contextual_seq_len: int = 0,
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     if kernel == Kernel.CUTLASS:
         kernel = Kernel.TRITON
@@ -200,6 +205,7 @@ def delta_hstu_mha(
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             enable_tma=enable_tma,
+            scaling_seqlen=scaling_seqlen,
         )
     else:
         return pytorch_cached_hstu_mha(
@@ -212,4 +218,5 @@ def delta_hstu_mha(
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
+            scaling_seqlen=scaling_seqlen,
         )
