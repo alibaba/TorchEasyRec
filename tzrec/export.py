@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import argparse
+import json
 
 from tzrec.main import export
 
@@ -41,17 +42,24 @@ if __name__ == "__main__":
         help="more files will be copied to export_dir.",
     )
     parser.add_argument(
-        "--hstu_item_id",
+        "--additional_export_config",
         type=str,
         default=None,
-        help="feature name of candidate item id for HSTU model.",
+        help="JSON string of extra key/value pairs merged into model_acc.json, "
+        'e.g. \'{"cand_seq_pk": "cand_seq"}\' for DlrmHSTU.',
     )
     args, extra_args = parser.parse_known_args()
+
+    additional_export_config = (
+        json.loads(args.additional_export_config)
+        if args.additional_export_config
+        else None
+    )
 
     export(
         args.pipeline_config_path,
         export_dir=args.export_dir,
         checkpoint_path=args.checkpoint_path,
         asset_files=args.asset_files,
-        hstu_item_id=args.hstu_item_id,
+        additional_export_config=additional_export_config,
     )

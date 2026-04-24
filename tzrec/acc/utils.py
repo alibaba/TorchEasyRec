@@ -273,13 +273,13 @@ def write_mapping_file_for_input_tile(
 
 
 def export_acc_config(
-    hstu_item_id: Optional[str] = None, hstu_kernel: Optional[str] = None
+    additional_export_config: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """Export acc config for model online inference.
 
     Args:
-        hstu_item_id (str, optional): feature name of candidate item id for HSTU model.
-        hstu_kernel (str, optional): kernel type for HSTU model, default is "pytorch".
+        additional_export_config (dict, optional): extra key/value pairs merged
+            into the acc config (overriding env-derived defaults on conflict).
     """
     # use int64 sparse id as input
     acc_config = {"SPARSE_INT64": "1"}
@@ -295,10 +295,8 @@ def export_acc_config(
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
         # Record unified AOT mode (default 0) so predict can detect it.
         acc_config["UNIFIED_AOT"] = "1" if is_unified_aot() else "0"
-    if hstu_item_id is not None:
-        acc_config["hstu_item_id"] = hstu_item_id
-    if hstu_kernel is not None:
-        acc_config["hstu_kernel"] = hstu_kernel.lower()
+    if additional_export_config:
+        acc_config.update(additional_export_config)
     return acc_config
 
 

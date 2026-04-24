@@ -894,7 +894,7 @@ def export(
     export_dir: str,
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
-    hstu_item_id: Optional[str] = None,
+    additional_export_config: Optional[Dict[str, str]] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -904,7 +904,8 @@ def export(
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path.
         asset_files (str, optional): more files will be copied to export_dir.
-        hstu_item_id (str, optional): feature name of candidate item id for HSTU model.
+        additional_export_config (dict, optional): extra key/value pairs merged
+            into model_acc.json (e.g. ``{"cand_seq_pk": "cand_seq"}`` for DlrmHSTU).
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
@@ -961,7 +962,7 @@ def export(
                     checkpoint_path,
                     tower_export_dir,
                     assets=assets,
-                    hstu_item_id=hstu_item_id,
+                    additional_export_config=additional_export_config,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
@@ -988,7 +989,7 @@ def export(
             checkpoint_path,
             export_dir,
             assets=assets,
-            hstu_item_id=hstu_item_id,
+            additional_export_config=additional_export_config,
         )
 
 
