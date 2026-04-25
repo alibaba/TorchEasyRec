@@ -107,19 +107,33 @@ def export_model_aot(
     sparse_model_scripted.save(os.path.join(save_dir, "scripted_sparse_model.pt"))
 
     batch = torch.export.Dim("batch", min=1, max=499999999)
-    dynamic_shapes = {}
+    dynamic_shapes: Dict[str, Dict[int, torch.export.Dim]] = {}
     seq_tensor_names = meta_info.get("seq_tensor_names", [])
     jagged_seq_tensor_names = meta_info.get("jagged_seq_tensor_names", [])
+    seq_share_groups = meta_info.get("seq_share_groups", {})
+
+    # Separate caches per axis: a SEQUENCE group and a JAGGED_SEQUENCE
+    # group from the same parent SequenceFeature share a lengths source,
+    # but the Dims they need are different symbolic quantities — max
+    # seq_len (axis 1, padded) vs total nnz (axis 0, jagged).
+    seq_len_dims: Dict[str, torch.export.Dim] = {}
+    jagged_batch_dims: Dict[str, torch.export.Dim] = {}
+
     for key in sparse_output.keys():
         if key in seq_tensor_names:
-            dynamic_shapes[key] = {
-                0: batch,
-                1: torch.export.Dim(f"{key}__seq_len", min=1, max=999999993),
-            }
+            share_key = seq_share_groups.get(key, key)
+            if share_key not in seq_len_dims:
+                seq_len_dims[share_key] = torch.export.Dim(
+                    f"{share_key}__seq_len", min=1, max=999999993
+                )
+            dynamic_shapes[key] = {0: batch, 1: seq_len_dims[share_key]}
         elif key in jagged_seq_tensor_names:
-            dynamic_shapes[key] = {
-                0: torch.export.Dim(f"{key}__batch", min=1, max=999999993)
-            }
+            share_key = seq_share_groups.get(key, key)
+            if share_key not in jagged_batch_dims:
+                jagged_batch_dims[share_key] = torch.export.Dim(
+                    f"{share_key}__batch", min=1, max=999999993
+                )
+            dynamic_shapes[key] = {0: jagged_batch_dims[share_key]}
         else:
             dynamic_shapes[key] = {0: batch}
 

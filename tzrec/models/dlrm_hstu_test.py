@@ -48,6 +48,36 @@ def _build_model(
     concat_contextual_features: bool = False,
 ) -> DlrmHSTU:
     """Build a DlrmHSTU model with standard test configuration."""
+    uih_seq_features = [
+        feature_pb2.SeqFeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="video_id",
+                embedding_dim=16,
+                embedding_name="video_id_emb",
+                num_buckets=1000,
+            )
+        ),
+        feature_pb2.SeqFeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="video_cat",
+                embedding_dim=16,
+                embedding_name="video_cat_emb",
+                num_buckets=100,
+            )
+        ),
+        feature_pb2.SeqFeatureConfig(
+            raw_feature=feature_pb2.RawFeature(feature_name="action_timestamp")
+        ),
+        feature_pb2.SeqFeatureConfig(
+            raw_feature=feature_pb2.RawFeature(feature_name="action_weight")
+        ),
+    ]
+    if has_watchtime:
+        uih_seq_features.append(
+            feature_pb2.SeqFeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="watch_time")
+            )
+        )
     feature_cfgs = [
         feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
@@ -62,50 +92,38 @@ def _build_model(
             )
         ),
         feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="video_id",
-                embedding_dim=16,
-                embedding_name="video_id_emb",
-                num_buckets=1000,
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="uih_seq",
+                features=uih_seq_features,
             )
         ),
         feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="video_cat",
-                embedding_dim=16,
-                embedding_name="video_cat_emb",
-                num_buckets=100,
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="cand_seq",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="item_video_id",
+                            embedding_dim=16,
+                            embedding_name="video_id_emb",
+                            num_buckets=1000,
+                        )
+                    ),
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="item_video_cat",
+                            embedding_dim=16,
+                            embedding_name="video_cat_emb",
+                            num_buckets=100,
+                        )
+                    ),
+                    feature_pb2.SeqFeatureConfig(
+                        raw_feature=feature_pb2.RawFeature(
+                            feature_name="item_query_time"
+                        )
+                    ),
+                ],
             )
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="item_video_id",
-                embedding_dim=16,
-                embedding_name="video_id_emb",
-                num_buckets=1000,
-            )
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="item_video_cat",
-                embedding_dim=16,
-                embedding_name="video_cat_emb",
-                num_buckets=100,
-            )
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_raw_feature=feature_pb2.RawFeature(feature_name="action_timestamp")
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_raw_feature=feature_pb2.RawFeature(feature_name="item_query_time")
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_raw_feature=feature_pb2.RawFeature(
-                feature_name="action_weight",
-            )
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_raw_feature=feature_pb2.RawFeature(feature_name="watch_time")
         ),
     ]
     features = create_features(feature_cfgs)
@@ -117,35 +135,35 @@ def _build_model(
         ),
         model_pb2.FeatureGroupConfig(
             group_name="uih",
-            feature_names=["video_id", "video_cat"],
+            feature_names=["uih_seq__video_id", "uih_seq__video_cat"],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
         model_pb2.FeatureGroupConfig(
             group_name="candidate",
             feature_names=[
-                "item_video_id",
-                "item_video_cat",
+                "cand_seq__item_video_id",
+                "cand_seq__item_video_cat",
             ],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
         model_pb2.FeatureGroupConfig(
             group_name="uih_timestamp",
             feature_names=[
-                "action_timestamp",
+                "uih_seq__action_timestamp",
             ],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
         model_pb2.FeatureGroupConfig(
             group_name="candidate_timestamp",
             feature_names=[
-                "item_query_time",
+                "cand_seq__item_query_time",
             ],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
         model_pb2.FeatureGroupConfig(
             group_name="uih_action",
             feature_names=[
-                "action_weight",
+                "uih_seq__action_weight",
             ],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
@@ -155,7 +173,7 @@ def _build_model(
             model_pb2.FeatureGroupConfig(
                 group_name="uih_watchtime",
                 feature_names=[
-                    "watch_time",
+                    "uih_seq__watch_time",
                 ],
                 group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
             )
@@ -230,8 +248,18 @@ def _build_model(
                 input_preprocessor=module_pb2.GRInputPreprocessor(
                     contextual_preprocessor=module_pb2.GRContextualPreprocessor(
                         action_encoder=module_pb2.GRActionEncoder(
+                            # has_watchtime also enables the watchtime->action
+                            # bitwise-OR so AOT export traces the cross-sequence
+                            # op that constrains uih_action and uih_watchtime nnz.
                             simple_action_encoder=module_pb2.GRSimpleActionEncoder(
-                                action_embedding_dim=8, action_weights=[1, 2, 4]
+                                action_embedding_dim=8,
+                                action_weights=[1, 2, 4],
+                                watchtime_to_action_thresholds=(
+                                    [60, 300] if has_watchtime else []
+                                ),
+                                watchtime_to_action_weights=(
+                                    [256, 512] if has_watchtime else []
+                                ),
                             )
                         ),
                         action_mlp=module_pb2.GRContextualizedMLP(
@@ -282,32 +310,33 @@ def _build_batch(
         keys=[
             "user_id",
             "user_active_degree",
-            "video_id",
-            "item_video_id",
-            "video_cat",
-            "item_video_cat",
+            "uih_seq__video_id",
+            "cand_seq__item_video_id",
+            "uih_seq__video_cat",
+            "cand_seq__item_video_cat",
         ],
         values=torch.tensor(list(range(26))),
         lengths=torch.tensor([1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 2, 4]),
     )
     sequence_dense_features = {
-        "action_timestamp": JaggedTensor(
+        "uih_seq__action_timestamp": JaggedTensor(
             values=torch.tensor([[1], [2], [3], [4], [5]]),
             lengths=torch.tensor([2, 3]),
         ),
-        "item_query_time": JaggedTensor(
+        "cand_seq__item_query_time": JaggedTensor(
             values=torch.tensor([[6], [7], [8], [9], [10], [11]]),
             lengths=torch.tensor([2, 4]),
         ),
-        "action_weight": JaggedTensor(
+        "uih_seq__action_weight": JaggedTensor(
             values=torch.tensor([[0], [1], [0], [1], [0]]),
             lengths=torch.tensor([2, 3]),
         ),
-        "watch_time": JaggedTensor(
+    }
+    if has_watchtime:
+        sequence_dense_features["uih_seq__watch_time"] = JaggedTensor(
             values=torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]]),
             lengths=torch.tensor([2, 3]),
-        ),
-    }
+        )
     jagged_labels = {
         "item_action_weight": JaggedTensor(
             values=torch.tensor([0, 1, 0, 0, 1, 0]),
