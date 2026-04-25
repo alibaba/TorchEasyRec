@@ -487,5 +487,120 @@ class HSTUComputeTest(unittest.TestCase):
             )
 
 
+class Hstu4WayRematParityTest(unittest.TestCase):
+    """Forward + backward parity for ``hstu_compute_uqvk``'s 4 remat combos.
+
+    The PR description claims bitwise forward + gradient parity across
+    every ``(recompute_normed_x, recompute_uvqk)`` combination; this
+    test substantiates that claim by comparing each checkpointed
+    configuration against the non-checkpointed reference
+    (``_hstu_compute_uqvk_impl``).  Runs on CPU with the PyTorch
+    kernel so it executes in every CI lane.
+    """
+
+    def _build_inputs(self, total: int = 12, dim: int = 16):
+        torch.manual_seed(0)
+        num_heads, attn_dim, hidden_dim = 2, 8, 8
+        x = torch.randn(total, dim, requires_grad=True)
+        norm_weight = torch.randn(dim, requires_grad=True)
+        norm_bias = torch.randn(dim, requires_grad=True)
+        uvqk_weight = torch.randn(
+            dim,
+            (hidden_dim * 2 + attn_dim * 2) * num_heads,
+            requires_grad=True,
+        )
+        uvqk_bias = torch.randn(
+            (hidden_dim * 2 + attn_dim * 2) * num_heads,
+            requires_grad=True,
+        )
+        return (
+            x,
+            norm_weight,
+            norm_bias,
+            uvqk_weight,
+            uvqk_bias,
+            (
+                num_heads,
+                attn_dim,
+                hidden_dim,
+            ),
+        )
+
+    def test_4way_remat_forward_and_grad_parity(self) -> None:
+        from tzrec.ops.hstu_compute import (
+            _hstu_compute_uqvk_impl,
+            hstu_compute_uqvk,
+        )
+
+        for rn, ru in [(False, False), (True, False), (False, True), (True, True)]:
+            with self.subTest(recompute_normed_x=rn, recompute_uvqk=ru):
+                (
+                    x,
+                    nw,
+                    nb,
+                    uw,
+                    ub,
+                    (num_heads, attn_dim, hidden_dim),
+                ) = self._build_inputs()
+
+                def _grads(out):
+                    # Sum over u + q + k + v gives a scalar that
+                    # exercises every gradient branch.
+                    loss = sum(t.sum() for t in out)
+                    loss.backward()
+
+                # Reference: vanilla, no checkpoint.
+                ref = _hstu_compute_uqvk_impl(
+                    x,
+                    nw,
+                    nb,
+                    1e-6,
+                    num_heads,
+                    attn_dim,
+                    hidden_dim,
+                    uw,
+                    ub,
+                    Kernel.PYTORCH,
+                )
+                _grads(ref)
+                ref_grads = (
+                    x.grad.clone(),
+                    nw.grad.clone(),
+                    nb.grad.clone(),
+                    uw.grad.clone(),
+                    ub.grad.clone(),
+                )
+                ref_out = tuple(t.detach().clone() for t in ref)
+
+                # Reset grads on shared tensors.
+                for t in (x, nw, nb, uw, ub):
+                    t.grad = None
+
+                got = hstu_compute_uqvk(
+                    x=x,
+                    norm_weight=nw,
+                    norm_bias=nb,
+                    norm_eps=1e-6,
+                    num_heads=num_heads,
+                    attn_dim=attn_dim,
+                    hidden_dim=hidden_dim,
+                    uvqk_weight=uw,
+                    uvqk_bias=ub,
+                    kernel=Kernel.PYTORCH,
+                    recompute_normed_x_in_backward=rn,
+                    recompute_uvqk_in_backward=ru,
+                )
+                _grads(got)
+                got_grads = (x.grad, nw.grad, nb.grad, uw.grad, ub.grad)
+
+                # Bitwise-equal forward.
+                for ref_t, got_t in zip(ref_out, got, strict=True):
+                    torch.testing.assert_close(got_t, ref_t, atol=0, rtol=0)
+                # Bitwise-equal grads -- the ckpt branches must
+                # recompute exactly the same values.
+                for ref_g, got_g in zip(ref_grads, got_grads, strict=True):
+                    torch.testing.assert_close(got_g, ref_g, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     unittest.main()
