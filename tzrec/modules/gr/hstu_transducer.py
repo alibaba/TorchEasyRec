@@ -24,9 +24,12 @@ from tzrec.modules.gr.postprocessors import (
     create_output_postprocessor,
 )
 from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
-from tzrec.modules.gr.stu import STU, STULayer, STUStack
+from tzrec.modules.gr.stu import STULayer, STUStack
 from tzrec.modules.utils import BaseModule
-from tzrec.ops.hstu_attention_utils import apply_stu_truncation
+from tzrec.ops.hstu_attention_utils import (
+    STUTruncationPlan,
+    apply_stu_truncation_plan,
+)
 from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
@@ -94,7 +97,7 @@ class HSTUTransducer(BaseModule):
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
         if "scaling_seqlen" not in stu:
             stu["scaling_seqlen"] = scaling_seqlen
-        self._stu_module: STU = STUStack(
+        self._stu_module: STUStack = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
             truncate_split_layer=attn_truncation_split_layer,
             truncate_tail_len=attn_truncation_tail_len,
@@ -175,16 +178,19 @@ class HSTUTransducer(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, Optional[STUTruncationPlan]]:
         """Run the STU stack and return truncated metadata alongside x.
 
         Returns:
-            ``(seq_embeddings, seq_offsets, max_seq_len)`` -- when
-            attention truncation is enabled, the offsets and max reflect
-            the post-truncation state so downstream splits stay aligned
-            with ``seq_embeddings``.  ``num_targets`` is preserved intact
-            across truncation, so the caller's input tensor is still
-            valid post-call.
+            ``(seq_embeddings, seq_offsets, max_seq_len, plan)``.
+            ``plan`` is the :class:`STUTruncationPlan` produced by the
+            stack when mid-stack truncation fired, else ``None``; callers
+            replay it on parallel jagged tensors via
+            :func:`apply_stu_truncation_plan`.  The ``seq_offsets`` /
+            ``max_seq_len`` reflect the post-truncation state when
+            ``plan`` is not ``None``.  ``num_targets`` is preserved
+            intact across truncation, so the caller's input tensor is
+            still valid post-call.
         """
         with record_function("hstu"):
             return self._stu_module(
@@ -197,7 +203,7 @@ class HSTUTransducer(BaseModule):
     def _postprocess(
         self,
         max_seq_len: int,
-        total_uih_len: int,
+        total_uih_len: Optional[int],
         total_targets: int,
         seq_lengths: torch.Tensor,
         seq_timestamps: torch.Tensor,
@@ -279,47 +285,44 @@ class HSTUTransducer(BaseModule):
             num_targets,
         ) = self._preprocess(grouped_features)
 
-        encoded_embeddings, post_stu_seq_offsets, post_stu_max_seq_len = (
-            self._hstu_compute(
-                max_seq_len=max_seq_len,
-                seq_lengths=seq_lengths,
-                seq_offsets=seq_offsets,
-                seq_timestamps=seq_timestamps,
-                seq_embeddings=seq_embeddings,
-                num_targets=num_targets,
-            )
+        (
+            encoded_embeddings,
+            post_stu_seq_offsets,
+            post_stu_max_seq_len,
+            plan,
+        ) = self._hstu_compute(
+            max_seq_len=max_seq_len,
+            seq_lengths=seq_lengths,
+            seq_offsets=seq_offsets,
+            seq_timestamps=seq_timestamps,
+            seq_embeddings=seq_embeddings,
+            num_targets=num_targets,
         )
 
-        # If STUStack truncated mid-stack, the returned offsets / max_seq_len
-        # describe the truncated embeddings.  Replay the same truncation on
-        # ``seq_timestamps`` so the downstream postprocessor's jagged splits
-        # index the truncated x with matching offsets. ``num_targets`` /
-        # ``total_targets`` are preserved by ``apply_stu_truncation``, so
-        # they stay valid as-is.
-        if post_stu_seq_offsets is not seq_offsets:
-            truncated_timestamps, _, new_seq_lengths, _ = apply_stu_truncation(
-                x=seq_timestamps.unsqueeze(-1),
-                x_offsets=seq_offsets,
-                seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
-                num_targets=num_targets,
-                max_seq_len=max_seq_len,
-                truncate_tail_len=self._stu_module._truncate_tail_len,
-                contextual_seq_len=getattr(
-                    self._stu_module._stu_layers[0], "_contextual_seq_len", 0
-                ),
-                kernel=self.kernel(),
-            )
-            seq_timestamps = truncated_timestamps.squeeze(-1)
-            seq_lengths = new_seq_lengths
+        # When STUStack truncated mid-stack, replay the *same* split on
+        # seq_timestamps so the downstream postprocessor's jagged splits
+        # match the truncated embeddings.  Reusing the precomputed plan
+        # avoids redoing the offset arithmetic and the .item() sync that
+        # the previous "second apply_stu_truncation call" pattern needed.
+        # ``num_targets`` / ``total_targets`` are preserved by truncation,
+        # so they stay valid as-is.
+        post_truncation_total_uih_len: Optional[int] = total_uih_len
+        if plan is not None:
+            seq_timestamps = apply_stu_truncation_plan(
+                seq_timestamps.unsqueeze(-1), plan
+            ).squeeze(-1)
+            seq_lengths = plan.new_lengths
             seq_offsets = post_stu_seq_offsets
             max_seq_len = post_stu_max_seq_len
-            # total_uih_len (Triton output-shape hint) shrank; total_targets
-            # is unchanged because targets are preserved intact.
-            total_uih_len = int(post_stu_seq_offsets[-1].item()) - total_targets
+            # ``total_uih_len`` shrank; let split_2D_jagged derive the
+            # exact value from offsets to avoid a second D->H sync (the
+            # only one on the truncation path is the tight max inside
+            # compute_stu_truncation_plan).
+            post_truncation_total_uih_len = None
 
         encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
             max_seq_len=max_seq_len,
-            total_uih_len=total_uih_len,
+            total_uih_len=post_truncation_total_uih_len,
             total_targets=total_targets,
             seq_lengths=seq_lengths,
             seq_embeddings=encoded_embeddings,

@@ -23,8 +23,10 @@ from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention import delta_hstu_mha
 from tzrec.ops.hstu_attention_utils import (
-    apply_stu_truncation,
+    STUTruncationPlan,
+    apply_stu_truncation_plan,
     build_sla_func_tensor,
+    compute_stu_truncation_plan,
 )
 from tzrec.ops.hstu_compute import (
     hstu_compute_output,
@@ -528,15 +530,23 @@ class STULayer(STU):
             )
 
 
-class STUStack(STU):
-    """Stack of STU layers with optional attention truncation.
+class STUStack(BaseModule):
+    """Stack of ``STU`` layers with optional mid-stack attention truncation.
+
+    ``STUStack`` is a container, not an ``STU`` -- it has its own forward
+    contract (returns post-truncation metadata alongside ``x``) that is
+    not Liskov-substitutable for ``STU.forward``.  Subclasses of ``STU``
+    (i.e. real attention layers) keep returning a single tensor.
 
     Args:
         stu_list (List[STU]): list of STU layers.
         truncate_split_layer (int): after this many layers, truncate to tail.
-            0 means disabled (all layers run on full sequence).
-        truncate_tail_len (int): number of trailing tokens to keep after
-            truncation. Only used when truncate_split_layer > 0.
+            Must be in ``(0, len(stu_list))`` when truncation is enabled,
+            else ``0``.
+        truncate_tail_len (int): number of trailing UIH tokens to keep
+            after truncation.  Both ``truncate_split_layer`` and
+            ``truncate_tail_len`` must be ``> 0`` to enable truncation;
+            mixed (one zero, one positive) is rejected.
         is_inference (bool): whether to run in inference mode.
     """
 
@@ -551,9 +561,16 @@ class STUStack(STU):
         self._stu_layers: torch.nn.ModuleList = torch.nn.ModuleList(modules=stu_list)
         self._truncate_split_layer: int = truncate_split_layer
         self._truncate_tail_len: int = truncate_tail_len
-        # Without this check, truncate_split_layer >= len(stu_list) silently
-        # no-ops (the loop never hits the split index) and truncation is
-        # lost without any signal.
+        # Both fields must be > 0 to enable truncation.  Catching the
+        # mismatched-defaults case here surfaces "set split_layer but
+        # forgot tail_len" (and vice versa) at construction time instead
+        # of silently no-opping at forward time.
+        if (truncate_split_layer > 0) != (truncate_tail_len > 0):
+            raise ValueError(
+                f"truncate_split_layer and truncate_tail_len must both be "
+                f"> 0 to enable truncation, or both 0 to disable; got "
+                f"split_layer={truncate_split_layer}, tail_len={truncate_tail_len}."
+            )
         if self._truncate_tail_len > 0 and not (
             0 < self._truncate_split_layer < len(self._stu_layers)
         ):
@@ -572,8 +589,7 @@ class STUStack(STU):
         num_targets: Optional[torch.Tensor],
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
-        attn_func: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, Optional[STUTruncationPlan]]:
         """Forward stack of stu layer.
 
         Args:
@@ -584,19 +600,19 @@ class STUStack(STU):
                 element (None in listwise-training mode).
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
-            attn_func: accepted for signature parity with ``STULayer.forward``.
-                STUStack builds its own per-layer ``attn_func`` (memoized on
-                SLA config + offsets identity), so any caller-supplied value
-                is overwritten on the first iteration that needs it.
 
         Returns:
-            ``(x, x_offsets, max_seq_len)``.  When attention truncation is
-            enabled (``truncate_tail_len > 0``) the offsets / max reflect
-            the post-truncation state so downstream splits stay aligned
-            with the returned ``x``; when disabled they equal the inputs.
-            ``num_targets`` is not echoed back -- ``apply_stu_truncation``
-            preserves targets intact, so the caller's input tensor is
-            still valid post-truncation.
+            ``(x, x_offsets, max_seq_len, plan)``.  ``plan`` is the
+            :class:`STUTruncationPlan` produced inside the stack when
+            attention truncation fires, else ``None``.  Callers that hold
+            tensors in parallel with ``x`` (e.g. ``seq_timestamps``) can
+            replay the same split via :func:`apply_stu_truncation_plan`
+            without recomputing the offsets.
+
+            When ``plan`` is not ``None`` the returned ``x_offsets`` /
+            ``max_seq_len`` reflect the post-truncation state.
+            ``num_targets`` is preserved intact across truncation, so the
+            caller's input tensor is still valid post-call.
         """
         seq_lengths = x_offsets[1:] - x_offsets[:-1]
         # SLA (sla_k1 > 0 or sla_k2 > 0) runs on the CUTLASS production
@@ -619,16 +635,16 @@ class STUStack(STU):
         # tensor N times per forward.  We memoize on the SLA config +
         # current offsets identity and only rebuild when those change (in
         # particular, once across the truncation boundary).
-        cur_attn_func: Optional[torch.Tensor] = attn_func
+        cur_attn_func: Optional[torch.Tensor] = None
         attn_func_sig: Optional[tuple] = None
+        plan: Optional[STUTruncationPlan] = None
         for i, layer in enumerate(self._stu_layers):
             if (
                 i == self._truncate_split_layer
                 and self._truncate_split_layer > 0
                 and self._truncate_tail_len > 0
             ):
-                x, x_offsets, seq_lengths, max_seq_len = apply_stu_truncation(
-                    x=x,
+                plan = compute_stu_truncation_plan(
                     x_offsets=x_offsets,
                     seq_lengths=seq_lengths,
                     num_targets=num_targets,
@@ -639,6 +655,10 @@ class STUStack(STU):
                     ),
                     kernel=self.kernel(),
                 )
+                x = apply_stu_truncation_plan(x, plan)
+                x_offsets = plan.new_x_offsets
+                seq_lengths = plan.new_lengths
+                max_seq_len = plan.new_max_seq_len
 
             sla_k1 = getattr(layer, "_sla_k1", 0)
             sla_k2 = getattr(layer, "_sla_k2", 0)
@@ -678,7 +698,7 @@ class STUStack(STU):
                 kv_caching_lengths=kv_caching_lengths,
                 attn_func=cur_attn_func,
             )
-        return x, x_offsets, max_seq_len
+        return x, x_offsets, max_seq_len, plan
 
     def cached_forward(
         self,

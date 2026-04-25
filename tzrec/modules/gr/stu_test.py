@@ -133,13 +133,13 @@ class StuTest(unittest.TestCase):
             dtype=dtype,
         ).requires_grad_(True)
         x_triton = x.clone().detach().requires_grad_()
-        stu_output, _, _ = stu(
+        stu_output, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
         )
-        stu_triton_output, _, _ = stu_triton(
+        stu_triton_output, _, _, _ = stu_triton(
             x=x_triton,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -230,7 +230,7 @@ class StuTest(unittest.TestCase):
             device=device,
             dtype=dtype,
         ).requires_grad_(True)
-        stu_output, _, _ = stu(
+        stu_output, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -254,7 +254,7 @@ class StuTest(unittest.TestCase):
             swapped_dense_x,
             [x_offsets],
         )[0].requires_grad_(True)
-        swapped_stu_output, _, _ = stu(
+        swapped_stu_output, _, _, _ = stu(
             x=swapped_x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -383,7 +383,7 @@ class StuTest(unittest.TestCase):
         ).requires_grad_(True)
 
         # default forward().
-        ref_y, _, _ = stu(
+        ref_y, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -411,7 +411,7 @@ class StuTest(unittest.TestCase):
             offsets_right=None,
             kernel=Kernel.TRITON,
         )
-        _, _, _ = stu(
+        _, _, _, _ = stu(
             x=prime_x,
             x_offsets=prime_offsets,
             max_seq_len=max_seq_len,
@@ -510,10 +510,23 @@ class STUStackTruncationTest(unittest.TestCase):
                 truncate_split_layer=3,  # invalid: must be < len(stu_list)
                 truncate_tail_len=4,
             )
+        # Symmetric init: setting one of the two without the other is
+        # rejected (used to silently no-op).
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=1,
+                truncate_tail_len=0,
+            )
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=0,
+                truncate_tail_len=4,
+            )
         # Valid configurations must not raise.
         STUStack(stu_list=stu_list, truncate_split_layer=1, truncate_tail_len=4)
-        # truncate_tail_len == 0 disables truncation; split_layer is free.
-        STUStack(stu_list=stu_list, truncate_split_layer=99, truncate_tail_len=0)
+        STUStack(stu_list=stu_list, truncate_split_layer=0, truncate_tail_len=0)
 
     def _forward_and_check_truncation(
         self,
@@ -536,7 +549,7 @@ class STUStackTruncationTest(unittest.TestCase):
             if num_targets_val is not None
             else None
         )
-        out, new_offsets, new_max_seq_len = stack(
+        out, new_offsets, new_max_seq_len, _plan = stack(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -576,11 +589,12 @@ class STUStackTruncationTest(unittest.TestCase):
         # Tight max: equals the original max (no truncation happened).
         self.assertEqual(new_max_seq_len, int(x_lengths.max().item()))
 
-    def test_return_signature_is_three_tuple(self) -> None:
-        """Forward returns ``(x, x_offsets, max_seq_len)`` -- no num_targets.
+    def test_return_signature_is_four_tuple(self) -> None:
+        """Forward returns ``(x, x_offsets, max_seq_len, plan)``.
 
-        ``num_targets`` is preserved intact through truncation, so
-        callers continue to use their own input tensor.
+        ``plan`` is ``None`` when truncation is disabled.  ``num_targets``
+        is preserved intact through truncation, so callers continue to
+        use their own input tensor.
         """
         stack, D = self._make_stack(
             num_layers=2,
@@ -596,12 +610,13 @@ class STUStackTruncationTest(unittest.TestCase):
             max_seq_len=6,
             num_targets=torch.tensor([1, 2], dtype=torch.int64),
         )
-        self.assertEqual(len(out), 3)
-        returned_x, returned_offsets, returned_max = out
-        # No truncation: offsets / max equal the inputs.
+        self.assertEqual(len(out), 4)
+        returned_x, returned_offsets, returned_max, returned_plan = out
+        # No truncation: offsets / max equal the inputs and plan is None.
         torch.testing.assert_close(returned_offsets, x_offsets)
         self.assertEqual(returned_max, 6)
         self.assertEqual(returned_x.size(0), x.size(0))
+        self.assertIsNone(returned_plan)
 
     def test_sla_on_triton_kernel_raises(self) -> None:
         """C4: STUStack surfaces SLA-on-Kernel.TRITON as a loud error.
