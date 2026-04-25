@@ -440,10 +440,36 @@ class CombinedModelWrapper(nn.Module):
         dense_model (nn.Module): dense part AOTInductor model.
     """
 
+    _dense_is_aoti: bool
+
     def __init__(self, sparse_model: nn.Module, dense_model: nn.Module) -> None:
         super().__init__()
         self.sparse_model = sparse_model
         self.dense_model = dense_model
+        # Only AOTI dense models need the GIL + model-pool-mutex guard:
+        # AOTI extern ops release the GIL and then block on the AOTI
+        # model-pool mutex, deadlocking the predict forward workers.
+        dense_is_aoti = False
+        try:
+            from torch.export.pt2_archive._package import AOTICompiledModel
+
+            dense_is_aoti = isinstance(dense_model, AOTICompiledModel)
+        except ImportError:
+            pass
+        self._dense_is_aoti = dense_is_aoti
+        if dense_is_aoti:
+            object.__setattr__(self, "_lock", threading.Lock())
+
+    @torch.jit.unused
+    def _locked_dense(
+        self,
+        sparse_out: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        torch.cuda.set_device(device)
+        with self._lock:
+            return self.dense_model(sparse_out)
 
     def forward(
         self,
@@ -461,8 +487,9 @@ class CombinedModelWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         sparse_out, _ = self.sparse_model(data, device)
-        outputs = self.dense_model(sparse_out)
-        return outputs
+        if self._dense_is_aoti:
+            return self._locked_dense(sparse_out, device)
+        return self.dense_model(sparse_out)
 
 
 class UnifiedAOTIModelWrapper(nn.Module):
