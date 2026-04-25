@@ -313,7 +313,7 @@ model_config {
 
 ### 模型导出
 
-hstu模型导出时， 需要设置命令行参数hstu_item_id， 指定输入模型的candidate item_id 序列的列名。
+hstu模型导出时， 需要通过命令行参数 `--additional_export_config` 传入一个 JSON， 其中 `cand_seq_pk` 指定 candidate 序列特征的名称（即 `sequence_feature.sequence_name`， 例如 `cand_seq`）。该 JSON 的内容会被合并写入 `model_acc.json` 供在线推理使用。
 
 例如:
 
@@ -322,7 +322,7 @@ torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=1 --node_rank=0 \
     -m tzrec.export \
     --pipeline_config_path experiments/dlrm_hstu/pipeline.config \
-    --hstu_item_id cand_seq___video_id \
+    --additional_export_config '{"cand_seq_pk": "cand_seq"}' \
     --export_dir experiments/dlrm_hstu/export
 ```
 

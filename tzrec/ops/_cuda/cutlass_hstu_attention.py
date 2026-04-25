@@ -292,6 +292,7 @@ def cutlass_hstu_mha(
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     attn_func: Optional[torch.Tensor] = None,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
@@ -329,6 +330,9 @@ def cutlass_hstu_mha(
             ``(nheads, 3, total_q)``, int32. When provided, selects the
             NFUNC mask path; ``causal`` and ``max_attn_len`` must be at
             defaults.
+        scaling_seqlen: divisor used to scale the attention output inside
+            the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
+            the behavior matches the legacy code path.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -394,6 +398,9 @@ def cutlass_hstu_mha(
         else:
             window_size_left, window_size_right = -1, -1
 
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seq_len
+
     if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
         return _CutlassHstuMhaFunction.apply(
             q,
@@ -401,7 +408,7 @@ def cutlass_hstu_mha(
             v,
             cu_seqlens,
             max_seq_len,
-            max_seq_len,  # scaling_seqlen
+            scaling_seqlen,
             num_contexts_tensor,
             num_targets_int32,
             1,  # target_group_size
@@ -416,7 +423,7 @@ def cutlass_hstu_mha(
         v,
         cu_seqlens,
         max_seq_len,
-        max_seq_len,  # scaling_seqlen
+        scaling_seqlen,
         num_contexts_tensor,
         num_targets_int32,
         1,  # target_group_size

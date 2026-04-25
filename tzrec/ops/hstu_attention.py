@@ -58,6 +58,7 @@ def hstu_mha(
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
     attn_func: Optional[torch.Tensor] = None,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     """HSTU multi-head attention with kernel backend dispatch.
 
@@ -81,6 +82,9 @@ def hstu_mha(
         attn_func: pre-built arbitrary-mask func tensor of shape
             ``(nheads, 3, total_q)``, int32 — selects the CUTLASS NFUNC
             mask path. Only supported when ``kernel=Kernel.CUTLASS``.
+        scaling_seqlen: divisor used to scale the attention output inside
+            the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
+            the behavior matches the legacy code path.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -135,6 +139,7 @@ def hstu_mha(
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             attn_func=attn_func,
+            scaling_seqlen=scaling_seqlen,
         )
 
     if kernel == Kernel.TRITON:
@@ -168,6 +173,7 @@ def hstu_mha(
             contextual_seq_len=contextual_seq_len,
             sort_by_length=sort_by_length,
             enable_tma=enable_tma,
+            scaling_seqlen=scaling_seqlen,
         )
     else:
         return pytorch_hstu_mha(
@@ -185,6 +191,7 @@ def hstu_mha(
             contextual_seq_len=contextual_seq_len,
             min_full_attn_seq_len=min_full_attn_seq_len,
             attn_func=attn_func,
+            scaling_seqlen=scaling_seqlen,
         )
 
 
@@ -200,6 +207,7 @@ def delta_hstu_mha(
     contextual_seq_len: int = 0,
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     if kernel == Kernel.CUTLASS:
         kernel = Kernel.TRITON
@@ -241,6 +249,7 @@ def delta_hstu_mha(
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             enable_tma=enable_tma,
+            scaling_seqlen=scaling_seqlen,
         )
     else:
         return pytorch_cached_hstu_mha(
@@ -253,4 +262,5 @@ def delta_hstu_mha(
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
+            scaling_seqlen=scaling_seqlen,
         )

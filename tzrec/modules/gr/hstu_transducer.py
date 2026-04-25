@@ -48,6 +48,12 @@ class HSTUTransducer(BaseModule):
         contextual_feature_dim (int): contextual feature dimension.
         max_contextual_seq_len (int): contextual feature num.
         contextual_group_name (str): contextual group name in grouped features.
+        scaling_seqlen (int): sequence length used as the divisor in the
+            attention output scaling of every STULayer. ``-1`` (the default)
+            preserves legacy behavior (divides by runtime ``max_seq_len``).
+            Pass a fixed positive int (typically the model's ``max_seq_len``
+            config) to make attention output invariant to batch-level
+            seq-length.
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
@@ -66,6 +72,7 @@ class HSTUTransducer(BaseModule):
         contextual_feature_dim: int = 0,
         max_contextual_seq_len: int = 0,
         contextual_group_name: str = "contextual",
+        scaling_seqlen: int = -1,
         is_inference: bool = True,
         return_full_embeddings: bool = False,
         listwise: bool = False,
@@ -85,6 +92,8 @@ class HSTUTransducer(BaseModule):
         stu = dict(stu)
         if "contextual_seq_len" not in stu:
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
+        if "scaling_seqlen" not in stu:
+            stu["scaling_seqlen"] = scaling_seqlen
         self._stu_module: STU = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
             truncate_split_layer=attn_truncation_split_layer,

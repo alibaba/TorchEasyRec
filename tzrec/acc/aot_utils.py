@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-import json
 import os
 from typing import Any, Dict, Optional, Set, Union
 
@@ -62,7 +61,10 @@ def load_model_aot(
         )
         return UnifiedAOTIModelWrapper(model)
     else:
-        # Legacy two-stage path: sparse JIT + dense AOTI
+        # Legacy two-stage path: sparse JIT + dense AOTI.
+        # Disable TensorExpr fuser: its lazy first-call compile is not
+        # thread-safe under the predict worker pool.
+        torch._C._jit_set_texpr_fuser_enabled(False)
         sparse_model: torch.jit.ScriptModule = torch.jit.load(
             os.path.join(model_path, "scripted_sparse_model.pt"),
             map_location=device,
@@ -132,14 +134,6 @@ def export_model_aot(
     if mixed_precision:
         dense_to_export = CudaAutocastWrapper(dense_model, mixed_precision)
 
-    # Dry-run the wrapped module to capture output field names. Must run
-    # through dense_to_export (not dense_model) so the autocast context is
-    # active — kernels like CUTLASS HSTU attention reject fp32 inputs.
-    with torch.no_grad():
-        _out = dense_to_export(sparse_output)
-        aoti_output_keys = list(_out.keys())
-        del _out
-
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -158,15 +152,6 @@ def export_model_aot(
     ):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
-
-        # Save original model output field names to aoti directory
-        if aoti_output_keys:
-            output_names_path = os.path.join(aoti_dir, "output_field_names.json")
-            with open(output_names_path, "w") as f:
-                json.dump(aoti_output_keys, f, indent=4)
-            logger.info(
-                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
-            )
 
         torch._inductor.aoti_compile_and_package(
             exported_pg,
@@ -407,10 +392,6 @@ def export_unified_model_aot(
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
-    result = full_gm(data)
-    aoti_output_keys = list(result.keys())
-    del result
-
     # Pad any 0-size non-sequence sparse .values tensors so torch.export
     # doesn't specialize on the empty size (which conflicts with dynamic Dims).
     seq_feat_names = {f.name for f in model._features if f.is_sequence}
@@ -445,16 +426,6 @@ def export_unified_model_aot(
     ):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
-
-        # Save original model output field names (matches legacy
-        # export_model_aot behavior).
-        if aoti_output_keys:
-            output_names_path = os.path.join(aoti_dir, "output_field_names.json")
-            with open(output_names_path, "w") as f:
-                json.dump(aoti_output_keys, f, indent=4)
-            logger.info(
-                f"Saved output field names to {output_names_path}: {aoti_output_keys}"
-            )
 
         torch._inductor.aoti_compile_and_package(
             exported_pg,

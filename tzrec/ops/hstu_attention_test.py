@@ -49,6 +49,7 @@ def test_attn(
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
     enable_tma: bool = False,
+    scaling_seqlen: int = -1,
 ) -> None:
     # has_max_attn_len=True and enable_tma=True will result in TritonGPUCoalesce error
     # include/llvm/llvm/ADT/SmallVector.h:296: const_reference llvm::SmallVectorTemplateCommon<long>::operator[](size_type) const [T = long]: Assertion `idx < size()' failed.    # NOQA
@@ -115,6 +116,7 @@ def test_attn(
         max_attn_len=max_attn_len,
         contextual_seq_len=contextual_seq_len,
         kernel=ref_kernel,
+        scaling_seqlen=scaling_seqlen,
     )
     dout = torch.randn_like(ref_out)
     ref_out.backward(dout)
@@ -146,6 +148,7 @@ def test_attn(
         contextual_seq_len=contextual_seq_len,
         kernel=real_kernel,
         enable_tma=enable_tma,
+        scaling_seqlen=scaling_seqlen,
     )
 
     torch.testing.assert_close(
@@ -277,6 +280,7 @@ class HSTUAttentionTest(unittest.TestCase):
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
         enable_tma=st.sampled_from(get_test_enable_tma()),
+        scaling_seqlen=st.sampled_from([-1, 512, 2048]),
     )
     @settings(
         verbosity=Verbosity.verbose,
@@ -500,6 +504,7 @@ class HSTUAttentionTest(unittest.TestCase):
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
         has_max_attn_len=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 10]),
+        scaling_seqlen=st.sampled_from([-1, 512, 2048]),
     )
     @settings(
         verbosity=Verbosity.verbose,
