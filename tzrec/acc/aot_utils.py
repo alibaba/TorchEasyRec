@@ -61,7 +61,10 @@ def load_model_aot(
         )
         return UnifiedAOTIModelWrapper(model)
     else:
-        # Legacy two-stage path: sparse JIT + dense AOTI
+        # Legacy two-stage path: sparse JIT + dense AOTI.
+        # Disable TensorExpr fuser: its lazy first-call compile is not
+        # thread-safe under the predict worker pool.
+        torch._C._jit_set_texpr_fuser_enabled(False)
         sparse_model: torch.jit.ScriptModule = torch.jit.load(
             os.path.join(model_path, "scripted_sparse_model.pt"),
             map_location=device,
