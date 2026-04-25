@@ -24,7 +24,9 @@ import torch
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention_utils import (
     apply_stu_truncation,
+    apply_stu_truncation_plan,
     build_sla_func_tensor,
+    compute_stu_truncation_plan,
 )
 
 
@@ -362,6 +364,79 @@ class ApplyStuTruncationTest(unittest.TestCase):
             contextual_seq_len=1,
             kernel=Kernel.PYTORCH,
         )
+
+
+class StuTruncationPlanTest(unittest.TestCase):
+    """Bit-equivalence + replay tests for the truncation plan API.
+
+    Validate that ``compute_plan`` + ``apply_plan`` matches the legacy
+    single-shot ``apply_stu_truncation``, and that the plan can be
+    replayed on a parallel jagged tensor (e.g. seq_timestamps in the
+    transducer) with shape-consistent results.
+    """
+
+    def _id_marked_input(self, lengths):
+        offsets = torch.tensor(
+            [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
+            dtype=torch.int64,
+        )
+        total = int(offsets[-1].item())
+        # Each row is a unique tag so we can assert which rows survived.
+        x = torch.arange(total, dtype=torch.float32).view(-1, 1)
+        return x, offsets, torch.tensor(lengths, dtype=torch.int64)
+
+    def test_plan_apply_matches_apply_stu_truncation(self) -> None:
+        """compute_plan + apply_plan == apply_stu_truncation, value-by-value."""
+        for ctx_len in (0, 1):
+            x, offsets, lengths = self._id_marked_input([8, 12, 5])
+            num_targets = torch.tensor([2, 3, 1], dtype=torch.int64)
+            kwargs = dict(
+                x_offsets=offsets,
+                seq_lengths=lengths,
+                num_targets=num_targets,
+                max_seq_len=int(lengths.max().item()),
+                truncate_tail_len=4,
+                contextual_seq_len=ctx_len,
+                kernel=Kernel.PYTORCH,
+            )
+            plan = compute_stu_truncation_plan(**kwargs)
+            x_via_plan = apply_stu_truncation_plan(x, plan)
+            x_via_legacy, off_legacy, lens_legacy, max_legacy = apply_stu_truncation(
+                x=x, **kwargs
+            )
+            torch.testing.assert_close(x_via_plan, x_via_legacy)
+            torch.testing.assert_close(plan.new_x_offsets, off_legacy)
+            torch.testing.assert_close(plan.new_lengths, lens_legacy)
+            self.assertEqual(plan.new_max_seq_len, max_legacy)
+
+    def test_replay_on_parallel_jagged(self) -> None:
+        """Single plan replayed on (embeddings, timestamps) gives matching shapes.
+
+        This is exactly the HSTUTransducer path: the stack returns a
+        plan after truncating ``seq_embeddings``, and the transducer
+        replays the same plan on ``seq_timestamps`` so the postprocessor's
+        jagged splits index both with consistent offsets.
+        """
+        x_lengths = torch.tensor([12, 20, 5, 30], dtype=torch.int64)
+        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        total = int(offsets[-1].item())
+        embeddings = torch.randn(total, 16)
+        timestamps = torch.arange(total, dtype=torch.float32).view(-1, 1)
+        num_targets = torch.tensor([2, 4, 1, 3], dtype=torch.int64)
+        plan = compute_stu_truncation_plan(
+            x_offsets=offsets,
+            seq_lengths=x_lengths,
+            num_targets=num_targets,
+            max_seq_len=int(x_lengths.max().item()),
+            truncate_tail_len=6,
+            contextual_seq_len=2,
+            kernel=Kernel.PYTORCH,
+        )
+        new_embeddings = apply_stu_truncation_plan(embeddings, plan)
+        new_timestamps = apply_stu_truncation_plan(timestamps, plan)
+        # Same total rows after truncation; same per-batch lengths.
+        self.assertEqual(new_embeddings.size(0), new_timestamps.size(0))
+        self.assertEqual(int(plan.new_x_offsets[-1].item()), new_embeddings.size(0))
 
 
 if __name__ == "__main__":

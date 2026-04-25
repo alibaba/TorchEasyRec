@@ -618,6 +618,144 @@ class STUStackTruncationTest(unittest.TestCase):
         self.assertEqual(returned_x.size(0), x.size(0))
         self.assertIsNone(returned_plan)
 
+    def test_cached_forward_raises_on_truncation(self) -> None:
+        """``cached_forward`` is a train/serve firewall when truncation is on.
+
+        Mid-stack truncation drops UIH prefix tokens that the
+        post-truncation layers' KV cache would still reference, so the
+        cached path raises rather than silently diverging.
+        """
+        stack, D = self._make_stack(
+            num_layers=3,
+            truncate_split_layer=1,
+            truncate_tail_len=4,
+        )
+        delta_x = torch.randn(8, D)
+        num_targets = torch.tensor([2, 2], dtype=torch.int64)
+        with self.assertRaisesRegex(NotImplementedError, "truncation"):
+            stack.cached_forward(
+                delta_x=delta_x,
+                num_targets=num_targets,
+            )
+
+    def test_truncation_with_num_targets_none(self) -> None:
+        """Listwise mode: ``num_targets=None`` + truncation works end-to-end.
+
+        Exercises the listwise path through the STUStack truncation
+        branch + the corresponding ``num_targets is None`` branch in
+        ``compute_stu_truncation_plan``.  Used to crash on the old
+        transducer's ``total_uih_len -= total_targets`` codepath; with
+        the plan-consumption refactor, this should just work.
+        """
+        x_lengths = torch.tensor([12, 20, 5, 30], dtype=torch.int64)
+        tail_len = 8
+        out, new_offsets, _new_max_seq_len, _x_lengths = (
+            self._forward_and_check_truncation(
+                x_lengths,
+                num_targets_val=None,
+                truncate_tail_len=tail_len,
+            )
+        )
+        # In listwise mode the entire sequence is "UIH" (no targets to
+        # preserve): new_uih = min(L, tail_len).
+        expected_lengths = torch.clamp(x_lengths, max=tail_len)
+        new_lengths = new_offsets[1:] - new_offsets[:-1]
+        torch.testing.assert_close(new_lengths, expected_lengths)
+        self.assertEqual(out.size(0), int(expected_lengths.sum().item()))
+
+    def test_truncation_with_sla_rebuilds_attn_func(self) -> None:
+        """SLA + truncation: attn_func is rebuilt across the truncation boundary.
+
+        Verifies that ``_build_sla_attn_func`` is called twice -- once
+        before the layer loop with the pre-truncation ``total_q``, and
+        once immediately after ``apply_stu_truncation_plan`` with the
+        post-truncation ``total_q`` -- so the post-truncation layers
+        see a func tensor that matches the truncated jagged length.
+        """
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        D = 16
+        stu_list: List[STU] = [
+            STULayer(
+                embedding_dim=D,
+                num_heads=2,
+                hidden_dim=32,
+                attention_dim=32,
+                output_dropout_ratio=0.0,
+                causal=True,
+                target_aware=True,
+                contextual_seq_len=0,
+                sla_k1=4,
+                sla_k2=2,
+                is_inference=False,
+            )
+            for _ in range(3)
+        ]
+        stack = STUStack(
+            stu_list=stu_list,
+            truncate_split_layer=1,
+            truncate_tail_len=6,
+            is_inference=False,
+        )
+        # SLA requires CUTLASS or PYTORCH; PYTORCH is the only CPU-runnable
+        # option, so it's the default kernel selection here for the test.
+        stack.set_kernel(Kernel.PYTORCH)
+        x_lengths = torch.tensor([16, 20, 8], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), D)
+        num_targets = torch.tensor([2, 2, 2], dtype=torch.int64)
+        max_seq_len = int(x_lengths.max().item())
+
+        # Spy on _build_sla_attn_func to count the calls and capture
+        # total_q at each invocation.
+        calls: List[int] = []
+        original = stack._build_sla_attn_func
+
+        def _spy(*args, **kwargs):
+            calls.append(int(kwargs.get("total_q", args[1] if len(args) > 1 else -1)))
+            return original(*args, **kwargs)
+
+        stack._build_sla_attn_func = _spy  # type: ignore[assignment]
+        out, new_offsets, _new_max, plan = stack(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        self.assertIsNotNone(plan)
+        # Two builds: pre-loop with original total_q, post-truncation
+        # with the new total_q.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], int(x_offsets[-1].item()))
+        self.assertEqual(calls[1], int(new_offsets[-1].item()))
+        self.assertNotEqual(calls[0], calls[1])  # truncation actually shrank
+        self.assertEqual(out.size(0), calls[1])
+
+    def test_forward_rejects_attn_func_kwarg(self) -> None:
+        """STUStack.forward no longer accepts an ``attn_func`` kwarg.
+
+        It used to accept the kwarg "for signature parity" with
+        STULayer.forward but silently overwrite it on the first SLA
+        layer.  Removing the kwarg outright surfaces the foot-gun as
+        a clean ``TypeError`` for direct callers.
+        """
+        stack, D = self._make_stack(
+            num_layers=2,
+            truncate_split_layer=0,
+            truncate_tail_len=0,
+        )
+        x_lengths = torch.tensor([4, 6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), D)
+        with self.assertRaises(TypeError):
+            stack(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=6,
+                num_targets=torch.tensor([1, 2], dtype=torch.int64),
+                attn_func=torch.zeros(2, 3, 10, dtype=torch.int32),
+            )
+
     def test_sla_on_triton_kernel_raises(self) -> None:
         """C4: STUStack surfaces SLA-on-Kernel.TRITON as a loud error.
 
