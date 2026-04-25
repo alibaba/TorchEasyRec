@@ -339,6 +339,36 @@ class STULayer(STU):
             )
         )
 
+    # Public read-only accessors used by ``STUStack`` (and by external
+    # introspection / tests) instead of ``getattr(layer, "_sla_k1", 0)``.
+    # Direct attribute access lets a future ``STU`` subclass that omits
+    # one of these surface a clear ``AttributeError`` at construction.
+
+    @property
+    def sla_k1(self) -> int:
+        """SLA local-causal window size (0 = disabled)."""
+        return self._sla_k1
+
+    @property
+    def sla_k2(self) -> int:
+        """SLA global-prefix length (0 = disabled)."""
+        return self._sla_k2
+
+    @property
+    def contextual_seq_len(self) -> int:
+        """Number of contextual tokens at the start of every sample."""
+        return self._contextual_seq_len
+
+    @property
+    def num_heads(self) -> int:
+        """Number of attention heads."""
+        return self._num_heads
+
+    @property
+    def target_aware(self) -> bool:
+        """Whether attention is target-aware (excludes targets from history)."""
+        return self._target_aware
+
     def construct_full_kv(
         self,
         delta_k: torch.Tensor,
@@ -581,6 +611,40 @@ class STUStack(BaseModule):
                 f"{self._truncate_tail_len}."
             )
 
+        # Cache SLA configs at __init__: SLA params are immutable
+        # post-construction.  Kernel selection, however, is mutable via
+        # ``set_kernel``, so the kernel-compatibility check stays in
+        # forward.  All SLA-enabled layers must share the same SLA tuple
+        # (one attn_func tensor is built per segment for the whole
+        # stack); enforce that here so a heterogeneous config surfaces
+        # at construction.
+        sla_layers: List[Tuple[int, int, int, int, bool]] = []
+        layer_uses_sla: List[bool] = []
+        for layer in stu_list:
+            uses_sla = layer.sla_k1 > 0 or layer.sla_k2 > 0
+            layer_uses_sla.append(uses_sla)
+            if uses_sla:
+                sla_layers.append(
+                    (
+                        layer.sla_k1,
+                        layer.sla_k2,
+                        layer.contextual_seq_len,
+                        layer.num_heads,
+                        layer.target_aware,
+                    )
+                )
+        if len(set(sla_layers)) > 1:
+            raise ValueError(
+                f"All SLA-enabled layers in an STUStack must share the "
+                f"same SLA config (sla_k1, sla_k2, contextual_seq_len, "
+                f"num_heads, target_aware); got distinct configs "
+                f"{sorted(set(sla_layers))}."
+            )
+        self._stack_sla_config: Optional[Tuple[int, int, int, int, bool]] = (
+            sla_layers[0] if sla_layers else None
+        )
+        self._layer_uses_sla: List[bool] = layer_uses_sla
+
     def forward(
         self,
         x: torch.Tensor,
@@ -615,28 +679,28 @@ class STUStack(BaseModule):
             caller's input tensor is still valid post-call.
         """
         seq_lengths = x_offsets[1:] - x_offsets[:-1]
-        # SLA (sla_k1 > 0 or sla_k2 > 0) runs on the CUTLASS production
-        # kernel or the PyTorch reference kernel; Kernel.TRITON has no
-        # NFUNC path. Surface a loud error instead of silently dropping
-        # the mask when a layer's kernel and SLA config disagree.
-        for layer in self._stu_layers:
-            if (
-                getattr(layer, "_sla_k1", 0) > 0 or getattr(layer, "_sla_k2", 0) > 0
-            ) and layer.kernel() == Kernel.TRITON:
-                raise ValueError(
-                    f"STULayer has SLA enabled (sla_k1="
-                    f"{getattr(layer, '_sla_k1', 0)}, sla_k2="
-                    f"{getattr(layer, '_sla_k2', 0)}) but kernel is "
-                    f"Kernel.TRITON. SLA requires Kernel.CUTLASS or "
-                    f"Kernel.PYTORCH."
-                )
-        # Hoist SLA func construction out of the per-layer attention op so
-        # a stack of N layers doesn't rebuild the same (nheads, 3, total_q)
-        # tensor N times per forward.  We memoize on the SLA config +
-        # current offsets identity and only rebuild when those change (in
-        # particular, once across the truncation boundary).
-        cur_attn_func: Optional[torch.Tensor] = None
-        attn_func_sig: Optional[tuple] = None
+        # SLA params are cached at __init__, but kernel is mutable via
+        # ``set_kernel`` post-construction, so the kernel-compatibility
+        # check must run here.  Cheap: iterate ``self._layer_uses_sla``,
+        # not the layers themselves.
+        if self._stack_sla_config is not None:
+            for i, uses_sla in enumerate(self._layer_uses_sla):
+                if uses_sla and self._stu_layers[i].kernel() == Kernel.TRITON:
+                    raise ValueError(
+                        f"STULayer at index {i} has SLA enabled "
+                        f"(sla_k1={self._stack_sla_config[0]}, "
+                        f"sla_k2={self._stack_sla_config[1]}) but kernel is "
+                        f"Kernel.TRITON. SLA requires Kernel.CUTLASS or "
+                        f"Kernel.PYTORCH."
+                    )
+        # Build the SLA func tensor once before the loop, and once more
+        # immediately after mid-stack truncation rewrites x_offsets.  Both
+        # branches reuse the cached ``self._stack_sla_config``.  Layers
+        # without SLA receive ``attn_func=None``.
+        attn_func: Optional[torch.Tensor] = self._build_sla_attn_func(
+            x_offsets=x_offsets, total_q=x.size(0), num_targets=num_targets
+        )
+
         plan: Optional[STUTruncationPlan] = None
         for i, layer in enumerate(self._stu_layers):
             if (
@@ -650,8 +714,10 @@ class STUStack(BaseModule):
                     num_targets=num_targets,
                     max_seq_len=max_seq_len,
                     truncate_tail_len=self._truncate_tail_len,
-                    contextual_seq_len=getattr(
-                        self._stu_layers[0], "_contextual_seq_len", 0
+                    contextual_seq_len=(
+                        self._stack_sla_config[2]
+                        if self._stack_sla_config is not None
+                        else self._stu_layers[0].contextual_seq_len
                     ),
                     kernel=self.kernel(),
                 )
@@ -659,35 +725,14 @@ class STUStack(BaseModule):
                 x_offsets = plan.new_x_offsets
                 seq_lengths = plan.new_lengths
                 max_seq_len = plan.new_max_seq_len
-
-            sla_k1 = getattr(layer, "_sla_k1", 0)
-            sla_k2 = getattr(layer, "_sla_k2", 0)
-            if sla_k1 > 0 or sla_k2 > 0:
-                ctx_len = getattr(layer, "_contextual_seq_len", 0)
-                nheads = getattr(layer, "_num_heads", 0)
-                tgt_aware = getattr(layer, "_target_aware", False)
-                sig = (
-                    sla_k1,
-                    sla_k2,
-                    ctx_len,
-                    nheads,
-                    tgt_aware,
-                    id(x_offsets),
+                # Rebuild attn_func once across the truncation boundary;
+                # offsets/total_q changed, so the previous tensor is
+                # stale even though the SLA config is unchanged.
+                attn_func = self._build_sla_attn_func(
+                    x_offsets=x_offsets,
+                    total_q=x.size(0),
+                    num_targets=num_targets,
                 )
-                if sig != attn_func_sig:
-                    cur_attn_func = build_sla_func_tensor(
-                        nheads=nheads,
-                        sla_k1=sla_k1,
-                        sla_k2=sla_k2,
-                        seq_offsets=x_offsets,
-                        total_q=x.size(0),
-                        num_targets=num_targets if tgt_aware else None,
-                        contextual_seq_len=ctx_len,
-                    )
-                    attn_func_sig = sig
-            else:
-                cur_attn_func = None
-                attn_func_sig = None
 
             x = layer(
                 x=x,
@@ -696,9 +741,29 @@ class STUStack(BaseModule):
                 num_targets=num_targets,
                 max_kv_caching_len=max_kv_caching_len,
                 kv_caching_lengths=kv_caching_lengths,
-                attn_func=cur_attn_func,
+                attn_func=attn_func if self._layer_uses_sla[i] else None,
             )
         return x, x_offsets, max_seq_len, plan
+
+    def _build_sla_attn_func(
+        self,
+        x_offsets: torch.Tensor,
+        total_q: int,
+        num_targets: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Build the per-segment SLA func tensor, or None if no SLA layer."""
+        if self._stack_sla_config is None:
+            return None
+        sla_k1, sla_k2, ctx_len, nheads, tgt_aware = self._stack_sla_config
+        return build_sla_func_tensor(
+            nheads=nheads,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            seq_offsets=x_offsets,
+            total_q=total_q,
+            num_targets=num_targets if tgt_aware else None,
+            contextual_seq_len=ctx_len,
+        )
 
     def cached_forward(
         self,
