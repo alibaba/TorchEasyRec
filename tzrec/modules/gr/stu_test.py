@@ -427,5 +427,106 @@ class StuTest(unittest.TestCase):
         torch.testing.assert_close(ref_delta_y, delta_y)
 
 
+class STUStackSLATest(unittest.TestCase):
+    """Cover STUStack's SLA infrastructure that is independent of GPU kernels.
+
+    The SLA func tensor build, the per-layer ``attn_func`` threading, and
+    the ``_stack_sla_config`` caching all live in STUStack itself; these
+    tests exercise them on CPU without needing the CUTLASS path.
+    """
+
+    def _make_layer(self, sla_k1: int = 0, sla_k2: int = 0):
+        from tzrec.modules.gr.stu import STULayer
+
+        return STULayer(
+            embedding_dim=16,
+            num_heads=2,
+            hidden_dim=32,
+            attention_dim=32,
+            output_dropout_ratio=0.0,
+            causal=True,
+            target_aware=True,
+            max_attn_len=None,
+            attn_alpha=None,
+            use_group_norm=False,
+            recompute_normed_x=False,
+            recompute_uvqk=False,
+            recompute_y=False,
+            sort_by_length=False,
+            contextual_seq_len=0,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            is_inference=False,
+        )
+
+    def test_forward_rejects_user_attn_func(self) -> None:
+        """STUStack owns SLA func construction; passing one in must fail."""
+        from tzrec.modules.gr.stu import STU, STUStack
+
+        stu_list: List[STU] = [self._make_layer() for _ in range(2)]
+        stack = STUStack(stu_list=stu_list)
+        stack.set_kernel(Kernel.PYTORCH)
+        x_lengths = torch.tensor([4, 6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), 16)
+        with self.assertRaisesRegex(ValueError, "STUStack"):
+            stack(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=6,
+                num_targets=torch.tensor([1, 2], dtype=torch.int64),
+                attn_func=torch.zeros(2, 3, 10, dtype=torch.int32),
+            )
+
+    def test_sla_on_triton_kernel_raises(self) -> None:
+        """SLA + Kernel.TRITON must raise before any kernel call.
+
+        CUTLASS and PyTorch both support the NFUNC path; Triton does not.
+        """
+        from tzrec.modules.gr.stu import STU, STUStack
+
+        stu_list: List[STU] = [self._make_layer(sla_k1=8, sla_k2=4)]
+        stack = STUStack(stu_list=stu_list)
+        stack.set_kernel(Kernel.TRITON)
+        x_lengths = torch.tensor([6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), 16)
+        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
+            stack(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=6,
+                num_targets=torch.tensor([1], dtype=torch.int64),
+            )
+
+    def test_heterogeneous_sla_config_raises(self) -> None:
+        """All SLA-enabled layers in a stack must share the same config."""
+        from tzrec.modules.gr.stu import STU, STUStack
+
+        stu_list: List[STU] = [
+            self._make_layer(sla_k1=8, sla_k2=4),
+            self._make_layer(sla_k1=16, sla_k2=4),  # different k1
+        ]
+        with self.assertRaisesRegex(ValueError, "same SLA config"):
+            STUStack(stu_list=stu_list)
+
+    def test_sla_config_cached_at_init(self) -> None:
+        """``_stack_sla_config`` is None when no layer enables SLA."""
+        from tzrec.modules.gr.stu import STU, STUStack
+
+        no_sla: List[STU] = [self._make_layer() for _ in range(2)]
+        stack = STUStack(stu_list=no_sla)
+        self.assertIsNone(stack._stack_sla_config)
+        self.assertEqual(stack._layer_uses_sla, [False, False])
+
+        mixed: List[STU] = [
+            self._make_layer(),
+            self._make_layer(sla_k1=8, sla_k2=4),
+        ]
+        stack = STUStack(stu_list=mixed)
+        self.assertEqual(stack._stack_sla_config, (8, 4, 0, 2, True))
+        self.assertEqual(stack._layer_uses_sla, [False, True])
+
+
 if __name__ == "__main__":
     unittest.main()
