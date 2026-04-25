@@ -117,6 +117,60 @@ def _pad_qkv(
 
 
 @torch.fx.wrap
+def _decode_attn_func_to_mask(
+    attn_func: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    N: int,
+) -> torch.Tensor:
+    """Decode a CUTLASS-style NFUNC=3 mask tensor into a dense bool mask.
+
+    The NFUNC encoding (see ``build_sla_func_tensor``) has shape
+    ``(nheads, 3, total_q)`` where for each query position q the three
+    values are ``[col_max0, col_min0, col_max1]``.  Query q attends to key
+    positions in ``[0, col_max0) ∪ [col_min0, col_max1)``.
+
+    This helper produces a per-sample dense ``(B, H, N, N)`` boolean mask
+    consumable by the jagged-to-padded PyTorch reference path.  Columns
+    past each sample's jagged length are forced to False so padding keys
+    never contribute to attention.
+
+    Args:
+        attn_func: shape ``(H, 3, total_q)`` int32, jagged along ``total_q``.
+        seq_offsets: shape ``(B + 1,)`` int32 cumulative offsets matching
+            ``attn_func``'s jagged layout.
+        N: padded maximum sequence length.
+
+    Returns:
+        bool tensor of shape ``(B, H, N, N)``.
+    """
+    H, three, total_q = attn_func.shape
+    torch._assert(three == 3, "attn_func must have shape (H, 3, total_q)")
+    # Fold (H, 3) into channels so we can use jagged_to_padded_dense with
+    # the (total_q, C) 2D layout; unfold after padding.
+    padded_flat = attn_func.permute(2, 0, 1).reshape(total_q, H * 3)
+    padded = torch.ops.fbgemm.jagged_to_padded_dense(
+        values=padded_flat,
+        offsets=[seq_offsets],
+        max_lengths=[N],
+        padding_value=0,
+    )  # (B, N, H * 3)
+    B = padded.size(0)
+    padded = padded.view(B, N, H, 3).permute(0, 2, 1, 3)  # (B, H, N, 3)
+    col_max0 = padded[..., 0:1]  # (B, H, N, 1)
+    col_min0 = padded[..., 1:2]
+    col_max1 = padded[..., 2:3]
+    col_ids = torch.arange(N, device=attn_func.device, dtype=torch.int32).view(
+        1, 1, 1, N
+    )
+    in_0 = col_ids < col_max0
+    in_1 = (col_ids >= col_min0) & (col_ids < col_max1)
+    mask = in_0 | in_1  # (B, H, N, N) bool
+    seq_lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int32).view(B, 1, 1, 1)
+    col_valid = col_ids < seq_lengths
+    return mask & col_valid
+
+
+@torch.fx.wrap
 def pytorch_hstu_mha(
     max_seq_len: int,
     alpha: float,
@@ -131,8 +185,16 @@ def pytorch_hstu_mha(
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
+    attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
 ) -> torch.Tensor:
+    """PyTorch reference HSTU attention.
+
+    When ``attn_func`` is provided the mask is decoded from the NFUNC=3
+    tensor (matching the CUTLASS kernel's arbitrary-mask path).  When
+    ``attn_func`` is ``None`` the fixed-mask path uses ``causal`` /
+    ``max_attn_len`` / ``contextual_seq_len`` / ``num_targets``.
+    """
     if scaling_seqlen == -1:
         scaling_seqlen = max_seq_len
     L, H, _ = q.shape
@@ -142,18 +204,25 @@ def pytorch_hstu_mha(
     )  # [B, H, N, D) and [B, H, N, V]
     qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
     qk_attn = F.silu(qk_attn) / scaling_seqlen
-    valid_attn_mask = _get_valid_attn_mask(
-        device=q.device,
-        causal=causal,
-        N=max_seq_len,
-        seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
-        num_targets=num_targets,
-        max_attn_len=max_attn_len,
-        contextual_seq_len=contextual_seq_len,
-        min_full_attn_seq_len=min_full_attn_seq_len,
-    )
-    # raise NotImplementedError(valid_attn_mask[0, :, :].to(torch.int32))
-    qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
+    if attn_func is not None:
+        # NFUNC arbitrary-mask path; the mask already encodes causality,
+        # local window, contextual prefix and target isolation.
+        valid_attn_mask = _decode_attn_func_to_mask(
+            attn_func=attn_func, seq_offsets=seq_offsets, N=max_seq_len
+        )  # (B, H, N, N)
+        qk_attn = qk_attn * valid_attn_mask
+    else:
+        valid_attn_mask = _get_valid_attn_mask(
+            device=q.device,
+            causal=causal,
+            N=max_seq_len,
+            seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            min_full_attn_seq_len=min_full_attn_seq_len,
+        )  # (B, N, N) -- broadcasts over H
+        qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
     if dropout_pr > 0.0:
         qk_attn = F.dropout(qk_attn, p=dropout_pr, training=training)
     attn_dense = torch.einsum("bhxd,bhdv->bhxv", qk_attn, v)  # [B, H, N, V]

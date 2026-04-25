@@ -13,6 +13,7 @@
 # https://github.com/facebookresearch/generative-recommenders
 # thanks to their public work.
 
+import functools
 from typing import Optional
 
 import torch
@@ -26,7 +27,17 @@ from tzrec.ops._pytorch.pt_hstu_attention import (
 from tzrec.ops.utils import switch_to_contiguous_if_needed
 from tzrec.utils.logging_util import logger
 
-_cutlass_local_window_fallback_warned = False
+
+@functools.lru_cache(maxsize=1)
+def _warn_cutlass_fallback_local_target() -> None:
+    logger.warning(
+        "hstu_mha: requested kernel=Kernel.CUTLASS with max_attn_len>0 "
+        "combined with contextual_seq_len>0 or num_targets!=None -- the "
+        "CUTLASS Is_local dispatch does not support context/target masks "
+        "in this combination. Falling back to Kernel.TRITON for this run. "
+        "Benchmarks / memory reports for CUTLASS will not reflect this "
+        "call site."
+    )
 
 
 def hstu_mha(
@@ -46,8 +57,39 @@ def hstu_mha(
     sort_by_length: bool = False,
     kernel: Kernel = Kernel.PYTORCH,
     enable_tma: bool = False,
+    attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
 ) -> torch.Tensor:
+    """HSTU multi-head attention with kernel backend dispatch.
+
+    Args:
+        max_seq_len: maximum sequence length in the batch.
+        alpha: scaling factor for attention scores.
+        q: query tensor of shape (total, nheads, attn_dim).
+        k: key tensor of shape (total, nheads, attn_dim).
+        v: value tensor of shape (total, nheads, hidden_dim).
+        seq_offsets: cumulative sequence offsets (batch_size + 1,).
+        causal: whether to apply causal masking.
+        dropout_pr: dropout probability (PYTORCH backend only).
+        training: whether in training mode (PYTORCH backend only).
+        num_targets: number of target tokens per batch element.
+        max_attn_len: max attention window length (0 = unlimited).
+        contextual_seq_len: number of contextual tokens per sequence.
+        min_full_attn_seq_len: min seq len for full attention (PYTORCH only).
+        sort_by_length: sort sequences by length (TRITON only).
+        kernel: backend kernel to use (PYTORCH, TRITON, CUTLASS).
+        enable_tma: enable TMA (TRITON only).
+        attn_func: pre-built arbitrary-mask func tensor of shape
+            ``(nheads, 3, total_q)``, int32 — selects the NFUNC mask
+            path.  Supported on ``Kernel.CUTLASS`` and ``Kernel.PYTORCH``;
+            rejected on ``Kernel.TRITON``.
+        scaling_seqlen: divisor used to scale the attention output inside
+            the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
+            the behavior matches the legacy code path.
+
+    Returns:
+        output tensor of shape (total, nheads, hidden_dim).
+    """
     _, H, _ = q.shape
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -58,21 +100,22 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if kernel == Kernel.CUTLASS:
-        # CUTLASS kernel does not support combining local window attention
-        # (max_attn_len > 0) with context/target masking, fall back to Triton.
+    if attn_func is not None and kernel == Kernel.TRITON:
+        raise ValueError(
+            "attn_func (arbitrary-mask NFUNC path) is not supported on "
+            "Kernel.TRITON. Use Kernel.CUTLASS for production training or "
+            "Kernel.PYTORCH for the reference implementation."
+        )
+
+    if kernel == Kernel.CUTLASS and attn_func is None:
+        # Without an arbitrary mask, the CUTLASS kernel's local-window path
+        # (Is_local) cannot combine with context/target masking — fall back
+        # to Triton in that combination.
         _has_local_window = max_attn_len > 0
         _has_ctx_or_tgt = contextual_seq_len > 0 or num_targets is not None
         if _has_local_window and _has_ctx_or_tgt:
-            global _cutlass_local_window_fallback_warned
-            if not _cutlass_local_window_fallback_warned:
-                logger.warning(
-                    "CUTLASS kernel does not support combining local "
-                    "window attention (max_attn_len > 0) with "
-                    "context/target masking, falling back to Triton."
-                )
-                _cutlass_local_window_fallback_warned = True
             kernel = Kernel.TRITON
+            _warn_cutlass_fallback_local_target()
 
     if kernel == Kernel.CUTLASS:
         # cutlass_hstu_mha is @torch.fx.wrap'd; FX treats it as a leaf so
@@ -82,7 +125,7 @@ def hstu_mha(
         # inputs; we rely on the CudaAutocastWrapper applied in
         # tzrec/acc/aot_utils.py and trt_utils.py (driven by
         # export_config.mixed_precision / train_config.mixed_precision) to
-        # ensure q/k/v are bf16/fp16 when reaching this dispatch.
+        # ensure q/k/v are in a supported dtype when reaching this dispatch.
         from tzrec.ops._cuda.cutlass_hstu_attention import cutlass_hstu_mha
 
         return cutlass_hstu_mha(
@@ -96,6 +139,7 @@ def hstu_mha(
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
+            attn_func=attn_func,
             scaling_seqlen=scaling_seqlen,
         )
 
@@ -147,6 +191,7 @@ def hstu_mha(
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             min_full_attn_seq_len=min_full_attn_seq_len,
+            attn_func=attn_func,
             scaling_seqlen=scaling_seqlen,
         )
 
