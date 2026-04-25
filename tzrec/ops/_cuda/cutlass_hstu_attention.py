@@ -142,6 +142,24 @@ def _cutlass_hstu_mha_bwd_impl(
     return [dq, dk, dv]
 
 
+def _assert_attn_func_shape(func: Optional[torch.Tensor], q: torch.Tensor) -> None:
+    """Mirror cutlass_hstu_mha's attn_func validation in fake/meta land."""
+    if func is None:
+        return
+    torch._assert(func.dtype == torch.int32, "attn_func must be int32")
+    torch._assert(func.dim() == 3, "attn_func must be 3-D")
+    torch._assert(
+        func.shape[0] == q.shape[1]
+        and func.shape[1] == 3
+        and func.shape[2] == q.shape[0],
+        "attn_func must have shape (nheads, 3, total_q)",
+    )
+    torch._assert(
+        func.device == q.device,
+        "attn_func must be on the same device as q",
+    )
+
+
 def _cutlass_hstu_mha_fwd_meta(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -157,6 +175,7 @@ def _cutlass_hstu_mha_fwd_meta(
     alpha: float,
     func: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    _assert_attn_func_shape(func, q)
     # Output shape is (total, nheads, hidden_dim); that matches v, not q.
     # Under the current attention_dim == hidden_dim constraint q and v are
     # the same shape, but keying the fake off v makes the meta robust if
@@ -180,6 +199,7 @@ def _cutlass_hstu_mha_bwd_meta(
     alpha: float,
     func: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
+    _assert_attn_func_shape(func, q)
     return [torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)]
 
 
@@ -363,6 +383,29 @@ def cutlass_hstu_mha(
                 f"(got max_attn_len={max_attn_len}); any local window "
                 "must be encoded by the func tensor itself."
             )
+        # The CUDA kernel addresses ``attn_func`` via pointer arithmetic
+        # (``func_ptr + cu_seqlens[b]``) assuming a contiguous int32
+        # ``(nheads, 3, total_q)`` jagged layout on the same device as q.
+        # A caller that bypasses ``build_sla_func_tensor`` (mismatched
+        # total_q, int64 dtype, a permuted view, or a CPU tensor) would
+        # otherwise produce OOB reads or silent NaNs with no upstream
+        # signal -- catch it here.
+        torch._assert(
+            attn_func.dtype == torch.int32,
+            "attn_func must be int32",
+        )
+        torch._assert(attn_func.dim() == 3, "attn_func must be 3-D")
+        torch._assert(
+            attn_func.shape[0] == q.shape[1]
+            and attn_func.shape[1] == 3
+            and attn_func.shape[2] == q.shape[0],
+            "attn_func must have shape (nheads, 3, total_q)",
+        )
+        torch._assert(
+            attn_func.device == q.device,
+            "attn_func must be on the same device as q",
+        )
+        attn_func = attn_func.contiguous()
 
     q = q.contiguous()
     k = k.contiguous()

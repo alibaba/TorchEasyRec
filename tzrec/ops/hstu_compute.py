@@ -336,6 +336,20 @@ def hstu_preprocess_and_attention(
             "uvqk_weight.shape[1] must equal 2 * num_heads * (hidden_dim + attn_dim)",
         )
     if kernel == Kernel.TRITON and prefill is False:
+        # The fused Triton preprocess+attention does not implement the
+        # NFUNC arbitrary-mask path.  Defense-in-depth: today STUStack
+        # only builds attn_func for SLA, which is gated to CUTLASS or
+        # PYTORCH (so this branch is unreachable from the stack), but a
+        # direct caller could otherwise pass attn_func and silently get
+        # the wrong attention.
+        if attn_func is not None:
+            raise ValueError(
+                "attn_func (NFUNC mask path) is not supported on the "
+                "fused Triton preprocess+attention path; use "
+                "kernel=Kernel.CUTLASS or kernel=Kernel.PYTORCH, or "
+                "split the call into separate preprocess and hstu_mha "
+                "(prefill=True)."
+            )
         from tzrec.ops._triton.triton_hstu_preprocess_and_attention import (
             triton_hstu_preprocess_and_attention,
         )
