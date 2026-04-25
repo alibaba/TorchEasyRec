@@ -287,8 +287,15 @@ message HSTU {
     required GRInputPreprocessor input_preprocessor = 5;
     // output postprocessor
     required GROutputPostprocessor output_postprocessor = 6;
-    // attention truncation: run first N1 layers on full seq, then N2 on tail
-    // split_layer is N1 (0 = disabled); tail_len is L' for the truncated segment
+    // Attention truncation: run the first N1 layers on the full sequence,
+    // then on layers >= N1 keep only the last ``attn_truncation_tail_len``
+    // UIH tokens per sample.  Contextual prefix and targets always survive.
+    //
+    // attn_truncation_split_layer is N1; must be in (0, attn_num_layers)
+    // when truncation is enabled.
+    // attn_truncation_tail_len is the trailing UIH cap on layers >= N1.
+    //
+    // Both must be > 0 to enable truncation; setting only one is rejected.
     optional uint32 attn_truncation_split_layer = 7;
     optional uint32 attn_truncation_tail_len = 8;
 }

@@ -198,6 +198,15 @@ class STULayer(STU):
         recompute_y (bool): whether to recompute y in backward
         sort_by_length (bool): whether to sort by length when forwarding
         contextual_seq_len (int): sequence length of contextual feature
+        sla_k1 (int): Semi-Local Attention local-causal window size.  ``0``
+            disables SLA on this layer.  When non-zero (and ``sla_k2`` is
+            non-zero or ``contextual_seq_len > 0``), the layer attends to
+            ``[max(0, pos - sla_k1 + 1), pos]`` plus the global prefix.
+            Requires ``Kernel.CUTLASS`` or ``Kernel.PYTORCH`` (Triton has
+            no NFUNC mask path).
+        sla_k2 (int): Semi-Local Attention global-prefix length.  ``0``
+            disables the global prefix; ``effective_k2 = max(sla_k2,
+            contextual_seq_len)`` so a contextual prefix can subsume it.
         scaling_seqlen (int): sequence length used as the divisor in the
             attention output scaling. ``-1`` means fall back to the runtime
             ``max_seq_len`` (legacy behavior). When set to a fixed value

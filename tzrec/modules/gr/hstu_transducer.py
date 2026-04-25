@@ -60,6 +60,13 @@ class HSTUTransducer(BaseModule):
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
+        attn_truncation_split_layer (int): layer index ``N1`` after which
+            mid-stack attention truncation fires.  Must be in
+            ``(0, attn_num_layers)`` when truncation is enabled, else 0.
+        attn_truncation_tail_len (int): number of trailing UIH tokens kept
+            on layers ``>= N1``.  Both ``attn_truncation_split_layer`` and
+            ``attn_truncation_tail_len`` must be ``> 0`` to enable
+            truncation; setting only one is rejected at construction.
     """
 
     def __init__(
