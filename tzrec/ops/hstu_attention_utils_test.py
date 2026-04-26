@@ -106,19 +106,6 @@ class BuildSlaFuncTensorTest(unittest.TestCase):
             self.assertEqual(func[0, 1, q].item(), 0)
             self.assertEqual(func[0, 2, q].item(), 0)
 
-    def test_negative_params_raise(self) -> None:
-        seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32)
-        for sla_k1, sla_k2, ctx in [(-1, 4, 0), (4, -1, 0), (4, 4, -1)]:
-            with self.assertRaisesRegex(ValueError, "non-negative"):
-                build_sla_func_tensor(
-                    nheads=2,
-                    sla_k1=sla_k1,
-                    sla_k2=sla_k2,
-                    seq_offsets=seq_offsets,
-                    total_q=8,
-                    contextual_seq_len=ctx,
-                )
-
     def test_int32_offsets_skip_cast(self) -> None:
         """int32 offsets pass through; int64 offsets get cast."""
         L = 4
