@@ -24,8 +24,12 @@ from tzrec.modules.gr.postprocessors import (
     create_output_postprocessor,
 )
 from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
-from tzrec.modules.gr.stu import STU, STULayer, STUStack
+from tzrec.modules.gr.stu import STULayer, STUStack
 from tzrec.modules.utils import BaseModule
+from tzrec.ops.hstu_attention_utils import (
+    STUTruncationPlan,
+    apply_stu_truncation_plan,
+)
 from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
@@ -56,6 +60,13 @@ class HSTUTransducer(BaseModule):
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
         listwise (bool): listwise training or not.
+        attn_truncation_split_layer (int): layer index ``N1`` after which
+            mid-stack attention truncation fires.  Must be in
+            ``(0, attn_num_layers)`` when truncation is enabled, else 0.
+        attn_truncation_tail_len (int): number of trailing UIH tokens kept
+            on layers ``>= N1``.  Both ``attn_truncation_split_layer`` and
+            ``attn_truncation_tail_len`` must be ``> 0`` to enable
+            truncation; setting only one is rejected at construction.
     """
 
     def __init__(
@@ -75,6 +86,8 @@ class HSTUTransducer(BaseModule):
         is_inference: bool = True,
         return_full_embeddings: bool = False,
         listwise: bool = False,
+        attn_truncation_split_layer: int = 0,
+        attn_truncation_tail_len: int = 0,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
@@ -91,8 +104,10 @@ class HSTUTransducer(BaseModule):
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
         if "scaling_seqlen" not in stu:
             stu["scaling_seqlen"] = scaling_seqlen
-        self._stu_module: STU = STUStack(
+        self._stu_module: STUStack = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
+            truncate_split_layer=attn_truncation_split_layer,
+            truncate_tail_len=attn_truncation_tail_len,
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
             output_postprocessor, embedding_dim=stu["embedding_dim"]
@@ -170,20 +185,32 @@ class HSTUTransducer(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, Optional[STUTruncationPlan]]:
+        """Run the STU stack and return truncated metadata alongside x.
+
+        Returns:
+            ``(seq_embeddings, seq_offsets, max_seq_len, plan)``.
+            ``plan`` is the :class:`STUTruncationPlan` produced by the
+            stack when mid-stack truncation fired, else ``None``; callers
+            replay it on parallel jagged tensors via
+            :func:`apply_stu_truncation_plan`.  The ``seq_offsets`` /
+            ``max_seq_len`` reflect the post-truncation state when
+            ``plan`` is not ``None``.  ``num_targets`` is preserved
+            intact across truncation, so the caller's input tensor is
+            still valid post-call.
+        """
         with record_function("hstu"):
-            seq_embeddings = self._stu_module(
+            return self._stu_module(
                 max_seq_len=max_seq_len,
                 x=seq_embeddings,
                 x_offsets=seq_offsets,
                 num_targets=(None if self._listwise_training else num_targets),
             )
-        return seq_embeddings
 
     def _postprocess(
         self,
         max_seq_len: int,
-        total_uih_len: int,
+        total_uih_len: Optional[int],
         total_targets: int,
         seq_lengths: torch.Tensor,
         seq_timestamps: torch.Tensor,
@@ -265,7 +292,12 @@ class HSTUTransducer(BaseModule):
             num_targets,
         ) = self._preprocess(grouped_features)
 
-        encoded_embeddings = self._hstu_compute(
+        (
+            encoded_embeddings,
+            post_stu_seq_offsets,
+            post_stu_max_seq_len,
+            plan,
+        ) = self._hstu_compute(
             max_seq_len=max_seq_len,
             seq_lengths=seq_lengths,
             seq_offsets=seq_offsets,
@@ -274,9 +306,30 @@ class HSTUTransducer(BaseModule):
             num_targets=num_targets,
         )
 
+        # When STUStack truncated mid-stack, replay the *same* split on
+        # seq_timestamps so the downstream postprocessor's jagged splits
+        # match the truncated embeddings.  Reusing the precomputed plan
+        # avoids redoing the offset arithmetic and the .item() sync that
+        # the previous "second apply_stu_truncation call" pattern needed.
+        # ``num_targets`` / ``total_targets`` are preserved by truncation,
+        # so they stay valid as-is.
+        post_truncation_total_uih_len: Optional[int] = total_uih_len
+        if plan is not None:
+            seq_timestamps = apply_stu_truncation_plan(
+                seq_timestamps.unsqueeze(-1), plan
+            ).squeeze(-1)
+            seq_lengths = plan.new_lengths
+            seq_offsets = post_stu_seq_offsets
+            max_seq_len = post_stu_max_seq_len
+            # ``total_uih_len`` shrank; let split_2D_jagged derive the
+            # exact value from offsets to avoid a second D->H sync (the
+            # only one on the truncation path is the tight max inside
+            # compute_stu_truncation_plan).
+            post_truncation_total_uih_len = None
+
         encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
             max_seq_len=max_seq_len,
-            total_uih_len=total_uih_len,
+            total_uih_len=post_truncation_total_uih_len,
             total_targets=total_targets,
             seq_lengths=seq_lengths,
             seq_embeddings=encoded_embeddings,

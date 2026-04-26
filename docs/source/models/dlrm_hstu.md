@@ -150,12 +150,14 @@ model_config {
 - dlrm_hstu: dlrm_hstu 模型相关的参数
 
   - hstu: HSTU模型参数配置
-    - stu: STU模块配置
+    - stu: STU模块配置（参见下文 ULTRA-HSTU 节介绍 `sla_k1` / `sla_k2`）
     - input_dropout_ratio: 输入是否使用dropout
     - attn_num_layers: STU层数
     - positional_encoder: 位置时间编码配置
     - input_preprocessor: 输入特征预处理配置，主要用于contextual和action特征处理
     - output_postprocessor: 输出后处理配置，主要用于normalization
+    - attn_truncation_split_layer: 注意力截断的分层位置 N1（参见下文 ULTRA-HSTU 节）
+    - attn_truncation_tail_len: 注意力截断时每个样本保留的UIH尾部token数
   - fusion_mtl_tower: 多目标目标塔配置
     - task_configs:
       - task_name: 任务名
@@ -326,6 +328,54 @@ torchrun --master_addr=localhost --master_port=32555 \
     --export_dir experiments/dlrm_hstu/export
 ```
 
+## ULTRA-HSTU
+
+ULTRA-HSTU 在 HSTU 之上引入了三个可独立开启的优化（参见 [ULTRA-HSTU](https://arxiv.org/abs/2602.16986)）：Semi-Local Attention、注意力截断、以及精细化的重计算控制。
+
+### Semi-Local Attention（SLA）
+
+SLA 通过 `sla_k1` / `sla_k2` 把全局 attention 拆成「局部因果窗口 + 全局前缀」：history 行只 attend 到 `[max(0, pos - sla_k1 + 1), pos]` 这个局部窗口加上前 `max(sla_k2, contextual_seq_len)` 个全局 token。两个参数都为 0 时表示禁用 SLA。
+
+- `sla_k1`：局部因果窗口大小（`0` 表示禁用）。
+- `sla_k2`：全局前缀长度（`0` 表示禁用；`contextual_seq_len > 0` 时会自动取 `max(sla_k2, contextual_seq_len)`）。
+- SLA 仅支持 `Kernel.CUTLASS`（生产）和 `Kernel.PYTORCH`（参考实现）。`Kernel.TRITON` 没有 NFUNC 路径，会在构造期或前向直接报错。
+
+```
+stu {
+    embedding_dim: 512
+    num_heads: 4
+    sla_k1: 256
+    sla_k2: 32
+    ...
+}
+```
+
+### 注意力截断（Attention Truncation）
+
+`attn_truncation_split_layer`（N1）和 `attn_truncation_tail_len`（L'）共同启用层间截断：前 N1 层在完整序列上跑，从第 N1 层开始仅保留每个样本最后 L' 个 UIH token，contextual 前缀和 targets 永远保留。两个字段必须同时 `> 0` 才会生效，单独设置其一会在构造期被拒。
+
+```
+hstu {
+    attn_num_layers: 8
+    attn_truncation_split_layer: 2
+    attn_truncation_tail_len: 512
+    ...
+}
+```
+
+注意：`STUStack.cached_forward`（serving 路径）暂不支持截断，配置开启时会抛 `NotImplementedError`，避免 train/serve 不一致。
+
+### 选择性重计算
+
+`stu` 下的 `recompute_normed_x` / `recompute_uvqk` / `recompute_y` 控制反向传播时的重计算颗粒度：
+
+- `recompute_normed_x`：`True` 时反向时重算 LayerNorm 后的 `normed_x`。
+- `recompute_uvqk`：`True` 时反向时重算 `addmm + split + silu` 得到的 UVQK。
+- `recompute_y`：`True` 时反向时重算输出投影。
+
+四种 `(recompute_normed_x, recompute_uvqk)` 组合的前向输出和梯度对位结果均与无重计算的参考实现 bitwise 相同（参见 `tzrec/ops/hstu_compute_test.py::Hstu4WayRematParityTest`）。
+
 ## 参考论文
 
 [HSTU](https://arxiv.org/abs/2402.17152)
+[ULTRA-HSTU](https://arxiv.org/abs/2602.16986)
