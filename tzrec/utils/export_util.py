@@ -990,6 +990,37 @@ def export_rtp_model(
                 json.dump(fg_json, f, indent=4)
 
 
+def _compute_seq_share_groups(
+    features: List[BaseFeature],
+    model_config: Any,
+) -> Dict[str, str]:
+    """Map ``{group_name}__sequence`` to a share_key.
+
+    Feature groups whose first feature comes from the same parent
+    SequenceFeature share per-sample lengths and therefore must share
+    a torch.export.Dim on the lengths-derived axis.
+    """
+    from tzrec.protos.model_pb2 import FeatureGroupType
+
+    feat_by_name = {f.name: f for f in features}
+    share: Dict[str, str] = {}
+    for fg in model_config.feature_groups:
+        if fg.group_type not in (
+            FeatureGroupType.SEQUENCE,
+            FeatureGroupType.JAGGED_SEQUENCE,
+        ):
+            continue
+        if not fg.feature_names:
+            continue
+        first = feat_by_name.get(fg.feature_names[0])
+        if first is not None and getattr(first, "_is_grouped_seq", False):
+            share_key = f"seq_{first.sequence_name}"
+        else:
+            share_key = f"fg_{fg.group_name}"
+        share[f"{fg.group_name}__sequence"] = share_key
+    return share
+
+
 def split_model(
     data: Dict[str, torch.Tensor], model: BaseModule, save_dir: str
 ) -> Tuple[nn.Module, nn.Module, Dict[str, Any]]:
@@ -1120,8 +1151,13 @@ def split_model(
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
+    seq_share_groups = _compute_seq_share_groups(
+        features=cast(List[BaseFeature], model._features),
+        model_config=model.model._base_model_config,
+    )
     meta_info = {
         "seq_tensor_names": seq_tensor_names,
         "jagged_seq_tensor_names": jagged_seq_tensor_names,
+        "seq_share_groups": seq_share_groups,
     }
     return sparse_gm, dense_gm, meta_info

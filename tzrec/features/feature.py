@@ -69,7 +69,12 @@ _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
 
 
 MAX_HASH_BUCKET_SIZE = 2**63 - 1
-SINGLE_INPUT_FEATURE_CLASSES = ["IdFeature", "RawFeature", "TokenizeFeature"]
+SINGLE_INPUT_FEATURE_CLASSES = [
+    "IdFeature",
+    "RawFeature",
+    "TokenizeFeature",
+    "CombineFeature",
+]
 
 
 def _parse_fg_encoded_sparse_feature_impl(
