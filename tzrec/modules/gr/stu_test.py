@@ -426,6 +426,99 @@ class StuTest(unittest.TestCase):
 
         torch.testing.assert_close(ref_delta_y, delta_y)
 
+    def _make_sla_layer(self, sla_k1: int = 0, sla_k2: int = 0):
+        from tzrec.modules.gr.stu import STULayer
+
+        layer = STULayer(
+            embedding_dim=16,
+            num_heads=2,
+            hidden_dim=32,
+            attention_dim=32,
+            output_dropout_ratio=0.0,
+            causal=True,
+            target_aware=True,
+            max_attn_len=None,
+            attn_alpha=None,
+            use_group_norm=False,
+            recompute_normed_x=False,
+            recompute_uvqk=False,
+            recompute_y=False,
+            sort_by_length=False,
+            contextual_seq_len=0,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            is_inference=False,
+        )
+        layer.set_kernel(Kernel.PYTORCH)
+        return layer
+
+    def _sla_inputs(self):
+        x_lengths = torch.tensor([4, 6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), 16)
+        num_targets = torch.tensor([1, 2], dtype=torch.int64)
+        return x, x_offsets, int(x_lengths.max().item()), num_targets
+
+    def test_consecutive_same_sig_layers_share_func(self) -> None:
+        """A second SLA layer with matching sig reuses the prev tensor."""
+        layer1 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+
+        out1, attn_func1, sig1 = layer1(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        _, attn_func2, sig2 = layer2(
+            x=out1,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+            prev_attn_func=attn_func1,
+            prev_attn_func_sig=sig1,
+        )
+        self.assertEqual(sig2, sig1)
+        # Tensor identity confirms layer2 reused rather than rebuilt.
+        self.assertIs(attn_func2, attn_func1)
+
+    def test_distinct_sig_rebuilds(self) -> None:
+        """A second SLA layer with a different sig builds a fresh tensor."""
+        layer1 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_sla_layer(sla_k1=8, sla_k2=2)  # different k1
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+
+        out1, attn_func1, sig1 = layer1(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        _, attn_func2, sig2 = layer2(
+            x=out1,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+            prev_attn_func=attn_func1,
+            prev_attn_func_sig=sig1,
+        )
+        self.assertNotEqual(sig2, sig1)
+        self.assertIsNot(attn_func2, attn_func1)
+
+    def test_sla_on_triton_kernel_raises(self) -> None:
+        """SLA paths require CUTLASS or PYTORCH; Triton has no NFUNC kernel."""
+        layer = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer.set_kernel(Kernel.TRITON)
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
+            layer(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=max_seq_len,
+                num_targets=num_targets,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
