@@ -172,7 +172,7 @@ class HSTUTransducer(BaseModule):
         num_targets: torch.Tensor,
     ) -> torch.Tensor:
         with record_function("hstu"):
-            seq_embeddings = self._stu_module(
+            seq_embeddings, _, _ = self._stu_module(
                 max_seq_len=max_seq_len,
                 x=seq_embeddings,
                 x_offsets=seq_offsets,

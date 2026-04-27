@@ -133,13 +133,13 @@ class StuTest(unittest.TestCase):
             dtype=dtype,
         ).requires_grad_(True)
         x_triton = x.clone().detach().requires_grad_()
-        stu_output = stu(
+        stu_output, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
         )
-        stu_triton_output = stu_triton(
+        stu_triton_output, _, _ = stu_triton(
             x=x_triton,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -230,7 +230,7 @@ class StuTest(unittest.TestCase):
             device=device,
             dtype=dtype,
         ).requires_grad_(True)
-        stu_output = stu(
+        stu_output, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -254,7 +254,7 @@ class StuTest(unittest.TestCase):
             swapped_dense_x,
             [x_offsets],
         )[0].requires_grad_(True)
-        swapped_stu_output = stu(
+        swapped_stu_output, _, _ = stu(
             x=swapped_x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -383,7 +383,7 @@ class StuTest(unittest.TestCase):
         ).requires_grad_(True)
 
         # default forward().
-        ref_y = stu(
+        ref_y, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -411,7 +411,7 @@ class StuTest(unittest.TestCase):
             offsets_right=None,
             kernel=Kernel.TRITON,
         )
-        _ = stu(
+        _, _, _ = stu(
             x=prime_x,
             x_offsets=prime_offsets,
             max_seq_len=max_seq_len,
@@ -427,18 +427,13 @@ class StuTest(unittest.TestCase):
         torch.testing.assert_close(ref_delta_y, delta_y)
 
 
-class STUStackSLATest(unittest.TestCase):
-    """Cover STUStack's SLA infrastructure that is independent of GPU kernels.
-
-    The SLA func tensor build, the per-layer ``attn_func`` threading, and
-    the ``_stack_sla_config`` caching all live in STUStack itself; these
-    tests exercise them on CPU without needing the CUTLASS path.
-    """
+class STULayerSLATest(unittest.TestCase):
+    """Cover STULayer's SLA func reuse path on CPU."""
 
     def _make_layer(self, sla_k1: int = 0, sla_k2: int = 0):
         from tzrec.modules.gr.stu import STULayer
 
-        return STULayer(
+        layer = STULayer(
             embedding_dim=16,
             num_heads=2,
             hidden_dim=32,
@@ -458,23 +453,62 @@ class STUStackSLATest(unittest.TestCase):
             sla_k2=sla_k2,
             is_inference=False,
         )
+        layer.set_kernel(Kernel.PYTORCH)
+        return layer
 
-    def test_sla_config_cached_at_init(self) -> None:
-        """``_stack_sla_config`` is None when no layer enables SLA."""
-        from tzrec.modules.gr.stu import STU, STUStack
+    def _inputs(self):
+        x_lengths = torch.tensor([4, 6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), 16)
+        num_targets = torch.tensor([1, 2], dtype=torch.int64)
+        return x, x_offsets, int(x_lengths.max().item()), num_targets
 
-        no_sla: List[STU] = [self._make_layer() for _ in range(2)]
-        stack = STUStack(stu_list=no_sla)
-        self.assertIsNone(stack._stack_sla_config)
-        self.assertEqual(stack._layer_uses_sla, [False, False])
+    def test_consecutive_same_sig_layers_share_func(self) -> None:
+        """A second SLA layer with matching sig reuses the prev tensor."""
+        layer1 = self._make_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_layer(sla_k1=4, sla_k2=2)
+        x, x_offsets, max_seq_len, num_targets = self._inputs()
 
-        mixed: List[STU] = [
-            self._make_layer(),
-            self._make_layer(sla_k1=8, sla_k2=4),
-        ]
-        stack = STUStack(stu_list=mixed)
-        self.assertEqual(stack._stack_sla_config, (8, 4, 0, 2, True))
-        self.assertEqual(stack._layer_uses_sla, [False, True])
+        out1, attn_func1, sig1 = layer1(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        out2, attn_func2, sig2 = layer2(
+            x=out1,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+            prev_attn_func=attn_func1,
+            prev_attn_func_sig=sig1,
+        )
+        self.assertEqual(sig2, sig1)
+        # Tensor identity confirms layer2 reused rather than rebuilt.
+        self.assertIs(attn_func2, attn_func1)
+
+    def test_distinct_sig_rebuilds(self) -> None:
+        """A second SLA layer with a different sig builds a fresh tensor."""
+        layer1 = self._make_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_layer(sla_k1=8, sla_k2=2)  # different k1
+        x, x_offsets, max_seq_len, num_targets = self._inputs()
+
+        out1, attn_func1, sig1 = layer1(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        _, attn_func2, sig2 = layer2(
+            x=out1,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+            prev_attn_func=attn_func1,
+            prev_attn_func_sig=sig1,
+        )
+        self.assertNotEqual(sig2, sig1)
+        self.assertIsNot(attn_func2, attn_func1)
 
 
 if __name__ == "__main__":
