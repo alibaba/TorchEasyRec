@@ -24,7 +24,7 @@ from tzrec.modules.gr.postprocessors import (
     create_output_postprocessor,
 )
 from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
-from tzrec.modules.gr.stu import STU, STULayer, STUStack
+from tzrec.modules.gr.stu import STULayer, STUStack
 from tzrec.modules.utils import BaseModule
 from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
@@ -91,7 +91,7 @@ class HSTUTransducer(BaseModule):
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
         if "scaling_seqlen" not in stu:
             stu["scaling_seqlen"] = scaling_seqlen
-        self._stu_module: STU = STUStack(
+        self._stu_module: STUStack = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
@@ -172,7 +172,7 @@ class HSTUTransducer(BaseModule):
         num_targets: torch.Tensor,
     ) -> torch.Tensor:
         with record_function("hstu"):
-            seq_embeddings, _, _ = self._stu_module(
+            seq_embeddings = self._stu_module(
                 max_seq_len=max_seq_len,
                 x=seq_embeddings,
                 x_offsets=seq_offsets,

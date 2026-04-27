@@ -68,7 +68,8 @@ def build_sla_func_tensor(
         device: target device (inferred from seq_offsets if None).
 
     Returns:
-        func tensor of shape (nheads, 3, total_q), dtype int32.
+        func tensor of shape (nheads, 3, total_q), dtype int32; head dim
+        is a stride-0 broadcast view, do not call ``.contiguous()``.
     """
     if sla_k1 < 0 or sla_k2 < 0 or contextual_seq_len < 0:
         raise ValueError(
@@ -116,6 +117,5 @@ def build_sla_func_tensor(
     col_min0 = torch.where(is_history, hist_col_min0, H_boundary)
     col_max1 = torch.where(is_history, hist_col_max1, H_boundary)
 
-    # Stack as (3, total_q) then expand to (nheads, 3, total_q)
     func_2d = torch.stack([col_max0, col_min0, col_max1], dim=0)  # (3, total_q)
-    return func_2d.unsqueeze(0).expand(nheads, 3, total_q).contiguous()
+    return func_2d.unsqueeze(0).expand(nheads, 3, total_q)

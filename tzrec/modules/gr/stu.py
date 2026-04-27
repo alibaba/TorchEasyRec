@@ -66,8 +66,12 @@ class STU(BaseModule, abc.ABC):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
         prev_attn_func: Optional[torch.Tensor] = None,
-        prev_attn_func_sig: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[str]]:
+        prev_attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[Tuple[int, int, int, int, bool]],
+    ]:
         """Forward the layer.
 
         Args:
@@ -80,14 +84,16 @@ class STU(BaseModule, abc.ABC):
             prev_attn_func (Optional[torch.Tensor]): SLA NFUNC mask tensor
                 produced by the previous layer in the stack, available for
                 reuse when the current layer's signature matches.
-            prev_attn_func_sig (Optional[str]): signature describing the
-                SLA config that produced ``prev_attn_func``.
+            prev_attn_func_sig (Optional[Tuple[int,int,int,int,bool]]):
+                signature ``(sla_k1, sla_k2, contextual_seq_len, num_heads,
+                target_aware)`` describing the SLA config that produced
+                ``prev_attn_func``.
 
         Returns:
-            Tuple of ``(output, attn_func, attn_func_sig)``.  ``attn_func``
-            and ``attn_func_sig`` describe the SLA mask the layer ended up
-            using (or passed through, for non-SLA layers); ``STUStack``
-            threads them into the next layer's ``prev_*`` inputs.
+            Tuple of ``(output, attn_func, attn_func_sig)``.  The sig
+            does not encode offsets / num_targets identity; reuse
+            assumes all layers in one stack forward see the same
+            offsets.
         """
         pass
 
@@ -200,15 +206,18 @@ class STULayer(STU):
         recompute_y (bool): whether to recompute y in backward
         sort_by_length (bool): whether to sort by length when forwarding
         contextual_seq_len (int): sequence length of contextual feature
-        sla_k1 (int): Semi-Local Attention local-causal window size.  ``0``
-            disables SLA on this layer.  When non-zero (and ``sla_k2`` is
-            non-zero or ``contextual_seq_len > 0``), the layer attends to
-            ``[max(0, pos - sla_k1 + 1), pos]`` plus the global prefix.
-            Requires ``Kernel.CUTLASS`` or ``Kernel.PYTORCH`` (Triton has
-            no NFUNC mask path).
-        sla_k2 (int): Semi-Local Attention global-prefix length.  ``0``
-            disables the global prefix; ``effective_k2 = max(sla_k2,
-            contextual_seq_len)`` so a contextual prefix can subsume it.
+        sla_k1 (int): Semi-Local Attention local-causal window size.
+            Setting either ``sla_k1`` or ``sla_k2`` to a value > 0
+            activates the SLA path on this layer (the other may stay 0
+            to disable that side).  The active layer attends to
+            ``[max(0, pos - sla_k1 + 1), pos]`` plus the global prefix
+            of length ``max(sla_k2, contextual_seq_len)``.  Requires
+            ``Kernel.CUTLASS`` or ``Kernel.PYTORCH`` (Triton has no
+            NFUNC mask path).
+        sla_k2 (int): Semi-Local Attention global-prefix length.
+            ``effective_k2 = max(sla_k2, contextual_seq_len)`` so a
+            contextual prefix can subsume it.  See ``sla_k1`` for
+            activation rules.
         scaling_seqlen (int): sequence length used as the divisor in the
             attention output scaling. ``-1`` means fall back to the runtime
             ``max_seq_len`` (legacy behavior). When set to a fixed value
@@ -386,8 +395,12 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
         prev_attn_func: Optional[torch.Tensor] = None,
-        prev_attn_func_sig: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[str]]:
+        prev_attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[Tuple[int, int, int, int, bool]],
+    ]:
         """Forward the layer.
 
         Args:
@@ -397,21 +410,17 @@ class STULayer(STU):
             num_targets (torch.Tensor): number of targets.
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
-            prev_attn_func (Optional[torch.Tensor]): SLA NFUNC mask tensor
-                produced by the previous layer in the stack.
-            prev_attn_func_sig (Optional[str]): signature describing the
-                SLA config that produced ``prev_attn_func``.  When the
-                current layer's signature matches, ``prev_attn_func`` is
-                reused; otherwise the layer rebuilds.
+            prev_attn_func (Optional[torch.Tensor]): SLA NFUNC mask
+                from the previous layer; reused if sig matches.
+            prev_attn_func_sig (Optional[Tuple[int,int,int,int,bool]]):
+                ``(sla_k1, sla_k2, contextual_seq_len, num_heads,
+                target_aware)`` of ``prev_attn_func``.
 
         Returns:
-            Tuple of ``(output, attn_func, attn_func_sig)``.  ``attn_func``
-            and ``attn_func_sig`` are this layer's mask tensor and signature
-            (or pass-through values for non-SLA layers) so the next layer
-            in the stack can reuse them when its config matches.
+            ``(output, attn_func, attn_func_sig)``.
         """
         attn_func: Optional[torch.Tensor] = None
-        attn_func_sig: Optional[str] = None
+        attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None
         uses_sla = self._sla_k1 > 0 or self._sla_k2 > 0
         if uses_sla:
             if self.kernel() == Kernel.TRITON:
@@ -419,10 +428,12 @@ class STULayer(STU):
                     "SLA (sla_k1 / sla_k2 > 0) requires Kernel.CUTLASS or "
                     "Kernel.PYTORCH; Kernel.TRITON has no NFUNC mask path."
                 )
-            my_sig = (
-                f"sla:{self._sla_k1}:{self._sla_k2}:"
-                f"{self._contextual_seq_len}:{self._num_heads}:"
-                f"{int(self._target_aware)}"
+            my_sig: Tuple[int, int, int, int, bool] = (
+                self._sla_k1,
+                self._sla_k2,
+                self._contextual_seq_len,
+                self._num_heads,
+                self._target_aware,
             )
             if my_sig == prev_attn_func_sig and prev_attn_func is not None:
                 attn_func = prev_attn_func
@@ -438,13 +449,9 @@ class STULayer(STU):
                 )
             attn_func_sig = my_sig
         else:
-            # Non-SLA layer: pass through so a downstream SLA layer with
-            # a matching signature can still reuse a previously built mask.
             attn_func = prev_attn_func
             attn_func_sig = prev_attn_func_sig
 
-        # Only feed attn_func into the kernel when this layer is itself
-        # SLA-enabled; non-SLA layers must run the legacy fixed-mask path.
         local_attn_func = attn_func if uses_sla else None
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
@@ -583,14 +590,8 @@ class STULayer(STU):
             )
 
 
-class STUStack(STU):
-    """Stack of ``STU`` layers.
-
-    ``STUStack`` is a thin chain over a list of ``STU`` modules.  SLA func
-    tensor construction lives inside each ``STULayer``; the stack just
-    threads ``(prev_attn_func, prev_attn_func_sig)`` from one layer's
-    output into the next layer's input, so consecutive layers with
-    matching SLA signatures share the same NFUNC mask without rebuilding.
+class STUStack(BaseModule):
+    """Stack of ``STU`` layers.  Threads SLA mask reuse between layers.
 
     Args:
         stu_list (List[STU]): list of STU layers.
@@ -613,9 +614,7 @@ class STUStack(STU):
         num_targets: torch.Tensor,
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
-        prev_attn_func: Optional[torch.Tensor] = None,
-        prev_attn_func_sig: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[str]]:
+    ) -> torch.Tensor:
         """Forward stack of stu layer.
 
         Args:
@@ -625,15 +624,12 @@ class STUStack(STU):
             num_targets (torch.Tensor): number of targets.
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
-            prev_attn_func (Optional[torch.Tensor]): SLA NFUNC mask seeded
-                from upstream; threaded into the first layer.
-            prev_attn_func_sig (Optional[str]): signature describing
-                ``prev_attn_func``.
 
         Returns:
-            Tuple of ``(output, attn_func, attn_func_sig)`` from the last
-            layer in the stack.
+            torch.Tensor: output sequence embedding tensor from the last layer.
         """
+        prev_attn_func: Optional[torch.Tensor] = None
+        prev_attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None
         for layer in self._stu_layers:
             x, prev_attn_func, prev_attn_func_sig = layer(
                 x=x,
@@ -645,7 +641,7 @@ class STUStack(STU):
                 prev_attn_func=prev_attn_func,
                 prev_attn_func_sig=prev_attn_func_sig,
             )
-        return x, prev_attn_func, prev_attn_func_sig
+        return x
 
     def cached_forward(
         self,

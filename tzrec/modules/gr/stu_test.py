@@ -426,11 +426,7 @@ class StuTest(unittest.TestCase):
 
         torch.testing.assert_close(ref_delta_y, delta_y)
 
-
-class STULayerSLATest(unittest.TestCase):
-    """Cover STULayer's SLA func reuse path on CPU."""
-
-    def _make_layer(self, sla_k1: int = 0, sla_k2: int = 0):
+    def _make_sla_layer(self, sla_k1: int = 0, sla_k2: int = 0):
         from tzrec.modules.gr.stu import STULayer
 
         layer = STULayer(
@@ -456,7 +452,7 @@ class STULayerSLATest(unittest.TestCase):
         layer.set_kernel(Kernel.PYTORCH)
         return layer
 
-    def _inputs(self):
+    def _sla_inputs(self):
         x_lengths = torch.tensor([4, 6], dtype=torch.int64)
         x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
         x = torch.randn(int(x_offsets[-1].item()), 16)
@@ -465,9 +461,9 @@ class STULayerSLATest(unittest.TestCase):
 
     def test_consecutive_same_sig_layers_share_func(self) -> None:
         """A second SLA layer with matching sig reuses the prev tensor."""
-        layer1 = self._make_layer(sla_k1=4, sla_k2=2)
-        layer2 = self._make_layer(sla_k1=4, sla_k2=2)
-        x, x_offsets, max_seq_len, num_targets = self._inputs()
+        layer1 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
 
         out1, attn_func1, sig1 = layer1(
             x=x,
@@ -475,7 +471,7 @@ class STULayerSLATest(unittest.TestCase):
             max_seq_len=max_seq_len,
             num_targets=num_targets,
         )
-        out2, attn_func2, sig2 = layer2(
+        _, attn_func2, sig2 = layer2(
             x=out1,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -489,9 +485,9 @@ class STULayerSLATest(unittest.TestCase):
 
     def test_distinct_sig_rebuilds(self) -> None:
         """A second SLA layer with a different sig builds a fresh tensor."""
-        layer1 = self._make_layer(sla_k1=4, sla_k2=2)
-        layer2 = self._make_layer(sla_k1=8, sla_k2=2)  # different k1
-        x, x_offsets, max_seq_len, num_targets = self._inputs()
+        layer1 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_sla_layer(sla_k1=8, sla_k2=2)  # different k1
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
 
         out1, attn_func1, sig1 = layer1(
             x=x,
@@ -509,6 +505,19 @@ class STULayerSLATest(unittest.TestCase):
         )
         self.assertNotEqual(sig2, sig1)
         self.assertIsNot(attn_func2, attn_func1)
+
+    def test_sla_on_triton_kernel_raises(self) -> None:
+        """SLA paths require CUTLASS or PYTORCH; Triton has no NFUNC kernel."""
+        layer = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer.set_kernel(Kernel.TRITON)
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
+            layer(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=max_seq_len,
+                num_targets=num_targets,
+            )
 
 
 if __name__ == "__main__":
