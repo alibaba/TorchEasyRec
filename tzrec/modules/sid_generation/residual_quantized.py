@@ -426,6 +426,7 @@ class ResidualQuantized(nn.Module):
         input: torch.Tensor,
         temperature: float = 1.0,
         reference_code: Optional[torch.Tensor] = None,
+        ema_mask: Optional[torch.Tensor] = None,
     ) -> ResidualQuantizedOutput:
         """Forward the multi-layer residual quantization.
 
@@ -442,6 +443,8 @@ class ResidualQuantized(nn.Module):
             reference_code (Tensor, optional): reference codebook indices,
                 shape (B, n_layers). If provided, each layer receives
                 reference_code[:, i] for probabilistic replacement.
+            ema_mask (Tensor, optional): per-row EMA mask, shape (B,)
+                float. Passed through to each VectorQuantize layer.
 
         Returns:
             ResidualQuantizedOutput: (cluster_ids, quantized_embeddings,
@@ -472,6 +475,7 @@ class ResidualQuantized(nn.Module):
             quantized = layer(
                 residual, temperature=temperature,
                 reference_code=ref_code_i,
+                ema_mask=ema_mask,
             )
             all_ids.append(quantized.ids)
 

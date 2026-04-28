@@ -288,7 +288,10 @@ class VectorQuantize(nn.Module):
 
     @torch.no_grad()
     def _update_ema_buffers(
-        self, x: torch.Tensor, ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        ids: torch.Tensor,
+        ema_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """EMA update cluster_size_ema and embed_ema buffers.
 
@@ -298,6 +301,9 @@ class VectorQuantize(nn.Module):
         Args:
             x (Tensor): input vectors, shape (B, D).
             ids (Tensor): assigned codebook indices, shape (B,).
+            ema_mask (Tensor, optional): per-row mask, shape (B,) float.
+                1.0 = contribute to EMA, 0.0 = skip. Used by mixed
+                mode to prevent recon rows from updating path2 EMA.
         """
         n_embed = self.n_embed
         embed_dim = self.embed_dim
@@ -313,6 +319,11 @@ class VectorQuantize(nn.Module):
             index=ids_flat.unsqueeze(0),
             src=x_flat.new_ones(1, n_vectors),
         )
+
+        # Per-row EMA mask: masked rows contribute zero
+        if ema_mask is not None:
+            # ema_mask: (B,) float, 1.0 = participate, 0.0 = skip
+            one_hot = one_hot * ema_mask.reshape(1, -1)  # (n_embed, B) * (1, B)
 
         cluster_size = one_hot.sum(dim=1)            # (n_embed,)
         vectors_sum = one_hot @ x_flat               # (n_embed, embed_dim)
@@ -379,6 +390,7 @@ class VectorQuantize(nn.Module):
         x: torch.Tensor,
         temperature: float = 1.0,
         reference_code: Optional[torch.Tensor] = None,
+        ema_mask: Optional[torch.Tensor] = None,
     ) -> QuantizeOutput:
         """Forward the vector quantization layer.
 
@@ -397,6 +409,9 @@ class VectorQuantize(nn.Module):
             reference_code (Tensor, optional): reference codebook indices,
                 shape (B,). If provided, randomly replace assigned ids
                 with reference codes at probability 0.04.
+            ema_mask (Tensor, optional): per-row EMA mask, shape (B,)
+                float. 1.0 = contribute to EMA update, 0.0 = skip.
+                Used by mixed mode path2 to exclude recon rows.
 
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids, loss).
@@ -412,7 +427,7 @@ class VectorQuantize(nn.Module):
 
         # Step 4: EMA codebook update (training only)
         if self.training and self.use_ema:
-            self._update_ema_buffers(x, ids)
+            self._update_ema_buffers(x, ids, ema_mask)
 
         # Step 5: compute differentiable embedding
         if self.training:

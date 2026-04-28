@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.clip_loss import CLIPLoss
+from tzrec.modules.sid_generation.clip_loss import CLIPLoss, MaskedCLIPLoss
 from tzrec.modules.sid_generation.residual_quantized import ResidualQuantized
 
 
@@ -163,7 +163,7 @@ class RQVAE(nn.Module):
             self.logit_scale = nn.Parameter(
                 torch.ones([]) * np.log(1 / 0.07)
             )
-            self.clip_loss_fn = CLIPLoss()
+            self.masked_clip_loss_fn = MaskedCLIPLoss()
 
     # ------------------------------------------------------------------
     # Basic methods
@@ -228,11 +228,11 @@ class RQVAE(nn.Module):
         """Dispatch based on use_clip.
 
         use_clip=False: forward(x) -> forward_rqvae(x)
-        use_clip=True:  forward(fea1, fea2) -> forward_clip(fea1, fea2)
+        use_clip=True:  forward(fea1, fea2, clip_mask) -> forward_mixed(...)
         """
         if self.use_clip:
-            assert len(args) == 2, "CLIP mode requires (fea1, fea2)"
-            return self.forward_clip(args[0], args[1], **kwargs)
+            assert len(args) == 3, "Mixed mode requires (fea1, fea2, clip_mask)"
+            return self.forward_mixed(args[0], args[1], args[2], **kwargs)
         else:
             assert len(args) == 1, "Standard mode requires (x,)"
             return self.forward_rqvae(args[0], **kwargs)
@@ -273,14 +273,7 @@ class RQVAE(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Siamese RQ-VAE + CLIP contrastive learning.
 
-        fea1, fea2 go through the same RQVAE (shared params),
-        then compute CLIP loss + average commitment loss.
-
-        Note: al_sid forward_clip does NOT use reference_code.
-        fea1 and fea2 are independently quantized.
-
-        Backward loss = clip_loss + commitment_loss
-        recon_loss, pair_code_loss are logged only (no backprop).
+        DEPRECATED: kept for backward compatibility. Use forward_mixed instead.
 
         Args:
             fea1: (B, input_dim) first feature.
@@ -288,65 +281,108 @@ class RQVAE(nn.Module):
             temperature: Gumbel-Softmax temperature.
 
         Returns:
-            dict with keys: 'clip_loss', 'loss_self', 'loss_ori', 'loss_cl',
-                'clip_acc', 'commitment_loss', 'reconstruction_loss',
-                'pair_code_loss', 'loss'.
+            dict with clip_loss, commitment_loss, etc.
         """
-        # Two independent quantization passes (shared params)
+        # All rows are clip rows -> full True mask
+        clip_mask = torch.ones(
+            fea1.shape[0], dtype=torch.bool, device=fea1.device
+        )
+        return self.forward_mixed(fea1, fea2, clip_mask, temperature)
+
+    def _compute_masked_recon_loss(
+        self,
+        x_hat: torch.Tensor,
+        x: torch.Tensor,
+        recon_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute per-sample recon loss, masked to recon rows only.
+
+        No boolean indexing, no data-dependent branching,
+        compatible with torch.compile.
+
+        Args:
+            x_hat: (B, D) reconstructed output.
+            x: (B, D) original input.
+            recon_mask: (B,) bool, True = recon row.
+        """
+        if self.loss_type == "mse":
+            per_sample = F.mse_loss(
+                x_hat, x, reduction="none"
+            ).mean(dim=-1)
+        elif self.loss_type == "l1":
+            per_sample = F.l1_loss(
+                x_hat, x, reduction="none"
+            ).mean(dim=-1)
+        elif self.loss_type == "cosine":
+            per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
+        else:
+            raise ValueError(f"Unsupported loss_type: {self.loss_type}")
+        n_recon = recon_mask.float().sum().clamp(min=1)
+        return (per_sample * recon_mask.float()).sum() / n_recon
+
+    def forward_mixed(
+        self,
+        fea1: torch.Tensor,
+        fea2: torch.Tensor,
+        clip_mask: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Mixed recon + CLIP forward.
+
+        All samples go through dual paths; mask separates recon and clip
+        loss contributions.
+
+        Args:
+            fea1: (B, input_dim) main embedding (all rows valid).
+            fea2: (B, input_dim) clip embedding (recon rows == fea1).
+            clip_mask: (B,) bool, True = clip sample.
+            temperature: Gumbel-Softmax temperature.
+        """
+        # Step 1: dual-path encode -> quantize -> decode
         z_e1 = self.encode(fea1)
         quant1 = self.quantizer(z_e1, temperature=temperature)
-        fea1_vq = self.decode(quant1.quantized_embeddings)
+        x_hat1 = self.decode(quant1.quantized_embeddings)
 
         z_e2 = self.encode(fea2)
-        quant2 = self.quantizer(z_e2, temperature=temperature)
-        fea2_vq = self.decode(quant2.quantized_embeddings)
+        quant2 = self.quantizer(
+            z_e2, temperature=temperature,
+            ema_mask=clip_mask.float(),
+        )
+        x_hat2 = self.decode(quant2.quantized_embeddings)
 
-        # CLIP contrastive loss
+        # Step 2: recon loss (only recon rows, no branching)
+        recon_mask = ~clip_mask
+        recon_loss = self._compute_masked_recon_loss(x_hat1, fea1, recon_mask)
+
+        # Step 3: masked CLIP loss (only clip rows)
         features = {
-            "image_embed": fea1_vq,
-            "text_embed": fea2_vq,
+            "image_embed": x_hat1,
+            "text_embed": x_hat2,
             "image_embed_ori": fea1,
             "text_embed_ori": fea2,
             "logit_scale_self": self.logit_scale_self.exp(),
             "logit_scale_cl": self.logit_scale_cl.exp(),
             "logit_scale": self.logit_scale.exp(),
         }
-        clip_result = self.clip_loss_fn(features)
+        clip_result = self.masked_clip_loss_fn(features, clip_mask)
 
-        # Commitment loss (average of two paths)
-        commitment_loss = (
+        # Step 4: commitment loss (average of two paths)
+        commitment = (
             quant1.quantization_loss + quant2.quantization_loss
         ) / 2
 
-        # Reconstruction loss (log only, no backprop)
-        feas = torch.cat([fea1, fea2], dim=0)
-        recons = torch.cat([fea1_vq, fea2_vq], dim=0)
-        with torch.no_grad():
-            if self.loss_type == "mse":
-                recon_loss = F.mse_loss(recons, feas, reduction="mean")
-            elif self.loss_type == "l1":
-                recon_loss = F.l1_loss(recons, feas, reduction="mean")
-            elif self.loss_type == "cosine":
-                recon_loss = self._cosine_loss(recons, feas)
-            else:
-                recon_loss = torch.tensor(0.0, device=fea1.device)
-
-        # Pair code loss: z_e1 vs z_e2 MSE (log only)
-        with torch.no_grad():
-            pair_code_loss = F.mse_loss(
-                z_e1, z_e2, reduction="mean"
-            )
-
         return {
+            "codes": quant1.cluster_ids,
+            "quantized": quant1.quantized_embeddings,
+            "x_hat": x_hat1,
+            "recon_loss": recon_loss,
             "clip_loss": clip_result["clip_loss"],
+            "clip_acc": clip_result["clip_acc"],
             "loss_self": clip_result["loss_self"],
             "loss_ori": clip_result["loss_ori"],
             "loss_cl": clip_result["loss_cl"],
-            "clip_acc": clip_result["clip_acc"],
-            "commitment_loss": commitment_loss,
-            "reconstruction_loss": recon_loss,
-            "pair_code_loss": pair_code_loss,
-            "loss": clip_result["clip_loss"],
+            "commitment_loss": commitment,
+            "loss": recon_loss + clip_result["clip_loss"] + commitment,
         }
 
     # ------------------------------------------------------------------

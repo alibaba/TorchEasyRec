@@ -1,0 +1,99 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// ============================================================
+// EMA 码本更新配置
+// ============================================================
+message EmaConfig {
+    // EMA 衰减系数
+    optional float decay = 1 [default = 0.99];
+    // 重启死码（将不活跃码本重置为当前 batch 随机样本）
+    optional bool restart_unused_codes = 2 [default = true];
+}
+
+// ============================================================
+// Sinkhorn 均匀分配配置
+// ============================================================
+message SinkhornConfig {
+    // Sinkhorn 迭代次数
+    optional uint32 iters = 1 [default = 5];
+    // Sinkhorn 锐度参数（epsilon）
+    optional float epsilon = 2 [default = 10.0];
+}
+
+// ============================================================
+// CLIP 对比学习配置
+// ============================================================
+message ClipConfig {
+    // 第二个特征名（与 embedding_feature_name 组成对比对）
+    required string clip_feature_name = 1;
+}
+
+// ============================================================
+// SidRqvae: RQ-VAE 向量量化模型
+// ============================================================
+message SidRqvae {
+    // === 网络结构 ===
+    // 输入 embedding 维度
+    optional uint32 input_dim = 1 [default = 512];
+    // 量化潜空间维度（Encoder 输出维度 / 码本维度）
+    optional uint32 embed_dim = 2 [default = 64];
+    // Encoder hidden layer 维度，逗号分隔，如 "256,128"
+    // 不配则默认 [input_dim // 2]
+    optional string hidden_dims = 3;
+    // 每层码本大小，逗号分隔，如 "256,256,256"
+    // 列表长度即残差量化层数（n_layers），支持非均匀码表如 "512,256,128"
+    optional string n_embed_per_layer = 5;
+
+    // === 量化策略 ===
+    // VQ forward mode: "ste" 或 "gumbel_softmax"
+    optional string forward_mode = 6 [default = "ste"];
+    // 是否 L2 归一化残差
+    optional bool normalize_residuals = 7 [default = false];
+    // 是否共享码本
+    optional bool shared_codebook = 8 [default = false];
+    // 距离度量: "l2" 或 "cosine"
+    optional string distance_type = 9 [default = "l2"];
+    // commitment loss 类型: "l2" 或 "cos"
+    optional string commitment_loss = 10 [default = "l2"];
+    // commitment loss 权重 [w1, w2]，逗号分隔
+    optional string latent_weight = 11 [default = "1.0,0.5"];
+    // STE rotation trick
+    optional bool rotation_trick = 12 [default = false];
+    // KMeans 码本初始化
+    optional bool kmeans_init = 13 [default = true];
+
+    // === 可选子模块配置（不配则使用默认行为）===
+    // EMA 码本更新（不配则启用 EMA，decay=0.99）
+    optional EmaConfig ema_config = 14;
+    // Sinkhorn 均匀分配（不配则启用，iters=5, epsilon=10.0）
+    optional SinkhornConfig sinkhorn_config = 15;
+    // CLIP 对比学习（不配则不启用）
+    optional ClipConfig clip_config = 16;
+
+    // === 损失 ===
+    // 重建损失类型: "mse", "l1", "cosine"
+    optional string loss_type = 20 [default = "mse"];
+
+    // === 特征名 ===
+    // Batch 中 item embedding 的特征名
+    optional string embedding_feature_name = 40 [default = "item_emb"];
+}
+
+// ============================================================
+// SidRqkmeans: 残差 Mini-Batch KMeans 模型
+// ============================================================
+message SidRqkmeans {
+    // 输入 embedding 维度（KMeans 直接操作原始维度，无 Encoder）
+    optional uint32 input_dim = 1 [default = 512];
+    // 每层聚类数，逗号分隔，如 "256,256,256"
+    // 列表长度即残差量化层数（n_layers），支持非均匀码表如 "512,256,128"
+    optional string n_embed_per_layer = 3;
+    // 是否 L2 归一化残差
+    optional bool normalize_residuals = 4 [default = true];
+    // KMeans++ 初始化缓冲区大小
+    optional uint32 init_buffer_size = 5 [default = 3072];
+
+    // Batch 中 item embedding 的特征名
+    optional string embedding_feature_name = 40 [default = "item_emb"];
+}
