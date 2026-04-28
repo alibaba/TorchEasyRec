@@ -10,9 +10,10 @@
 # limitations under the License.
 
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import threading
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Final, Iterable, List, Optional, Tuple
 
 import torch
 import torchmetrics
@@ -22,7 +23,8 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 
-from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
+from tzrec.acc import utils as acc_utils
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -236,16 +238,7 @@ class TrainWrapper(BaseModule):
         self._device_type = "cpu"
         if device is not None:
             self._device_type = device.type
-        if mixed_precision is None or len(mixed_precision) == 0:
-            self._mixed_dtype = None
-        elif mixed_precision == "FP16":
-            self._mixed_dtype = torch.float16
-        elif mixed_precision == "BF16":
-            self._mixed_dtype = torch.bfloat16
-        else:
-            raise ValueError(
-                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
-            )
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         self.pareto = None
         if (
             hasattr(self.model, "_use_pareto_loss_weight")
@@ -300,16 +293,7 @@ class PredictWrapper(BaseModule):
         self._device_type = "cpu"
         if device is not None:
             self._device_type = device.type
-        if mixed_precision is None or len(mixed_precision) == 0:
-            self._mixed_dtype = None
-        elif mixed_precision == "FP16":
-            self._mixed_dtype = torch.float16
-        elif mixed_precision == "BF16":
-            self._mixed_dtype = torch.bfloat16
-        else:
-            raise ValueError(
-                f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
-            )
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         self._output_cols = output_cols
 
     def forward(
@@ -334,9 +318,9 @@ class PredictWrapper(BaseModule):
                 result = dict()
                 for c in self._output_cols:
                     result[c] = predictions[c]
-                if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
-                    result[TRAGET_REPEAT_INTERLEAVE_KEY] = predictions[
-                        TRAGET_REPEAT_INTERLEAVE_KEY
+                if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
+                    result[TARGET_REPEAT_INTERLEAVE_KEY] = predictions[
+                        TARGET_REPEAT_INTERLEAVE_KEY
                     ]
             else:
                 result = predictions
@@ -389,18 +373,103 @@ class ScriptWrapper(BaseModule):
         return self.model.predict(batch)
 
 
+class CudaAutocastWrapper(nn.Module):
+    """Wraps a module in a torch.autocast context for torch.export.
+
+    torch.export captures ``with torch.autocast(...)`` as a
+    ``wrap_with_autocast`` Higher Order Op that AOT Inductor lowers to
+    proper dtype casts. CUTLASS HSTU attention requires bf16/fp16 inputs.
+
+    When ``device`` is set, it is passed as a second positional argument
+    to ``inner.forward(x, device)`` — this binds the device for models
+    like ``ScriptWrapper`` whose forward takes ``(data, device)``.
+
+    ``_mixed_dtype_id: Final[int]`` encodes the dtype so that
+    ``torch.export`` resolves each if/elif branch statically during
+    tracing.
+
+    Args:
+        inner (nn.Module): inner module to wrap.
+        mixed_precision (Optional[str]): one of "BF16", "FP16", or None.
+        device (str): device string to pass to inner, empty means no device arg.
+    """
+
+    _mixed_dtype_id: Final[int]
+    _device: Final[str]
+
+    def __init__(
+        self,
+        inner: nn.Module,
+        mixed_precision: Optional[str] = None,
+        device: str = "",
+    ) -> None:
+        super().__init__()
+        self.inner = inner
+        self._device = device
+        if mixed_precision == "BF16":
+            self._mixed_dtype_id = 1
+        elif mixed_precision == "FP16":
+            self._mixed_dtype_id = 2
+        else:
+            self._mixed_dtype_id = 0
+
+    def _call_inner(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if self._device != "":
+            return self.inner(x, self._device)
+        return self.inner(x)
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Forward through inner module under an autocast context."""
+        if self._mixed_dtype_id == 1:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return self._call_inner(x)
+        elif self._mixed_dtype_id == 2:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                return self._call_inner(x)
+        else:
+            return self._call_inner(x)
+
+
 class CombinedModelWrapper(nn.Module):
-    """Model inference wrapper for model combined with sparse and dense part.
+    """Model inference wrapper for two-stage export (JIT sparse + AOTI dense).
+
+    Must remain ``torch.jit.script``-friendly (used by TRT export).
 
     Args:
         sparse_model (nn.Module): sparse part scripted model.
         dense_model (nn.Module): dense part AOTInductor model.
     """
 
+    _dense_is_aoti: bool
+
     def __init__(self, sparse_model: nn.Module, dense_model: nn.Module) -> None:
         super().__init__()
         self.sparse_model = sparse_model
         self.dense_model = dense_model
+        # Only AOTI dense models need the GIL + model-pool-mutex guard:
+        # AOTI extern ops release the GIL and then block on the AOTI
+        # model-pool mutex, deadlocking the predict forward workers.
+        dense_is_aoti = False
+        try:
+            from torch.export.pt2_archive._package import AOTICompiledModel
+
+            dense_is_aoti = isinstance(dense_model, AOTICompiledModel)
+        except ImportError:
+            pass
+        self._dense_is_aoti = dense_is_aoti
+        if dense_is_aoti:
+            object.__setattr__(self, "_lock", threading.Lock())
+
+    @torch.jit.unused
+    def _locked_dense(
+        self,
+        sparse_out: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        torch.cuda.set_device(device)
+        with self._lock:
+            return self.dense_model(sparse_out)
 
     def forward(
         self,
@@ -418,5 +487,48 @@ class CombinedModelWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         sparse_out, _ = self.sparse_model(data, device)
-        outputs = self.dense_model(sparse_out)
-        return outputs
+        if self._dense_is_aoti:
+            return self._locked_dense(sparse_out, device)
+        return self.dense_model(sparse_out)
+
+
+class UnifiedAOTIModelWrapper(nn.Module):
+    """Model inference wrapper for unified AOTI model (sparse+dense fused).
+
+    Args:
+        model (nn.Module): unified AOTInductor compiled model.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+        # Serializes forward to prevent GIL + C++ mutex deadlock.
+        # AOTI extern ops go through redispatch_boxed which releases the
+        # GIL; a second thread can then hold the GIL while blocking on
+        # the AOTI model-pool mutex, deadlocking with the first thread.
+        # object.__setattr__ bypasses nn.Module's strict registration.
+        object.__setattr__(self, "_lock", threading.Lock())
+        object.__setattr__(self, "_key_order", None)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+
+        Args:
+            data (dict): a dict of input data for Batch.
+            device (torch.device): target CUDA device.
+
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        if self._key_order is None:
+            object.__setattr__(self, "_key_order", sorted(data.keys()))
+        data = OrderedDict((k, data[k]) for k in self._key_order)
+        # Force CUDA primary context creation on worker threads.
+        torch.cuda.set_device(device)
+        with self._lock:
+            return self.model(data)

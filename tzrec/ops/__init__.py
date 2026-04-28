@@ -18,4 +18,4 @@ class Kernel(Enum):
 
     TRITON = "TRITON"
     PYTORCH = "PYTORCH"
-    CUDA = "CUDA"
+    CUTLASS = "CUTLASS"

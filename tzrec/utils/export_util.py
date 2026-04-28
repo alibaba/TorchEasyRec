@@ -44,9 +44,9 @@ from torchrec.quant.embedding_modules import (
 from torchrec.sparse import jagged_tensor
 
 from tzrec.acc import utils as acc_utils
-from tzrec.acc.aot_utils import export_model_aot
+from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
-from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY, Mode
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -79,6 +79,7 @@ def export_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    additional_export_config: Optional[Dict[str, str]] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = env_util.use_rtp()
@@ -103,6 +104,7 @@ def export_model(
         save_dir=local_path,
         assets=assets,
         use_local_cache_dir=use_local_cache_dir,
+        additional_export_config=additional_export_config,
     )
     if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
@@ -111,12 +113,40 @@ def export_model(
         shutil.rmtree(local_path)
 
 
+def _move_quantized_modules_to_device(model: nn.Module, device: torch.device) -> None:
+    """Move quantized fbgemm modules to device after CPU quantization.
+
+    torchrec stores fbgemm IntNBitTableBatchedEmbeddingBagsCodegen in a
+    plain list (_emb_modules), not nn.ModuleList, so model.cuda() skips
+    them. Use fbgemm's move_to_device_with_cache() which properly handles
+    weight migration, placement metadata, row alignment, and buffer views.
+
+    Must use cache_load_factor=1.0 to place weights in device HBM
+    (EmbeddingLocation.DEVICE). The default 0.0 places weights in UVM
+    (MANAGED) which is incompatible with the inference forward path.
+    """
+    from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
+        IntNBitTableBatchedEmbeddingBagsCodegen,
+    )
+
+    for m in model.modules():
+        if not hasattr(m, "_emb_modules"):
+            continue
+        for emb in m._emb_modules:
+            if (
+                isinstance(emb, IntNBitTableBatchedEmbeddingBagsCodegen)
+                and emb.current_device != device
+            ):
+                emb.move_to_device_with_cache(device, 1.0)
+
+
 def export_model_normal(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
+    additional_export_config: Optional[Dict[str, str]] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
@@ -135,7 +165,7 @@ def export_model_normal(
         dist.init_process_group("gloo")
 
     # make dataparser to get user feats before create model
-    data_config = pipeline_config.data_config
+    data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model._features)
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
@@ -176,9 +206,10 @@ def export_model_normal(
 
         batch = next(iter(dataloader))
 
-        if acc_utils.is_cuda_export():
-            model = model.cuda()
-
+        # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
+        # for nbit quantization uses int32 pointer arithmetic which
+        # overflows for large embedding tables. The CPU kernel uses
+        # int64 and is safe for any table size.
         if acc_utils.is_quant() or acc_utils.is_ec_quant():
             logger.info("quantize embeddings...")
             additional_qconfig_spec_keys = []
@@ -195,23 +226,44 @@ def export_model_normal(
             )
             logger.info("finish quantize embeddings...")
 
+        if acc_utils.is_cuda_export():
+            _move_quantized_modules_to_device(model, torch.device("cuda:0"))
+            model = model.cuda()
+
         model.eval()
 
         data = batch.to_dict(sparse_dtype=torch.int64)
-        if acc_utils.is_trt():
+        mixed_precision = acc_utils.resolve_mixed_precision(pipeline_config)
+        autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if acc_utils.is_trt() or acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
-            result = model(data, "cuda:0")
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_dtype is not None,
+            ):
+                result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
-            sparse, dense, _ = split_model(data, model, save_dir)
-            export_model_trt(sparse, dense, data, save_dir)
-        elif acc_utils.is_aot():
-            data = OrderedDict(sorted(data.items()))
-            result = model(data, "cuda:0")
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            sparse, dense, meta_info = split_model(data, model, save_dir)
-            export_model_aot(sparse, dense, data, meta_info, save_dir)
+            if acc_utils.is_trt():
+                sparse, dense, meta_info = split_model(data, model, save_dir)
+                export_model_trt(
+                    sparse, dense, data, save_dir, mixed_precision=mixed_precision
+                )
+            elif acc_utils.is_unified_aot():
+                export_unified_model_aot(
+                    model, data, save_dir, mixed_precision=mixed_precision
+                )
+            else:
+                sparse, dense, meta_info = split_model(data, model, save_dir)
+                export_model_aot(
+                    sparse,
+                    dense,
+                    data,
+                    meta_info,
+                    save_dir,
+                    mixed_precision=mixed_precision,
+                )
         else:
             result = model(data)
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
@@ -236,7 +288,13 @@ def export_model_normal(
         with open(os.path.join(save_dir, "fg.json"), "w") as f:
             json.dump(fg_json, f, indent=4)
         with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(acc_utils.export_acc_config(), f, indent=4)
+            json.dump(
+                acc_utils.export_acc_config(
+                    additional_export_config=additional_export_config
+                ),
+                f,
+                indent=4,
+            )
 
         if assets is not None:
             for asset in assets:
@@ -650,7 +708,7 @@ def export_rtp_model(
         raise ValueError("checkpoint path should be specified.")
 
     # make dataparser to get user feats before create model
-    data_config = pipeline_config.data_config
+    data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model._features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
@@ -797,7 +855,7 @@ def export_rtp_model(
     for node in graph.nodes:
         if node.op == "output":
             for k, v in sorted(node.args[0].items()):
-                if k == TRAGET_REPEAT_INTERLEAVE_KEY:
+                if k == TARGET_REPEAT_INTERLEAVE_KEY:
                     continue
                 output_keys.append(k)
                 output_values.append(v)
@@ -938,6 +996,37 @@ def export_rtp_model(
                 json.dump(fg_json, f, indent=4)
 
 
+def _compute_seq_share_groups(
+    features: List[BaseFeature],
+    model_config: Any,
+) -> Dict[str, str]:
+    """Map ``{group_name}__sequence`` to a share_key.
+
+    Feature groups whose first feature comes from the same parent
+    SequenceFeature share per-sample lengths and therefore must share
+    a torch.export.Dim on the lengths-derived axis.
+    """
+    from tzrec.protos.model_pb2 import FeatureGroupType
+
+    feat_by_name = {f.name: f for f in features}
+    share: Dict[str, str] = {}
+    for fg in model_config.feature_groups:
+        if fg.group_type not in (
+            FeatureGroupType.SEQUENCE,
+            FeatureGroupType.JAGGED_SEQUENCE,
+        ):
+            continue
+        if not fg.feature_names:
+            continue
+        first = feat_by_name.get(fg.feature_names[0])
+        if first is not None and getattr(first, "_is_grouped_seq", False):
+            share_key = f"seq_{first.sequence_name}"
+        else:
+            share_key = f"fg_{fg.group_name}"
+        share[f"{fg.group_name}__sequence"] = share_key
+    return share
+
+
 def split_model(
     data: Dict[str, torch.Tensor], model: BaseModule, save_dir: str
 ) -> Tuple[nn.Module, nn.Module, Dict[str, Any]]:
@@ -1068,9 +1157,14 @@ def split_model(
     dense_gm.graph.eliminate_dead_code()
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
+    seq_share_groups = _compute_seq_share_groups(
+        features=cast(List[BaseFeature], model._features),
+        model_config=model.model._base_model_config,
+    )
     meta_info = {
         "seq_tensor_names": seq_tensor_names,
         "jagged_seq_tensor_names": jagged_seq_tensor_names,
+        "seq_share_groups": seq_share_groups,
     }
     return sparse_gm, dense_gm, meta_info
 

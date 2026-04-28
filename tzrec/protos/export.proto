@@ -10,4 +10,10 @@ message ExportConfig {
     optional string best_exporter_metric = 2 [default = 'auc'];
     // metric value the bigger the best
     optional bool metric_larger_is_better = 3 [default = true];
+    // mixed precision mode for inference/export [BF16 | FP16 | ""].
+    // If empty, falls back to train_config.mixed_precision. When set, the
+    // dense sub-graph is wrapped in torch.autocast before torch.export so
+    // that AOT Inductor captures dtype-promoting casts as a
+    // wrap_with_autocast HOP.
+    optional string mixed_precision = 4 [default = ''];
 }

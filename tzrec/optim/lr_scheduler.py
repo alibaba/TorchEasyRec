@@ -157,3 +157,118 @@ class ManualStepLR(BaseLR):
         else:
             lr = self.base_lrs
         return lr
+
+
+class CosineAnnealingLR(BaseLR):
+    """Cosine Annealing LearningRate Scheduler.
+
+    Decays the learning rate following a cosine curve from base_lr to
+    min_learning_rate over T_max steps or epochs, with optional linear warmup.
+
+    Args:
+        optimizer (Optimizer): an instance of Optimizer.
+        T_max (int): total number of steps or epochs for cosine annealing.
+        min_learning_rate (float): minimum learning rate.
+        warmup_learning_rate (float): warmup start learning rate.
+        warmup_size (int): warmup steps or epochs.
+        by_epoch (bool): schedule by epoch or by step.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        T_max: int,
+        min_learning_rate: float = 0.0,
+        warmup_learning_rate: float = 0.0,
+        warmup_size: int = 0,
+        by_epoch: bool = False,
+    ) -> None:
+        if T_max <= 0:
+            raise ValueError(f"T_max must be positive, got {T_max}")
+        self._T_max = T_max
+        self._min_learning_rate = min_learning_rate
+        self._warmup_learning_rate = warmup_learning_rate
+        self._warmup_size = warmup_size
+        super().__init__(optimizer, by_epoch=by_epoch)
+
+    def _get_lr(self) -> List[float]:
+        """Calculates the learning rate."""
+        step_count = max(self._step_count - 1, 0)
+        if step_count < self._warmup_size:
+            scale = step_count / self._warmup_size
+            return [
+                (base_lr - self._warmup_learning_rate) * scale
+                + self._warmup_learning_rate
+                for base_lr in self.base_lrs
+            ]
+        t = min(step_count - self._warmup_size, self._T_max)
+        cos_scale = 0.5 * (1 + math.cos(math.pi * t / self._T_max))
+        return [
+            self._min_learning_rate + (base_lr - self._min_learning_rate) * cos_scale
+            for base_lr in self.base_lrs
+        ]
+
+
+class CosineAnnealingWarmRestartsLR(BaseLR):
+    """Cosine Annealing with Warm Restarts LearningRate Scheduler.
+
+    Decays the learning rate following a cosine curve with periodic restarts.
+    After each period, the learning rate resets to base_lr and the period
+    length is multiplied by T_mult.
+
+    Args:
+        optimizer (Optimizer): an instance of Optimizer.
+        T_0 (int): number of steps or epochs for the first cosine period.
+        T_mult (int): factor to grow period length after each restart.
+        min_learning_rate (float): minimum learning rate.
+        warmup_learning_rate (float): warmup start learning rate.
+        warmup_size (int): warmup steps or epochs.
+        by_epoch (bool): schedule by epoch or by step.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        T_0: int,
+        T_mult: int = 1,
+        min_learning_rate: float = 0.0,
+        warmup_learning_rate: float = 0.0,
+        warmup_size: int = 0,
+        by_epoch: bool = False,
+    ) -> None:
+        if T_0 <= 0:
+            raise ValueError(f"T_0 must be positive, got {T_0}")
+        self._T_0 = T_0
+        self._T_mult = T_mult
+        self._min_learning_rate = min_learning_rate
+        self._warmup_learning_rate = warmup_learning_rate
+        self._warmup_size = warmup_size
+        super().__init__(optimizer, by_epoch=by_epoch)
+
+    def _get_lr(self) -> List[float]:
+        """Calculates the learning rate."""
+        step_count = max(self._step_count - 1, 0)
+        if step_count < self._warmup_size:
+            scale = step_count / self._warmup_size
+            return [
+                (base_lr - self._warmup_learning_rate) * scale
+                + self._warmup_learning_rate
+                for base_lr in self.base_lrs
+            ]
+        elapsed = step_count - self._warmup_size
+        if self._T_mult == 1:
+            T_cur = elapsed % self._T_0
+            T_i = self._T_0
+        else:
+            n = math.floor(
+                math.log(elapsed / self._T_0 * (self._T_mult - 1) + 1, self._T_mult)
+            )
+            mult_n = self._T_mult**n
+            T_i = self._T_0 * mult_n
+            cycle_start = self._T_0 * (mult_n - 1) // (self._T_mult - 1)
+            T_cur = elapsed - cycle_start
+        cos_scale = 0.5 * (1 + math.cos(math.pi * T_cur / T_i))
+        return [
+            self._min_learning_rate + (base_lr - self._min_learning_rate) * cos_scale
+            for base_lr in self.base_lrs
+        ]

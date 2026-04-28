@@ -29,6 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchrec.optim.apply_optimizer_in_backward import (
     apply_optimizer_in_backward,  # NOQA
 )
+from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
@@ -36,8 +37,8 @@ from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
+    TARGET_REPEAT_INTERLEAVE_KEY,
     TENSORBOARD_SUMMARIES,
-    TRAGET_REPEAT_INTERLEAVE_KEY,
     TRAIN_EVAL_RESULT_FILENAME,
     Mode,
 )
@@ -264,10 +265,16 @@ def _log_train(
                 summary_writer.add_scalar(f"lr/g{i}", g["lr"], step)
 
         if "global_gradient_norm" in tb_summaries:
-            global_grad_norm = torch.nn.utils.get_total_norm(
-                [p.grad for p in params.values() if not isinstance(p, ShardedTensor)]
-            )
-            summary_writer.add_scalar("global_gradient_norm", global_grad_norm, step)
+            grads = [
+                p.grad
+                for p in params.values()
+                if p.grad is not None and not isinstance(p, ShardedTensor)
+            ]
+            if grads:
+                global_grad_norm = torch.nn.utils.get_total_norm(grads)
+                summary_writer.add_scalar(
+                    "global_gradient_norm", global_grad_norm, step
+                )
 
         if (
             "gradient_norm" in tb_summaries
@@ -291,11 +298,11 @@ def _log_train(
                         summary_writer.add_histogram(
                             tag=name, values=param, global_step=step
                         )
-                    if "gradient" in tb_summaries:
+                    if "gradient" in tb_summaries and param.grad is not None:
                         summary_writer.add_histogram(
                             tag=f"{name}/gradient", values=param.grad, global_step=step
                         )
-                    if "gradient_norm" in tb_summaries:
+                    if "gradient_norm" in tb_summaries and param.grad is not None:
                         grad_norm = torch.norm(param.grad)
                         summary_writer.add_scalar(
                             tag=f"{name}/gradient_norm",
@@ -321,12 +328,17 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
+    dataloader_state: Optional[Dict[str, int]] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.train()
     _model = model.module.model
+
+    # Initialize dataloader checkpoint state
+    if dataloader_state is None:
+        dataloader_state = {}
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -418,6 +430,10 @@ def _train_and_evaluate(
                 continue
             try:
                 losses, predictions, batch = pipeline.progress(train_iterator)
+                # Update dataloader checkpoint state
+                checkpoint_util.update_dataloder_state(
+                    dataloader_state, batch.checkpoint_info
+                )
                 _model.update_train_metric(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
                     train_metrics = _model.compute_train_metric()
@@ -443,11 +459,13 @@ def _train_and_evaluate(
             if save_checkpoints_steps > 0 and i_step > 0:
                 if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
+                    ckpt_dir = os.path.join(model_dir, f"model.ckpt-{i_step}")
                     checkpoint_util.save_model(
-                        os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                        ckpt_dir,
                         model,
                         optimizer,
                     )
+                    checkpoint_util.save_dataloader_state(ckpt_dir, dataloader_state)
                     if eval_dataloader is not None:
                         _evaluate(
                             model,
@@ -466,11 +484,13 @@ def _train_and_evaluate(
         if save_checkpoints_epochs > 0 and i_step > 0:
             if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
+                ckpt_dir = os.path.join(model_dir, f"model.ckpt-{i_step}")
                 checkpoint_util.save_model(
-                    os.path.join(model_dir, f"model.ckpt-{i_step}"),
+                    ckpt_dir,
                     model,
                     optimizer,
                 )
+                checkpoint_util.save_dataloader_state(ckpt_dir, dataloader_state)
                 if eval_dataloader is not None:
                     _evaluate(
                         model,
@@ -505,11 +525,13 @@ def _train_and_evaluate(
     if train_config.is_profiling:
         prof.stop()
     if last_ckpt_step != i_step:
+        ckpt_dir = os.path.join(model_dir, f"model.ckpt-{i_step}")
         checkpoint_util.save_model(
-            os.path.join(model_dir, f"model.ckpt-{i_step}"),
+            ckpt_dir,
             model,
             optimizer,
         )
+        checkpoint_util.save_dataloader_state(ckpt_dir, dataloader_state)
         if eval_dataloader is not None:
             _evaluate(
                 model,
@@ -601,7 +623,7 @@ def train_and_evaluate(
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
     if os.path.exists(pipeline_config.model_dir):
-        # TODO(hongsheng.jhs): save and restore dataloader state.
+        # Restore dataloader state if continuing training
         latest_ckpt_path, skip_steps = checkpoint_util.latest_checkpoint(
             pipeline_config.model_dir
         )
@@ -615,6 +637,13 @@ def train_and_evaluate(
                     "model_dir please delete dir model_dir or specify "
                     "--continue_train)"
                 )
+
+    # Restore dataloader checkpoint state
+    dataloader_state: Optional[Dict[str, int]] = None
+    if ckpt_path and continue_train:
+        dataloader_state = checkpoint_util.restore_dataloader_state(ckpt_path)
+        if dataloader_state:
+            train_dataloader.dataset.load_state_dict(dataloader_state)
 
     sampler_type = _get_sampler_type(data_config)
 
@@ -689,8 +718,30 @@ def train_and_evaluate(
             device=device.type,
             **config_util.config_to_kwargs(train_config.grad_scaler),
         )
+    combined_optimizer = CombinedOptimizer(
+        [model.fused_optimizer, dense_optimizer, *part_optimizers]
+    )
+    # Apply gradient clipping for dense parameters if configured
+    if train_config.HasField("grad_clipping"):
+        gc_config = train_config.grad_clipping
+        valid_clipping_types = set(GradientClipping.__members__.keys())
+        clipping_type_str = gc_config.clipping_type.upper()
+        if clipping_type_str not in valid_clipping_types:
+            raise ValueError(
+                f"Invalid clipping_type '{gc_config.clipping_type}'. Valid "
+                f"values are: {', '.join(t.lower() for t in valid_clipping_types)}"
+            )
+        clipping_type = GradientClipping[clipping_type_str]
+        if clipping_type != GradientClipping.NONE:
+            combined_optimizer = GradientClippingOptimizer(
+                optimizer=combined_optimizer,
+                clipping=clipping_type,
+                max_gradient=gc_config.max_gradient,
+                norm_type=gc_config.norm_type,
+                enable_global_grad_clip=gc_config.enable_global_grad_clip,
+            )
     optimizer = TZRecOptimizer(
-        CombinedOptimizer([model.fused_optimizer, dense_optimizer, *part_optimizers]),
+        combined_optimizer,
         grad_scaler=grad_scaler,
         gradient_accumulation_steps=train_config.gradient_accumulation_steps,
     )
@@ -731,6 +782,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
+        dataloader_state=dataloader_state,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -842,6 +894,7 @@ def export(
     export_dir: str,
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
+    additional_export_config: Optional[Dict[str, str]] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -851,6 +904,8 @@ def export(
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path.
         asset_files (str, optional): more files will be copied to export_dir.
+        additional_export_config (dict, optional): extra key/value pairs merged
+            into model_acc.json (e.g. ``{"cand_seq_pk": "cand_seq"}`` for DlrmHSTU).
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
@@ -907,6 +962,7 @@ def export(
                     checkpoint_path,
                     tower_export_dir,
                     assets=assets,
+                    additional_export_config=additional_export_config,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
@@ -933,6 +989,7 @@ def export(
             checkpoint_path,
             export_dir,
             assets=assets,
+            additional_export_config=additional_export_config,
         )
 
 
@@ -944,17 +1001,17 @@ def _write_predictions(
 ) -> None:
     output_dict = OrderedDict()
     repeat_offsets = None
-    if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+    if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
         # for gr models, we need convert flatted predictions to ListArray for
         # keeping same batch-size with predictions
         repeat_offsets = pa.array(
             torch.ops.fbgemm.asynchronous_complete_cumsum(
-                predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                predictions[TARGET_REPEAT_INTERLEAVE_KEY]
             ).numpy()
         )
 
     for c in output_cols:
-        if c == TRAGET_REPEAT_INTERLEAVE_KEY:
+        if c == TARGET_REPEAT_INTERLEAVE_KEY:
             continue
         v = predictions[c]
         if torch.is_floating_point(v):
@@ -1015,8 +1072,7 @@ def predict(
     if output_columns is not None:
         output_cols = [x.strip() for x in output_columns.split(",")]
 
-    device_and_backend = init_process_group()
-    device: torch.device = device_and_backend[0]
+    device, backend = init_process_group()
 
     fs, local_path = url_to_fs(scripted_model_path)
     if fs is not None:
@@ -1033,6 +1089,9 @@ def predict(
     )
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
+
+    train_config = pipeline_config.train_config
+    acc_utils.allow_tf32(train_config, backend)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
@@ -1152,43 +1211,58 @@ def predict(
     forward_t_list = []
     write_t = None
     i_step = 0
-    while True:
-        try:
-            batch = next(infer_iterator)
+    try:
+        while True:
+            try:
+                batch = next(infer_iterator)
 
-            if i_step == 0:
-                # lazy init writer and create write and forward thread
-                predictions, reserves = _forward(batch)
-                if output_cols is None:
-                    output_cols = sorted(predictions.keys())
-                _write_predictions(writer, predictions, reserves, output_cols)
-                for _ in range(predict_threads):
-                    t = Thread(target=_forward_loop)
+                if i_step == 0:
+                    # lazy init writer and create write and forward thread
+                    predictions, reserves = _forward(batch)
+                    if output_cols is None:
+                        output_cols = sorted(predictions.keys())
+                    _write_predictions(writer, predictions, reserves, output_cols)
+                    for _ in range(predict_threads):
+                        t = Thread(target=_forward_loop)
+                        t.start()
+                        forward_t_list.append(t)
+                    t = Thread(target=_write_loop, args=(output_cols,))
                     t.start()
-                    forward_t_list.append(t)
-                write_t = Thread(target=_write_loop, args=(output_cols,))
-                write_t.start()
-            else:
-                data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
+                    write_t = t
+                else:
+                    data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
 
-            if is_local_rank_zero:
-                plogger.log(i_step)
-            if is_profiling:
-                prof.step()
-            i_step += 1
-            if predict_steps is not None and i_step >= predict_steps:
+                if is_local_rank_zero:
+                    plogger.log(i_step)
+                if is_profiling:
+                    prof.step()
+                i_step += 1
+                if predict_steps is not None and i_step >= predict_steps:
+                    break
+            except StopIteration:
                 break
-        except StopIteration:
-            break
-
-    for _ in range(predict_threads):
-        data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
-    for t in forward_t_list:
-        t.join()
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+    finally:
+        for _ in range(len(forward_t_list)):
+            try:
+                data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception as e:
+                logger.warning(f"Failed to send sentinel to data_queue: {e}")
+        for t in forward_t_list:
+            t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+            if t.is_alive():
+                logger.warning(f"Forward thread {t.name} did not terminate in time.")
+        if write_t is not None:
+            try:
+                pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+            except Exception as e:
+                logger.warning(f"Failed to send sentinel to pred_queue: {e}")
+            write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+            if write_t.is_alive():
+                logger.warning("Write thread did not terminate in time.")
+        try:
+            writer.close()
+        except Exception as e:
+            logger.warning(f"Failed to close writer: {e}")
 
     if is_profiling:
         prof.stop()
@@ -1356,33 +1430,47 @@ def predict_checkpoint(
     if is_local_rank_zero:
         plogger = ProgressLogger(desc=f"Predicting{desc_suffix}")
 
+    write_t = None
     with torch.no_grad():
         i_step = 0
-        for i_step in step_iter:
+        try:
+            for i_step in step_iter:
+                try:
+                    predictions, batch = pipeline.progress(iterator)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    if i_step == 0:
+                        # lazy init writer and create write thread
+                        output_cols = sorted(predictions.keys())
+                        _write_predictions(
+                            writer, predictions, batch.reserves, output_cols
+                        )
+                        t = Thread(target=_write_loop, args=(output_cols,))
+                        t.start()
+                        write_t = t
+                    elif not batch.dummy:
+                        pred_queue.put(
+                            (predictions, batch.reserves),
+                            timeout=PREDICT_QUEUE_TIMEOUT,
+                        )
+                    if plogger and i_step % 100 == 0:
+                        plogger.log(i_step)
+                except StopIteration:
+                    break
+            if plogger is not None:
+                plogger.log(i_step)
+        finally:
+            if write_t is not None:
+                try:
+                    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
+                except Exception as e:
+                    logger.warning(f"Failed to send sentinel to pred_queue: {e}")
+                write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
+                if write_t.is_alive():
+                    logger.warning("Write thread did not terminate in time.")
             try:
-                predictions, batch = pipeline.progress(iterator)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                if i_step == 0:
-                    # lazy init writer and create write thread
-                    output_cols = sorted(predictions.keys())
-                    _write_predictions(writer, predictions, batch.reserves, output_cols)
-                    write_t = Thread(target=_write_loop, args=(output_cols,))
-                    write_t.start()
-                elif not batch.dummy:
-                    pred_queue.put(
-                        (predictions, batch.reserves), timeout=PREDICT_QUEUE_TIMEOUT
-                    )
-                if plogger and i_step % 100 == 0:
-                    plogger.log(i_step)
-            except StopIteration:
-                break
-        if plogger is not None:
-            plogger.log(i_step)
-
-    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+                writer.close()
+            except Exception as e:
+                logger.warning(f"Failed to close writer: {e}")
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")

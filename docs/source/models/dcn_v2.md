@@ -2,9 +2,7 @@
 
 ## 简介
 
-### DCN v2
-
-相对于DCN v1模型，主要的改进点在于：
+DCN v2相对于DCN v1模型，主要的改进点在于：
 
 1. Wide侧-Cross Network中用矩阵替代向量,方阵可以分解成2个低维矩阵;
 1. 提出2种模型结构，传统的Wide&Deep并行 + Wide&Deep串行。

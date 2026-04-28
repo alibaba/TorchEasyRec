@@ -4,11 +4,11 @@
 
 feature_group用于将一组特征在Embedding Lookup后聚合成一组，方便在模型中直接根据group_name获取获取一组特征的Embedding值。feature_group支持多组，也支持通过group_type配置多种类型的feature_group，包括WIDE，DEEP，SEQUENCE。
 
-#### SEQUENCE
+### SEQUENCE
 
 SEQUENCE: 序列特征组。其中feature_names实际分为`query`和`sequence`部分，`query`对应feature_names中的非序列特征（IdFeature/RawFeature/ComboFeature等），`sequence`对应feature_names中的序列特征（SequenceIdFeature/SequenceRawFeature/SequenceFeature等）。序列特征组的特征经过Embedding后不做任何处理，开发者可以根据`{{group_name}}.query`，`{{group_name}}.sequence`，`{{group_name}}.sequence_length`从`EmbeddingGroup`的输出字典中获取到相应的序列特征信息，从而进一步构建对序列特征的处理。
 
-#### DEEP
+### DEEP
 
 DEEP: 深度特征组。其中feature_names只能包含非序列特征（IdFeature/RawFeature/ComboFeature等），但可以嵌套包含多个sequence_groups来配置序列特征，此处序列特征会走对应配置的sequence_encoders进行序列维度的池化，并和非序列特征Embedding拼接在一起，开发者可以根据group_name从EmbeddingGroup的输出字典中获取到相应的特征组Embedding。其中sequence_groups的配置方式同序列特征组，sequence_encoders目前包含DINEncoder和SimpleAttention两种：
 
@@ -22,7 +22,7 @@ DEEP: 深度特征组。其中feature_names只能包含非序列特征（IdFeatu
 
 - MultiWindowDINEncoder: 相比DINEncoder新增一个`windows_len`参数来设置分段的序列行为窗口长度，会对序列分段做TargetAttention，从而强化用户的长短期兴趣。
 
-#### WIDE
+### WIDE
 
 WIDE: 广度特征组，主要用于WideAndDeep/DeepFM模型。其中feature_names只能包含非序列特征IdFeature/RawFeature/ComboFeature等，embedding_dim固定为4，不根据feature_group中的embedding_dim的配置变化而变化，开发者可以根据group_name从EmbeddingGroup的输出字典中获取到相应的特征组Embedding。不可以包含sequence_groups。
 
@@ -74,16 +74,16 @@ model_config {
             feature_names: "buy_50__ts"
         }
         sequence_encoders {
-            din_encoder: {
+            din_encoder {
                 input: "click_50"
-                attn_mlp: {
+                attn_mlp {
                     hidden_units: [128, 64]
                     activation: "Dice"
                 }
             }
         }
         sequence_encoders {
-            simple_attention: {
+            simple_attention {
                 input: "buy_50"
             }
         }

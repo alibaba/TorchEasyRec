@@ -1,8 +1,7 @@
 # 数据格式
 
-TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件。
-
-## DataConfig
+TorchEasyRec作为阿里云PAI的推荐算法包，可以无缝对接MaxCompute的数据表，也可以读取OSS、NAS或Local环境中的CSV, Parquet文件，同时支持Kafka和Datahub的流式消息。
+TorchEasyRec的OdpsDataset, ParquetDataset, KafkaDataset进一步可支持训练断点续训功能，当训练中断后可以从上次的数据位置继续训练，避免重复处理已消费的数据。
 
 **一个最简单的data config的配置**
 
@@ -18,72 +17,149 @@ data_config {
 }
 ```
 
-如果希望在训练过程带上样本权重，支持在data_config中增加配置项
-sample_weight_fields: 'col_name'
+目前支持以下几种dataset_type:
 
-### dataset_type
+## OdpsDataset
 
-目前支持一下几种[input_type](../proto.html#tzrec.protos.DatasetType):
+输入数据为MaxCompute表
 
-- OdpsDataset: 输入数据为MaxCompute表
+- **前置条件**:
 
-  - **前置条件**:
+  - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
+  - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
 
-    - 在[MaxCompute控制台](https://maxcompute.console.aliyun.com/)的「租户管理」->「租户属性」页面打开**开放存储(Storage API)开关**
-    - 「租户管理」->「新增成员」给相应用户授予「admin」权限；或参考[租户权限](https://help.aliyun.com/zh/maxcompute/user-guide/overview-1#cabfa502c288o)文档，精细授予用户Quota的使用权限
+- input_path: 按如下格式设置
 
-  - input_path: 按如下格式设置
+  - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
+  - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
 
-    - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
-    - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
+- 运行训练/评估/导出/预测等命令时
 
-  - 运行训练/评估/导出/预测等命令时
+  - **本地环境**：
+    - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
+    ```bash
+    cat << EOF >> odps_conf
+    project_name=${PROJECT_NAME}
+    access_id=${ACCESS_ID}
+    access_key=${ACCESS_KEY}
+    end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
+    EOF
 
-    - **本地环境**：
-      - 需要准备一个odps_conf文件，并在启动命令中设置在`ODPS_CONFIG_FILE_PATH`环境变量中
-      ```bash
-      cat << EOF >> odps_conf
-      project_name=${PROJECT_NAME}
-      access_id=${ACCESS_ID}
-      access_key=${ACCESS_KEY}
-      end_point=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api
-      EOF
+    ODPS_CONFIG_FILE_PATH=odps_conf \
+    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path ${PIPELINE_CONFIG}
+    ```
+  - **PAI-DLC/PAI-DSW环境**：
+    - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
+    ```bash
+    ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
+    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path ${PIPELINE_CONFIG}
+    ```
 
-      ODPS_CONFIG_FILE_PATH=odps_conf \
-      torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-      --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-      -m tzrec.train_eval \
-      --pipeline_config_path ${PIPELINE_CONFIG}
-      ```
-    - **PAI-DLC/PAI-DSW环境**：
-      - 需要设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**
-      ```bash
-      ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
-      torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-      --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-      -m tzrec.train_eval \
-      --pipeline_config_path ${PIPELINE_CONFIG}
-      ```
+- 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
 
-  - 如果是预付费Quota，参考[独享数据传输服务](https://help.aliyun.com/zh/maxcompute/user-guide/purchase-and-use-exclusive-resource-groups-for-dts)文档购买和授权，可通过`odps_data_quota_name`传入购买的Quota名
+- 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
 
-  - 如果CPU/GPU利用率都不高，可能是网络传输带宽瓶颈，可以尝试设置`odps_data_compression`为`ZSTD`来增大数据的压缩率，减少数据网络传输带宽
+## ParquetDataset
 
-- ParquetDataset: 输入数据为parquet格式
+输入数据为parquet格式
 
-  - input_path: 按如下格式设置
-    - `${PATH_TO_DATA_DIR}/*.parquet`
-  - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
+- input_path: 按如下格式设置
 
-- CsvDataset: 输入数据为csv格式
+  - `${PATH_TO_DATA_DIR}/*.parquet`
 
-  - input_path: 按如下格式设置
-    - `${PATH_TO_DATA_DIR}/*.csv`
-  - 需设置`delimiter`来指名列分隔符，默认为`,`
-  - 注意:
-    - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
-    - 暂不支持没有header的csv文件
-    - csv格式数据读性能有瓶颈
+- 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
+
+## CsvDataset
+
+- input_path: 按如下格式设置
+
+  - `${PATH_TO_DATA_DIR}/*.csv`
+
+- 需设置`data_config.delimiter`来指名列分隔符，默认为`,`
+
+- 需设置 `data_config.with_header`来指定是否有header行，默认为false
+
+- 按需设置 `data_config.input_fields` 来指定schema，详见下文input_fields参数说明
+
+- 注意:
+
+  - 训练和评估时需要csv文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个csv文件的数据量相等
+  - csv格式数据读性能有瓶颈
+
+## KafkaDataset
+
+输入数据为Kafka 或 [Datahub](https://help.aliyun.com/zh/datahub/product-overview/what-is-datahub) 消息流
+
+- 输入消息流的内容是序列化的ArrowRecordBatch，支持两种序列化格式:
+
+  - schema-less格式 (`record_batch.serialize()`): 需设置`data_config.input_fields`或`data_config.input_fields_str`来指定数据的schema
+  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，但schema会占用消息体大小
+
+- input_path: 按如下格式设置
+
+  - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
+  - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
+  - `enable.auto.commit`默认设置为`false`，KafkaDataset使用自身的checkpoint机制管理消费位点，不依赖Kafka broker端的offset提交。如需启用自动提交，可在URI中显式设置`enable.auto.commit=true`
+  - 支持`start.timestamp.ms`参数，指定从某个时间戳（毫秒）开始消费，消费者会从各分区中时间戳 >= 该值的最早offset开始读取。当同时存在checkpoint时，checkpoint优先级更高。示例:
+    - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest&start.timestamp.ms=1711929600000`
+
+- 注意:
+
+  - Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - 当输入数据为Datahub时，Datahub需设置为[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)， input_path按如下格式设置
+    - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
+  - 当使用 Arrow IPC Stream 格式 (带 schema) 时，每个 Kafka消息应只包含一个 record batch。如果单个消息包含多个 record batches，只有第一个 batch 会被读取，后续 batches 将被忽略。如需发送多个 batches，请将其作为多个独立的 Kafka消息发送。
+
+### 使用 Flink ArrowBatchUDTF 序列化数据
+
+TorchEasyRec 提供了 Flink UDTF 用于将 Flink 流数据序列化为 Arrow IPC 格式，写入 Kafka 供 KafkaDataset 消费。
+
+#### 下载 UDF JAR
+
+- JAR 下载地址: `https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/flink/flink-arrow-batch-udf-0.1.jar`
+
+#### 在阿里云 Flink VVP 中使用
+
+1. **注册 UDF**: 参考[UDF管理文档](https://help.aliyun.com/zh/flink/realtime-flink/user-guide/manage-udfs)注册 ArrowBatchUDTF，类名为 `com.aliyun.pai.flinkjob.ArrowBatchUDTF`
+
+1. **SQL 使用示例**
+
+```sql
+-- 将数据序列化为 Arrow IPC 格式写入 Kafka
+INSERT INTO kafka_sink
+SELECT T.arrow_data
+FROM source_table,
+LATERAL TABLE(ArrowBatchUDTF(ROW(user_id, item_id, label, embedding))) AS T(arrow_data);
+```
+
+3. **配置参数**: 在 Flink Deployment Configuration 中添加 `pipeline.global-job-parameters`
+
+```yaml
+pipeline.global-job-parameters: |
+  'arrow.batch.udtf.batch-size:"128"',
+  'arrow.batch.udtf.bytes-limit:"917504"',
+  'arrow.batch.udtf.compression:"ZSTD"',
+  'arrow.batch.udtf.embed-schema:"true"',
+  'arrow.batch.udtf.input-typeinfo:"user_id:BIGINT;item_id:BIGINT;label:FLOAT;embedding:ARRAY<FLOAT>"'
+```
+
+#### 配置参数说明
+
+| 参数                            | 默认值 | 说明                                                                                                                                                                                                                                                                                   |
+| ------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| arrow.batch.udtf.batch-size     | 128    | 累积多少行后序列化为一个 Arrow IPC batch                                                                                                                                                                                                                                               |
+| arrow.batch.udtf.bytes-limit    | 917504 | 单个序列化 batch 的最大字节数，超出会自动拆分。设置为 0 表示不限制。注意：该值需小于 [Kafka 消息大小上限](https://help.aliyun.com/zh/apsaramq-for-kafka/cloud-message-queue-for-kafka/product-overview/terms#dt-w4l-kbb-3df)，Kafka 默认消息大小为 1MB，建议调整 Kafka 消息大小至 10MB |
+| arrow.batch.udtf.compression    | ZSTD   | 压缩编码，支持 ZSTD、LZ4_FRAME、UNCOMPRESSED                                                                                                                                                                                                                                           |
+| arrow.batch.udtf.embed-schema   | false  | 是否在输出中嵌入 schema。设置为 true 时使用 IPC Stream 格式（带 schema），KafkaDataset 可自动推断 schema；设置为 false 时使用 schema-less 格式，需在 KafkaDataset 中配置 input_fields                                                                                                  |
+| arrow.batch.udtf.input-typeinfo | 无     | 输入数据的 schema，格式为 `fieldName:TYPE;fieldName:TYPE;...`，支持的类型同下文`input_fields_str`                                                                                                                                                                                      |
+
+## data_config配置
 
 ### fg_mode
 
@@ -177,11 +253,11 @@ sample_weight_fields: 'col_name'
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg101-1.0.1-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
+    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg104-1.0.4-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg101 import offline_pyfg
+    from pyfg104 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",
@@ -234,6 +310,10 @@ sample_weight_fields: 'col_name'
     label_fields: "buy"
   ```
 
+### sample_weight_fields
+
+- 训练样本的样本权重列名
+
 ### drop_remainder
 
 - 是否丢弃掉最后一个不足batch_size的batch数据，默认为false
@@ -265,18 +345,43 @@ sample_weight_fields: 'col_name'
 ### input_fields
 
 ```
-input_fields: {
+input_fields {
     input_name: "input1"
 }
-input_fields: {
+input_fields {
     input_name: "input2"
     input_type: DOUBLE
 }
 ```
 
 - 当使用CsvDataset，如果出现以下情况，需要按如下方式指定`input_fields`，其余Dataset可以自动推理字段类型
-  - 情况一：csv文件没有header行时 => 只需设置`input_name`
-  - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32|INT64|STRING|FLOAT|DOUBLE
+  - 情况一：csv文件没有header行时 => 需至少设置`input_name`
+  - 情况二：csv文件中存在某列的整列为空值时，或遇到`column [xxx] with dtype null is not supported now`报错时 => 需进一步设置`input_type`，目前`input_type`支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING
+- 当使用KafkaDataset：
+  - `input_type` 支持设置 INT32 | INT64 | FLOAT | DOUBLE | STRING | ARRAY_INT32 | ARRAY_INT64 | ARRAY_FLOAT | ARRAY_DOUBLE | ARRAY_STRING | ARRAY_ARRAY_INT32 | ARRAY_ARRAY_INT64 | ARRAY_ARRAY_FLOAT | ARRAY_ARRAY_DOUBLE | ARRAY_ARRAY_STRING | MAP_STRING_INT32 | MAP_STRING_INT64 | MAP_STRING_FLOAT | MAP_STRING_DOUBLE | MAP_STRING_STRING | MAP_INT64_INT32 | MAP_INT64_INT64 | MAP_INT64_FLOAT | MAP_INT64_DOUBLE | MAP_INT64_STRING | MAP_INT32_INT32 | MAP_INT32_INT64 | MAP_INT32_FLOAT | MAP_INT32_DOUBLE | MAP_INT32_STRING
+
+### input_fields_str
+
+`input_fields_str`是`input_fields`的简化配置格式，格式为: `field_name1:field_type1;field_name2:field_type2;`
+
+示例:
+
+```
+data_config {
+    input_fields_str: "user_id:BIGINT;item_id:BIGINT;label:FLOAT;features:ARRAY<FLOAT>;"
+}
+```
+
+支持的类型名:
+
+- 基本类型: INT, INT32, BIGINT, INT64, STRING, FLOAT, DOUBLE
+  - 类型别名: BIGINT=INT64, INT=INT32 (在基本类型、ARRAY、MAP中均可使用)
+- 数组类型: ARRAY<INT>, ARRAY<BIGINT>, ARRAY<STRING>, ARRAY<FLOAT>, ARRAY<DOUBLE>
+- 嵌套数组: ARRAY\<ARRAY\<INT>>, ARRAY\<ARRAY\<BIGINT>>, ARRAY\<ARRAY\<FLOAT>>, ARRAY\<ARRAY\<DOUBLE>>, ARRAY\<ARRAY\<STRING>>
+- Map类型: MAP\<STRING,INT>, MAP\<STRING,BIGINT>, MAP\<STRING,FLOAT>, MAP\<STRING,DOUBLE>, MAP\<STRING,STRING>, MAP\<INT,INT>, MAP\<INT,BIGINT>, MAP\<INT,FLOAT>, MAP\<INT,DOUBLE>, MAP\<INT,STRING>, MAP\<BIGINT,INT>, MAP\<BIGINT,BIGINT>, MAP\<BIGINT,FLOAT>, MAP\<BIGINT,DOUBLE>, MAP\<BIGINT,STRING>
+- 逗号周围允许空格: `MAP<STRING, BIGINT>` 是有效的
+
+注意: 如果同时设置了`input_fields_str`和`input_fields`，`input_fields_str`优先级更高。
 
 ### 更多配置
 

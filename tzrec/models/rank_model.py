@@ -16,7 +16,7 @@ import torch
 import torchmetrics
 from torch import nn
 
-from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
@@ -74,9 +74,7 @@ class RankModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0] if len(labels) > 0 else ""
-        self._sample_weight_name = (
-            sample_weights[0] if sample_weights else sample_weights
-        )
+        self._sample_weight_name = sample_weights[0] if sample_weights else None
         self._loss_collection = OrderedDict()
         self.embedding_group = None
         self.group_variational_dropouts = None
@@ -234,6 +232,10 @@ class RankModel(BaseModel):
         if loss_type in ("binary_cross_entropy", "binary_focal_loss"):
             pred = predictions["logits" + suffix]
             label = label.to(torch.float32)
+            if loss_type == "binary_cross_entropy":
+                label_smoothing = loss_cfg.binary_cross_entropy.label_smoothing
+                if label_smoothing > 0:
+                    label = label * (1.0 - label_smoothing) + 0.5 * label_smoothing
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         elif loss_type == "softmax_cross_entropy":
             pred = predictions["logits" + suffix]
@@ -244,9 +246,9 @@ class RankModel(BaseModel):
             session_id = batch.sparse_features[BASE_DATA_GROUP][
                 loss_cfg.jrc_loss.session_name
             ].to_padded_dense(1)[:, 0]
-            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 session_id = session_id.repeat_interleave(
-                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             losses[loss_name] = self._loss_modules[loss_name](pred, label, session_id)
         elif loss_type == "l2_loss":
@@ -410,9 +412,9 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
-            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 grouping_key = grouping_key.repeat_interleave(
-                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         elif metric_type == "xauc":
@@ -423,9 +425,9 @@ class RankModel(BaseModel):
             grouping_key = base_sparse_feat[
                 oneof_metric_cfg.grouping_key
             ].to_padded_dense(1)[:, 0]
-            if TRAGET_REPEAT_INTERLEAVE_KEY in predictions:
+            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 grouping_key = grouping_key.repeat_interleave(
-                    predictions[TRAGET_REPEAT_INTERLEAVE_KEY]
+                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         else:

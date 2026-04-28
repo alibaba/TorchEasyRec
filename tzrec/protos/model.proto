@@ -34,7 +34,7 @@ message FeatureGroupConfig {
 enum Kernel {
     TRITON = 0;
     PYTORCH = 1;
-    CUDA = 2;
+    CUTLASS = 2;
 }
 
 message ModelConfig {
@@ -69,6 +69,7 @@ message ModelConfig {
         TDM tdm = 400;
 
         RocketLaunching rocket_launching = 500;
+        PEPNet pepnet = 206;
     }
 
     optional uint32 num_class = 2 [default = 1];

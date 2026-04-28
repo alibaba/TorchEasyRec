@@ -12,7 +12,6 @@
 import unittest
 
 import torch
-from torch.autograd import Variable
 from torchrec.optim import KeyedOptimizerWrapper
 
 from tzrec.optim.optimizer import TZRecOptimizer
@@ -20,7 +19,7 @@ from tzrec.optim.optimizer import TZRecOptimizer
 
 class TZRecOptimizerTest(unittest.TestCase):
     def test_optimizer(self):
-        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+        param_1 = torch.tensor([1.0, 2.0], requires_grad=True)
         keyed_optimizer = KeyedOptimizerWrapper(
             {"param_1": param_1}, lambda params: torch.optim.SGD(params, lr=0.001)
         )
@@ -33,7 +32,7 @@ class TZRecOptimizerTest(unittest.TestCase):
         torch.testing.assert_close(param_1, torch.tensor([0.9990, 1.9980]))
 
     def test_optimizer_with_ga(self):
-        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+        param_1 = torch.tensor([1.0, 2.0], requires_grad=True)
         keyed_optimizer = KeyedOptimizerWrapper(
             {"param_1": param_1}, lambda params: torch.optim.SGD(params, lr=0.001)
         )

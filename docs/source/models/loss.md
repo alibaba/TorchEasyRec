@@ -14,10 +14,15 @@
 model_config {
     losses {
         binary_cross_entropy {
+            label_smoothing: 0.1
         }
     }
 }
 ```
+
+参数说明：
+
+1. label_smoothing: 标签平滑系数，默认值0.0（不使用标签平滑）。设置后，标签会被平滑为 `label * (1 - label_smoothing) + 0.5 * label_smoothing`，即将硬标签0/1分别平滑为 `label_smoothing/2` 和 `1 - label_smoothing/2`。建议值：0.05 ~ 0.2。
 
 ## binary_focal_loss
 

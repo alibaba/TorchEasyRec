@@ -66,7 +66,7 @@ class KvDotProduct(RawFeature):
         fg_cfg = {
             "feature_type": "kv_dot_product",
             "feature_name": self.config.feature_name,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "query": self.config.query,
             "document": self.config.document,
         }

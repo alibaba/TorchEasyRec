@@ -243,7 +243,7 @@ class MatchModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         self._num_class = model_config.num_class
         self._label_name = labels[0]
-        self._sample_weight = sample_weights[0] if sample_weights else sample_weights
+        self._sample_weight = sample_weights[0] if sample_weights else None
         self._in_batch_negative = False
         self._loss_collection = {}
         if self._model_config and hasattr(self._model_config, "in_batch_negative"):

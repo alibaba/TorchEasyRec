@@ -153,10 +153,10 @@ data_config {
 }
 
 # 特征相关参数配置
-feature_configs : {
+feature_configs {
   ...
 }
-feature_configs : {
+feature_configs {
   ...
 }
 
@@ -171,15 +171,15 @@ eval_config {
 }
 
 # 模型相关参数配置
-model_config: {
-    feature_groups: {
+model_config {
+    feature_groups {
         group_name: 'group1'
         feature_names: 'f1'
         feature_names: 'f2'
         ...
         wide_deep: DEEP
     }
-    feature_groups: {
+    feature_groups {
         group_name: 'group2'
         feature_names: 'f3'
         feature_names: 'f4'

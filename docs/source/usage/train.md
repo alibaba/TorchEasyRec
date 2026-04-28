@@ -106,6 +106,34 @@ grad_scaler {
 
 - gradient_accumulation_steps: **梯度累计**，累计gradient_accumulation_steps步梯度更新参数，适用于batch_size小的情况，默认为0，不开启
 
+- grad_clipping: **稠密梯度裁剪**，用于防止稠密参数梯度爆炸，默认不开启
+
+  - clipping_type: 裁剪类型，可选值为"norm"（按梯度范数裁剪）、"value"（按梯度值裁剪）、"none"（不裁剪），默认为"none"
+  - max_gradient: 梯度裁剪阈值，默认为1.0
+  - norm_type: 范数类型，默认为2.0（L2范数），可以设置为inf（无穷范数）
+  - enable_global_grad_clip: 是否启用全局梯度裁剪（分布式训练），默认为false
+
+```
+grad_clipping {
+    clipping_type: "norm"
+    max_gradient: 1.0
+    norm_type: 2.0
+    enable_global_grad_clip: false
+}
+```
+
+**Note**: 稀疏参数（Embedding）的梯度裁剪通过sparse_optimizer中各优化器（如adagrad_optimizer）的`gradient_clipping`和`max_gradient`字段配置，例如：
+
+```
+sparse_optimizer {
+    adagrad_optimizer {
+        lr: 0.001
+        gradient_clipping: true
+        max_gradient: 1.0
+    }
+}
+```
+
 ## 训练性能优化
 
 TorchEasyRec是以模型混合并行的方式进行训练的，会根据机间和卡间的通信拓扑环境的设置寻优最好的Embedding分片和并行计算的方式，在显存约束下最小化计算和通信开销

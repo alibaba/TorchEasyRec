@@ -12,11 +12,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.utils.logging_util import logger
 
 
 def is_input_tile() -> bool:
@@ -48,6 +50,18 @@ def is_input_tile_emb() -> bool:
     return False
 
 
+def is_input_tile_3_online() -> bool:
+    """Judge is the sequential tensor use jt.values() directly or not.
+
+    If INPUT_TILE_3_ONLINE=1, sequential tensor use jt.values() directly,
+    offline prediction for the model will not be supported.
+    """
+    input_tile_3_online = os.environ.get("INPUT_TILE_3_ONLINE")
+    if input_tile_3_online and input_tile_3_online[0] == "1":
+        return True
+    return False
+
+
 def is_aot() -> bool:
     """Judge is inductor or not."""
     is_aot = os.environ.get("ENABLE_AOT")
@@ -55,6 +69,42 @@ def is_aot() -> bool:
         return True
     else:
         return False
+
+
+def is_unified_aot() -> bool:
+    """Judge whether to use the unified AOTI export.
+
+    UNIFIED_AOT=1: fused sparse+dense AOTI model.
+    UNIFIED_AOT=0 (default): legacy two-stage export (sparse JIT + dense AOTI).
+    """
+    unified_aot = os.environ.get("UNIFIED_AOT", "0")
+    return bool(unified_aot) and unified_aot[0] == "1"
+
+
+def is_unified_aot_predict(model_path: str) -> bool:
+    """Judge whether the exported model uses unified AOTI in predict.
+
+    Prefers the explicit UNIFIED_AOT field in model_acc.json. Falls back
+    to file presence (legacy two-stage exports produce
+    scripted_sparse_model.pt; unified exports do not) when the acc.json
+    is missing or does not contain UNIFIED_AOT — this keeps unit tests
+    that bypass the full export pipeline working.
+    """
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if os.path.exists(acc_json_path):
+        with open(acc_json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        unified_aot = data.get("UNIFIED_AOT")
+        if unified_aot is not None:
+            return str(unified_aot)[:1] == "1"
+    sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
+    if not os.path.exists(sparse_model_path):
+        logger.warning(
+            "model_acc.json missing UNIFIED_AOT; falling back to file-presence "
+            "heuristic (no scripted_sparse_model.pt → unified)"
+        )
+        return True
+    return False
 
 
 def is_aot_predict(model_path: str) -> bool:
@@ -153,6 +203,41 @@ def ec_quant_dtype() -> torch.dtype:
         return _quant_str_to_dtype[quant_dtype_str]
 
 
+_MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {
+    "BF16": torch.bfloat16,
+    "FP16": torch.float16,
+}
+
+
+def mixed_precision_to_dtype(mixed_precision: Optional[str]) -> Optional[torch.dtype]:
+    """Convert a TrainConfig.mixed_precision string to a torch dtype.
+
+    Returns ``None`` when ``mixed_precision`` is ``None`` or empty.
+    Raises ``ValueError`` on unknown values so typos fail loudly.
+    """
+    if not mixed_precision:
+        return None
+    if mixed_precision not in _MIXED_PRECISION_TO_DTYPE:
+        raise ValueError(
+            f"Unknown mixed_precision: {mixed_precision}, "
+            f"available types: {list(_MIXED_PRECISION_TO_DTYPE.keys())}"
+        )
+    return _MIXED_PRECISION_TO_DTYPE[mixed_precision]
+
+
+def resolve_mixed_precision(pipeline_config: EasyRecConfig) -> str:
+    """Resolve the mixed_precision mode for export/inference.
+
+    Precedence: ``export_config.mixed_precision`` (when set) overrides
+    ``train_config.mixed_precision``. Empty string means no AMP.
+    """
+    if pipeline_config.HasField("export_config"):
+        export_mp = pipeline_config.export_config.mixed_precision
+        if export_mp:
+            return export_mp
+    return pipeline_config.train_config.mixed_precision
+
+
 def write_mapping_file_for_input_tile(
     state_dict: Dict[str, torch.Tensor], remap_file_path: str
 ) -> None:
@@ -187,8 +272,15 @@ def write_mapping_file_for_input_tile(
         f.write(remap_str)
 
 
-def export_acc_config() -> Dict[str, str]:
-    """Export acc config for model online inference."""
+def export_acc_config(
+    additional_export_config: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Export acc config for model online inference.
+
+    Args:
+        additional_export_config (dict, optional): extra key/value pairs merged
+            into the acc config (overriding env-derived defaults on conflict).
+    """
     # use int64 sparse id as input
     acc_config = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
@@ -201,6 +293,10 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "ENABLE_AOT" in os.environ:
         acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
+        # Record unified AOT mode (default 0) so predict can detect it.
+        acc_config["UNIFIED_AOT"] = "1" if is_unified_aot() else "0"
+    if additional_export_config:
+        acc_config.update(additional_export_config)
     return acc_config
 
 

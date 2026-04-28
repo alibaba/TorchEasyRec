@@ -53,6 +53,8 @@ def add_positional_embeddings(
     interleave_targets: bool,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     high_inds = _get_high_inds(
         seq_lengths, position_embeddings_weight, num_targets, interleave_targets
     )
@@ -104,6 +106,8 @@ def add_timestamp_positional_embeddings(
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
     assert time_bucket_fn in ["sqrt", "log"]
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     seq_embeddings = seq_embeddings * alpha
     if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_position import (

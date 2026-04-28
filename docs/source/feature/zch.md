@@ -10,7 +10,7 @@ feature_configs {
         feature_name: "cate"
         expression: "item:cate"
         embedding_dim: 32
-        zch: {
+        zch {
             zch_size: 1000000
             eviction_interval: 2
             lfu {}
@@ -70,7 +70,7 @@ distance_lfu {
 函数可支持直接用torch的tensor库来撰写，样例如下：
 
 ```
-zch: {
+zch {
     zch_size: 1000000
     eviction_interval: 2
     lfu {}
@@ -81,7 +81,7 @@ zch: {
 函数也可以支持调用内置函数：`dynamic_threshold_filter`, `average_threshold_filter` 和 `probabilistic_threshold_filter`，样例如下：
 
 ```
-zch: {
+zch {
     zch_size: 1000000
     eviction_interval: 2
     lfu {}

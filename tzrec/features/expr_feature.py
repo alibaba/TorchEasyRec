@@ -51,7 +51,7 @@ class ExprFeature(RawFeature):
         fg_cfg = {
             "feature_type": "expr_feature",
             "feature_name": self.config.feature_name,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "expression": self.config.expression,
             "variables": list(self.config.variables),
             "value_type": "float",

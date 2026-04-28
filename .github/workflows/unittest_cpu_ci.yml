@@ -5,20 +5,31 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+concurrency:
+  group: unittest-cpu-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   ci-test:
     runs-on: tzrec-cpu-runner
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.0-cpu
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.1-cpu
       options: --ipc host
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
         id: run_unittest_ci
+        env:
+          ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
+          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ secrets.CI_ALIKAFKA_INSTANCE_ID }}
+          CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
+          CI_REGION: ${{ secrets.CI_REGION }}
         run: |
           cd run_${{ github.run_id }}
           CI_HYPOTHESIS=true bash scripts/ci/ci_test_cpu.sh

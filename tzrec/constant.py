@@ -37,4 +37,4 @@ TENSORBOARD_SUMMARIES = [
 ]
 
 # repeat interleave session_id or grouping key for one-to-many rank sample
-TRAGET_REPEAT_INTERLEAVE_KEY = "__TRAGET_REPEAT_INTERLEAVE_KEY__"
+TARGET_REPEAT_INTERLEAVE_KEY = "__TARGET_REPEAT_INTERLEAVE_KEY__"

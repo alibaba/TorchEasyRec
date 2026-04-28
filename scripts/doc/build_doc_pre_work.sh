@@ -5,7 +5,8 @@ bash scripts/gen_proto.sh
 sed -i 's#<p>#<pre>#g;s#</p>#</pre>#g' docs/source/proto.html
 
 # copy intro
-sed 's#(docs/source/#(#g;s#(docs/images/#(../images/#g' README.md > docs/source/intro.md
+sed 's#(docs/source/#(#g;s#(docs/images/#(../images/#g;s#"docs/images/#"../images/#g' README.md > docs/source/intro.md
+sed -i '1i\# 简介' docs/source/intro.md
 
 # replace wheel and docker version
 LATEST_WHEEL_VERSION=$(pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com | awk 'NR==1{print $2}' | sed 's/[()]//g')

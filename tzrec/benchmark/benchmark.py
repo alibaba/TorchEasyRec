@@ -259,8 +259,8 @@ def main(
 ) -> None:
     """Run benchmarks."""
     train_config_paths = _get_config_paths(pipeline_config_paths)
-    f = open(base_metric_path)
-    base_eval_metrics = json.load(f)
+    with open(base_metric_path) as f:
+        base_eval_metrics = json.load(f)
     experiment_path = experiment_path + f"_{int(time.time())}"
     print(f"******* We will save experiment is {experiment_path} *******")
     models_path = _create_directory(os.path.join(experiment_path, "models"))

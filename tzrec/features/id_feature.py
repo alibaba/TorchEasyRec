@@ -98,7 +98,7 @@ class IdFeature(BaseFeature):
         fg_cfg = {
             "feature_type": "id_feature",
             "feature_name": self.config.feature_name,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "expression": self.config.expression,
             "value_type": "string",
             "need_prefix": False,

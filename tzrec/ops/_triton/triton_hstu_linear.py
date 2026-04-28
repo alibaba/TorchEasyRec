@@ -337,7 +337,7 @@ def triton_layer_norm_mul_dropout_fwd(
         y = torch.empty_like(x)
     mean = torch.empty((N,), dtype=torch.float32, device=x.device)
     rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-    if N == 0:
+    if not torch.compiler.is_compiling() and N == 0:
         return y, mean, rstd, 0, 0, 0
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -811,7 +811,7 @@ def triton_group_norm_mul_dropout_fwd(
         y = torch.empty((N, num_heads * linear_dim), dtype=x.dtype, device=x.device)
     mean = torch.empty((N * num_heads,), dtype=torch.float32, device=x.device)
     rstd = torch.empty((N * num_heads,), dtype=torch.float32, device=x.device)
-    if N == 0:
+    if not torch.compiler.is_compiling() and N == 0:
         return y, mean, rstd, 0, 0, 0, 0
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()

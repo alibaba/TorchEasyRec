@@ -15,7 +15,7 @@ import os
 import random
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -23,7 +23,7 @@ from pyarrow import csv
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import FIELD_TYPE_TO_PA
+from tzrec.datasets.utils import FIELD_TYPE_TO_PA, get_input_fields_proto
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 
@@ -45,11 +45,12 @@ class CsvDataset(BaseDataset):
         **kwargs: Any,
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
+        input_fields = get_input_fields_proto(self._data_config)
         column_names = None
         column_types = {}
         if not self._data_config.with_header:
-            column_names = [f.input_name for f in self._data_config.input_fields]
-        for f in self._data_config.input_fields:
+            column_names = [f.input_name for f in input_fields]
+        for f in input_fields:
             if f.HasField("input_type"):
                 if f.input_type in FIELD_TYPE_TO_PA:
                     column_types[f.input_name] = FIELD_TYPE_TO_PA[f.input_type]
@@ -72,7 +73,6 @@ class CsvDataset(BaseDataset):
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
         )
-        self._init_input_fields()
 
 
 class CsvReader(BaseReader):
@@ -185,16 +185,19 @@ class CsvWriter(BaseWriter):
         super().__init__(output_path)
         self._writer = None
 
-    def write(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def write(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Write a batch of data."""
+        output_arrays = self._flatten_chunked_arrays(output_dict)
         if not self._lazy_inited:
             schema = []
-            for k, v in output_dict.items():
+            for k, v in zip(output_dict.keys(), output_arrays):
                 schema.append((k, v.type))
             self._writer = csv.CSVWriter(self._output_path, schema=pa.schema(schema))
             self._lazy_inited = True
         record_batch = pa.RecordBatch.from_arrays(
-            list(output_dict.values()),
+            output_arrays,
             list(output_dict.keys()),
         )
         self._writer.write(record_batch)

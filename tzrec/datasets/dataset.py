@@ -26,6 +26,8 @@ from tzrec.datasets.sampler import BaseSampler, TDMSampler
 from tzrec.datasets.utils import (
     C_NEG_SAMPLE_MASK,
     C_SAMPLE_MASK,
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
     Batch,
     RecordBatchTensor,
     process_hstu_neg_sample,
@@ -283,8 +285,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     @property
     def input_fields(self) -> List[pa.Field]:
         """Input fields info, overwrote by subclass for auto infer the info."""
-        if not self._input_fields:
-            self._input_fields = list(self._data_config.input_fields)
+        if self._input_fields is None:
+            self._init_input_fields()
         return self._input_fields
 
     def get_worker_info(self) -> Tuple[int, int]:
@@ -306,6 +308,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         return rank * num_workers + worker_id, num_workers * world_size
 
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+        """Set checkpoint state for resume.
+
+        Args:
+            state: dict mapping source_key to max consumed row index.
+        """
+        assert self._reader is not None
+        self._reader.load_state_dict(state)
+
     def __iter__(self) -> Iterator[Batch]:
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
@@ -323,6 +334,24 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         Returns:
             an instance of Batch.
         """
+        # Extract checkpoint info if present
+        checkpoint_info = None
+        if CKPT_SOURCE_ID in input_data and CKPT_ROW_IDX in input_data:
+            source_ids = input_data.pop(CKPT_SOURCE_ID)
+            row_idxs = input_data.pop(CKPT_ROW_IDX)
+
+            # Use PyArrow group_by + max aggregation
+            table = pa.table({CKPT_SOURCE_ID: source_ids, CKPT_ROW_IDX: row_idxs})
+            grouped = table.group_by(CKPT_SOURCE_ID).aggregate([(CKPT_ROW_IDX, "max")])
+
+            # Convert to dict: {source_key: max_absolute_position}
+            checkpoint_info = dict(
+                zip(
+                    grouped[CKPT_SOURCE_ID].to_pylist(),
+                    grouped[f"{CKPT_ROW_IDX}_max"].to_pylist(),
+                )
+            )
+
         use_sample_mask = self._mode == Mode.TRAIN and (
             self._data_config.negative_sample_mask_prob > 0
             or self._data_config.sample_mask_prob > 0
@@ -338,6 +367,26 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data = _expand_tdm_sample(
                     input_data, pos_sampled, neg_sampled, self._data_config
                 )
+                if use_sample_mask:
+                    num_pos = len(list(pos_sampled.values())[0])
+                    num_neg = len(list(neg_sampled.values())[0])
+                    total = len(list(input_data.values())[0])
+                    batch_size = total - num_pos - num_neg
+                    # Rows after _expand_tdm_sample are laid out as
+                    # [orig_targets | pos_sampled | neg_sampled]. Mask the
+                    # positives (orig + pos_sampled) with sample_mask_prob and
+                    # the negatives with negative_sample_mask_prob. TDM features
+                    # are never is_neg, so only C_SAMPLE_MASK needs to be set.
+                    input_data[C_SAMPLE_MASK] = pa.array(
+                        np.concatenate(
+                            [
+                                np.random.random(batch_size + num_pos)
+                                < self._data_config.sample_mask_prob,
+                                np.random.random(num_neg)
+                                < self._data_config.negative_sample_mask_prob,
+                            ]
+                        )
+                    )
             elif self._enable_hstu:
                 seq_attr = self._sampler._item_id_field
 
@@ -383,17 +432,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         input_data[k] = pa.concat_arrays([input_data[k], v])
                     else:
                         input_data[k] = v
-
-            if use_sample_mask:
-                input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-                    [
-                        input_data[C_SAMPLE_MASK],
-                        pa.array(
-                            np.random.random(len(list(sampled.values())[0]))
-                            < self._data_config.negative_sample_mask_prob
-                        ),
-                    ]
-                )
+                if use_sample_mask:
+                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+                        [
+                            input_data[C_SAMPLE_MASK],
+                            pa.array(
+                                np.random.random(len(list(sampled.values())[0]))
+                                < self._data_config.negative_sample_mask_prob
+                            ),
+                        ]
+                    )
 
         # TODO(hongsheng.jhs): add additional field like hard_negative
         output_data = self._data_parser.parse(input_data)
@@ -416,6 +464,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 batch.reserves = RecordBatchTensor(pa.record_batch(reserved_data))
         else:
             batch = self._data_parser.to_batch(output_data)
+
+        # Set checkpoint info on batch
+        batch.checkpoint_info = checkpoint_info
         return batch
 
     @property
@@ -462,11 +513,20 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
         self._use_sample_cost = False
+        self._checkpoint_state: Optional[Dict[str, int]] = None
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
             assert (
                 self._sample_cost_field is not None and len(self._sample_cost_field) > 0
             ), "Should set data_config.sample_cost_field when use batch_cost_size"
             self._use_sample_cost = True
+
+    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+        """Set checkpoint state for resume.
+
+        Args:
+            state: dict mapping source_key to max consumed row index.
+        """
+        self._checkpoint_state = state
 
     @property
     def schema(self) -> pa.Schema:
@@ -564,9 +624,28 @@ class BaseWriter(metaclass=_writer_meta_cls):
         self._lazy_inited = False
         self._output_path = output_path
 
-    def write(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def write(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Write a batch of data."""
         raise NotImplementedError
+
+    @staticmethod
+    def _flatten_chunked_arrays(
+        output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]],
+    ) -> List[pa.Array]:
+        """Collapse ChunkedArray columns into contiguous Arrays.
+
+        ``pa.RecordBatch.from_arrays`` only accepts ``pa.Array``, so any
+        ``pa.ChunkedArray`` column must be combined into a single chunk before
+        constructing the batch.
+        """
+        output_arrays = []
+        for v in output_dict.values():
+            if isinstance(v, pa.ChunkedArray):
+                v = v.combine_chunks()
+            output_arrays.append(v)
+        return output_arrays
 
     def close(self) -> None:
         """Close and commit data."""
@@ -600,6 +679,8 @@ def create_reader(
     """
     if input_path.startswith("odps://"):
         reader_cls_name = "OdpsReader"
+    elif input_path.startswith("kafka://"):
+        reader_cls_name = "KafkaReader"
     elif input_path.endswith(".csv"):
         reader_cls_name = "CsvReader"
     elif input_path.endswith(".parquet"):

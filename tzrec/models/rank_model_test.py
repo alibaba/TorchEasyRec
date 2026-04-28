@@ -153,6 +153,52 @@ class RankModelTest(unittest.TestCase):
             [TestGraphType.FX_TRACE],
         ]
     )
+    def test_binary_classification_model_with_label_smoothing(self, graph_type):
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy(
+                        label_smoothing=0.1
+                    )
+                )
+            ],
+            metrics=[
+                metric_pb2.MetricConfig(auc=metric_pb2.AUC()),
+            ],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config, features=[], labels=["label"]
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"], values=torch.tensor([1, 1]), lengths=torch.tensor([1, 1])
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        label = torch.tensor([0, 1])
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": label},
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        # With label_smoothing=0.1, labels [0,1] become [0.05, 0.95]
+        # BCEWithLogitsLoss([0.2, 0.3], [0.05, 0.95]) = 0.6787
+        expected_total_loss = torch.tensor(0.6787)
+        torch.testing.assert_close(
+            total_loss, expected_total_loss, rtol=1e-4, atol=1e-4
+        )
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+        ]
+    )
     def test_regression_model(self, graph_type):
         model_config = model_pb2.ModelConfig(
             losses=[loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())],

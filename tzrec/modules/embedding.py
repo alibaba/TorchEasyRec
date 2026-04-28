@@ -280,9 +280,9 @@ class EmbeddingGroup(nn.Module):
         sequence_encoders = list(feature_group.sequence_encoders)
         is_deep = feature_group.group_type == model_pb2.DEEP
         if is_deep:
-            if len(sequence_groups) == 0 and sequence_encoders == 0:
+            if len(sequence_groups) == 0 and len(sequence_encoders) == 0:
                 return
-            elif len(sequence_groups) > 0 and sequence_encoders == 0:
+            elif len(sequence_groups) > 0 and len(sequence_encoders) == 0:
                 raise ValueError(
                     f"{group_name} group has sequence_groups,but no sequence_encoders "
                 )
@@ -1371,9 +1371,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     results[f"{group_name}.sequence_length"] = sequence_length
 
                 if (
-                    int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1
-                    or self._group_to_is_jagged[group_name]
-                ):
+                    int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1 and info.is_user
+                ) or self._group_to_is_jagged[group_name]:
                     seq_t = jt.values()
                 else:
                     seq_t = jt.to_padded_dense(group_sequence_length)

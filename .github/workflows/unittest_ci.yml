@@ -5,15 +5,19 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+concurrency:
+  group: unittest-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   ci-test:
     runs-on: tzrec-runner
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.0
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.1
       options: --gpus all --ipc host
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: run_${{ github.run_id }}
