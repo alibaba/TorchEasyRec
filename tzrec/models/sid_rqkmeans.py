@@ -60,10 +60,10 @@ class SidRqkmeans(BaseModel):
         cfg = self._model_config  # SidRqkmeans proto message
         self._embedding_feature_name = cfg.embedding_feature_name
 
-        assert cfg.n_embed_per_layer, (
-            "n_embed_per_layer must be set, e.g. '256,256,256'"
+        assert cfg.codebook, (
+            "codebook must be set, e.g. '256,256,256'"
         )
-        n_embed_list = _parse_int_list(cfg.n_embed_per_layer)
+        n_embed_list = _parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
         self._rqkmeans = RQKMeans(
@@ -139,8 +139,41 @@ class SidRqkmeans(BaseModel):
 
     def init_metric(self) -> None:
         """Initialize metric modules."""
+        # Eval metrics
         self._metric_modules["mse"] = torchmetrics.MeanMetric()
         self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
+
+        # Train metrics (loss is dummy, only track mse + unique_sid_ratio)
+        self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
+        self._train_metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        # Quantization MSE
+        if "input_embedding" in predictions:
+            mse = F.mse_loss(
+                predictions["quantized"],
+                predictions["input_embedding"],
+                reduction="mean",
+            )
+            self._train_metric_modules["mse"].update(mse)
+
+        # Unique SID ratio
+        codes = predictions["codes"]
+        B = codes.shape[0]
+        unique_sids = torch.unique(codes, dim=0).shape[0]
+        self._train_metric_modules["unique_sid_ratio"].update(
+            torch.tensor(unique_sids / B, device=codes.device)
+        )
 
     def update_metric(
         self,

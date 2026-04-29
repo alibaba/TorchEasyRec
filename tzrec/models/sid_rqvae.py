@@ -75,17 +75,17 @@ class SidRqvae(BaseModel):
             _parse_float_list(cfg.latent_weight) if cfg.latent_weight else None
         )
 
-        assert cfg.n_embed_per_layer, (
-            "n_embed_per_layer must be set, e.g. '256,256,256'"
+        assert cfg.codebook, (
+            "codebook must be set, e.g. '256,256,256'"
         )
-        n_embed_list = _parse_int_list(cfg.n_embed_per_layer)
+        n_embed_list = _parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
-        # Parse EMA sub-config (defaults: enabled, decay=0.99)
-        use_ema = True
+        # Parse EMA sub-config (disabled unless ema_config is explicitly set)
+        use_ema = cfg.HasField("ema_config")
         ema_decay = 0.99
         restart_unused_codes = True
-        if cfg.HasField("ema_config"):
+        if use_ema:
             ema_decay = cfg.ema_config.decay
             restart_unused_codes = cfg.ema_config.restart_unused_codes
 
@@ -121,13 +121,18 @@ class SidRqvae(BaseModel):
             use_clip=self._use_clip,
         )
 
-    def _extract_embedding(self, batch: Batch) -> torch.Tensor:
-        """Extract item embedding from Batch.dense_features."""
-        kt = batch.dense_features[BASE_DATA_GROUP]
-        return kt[self._embedding_feature_name]
+    def _extract_feature(
+        self, batch: Batch, feature_name: Optional[str] = None
+    ) -> torch.Tensor:
+        """Extract a named feature from Batch.dense_features.
 
-    def _extract_feature(self, batch: Batch, feature_name: str) -> torch.Tensor:
-        """Extract a named feature from Batch.dense_features."""
+        Args:
+            batch (Batch): input batch data.
+            feature_name (str, optional): feature name to extract.
+                Defaults to self._embedding_feature_name.
+        """
+        if feature_name is None:
+            feature_name = self._embedding_feature_name
         kt = batch.dense_features[BASE_DATA_GROUP]
         return kt[feature_name]
 
@@ -140,7 +145,7 @@ class SidRqvae(BaseModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        embedding = self._extract_embedding(batch)
+        embedding = self._extract_feature(batch)
 
         if self._use_clip:
             return self._predict_mixed(embedding, batch)
@@ -230,8 +235,39 @@ class SidRqvae(BaseModel):
 
     def init_metric(self) -> None:
         """Initialize metric modules."""
+        # Eval metrics
         self._metric_modules["mse"] = torchmetrics.MeanMetric()
         self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
+
+        # Train metrics: mse + unique_sid_ratio only
+        # (loss values are already logged by the framework via loss() return)
+        self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
+        self._train_metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
+
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+        """
+        # Reconstruction MSE
+        if "x_hat" in predictions:
+            embedding = self._extract_feature(batch)
+            mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
+            self._train_metric_modules["mse"].update(mse)
+
+        # Unique SID ratio
+        codes = predictions["codes"]
+        B = codes.shape[0]
+        unique_sids = torch.unique(codes, dim=0).shape[0]
+        self._train_metric_modules["unique_sid_ratio"].update(
+            torch.tensor(unique_sids / B, device=codes.device)
+        )
 
     def update_metric(
         self,
@@ -251,7 +287,7 @@ class SidRqvae(BaseModel):
 
         # Reconstruction MSE
         if "x_hat" in predictions:
-            embedding = self._extract_embedding(batch)
+            embedding = self._extract_feature(batch)
             mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
             self._metric_modules["mse"].update(mse)
 

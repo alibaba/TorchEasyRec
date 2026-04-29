@@ -41,7 +41,7 @@ class SidRqkmeansTest(unittest.TestCase):
         n_embed_str = ",".join(["16"] * n_layers)
         sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
             input_dim=input_dim,
-            n_embed_per_layer=n_embed_str,
+            codebook=n_embed_str,
             normalize_residuals=True,
             init_buffer_size=64,
             embedding_feature_name="item_emb",

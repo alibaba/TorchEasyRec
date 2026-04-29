@@ -43,7 +43,7 @@ message SidRqvae {
     optional string hidden_dims = 3;
     // 每层码本大小，逗号分隔，如 "256,256,256"
     // 列表长度即残差量化层数（n_layers），支持非均匀码表如 "512,256,128"
-    optional string n_embed_per_layer = 5;
+    optional string codebook = 5;
 
     // === 量化策略 ===
     // VQ forward mode: "ste" 或 "gumbel_softmax"
@@ -88,7 +88,7 @@ message SidRqkmeans {
     optional uint32 input_dim = 1 [default = 512];
     // 每层聚类数，逗号分隔，如 "256,256,256"
     // 列表长度即残差量化层数（n_layers），支持非均匀码表如 "512,256,128"
-    optional string n_embed_per_layer = 3;
+    optional string codebook = 3;
     // 是否 L2 归一化残差
     optional bool normalize_residuals = 4 [default = true];
     // KMeans++ 初始化缓冲区大小

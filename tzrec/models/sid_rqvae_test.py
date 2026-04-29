@@ -51,7 +51,7 @@ class SidRqvaeTest(unittest.TestCase):
         sid_rqvae_cfg = sid_model_pb2.SidRqvae(
             input_dim=input_dim,
             embed_dim=embed_dim,
-            n_embed_per_layer=n_embed_str,
+            codebook=n_embed_str,
             forward_mode="ste",
             loss_type="mse",
             kmeans_init=False,

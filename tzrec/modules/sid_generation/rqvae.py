@@ -165,10 +165,6 @@ class RQVAE(nn.Module):
             )
             self.masked_clip_loss_fn = MaskedCLIPLoss()
 
-    # ------------------------------------------------------------------
-    # Basic methods
-    # ------------------------------------------------------------------
-
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode. (B, input_dim) -> (B, embed_dim)."""
         return self.encoder(x)
@@ -220,10 +216,6 @@ class RQVAE(nn.Module):
             "loss": loss_total,
         }
 
-    # ------------------------------------------------------------------
-    # Forward interfaces
-    # ------------------------------------------------------------------
-
     def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
         """Dispatch based on use_clip.
 
@@ -264,30 +256,6 @@ class RQVAE(nn.Module):
             "quantized": quant_output.quantized_embeddings,
             **losses,
         }
-
-    def forward_clip(
-        self,
-        fea1: torch.Tensor,
-        fea2: torch.Tensor,
-        temperature: float = 1.0,
-    ) -> Dict[str, torch.Tensor]:
-        """Siamese RQ-VAE + CLIP contrastive learning.
-
-        DEPRECATED: kept for backward compatibility. Use forward_mixed instead.
-
-        Args:
-            fea1: (B, input_dim) first feature.
-            fea2: (B, input_dim) second feature (same item, diff modal).
-            temperature: Gumbel-Softmax temperature.
-
-        Returns:
-            dict with clip_loss, commitment_loss, etc.
-        """
-        # All rows are clip rows -> full True mask
-        clip_mask = torch.ones(
-            fea1.shape[0], dtype=torch.bool, device=fea1.device
-        )
-        return self.forward_mixed(fea1, fea2, clip_mask, temperature)
 
     def _compute_masked_recon_loss(
         self,

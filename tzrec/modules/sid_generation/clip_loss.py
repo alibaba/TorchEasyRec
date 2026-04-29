@@ -205,10 +205,6 @@ class CLIPLoss(nn.Module):
             "clip_acc": acc,
         }
 
-# ------------------------------------------------------------------
-# MaskedCLIPLoss
-# ------------------------------------------------------------------
-
 
 class MaskedCLIPLoss(nn.Module):
     """Masked CLIP loss for mixed recon+clip batches.

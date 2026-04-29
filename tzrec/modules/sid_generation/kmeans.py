@@ -43,20 +43,9 @@ def _squared_euclidean_distance(
     Returns:
         Tensor: squared distances, shape (N, K).
     """
-    N = x.shape[0]
-
-    if N <= chunk_size:
-        x_sq = x.pow(2).sum(dim=1, keepdim=True)
-        y_sq = y.pow(2).sum(dim=1, keepdim=True).t()
-        return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
-
-    chunks = []
-    for start in range(0, N, chunk_size):
-        x_chunk = x[start : start + chunk_size]
-        x_sq = x_chunk.pow(2).sum(dim=1, keepdim=True)
-        y_sq = y.pow(2).sum(dim=1, keepdim=True).t()
-        chunks.append((x_sq + y_sq - 2.0 * x_chunk @ y.t()).clamp(min=0.0))
-    return torch.cat(chunks, dim=0)
+    x_sq = x.pow(2).sum(dim=1, keepdim=True)
+    y_sq = y.pow(2).sum(dim=1, keepdim=True).t()
+    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
 
 
 # ------------------------------------------------------------------
