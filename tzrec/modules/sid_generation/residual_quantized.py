@@ -295,14 +295,13 @@ class ResidualQuantized(nn.Module):
     # Commitment loss
     # ------------------------------------------------------------------
 
-    def _compute_commitment_loss(
+    def _single_commitment_loss(
         self,
         x: torch.Tensor,
-        quant_list: List[torch.Tensor],
+        quant: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute top-level commitment loss over all layers.
+        """Commitment loss for a single cumulative quantization tensor.
 
-        For each cumulative quantization in quant_list:
           - cos: (1 - cosine_similarity) * weight
           - l2:  (x - quant)^2.mean() * weight
         EMA mode zeros out the codebook-toward-encoder term.
@@ -311,44 +310,41 @@ class ResidualQuantized(nn.Module):
 
         Args:
             x (Tensor): original input, shape (B, D).
-            quant_list (List[Tensor]): cumulative quantized outputs
-                per layer.
+            quant (Tensor): cumulative quantized output at one layer,
+                shape (B, D).
 
         Returns:
-            Tensor: scalar commitment loss.
+            Tensor: scalar commitment loss for this layer.
         """
-        loss_list = []
-        for quant in quant_list:
-            if self.commitment_loss_type == "cos":
-                loss1 = (
-                    (1 - F.cosine_similarity(x, quant.detach(), dim=-1))
+        if self.commitment_loss_type == "cos":
+            loss1 = (
+                (1 - F.cosine_similarity(x, quant.detach(), dim=-1))
+                .mean()
+                * self.commitment_w1
+            )
+            if self.use_ema:
+                loss2 = torch.tensor(0.0, device=x.device)
+            else:
+                loss2 = (
+                    (1 - F.cosine_similarity(
+                        x.detach(), quant, dim=-1
+                    ))
                     .mean()
-                    * self.commitment_w1
+                    * self.commitment_w2
                 )
-                if self.use_ema:
-                    loss2 = torch.tensor(0.0, device=x.device)
-                else:
-                    loss2 = (
-                        (1 - F.cosine_similarity(
-                            x.detach(), quant, dim=-1
-                        ))
-                        .mean()
-                        * self.commitment_w2
-                    )
-            else:  # 'l2'
-                loss1 = (
-                    (x - quant.detach()).pow(2.0).mean()
-                    * self.commitment_w1
+        else:  # 'l2'
+            loss1 = (
+                (x - quant.detach()).pow(2.0).mean()
+                * self.commitment_w1
+            )
+            if self.use_ema:
+                loss2 = torch.tensor(0.0, device=x.device)
+            else:
+                loss2 = (
+                    (x.detach() - quant).pow(2.0).mean()
+                    * self.commitment_w2
                 )
-                if self.use_ema:
-                    loss2 = torch.tensor(0.0, device=x.device)
-                else:
-                    loss2 = (
-                        (x.detach() - quant).pow(2.0).mean()
-                        * self.commitment_w2
-                    )
-            loss_list.append(loss1 + loss2)
-        return torch.mean(torch.stack(loss_list))
+        return loss1 + loss2
 
     # ------------------------------------------------------------------
     # Rotation trick
@@ -432,9 +428,11 @@ class ResidualQuantized(nn.Module):
 
         Training flow:
             1. If kmeans_init and not initialized -> init_embed_(input)
-            2. For each layer: quantize detached residual, collect quant_list
+            2. For each layer: quantize detached residual, accumulate
+               into aggregated_quants and compute per-layer commitment loss
+               in-place (avoids storing a quant_list of clones).
                - pass reference_code[:, i] if provided
-            3. Compute commitment loss (cos/l2 with latent_weight)
+            3. Mean of per-layer commitment losses (cos/l2 with latent_weight)
             4. STE gradient pass-through (or rotation trick)
 
         Args:
@@ -457,7 +455,7 @@ class ResidualQuantized(nn.Module):
         # Detach residual for VQ assignment (gradient flows via STE only)
         residual = input.detach().clone()
         all_ids: List[torch.Tensor] = []
-        quant_list: List[torch.Tensor] = []
+        commitment_loss_list: List[torch.Tensor] = []
         aggregated_quants = torch.zeros_like(input)
 
         # Step 2: per-layer residual quantization
@@ -487,15 +485,19 @@ class ResidualQuantized(nn.Module):
 
             # Accumulate raw embeddings (preserves gradient to codebook)
             aggregated_quants = aggregated_quants + raw_emb
-            quant_list.append(aggregated_quants.clone())
+
+            # Compute per-layer commitment loss in-place (no quant_list clone)
+            commitment_loss_list.append(
+                self._single_commitment_loss(input, aggregated_quants)
+            )
 
         cluster_ids = torch.stack(all_ids, dim=-1)  # (B, n_layers)
 
-        # Step 3: commitment loss (top-level, over cumulative quant_list)
-        commitment_loss = self._compute_commitment_loss(input, quant_list)
+        # Step 3: aggregate per-layer commitment loss
+        commitment_loss = torch.mean(torch.stack(commitment_loss_list))
 
-        # Step 4: STE or rotation trick
-        quants_trunc = quant_list[-1]
+        # Step 4: STE or rotation trick (quants_trunc = final accumulated)
+        quants_trunc = aggregated_quants
         if self.training:
             if self.rotation_trick:
                 quants_trunc = self._apply_rotation_trick(
