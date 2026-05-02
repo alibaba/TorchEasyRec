@@ -47,9 +47,9 @@ CPU版本 镜像地址:
   `compute_120` PTX）。覆盖 Turing (T4)、Ampere (A10/A30/A100、
   L4/L20)、Hopper (H100/H200)、Blackwell (B100/B200) 等
   CC 7.5–12.0 的卡。
-- **CUDA 12.6** 镜像：`sm_70 / 75 / 80 / 86 / 90`。覆盖 Volta
-  (V100)、Turing (T4)、Ampere (A10/A30/A100、L4/L20)、Hopper
-  (H100) 等 CC 7.0–9.0 的卡，不支持 Blackwell。
+- **CUDA 12.6** 镜像：`sm_60 / 70 / 75 / 80 / 86 / 90`。覆盖 Pascal
+  (P100)、Volta (V100)、Turing (T4)、Ampere (A10/A30/A100、L4/L20)、
+  Hopper (H100) 等 CC 6.0–9.0 的卡，不支持 Blackwell。
 
 ## 前置准备
 
