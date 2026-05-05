@@ -22,7 +22,12 @@ from torch.autograd.profiler import record_function
 from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention import delta_hstu_mha
-from tzrec.ops.hstu_attention_utils import build_sla_func_tensor
+from tzrec.ops.hstu_attention_utils import (
+    STUTruncationPlan,
+    apply_stu_truncation_plan,
+    build_sla_func_tensor,
+    compute_stu_truncation_plan,
+)
 from tzrec.ops.hstu_compute import (
     hstu_compute_output,
     hstu_compute_uqvk,
@@ -57,6 +62,35 @@ class STU(BaseModule, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def truncate_input(
+        self,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        max_seq_len: int,
+        num_targets: Optional[torch.Tensor],
+        *,
+        truncate_tail_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, STUTruncationPlan]:
+        """Truncate the UIH tail of the jagged batch before this layer.
+
+        Subclasses that don't participate in mid-stack truncation should
+        override and ``raise NotImplementedError(...)`` from their
+        override -- the abstract decorator forces a deliberate choice
+        at subclass instantiation rather than at the truncating call site.
+
+        Args:
+            x: jagged values ``(total, D)``.
+            x_offsets: cumulative offsets ``(B + 1,)``.
+            max_seq_len: padded max length.
+            num_targets: per-sample target counts ``(B,)`` or ``None``.
+            truncate_tail_len: max UIH tokens kept per sample.
+
+        Returns:
+            ``(x, x_offsets, max_seq_len, plan)`` post-truncation.
+        """
+        ...
+
+    @abc.abstractmethod
     def forward(
         self,
         x: torch.Tensor,
@@ -66,12 +100,8 @@ class STU(BaseModule, abc.ABC):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
         prev_attn_func: Optional[torch.Tensor] = None,
-        prev_attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[Tuple[int, int, int, int, bool]],
-    ]:
+        prev_attn_func_sig: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward the layer.
 
         Args:
@@ -83,17 +113,14 @@ class STU(BaseModule, abc.ABC):
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
             prev_attn_func (Optional[torch.Tensor]): SLA NFUNC mask tensor
                 produced by the previous layer in the stack, available for
-                reuse when the current layer's signature matches.
-            prev_attn_func_sig (Optional[Tuple[int,int,int,int,bool]]):
-                signature ``(sla_k1, sla_k2, contextual_seq_len, num_heads,
-                target_aware)`` describing the SLA config that produced
-                ``prev_attn_func``.
+                reuse when the current layer's static SLA signature matches.
+            prev_attn_func_sig (Optional[str]): ``attn_func_static_sig``
+                string of the previous layer that produced
+                ``prev_attn_func``.  Pass ``None`` to force a rebuild
+                (e.g. across a mid-stack truncation boundary).
 
         Returns:
-            Tuple of ``(output, attn_func, attn_func_sig)``.  The sig
-            does not encode offsets / num_targets identity; reuse
-            assumes all layers in one stack forward see the same
-            offsets.
+            Tuple of ``(output, attn_func)``.
         """
         pass
 
@@ -386,6 +413,35 @@ class STULayer(STU):
             kv_caching_offsets=self.kv_caching_offsets,
         )
 
+    def truncate_input(
+        self,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        max_seq_len: int,
+        num_targets: Optional[torch.Tensor],
+        *,
+        truncate_tail_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, STUTruncationPlan]:
+        """Truncate the UIH tail of the jagged batch before this layer."""
+        plan = compute_stu_truncation_plan(
+            x_offsets=x_offsets,
+            num_targets=num_targets,
+            max_seq_len=max_seq_len,
+            truncate_tail_len=truncate_tail_len,
+            contextual_seq_len=self._contextual_seq_len,
+        )
+        x = apply_stu_truncation_plan(x, plan, kernel=self.kernel())
+        return x, plan.new_x_offsets, plan.new_max_seq_len, plan
+
+    @property
+    def attn_func_static_sig(self) -> str:
+        """SLA NFUNC cache key (colon-separated, fx-trace-safe)."""
+        return (
+            f"{self._sla_k1}:{self._sla_k2}:{self._contextual_seq_len}:"
+            f"{self._num_heads}:{int(self._target_aware)}:"
+            f"{self._max_attn_len}:{int(self._causal)}"
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -395,12 +451,8 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
         prev_attn_func: Optional[torch.Tensor] = None,
-        prev_attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[Tuple[int, int, int, int, bool]],
-    ]:
+        prev_attn_func_sig: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward the layer.
 
         Args:
@@ -411,16 +463,19 @@ class STULayer(STU):
             max_kv_caching_len (int): maximum key-value caching length.
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
             prev_attn_func (Optional[torch.Tensor]): SLA NFUNC mask
-                from the previous layer; reused if sig matches.
-            prev_attn_func_sig (Optional[Tuple[int,int,int,int,bool]]):
-                ``(sla_k1, sla_k2, contextual_seq_len, num_heads,
-                target_aware)`` of ``prev_attn_func``.
+                from a prior layer; reused if its sig matches this
+                layer's ``attn_func_static_sig``.
+            prev_attn_func_sig (Optional[str]):
+                ``attn_func_static_sig`` of the layer that produced
+                ``prev_attn_func``.  Pass ``None`` to force a rebuild
+                (caller's responsibility across a mid-stack truncation
+                boundary; ``STUStack`` bakes this into its precomputed
+                sig list).
 
         Returns:
-            ``(output, attn_func, attn_func_sig)``.
+            ``(output, attn_func)``.
         """
         attn_func: Optional[torch.Tensor] = None
-        attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None
         uses_sla = self._sla_k1 > 0 or self._sla_k2 > 0
         if uses_sla:
             if self.kernel() == Kernel.TRITON:
@@ -428,14 +483,12 @@ class STULayer(STU):
                     "SLA (sla_k1 / sla_k2 > 0) requires Kernel.CUTLASS or "
                     "Kernel.PYTORCH; Kernel.TRITON has no NFUNC mask path."
                 )
-            my_sig: Tuple[int, int, int, int, bool] = (
-                self._sla_k1,
-                self._sla_k2,
-                self._contextual_seq_len,
-                self._num_heads,
-                self._target_aware,
-            )
-            if my_sig == prev_attn_func_sig and prev_attn_func is not None:
+            # str==str, fx-trace-safe. Truncation-boundary invalidation
+            # is encoded by the caller passing prev_attn_func_sig=None.
+            if (
+                prev_attn_func is not None
+                and prev_attn_func_sig == self.attn_func_static_sig
+            ):
                 attn_func = prev_attn_func
             else:
                 attn_func = build_sla_func_tensor(
@@ -447,10 +500,8 @@ class STULayer(STU):
                     num_targets=num_targets if self._target_aware else None,
                     contextual_seq_len=self._contextual_seq_len,
                 )
-            attn_func_sig = my_sig
         else:
             attn_func = prev_attn_func
-            attn_func_sig = prev_attn_func_sig
 
         local_attn_func = attn_func if uses_sla else None
         with record_function("## stu_preprocess_and_attention ##"):
@@ -508,7 +559,7 @@ class STULayer(STU):
                 kernel=self.kernel(),
                 recompute_y_in_backward=self._recompute_y,
             )
-        return output, attn_func, attn_func_sig
+        return output, attn_func
 
     def cached_forward(
         self,
@@ -591,20 +642,65 @@ class STULayer(STU):
 
 
 class STUStack(BaseModule):
-    """Stack of ``STU`` layers.  Threads SLA mask reuse between layers.
+    """Stack of ``STU`` layers with optional mid-stack attention truncation.
 
     Args:
         stu_list (List[STU]): list of STU layers.
+        truncate_split_layer (int): layer index after which UIH tokens
+            are truncated.  Must be in ``(0, len(stu_list))`` when
+            ``truncate_tail_len > 0``, else ``0``.
+        truncate_tail_len (int): max UIH tokens kept on layers
+            ``>= truncate_split_layer``.  Both fields must be ``> 0``
+            to enable truncation.
         is_inference (bool): whether to run in inference mode.
     """
 
     def __init__(
         self,
         stu_list: List[STU],
+        truncate_split_layer: int = 0,
+        truncate_tail_len: int = 0,
         is_inference: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._stu_layers: torch.nn.ModuleList = torch.nn.ModuleList(modules=stu_list)
+        if truncate_split_layer < 0 or truncate_tail_len < 0:
+            raise ValueError(
+                f"truncate_split_layer and truncate_tail_len must be "
+                f"non-negative; got truncate_split_layer={truncate_split_layer}, "
+                f"truncate_tail_len={truncate_tail_len}."
+            )
+        if (truncate_split_layer > 0) != (truncate_tail_len > 0):
+            raise ValueError(
+                f"truncate_split_layer and truncate_tail_len must both be "
+                f"> 0 to enable truncation, or both 0 to disable; got "
+                f"truncate_split_layer={truncate_split_layer}, "
+                f"truncate_tail_len={truncate_tail_len}."
+            )
+        if truncate_tail_len > 0 and not (
+            0 < truncate_split_layer < len(self._stu_layers)
+        ):
+            raise ValueError(
+                f"truncate_split_layer must be in (0, {len(self._stu_layers)}) "
+                f"when truncate_tail_len > 0; got "
+                f"truncate_split_layer={truncate_split_layer}, "
+                f"truncate_tail_len={truncate_tail_len}."
+            )
+        self._truncate_split_layer: int = truncate_split_layer
+        self._truncate_tail_len: int = truncate_tail_len
+
+        # Per-layer prev_attn_func_sig: previous layer's static sig,
+        # except None at layer 0 and at the truncation-split layer
+        # (cache invalidation -- post-truncation total_q differs).
+        self._prev_attn_func_sig_per_layer: List[Optional[str]] = []
+        for i in range(len(self._stu_layers)):
+            if i == 0 or (
+                self._truncate_tail_len > 0 and i == self._truncate_split_layer
+            ):
+                prev_sig: Optional[str] = None
+            else:
+                prev_sig = self._stu_layers[i - 1].attn_func_static_sig
+            self._prev_attn_func_sig_per_layer.append(prev_sig)
 
     def forward(
         self,
@@ -614,7 +710,7 @@ class STUStack(BaseModule):
         num_targets: torch.Tensor,
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, Optional[STUTruncationPlan]]:
         """Forward stack of stu layer.
 
         Args:
@@ -626,12 +722,29 @@ class STUStack(BaseModule):
             kv_caching_lengths (Optional[torch.Tensor]): key-value caching lengths.
 
         Returns:
-            torch.Tensor: output sequence embedding tensor from the last layer.
+            ``(x, x_offsets, max_seq_len, plan)``.  ``plan`` is the
+            :class:`STUTruncationPlan` produced when mid-stack truncation
+            fired, else ``None``.  When ``plan`` is not ``None``,
+            ``x_offsets`` and ``max_seq_len`` reflect the post-truncation
+            state; ``num_targets`` is preserved intact across truncation,
+            so the caller's input tensor is still valid.  Callers that
+            hold parallel jagged tensors (e.g. ``seq_timestamps``) replay
+            the same split via :func:`apply_stu_truncation_plan`.
         """
+        plan: Optional[STUTruncationPlan] = None
         prev_attn_func: Optional[torch.Tensor] = None
-        prev_attn_func_sig: Optional[Tuple[int, int, int, int, bool]] = None
-        for layer in self._stu_layers:
-            x, prev_attn_func, prev_attn_func_sig = layer(
+        for i, layer in enumerate(self._stu_layers):
+            if self._truncate_tail_len > 0 and i == self._truncate_split_layer:
+                x, x_offsets, max_seq_len, plan = layer.truncate_input(
+                    x,
+                    x_offsets,
+                    max_seq_len,
+                    num_targets,
+                    truncate_tail_len=self._truncate_tail_len,
+                )
+                # No `prev_attn_func = None` reset: the precomputed sig
+                # at this index is already None, so the layer rebuilds.
+            x, prev_attn_func = layer(
                 x=x,
                 x_offsets=x_offsets,
                 max_seq_len=max_seq_len,
@@ -639,9 +752,9 @@ class STUStack(BaseModule):
                 max_kv_caching_len=max_kv_caching_len,
                 kv_caching_lengths=kv_caching_lengths,
                 prev_attn_func=prev_attn_func,
-                prev_attn_func_sig=prev_attn_func_sig,
+                prev_attn_func_sig=self._prev_attn_func_sig_per_layer[i],
             )
-        return x
+        return x, x_offsets, max_seq_len, plan
 
     def cached_forward(
         self,
@@ -661,6 +774,15 @@ class STUStack(BaseModule):
         Returns:
             torch.Tensor: output sequence embedding tensor.
         """
+        if self._truncate_tail_len > 0 and self._truncate_split_layer > 0:
+            # Cached / delta path keeps a rolling KV cache; mid-stack
+            # truncation would drop UIH prefix tokens that post-truncation
+            # layers still reference via the cache (train/serve skew).
+            raise NotImplementedError(
+                "STUStack attention truncation is not supported in "
+                "cached_forward (serving path). Either disable truncation "
+                "or use the non-cached forward path."
+            )
         for layer in self._stu_layers:
             delta_x = layer.cached_forward(
                 delta_x=delta_x,

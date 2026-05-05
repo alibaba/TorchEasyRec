@@ -75,6 +75,29 @@ message DlrmHSTU {
     optional bool concat_contextual_features = 7 [default = false];
 }
 
+message UltraHSTU {
+    // Mixture of Transducers: one HSTU per channel; per-candidate
+    // outputs are concatenated on the embedding dim.  >= 2 entries
+    // requires every entry to set a unique non-empty `name` plus the
+    // matching `<name>` / `<name>_action` / `<name>_watchtime` /
+    // `<name>_timestamp` feature_groups.  Candidate-side and
+    // contextual groups are shared across all channels.
+    repeated HSTU hstu = 1;
+    // multi task tower config
+    required FusionMTLTower fusion_mtl_tower = 2;
+    // max sequence length
+    required uint32 max_seq_len = 3;
+    // item embedding mlp hidden dimension
+    optional uint32 item_embedding_hidden_dim = 4 [default = 512];
+    // enables loss averaging computation globally across all ranks (total rank)
+    // instead of locally (local rank).
+    optional bool enable_global_average_loss = 5 [default = true];
+    // timestamp of sequence is ascending or descending
+    optional bool sequence_timestamp_is_ascending = 6 [default = true];
+    // concat all contextual features on channel dim as one token
+    optional bool concat_contextual_features = 7 [default = false];
+}
+
 message PEPNet {
     // epnet hidden units
     optional uint32 epnet_hidden_unit = 1;

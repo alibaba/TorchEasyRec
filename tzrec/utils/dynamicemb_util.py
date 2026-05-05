@@ -14,19 +14,14 @@ import os
 from typing import List, Optional, Tuple, Type, cast
 
 import torch
-from torch import distributed as dist
 from torch import nn
-from torchrec.distributed.embedding_kernel import BaseEmbedding
-from torchrec.distributed.embedding_types import (
-    EmbeddingComputeKernel,
-    GroupedEmbeddingConfig,
-)
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import (
-    constants,
     enumerators,
     planners,
     shard_estimators,
 )
+from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     ShardingOption,
@@ -41,7 +36,6 @@ from torchrec.distributed.types import (
     ModuleSharder,
     ParameterSharding,
     PipelineType,
-    ShardingEnv,
     ShardingPlan,
     ShardingType,
     ShardMetadata,
@@ -61,18 +55,10 @@ try:
         KVCounter,
         align_to_table_size,
     )
-    from dynamicemb.batched_dynamicemb_compute_kernel import (
-        BatchedDynamicEmbedding,
-        BatchedDynamicEmbeddingBag,
-    )
     from dynamicemb.dynamicemb_config import DynamicEmbKernel
     from dynamicemb.planner import (
         DynamicEmbParameterConstraints,
         DynamicEmbParameterSharding,
-    )
-    from dynamicemb.planner.rw_sharding import (
-        GroupedEmbeddingsLookup,
-        GroupedPooledEmbeddingsLookup,
     )
     from dynamicemb.shard import (
         DynamicEmbeddingBagCollectionSharder,
@@ -396,49 +382,36 @@ if has_dynamicemb:
     # pyre-ignore [9]
     planners.to_sharding_plan = _to_sharding_plan
 
-    def _kernel_bw_lookup(
+    _orig_hw_perf_config_get_device_bw = HardwarePerfConfig.get_device_bw
+
+    def _customized_kernel_aware_get_device_bw(
+        self,  # pyre-ignore [2]
         compute_device: str,
         compute_kernel: str,
         hbm_mem_bw: float,
         ddr_mem_bw: float,
+        ssd_mem_bw: float,
         hbm_to_ddr_mem_bw: float,
         caching_ratio: Optional[float] = None,
         prefetch_pipeline: bool = False,
     ) -> Optional[float]:
-        """Calculates the device bandwidth.
-
-        Args:
-            compute_kernel (str): compute kernel.
-            compute_device (str): compute device.
-            hbm_mem_bw (float): the bandwidth of the device HBM.
-            ddr_mem_bw (float): the bandwidth of the system DDR memory.
-            hbm_to_ddr_mem_bw (float): the bandwidth between device HBM and system DDR.
-            caching_ratio (Optional[float]): caching ratio used to determine device
-                bandwidth if UVM caching is enabled.
-            prefetch_pipeline (bool): whether prefetch pipeline is enabled.
-
-        Returns:
-            Optional[float]: the device bandwidth.
-        """
         if compute_kernel == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value:
-            # for dynamic embedding table
-            caching_ratio = caching_ratio if caching_ratio else 0.0
-            return (
-                caching_ratio * hbm_mem_bw + (1 - caching_ratio) * hbm_to_ddr_mem_bw
-            ) / 10
-        else:
-            return constants.kernel_bw_lookup(
-                compute_device=compute_device,
-                compute_kernel=compute_kernel,
-                hbm_mem_bw=hbm_mem_bw,
-                ddr_mem_bw=ddr_mem_bw,
-                hbm_to_ddr_mem_bw=hbm_to_ddr_mem_bw,
-                caching_ratio=caching_ratio,
-                prefetch_pipeline=prefetch_pipeline,
-            )
+            cr = caching_ratio if caching_ratio is not None else 0.0
+            return (cr * hbm_mem_bw + (1 - cr) * hbm_to_ddr_mem_bw) / 10
+        return _orig_hw_perf_config_get_device_bw(
+            self,
+            compute_device,
+            compute_kernel,
+            hbm_mem_bw,
+            ddr_mem_bw,
+            ssd_mem_bw,
+            hbm_to_ddr_mem_bw,
+            caching_ratio,
+            prefetch_pipeline,
+        )
 
     # pyre-ignore [9]
-    shard_estimators.kernel_bw_lookup = _kernel_bw_lookup
+    HardwarePerfConfig.get_device_bw = _customized_kernel_aware_get_device_bw
 
     def _calculate_dynamicemb_storage_specific_sizes(
         tensor: torch.Tensor,
@@ -616,58 +589,6 @@ if has_dynamicemb:
             )
             for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
         ]
-
-    # Monkey-patch for torchrec 1.5.0 compatibility
-    # The base class now passes 'env' parameter to _create_embedding_kernel
-    def _grouped_embeddings_lookup_create_embedding_kernel(
-        self,  # pyre-ignore [2]
-        config: GroupedEmbeddingConfig,
-        pg: Optional[dist.ProcessGroup],
-        device: Optional[torch.device],
-        env: Optional[ShardingEnv] = None,
-    ) -> BaseEmbedding:
-        """Patched version that accepts env parameter for torchrec 1.5.0."""
-        if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
-            # pyre-ignore [16]
-            return super(GroupedEmbeddingsLookup, self)._create_embedding_kernel(
-                config=config, pg=pg, device=device, env=env
-            )
-        else:
-            self._need_prefetch = True
-            return BatchedDynamicEmbedding(
-                config=config,
-                pg=pg,
-                device=device,
-            )
-
-    GroupedEmbeddingsLookup._create_embedding_kernel = (
-        _grouped_embeddings_lookup_create_embedding_kernel
-    )
-
-    def _grouped_pooled_embeddings_lookup_create_embedding_kernel(
-        self,  # pyre-ignore [2]
-        config: GroupedEmbeddingConfig,
-        device: Optional[torch.device],
-        pg: Optional[dist.ProcessGroup],
-        sharding_type: Optional[ShardingType],
-        env: Optional[ShardingEnv] = None,
-    ) -> BaseEmbedding:
-        """Patched version that accepts env parameter for torchrec 1.5.0."""
-        if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
-            # pyre-ignore [16]
-            return super(GroupedPooledEmbeddingsLookup, self)._create_embedding_kernel(
-                config, device, pg, sharding_type, env
-            )
-        else:
-            return BatchedDynamicEmbeddingBag(
-                config=config,
-                pg=pg,
-                device=device,
-            )
-
-    GroupedPooledEmbeddingsLookup._create_embedding_kernel = (
-        _grouped_pooled_embeddings_lookup_create_embedding_kernel
-    )
 
     from torchrec.sparse import jagged_tensor_validator as _jtv
 

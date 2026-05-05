@@ -237,14 +237,20 @@ def export_model_normal(
         autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
         if acc_utils.is_trt() or acc_utils.is_aot():
             data = OrderedDict(sorted(data.items()))
-            with torch.amp.autocast(
-                device_type="cuda",
-                dtype=autocast_dtype,
-                enabled=autocast_dtype is not None,
+            # no_grad: avoid retaining activations that OOM AOTI autotune.
+            with (
+                torch.no_grad(),
+                torch.amp.autocast(
+                    device_type="cuda",
+                    dtype=autocast_dtype,
+                    enabled=autocast_dtype is not None,
+                ),
             ):
                 result = model(data, "cuda:0")
             result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
             logger.info(f"Model Outputs: {result_info}")
+            del result
+            torch.cuda.empty_cache()
             if acc_utils.is_trt():
                 sparse, dense, meta_info = split_model(data, model, save_dir)
                 export_model_trt(

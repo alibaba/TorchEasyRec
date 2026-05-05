@@ -287,4 +287,20 @@ message HSTU {
     required GRInputPreprocessor input_preprocessor = 5;
     // output postprocessor
     required GROutputPostprocessor output_postprocessor = 6;
+    // Attention truncation: after this many full-sequence layers, drop UIH
+    // prefix tokens to keep only the last attn_truncation_tail_len per
+    // sample.  Contextual prefix and targets survive.  Must be in
+    // (0, attn_num_layers); 0 disables.
+    optional uint32 attn_truncation_split_layer = 7;
+    // Trailing UIH cap; both fields must be > 0 to enable truncation.
+    optional uint32 attn_truncation_tail_len = 8;
+    // MoT channel name.  When non-empty, replaces the default `uih`
+    // prefix on UIH-side keys read from grouped_features (e.g.
+    // name="uih_click" -> uih_click.sequence, uih_click_action.sequence,
+    // uih_click_watchtime.sequence, uih_click_timestamp.sequence).
+    // Empty preserves the original uih.* keys (DlrmHSTU behavior).
+    // Channels with the same `embedding_name` on a feature share the
+    // underlying embedding table via EmbeddingGroup dedupe; per-channel
+    // tables multiply sparse-param + TBE + all-to-all cost by N.
+    optional string name = 9 [default = ""];
 }

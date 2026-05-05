@@ -30,6 +30,7 @@ from torchrec.distributed.planner.constants import (
 )
 from torchrec.distributed.planner.enumerators import (
     GUARDED_COMPUTE_KERNELS,
+    GUARDED_SHARDING_TYPES_FOR_FP_MODULES,
     EmbeddingComputeKernel,
     EmbeddingTower,
     EmbeddingTowerCollection,
@@ -62,6 +63,7 @@ from torchrec.distributed.planner.types import (
     Storage,
     Topology,
 )
+from torchrec.distributed.planner.utils import build_sharder_data_map
 from torchrec.distributed.sharding_plan import (
     get_default_sharders as _get_default_sharders,
 )
@@ -74,6 +76,10 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
 
 from tzrec.protos import feature_pb2
 from tzrec.utils import env_util
@@ -536,7 +542,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
             return
 
         for sharding_option in sharding_options:
-            sharder_key = sharder_name(type(sharding_option.module[1]))
+            sharder_key = sharding_option.module_type_key
             sharder = sharder_map[sharder_key]
 
             caching_ratio = sharding_option.cache_load_factor
@@ -817,6 +823,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         self._sharder_map = {
             sharder_name(sharder.module_type): sharder for sharder in sharders
         }
+        self._sharder_data_map = build_sharder_data_map(self._sharder_map)
         sharding_options: List[ShardingOption] = []
 
         named_modules_queue = [("", module)]
@@ -865,10 +872,14 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                 if device_group and device_group != self._compute_device:
                     continue
 
+                num_buckets = self._get_num_buckets(name, child_module)
                 sharding_options_per_table: List[ShardingOption] = []
 
                 for sharding_type in self._filter_sharding_types(
-                    name, sharder.sharding_types(self._compute_device), child_path
+                    name,
+                    sharder.sharding_types(self._compute_device),
+                    child_path,
+                    sharder_key=sharder_key,
                 ):
                     for compute_kernel in self._filter_compute_kernels(
                         name,
@@ -886,6 +897,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_type=sharding_type,
                             col_wise_shard_dim=col_wise_shard_dim,
                             device_memory_sizes=self._device_memory_sizes,
+                            num_buckets=num_buckets,
                         )
                         dependency = None
                         if isinstance(child_module, EmbeddingTower):
@@ -955,21 +967,53 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
 
         return sharding_options
 
+    def _get_num_buckets(self, parameter: str, module: nn.Module) -> Optional[int]:
+        """Get total_num_buckets for virtual-table sharding, or None."""
+        if isinstance(module, EmbeddingBagCollection):
+            embedding_configs = module.embedding_bag_configs()
+        elif isinstance(module, EmbeddingCollection):
+            embedding_configs = module.embedding_configs()
+        else:
+            return None
+        for config in embedding_configs:
+            if config.name == parameter and getattr(config, "use_virtual_table", False):
+                return getattr(config, "total_num_buckets", None)
+        return None
+
     # pyre-ignore [14]
     def _filter_sharding_types(
-        self, name: str, allowed_sharding_types: List[str], child_path: str
+        self,
+        name: str,
+        allowed_sharding_types: List[str],
+        child_path: str,
+        sharder_key: str = "",
     ) -> List[str]:
         _constraints, key = self._get_constraints(child_path, name)
-        # GRID_SHARD is only supported if specified by user in parameter constraints
+        # GRID_SHARD and row-wise on FP modules require explicit opt-in.
+        is_fp_module = "FeatureProcessedEmbeddingBagCollection" in sharder_key
         if not _constraints or not _constraints.get(key):
-            return [
+            filtered = [
                 t for t in allowed_sharding_types if t != ShardingType.GRID_SHARD.value
             ]
+            if is_fp_module:
+                filtered = [
+                    t
+                    for t in filtered
+                    if t not in GUARDED_SHARDING_TYPES_FOR_FP_MODULES
+                ]
+            return filtered
         constraints: ParameterConstraints = _constraints[key]
         if not constraints.sharding_types:
-            return [
+            filtered = [
                 t for t in allowed_sharding_types if t != ShardingType.GRID_SHARD.value
             ]
+            if is_fp_module:
+                filtered = [
+                    t
+                    for t in filtered
+                    if t not in GUARDED_SHARDING_TYPES_FOR_FP_MODULES
+                ]
+            return filtered
         constrained_sharding_types: List[str] = constraints.sharding_types
 
         filtered_sharding_types = list(

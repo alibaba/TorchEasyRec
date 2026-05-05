@@ -214,3 +214,29 @@ def get_test_enable_tma() -> List[bool]:
             if version.parse(triton.__version__) >= version.parse("3.5.0"):
                 results.append(True)
     return results
+
+
+def reference_stu_truncation(
+    x: torch.Tensor,
+    x_offsets: torch.Tensor,
+    num_targets: Optional[List[int]],
+    truncate_tail_len: int,
+    contextual_seq_len: int = 0,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Plain-Python UIH-only truncation: ``[ctx | last min(U, tail) UIH | targets]``."""
+    chunks: List[torch.Tensor] = []
+    new_lens: List[int] = []
+    for b in range(x_offsets.numel() - 1):
+        s, e = int(x_offsets[b].item()), int(x_offsets[b + 1].item())
+        L = e - s
+        T = int(num_targets[b]) if num_targets is not None else 0
+        U = L - contextual_seq_len - T
+        new_uih = max(0, min(U, truncate_tail_len))
+        prefix = x[s : s + contextual_seq_len]
+        uih_kept = x[
+            s + contextual_seq_len + (U - new_uih) : s + contextual_seq_len + U
+        ]
+        targets = x[e - T : e]
+        chunks.append(torch.cat([prefix, uih_kept, targets], dim=0))
+        new_lens.append(contextual_seq_len + new_uih + T)
+    return torch.cat(chunks, dim=0), new_lens

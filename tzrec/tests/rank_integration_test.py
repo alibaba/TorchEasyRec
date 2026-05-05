@@ -1064,6 +1064,35 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_ultra_hstu_cutlass_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/ultra_hstu_cutlass_kuairand_1k.config",
+            self.test_dir,
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
+            )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path="data/test/kuairand-mot-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,cand_seq__video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
         "dynamicemb not available.",

@@ -281,7 +281,7 @@ feature_configs {
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 - **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
-- **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`/`min`/`max`
+- **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`/`gap_min`/`gap_max`
 - **num_buckets**: 离散化桶数量，设置后输出为离散整数值（value_type为int64），值范围为\[0, num_buckets)
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
 - **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
@@ -308,7 +308,7 @@ feature_configs {
 
 - **map**: 特征FG所依赖map字段的来源
 - **key**: 特征FG所依赖key字段的来源
-- **combiner**: 如果key为多值，可以设置combiner来对查找的值进行聚合，默认为`sum`，支持`sum`/`mean`/`min`/`max`
+- **combiner**: 如果key为多值，可以设置combiner来对查找的值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`/`gap_min`/`gap_max`
 - **need_discrete**: 查到的值是否为离散值，默认为false
 - **need_key**: 查到的值是否拼接key作为前缀，默认为false
 
@@ -324,7 +324,7 @@ feature_configs {
 
 ## MatchFeature: 主从键字典查询特征
 
-`match_feature`依赖`nested_map`和`pkey`和`skey`三个字段从kkv中匹配到特征值。`nested_map`是一个多值的kkv map，如`pk1^sk1:0.2,sk2:0.3,sk3:0.5|pk2^sk4:0.1`，`:`为内层kv分割符，`,`为内层多值分隔符，`^`为外层kv分割符，`|`为外层KV分隔符，分隔符不可以指定。生成特征时，使用`pkey`作为主键`skey`作为子健在`nested_map`字段所持有的kkv对中进行匹配，获取最终的特征。
+`match_feature`依赖`nested_map`和`pkey`和`skey`三个字段从kkv中匹配到特征值。`nested_map`是一个多值的kkv map，如`pk1^sk1:0.2,sk2:0.3,sk3:0.5|pk2^sk4:0.1`，`:`为内层kv分割符，`,`为内层多值分隔符，`^`为外层kv分割符，`|`为外层KV分隔符，分隔符不可以指定；也支持MAP\<K, string>类型（K为string/bigint），如`{"pk1":"sk1:0.2,sk2:0.3,sk3:0.5","pk2":"sk4:0.1"}`（建议，性能更好）。生成特征时，使用`pkey`作为主键`skey`作为子健在`nested_map`字段所持有的kkv对中进行匹配，获取最终的特征。
 
 ```
 feature_configs {
@@ -384,6 +384,7 @@ feature_configs {
   | 函数名      | 参数数量 | 解释                                                                    |
   | ----------- | -------- | ----------------------------------------------------------------------- |
   | rnd         | 0        | Generate a random number between 0 and 1                                |
+  | isnan       | 1        | 输入为NaN时返回1.0，否则返回0.0（pyfg>=1.0.5）                          |
   | sin         | 1        | sine function                                                           |
   | cos         | 1        | cosine function                                                         |
   | tan         | 1        | tangens function                                                        |
@@ -410,10 +411,10 @@ feature_configs {
   | trunc       | 1        | 截断取整（直接去掉小数部分）                                            |
   | round       | 1        | 四舍五入，总是使用"远离零"的舍入方式（round half away from zero）       |
   | roundp      | 2        | 自定义精度取整函数, e.g. roundp(3.14159,2)=3.14                         |
+  | mod         | 2        | 取余, e.g. mod(7,3)=1                                                   |
   | sigmoid     | 1        | sigmoid function                                                        |
   | sphere_dist | 4        | sphere distance between two gps points, args(lng1, lat1, lng2, lat2)    |
   | haversine   | 4        | haversine distance between two gps points, args(lng1, lat1, lng2, lat2) |
-  | sigmoid     | 1        | sigmoid function                                                        |
   | min         | var.     | min of all arguments                                                    |
   | max         | var.     | max of all arguments                                                    |
   | sum         | var.     | sum of all arguments                                                    |
@@ -430,6 +431,7 @@ feature_configs {
   | squared_norm | 1        | squared normalize of a vector                         |
   | dot          | 2        | dot product of two vectors                            |
   | euclid_dist  | 2        | euclidean distance between two vectors                |
+  | corr         | 2        | Pearson correlation coefficient between two vectors   |
   | std_dev      | 1        | standard deviation of a vector, divide n              |
   | pop_std_dev  | 1        | population standard deviation of a vector, divide n-1 |
   | variance     | 1        | sample variance of a vector, divide n                 |

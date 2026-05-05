@@ -121,6 +121,10 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         max_contextual_seq_len (int): contextual feature num.
         enable_interleaving (bool): enable interleaving target or not.
         is_inference (bool): whether to run in inference mode.
+        name (str): MoT channel name; when non-empty, replaces the
+            ``uih`` prefix on UIH-side keys read from
+            ``grouped_features``.  Empty (default) preserves the
+            original ``uih.*`` lookups.
     """
 
     def __init__(
@@ -137,12 +141,17 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         contextual_group_name: str = "contextual",
         enable_interleaving: bool = True,
         is_inference: bool = False,
+        name: str = "",
         **kwargs: Any,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._uih_embedding_dim: int = uih_embedding_dim
         self._target_embedding_dim: int = target_embedding_dim
         self._output_embedding_dim: int = output_embedding_dim
+        self._uih_key: str = name if name else "uih"
+        self._uih_action_key: str = f"{name}_action" if name else "uih_action"
+        self._uih_watchtime_key: str = f"{name}_watchtime" if name else "uih_watchtime"
+        self._uih_timestamp_key: str = f"{name}_timestamp" if name else "uih_timestamp"
 
         self._contextual_feature_dim: int = contextual_feature_dim
         self._max_contextual_seq_len: int = max_contextual_seq_len
@@ -361,8 +370,8 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             output_seq_embeddings (torch.Tensor): output sequence embedding tensor.
             output_num_targets (torch.Tensor): output number of targets.
         """
-        uih_embeddings = grouped_features["uih.sequence"]
-        uih_seq_lengths = grouped_features["uih.sequence_length"]
+        uih_embeddings = grouped_features[f"{self._uih_key}.sequence"]
+        uih_seq_lengths = grouped_features[f"{self._uih_key}.sequence_length"]
         max_uih_len = fx_int_item(uih_seq_lengths.max())
         total_uih_len = fx_int_item(uih_seq_lengths.sum())
 
@@ -417,14 +426,16 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         action_embeddings = None
         if self._action_encoder_cfg is not None:
             action_embeddings = self._action_encoder(
-                seq_actions=grouped_features["uih_action.sequence"].to(torch.int64),
+                seq_actions=grouped_features[f"{self._uih_action_key}.sequence"].to(
+                    torch.int64
+                ),
                 max_uih_len=max_uih_len,
                 max_targets=max_targets,
                 uih_offsets=uih_offsets,
                 target_offsets=target_offsets,
                 total_uih_len=total_uih_len,
                 total_targets=total_targets,
-                seq_watchtimes=grouped_features["uih_watchtime.sequence"]
+                seq_watchtimes=grouped_features[f"{self._uih_watchtime_key}.sequence"]
                 if self._action_encoder.need_watchtime
                 else None,
             ).to(uih_embeddings.dtype)
@@ -436,7 +447,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
             )
 
         seq_timestamps = concat_2D_jagged(
-            values_left=grouped_features["uih_timestamp.sequence"],
+            values_left=grouped_features[f"{self._uih_timestamp_key}.sequence"],
             values_right=grouped_features["candidate_timestamp.sequence"],
             max_len_left=max_uih_len,
             max_len_right=max_targets,

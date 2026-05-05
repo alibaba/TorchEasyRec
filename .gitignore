@@ -44,6 +44,7 @@ docs/source/proto.html
 
 # Download Data
 data/test/kuairand-1k*
+data/test/kuairand-mot-1k*
 
 # Other temp files
 .hypothesis/
