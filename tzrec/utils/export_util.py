@@ -495,7 +495,7 @@ def _get_rtp_embedding_tensor(
                     )
                 with open(
                     os.path.join(
-                        *path_parts[:-1],
+                        os.path.dirname(key_file),
                         f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
                     ),
                     "rb",
@@ -1182,6 +1182,7 @@ def export_distributed_embedding(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
+    **kwargs: Any,
 ) -> List[nn.Module]:
     """Export for online serving under distributed embedding mode."""
     device, _ = init_process_group()
@@ -1311,11 +1312,13 @@ def export_distributed_embedding(
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")
 
-    local_tensor, emb_meta, feat_meta = _get_sparse_embedding_tensor(
-        sparse_model,
-        checkpoint_path,
-        feature_to_embedding_info.values(),
-        feature_to_embedding_bag_info.values(),
+    local_tensor, dynamic_local_tensor, emb_meta, feat_meta = (
+        _get_sparse_embedding_tensor(
+            sparse_model,
+            checkpoint_path,
+            feature_to_embedding_info.values(),
+            feature_to_embedding_bag_info.values(),
+        )
     )
     local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
     save_dir_sparse = f"{save_dir}/sparse"
@@ -1332,6 +1335,18 @@ def export_distributed_embedding(
         np.savez(f, **local_tensor)
         temp_path = f.name
     shutil.move(temp_path, local_tensor_path)
+
+    if dynamic_local_tensor:
+        dynamic_tensor_name = f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
+        dynamic_tensor_path = os.path.join(
+            save_dir_sparse, f"{dynamic_tensor_name}.npz"
+        )
+        logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
+            np.savez(f, **dynamic_local_tensor)
+            temp_path = f.name
+        shutil.move(temp_path, dynamic_tensor_path)
+
     with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
         json.dump(emb_meta, f, indent=4)
     if is_rank_zero:
@@ -1349,7 +1364,7 @@ def export_distributed_embedding(
     for node in graph.nodes:
         if node.op == "output":
             for k, v in sorted(node.args[0].items()):
-                if k == TRAGET_REPEAT_INTERLEAVE_KEY:
+                if k == TARGET_REPEAT_INTERLEAVE_KEY:
                     continue
                 output_keys.append(k)
                 output_values.append(v)
@@ -1480,10 +1495,23 @@ def _merge_sharded_embedding_json(
     for emb_json in emb_json_files:
         for emb_name, info in emb_json.items():
             if emb_name not in merged_json:
+                if info.get("is_dynamic"):
+                    info = dict(info)
+                    info["key_npz_names"] = list(info.get("key_npz_names", []))
+                    info["value_npz_names"] = list(info.get("value_npz_names", []))
                 merged_json[emb_name] = info
             else:
                 merged_json[emb_name]["memory"] += info["memory"]
                 merged_json[emb_name]["shape"][0] += info["shape"][0]
+                if info.get("is_dynamic"):
+                    # npz key names are uniform across ranks (e.g. always
+                    # "user_id_emb.keys"), so dedupe while preserving order.
+                    for k in info.get("key_npz_names", []):
+                        if k not in merged_json[emb_name]["key_npz_names"]:
+                            merged_json[emb_name]["key_npz_names"].append(k)
+                    for v in info.get("value_npz_names", []):
+                        if v not in merged_json[emb_name]["value_npz_names"]:
+                            merged_json[emb_name]["value_npz_names"].append(v)
 
     return merged_json
 
@@ -1523,8 +1551,21 @@ def _get_sparse_embedding_tensor(
     checkpoint_path: str,
     embedding_infos: List[BaseEmbeddingConfig],
     embedding_bag_info: List[BaseEmbeddingConfig],
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    """Get Embedding Tensors for sparse part."""
+) -> Tuple[
+    Dict[str, torch.Tensor],
+    Dict[str, torch.Tensor],
+    Dict[str, Any],
+    Dict[str, Any],
+]:
+    """Get Embedding Tensors for sparse part.
+
+    Returns:
+        out: regular sparse embedding tensors keyed by emb_name.
+        dynamic_out: dynamicemb keys/values keyed by composite names. Empty if
+            no dynamic embedding tables exist.
+        emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
+        feat_meta: feature -> embedding_name / pooling mapping.
+    """
     emb_name_to_emb_dim = dict()
     feat_name_to_pooling = dict()
 
@@ -1564,8 +1605,21 @@ def _get_sparse_embedding_tensor(
         return src
 
     out = {}
+    # dynamicemb keys/values are saved into a separate npz, kept in this dict.
+    dynamic_out = {}
     # shard_offsets = {}
     value_name_to_key = {}
+    # per-table representative tensor used only for meta (shape/dtype/memory).
+    # dynamicemb tables are stored in `dynamic_out` under composite keys, so we
+    # track a separate mapping keyed by emb_name here.
+    emb_name_to_meta_tensor = {}
+    # set of emb_names that are dynamic embedding tables (loaded from
+    # checkpoint's `dynamicemb/` directory rather than model state_dict).
+    dynamic_emb_names = set()
+    # per-emb_name list of npz keys (composite names) for dynamic tables on
+    # this rank, used to make meta self-contained.
+    dynamic_key_npz_names = defaultdict(list)
+    dynamic_value_npz_names = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
@@ -1591,11 +1645,13 @@ def _get_sparse_embedding_tensor(
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
                             out[emb_name] = local_tensor
+                            emb_name_to_meta_tensor[emb_name] = local_tensor
                             value_name_to_key[feat_name_impl] = None
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
             out[emb_name] = values
+            emb_name_to_meta_tensor[emb_name] = values
             value_name_to_key[feat_name_impl] = None
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
@@ -1622,7 +1678,7 @@ def _get_sparse_embedding_tensor(
                     )
                 with open(
                     os.path.join(
-                        *path_parts[:-1],
+                        os.path.dirname(key_file),
                         f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
                     ),
                     "rb",
@@ -1630,26 +1686,34 @@ def _get_sparse_embedding_tensor(
                     values = torch.tensor(
                         np.fromfile(f, dtype=np.float32), dtype=torch.float32
                     )
-                key_name = f"{path_parts[-2]}.{emb_name}.keys/part_{idx}_{num_shards}"
-                value_name = (
-                    f"{path_parts[-2]}.{emb_name}.values/part_{idx}_{num_shards}"
-                )
-                out[key_name] = keys
-                out[value_name] = values.view([-1, emb_dim])
+                key_name = f"{emb_name}.keys"
+                value_name = f"{emb_name}.values"
+                values_2d = values.view([-1, emb_dim])
+                dynamic_out[key_name] = keys
+                dynamic_out[value_name] = values_2d
+                emb_name_to_meta_tensor[emb_name] = values_2d
                 value_name_to_key[value_name] = key_name
+                dynamic_emb_names.add(emb_name)
+                dynamic_key_npz_names[emb_name].append(key_name)
+                dynamic_value_npz_names[emb_name].append(value_name)
 
     # TODO(hongsheng.jhs): support mczch
 
     emb_meta = {}
     for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():
-        values = out[emb_name]
+        if emb_name not in emb_name_to_meta_tensor:
+            # table not present on this rank (e.g. sharded to other ranks)
+            continue
+        values = emb_name_to_meta_tensor[emb_name]
         dimension = list(values.shape)[-1]
         dtype = _remove_prefix(str(values.dtype))
         memory: int = int(values.nbytes)
         shape = list(values.shape)
+        is_dynamic = emb_name in dynamic_emb_names
         t_meta = {
             "feat_name_impl": feat_name_impl_list,
             "dense": False,
+            "is_dynamic": is_dynamic,
             "dimension": dimension,
             "dtype": dtype,
             "memory": memory,
@@ -1657,13 +1721,12 @@ def _get_sparse_embedding_tensor(
             # "shard_offsets": shard_offsets[name],
             # "pooling": feat_name_to_pooling[name],
         }
-        # if key_name is not None:
-        #     t_meta["hashmap_value"] = name
-        #     t_meta["hashmap_key"] = key_name
-        #     t_meta["hashmap_key_dtype"] = "int64"
-        #     t_meta["is_hashmap"] = True
-        # else:
-        #     t_meta["is_hashmap"] = False
+        if is_dynamic:
+            # composite npz keys inside sparse_dynamic_embedding-*.npz on this
+            # rank. Merged across ranks by _merge_sharded_embedding_json.
+            t_meta["key_dtype"] = "int64"
+            t_meta["key_npz_names"] = list(dynamic_key_npz_names[emb_name])
+            t_meta["value_npz_names"] = list(dynamic_value_npz_names[emb_name])
         emb_meta[emb_name] = t_meta
 
     feat_meta = {}
@@ -1673,4 +1736,4 @@ def _get_sparse_embedding_tensor(
             "pooling": feat_name_to_pooling[feat_name_impl],
         }
         feat_meta[feat_name_impl] = t_meta
-    return out, emb_meta, feat_meta
+    return out, dynamic_out, emb_meta, feat_meta
