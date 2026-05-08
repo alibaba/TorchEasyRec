@@ -103,7 +103,10 @@ class HSTUTransducer(BaseModule):
             name=name,
         )
         stu = dict(stu)
-        if "contextual_seq_len" not in stu:
+        # contextual_seq_len has [default = -1]; < 0 means "use the
+        # preprocessor fallback" so the input_preprocessor's value isn't
+        # silently shadowed by config_to_kwargs's default-zero fill.
+        if stu.get("contextual_seq_len", -1) < 0:
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
         if "scaling_seqlen" not in stu:
             stu["scaling_seqlen"] = scaling_seqlen

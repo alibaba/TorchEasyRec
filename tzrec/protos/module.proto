@@ -253,8 +253,9 @@ message STU {
     optional bool recompute_y = 11 [default = true];
     // whether to sort by sequence length when forwarding
     optional bool sort_by_length = 12 [default = true];
-    // sequence length of contextual feature
-    optional uint32 contextual_seq_len = 13;
+    // sequence length of contextual feature; < 0 (default) = use the
+    // input preprocessor's contextual_seq_len().
+    optional int32 contextual_seq_len = 13 [default = -1];
     // Semi-Local Attention: local causal window size (0 = disabled)
     optional uint32 sla_k1 = 14;
     // Semi-Local Attention: global prefix length (0 = disabled)
