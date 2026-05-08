@@ -305,3 +305,38 @@ torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 ```bash
 pip install --force-reinstall --no-deps "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
 ```
+
+______________________________________________________________________
+
+**Q16: DlrmHSTU/UltraHSTU AOTI sample-input autotune导出报错 `_assert_scalar(u? <= K)`**
+
+**报错信息：**
+
+```
+torch._inductor.exc.InductorError: RuntimeError: Runtime assertion failed for expression u0 <= 2002 on node 'le_5'
+While executing %_assert_scalar_1 = call_function[target=torch.ops.aten._assert_scalar.default](args = (%le, "Runtime assertion failed for expression u0 <= 2002 on node 'le_5'"), kwargs = {})
+```
+
+**原因：** 开启`AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=1`后，AOTI在`extract_autotune_inputs`中通过`torch.fx.Interpreter`走一次sample-input图，会触达由torch.export插入的`_assert_scalar(u_i <= K)`节点。这里：
+
+- `u0/u2` 是 `max(uih_seq_lengths).item() / max(num_targets).item()`等data-dependent unbacked SymInt（见`tzrec/modules/gr/preprocessors.py:375-381`）；
+- `tzrec/ops/utils.py:74` 的 `torch._check(max_len >= runtime_max_seq_len)` 在 `runtime_max_seq_len = max_uih_len + max_targets + max_contextual_seq_len`（见`preprocessors.py:283 + :325`）替换之后，给出 sum 上界 `u0 + u2 ≤ max_seq_len − max_contextual_seq_len`；sympy 进一步用 `u2 ≥ 1` 推出 per-symbol 上界 `u0 ≤ max_seq_len − max_contextual_seq_len − 1`；
+- PyTorch对unbacked SymInt的`node.hint`在创建时一次性赋值（约等于`max_seq_len`），后续`torch._check`只更新value-range而不回填hint；当hint大于 per-symbol 上界时 sample-input 走graph会触发 assert。
+
+**解决方法：** 调大`model_config.max_seq_len`使派生上界跳过hint，同时通过新增的`stu.scaling_seqlen`把attention scaling分母固定为原`max_seq_len`，保持推理跟训练时计算完全一致。例：原`max_seq_len: 2048`、`max_contextual_seq_len = 45`，per-symbol 上界 `2048 − 45 − 1 = 2002` 被 hint=2048 打破；改为：
+
+```protobuf
+model_config {
+  dlrm_hstu {
+    hstu {
+      stu {
+        # ...其余字段不变...
+        scaling_seqlen: 2048   # 与训练时相同；保持attention scaling
+      }
+    }
+    max_seq_len: 2112          # 原2048 + 余量；新 per-symbol 上界 2112−45−1 = 2066 > hint
+  }
+}
+```
+
+具体余量需大于`max_contextual_seq_len + 1`（`max_contextual_seq_len` = contextual feature group的特征数）。

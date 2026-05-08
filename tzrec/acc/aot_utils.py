@@ -15,9 +15,6 @@ from typing import Any, Dict, Optional, Set, Union
 
 import torch
 from torch import nn
-from torch._export.passes.remove_runtime_assertions import (
-    _RemoveRuntimeAssertionsPass,
-)
 
 from tzrec.acc.utils import is_autotune_with_sample_inputs, is_unified_aot_predict
 from tzrec.models.model import (
@@ -44,22 +41,6 @@ def _aoti_compile_cfg() -> Dict[str, Any]:
     if is_autotune_with_sample_inputs():
         cfg["triton.autotune_with_sample_inputs"] = True
     return cfg
-
-
-def _strip_runtime_asserts_for_sample_input_autotune(
-    exported_pg: torch.export.ExportedProgram,
-) -> None:
-    """Strip runtime asserts before sample-input autotune.
-
-    Sample-input autotune walks the FX graph via ``torch.fx.Interpreter``,
-    which crashes on ``_assert_scalar`` / ``sym_constrain_*`` ops; strip
-    them when ``AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS`` is on. No-op otherwise.
-    """
-    if not is_autotune_with_sample_inputs():
-        return
-    pass_result = _RemoveRuntimeAssertionsPass()(exported_pg.graph_module)
-    if pass_result.modified:
-        exported_pg.graph_module.recompile()
 
 
 def load_model_aot(
@@ -186,7 +167,6 @@ def export_model_aot(
             args=(sparse_output,),
             dynamic_shapes=(dynamic_shapes,),
         )
-    _strip_runtime_asserts_for_sample_input_autotune(exported_pg)
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
@@ -453,7 +433,6 @@ def export_unified_model_aot(
             args=(data,),
             dynamic_shapes=(dynamic_shapes,),
         )
-    _strip_runtime_asserts_for_sample_input_autotune(exported_pg)
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
