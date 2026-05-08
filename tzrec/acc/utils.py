@@ -158,14 +158,17 @@ def is_autotune_with_sample_inputs() -> bool:
     """Judge whether AOTI should autotune with realized sample inputs.
 
     AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=1: enable inductor's
-    ``triton.autotune_with_sample_inputs``. Pairs with
-    ``_RemoveRuntimeAssertionsPass`` at the AOTI compile site —
-    sample-input autotune walks the FX graph via
-    ``torch.fx.Interpreter`` which crashes on ``_assert_scalar`` /
-    ``sym_constrain_*`` ops upstream
-    ``_AddRuntimeAssertionsForInlineConstraintsPass`` inserts.
-    AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=0 (default): inductor's default —
-    autotune benches with random tensors (``rand_strided``).
+    ``triton.autotune_with_sample_inputs``. Sample-input autotune walks
+    the FX graph via ``torch.fx.Interpreter``, dispatching
+    ``_assert_scalar`` / ``sym_constrain_*`` nodes that
+    ``_AddRuntimeAssertionsForInlineConstraintsPass`` inserts upstream.
+    If a node's predicate evaluates False on the materialized hint --
+    typical for HSTU's data-dependent unbacked SymInts when the hint
+    exceeds the derived bound -- AOTI compile aborts. Mitigate via
+    ``stu.scaling_seqlen`` plus a bumped ``model_config.max_seq_len``
+    (see FAQ Q16). AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=0 (default):
+    inductor's default -- autotune benches with random tensors
+    (``rand_strided``).
     """
     val = os.environ.get("AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS")
     return bool(val) and val[0] == "1"

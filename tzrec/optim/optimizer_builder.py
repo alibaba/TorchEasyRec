@@ -51,12 +51,11 @@ def create_sparse_optimizer(
     if optimizer_type == "sgd_optimizer":
         return optimizers.SGD, optimizer_kwargs
     elif optimizer_type == "adagrad_optimizer":
-        if "initial_accumulator_value" in optimizer_kwargs:
+        # config_to_kwargs emits every optional field with its zero default.
+        init_acc = optimizer_kwargs.pop("initial_accumulator_value", 0)
+        if init_acc:
             # see apply_split_helper function patch in tzrec.optim.optimizer.py
-            os.environ["FBGEMM_MOMENTUM1_STATE_INIT_VALUE"] = str(
-                optimizer_kwargs["initial_accumulator_value"]
-            )
-            optimizer_kwargs.pop("initial_accumulator_value")
+            os.environ["FBGEMM_MOMENTUM1_STATE_INIT_VALUE"] = str(init_acc)
         return optimizers.Adagrad, optimizer_kwargs
     elif optimizer_type == "adam_optimizer":
         return optimizers.Adam, optimizer_kwargs

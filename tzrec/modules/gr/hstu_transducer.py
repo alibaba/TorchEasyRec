@@ -108,7 +108,8 @@ class HSTUTransducer(BaseModule):
         # silently shadowed by config_to_kwargs's default-zero fill.
         if stu.get("contextual_seq_len", -1) < 0:
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
-        if "scaling_seqlen" not in stu:
+        # scaling_seqlen has [default = -1]; < 0 means "use the kwarg fallback".
+        if stu.get("scaling_seqlen", -1) < 0:
             stu["scaling_seqlen"] = scaling_seqlen
         self._stu_module: STUStack = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
