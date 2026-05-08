@@ -169,7 +169,13 @@ class HSTUTransducerTest(unittest.TestCase):
         # seq_offsets / max_seq_len come from the post-STU outputs.
         self.assertIs(out_offsets, post_stu_seq_offsets)
         self.assertEqual(out_max, post_stu_max_seq_len)
-        expected_total_uih = s["plan"].total_kept - s["total_targets"]
+        # Post-truncation total UIH includes the contextual prefix per
+        # sample (still alive after truncation) plus the new UIH tail; the
+        # plan's ``total_kept`` is the rest portion only, so add
+        # ``total_prefix = B * contextual_seq_len`` back in.
+        expected_total_uih = (
+            s["plan"].total_kept + s["plan"].total_prefix - s["total_targets"]
+        )
         self.assertEqual(out_total_uih, expected_total_uih)
 
     # ---------- forward() end-to-end integration tests ----------

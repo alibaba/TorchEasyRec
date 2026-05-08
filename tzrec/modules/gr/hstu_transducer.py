@@ -273,9 +273,18 @@ class HSTUTransducer(BaseModule):
         """Replay ``plan`` on ``seq_timestamps`` and refresh dependent metadata.
 
         ``plan is None`` -> inputs unchanged.  Otherwise returns the
-        post-truncation tuple; ``post_truncation_total_uih_len`` =
-        ``plan.total_kept - total_targets`` (a static int, so the
-        downstream ``split_2D_jagged`` skips its ``.item()`` fallback).
+        post-truncation tuple; the ``post_truncation_total_uih_len``
+        component is ``plan.total_kept + plan.total_prefix -
+        total_targets`` (a static int, so the downstream
+        ``split_2D_jagged`` skips its ``.item()`` fallback).  ``total_kept``
+        is the post-truncation "rest" portion only -- excluding the
+        contextual prefix -- so we add ``total_prefix`` (= ``B *
+        contextual_seq_len``, 0 when ``contextual_seq_len == 0``) back in
+        to match the layout that ``_postprocess`` derives from
+        ``seq_lengths - num_targets`` (which still includes the
+        contextual prefix per sample).  Without that add-back, the
+        Triton/CUTLASS ``split_2D_jagged`` allocates ``OutA`` smaller than
+        ``offsets_left[-1]`` and writes OOB on the first forward.
         """
         if plan is None:
             return (
@@ -293,7 +302,7 @@ class HSTUTransducer(BaseModule):
             plan.new_lengths,
             post_stu_seq_offsets,
             post_stu_max_seq_len,
-            plan.total_kept - total_targets,
+            plan.total_kept + plan.total_prefix - total_targets,
         )
 
     def forward(
