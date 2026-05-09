@@ -103,12 +103,11 @@ class HSTUTransducer(BaseModule):
             name=name,
         )
         stu = dict(stu)
-        # contextual_seq_len has [default = -1]; < 0 means "use the
-        # preprocessor fallback" so the input_preprocessor's value isn't
-        # silently shadowed by config_to_kwargs's default-zero fill.
+        # `< 0` sentinel = fall back; explicit 0 means "no contextual".
+        # `not in stu` is unreachable -- config_to_kwargs's
+        # including_default_value_fields=True always populates the key.
         if stu.get("contextual_seq_len", -1) < 0:
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
-        # scaling_seqlen has [default = -1]; < 0 means "use the kwarg fallback".
         if stu.get("scaling_seqlen", -1) < 0:
             stu["scaling_seqlen"] = scaling_seqlen
         self._stu_module: STUStack = STUStack(
@@ -272,19 +271,12 @@ class HSTUTransducer(BaseModule):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         """Replay ``plan`` on ``seq_timestamps`` and refresh dependent metadata.
 
-        ``plan is None`` -> inputs unchanged.  Otherwise returns the
-        post-truncation tuple; the ``post_truncation_total_uih_len``
-        component is ``plan.total_kept + plan.total_prefix -
-        total_targets`` (a static int, so the downstream
-        ``split_2D_jagged`` skips its ``.item()`` fallback).  ``total_kept``
-        is the post-truncation "rest" portion only -- excluding the
-        contextual prefix -- so we add ``total_prefix`` (= ``B *
-        contextual_seq_len``, 0 when ``contextual_seq_len == 0``) back in
-        to match the layout that ``_postprocess`` derives from
-        ``seq_lengths - num_targets`` (which still includes the
-        contextual prefix per sample).  Without that add-back, the
-        Triton/CUTLASS ``split_2D_jagged`` allocates ``OutA`` smaller than
-        ``offsets_left[-1]`` and writes OOB on the first forward.
+        ``plan is None`` -> inputs unchanged.  Otherwise the returned
+        ``post_truncation_total_uih_len`` is ``plan.total_kept +
+        plan.total_prefix - total_targets`` (static int -- skips
+        ``split_2D_jagged``'s ``.item()`` fallback).  ``total_prefix``
+        is the add-back for the contextual prefix that ``total_kept``
+        excludes; see ``STUTruncationPlan.total_kept``.
         """
         if plan is None:
             return (

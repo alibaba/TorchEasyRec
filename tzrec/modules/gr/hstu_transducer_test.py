@@ -286,6 +286,71 @@ class HSTUTransducerTest(unittest.TestCase):
         # return_full_embeddings=False (default), so encoded_embeddings is None.
         self.assertIsNone(encoded_embeddings)
 
+    # ---------- contextual_seq_len resolution contract ----------
+
+    @parameterized.expand(
+        [
+            # name,                stu_value,   preprocessor_cs,   expected
+            ("absent_falls_back", None, 5, 5),  # key not in dict (manual dict)
+            ("sentinel_falls_back", -1, 5, 5),  # proto-default fill (-1)
+            ("explicit_zero_wins", 0, 5, 0),  # user explicit "no contextual"
+            ("explicit_positive_wins", 3, 5, 3),  # user explicit override
+        ]
+    )
+    def test_contextual_seq_len_resolution(
+        self,
+        _name: str,
+        stu_value: object,
+        preprocessor_cs: int,
+        expected: int,
+    ) -> None:
+        """Pin the ``stu.get("contextual_seq_len", -1) < 0`` semantics.
+
+        Three states must resolve correctly: absent / sentinel-fill / user
+        override.  ``not in stu`` would pass the absent case but not the
+        sentinel-fill case (which is what ``config_to_kwargs`` produces in
+        production via ``MessageToDict(including_default_value_fields=True)``).
+        """
+        stub_pre = _StubInputPreprocessor(
+            lengths=[8, 12],
+            targets=[1, 2],
+            embedding_dim=16,
+            contextual_seq_len=preprocessor_cs,
+        )
+        stub_post = _StubOutputPostprocessor()
+        stu_kwargs: Dict[str, object] = {
+            "embedding_dim": 16,
+            "num_heads": 2,
+            "hidden_dim": 32,
+            "attention_dim": 32,
+            "output_dropout_ratio": 0.0,
+            "causal": True,
+            "target_aware": True,
+        }
+        if stu_value is not None:
+            stu_kwargs["contextual_seq_len"] = stu_value
+        with (
+            patch(
+                "tzrec.modules.gr.hstu_transducer.create_input_preprocessor",
+                return_value=stub_pre,
+            ),
+            patch(
+                "tzrec.modules.gr.hstu_transducer.create_output_postprocessor",
+                return_value=stub_post,
+            ),
+        ):
+            transducer = HSTUTransducer(
+                uih_embedding_dim=16,
+                target_embedding_dim=16,
+                stu=stu_kwargs,
+                attn_num_layers=2,
+                input_preprocessor={"contextual_preprocessor": {}},
+                output_postprocessor={"l2norm_postprocessor": {}},
+                is_inference=False,
+            )
+        for layer in transducer._stu_module._stu_layers:
+            self.assertEqual(layer._contextual_seq_len, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

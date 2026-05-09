@@ -68,13 +68,10 @@ def build_sla_func_tensor(
         device: target device (inferred from seq_offsets if None).
 
     Returns:
-        func tensor of shape (nheads, 3, total_q), dtype int32. The result
-        is a strided view (stride 0 on the head dim); the consumer
-        ``cutlass_hstu_mha`` (an ``@torch.fx.wrap``'d FX leaf) calls
-        ``.contiguous()`` itself at runtime, which keeps Inductor from
-        invoking ``combine_contiguous_dims`` on the symbolic-last-dim
-        broadcast and triggering a sympy ``ZeroDivisionError`` at AOT
-        compile.
+        func tensor of shape (nheads, 3, total_q), dtype int32, as a
+        strided view (stride 0 on the head dim).  The FX-leaf consumer
+        ``cutlass_hstu_mha`` materializes it via ``.contiguous()`` at
+        runtime.
     """
     if sla_k1 < 0 or sla_k2 < 0 or contextual_seq_len < 0:
         raise ValueError(
@@ -95,25 +92,15 @@ def build_sla_func_tensor(
     seq_lengths = torch.diff(seq_offsets_i32)  # (B,)
     B = seq_lengths.size(0)
     pos_global = torch.arange(total_q, device=device, dtype=torch.int32)
-    # Build the per-position (sample-start-offset, sample-length, sample-target-count)
-    # arrays via ``torch.repeat_interleave(values, lengths)`` directly
-    # instead of constructing an explicit ``batch_ids = repeat_interleave(
-    # arange(B), seq_lengths)`` tensor and then doing
-    # ``seq_offsets[batch_ids]`` / ``seq_lengths[batch_ids]`` /
-    # ``num_targets[batch_ids]``. The latter chain has Inductor materialize
-    # ``batch_ids`` as a separate kernel input and emit
-    # ``tl.device_assert(0 <= batch_ids < B)`` on the loaded value, which
-    # fires under AOTI compile-time autotune (the bench fills the input
-    # with ``rand_strided`` int32 garbage that almost never satisfies the
-    # bound, aborting export with a device-side assert). The
-    # ``repeat_interleave(values, lengths)`` form lowers to a single
-    # cumsum-driven scatter / gather pattern (no per-kernel
-    # indirect-indexing assert), which sidesteps the autotune failure
-    # while staying mathematically equivalent.
-    seq_offsets_starts = seq_offsets_i32.narrow(0, 0, B).contiguous()  # (B,)
+    # Use `repeat_interleave(values, lengths)` directly per slot, not
+    # `values[batch_ids]`. The latter has Inductor emit an indirect-
+    # indexing bounds-check assert that fires under AOTI autotune (bench
+    # fills batch_ids with rand_strided int32 garbage); the
+    # (values, lengths) form lowers without that codegen.
+    seq_offsets_starts = seq_offsets_i32.narrow(0, 0, B).contiguous()
     seq_offsets_per_pos = torch.repeat_interleave(seq_offsets_starts, seq_lengths)
     pos_local = pos_global - seq_offsets_per_pos
-    L = torch.repeat_interleave(seq_lengths, seq_lengths)  # per-position seq length
+    L = torch.repeat_interleave(seq_lengths, seq_lengths)
     if num_targets is not None:
         T = torch.repeat_interleave(num_targets.to(torch.int32), seq_lengths)
     else:
@@ -137,12 +124,10 @@ def build_sla_func_tensor(
     col_max1 = torch.where(is_history, hist_col_max1, H_boundary)
 
     func_2d = torch.stack([col_max0, col_min0, col_max1], dim=0)  # (3, total_q)
-    # Return a strided view; the consumer ``cutlass_hstu_mha`` (FX leaf)
-    # calls ``.contiguous()`` at runtime. Avoiding ``.contiguous()``
-    # here keeps Inductor from running ``combine_contiguous_dims`` on
-    # the (nheads, 3, total_q) iteration with symbolic last dim, which
-    # would emit ``ModularIndexing(idx, total_q, 3)`` whose sympy
-    # simplifier raises ``ZeroDivisionError`` during AOT compile.
+    # Return the strided view; the FX-leaf consumer `cutlass_hstu_mha`
+    # calls `.contiguous()` at runtime. Doing it here triggers
+    # `combine_contiguous_dims` -> `ModularIndexing(.., total_q, 3)`
+    # -> sympy ZeroDivisionError under AOT compile.
     return func_2d.unsqueeze(0).expand(nheads, 3, total_q)
 
 
@@ -164,7 +149,10 @@ class STUTruncationPlan:
         total_dropped: ``offsets_head[-1]`` as a static int; passed
             to ``split_2D_jagged`` as ``total_len_left`` to skip its
             ``.item()`` fallback under fx / AOT export.
-        total_kept: ``offsets_tail[-1]`` as a static int.
+        total_kept: ``offsets_tail[-1]`` as a static int.  Excludes the
+            contextual prefix (= ``sum(new_lengths - contextual_seq_len)``,
+            not ``sum(new_lengths)``); add ``total_prefix`` back to get
+            the full post-truncation total.
         offsets_prefix: contextual-prefix cumulative offsets ``(B+1,)``;
             only set when ``contextual_seq_len > 0``.
         offsets_rest: post-prefix cumulative offsets ``(B+1,)``;
@@ -255,19 +243,12 @@ def compute_stu_truncation_plan(
             * contextual_seq_len
         )
         offsets_rest = x_offsets - offsets_prefix
-        # ``new_x_offsets[i] = sum(new_lengths[0..i-1]) = sum(seq[0..i-1])
-        # - sum(drop[0..i-1]) = x_offsets[i] - offsets_head[i]`` -- a
-        # plain subtraction of two existing offsets. Mathematically
-        # equivalent to ``offsets_prefix + offsets_tail`` but does NOT
-        # route the post-truncation ``seq_offsets`` through
-        # ``arange(B+1) * contextual_seq_len``. The arange-mul form lets
-        # Inductor inline ``new_x_offsets[batch_ids] = cs * batch_ids +
-        # offsets_tail[batch_ids]`` into the downstream SLA func builder
-        # kernel, surfacing ``B`` as a kernel parameter and triggering
-        # ``tl.device_assert(0 <= batch_ids < ks)`` -- which fails under
-        # AOTI compile-time autotune (random ``rand_strided`` int32
-        # garbage). Rerouting through the cumsum-based subtraction
-        # leaves ``cs`` outside the seq_offsets dependency chain.
+        # `x_offsets - offsets_head` is math-equivalent to
+        # `offsets_prefix + offsets_tail` (= sum(new_lengths[0..i-1]))
+        # but keeps `arange(B+1)*cs` out of post-truncation seq_offsets,
+        # so the SLA builder kernel doesn't end up inlining
+        # `cs*batch_ids` and surfacing B (which would trigger the
+        # AOT autotune-bench bounds-check assert).
         new_x_offsets = x_offsets - offsets_head
         total_prefix = B_static * contextual_seq_len
         total_rest = fx_int_item(offsets_rest[-1])
