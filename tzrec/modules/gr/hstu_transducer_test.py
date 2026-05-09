@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 from unittest.mock import patch
 
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
 from tzrec.ops import Kernel
@@ -253,64 +253,62 @@ class HSTUTransducerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # (name, split, tail, interleave, ppr_cs, stu_cs, expected_cs,
-            #  lengths, targets)
             # Truncation/interleave matrix -- ``stu_cs=None`` (key absent
             # from the stu dict) falls back to the preprocessor's value.
-            (
+            param(
                 "disabled_baseline",
-                0,
-                0,
-                False,
-                0,
-                None,
-                0,
-                [12, 20, 5, 30],
-                [2, 3, 1, 2],
+                split=0,
+                tail=0,
+                interleave=False,
+                ppr_cs=0,
+                stu_cs=None,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 3, 1, 2],
             ),
-            (
+            param(
                 "truncation_plain",
-                1,
-                4,
-                False,
-                0,
-                None,
-                0,
-                [12, 20, 5, 30],
-                [2, 3, 1, 2],
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=0,
+                stu_cs=None,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 3, 1, 2],
             ),
-            (
+            param(
                 "interleave_no_ctx",
-                1,
-                4,
-                True,
-                0,
-                None,
-                0,
-                [12, 20, 5, 30],
-                [2, 4, 2, 2],
+                split=1,
+                tail=4,
+                interleave=True,
+                ppr_cs=0,
+                stu_cs=None,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 4, 2, 2],
             ),
-            (
+            param(
                 "contextual_prefix",
-                1,
-                4,
-                False,
-                3,
-                None,
-                3,
-                [15, 22, 8, 30],
-                [2, 3, 1, 2],
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=None,
+                expected_cs=3,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 3, 1, 2],
             ),
-            (
+            param(
                 "interleave_plus_ctx",
-                1,
-                4,
-                True,
-                3,
-                None,
-                3,
-                [15, 22, 8, 30],
-                [2, 4, 2, 2],
+                split=1,
+                tail=4,
+                interleave=True,
+                ppr_cs=3,
+                stu_cs=None,
+                expected_cs=3,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 4, 2, 2],
             ),
             # Sentinel-resolution contract on the same forward path.
             # ``stu_cs=-1`` is what config_to_kwargs's
@@ -320,38 +318,38 @@ class HSTUTransducerTest(unittest.TestCase):
             # from the user must take precedence.  Catches a regression
             # to ``not in stu`` (which would silently pass the
             # ``stu_cs=None`` rows but break the ``stu_cs=-1`` row).
-            (
+            param(
                 "sentinel_fill_falls_back",
-                1,
-                4,
-                False,
-                3,
-                -1,
-                3,
-                [15, 22, 8, 30],
-                [2, 3, 1, 2],
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=-1,
+                expected_cs=3,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 3, 1, 2],
             ),
-            (
+            param(
                 "explicit_zero_overrides",
-                1,
-                4,
-                False,
-                3,
-                0,
-                0,
-                [12, 20, 5, 30],
-                [2, 3, 1, 2],
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=0,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 3, 1, 2],
             ),
-            (
+            param(
                 "explicit_positive_overrides",
-                1,
-                4,
-                False,
-                3,
-                5,
-                5,
-                [15, 22, 8, 30],
-                [2, 3, 1, 2],
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=5,
+                expected_cs=5,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 3, 1, 2],
             ),
         ]
     )
