@@ -23,39 +23,6 @@ from tzrec.utils.fx_util import fx_int_item
 torch.fx.wrap(fx_int_item)
 
 
-# Register a black-box op for the (3, total_q) -> (nheads, 3, total_q)
-# broadcast so Inductor doesn't try to lower it as a Pointwise.  Inductor's
-# combine_contiguous_dims for that 3D iteration with symbolic last dim
-# emits ModularIndexing(idx, total_q, 3) whose sympy simplifier hits a
-# ZeroDivisionError during AOT compile.  Use the low-level
-# torch.library.define/impl/register_fake API (matching the convention in
-# ``cutlass_hstu_attention.py``) rather than ``@torch.library.custom_op``
-# to avoid the AOTI multi-thread-predict deadlock the latter triggers.
-_SLA_LIB = torch.library.Library("tzrec", "FRAGMENT")
-_SLA_LIB.define("_sla_broadcast_func_to_heads(Tensor func_2d, int nheads) -> Tensor")
-
-
-def _sla_broadcast_func_to_heads_impl(
-    func_2d: torch.Tensor, nheads: int
-) -> torch.Tensor:
-    return func_2d.unsqueeze(0).expand(nheads, *func_2d.shape).contiguous()
-
-
-def _sla_broadcast_func_to_heads_meta(
-    func_2d: torch.Tensor, nheads: int
-) -> torch.Tensor:
-    return torch.empty(
-        nheads, *func_2d.shape, dtype=func_2d.dtype, device=func_2d.device
-    )
-
-
-_SLA_LIB.impl("_sla_broadcast_func_to_heads", _sla_broadcast_func_to_heads_impl, "CUDA")
-_SLA_LIB.impl("_sla_broadcast_func_to_heads", _sla_broadcast_func_to_heads_impl, "CPU")
-torch.library.register_fake("tzrec::_sla_broadcast_func_to_heads")(
-    _sla_broadcast_func_to_heads_meta
-)
-
-
 def build_sla_func_tensor(
     nheads: int,
     sla_k1: int,
@@ -101,8 +68,10 @@ def build_sla_func_tensor(
         device: target device (inferred from seq_offsets if None).
 
     Returns:
-        func tensor of shape (nheads, 3, total_q), dtype int32, contiguous
-        (head dim materialized inside ``_sla_broadcast_func_to_heads``).
+        func tensor of shape (nheads, 3, total_q), dtype int32, as a
+        strided view (stride 0 on the head dim).  The FX-leaf consumer
+        ``cutlass_hstu_mha`` materializes it via ``.contiguous()`` at
+        runtime.
     """
     if sla_k1 < 0 or sla_k2 < 0 or contextual_seq_len < 0:
         raise ValueError(
@@ -123,15 +92,17 @@ def build_sla_func_tensor(
     seq_lengths = torch.diff(seq_offsets_i32)  # (B,)
     B = seq_lengths.size(0)
     pos_global = torch.arange(total_q, device=device, dtype=torch.int32)
-    batch_ids = torch.repeat_interleave(
-        torch.arange(B, device=device, dtype=torch.int32),
-        seq_lengths,
-    )
-    pos_local = pos_global - seq_offsets_i32[batch_ids]
-    L = seq_lengths[batch_ids]  # per-position sequence length
-
+    # Use `repeat_interleave(values, lengths)` directly per slot, not
+    # `values[batch_ids]`. The latter has Inductor emit an indirect-
+    # indexing bounds-check assert that fires under AOTI autotune (bench
+    # fills batch_ids with rand_strided int32 garbage); the
+    # (values, lengths) form lowers without that codegen.
+    seq_offsets_starts = seq_offsets_i32.narrow(0, 0, B).contiguous()
+    seq_offsets_per_pos = torch.repeat_interleave(seq_offsets_starts, seq_lengths)
+    pos_local = pos_global - seq_offsets_per_pos
+    L = torch.repeat_interleave(seq_lengths, seq_lengths)
     if num_targets is not None:
-        T = num_targets.to(torch.int32)[batch_ids]  # per-position target count
+        T = torch.repeat_interleave(num_targets.to(torch.int32), seq_lengths)
     else:
         T = torch.zeros_like(pos_local)
     # Clamp so pathological inputs (num_targets[b] > seq_lengths[b]) can't
@@ -153,10 +124,11 @@ def build_sla_func_tensor(
     col_max1 = torch.where(is_history, hist_col_max1, H_boundary)
 
     func_2d = torch.stack([col_max0, col_min0, col_max1], dim=0)  # (3, total_q)
-    # Custom op (black-box to Inductor) does the head-dim broadcast +
-    # contiguous-ification.  See the op definition above for the AOT
-    # codegen reason; cannot use plain ``.unsqueeze(0).expand(...)`` here.
-    return torch.ops.tzrec._sla_broadcast_func_to_heads(func_2d, nheads)
+    # Return the strided view; the FX-leaf consumer `cutlass_hstu_mha`
+    # calls `.contiguous()` at runtime. Doing it here triggers
+    # `combine_contiguous_dims` -> `ModularIndexing(.., total_q, 3)`
+    # -> sympy ZeroDivisionError under AOT compile.
+    return func_2d.unsqueeze(0).expand(nheads, 3, total_q)
 
 
 @dataclass(frozen=True)
@@ -177,7 +149,10 @@ class STUTruncationPlan:
         total_dropped: ``offsets_head[-1]`` as a static int; passed
             to ``split_2D_jagged`` as ``total_len_left`` to skip its
             ``.item()`` fallback under fx / AOT export.
-        total_kept: ``offsets_tail[-1]`` as a static int.
+        total_kept: ``offsets_tail[-1]`` as a static int.  Excludes the
+            contextual prefix (= ``sum(new_lengths - contextual_seq_len)``,
+            not ``sum(new_lengths)``); add ``total_prefix`` back to get
+            the full post-truncation total.
         offsets_prefix: contextual-prefix cumulative offsets ``(B+1,)``;
             only set when ``contextual_seq_len > 0``.
         offsets_rest: post-prefix cumulative offsets ``(B+1,)``;
@@ -268,9 +243,13 @@ def compute_stu_truncation_plan(
             * contextual_seq_len
         )
         offsets_rest = x_offsets - offsets_prefix
-        # ``new_lengths_b = C + rest_tail_lengths_b`` so cumsum(new_lengths)
-        # equals offsets_prefix + offsets_tail; saves one cumsum kernel.
-        new_x_offsets = offsets_prefix + offsets_tail
+        # `x_offsets - offsets_head` is math-equivalent to
+        # `offsets_prefix + offsets_tail` (= sum(new_lengths[0..i-1]))
+        # but keeps `arange(B+1)*cs` out of post-truncation seq_offsets,
+        # so the SLA builder kernel doesn't end up inlining
+        # `cs*batch_ids` and surfacing B (which would trigger the
+        # AOT autotune-bench bounds-check assert).
+        new_x_offsets = x_offsets - offsets_head
         total_prefix = B_static * contextual_seq_len
         total_rest = fx_int_item(offsets_rest[-1])
     else:
