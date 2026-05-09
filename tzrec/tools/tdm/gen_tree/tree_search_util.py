@@ -168,8 +168,10 @@ class TreeSearch(object):
             node_table_dict["id"] = pa.array(ids)
             node_table_dict["weight"] = pa.array(weight)
             node_table_dict["features"] = pa.array(features)
-            node_writer.write(node_table_dict)
-            node_writer.close()
+            try:
+                node_writer.write(node_table_dict)
+            finally:
+                node_writer.close()
 
             output_path = _add_suffix_to_odps_table(self.output_file, "_edge_table")
             edge_writer = create_writer(output_path, **self.dataset_kwargs)
@@ -186,8 +188,10 @@ class TreeSearch(object):
             edge_table_dict["src_id"] = pa.array(src_ids)
             edge_table_dict["dst_id"] = pa.array(dst_ids)
             edge_table_dict["weight"] = pa.array(weight)
-            edge_writer.write(edge_table_dict)
-            edge_writer.close()
+            try:
+                edge_writer.write(edge_table_dict)
+            finally:
+                edge_writer.close()
 
         else:
             if not os.path.exists(self.output_file):
@@ -256,8 +260,10 @@ class TreeSearch(object):
             edge_table_dict["src_id"] = pa.array(src_ids)
             edge_table_dict["dst_id"] = pa.array(dst_ids)
             edge_table_dict["weight"] = pa.array(weight)
-            writer.write(edge_table_dict)
-            writer.close()
+            try:
+                writer.write(edge_table_dict)
+            finally:
+                writer.close()
         else:
             with open(
                 os.path.join(self.output_file, "predict_edge_table.txt"), "w"
@@ -305,8 +311,10 @@ class TreeSearch(object):
         attr_dict = OrderedDict(
             zip(attr_names, [pa.array(attr_arr) for attr_arr in attr_values])
         )
-        writer.write(attr_dict)
-        writer.close()
+        try:
+            writer.write(attr_dict)
+        finally:
+            writer.close()
 
     def save_serving_tree(self, tree_output_dir: str) -> None:
         """Save tree info for serving."""

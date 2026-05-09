@@ -51,12 +51,11 @@ def create_sparse_optimizer(
     if optimizer_type == "sgd_optimizer":
         return optimizers.SGD, optimizer_kwargs
     elif optimizer_type == "adagrad_optimizer":
-        if "initial_accumulator_value" in optimizer_kwargs:
+        # config_to_kwargs emits every optional field with its zero default.
+        init_acc = optimizer_kwargs.pop("initial_accumulator_value", 0)
+        if init_acc:
             # see apply_split_helper function patch in tzrec.optim.optimizer.py
-            os.environ["FBGEMM_MOMENTUM1_STATE_INIT_VALUE"] = str(
-                optimizer_kwargs["initial_accumulator_value"]
-            )
-            optimizer_kwargs.pop("initial_accumulator_value")
+            os.environ["FBGEMM_MOMENTUM1_STATE_INIT_VALUE"] = str(init_acc)
         return optimizers.Adagrad, optimizer_kwargs
     elif optimizer_type == "adam_optimizer":
         return optimizers.Adam, optimizer_kwargs
@@ -70,6 +69,30 @@ def create_sparse_optimizer(
         return optimizers.PartialRowWiseAdam, optimizer_kwargs
     elif optimizer_type == "rowwise_adagrad_optimizer":
         return rowwise_adagrad.RowWiseAdagrad, optimizer_kwargs
+    elif optimizer_type == "adadelta_optimizer":
+        if not hasattr(optimizers, "AdaDelta"):
+            raise RuntimeError(
+                "sparse adadelta_optimizer is not available in the public "
+                "torchrec / fbgemm-gpu releases yet. Please contact the "
+                "TorchEasyRec team to obtain the maintained torchrec and "
+                "fbgemm-gpu wheels (with the AdaDelta sparse-embedding "
+                "kernel) and reinstall."
+            )
+        # FBGEMM reuses the beta1 OptimizerArgs slot for AdaDelta's rho.
+        optimizer_kwargs["beta1"] = optimizer_kwargs.pop("rho")
+        return optimizers.AdaDelta, optimizer_kwargs
+    elif optimizer_type == "rmsprop_optimizer":
+        if not hasattr(optimizers, "RMSProp"):
+            raise RuntimeError(
+                "sparse rmsprop_optimizer is not available in the public "
+                "torchrec / fbgemm-gpu releases yet. Please contact the "
+                "TorchEasyRec team to obtain the maintained torchrec and "
+                "fbgemm-gpu wheels (with the RMSProp sparse-embedding "
+                "kernel) and reinstall."
+            )
+        # FBGEMM reuses the beta1 OptimizerArgs slot for RMSProp's alpha.
+        optimizer_kwargs["beta1"] = optimizer_kwargs.pop("alpha")
+        return optimizers.RMSProp, optimizer_kwargs
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
@@ -105,6 +128,10 @@ def create_dense_optimizer(
         beta2 = optimizer_kwargs.pop("beta2")
         optimizer_kwargs["betas"] = (beta1, beta2)
         return torch.optim.AdamW, optimizer_kwargs
+    elif optimizer_type == "adadelta_optimizer":
+        return torch.optim.Adadelta, optimizer_kwargs
+    elif optimizer_type == "rmsprop_optimizer":
+        return torch.optim.RMSprop, optimizer_kwargs
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 

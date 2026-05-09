@@ -78,6 +78,7 @@ def create_test_model(
     if graph_type == TestGraphType.AOT_INDUCTOR:
         model = ScriptWrapper(model)
         assert data is not None
+        assert test_dir, "test_dir must be specified for AOT_INDUCTOR"
         sparse, dense, meta_info = split_model(data, model, test_dir)
         export_model_aot(sparse, dense, data, meta_info, test_dir)
         model = load_model_aot(test_dir, torch.device("cuda:0"))
@@ -120,6 +121,29 @@ class hypothesis_settings(_settings):
         super().__init__(
             parent, max_examples=max_examples, derandomize=derandomize, **kwargs
         )
+
+
+def mark_ci_scope(*scopes: str) -> Any:
+    """Tag a unittest method or class as in-scope for the given CI lane(s).
+
+    Use at the class or method level only -- module-level fallback is
+    intentionally not supported so each new test class must declare its
+    own scope.
+
+    Examples:
+        @mark_ci_scope("h20")
+        class FooTest(unittest.TestCase): ...
+
+        @mark_ci_scope("h20", "l20")
+        def test_bar(self): ...
+    """
+
+    def decorator(obj: Any) -> Any:
+        existing = set(getattr(obj, "_ci_scopes", ()) or ())
+        obj._ci_scopes = existing | set(scopes)
+        return obj
+
+    return decorator
 
 
 def dicts_are_equal(
@@ -213,3 +237,29 @@ def get_test_enable_tma() -> List[bool]:
             if version.parse(triton.__version__) >= version.parse("3.5.0"):
                 results.append(True)
     return results
+
+
+def reference_stu_truncation(
+    x: torch.Tensor,
+    x_offsets: torch.Tensor,
+    num_targets: Optional[List[int]],
+    truncate_tail_len: int,
+    contextual_seq_len: int = 0,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Plain-Python UIH-only truncation: ``[ctx | last min(U, tail) UIH | targets]``."""
+    chunks: List[torch.Tensor] = []
+    new_lens: List[int] = []
+    for b in range(x_offsets.numel() - 1):
+        s, e = int(x_offsets[b].item()), int(x_offsets[b + 1].item())
+        L = e - s
+        T = int(num_targets[b]) if num_targets is not None else 0
+        U = L - contextual_seq_len - T
+        new_uih = max(0, min(U, truncate_tail_len))
+        prefix = x[s : s + contextual_seq_len]
+        uih_kept = x[
+            s + contextual_seq_len + (U - new_uih) : s + contextual_seq_len + U
+        ]
+        targets = x[e - T : e]
+        chunks.append(torch.cat([prefix, uih_kept, targets], dim=0))
+        new_lens.append(contextual_seq_len + new_uih + T)
+    return torch.cat(chunks, dim=0), new_lens

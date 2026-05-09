@@ -12,6 +12,8 @@
 
 import math
 import os
+import threading
+import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
@@ -240,6 +242,14 @@ class KafkaReader(BaseReader):
     ) -> Iterator[pa.RecordBatch]:
         """Read Arrow batches from Kafka.
 
+        A background heartbeat thread monitors idle time (time since the last
+        ``consume()`` call).  When the generator is blocked at ``yield`` for
+        longer than 80% of ``max.poll.interval.ms``, the heartbeat thread
+        pauses all partitions and calls ``consumer.poll(0)`` periodically to
+        reset the application poll timer and keep the consumer in its group.
+        This prevents ``MAX_POLL_EXCEEDED`` errors during long downstream
+        pauses (checkpoint saves, evaluation, compilation warmup, etc.).
+
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
@@ -248,7 +258,15 @@ class KafkaReader(BaseReader):
             PyArrow RecordBatch
         """
         topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
+        max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
         consumer = Consumer(config)
+
+        stop_event = threading.Event()
+        consumer_lock = threading.RLock()
+        is_paused = [False]
+        last_consume_time = [time.monotonic()]
+        idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
+        stolen_msgs: List = []
 
         # Define on_assign callback to seek to checkpointed offsets
         def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
@@ -281,13 +299,52 @@ class KafkaReader(BaseReader):
                         )
                         tp.offset = OFFSET_INVALID
 
-            consumer.assign(partitions)
+            with consumer_lock:
+                consumer.assign(partitions)
+                if is_paused[0]:
+                    consumer.pause(consumer.assignment())
             logger.info(
                 f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "
                 f"assignment: {consumer.assignment()}"
             )
 
         consumer.subscribe([topic], on_assign=on_assign)
+
+        def _heartbeat() -> None:
+            """Keep consumer alive when generator is blocked at yield."""
+            while not stop_event.is_set():
+                try:
+                    elapsed = time.monotonic() - last_consume_time[0]
+                    if elapsed > idle_threshold:
+                        with consumer_lock:
+                            # Re-check elapsed inside lock to avoid racing
+                            # with the main thread that updates
+                            # last_consume_time under the same lock.
+                            elapsed = time.monotonic() - last_consume_time[0]
+                            if elapsed > idle_threshold:
+                                if not is_paused[0]:
+                                    assignment = consumer.assignment()
+                                    if assignment:
+                                        consumer.pause(assignment)
+                                    is_paused[0] = True
+                                    logger.debug(
+                                        f"heartbeat: paused {len(assignment)}"
+                                        f" partitions after {elapsed:.1f}s"
+                                        f" idle"
+                                    )
+                                msg = consumer.poll(0)
+                                if msg is not None and not msg.error():
+                                    stolen_msgs.append(msg)
+                except Exception:
+                    logger.warning("heartbeat error", exc_info=True)
+                stop_event.wait(1.0)
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat,
+            name=f"kafka-hb-w{worker_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         batch_size_per_msg = None
         try:
@@ -297,7 +354,22 @@ class KafkaReader(BaseReader):
                     if batch_size_per_msg
                     else 2
                 )
-                messages = consumer.consume(num_messages)
+                # Hold consumer_lock during consume() so the heartbeat
+                # thread cannot call pause() concurrently.
+                # rd_kafka_consume_batch_queue() (used by consume()) is
+                # not thread-safe with concurrent pause/resume/seek.
+                with consumer_lock:
+                    if is_paused[0]:
+                        assignment = consumer.assignment()
+                        if assignment:
+                            consumer.resume(assignment)
+                        is_paused[0] = False
+                        logger.debug("heartbeat: resumed partitions")
+                    last_consume_time[0] = time.monotonic()
+                    pending = list(stolen_msgs)
+                    stolen_msgs.clear()
+                    messages = pending
+                    messages.extend(consumer.consume(num_messages, timeout=1.0))
 
                 current_batch_size = 0
                 record_batchs = []
@@ -372,7 +444,18 @@ class KafkaReader(BaseReader):
             logger.error(f"KafkaReader exception: {e}", flush=True)
             raise e
         finally:
-            consumer.close()
+            stop_event.set()
+            heartbeat_thread.join(timeout=5.0)
+            if heartbeat_thread.is_alive():
+                logger.warning(
+                    "Heartbeat thread did not exit within timeout; "
+                    "skipping consumer.close() to avoid race."
+                )
+            else:
+                try:
+                    consumer.close()
+                except Exception as e:
+                    logger.warning(f"consumer.close() failed: {e}")
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1

@@ -12,11 +12,14 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional, Union
 
 import torch
 
+from tzrec.protos.export_pb2 import ExportConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.utils.logging_util import logger
 
 
 def is_input_tile() -> bool:
@@ -61,22 +64,71 @@ def is_input_tile_3_online() -> bool:
 
 
 def is_aot() -> bool:
-    """Judge is inductor or not."""
-    is_aot = os.environ.get("ENABLE_AOT")
-    if is_aot and is_aot[0] == "1":
+    """Judge is inductor or not.
+
+    ENABLE_AOT=1: legacy two-stage export (sparse JIT + dense AOTI).
+    ENABLE_AOT=2: unified AOTI export (fused sparse+dense single .pt2).
+    Legacy ``UNIFIED_AOT=1`` is honored as an alias of ``ENABLE_AOT=2``.
+    """
+    val = os.environ.get("ENABLE_AOT")
+    if val and val[0] in ("1", "2"):
         return True
-    else:
-        return False
+    legacy = os.environ.get("UNIFIED_AOT")
+    return bool(legacy) and legacy[0] == "1"
+
+
+def is_unified_aot() -> bool:
+    """Judge whether to use the unified AOTI export (ENABLE_AOT=2).
+
+    Legacy ``UNIFIED_AOT=1`` is honored as an alias of ``ENABLE_AOT=2``.
+    """
+    val = os.environ.get("ENABLE_AOT")
+    if val and val[0] == "2":
+        return True
+    legacy = os.environ.get("UNIFIED_AOT")
+    return bool(legacy) and legacy[0] == "1"
+
+
+def is_unified_aot_predict(model_path: str) -> bool:
+    """Judge whether the exported model uses unified AOTI in predict.
+
+    Reads ``ENABLE_AOT`` from model_acc.json (=2 → unified). Falls back
+    to the legacy ``UNIFIED_AOT`` key for pre-fold exports, then to
+    file presence (legacy two-stage exports produce
+    scripted_sparse_model.pt; unified exports do not) when neither
+    JSON key is present — keeps unit tests that bypass the full export
+    pipeline working.
+    """
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if os.path.exists(acc_json_path):
+        with open(acc_json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        enable_aot = data.get("ENABLE_AOT")
+        if enable_aot is not None:
+            return str(enable_aot)[:1] == "2"
+        # Pre-fold compat: model_acc.json may carry UNIFIED_AOT.
+        legacy = data.get("UNIFIED_AOT")
+        if legacy is not None:
+            return str(legacy)[:1] == "1"
+    sparse_model_path = os.path.join(model_path, "scripted_sparse_model.pt")
+    if not os.path.exists(sparse_model_path):
+        logger.warning(
+            "model_acc.json missing ENABLE_AOT; falling back to file-presence "
+            "heuristic (no scripted_sparse_model.pt → unified)"
+        )
+        return True
+    return False
 
 
 def is_aot_predict(model_path: str) -> bool:
-    """Judge is aot or not in predict."""
+    """Judge is aot or not in predict (ENABLE_AOT={1,2})."""
     with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
         data = json.load(file)
-    is_aot = data.get("ENABLE_AOT")
-    if is_aot and is_aot[0] == "1":
+    enable_aot = data.get("ENABLE_AOT")
+    if enable_aot and str(enable_aot)[:1] in ("1", "2"):
         return True
-    return False
+    legacy = data.get("UNIFIED_AOT")
+    return bool(legacy) and str(legacy)[:1] == "1"
 
 
 def is_trt() -> bool:
@@ -100,6 +152,26 @@ def is_trt_predict(model_path: str) -> bool:
 def is_cuda_export() -> bool:
     """Judge is trt/aot or not."""
     return is_trt() or is_aot()
+
+
+def is_autotune_with_sample_inputs() -> bool:
+    """Judge whether AOTI should autotune with realized sample inputs.
+
+    AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=1: enable inductor's
+    ``triton.autotune_with_sample_inputs``. Sample-input autotune walks
+    the FX graph via ``torch.fx.Interpreter``, dispatching
+    ``_assert_scalar`` / ``sym_constrain_*`` nodes that
+    ``_AddRuntimeAssertionsForInlineConstraintsPass`` inserts upstream.
+    If a node's predicate evaluates False on the materialized hint --
+    typical for HSTU's data-dependent unbacked SymInts when the hint
+    exceeds the derived bound -- AOTI compile aborts. Mitigate via
+    ``stu.scaling_seqlen`` plus a bumped ``model_config.max_seq_len``
+    (see FAQ Q16). AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=0 (default):
+    inductor's default -- autotune benches with random tensors
+    (``rand_strided``).
+    """
+    val = os.environ.get("AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS")
+    return bool(val) and val[0] == "1"
 
 
 def is_debug_trt() -> bool:
@@ -165,6 +237,54 @@ def ec_quant_dtype() -> torch.dtype:
         return _quant_str_to_dtype[quant_dtype_str]
 
 
+_MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {
+    "BF16": torch.bfloat16,
+    "FP16": torch.float16,
+}
+
+
+def mixed_precision_to_dtype(mixed_precision: Optional[str]) -> Optional[torch.dtype]:
+    """Convert a TrainConfig.mixed_precision string to a torch dtype.
+
+    Returns ``None`` when ``mixed_precision`` is ``None`` or empty.
+    Raises ``ValueError`` on unknown values so typos fail loudly.
+    """
+    if not mixed_precision:
+        return None
+    if mixed_precision not in _MIXED_PRECISION_TO_DTYPE:
+        raise ValueError(
+            f"Unknown mixed_precision: {mixed_precision}, "
+            f"available types: {list(_MIXED_PRECISION_TO_DTYPE.keys())}"
+        )
+    return _MIXED_PRECISION_TO_DTYPE[mixed_precision]
+
+
+def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
+    """Resolve mixed_precision for export.
+
+    Compares ``train_config.mixed_precision`` with
+    ``export_config.mixed_precision``; logs a warning when they differ.
+    Returns ``export_config.mixed_precision`` — does not fall back to
+    train_config. The export-time AMP intent must be expressed
+    explicitly on ``export_config``.
+    """
+    train_mp = pipeline_config.train_config.mixed_precision
+    export_mp = (
+        pipeline_config.export_config.mixed_precision
+        if pipeline_config.HasField("export_config")
+        else ""
+    )
+    if train_mp != export_mp:
+        logger.warning(
+            "export_config.mixed_precision=%r differs from "
+            "train_config.mixed_precision=%r; export uses %r",
+            export_mp,
+            train_mp,
+            export_mp,
+        )
+    return export_mp
+
+
 def write_mapping_file_for_input_tile(
     state_dict: Dict[str, torch.Tensor], remap_file_path: str
 ) -> None:
@@ -199,8 +319,15 @@ def write_mapping_file_for_input_tile(
         f.write(remap_str)
 
 
-def export_acc_config() -> Dict[str, str]:
-    """Export acc config for model online inference."""
+def export_acc_config(
+    additional_export_config: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Export acc config for model online inference.
+
+    Args:
+        additional_export_config (dict, optional): extra key/value pairs merged
+            into the acc config (overriding env-derived defaults on conflict).
+    """
     # use int64 sparse id as input
     acc_config = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
@@ -211,8 +338,18 @@ def export_acc_config() -> Dict[str, str]:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
-    if "ENABLE_AOT" in os.environ:
-        acc_config["ENABLE_AOT"] = os.environ["ENABLE_AOT"]
+    if "AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS" in os.environ:
+        acc_config["AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS"] = os.environ[
+            "AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS"
+        ]
+    if "MAX_EXPORT_BATCH_SIZE" in os.environ:
+        acc_config["MAX_EXPORT_BATCH_SIZE"] = os.environ["MAX_EXPORT_BATCH_SIZE"]
+    # Normalize ENABLE_AOT — write "2" whenever the resolved mode is unified
+    # (whether via the new env or the legacy UNIFIED_AOT=1).
+    if is_aot():
+        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
+    if additional_export_config:
+        acc_config.update(additional_export_config)
     return acc_config
 
 
@@ -230,10 +367,43 @@ def get_max_export_batch_size() -> int:
     return batch_size
 
 
-def allow_tf32(train_config: TrainConfig, backend: str) -> None:
-    """Set allow_tf32 flag for cudnn and cuda matmul."""
-    if backend == "nccl":
-        if train_config.HasField("cudnn_allow_tf32"):
-            torch.backends.cudnn.allow_tf32 = train_config.cudnn_allow_tf32
-        if train_config.HasField("cuda_matmul_allow_tf32"):
-            torch.backends.cuda.matmul.allow_tf32 = train_config.cuda_matmul_allow_tf32
+def allow_tf32(config: Union[TrainConfig, ExportConfig]) -> None:
+    """Apply TF32 flags from ``config`` to ``torch.backends``.
+
+    The flags are hardware-level matmul precision settings, not
+    distributed-backend-specific. Only fields that are explicitly set
+    (``HasField``) are applied; unset fields leave torch.backends as-is.
+    """
+    if config.HasField("cudnn_allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = config.cudnn_allow_tf32
+    if config.HasField("cuda_matmul_allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = config.cuda_matmul_allow_tf32
+
+
+def allow_tf32_for_export(pipeline_config: EasyRecConfig) -> None:
+    """Apply TF32 flags for AOTI export.
+
+    Warns when ``train_config`` and ``export_config`` are both
+    explicitly set on a field and disagree, then applies train_config
+    first and export_config second so train applies for fields export
+    leaves untouched and export wins where set. Must run BEFORE
+    ``torch.export.export()`` so AOTI captures the resolved
+    ``torch.backends`` globals into Triton ``ALLOW_TF32`` constexprs.
+    """
+    train_cfg = pipeline_config.train_config
+    export_cfg = pipeline_config.export_config
+    for field in ("cudnn_allow_tf32", "cuda_matmul_allow_tf32"):
+        if (
+            train_cfg.HasField(field)
+            and export_cfg.HasField(field)
+            and getattr(train_cfg, field) != getattr(export_cfg, field)
+        ):
+            logger.warning(
+                "export_config.%s=%s overrides train_config.%s=%s",
+                field,
+                getattr(export_cfg, field),
+                field,
+                getattr(train_cfg, field),
+            )
+    allow_tf32(train_cfg)
+    allow_tf32(export_cfg)

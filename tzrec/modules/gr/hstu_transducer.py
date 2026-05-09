@@ -24,8 +24,13 @@ from tzrec.modules.gr.postprocessors import (
     create_output_postprocessor,
 )
 from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
-from tzrec.modules.gr.stu import STU, STULayer, STUStack
+from tzrec.modules.gr.stu import STULayer, STUStack
 from tzrec.modules.utils import BaseModule
+from tzrec.ops import Kernel
+from tzrec.ops.hstu_attention_utils import (
+    STUTruncationPlan,
+    apply_stu_truncation_plan,
+)
 from tzrec.ops.jagged_tensors import split_2D_jagged
 from tzrec.utils.fx_util import fx_unwrap_optional_tensor
 
@@ -47,9 +52,23 @@ class HSTUTransducer(BaseModule):
         contextual_feature_dim (int): contextual feature dimension.
         max_contextual_seq_len (int): contextual feature num.
         contextual_group_name (str): contextual group name in grouped features.
+        scaling_seqlen (int): sequence length used as the divisor in the
+            attention output scaling of every STULayer. ``-1`` (the default)
+            preserves legacy behavior (divides by runtime ``max_seq_len``).
+            Pass a fixed positive int (typically the model's ``max_seq_len``
+            config) to make attention output invariant to batch-level
+            seq-length.
         is_inference (bool): whether to run in inference mode.
         return_full_embeddings (bool): return all embeddings or not.
-        listwise (bool): listwise training or not.
+        attn_truncation_split_layer (int): layer index ``N1`` after which
+            mid-stack attention truncation fires.  Must be in
+            ``(0, attn_num_layers)`` when truncation is enabled, else 0.
+        attn_truncation_tail_len (int): number of trailing UIH tokens kept
+            on layers ``>= N1``.  Both ``attn_truncation_split_layer`` and
+            ``attn_truncation_tail_len`` must be ``> 0`` to enable
+            truncation; setting only one is rejected at construction.
+        name (str): MoT channel name; forwarded to the input
+            preprocessor (replaces the ``uih`` prefix on UIH-side keys).
     """
 
     def __init__(
@@ -65,9 +84,12 @@ class HSTUTransducer(BaseModule):
         contextual_feature_dim: int = 0,
         max_contextual_seq_len: int = 0,
         contextual_group_name: str = "contextual",
+        scaling_seqlen: int = -1,
         is_inference: bool = True,
         return_full_embeddings: bool = False,
-        listwise: bool = False,
+        attn_truncation_split_layer: int = 0,
+        attn_truncation_tail_len: int = 0,
+        name: str = "",
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
@@ -78,12 +100,20 @@ class HSTUTransducer(BaseModule):
             max_contextual_seq_len=max_contextual_seq_len,
             contextual_group_name=contextual_group_name,
             output_embedding_dim=stu["embedding_dim"],
+            name=name,
         )
         stu = dict(stu)
-        if "contextual_seq_len" not in stu:
+        # `< 0` sentinel = fall back; explicit 0 means "no contextual".
+        # `not in stu` is unreachable -- config_to_kwargs's
+        # including_default_value_fields=True always populates the key.
+        if stu.get("contextual_seq_len", -1) < 0:
             stu["contextual_seq_len"] = self._input_preprocessor.contextual_seq_len()
-        self._stu_module: STU = STUStack(
+        if stu.get("scaling_seqlen", -1) < 0:
+            stu["scaling_seqlen"] = scaling_seqlen
+        self._stu_module: STUStack = STUStack(
             stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
+            truncate_split_layer=attn_truncation_split_layer,
+            truncate_tail_len=attn_truncation_tail_len,
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
             output_postprocessor, embedding_dim=stu["embedding_dim"]
@@ -97,7 +127,6 @@ class HSTUTransducer(BaseModule):
             )
         self._input_dropout_ratio: float = input_dropout_ratio
         self._return_full_embeddings: bool = return_full_embeddings
-        self._listwise_training: bool = listwise and self.is_train
 
     def _preprocess(
         self, grouped_features
@@ -131,9 +160,7 @@ class HSTUTransducer(BaseModule):
                     seq_offsets=output_seq_offsets,
                     seq_timestamps=output_seq_timestamps,
                     seq_embeddings=output_seq_embeddings,
-                    num_targets=(
-                        None if self._listwise_training else output_num_targets
-                    ),
+                    num_targets=output_num_targets,
                 )
 
         output_seq_embeddings = torch.nn.functional.dropout(
@@ -161,20 +188,19 @@ class HSTUTransducer(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, Optional[STUTruncationPlan]]:
         with record_function("hstu"):
-            seq_embeddings = self._stu_module(
+            return self._stu_module(
                 max_seq_len=max_seq_len,
                 x=seq_embeddings,
                 x_offsets=seq_offsets,
-                num_targets=(None if self._listwise_training else num_targets),
+                num_targets=num_targets,
             )
-        return seq_embeddings
 
     def _postprocess(
         self,
         max_seq_len: int,
-        total_uih_len: int,
+        total_uih_len: Optional[int],
         total_targets: int,
         seq_lengths: torch.Tensor,
         seq_timestamps: torch.Tensor,
@@ -230,6 +256,47 @@ class HSTUTransducer(BaseModule):
                 candidate_embeddings,
             )
 
+    @staticmethod
+    def _replay_truncation_state(
+        seq_timestamps: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        seq_offsets: torch.Tensor,
+        max_seq_len: int,
+        total_uih_len: int,
+        total_targets: int,
+        post_stu_seq_offsets: torch.Tensor,
+        post_stu_max_seq_len: int,
+        plan: Optional[STUTruncationPlan],
+        kernel: Kernel,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Replay ``plan`` on ``seq_timestamps`` and refresh dependent metadata.
+
+        ``plan is None`` -> inputs unchanged.  Otherwise the returned
+        ``post_truncation_total_uih_len`` is ``plan.total_kept +
+        plan.total_prefix - total_targets`` (static int -- skips
+        ``split_2D_jagged``'s ``.item()`` fallback).  ``total_prefix``
+        is the add-back for the contextual prefix that ``total_kept``
+        excludes; see ``STUTruncationPlan.total_kept``.
+        """
+        if plan is None:
+            return (
+                seq_timestamps,
+                seq_lengths,
+                seq_offsets,
+                max_seq_len,
+                total_uih_len,
+            )
+        seq_timestamps = apply_stu_truncation_plan(
+            seq_timestamps.unsqueeze(-1), plan, kernel=kernel
+        ).squeeze(-1)
+        return (
+            seq_timestamps,
+            plan.new_lengths,
+            post_stu_seq_offsets,
+            post_stu_max_seq_len,
+            plan.total_kept + plan.total_prefix - total_targets,
+        )
+
     def forward(
         self, grouped_features: Dict[str, torch.Tensor]
     ) -> Tuple[
@@ -256,7 +323,12 @@ class HSTUTransducer(BaseModule):
             num_targets,
         ) = self._preprocess(grouped_features)
 
-        encoded_embeddings = self._hstu_compute(
+        (
+            encoded_embeddings,
+            post_stu_seq_offsets,
+            post_stu_max_seq_len,
+            plan,
+        ) = self._hstu_compute(
             max_seq_len=max_seq_len,
             seq_lengths=seq_lengths,
             seq_offsets=seq_offsets,
@@ -265,9 +337,31 @@ class HSTUTransducer(BaseModule):
             num_targets=num_targets,
         )
 
-        encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
+        # When STUStack truncated mid-stack, replay the same split on the
+        # parallel jagged seq_timestamps so the postprocessor's UIH /
+        # candidate split lines up with the truncated embeddings.
+        (
+            seq_timestamps,
+            seq_lengths,
+            seq_offsets,
+            max_seq_len,
+            post_truncation_total_uih_len,
+        ) = self._replay_truncation_state(
+            seq_timestamps=seq_timestamps,
+            seq_lengths=seq_lengths,
+            seq_offsets=seq_offsets,
             max_seq_len=max_seq_len,
             total_uih_len=total_uih_len,
+            total_targets=total_targets,
+            post_stu_seq_offsets=post_stu_seq_offsets,
+            post_stu_max_seq_len=post_stu_max_seq_len,
+            plan=plan,
+            kernel=self.kernel(),
+        )
+
+        encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
+            max_seq_len=max_seq_len,
+            total_uih_len=post_truncation_total_uih_len,
             total_targets=total_targets,
             seq_lengths=seq_lengths,
             seq_embeddings=encoded_embeddings,

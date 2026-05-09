@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -432,6 +432,7 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
+    @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
@@ -446,7 +447,8 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         if self.success:
             self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
             )
         if self.success:
             self.success = utils.test_predict(

@@ -76,3 +76,25 @@ def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
                 return max_len
         max_len = STATIC_MAX_SEQ_LENS[-1]
         return max_len
+
+
+def clear_triton_caches(autotuner: object) -> None:
+    """Drop both the autotuner config cache and the JITFunction kernel cache.
+
+    Required when flipping a Triton cache-invalidating env var (e.g.
+    ``DISABLE_MMA_V3``) mid-process. The Python in-memory ``kernel_cache`` is
+    keyed by ``(specialization, options)`` only -- env vars do not participate
+    -- so without this clear a previously-cached cubin compiled under a
+    different env state would be silently reused.
+    """
+    cache = getattr(autotuner, "cache", None)
+    if cache is not None:
+        cache.clear()
+    fn = getattr(autotuner, "fn", None)
+    device_caches = getattr(fn, "device_caches", None)
+    if device_caches is not None:
+        # device_caches[device] = (kernel_cache, kernel_key_cache,
+        #                          target, backend, binder)
+        for entry in device_caches.values():
+            entry[0].clear()
+            entry[1].clear()

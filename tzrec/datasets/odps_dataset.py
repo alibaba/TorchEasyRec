@@ -15,7 +15,7 @@ import random
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import pyarrow as pa
 import urllib3
@@ -681,7 +681,9 @@ class OdpsWriter(BaseWriter):
         self._sess_req = None
         self._writer = None
 
-    def _create_table(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def _create_table(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Create output table."""
         if not self._o.exist_table(self._table_name):
             schemas = []
@@ -758,7 +760,9 @@ class OdpsWriter(BaseWriter):
                     continue
             break
 
-    def write(self, output_dict: OrderedDict[str, pa.Array]) -> None:
+    def write(
+        self, output_dict: OrderedDict[str, Union[pa.Array, pa.ChunkedArray]]
+    ) -> None:
         """Write a batch of data."""
         if not self._lazy_inited:
             if int(os.environ.get("RANK", 0)) == 0:
@@ -768,8 +772,9 @@ class OdpsWriter(BaseWriter):
                 self._wait_init_table()
             self._init_writer()
             self._lazy_inited = True
+        output_arrays = self._flatten_chunked_arrays(output_dict)
         record_batch = pa.RecordBatch.from_arrays(
-            list(output_dict.values()),
+            output_arrays,
             list(output_dict.keys()),
         )
         self._writer.write(record_batch)

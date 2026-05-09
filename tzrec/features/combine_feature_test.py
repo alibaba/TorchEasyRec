@@ -242,6 +242,10 @@ class CombineFeatureTest(unittest.TestCase):
         self.assertEqual(seq_feat.is_sequence, True)
         self.assertEqual(seq_feat.name, "click_50_seq__combine_feat")
         self.assertEqual(seq_feat.value_dim, 1)
+        self.assertEqual(
+            seq_feat.side_inputs, [("user", "click_50_seq__combine_input")]
+        )
+        self.assertEqual(seq_feat.inputs, ["click_50_seq__combine_input"])
 
         input_data = {
             "click_50_seq__combine_input": pa.array(["tag1\x1dtag2;tag1", "tag2", ""]),
@@ -285,6 +289,10 @@ class CombineFeatureTest(unittest.TestCase):
         self.assertEqual(seq_feat.is_sparse, False)
         self.assertEqual(seq_feat.is_sequence, True)
         self.assertEqual(seq_feat.name, "click_50_seq__combine_feat")
+        self.assertEqual(
+            seq_feat.side_inputs, [("user", "click_50_seq__combine_input")]
+        )
+        self.assertEqual(seq_feat.inputs, ["click_50_seq__combine_input"])
 
         input_data = {
             "click_50_seq__combine_input": pa.array(["tag1\x1dtag2;tag1", "tag2", ""]),

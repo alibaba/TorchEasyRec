@@ -132,6 +132,83 @@ class TokenizeFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
+            [["1\x032", "", None, "3"], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
+            [[[1, 2], None, None, [3]], [1, 2, 3], [1, 1, 1], [2, 0, 0, 1]],
+        ]
+    )
+    def test_fg_encoded_tokens_as_sequence(
+        self, input_feat, expected_values, expected_key_lengths, expected_seq_lengths
+    ):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                embedding_dim=16,
+                vocab_file="data/test/tokenizer.json",
+                tokens_as_sequence=True,
+                sequence_length=16,
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(token_feat_cfg)
+
+        input_data = {"token_feat": pa.array(input_feat)}
+        parsed_feat = token_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(
+            parsed_feat.key_lengths, np.array(expected_key_lengths)
+        )
+        np.testing.assert_allclose(
+            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
+        )
+
+    @parameterized.expand(
+        [
+            [
+                "xyz",
+                ["abc efg", "", "hij"],
+                [19758, 299, 16054, 35609, 73, 1944],
+                [1, 1, 1, 1, 1, 1],
+                [3, 1, 2],
+            ],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_tokens_as_sequence(
+        self,
+        default_value,
+        input_data,
+        expected_values,
+        expected_key_lengths,
+        expected_seq_lengths,
+    ):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                vocab_file="data/test/tokenizer.json",
+                embedding_dim=16,
+                expression="user:token_input",
+                default_value=default_value,
+                tokens_as_sequence=True,
+                sequence_length=16,
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(
+            token_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+
+        input_data = {"token_input": pa.array(input_data)}
+        parsed_feat = token_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "token_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(
+            parsed_feat.key_lengths, np.array(expected_key_lengths)
+        )
+        np.testing.assert_allclose(
+            parsed_feat.seq_lengths, np.array(expected_seq_lengths)
+        )
+
+    @parameterized.expand(
+        [
             [
                 "",
                 ["abc efg", "", "hij"],

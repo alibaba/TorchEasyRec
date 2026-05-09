@@ -51,6 +51,8 @@ from torchrec.distributed.types import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from tzrec.utils.logging_util import logger
+
 
 def init_process_group() -> Tuple[torch.device, str]:
     """Init process_group, device, rank, backend."""
@@ -249,6 +251,25 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
             enqueue_batch_after_forward,
         )
         self._check_all_workers_data_status = check_all_workers_data_status
+        self._sync_at_progress_entry = (
+            device.type == "cuda"
+            and dist.is_initialized()
+            and torch.cuda.get_device_capability(device)[0] < 7
+        )
+        if self._sync_at_progress_entry and int(os.environ.get("RANK", 0)) == 0:
+            logger.info(
+                "TrainPipelineSparseDist: cc<7.0 detected on %s; "
+                "enabling per-iter dist.barrier() at progress() entry",
+                device,
+            )
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """Run one training iter, with optional pre-iter barrier on cc<7.0."""
+        if self._sync_at_progress_entry:
+            # workaround NCCL deadlock from unconditional next-batch
+            # KJT a2a in upstream progress() on Pascal GPUs (cc<7.0).
+            dist.barrier()
+        return super().progress(dataloader_iter)
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         if dataloader_iter is not self._dataloader_iter:

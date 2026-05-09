@@ -102,7 +102,10 @@ class DlrmHSTU(RankModel):
             "invalid model config: %s" % self._model_config.WhichOneof("model")
         )
         assert isinstance(self._model_config, multi_task_rank_pb2.DlrmHSTU)
+        self._init()
 
+    def _init(self) -> None:
+        """Post-model-type-assert init; reused by UltraHSTU subclass."""
         set_static_max_seq_lens([self._model_config.max_seq_len])
 
         self.init_input()
@@ -140,19 +143,15 @@ class DlrmHSTU(RankModel):
             if task_cfg.HasField("task_bitmask"):
                 action_weights.append(task_cfg.task_bitmask)
 
-        # construct HSTU
-        self._hstu_transducer: HSTUTransducer = HSTUTransducer(
-            uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
-            target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
-            contextual_feature_dim=contextual_feature_dim,
-            max_contextual_seq_len=max_contextual_seq_len,
-            contextual_group_name=self._contextual_group_name,
-            **config_to_kwargs(self._model_config.hstu),
-            return_full_embeddings=False,
-            listwise=False,
+        # construct HSTU. Pin the attention-output scaling divisor to the
+        # configured max_seq_len so that attention output is invariant to
+        # batch-level seq-length.
+        self._hstu_transducer: torch.nn.Module = self._build_transducer(
+            contextual_feature_dim, max_contextual_seq_len
         )
 
         # item embeddings
+        stu_embedding_dim = self._stu_embedding_dim()
         self._item_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
                 in_features=self.embedding_group.group_total_dim("candidate"),
@@ -161,15 +160,34 @@ class DlrmHSTU(RankModel):
             SwishLayerNorm(self._model_config.item_embedding_hidden_dim),
             torch.nn.Linear(
                 in_features=self._model_config.item_embedding_hidden_dim,
-                out_features=self._model_config.hstu.stu.embedding_dim,
+                out_features=stu_embedding_dim,
             ),
-            LayerNorm(self._model_config.hstu.stu.embedding_dim),
+            LayerNorm(stu_embedding_dim),
         ).apply(init_linear_xavier_weights_zero_bias)
 
         self._multitask_module = FusionMTLTower(
-            tower_feature_in=self._model_config.hstu.stu.embedding_dim,
+            tower_feature_in=stu_embedding_dim,
             **config_to_kwargs(self._model_config.fusion_mtl_tower),
         ).apply(init_linear_xavier_weights_zero_bias)
+
+    def _build_transducer(
+        self, contextual_feature_dim: int, max_contextual_seq_len: int
+    ) -> torch.nn.Module:
+        """Subclass hook: build the HSTU transducer (or a MoT stack)."""
+        return HSTUTransducer(
+            uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
+            target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
+            contextual_feature_dim=contextual_feature_dim,
+            max_contextual_seq_len=max_contextual_seq_len,
+            contextual_group_name=self._contextual_group_name,
+            scaling_seqlen=self._model_config.max_seq_len,
+            **config_to_kwargs(self._model_config.hstu),
+            return_full_embeddings=False,
+        )
+
+    def _stu_embedding_dim(self) -> int:
+        """Subclass hook: dim feeding the item MLP and multi-task tower."""
+        return self._model_config.hstu.stu.embedding_dim
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.

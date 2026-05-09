@@ -1,0 +1,44 @@
+name: Unit Test H20 CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+concurrency:
+  group: unittest-h20-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci-test:
+    # `container:` would inject -v /var/run/docker.sock which DSW authZ blocks here.
+    runs-on: tzrec-h20-runner
+    steps:
+      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: run_${{ github.run_id }}
+      - name: RunUnitTestH20CI
+        id: run_unittest_h20_ci
+        run: |
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
+          docker run --rm \
+            --workdir /__w/TorchEasyRec/TorchEasyRec \
+            --gpus all --shm-size=512g --ulimit memlock=-1 \
+            -e HOME=/github/home \
+            -e GITHUB_ACTIONS=true \
+            -e CI=true \
+            -e CUDA_HOME=/usr/local/cuda-12 \
+            -e CI_HYPOTHESIS=true \
+            -e TORCHINDUCTOR_CACHE_DIR=/github/home/.torchinductor \
+            -v "$WORK_ROOT":/__w \
+            -v "$EXTERNALS_ROOT":/__e:ro \
+            -v "$WORK_ROOT/_temp":/__w/_temp \
+            -v "$WORK_ROOT/_actions":/__w/_actions \
+            -v "$WORK_ROOT/_tool":/__w/_tool \
+            -v "$WORK_ROOT/_temp/_github_home":/github/home \
+            -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.2 \
+            bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test.sh --scope h20'

@@ -24,6 +24,8 @@ def addmm(
     mat2: torch.Tensor,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         from tzrec.ops._triton.triton_addmm import triton_addmm
 

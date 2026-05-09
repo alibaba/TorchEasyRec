@@ -5,3 +5,4 @@
    :maxdepth: 2
 
    dlrm_hstu
+   ultra_hstu

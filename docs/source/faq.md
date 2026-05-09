@@ -232,3 +232,111 @@ ______________________________________________________________________
 **原因：** kv特征的key包含":"导致报错
 
 **解决方法：** 检查特征表string类型字段是否包含":"，进行数据清洗。
+
+______________________________________________________________________
+
+**Q14: 版本升级后序列特征vocab_list行为变化**
+
+**问题描述：** 从0.9.x或1.0.3-1.1.4升级后，序列特征（如SequenceIdFeature）的vocab_list首元素发生变化。
+
+**原因：** 在1.0.3版本中，`SequenceIdFeature`被合并到`IdFeature`（通过设置`sequence_length`），但`IdFeature`的proto `default_value`默认值为`""`，与原`SequenceIdFeature`的默认值`"0"`不同，导致vocab_list首元素从`"0"`变为`""`。1.1.5版本修复了此问题。
+
+**升级指南：**
+
+- **1.0.2及更早版本（含0.9.x）用户：** 可直接升级到1.0.18或1.1.5+，序列特征的`default_value`行为与旧版本一致，无需额外修改。
+
+- **1.0.3至1.1.4用户：** 升级到1.1.5+后，未显式设置`default_value`的序列特征的vocab_list首元素将从`""`变为`"0"`。如需保持与旧版本完全一致的行为，可通过显式设置`default_bucketize_value`来自行控制vocab_list。示例如下：
+
+  旧版本（1.0.3-1.1.4）配置，未显式设置`default_value`时，内部自动生成的vocab_list为 `["", "<OOV>", "cat", "dog", "bird"]`，其中index0为空字符串`""`，index1为`"<OOV>"`：
+
+  ```protobuf
+  feature_config {
+    id_feature {
+      feature_name: "item_id"
+      expression: "item:item_id"
+      embedding_dim: 16
+      vocab_list: ["cat", "dog", "bird"]
+      sequence_length: 50
+      sequence_delim: ";"
+    }
+  }
+  ```
+
+  升级到1.1.5+后，如需保持与旧版本一致的vocab_list映射（即index0为`""`，index1为`"<OOV>"`），需将`""`和`"<OOV>"`手动加入vocab_list，并设置`default_bucketize_value: 1`：
+
+  ```protobuf
+  feature_config {
+    id_feature {
+      feature_name: "item_id"
+      expression: "item:item_id"
+      embedding_dim: 16
+      vocab_list: ["", "<OOV>", "cat", "dog", "bird"]
+      default_bucketize_value: 1
+      sequence_length: 50
+      sequence_delim: ";"
+    }
+  }
+  ```
+
+  设置`default_bucketize_value`后，系统不再自动在vocab_list前插入`default_value`和`"<OOV>"`，而是直接使用用户配置的vocab_list，OOV值将映射到`default_bucketize_value`指定的索引。
+
+**版本查询方式：**
+
+```bash
+pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+```
+
+______________________________________________________________________
+
+**Q15: Hopper GPU上HSTU注意力反向传播autotuning崩溃**
+
+**报错信息：**
+
+```
+File "/opt/conda/lib/python3.11/site-packages/triton/testing.py", line 150, in do_bench
+    di.synchronize()
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+
+**原因：** Triton v3.6.0在Hopper GPU（如H20）上存在WGMMA（Warp Group Matrix Multiply-Accumulate）代码生成Bug。在RS WGMMA路径中缺少寄存器同步指令，导致`_hstu_attn_bwd`内核在autotuning阶段出现非法内存访问。
+
+**解决方法：** 安装修复后的Triton wheel：
+
+```bash
+pip install --force-reinstall --no-deps "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
+```
+
+______________________________________________________________________
+
+**Q16: DlrmHSTU/UltraHSTU AOTI sample-input autotune导出报错 `_assert_scalar(u? <= K)`**
+
+**报错信息：**
+
+```
+torch._inductor.exc.InductorError: RuntimeError: Runtime assertion failed for expression u0 <= 2002 on node 'le_5'
+While executing %_assert_scalar_1 = call_function[target=torch.ops.aten._assert_scalar.default](args = (%le, "Runtime assertion failed for expression u0 <= 2002 on node 'le_5'"), kwargs = {})
+```
+
+**原因：** 开启`AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=1`后，AOTI在`extract_autotune_inputs`中通过`torch.fx.Interpreter`走一次sample-input图，会触达由torch.export插入的`_assert_scalar(u_i <= K)`节点。这里：
+
+- `u0/u2` 是 `max(uih_seq_lengths).item() / max(num_targets).item()`等data-dependent unbacked SymInt（见`tzrec/modules/gr/preprocessors.py:375-381`）；
+- `tzrec/ops/utils.py:74` 的 `torch._check(max_len >= runtime_max_seq_len)` 在 `runtime_max_seq_len = max_uih_len + max_targets + max_contextual_seq_len`（见`preprocessors.py:283 + :325`）替换之后，给出 sum 上界 `u0 + u2 ≤ max_seq_len − max_contextual_seq_len`；sympy 进一步用 `u2 ≥ 1` 推出 per-symbol 上界 `u0 ≤ max_seq_len − max_contextual_seq_len − 1`；
+- PyTorch对unbacked SymInt的`node.hint`在创建时一次性赋值（约等于`max_seq_len`），后续`torch._check`只更新value-range而不回填hint；当hint大于 per-symbol 上界时 sample-input 走graph会触发 assert。
+
+**解决方法：** 调大`model_config.max_seq_len`使派生上界跳过hint，同时通过新增的`stu.scaling_seqlen`把attention scaling分母固定为原`max_seq_len`，保持推理跟训练时计算完全一致。例：原`max_seq_len: 2048`、`max_contextual_seq_len = 45`，per-symbol 上界 `2048 − 45 − 1 = 2002` 被 hint=2048 打破；改为：
+
+```protobuf
+model_config {
+  dlrm_hstu {
+    hstu {
+      stu {
+        # ...其余字段不变...
+        scaling_seqlen: 2048   # 与训练时相同；保持attention scaling
+      }
+    }
+    max_seq_len: 2112          # 原2048 + 余量；新 per-symbol 上界 2112−45−1 = 2066 > hint
+  }
+}
+```
+
+具体余量需大于`max_contextual_seq_len + 1`（`max_contextual_seq_len` = contextual feature group的特征数）。

@@ -30,6 +30,39 @@ SUBPROC_TEST_PATTERN = [
 ]
 
 
+def _is_in_scope(test_case: unittest.TestCase, scope: str) -> bool:
+    method = getattr(test_case, test_case._testMethodName, None)
+    method_scopes = set(getattr(method, "_ci_scopes", ()) or ())
+    if scope in method_scopes:
+        return True
+    cls = type(test_case)
+    cls_scopes = set(getattr(cls, "_ci_scopes", ()) or ())
+    return scope in cls_scopes
+
+
+def _filter_in_scope(suite, scope: str) -> unittest.TestSuite:
+    """Prune tests not tagged with ``scope``; preserves nested suite layout.
+
+    Robust against ``_FailedTest`` placeholders (modules whose import
+    failed at discovery): they aren't iterable, so handle the leaf-case
+    first and just drop them from a scoped run.
+    """
+    new_suite = unittest.TestSuite()
+    if isinstance(suite, unittest.TestCase):
+        if _is_in_scope(suite, scope):
+            new_suite.addTest(suite)
+        return new_suite
+    for child in suite:
+        if isinstance(child, unittest.TestCase):
+            if _is_in_scope(child, scope):
+                new_suite.addTest(child)
+        else:
+            filtered = _filter_in_scope(child, scope)
+            if filtered.countTestCases() > 0:
+                new_suite.addTest(filtered)
+    return new_suite
+
+
 def _gather_test_cases(args):
     test_dir = os.path.abspath(args.test_dir)
     test_suite_main = unittest.TestSuite()
@@ -39,6 +72,10 @@ def _gather_test_cases(args):
     )
     for suite_discovered in discover:
         for test_case in suite_discovered:
+            if args.scope is not None:
+                test_case = _filter_in_scope(test_case, args.scope)
+                if test_case.countTestCases() == 0:
+                    continue
             test_case_str = str(test_case)
             is_subproc = False
             for subp_pattern in SUBPROC_TEST_PATTERN:
@@ -201,6 +238,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--test_dir", type=str, default="tzrec", help="directory to be tested"
+    )
+    parser.add_argument(
+        "--scope",
+        type=str,
+        default=None,
+        help="filter tests by CI scope marker (e.g. 'h20'); "
+        "default None runs the full suite",
     )
     args = parser.parse_args()
 

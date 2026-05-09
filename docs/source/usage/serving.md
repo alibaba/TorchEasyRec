@@ -43,7 +43,7 @@ cat << EOF > tzrec_rank.json
       }
     }
   ],
-  "processor":"easyrec-torch-1.11"
+  "processor":"easyrec-torch-2.2"
 }
 EOF
 

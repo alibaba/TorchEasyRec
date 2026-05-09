@@ -16,9 +16,15 @@ import torch
 from parameterized import parameterized
 
 from tzrec.modules.gr.action_encoder import SimpleActionEncoder
-from tzrec.utils.test_util import TestGraphType, create_test_module, gpu_unavailable
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_module,
+    gpu_unavailable,
+    mark_ci_scope,
+)
 
 
+@mark_ci_scope("h20")
 class ActionEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)

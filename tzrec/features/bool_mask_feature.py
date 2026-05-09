@@ -54,7 +54,7 @@ class BoolMaskFeature(IdFeature):
         fg_cfg = {
             "feature_type": "bool_mask_feature",
             "feature_name": self.config.feature_name,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "expression": list(self.config.expression),
         }
         if self.config.separator != "\x1d":

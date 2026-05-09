@@ -463,6 +463,73 @@ class KafkaDatasetTest(unittest.TestCase):
         for label in labels:
             self.assertEqual(label, 1)
 
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_kafka_dataset_heartbeat_no_max_poll_exceeded(self):
+        """Test heartbeat prevents MAX_POLL_EXCEEDED during long idle."""
+        feature_cfgs, input_fields, _ = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+
+        # Use a low max.poll.interval.ms (10s) so idle_threshold = 8s.
+        # Sleep 12s between reads to exceed max.poll.interval.ms.
+        # Without the heartbeat, this would trigger MAX_POLL_EXCEEDED.
+        dataset = KafkaDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=8196,
+                dataset_type=data_pb2.DatasetType.KafkaDataset,
+                input_fields=input_fields,
+                fg_mode=FgMode.FG_DAG,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id=tzrec_test_group"
+                f"&auto.offset.reset=earliest"
+                f"&session.timeout.ms=6000"
+                f"&max.poll.interval.ms=10000"
+            ),
+        )
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+
+        # Read first batch
+        batch1 = next(iterator)
+        data_dict1 = batch1.to_dict()
+        self.assertEqual(len(data_dict1["id_a.lengths"]), 8196)
+
+        # Sleep longer than max.poll.interval.ms (10s).
+        # Heartbeat should activate at 8s (80% of 10s) and keep alive.
+        time.sleep(12)
+
+        # Read second batch — should succeed without MAX_POLL_EXCEEDED
+        batch2 = next(iterator)
+        data_dict2 = batch2.to_dict()
+        self.assertEqual(len(data_dict2["id_a.lengths"]), 8196)
+        self.assertEqual(
+            sorted(data_dict2.keys()),
+            [
+                "id_a.lengths",
+                "id_a.values",
+                "label",
+                "lookup_h.values",
+                "raw_c.values",
+                "raw_d.values",
+                "raw_e.values",
+                "raw_f.values",
+                "raw_g.values",
+                "tag_b.lengths",
+                "tag_b.values",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

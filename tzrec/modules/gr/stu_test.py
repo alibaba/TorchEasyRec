@@ -16,9 +16,14 @@ from typing import List
 import torch
 from hypothesis import Verbosity, given, settings
 from hypothesis import strategies as st
+from parameterized import parameterized
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import (
+    gpu_unavailable,
+    mark_ci_scope,
+    reference_stu_truncation,
+)
 
 
 def _inplace_swap(
@@ -34,6 +39,7 @@ def _inplace_swap(
     return x
 
 
+@mark_ci_scope("h20")
 class StuTest(unittest.TestCase):
     # pyre-ignore
     @given(
@@ -133,13 +139,13 @@ class StuTest(unittest.TestCase):
             dtype=dtype,
         ).requires_grad_(True)
         x_triton = x.clone().detach().requires_grad_()
-        stu_output = stu(
+        stu_output, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
             num_targets=num_targets,
         )
-        stu_triton_output = stu_triton(
+        stu_triton_output, _, _, _ = stu_triton(
             x=x_triton,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -230,7 +236,7 @@ class StuTest(unittest.TestCase):
             device=device,
             dtype=dtype,
         ).requires_grad_(True)
-        stu_output = stu(
+        stu_output, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -254,7 +260,7 @@ class StuTest(unittest.TestCase):
             swapped_dense_x,
             [x_offsets],
         )[0].requires_grad_(True)
-        swapped_stu_output = stu(
+        swapped_stu_output, _, _, _ = stu(
             x=swapped_x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -383,7 +389,7 @@ class StuTest(unittest.TestCase):
         ).requires_grad_(True)
 
         # default forward().
-        ref_y = stu(
+        ref_y, _, _, _ = stu(
             x=x,
             x_offsets=x_offsets,
             max_seq_len=max_seq_len,
@@ -425,6 +431,302 @@ class StuTest(unittest.TestCase):
         )
 
         torch.testing.assert_close(ref_delta_y, delta_y)
+
+    def _make_sla_layer(self, sla_k1: int = 0, sla_k2: int = 0):
+        from tzrec.modules.gr.stu import STULayer
+
+        layer = STULayer(
+            embedding_dim=16,
+            num_heads=2,
+            hidden_dim=32,
+            attention_dim=32,
+            output_dropout_ratio=0.0,
+            causal=True,
+            target_aware=True,
+            max_attn_len=None,
+            attn_alpha=None,
+            use_group_norm=False,
+            recompute_normed_x=False,
+            recompute_uvqk=False,
+            recompute_y=False,
+            sort_by_length=False,
+            contextual_seq_len=0,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            is_inference=False,
+        )
+        layer.set_kernel(Kernel.PYTORCH)
+        return layer
+
+    def _sla_inputs(self):
+        x_lengths = torch.tensor([4, 6], dtype=torch.int64)
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        x = torch.randn(int(x_offsets[-1].item()), 16)
+        num_targets = torch.tensor([1, 2], dtype=torch.int64)
+        return x, x_offsets, int(x_lengths.max().item()), num_targets
+
+    def test_consecutive_same_sig_layers_share_func(self) -> None:
+        """A second SLA layer with matching sig reuses the prev tensor."""
+        layer1 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+
+        out1, attn_func1 = layer1(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        _, attn_func2 = layer2(
+            x=out1,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+            prev_attn_func=attn_func1,
+            prev_attn_func_sig=layer1.attn_func_static_sig,
+        )
+        self.assertEqual(layer2.attn_func_static_sig, layer1.attn_func_static_sig)
+        # Tensor identity confirms layer2 reused rather than rebuilt.
+        self.assertIs(attn_func2, attn_func1)
+
+    def test_distinct_sig_rebuilds(self) -> None:
+        """A second SLA layer with a different sig builds a fresh tensor."""
+        layer1 = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer2 = self._make_sla_layer(sla_k1=8, sla_k2=2)  # different k1
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+
+        out1, attn_func1 = layer1(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+        _, attn_func2 = layer2(
+            x=out1,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+            prev_attn_func=attn_func1,
+            prev_attn_func_sig=layer1.attn_func_static_sig,
+        )
+        self.assertNotEqual(layer2.attn_func_static_sig, layer1.attn_func_static_sig)
+        self.assertIsNot(attn_func2, attn_func1)
+
+    def test_sla_on_triton_kernel_raises(self) -> None:
+        """SLA paths require CUTLASS or PYTORCH; Triton has no NFUNC kernel."""
+        layer = self._make_sla_layer(sla_k1=4, sla_k2=2)
+        layer.set_kernel(Kernel.TRITON)
+        x, x_offsets, max_seq_len, num_targets = self._sla_inputs()
+        with self.assertRaisesRegex(ValueError, "Kernel.TRITON"):
+            layer(
+                x=x,
+                x_offsets=x_offsets,
+                max_seq_len=max_seq_len,
+                num_targets=num_targets,
+            )
+
+
+@mark_ci_scope("h20")
+class STUStackTruncationTest(unittest.TestCase):
+    """Cover the mid-stack truncation block in ``STUStack.forward``.
+
+    The truncation branch rewrites ``x`` / ``x_offsets`` / ``max_seq_len``
+    and has no coverage from ``StuTest`` (which leaves ``truncate_*`` at
+    their defaults).
+    """
+
+    _LAYER_KWARGS = dict(
+        embedding_dim=16,
+        num_heads=2,
+        hidden_dim=32,
+        attention_dim=32,
+        output_dropout_ratio=0.0,
+        causal=True,
+        target_aware=True,
+        max_attn_len=None,
+        attn_alpha=None,
+        use_group_norm=False,
+        recompute_normed_x=False,
+        recompute_uvqk=False,
+        recompute_y=False,
+        sort_by_length=False,
+        contextual_seq_len=0,
+        is_inference=False,
+    )
+
+    def _make_stack(
+        self,
+        num_layers: int,
+        truncate_split_layer: int,
+        truncate_tail_len: int,
+        contextual_seq_len: int = 0,
+        sla_k1: int = 0,
+        sla_k2: int = 0,
+    ):
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        kwargs = dict(self._LAYER_KWARGS)
+        kwargs["contextual_seq_len"] = contextual_seq_len
+        kwargs["sla_k1"] = sla_k1
+        kwargs["sla_k2"] = sla_k2
+        embedding_dim = kwargs["embedding_dim"]
+        layers: List[STU] = [STULayer(**kwargs) for _ in range(num_layers)]
+        stack = STUStack(
+            stu_list=layers,
+            truncate_split_layer=truncate_split_layer,
+            truncate_tail_len=truncate_tail_len,
+            is_inference=False,
+        )
+        stack.set_kernel(Kernel.PYTORCH)
+        return stack, embedding_dim
+
+    def test_init_validates_split_layer_bounds(self) -> None:
+        """Both bounds + symmetric (only-one-positive rejected)."""
+        from tzrec.modules.gr.stu import STU, STULayer, STUStack
+
+        stu_list: List[STU] = [STULayer(**self._LAYER_KWARGS) for _ in range(3)]
+        # split_layer must be > 0 when tail_len > 0.
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=0,
+                truncate_tail_len=4,
+            )
+        # split_layer must be < len(stu_list).
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=3,
+                truncate_tail_len=4,
+            )
+        # Asymmetric: setting split_layer without tail_len.
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=1,
+                truncate_tail_len=0,
+            )
+        # Asymmetric: setting tail_len without split_layer.
+        with self.assertRaises(ValueError):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=0,
+                truncate_tail_len=4,
+            )
+        # Negative pair: would XOR-equal to False and silently disable.
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=-1,
+                truncate_tail_len=-1,
+            )
+        # Single negative: rejected before the XOR check.
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            STUStack(
+                stu_list=stu_list,
+                truncate_split_layer=-1,
+                truncate_tail_len=4,
+            )
+        # Valid: enabled.
+        STUStack(stu_list=stu_list, truncate_split_layer=1, truncate_tail_len=4)
+        # Valid: disabled (defaults).
+        STUStack(stu_list=stu_list)
+
+    def _forward(
+        self,
+        stack,
+        embedding_dim: int,
+        x_lengths: torch.Tensor,
+        num_targets,
+    ):
+        x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+        total = int(x_offsets[-1].item())
+        x = torch.randn(total, embedding_dim)
+        max_seq_len = int(x_lengths.max().item())
+        return stack(
+            x=x,
+            x_offsets=x_offsets,
+            max_seq_len=max_seq_len,
+            num_targets=num_targets,
+        )
+
+    @parameterized.expand(
+        [
+            # split, tail, num_targets, lengths, expects_plan
+            [0, 0, [1, 2], [4, 6], False],  # disabled
+            [1, 8, [2, 2, 2, 2], [12, 20, 5, 30], True],  # truncated
+            [1, 16, [1, 1, 1], [3, 5, 2], True],  # no-op (plan still returned)
+            [1, 8, None, [12, 20, 5, 30], True],  # listwise (num_targets=None)
+        ]
+    )
+    def test_forward_threads_truncation_metadata(
+        self, split, tail, targets, lengths, expects_plan
+    ) -> None:
+        """Stack returns ``(x, offsets, max, plan)`` and threads num_targets.
+
+        Asserts post-truncation lengths against an independent Python
+        reference, so a regression that silently corrupts ``x``'s row
+        count fails (the trivial ``out.size(0) == new_offsets[-1]``
+        identity would otherwise pass).
+        """
+        stack, D = self._make_stack(
+            num_layers=3, truncate_split_layer=split, truncate_tail_len=tail
+        )
+        x_lengths = torch.tensor(lengths, dtype=torch.int64)
+        num_targets = (
+            torch.tensor(targets, dtype=torch.int64) if targets is not None else None
+        )
+        out, new_offsets, new_max, plan = self._forward(
+            stack, D, x_lengths, num_targets
+        )
+        if split > 0 and tail > 0:
+            offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(x_lengths)
+            _, expected_lens = reference_stu_truncation(
+                torch.zeros(int(offsets[-1].item()), 1),
+                offsets,
+                targets,
+                truncate_tail_len=tail,
+            )
+        else:
+            expected_lens = list(lengths)
+        self.assertEqual(plan is not None, expects_plan)
+        self.assertEqual((new_offsets[1:] - new_offsets[:-1]).tolist(), expected_lens)
+        self.assertEqual(out.size(0), sum(expected_lens))
+        self.assertEqual(new_max, max(expected_lens))
+
+    def test_cached_forward_raises_on_truncation(self) -> None:
+        """Train/serve firewall: ``cached_forward`` refuses truncation."""
+        stack, D = self._make_stack(
+            num_layers=3, truncate_split_layer=1, truncate_tail_len=4
+        )
+        delta_x = torch.randn(8, D)
+        num_targets = torch.tensor([2, 2], dtype=torch.int64)
+        with self.assertRaisesRegex(NotImplementedError, "truncation"):
+            stack.cached_forward(
+                delta_x=delta_x,
+                num_targets=num_targets,
+            )
+
+    def test_truncation_with_sla_runs(self) -> None:
+        """SLA-enabled stack with truncation produces a finite output.
+
+        Ensures that resetting ``prev_attn_func`` across the truncation
+        boundary lets the next layer's cache-miss path rebuild the SLA
+        func tensor against the truncated offsets without crashing.
+        """
+        stack, D = self._make_stack(
+            num_layers=3,
+            truncate_split_layer=1,
+            truncate_tail_len=6,
+            sla_k1=4,
+            sla_k2=2,
+        )
+        x_lengths = torch.tensor([16, 20, 8], dtype=torch.int64)
+        num_targets = torch.tensor([2, 2, 2], dtype=torch.int64)
+        out, new_offsets, _, plan = self._forward(stack, D, x_lengths, num_targets)
+        self.assertIsNotNone(plan)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(out.size(0), int(new_offsets[-1].item()))
 
 
 if __name__ == "__main__":

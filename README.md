@@ -94,9 +94,10 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 
 ### Generative Recommendation
 
-| Model                                        | Description                                |
-| -------------------------------------------- | ------------------------------------------ |
-| [DLRM-HSTU](docs/source/models/dlrm_hstu.md) | Hierarchical Sequential Transduction Units |
+| Model                                          | Description                                                                      |
+| ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| [DLRM-HSTU](docs/source/models/dlrm_hstu.md)   | Hierarchical Sequential Transduction Units                                       |
+| [ULTRA-HSTU](docs/source/models/ultra_hstu.md) | HSTU with Semi-Local Attention, Attention Truncation, and Mixture of Transducers |
 
 ## Documentation
 

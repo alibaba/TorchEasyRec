@@ -24,7 +24,7 @@ from tzrec.datasets.dataset import create_dataloader
 from tzrec.main import _create_features
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
-from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
+from tzrec.utils.test_util import dfs_are_close, gpu_unavailable, mark_ci_scope
 
 
 class RankIntegrationTest(unittest.TestCase):
@@ -510,13 +510,15 @@ class RankIntegrationTest(unittest.TestCase):
 
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(input_tile_dir, "export/aoti/aoti_model.pt2"))
         )
         self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir_emb, "export/aoti_model.pt2"))
+            os.path.exists(
+                os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2")
+            )
         )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
@@ -789,6 +791,47 @@ class RankIntegrationTest(unittest.TestCase):
             comp_cpu_gpu_pred_result=True,
         )
 
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+        "needs >= 2 GPUs to exercise different world sizes",
+    )
+    def test_multi_tower_din_zch_finetune_world_size_change(self):
+        # First train on 1 GPU, then finetune from that checkpoint on 2 GPUs.
+        # Regression test for the assertion in MCH validate_state caused by
+        # _output_segments_tensor being clobbered when the saved world size
+        # differs from the current world size.
+        prev_nproc = os.environ.get("TEST_NPROC_PER_NODE")
+        try:
+            os.environ["TEST_NPROC_PER_NODE"] = "1"
+            self.success = utils.test_train_eval(
+                "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+                os.path.join(self.test_dir, "1"),
+                user_id="user_id",
+                item_id="item_id",
+            )
+            self.assertTrue(self.success)
+
+            os.environ["TEST_NPROC_PER_NODE"] = "2"
+            self.success = utils.test_train_eval(
+                "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+                os.path.join(self.test_dir, "2"),
+                user_id="user_id",
+                item_id="item_id",
+                args_str=(
+                    f"--fine_tune_checkpoint {os.path.join(self.test_dir, '1/train')}"
+                ),
+            )
+            self.assertTrue(self.success)
+            _, steps = checkpoint_util.latest_checkpoint(
+                os.path.join(self.test_dir, "2/train")
+            )
+            self.assertGreater(steps, 0)
+        finally:
+            if prev_nproc is None:
+                os.environ.pop("TEST_NPROC_PER_NODE", None)
+            else:
+                os.environ["TEST_NPROC_PER_NODE"] = prev_nproc
+
     def test_multi_tower_din_with_fg_export_quant(self):
         self._test_rank_with_fg_quant(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
@@ -916,20 +959,26 @@ class RankIntegrationTest(unittest.TestCase):
         df2 = df2.sort_values(by=predict_columns).reset_index(drop=True)
         self.assertTrue(dfs_are_close(df1, df2, 1e-6))
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_rank_dlrm_hstu_train_eval_export(self):
+    def _test_rank_dlrm_hstu_train_eval_export(self, export_env_str: str):
+        # DISABLE_MMA_V3=1: Triton 3.6 sm_90 WGMMA bug
+        hstu_env = "DISABLE_MMA_V3=1"
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config", self.test_dir
+            "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config",
+            self.test_dir,
+            env_str=hstu_env,
         )
         if self.success:
             self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str=hstu_env,
             )
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="ENABLE_AOT=1",
+                env_str=f"{hstu_env} {export_env_str}",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
         predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
@@ -953,8 +1002,120 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
         self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti_model.pt2"))
+            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
         )
+        # Verify model_acc.json contains HSTU-related fields
+        model_acc_path = os.path.join(self.test_dir, "export/model_acc.json")
+        self.assertTrue(os.path.exists(model_acc_path))
+        with open(model_acc_path) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["cand_seq_pk"], "cand_seq")
+
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export(self):
+        # Default path: legacy two-stage export (sparse JIT + dense AOTI).
+        self._test_rank_dlrm_hstu_train_eval_export(export_env_str="ENABLE_AOT=1")
+        # Two-stage export must produce both the JIT sparse model and the
+        # AOTI dense model.
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
+            )
+        )
+        with open(os.path.join(self.test_dir, "export/model_acc.json")) as f:
+            self.assertEqual(json.load(f).get("ENABLE_AOT"), "1")
+
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export_unified_aot(self):
+        # Unified AOTI export (ENABLE_AOT=2): fused sparse+dense single .pt2.
+        self._test_rank_dlrm_hstu_train_eval_export(export_env_str="ENABLE_AOT=2")
+        # Unified export must NOT produce the legacy JIT sparse model file.
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, "export/scripted_sparse_model.pt")
+            )
+        )
+        # model_acc.json must explicitly record ENABLE_AOT=2.
+        with open(os.path.join(self.test_dir, "export/model_acc.json")) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg.get("ENABLE_AOT"), "2")
+
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_train_eval_export_autotune_with_sample_inputs(self):
+        # Exercise the AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS path with a small
+        # MAX_EXPORT_BATCH_SIZE so the FX-Interpreter bench walk stays light.
+        self._test_rank_dlrm_hstu_train_eval_export(
+            export_env_str=(
+                "ENABLE_AOT=1 AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS=1 "
+                "MAX_EXPORT_BATCH_SIZE=2"
+            )
+        )
+        with open(os.path.join(self.test_dir, "export/model_acc.json")) as f:
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg.get("AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS"), "1")
+            self.assertEqual(acc_cfg.get("MAX_EXPORT_BATCH_SIZE"), "2")
+
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_dlrm_hstu_cutlass_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dlrm_hstu_cutlass_kuairand_1k.config", self.test_dir
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
+            )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path="data/test/kuairand-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,cand_seq__video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
+
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_rank_ultra_hstu_cutlass_train_eval_export(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/ultra_hstu_cutlass_kuairand_1k.config",
+            self.test_dir,
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
+            )
+        predict_output_path = os.path.join(self.test_dir, "predict_result")
+        if self.success:
+            self.success = utils.test_predict(
+                os.path.join(self.test_dir, "export"),
+                predict_input_path="data/test/kuairand-mot-1k-eval-c4096-s100.parquet",
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,cand_seq__video_id",
+                output_columns="",
+                test_dir=self.test_dir,
+            )
+        self.assertTrue(self.success)
 
     @unittest.skipIf(
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
@@ -1027,6 +1188,7 @@ class RankIntegrationTest(unittest.TestCase):
             in weight_json
         )
 
+    @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_rtp_train_export(self):
         self.success = utils.test_train_eval(
@@ -1039,6 +1201,7 @@ class RankIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str="MAX_EXPORT_BATCH_SIZE=1 USE_FARM_HASH_TO_BUCKETIZE=true USE_RTP=1",  # NOQA
+                additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         self.assertTrue(self.success)
 

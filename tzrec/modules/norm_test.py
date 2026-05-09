@@ -17,9 +17,10 @@ from hypothesis import Verbosity, given, settings
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable
+from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable, mark_ci_scope
 
 
+@mark_ci_scope("h20")
 class LayerNormTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]

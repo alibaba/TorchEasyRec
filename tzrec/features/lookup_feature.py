@@ -114,7 +114,7 @@ class LookupFeature(BaseFeature):
             "feature_name": self.config.feature_name,
             "map": self.config.map,
             "key": self.config.key,
-            "default_value": self.config.default_value,
+            "default_value": self.default_value,
             "value_type": "float",
             "needDiscrete": self.config.need_discrete,
             "needKey": self.config.need_key,
@@ -124,7 +124,7 @@ class LookupFeature(BaseFeature):
         if self.config.value_dim > 1:
             fg_cfg["feature_name"] = self.config.feature_name + "__lookup"
             fg_cfg["default_value"] = self.config.value_separator.join(
-                [self.config.default_value] * self.config.value_dim
+                [self.default_value] * self.config.value_dim
             )
             fg_cfg["value_type"] = "string"
             fg_cfg["value_dim"] = 1
@@ -134,7 +134,7 @@ class LookupFeature(BaseFeature):
             raw_fg_cfg = {
                 "feature_type": "raw_feature",
                 "feature_name": self.config.feature_name,
-                "default_value": self.config.default_value,
+                "default_value": self.default_value,
                 "expression": "feature:" + fg_cfg["feature_name"],
                 "separator": self.config.value_separator,
                 "value_dim": self.config.value_dim,

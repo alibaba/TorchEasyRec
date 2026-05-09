@@ -165,7 +165,11 @@ model_config {
       - metrics: 任务指标
   - max_seq_len: 最大序列长度
 
-- kernel: 算子实现，可选TRITON/PYTORCH，TRITON通常比PYTORCH快2-3x，节省2-3x显存
+- kernel: 算子实现，可选TRITON/PYTORCH/CUTLASS
+
+  - TRITON: 基于Triton的实现，通常比PYTORCH快2-3x，节省2-3x显存
+  - CUTLASS: 基于CUTLASS的CUDA融合算子实现，需安装fbgemm_gpu_hstu包（DEVICE可选cu126/cu129，对应DEVICE_DOTTED为cu12.6/cu12.9：`pip install fbgemm_gpu_hstu==0.1.0+${DEVICE_DOTTED} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/hstu/${DEVICE}/repo.html`），要求`attention_dim`等于`hidden_dim`，支持Ampere/Ada/Hopper GPU
+  - PYTORCH: 纯PyTorch实现，兼容性最好
 
 ### MTGR Style 配置方式
 
@@ -306,6 +310,21 @@ model_config {
 
 [dlrm_hstu_kuairand.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_hstu_kuairand.config)
 注: 如遇到训练不稳定问题，可优先考虑调整混合精度相关的配置: 去除train_config中的mixed_precision，去除feature_configs中的data_type，设置train_config.cuda_matmul_allow_tf32=true
+
+### 模型导出
+
+hstu模型导出时， 需要通过命令行参数 `--additional_export_config` 传入一个 JSON， 其中 `cand_seq_pk` 指定 candidate 序列特征的名称（即 `sequence_feature.sequence_name`， 例如 `cand_seq`）。该 JSON 的内容会被合并写入 `model_acc.json` 供在线推理使用。
+
+例如:
+
+```
+torchrun --master_addr=localhost --master_port=32555 \
+    --nnodes=1 --nproc-per-node=1 --node_rank=0 \
+    -m tzrec.export \
+    --pipeline_config_path experiments/dlrm_hstu/pipeline.config \
+    --additional_export_config '{"cand_seq_pk": "cand_seq"}' \
+    --export_dir experiments/dlrm_hstu/export
+```
 
 ## 参考论文
 

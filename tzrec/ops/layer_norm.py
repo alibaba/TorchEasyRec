@@ -32,6 +32,8 @@ def layer_norm(
     eps: float = 1e-5,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
@@ -60,6 +62,8 @@ def rms_norm(
     eps: float = 1e-5,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
@@ -87,6 +91,8 @@ def swish_layer_norm(
     eps: float = 1e-5,
     kernel: Kernel = Kernel.PYTORCH,
 ) -> torch.Tensor:
+    if kernel == Kernel.CUTLASS:
+        kernel = Kernel.TRITON
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
