@@ -33,9 +33,8 @@ WIDE: 广度特征组，主要用于WideAndDeep/DeepFM模型。其中feature_nam
 - 不设置或为空：保持默认行为，相同embedding_name的特征跨feature_group共享embedding表。
 - 不同feature_group设置相同的embedding_name_suffix：仍共享同一embedding表。
 - 不同feature_group设置不同的embedding_name_suffix：使用各自独立的embedding表。
-- 当DEEP feature_group同时设置embedding_name_suffix和嵌套sequence_groups时，后缀会自动传递到嵌套的sequence_groups。`SeqGroupConfig`同样支持`embedding_name_suffix`字段，在子sequence_group上显式设置该字段会覆盖父feature_group传递下来的值。
+- 当DEEP feature_group同时设置embedding_name_suffix和嵌套sequence_groups时，后缀会自动传递到嵌套的sequence_groups。`SeqGroupConfig`也支持`embedding_name_suffix`字段，在子sequence_group上显式设置该字段会覆盖父feature_group传递下来的值。
 - 当WIDE feature_group设置embedding_name_suffix时，最终embedding表名为`<emb_name>_wide_<suffix>`。
-- 若两个feature_group的最终embedding表名相同但`embedding_name_suffix`不同（即存在隐式碰撞，例如手工命名的`embedding_name`恰好包含suffix前缀字符串），构造`EmbeddingGroup`时会直接抛出`ValueError`，以避免静默合并本应独立的embedding表。
 
 配置样例（双塔不共享embedding）：
 
