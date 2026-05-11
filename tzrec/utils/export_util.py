@@ -611,7 +611,8 @@ def _rtp_slice_with_seq_len(
     x: torch.Tensor, seq_len: torch.Tensor, max_seq_len: int
 ) -> torch.Tensor:
     seq_len_int = seq_len.max().item()
-    torch._check_is_size(seq_len_int, max=max_seq_len)
+    torch._check(seq_len_int >= 0)
+    torch._check(seq_len_int <= max_seq_len)
     return x[:, :seq_len_int, :]
 
 
