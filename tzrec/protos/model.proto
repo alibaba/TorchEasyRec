@@ -20,7 +20,9 @@ enum FeatureGroupType {
 message SeqGroupConfig {
     optional string group_name = 1;
     repeated string feature_names = 2;
-
+    // Suffix appended to each feature's embedding_name; same semantics as
+    // FeatureGroupConfig.embedding_name_suffix. Empty == disabled.
+    optional string embedding_name_suffix = 3;
 }
 
 message FeatureGroupConfig {
@@ -29,6 +31,9 @@ message FeatureGroupConfig {
     required FeatureGroupType group_type = 3 [default = DEEP];
     repeated SeqGroupConfig sequence_groups = 4;
     repeated SeqEncoderConfig sequence_encoders = 5;
+    // Suffix appended to each feature's embedding_name so groups with
+    // different suffixes use independent embedding tables. Empty == disabled.
+    optional string embedding_name_suffix = 6;
 }
 
 enum Kernel {
