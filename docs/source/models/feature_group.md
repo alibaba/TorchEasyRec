@@ -57,6 +57,26 @@ model_config {
 }
 ```
 
+配置样例（嵌套sequence_group用自己的后缀覆盖父group的传递值）：
+
+```
+feature_groups {
+    group_name: "deep"
+    feature_names: "cat_a"
+    group_type: DEEP
+    embedding_name_suffix: "tower_a"
+    sequence_groups {
+        group_name: "click_seq"
+        feature_names: "cat_a"
+        feature_names: "click_seq__cat_a"
+        embedding_name_suffix: "click_only"
+    }
+    sequence_encoders {
+        simple_attention { input: "click_seq" }
+    }
+}
+```
+
 ## 配置样例
 
 ```
