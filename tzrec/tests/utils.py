@@ -802,7 +802,7 @@ def build_mock_input_with_fg(
                         # Sampler-targeted sequence features must have
                         # single-value mock data because the sampler casts
                         # the field to int64. The candidate sequence is
-                        # created at runtime by combine_neg_as_candidate_sequence.
+                        # created at runtime by combine_candidate_sequence_block.
                         # Generate as string so the sequence_id_feature parser
                         # can read it (with delimiter; single value parses as
                         # one-element sequence).

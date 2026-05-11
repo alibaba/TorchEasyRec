@@ -12,6 +12,7 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, CAND_POS_LENGTHS, Batch
@@ -29,7 +30,7 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import TestGraphType, create_test_model
 
 
 def _build_model_config():
@@ -53,10 +54,12 @@ def _build_model_config():
                 input="uih",
                 hstu=module_pb2.HSTU(
                     stu=module_pb2.STU(
-                        embedding_dim=48,
-                        num_heads=1,
-                        hidden_dim=48,
-                        attention_dim=48,
+                        # Power-of-2 dims so the Triton HSTU kernels accept
+                        # the shapes.
+                        embedding_dim=64,
+                        num_heads=2,
+                        hidden_dim=32,
+                        attention_dim=32,
                         output_dropout_ratio=0.2,
                     ),
                     attn_num_layers=2,
@@ -88,7 +91,7 @@ def _build_features():
             sequence_id_feature=feature_pb2.IdFeature(
                 feature_name="historical_ids",
                 sequence_length=210,
-                embedding_dim=48,
+                embedding_dim=64,
                 num_buckets=3953,
             )
         ),
@@ -97,7 +100,7 @@ def _build_features():
                 feature_name="item_id",
                 sequence_length=10,
                 sequence_delim=";",
-                embedding_dim=48,
+                embedding_dim=64,
                 num_buckets=1000,
             )
         ),
@@ -105,8 +108,8 @@ def _build_features():
     return create_features(feature_cfgs)
 
 
-def _build_model(device):
-    """Build HSTUMatch model on device."""
+def _build_model(device, kernel=Kernel.PYTORCH):
+    """Build HSTUMatch model on device with the given kernel."""
     model_config = _build_model_config()
     features = _build_features()
     hstu = HSTUMatch(
@@ -117,8 +120,22 @@ def _build_model(device):
     )
     init_parameters(hstu, device=device)
     hstu.to(device)
-    hstu.set_kernel(Kernel.PYTORCH)
+    hstu.set_kernel(kernel)
     return hstu
+
+
+# (device, kernel) — Kernel.PYTORCH runs on CPU so CPU CI catches regressions
+# in the HSTUMatch wiring; Kernel.TRITON runs on CUDA when available.
+_DEVICE_KERNEL_CASES = [
+    ("cpu", Kernel.PYTORCH),
+    ("cuda", Kernel.TRITON),
+]
+
+
+def _resolve_device(device_str: str) -> torch.device:
+    if device_str == "cuda" and not torch.cuda.is_available():
+        raise unittest.SkipTest("CUDA unavailable")
+    return torch.device(device_str)
 
 
 def _build_batch(device):
@@ -145,11 +162,11 @@ def _build_batch(device):
 class HSTUMatchTest(unittest.TestCase):
     """Tests for HSTUMatch model with STU and jagged sequences."""
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_hstu_match_train(self) -> None:
+    @parameterized.expand(_DEVICE_KERNEL_CASES)
+    def test_hstu_match_train(self, device_str: str, kernel: Kernel) -> None:
         """Test HSTUMatch training: forward + loss + backward."""
-        device = torch.device("cuda")
-        hstu = _build_model(device)
+        device = _resolve_device(device_str)
+        hstu = _build_model(device, kernel)
         batch = _build_batch(device)
 
         train_model = TrainWrapper(hstu, device=device).to(device)
@@ -160,11 +177,11 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertTrue(total_loss.requires_grad)
         self.assertFalse(torch.isnan(total_loss))
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_hstu_match_eval(self) -> None:
+    @parameterized.expand(_DEVICE_KERNEL_CASES)
+    def test_hstu_match_eval(self, device_str: str, kernel: Kernel) -> None:
         """Test HSTUMatch evaluation: forward + metrics."""
-        device = torch.device("cuda")
-        hstu = _build_model(device)
+        device = _resolve_device(device_str)
+        hstu = _build_model(device, kernel)
         batch = _build_batch(device)
 
         train_model = TrainWrapper(hstu, device=device).to(device)
@@ -174,11 +191,11 @@ class HSTUMatchTest(unittest.TestCase):
         metric_result = hstu.compute_metric()
         self.assertIn("recall@1", metric_result)
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_hstu_match_export(self) -> None:
+    @parameterized.expand(_DEVICE_KERNEL_CASES)
+    def test_hstu_match_export(self, device_str: str, kernel: Kernel) -> None:
         """Test HSTUMatch export: FX trace for serving."""
-        device = torch.device("cuda")
-        hstu = _build_model(device)
+        device = _resolve_device(device_str)
+        hstu = _build_model(device, kernel)
         batch = _build_batch(device)
 
         hstu.eval()
@@ -190,11 +207,11 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertEqual(sim.dim(), 2)
         self.assertEqual(sim.size(0), 2)
 
-    @unittest.skipIf(*gpu_unavailable)
-    def test_hstu_match_predict(self) -> None:
+    @parameterized.expand(_DEVICE_KERNEL_CASES)
+    def test_hstu_match_predict(self, device_str: str, kernel: Kernel) -> None:
         """Test HSTUMatch predict: inference mode forward pass."""
-        device = torch.device("cuda")
-        hstu = _build_model(device)
+        device = _resolve_device(device_str)
+        hstu = _build_model(device, kernel)
         batch = _build_batch(device)
 
         hstu.eval()

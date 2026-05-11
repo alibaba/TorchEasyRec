@@ -473,7 +473,7 @@ class DataParser:
         if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
             try:
                 additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
-            except Exception:
+            except KeyError:
                 logger.warning("No hard negative samples exist in the batch.")
         try:
             additional_infos[CAND_POS_LENGTHS] = input_data[CAND_POS_LENGTHS]
