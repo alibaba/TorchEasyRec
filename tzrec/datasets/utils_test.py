@@ -206,84 +206,101 @@ class DatasetUtilsTest(unittest.TestCase):
 
         self.assertEqual(total_rows, 400)  # All remaining rows accounted for
 
-    def test_build_sampler_input_string_item_id_no_user_id(self):
-        # NegativeSampler-style: no user_id_field; item_id is delimited string.
-        input_data = {
-            "item_id": pa.array(["1;2", "3"]),
-            "label": pa.array([1, 0]),
-        }
+    # Single parameterized test for build_sampler_input covering the
+    # three transform branches (string flatten + user_id expand, list
+    # flatten + user_id expand, scalar pass-through) plus two defensive
+    # pass-through cases. Every case uniformly verifies:
+    #   - output dict equals expected_output
+    #   - input_data is not mutated (shallow-copy contract)
+    #   - returned dict is a different object from input_data
+    @parameterized.expand(
+        [
+            # (name, input_data, item_id_field, user_id_field,
+            #  seq_field_delims, expected_output)
+            (
+                # NegativeSampler-style: no user_id_field; item_id is
+                # delimited string; gets flattened.
+                "string_item_id_no_user_id",
+                {"item_id": pa.array(["1;2", "3"]), "label": pa.array([1, 0])},
+                "item_id",
+                None,
+                {"item_id": ";"},
+                {"item_id": ["1", "2", "3"], "label": [1, 0]},
+            ),
+            (
+                # NegativeSamplerV2 / HardNeg style: item_id arrives as
+                # list<int64>; user_id is expanded by per-row pos count.
+                "list_item_id_expands_user_id",
+                {
+                    "item_id": pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
+                    "user_id": pa.array(["u0", "u1"]),
+                },
+                "item_id",
+                "user_id",
+                {"item_id": ";"},
+                {"item_id": [1, 2, 3], "user_id": ["u0", "u0", "u1"]},
+            ),
+            (
+                # DSSM-style: item_id is scalar int64. No flatten, no
+                # user_id expand.
+                "scalar_item_id_passthrough",
+                {
+                    "item_id": pa.array([1, 2, 3], type=pa.int64()),
+                    "user_id": pa.array(["u0", "u1", "u2"]),
+                },
+                "item_id",
+                "user_id",
+                {"item_id": ";"},
+                {"item_id": [1, 2, 3], "user_id": ["u0", "u1", "u2"]},
+            ),
+            (
+                # item_id_field has no seq_delim entry -> pass through.
+                "item_id_not_in_seq_field_delims",
+                {"item_id": pa.array(["1", "2"])},
+                "item_id",
+                None,
+                {},
+                {"item_id": ["1", "2"]},
+            ),
+            (
+                # Sampler config without item_id_field at all -> still
+                # shallow-copied, no transformation.
+                "no_item_id_field",
+                {"a": pa.array([1, 2])},
+                None,
+                None,
+                {},
+                {"a": [1, 2]},
+            ),
+        ]
+    )
+    def test_build_sampler_input(
+        self,
+        _name,
+        input_data,
+        item_id_field,
+        user_id_field,
+        seq_field_delims,
+        expected_output,
+    ):
+        # Snapshot input_data so we can verify the function didn't mutate it.
+        input_snapshot = {k: v.to_pylist() for k, v in input_data.items()}
+
         out = build_sampler_input(
             input_data,
-            item_id_field="item_id",
-            user_id_field=None,
-            seq_field_delims={"item_id": ";"},
+            item_id_field=item_id_field,
+            user_id_field=user_id_field,
+            seq_field_delims=seq_field_delims,
         )
-        # input_data is not mutated
-        self.assertEqual(input_data["item_id"].to_pylist(), ["1;2", "3"])
-        # output is flat
-        self.assertEqual(out["item_id"].to_pylist(), ["1", "2", "3"])
-        # other keys carry through
-        self.assertEqual(out["label"].to_pylist(), [1, 0])
-        # returned dict is a different object
+
+        # Contract 1: output equals expected (per-column pylist compare).
+        self.assertEqual({k: v.to_pylist() for k, v in out.items()}, expected_output)
+        # Contract 2: input_data is not mutated.
+        self.assertEqual(
+            {k: v.to_pylist() for k, v in input_data.items()}, input_snapshot
+        )
+        # Contract 3: returned dict is a different object (shallow copy).
         self.assertIsNot(out, input_data)
-
-    def test_build_sampler_input_list_item_id_expands_user_id(self):
-        # NegativeSamplerV2 / HardNeg style: item_id arrives as list<int64>;
-        # user_id is expanded by per-row positive count.
-        input_data = {
-            "item_id": pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
-            "user_id": pa.array(["u0", "u1"]),
-        }
-        out = build_sampler_input(
-            input_data,
-            item_id_field="item_id",
-            user_id_field="user_id",
-            seq_field_delims={"item_id": ";"},
-        )
-        self.assertEqual(out["item_id"].to_pylist(), [1, 2, 3])
-        self.assertEqual(out["user_id"].to_pylist(), ["u0", "u0", "u1"])
-        # original unchanged
-        self.assertEqual(input_data["item_id"].to_pylist(), [[1, 2], [3]])
-        self.assertEqual(input_data["user_id"].to_pylist(), ["u0", "u1"])
-
-    def test_build_sampler_input_scalar_item_id_passthrough(self):
-        # DSSM-style: item_id is scalar int64 (single positive per row).
-        # No flatten, no user_id expansion.
-        input_data = {
-            "item_id": pa.array([1, 2, 3], type=pa.int64()),
-            "user_id": pa.array(["u0", "u1", "u2"]),
-        }
-        out = build_sampler_input(
-            input_data,
-            item_id_field="item_id",
-            user_id_field="user_id",
-            seq_field_delims={"item_id": ";"},
-        )
-        self.assertEqual(out["item_id"].to_pylist(), [1, 2, 3])
-        self.assertEqual(out["user_id"].to_pylist(), ["u0", "u1", "u2"])
-
-    def test_build_sampler_input_item_id_not_in_seq_field_delims(self):
-        # If item_id_field has no seq_delim, treat as scalar and pass through.
-        input_data = {"item_id": pa.array(["1", "2"])}
-        out = build_sampler_input(
-            input_data,
-            item_id_field="item_id",
-            user_id_field=None,
-            seq_field_delims={},
-        )
-        self.assertEqual(out["item_id"].to_pylist(), ["1", "2"])
-
-    def test_build_sampler_input_no_item_id_field(self):
-        # Sampler config without item_id_field at all (defensive path).
-        input_data = {"a": pa.array([1, 2])}
-        out = build_sampler_input(
-            input_data,
-            item_id_field=None,
-            user_id_field=None,
-            seq_field_delims={},
-        )
-        self.assertIsNot(out, input_data)  # still shallow-copied
-        self.assertEqual(out["a"].to_pylist(), [1, 2])
 
     # Single parameterized test for combine_negs_to_candidate_sequence
     # exercising both the string path (output type preserved as string) and
