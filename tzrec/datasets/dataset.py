@@ -366,7 +366,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             input_data[HARD_NEG_INDICES] = hard_neg_indices
 
         if use_sample_mask:
-            self._append_neg_sample_mask(input_data, sampled)
+            num_sampled = len(next(iter(sampled.values())))
+            input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+                [
+                    input_data[C_SAMPLE_MASK],
+                    pa.array(
+                        np.random.random(num_sampled)
+                        < self._data_config.negative_sample_mask_prob
+                    ),
+                ]
+            )
         return input_data
 
     def _apply_tdm_sampler(
@@ -436,23 +445,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if k == prefer_key or (prefer_key is None and pos_lengths is None):
                 pos_lengths = pl
         return pos_lengths
-
-    def _append_neg_sample_mask(
-        self,
-        input_data: Dict[str, pa.Array],
-        sampled: Dict[str, pa.Array],
-    ) -> None:
-        """Append per-negative sample mask after the BASE sample mask."""
-        num_sampled = len(next(iter(sampled.values())))
-        input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-            [
-                input_data[C_SAMPLE_MASK],
-                pa.array(
-                    np.random.random(num_sampled)
-                    < self._data_config.negative_sample_mask_prob
-                ),
-            ]
-        )
 
     @property
     def sampled_batch_size(self) -> int:
