@@ -267,15 +267,12 @@ class DataParser:
 
         if HARD_NEG_INDICES in input_data.keys():
             flat = pc.list_flatten(input_data[HARD_NEG_INDICES]).to_numpy()
-            output_data[HARD_NEG_INDICES] = torch.from_numpy(
+            output_data[HARD_NEG_INDICES] = _to_tensor(
                 flat.astype(np.int32, copy=False).reshape(-1, 2)
             )
         if CAND_POS_LENGTHS in input_data.keys():
-            # writable=True copies once -- avoids torch's non-writable warning.
-            output_data[CAND_POS_LENGTHS] = torch.from_numpy(
-                input_data[CAND_POS_LENGTHS].to_numpy(
-                    zero_copy_only=False, writable=True
-                )
+            output_data[CAND_POS_LENGTHS] = _to_tensor(
+                input_data[CAND_POS_LENGTHS].to_numpy()
             )
         return output_data
 
@@ -479,10 +476,14 @@ class DataParser:
                 additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
             except KeyError:
                 logger.warning("No hard negative samples exist in the batch.")
-        try:
-            additional_infos[CAND_POS_LENGTHS] = input_data[CAND_POS_LENGTHS]
-        except KeyError:
-            pass
+        # Gate by sampler_type so torch.fx.symbolic_trace (unified AOT export)
+        # doesn't bake `cand_pos_lengths` into the graph when no sampler is
+        # configured.
+        if self.sampler_type is not None:
+            try:
+                additional_infos[CAND_POS_LENGTHS] = input_data[CAND_POS_LENGTHS]
+            except KeyError:
+                pass
 
         batch = Batch(
             dense_features=dense_features,
