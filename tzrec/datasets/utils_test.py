@@ -14,6 +14,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
+from parameterized import parameterized
 
 from tzrec.datasets.utils import (
     _normalize_type_str,
@@ -284,92 +285,102 @@ class DatasetUtilsTest(unittest.TestCase):
         self.assertIsNot(out, input_data)  # still shallow-copied
         self.assertEqual(out["a"].to_pylist(), [1, 2])
 
-    def test_combine_negs_to_candidate_sequence_single_pos(self):
-        pos_data = pa.array(["1", "2", "3"])
-        negs = pa.array(["10", "20", "30"])
+    # Single parameterized test for combine_negs_to_candidate_sequence
+    # exercising both the string path (output type preserved as string) and
+    # the list path (output type preserved as list<T> / large_list<T>).
+    @parameterized.expand(
+        [
+            # name, pos_data, negs, expected_rows, expected_pos_lengths, expected_type
+            (
+                "single_pos_string",
+                pa.array(["1", "2", "3"]),
+                pa.array(["10", "20", "30"]),
+                ["1", "2", "3;10;20;30"],
+                [1, 1, 1],
+                pa.string(),
+            ),
+            (
+                "multivalue_pos_string",
+                pa.array(["1;2", "3;4;5"]),
+                pa.array(["10", "20"]),
+                ["1;2", "3;4;5;10;20"],
+                [2, 3],
+                pa.string(),
+            ),
+            (
+                # String pos + list<T> negs: still uses string path; combine
+                # flattens the list-wrapped negs before joining.
+                "string_pos_list_negs",
+                pa.array(["1", "2"]),
+                pa.array([[10], [20], [30]], type=pa.list_(pa.int64())),
+                ["1", "2;10;20;30"],
+                [1, 1],
+                pa.string(),
+            ),
+            (
+                "empty_negs_string",
+                pa.array(["1", "2"]),
+                pa.array([], type=pa.string()),
+                ["1", "2"],
+                [1, 1],
+                pa.string(),
+            ),
+            (
+                # list<T> pos + flat T negs -> list<T> out (no string round-trip).
+                "list_pos_flat_negs",
+                pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
+                pa.array([10, 20], type=pa.int64()),
+                [[1, 2], [3, 10, 20]],
+                [2, 1],
+                pa.list_(pa.int64()),
+            ),
+            (
+                # The sampler emits list<T> of 1-element lists when the
+                # attr's field schema is list-typed (see _to_arrow_array in
+                # sampler.py:168); combine flattens that shape.
+                "list_pos_list_negs",
+                pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
+                pa.array([[10], [20], [30]], type=pa.list_(pa.int64())),
+                [[1, 2], [3, 10, 20, 30]],
+                [2, 1],
+                pa.list_(pa.int64()),
+            ),
+            (
+                "list_pos_empty_negs",
+                pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
+                pa.array([], type=pa.int64()),
+                [[1, 2], [3]],
+                [2, 1],
+                pa.list_(pa.int64()),
+            ),
+            (
+                # large_list<T> pos -> large_list<T> out.
+                "large_list_pos",
+                pa.array([["a", "b"], ["c"]], type=pa.large_list(pa.string())),
+                pa.array(["d", "e"], type=pa.string()),
+                [["a", "b"], ["c", "d", "e"]],
+                [2, 1],
+                pa.large_list(pa.string()),
+            ),
+        ]
+    )
+    def test_combine_negs_to_candidate_sequence(
+        self,
+        _name,
+        pos_data,
+        negs,
+        expected_rows,
+        expected_pos_lengths,
+        expected_type,
+    ):
         result, pos_lengths = combine_negs_to_candidate_sequence(
             pos_data=pos_data, negs=negs, seq_delim=";"
         )
-        # Last row carries the shared neg pool; others hold pos only.
-        self.assertEqual(result.to_pylist(), ["1", "2", "3;10;20;30"])
-        np.testing.assert_array_equal(pos_lengths, np.array([1, 1, 1], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_multivalue_pos(self):
-        pos_data = pa.array(["1;2", "3;4;5"])  # 5 positives total
-        negs = pa.array(["10", "20"])
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
+        self.assertEqual(result.to_pylist(), expected_rows)
+        np.testing.assert_array_equal(
+            pos_lengths, np.array(expected_pos_lengths, dtype=np.int32)
         )
-        # row 0 (i<B-1): "1;2"
-        # row 1 (last):  "3;4;5;10;20"
-        self.assertEqual(result.to_pylist(), ["1;2", "3;4;5;10;20"])
-        np.testing.assert_array_equal(pos_lengths, np.array([2, 3], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_list_pos_returns_list(self):
-        # list pos_data -> list output (no string round-trip).
-        pos_data = pa.array([[1, 2], [3]], type=pa.list_(pa.int64()))
-        negs = pa.array([10, 20], type=pa.int64())
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
-        )
-        self.assertTrue(result.type.equals(pa.list_(pa.int64())))
-        self.assertEqual(result.to_pylist(), [[1, 2], [3, 10, 20]])
-        np.testing.assert_array_equal(pos_lengths, np.array([2, 1], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_list_pos_list_negs_returns_list(self):
-        # The sampler emits list<T> of 1-element lists when the attr's field
-        # schema is list-typed (see _to_arrow_array in sampler.py:168).
-        # combine flattens that shape before appending.
-        pos_data = pa.array([[1, 2], [3]], type=pa.list_(pa.int64()))
-        negs = pa.array([[10], [20], [30]], type=pa.list_(pa.int64()))
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
-        )
-        self.assertTrue(result.type.equals(pa.list_(pa.int64())))
-        self.assertEqual(result.to_pylist(), [[1, 2], [3, 10, 20, 30]])
-        np.testing.assert_array_equal(pos_lengths, np.array([2, 1], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_empty_negs_list_pos(self):
-        # list pos_data + empty negs -> list output, unchanged.
-        pos_data = pa.array([[1, 2], [3]], type=pa.list_(pa.int64()))
-        negs = pa.array([], type=pa.int64())
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
-        )
-        self.assertTrue(result.type.equals(pa.list_(pa.int64())))
-        self.assertEqual(result.to_pylist(), [[1, 2], [3]])
-        np.testing.assert_array_equal(pos_lengths, np.array([2, 1], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_large_list_pos(self):
-        # large_list<T> pos_data -> large_list<T> output.
-        pos_data = pa.array([["a", "b"], ["c"]], type=pa.large_list(pa.string()))
-        negs = pa.array(["d", "e"], type=pa.string())
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
-        )
-        self.assertTrue(result.type.equals(pa.large_list(pa.string())))
-        self.assertEqual(result.to_pylist(), [["a", "b"], ["c", "d", "e"]])
-        np.testing.assert_array_equal(pos_lengths, np.array([2, 1], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_list_typed_negs(self):
-        # String pos_data + list-typed negs still uses the string path
-        # (output is string), and flattens negs before joining.
-        pos_data = pa.array(["1", "2"])
-        negs = pa.array([[10], [20], [30]], type=pa.list_(pa.int64()))
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
-        )
-        self.assertEqual(result.to_pylist(), ["1", "2;10;20;30"])
-        np.testing.assert_array_equal(pos_lengths, np.array([1, 1], dtype=np.int32))
-
-    def test_combine_negs_to_candidate_sequence_empty_negs(self):
-        pos_data = pa.array(["1", "2"])
-        negs = pa.array([], type=pa.string())
-        result, pos_lengths = combine_negs_to_candidate_sequence(
-            pos_data=pos_data, negs=negs, seq_delim=";"
-        )
-        self.assertEqual(result.to_pylist(), ["1", "2"])
-        np.testing.assert_array_equal(pos_lengths, np.array([1, 1], dtype=np.int32))
+        self.assertTrue(result.type.equals(expected_type))
 
     def test_normalize_type_str_basic_types(self):
         """Test normalizing basic types."""
