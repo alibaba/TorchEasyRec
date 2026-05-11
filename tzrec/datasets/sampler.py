@@ -360,13 +360,10 @@ class BaseSampler(metaclass=_meta_cls):
     ) -> Tuple[List[pa.Array], npt.NDArray]:
         """Parse sparse-neighbor sampler output.
 
-        Returns ``(features, indices)`` where ``indices`` has shape
-        ``(H, 2)`` and ``indices[:, 0]`` is the source-axis offset into
-        the array the caller passed to the sampler. When the caller
-        passes ``B`` row-ids, indices are in ``[0, B)``; when the
-        caller flattens to ``Q`` per-positive ids (e.g. via
-        ``build_sampler_input``), indices are in ``[0, Q)``. ``indices[:, 1]``
-        is the per-source neighbor offset.
+        `indices[:, 0]` indexes into the caller-supplied src array:
+        `[0, B)` for row-aligned callers, `[0, Q)` when the caller
+        flattens via `build_sampler_input`. `indices[:, 1]` is the
+        per-source neighbor offset.
         """
         features = []
         # pyre-ignore [16]
@@ -456,9 +453,8 @@ class NegativeSampler(BaseSampler):
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
 
-        `expand_factor` is computed from the actual input length so that
-        flattened multi-positive queries (Q values from B rows) are
-        supported with no padding to batch_size.
+        `expand_factor` is derived from the actual input length, so
+        flattened multi-positive queries flow through without padding.
 
         Args:
             input_data (dict): input data with item_id.
@@ -555,10 +551,8 @@ class NegativeSamplerV2(BaseSampler):
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
 
-        Caller is responsible for keeping (user_id, item_id) row-aligned;
-        for flattened multi-positive queries, `build_sampler_input` in
-        ``tzrec/datasets/utils.py`` expands user_id by per-row positive
-        count before calling here.
+        Caller keeps (user_id, item_id) row-aligned; `build_sampler_input`
+        expands user_id for flattened multi-positive queries.
 
         Args:
             input_data (dict): input data with user_id and item_id.
@@ -657,19 +651,17 @@ class HardNegativeSampler(BaseSampler):
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
 
-        ``hard_neg_indices[:, 0]`` indexes into the caller-supplied
-        ``input_data[user_id_field]`` array: if the caller passed ``B``
-        user ids, indices are in ``[0, B)``; if the caller flattened to
-        ``Q`` user ids (e.g. via ``build_sampler_input``), indices are
-        in ``[0, Q)``.
+        `hard_neg_indices[:, 0]` indexes into the caller-supplied
+        `input_data[user_id_field]`: `[0, B)` for row-aligned input,
+        `[0, Q)` when the caller flattens via `build_sampler_input`.
 
         Args:
             input_data (dict): input data with user_id and item_id.
 
         Returns:
             Negative sampled feature dict. First num_sample entries are
-            simple negatives; the remaining entries are hard negatives.
-            ``HARD_NEG_INDICES`` is included when any hard neg exists.
+            simple negatives; remaining entries are hard negatives.
+            `HARD_NEG_INDICES` is included when any hard neg exists.
         """
         src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
         dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
@@ -775,19 +767,18 @@ class HardNegativeSamplerV2(BaseSampler):
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
 
-        Caller is responsible for keeping (user_id, item_id) row-aligned;
-        for flattened multi-positive queries, ``build_sampler_input`` in
-        ``tzrec/datasets/utils.py`` expands user_id by per-row positive
-        count before calling here. ``hard_neg_indices[:, 0]`` then
-        indexes into the caller-supplied ``input_data[user_id_field]``.
+        Caller keeps (user_id, item_id) row-aligned; `build_sampler_input`
+        expands user_id for flattened multi-positive queries.
+        `hard_neg_indices[:, 0]` indexes into the caller-supplied
+        `input_data[user_id_field]` (`[0, B)` or `[0, Q)` accordingly).
 
         Args:
             input_data (dict): input data with user_id and item_id.
 
         Returns:
             Negative sampled feature dict. First num_sample entries are
-            simple negatives; the remaining entries are hard negatives.
-            ``HARD_NEG_INDICES`` is included when any hard neg exists.
+            simple negatives; remaining entries are hard negatives.
+            `HARD_NEG_INDICES` is included when any hard neg exists.
         """
         src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
         dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])

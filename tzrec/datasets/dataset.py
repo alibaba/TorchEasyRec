@@ -165,9 +165,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Map of input_name -> sequence_delim for features declared as
-        # sequence_id_feature. _apply_negative_sampler uses this to detect
-        # which sampled-output keys need block-suffix combine vs plain concat.
+        # Map input_name -> sequence_delim for sequence_id_features.
         self._seq_field_delims: Dict[str, str] = {}
         for feature in features:
             if hasattr(feature, "sequence_delim") and feature.sequence_delim:
@@ -414,17 +412,14 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     ) -> Optional[np.ndarray]:
         """Merge sampler outputs into input_data in place; return per-row pos lengths.
 
-        For each sampled key:
-          - new key (not in input_data) -> assigned as-is;
-          - key with a seq_delim -> block-(B-1)-suffix combine via
-            ``combine_negs_to_candidate_sequence`` (negatives go into
-            row B-1's suffix);
-          - key without a seq_delim -> ``pa.concat_arrays`` (legacy path).
-
-        pos_lengths is sourced from the first sequence-field combine call
-        (all sequence fields share the same per-row pos counts by
-        construction). Returns None if no sequence field was merged.
+        Per sampled key: new keys are assigned as-is, keys with a
+        `seq_delim` use the block-suffix combine, others fall back to
+        `pa.concat_arrays`. `pos_lengths` is sourced from the configured
+        item_id_field combine; returns None if no sequence field was
+        merged.
         """
+        # Prefer item_id_field; fall back to first-seen if none configured.
+        prefer_key = self._sampler_item_id_field
         pos_lengths: Optional[np.ndarray] = None
         for k, v in sampled.items():
             if k not in input_data:
@@ -438,7 +433,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data[k], v, seq_delim
             )
             input_data[k] = combined
-            if pos_lengths is None:
+            if k == prefer_key or (prefer_key is None and pos_lengths is None):
                 pos_lengths = pl
         return pos_lengths
 

@@ -585,29 +585,21 @@ def build_sampler_input(
 ) -> Dict[str, pa.Array]:
     """Shallow-copy input_data with item_id (and user_id) flattened for the sampler.
 
-    When `item_id_field` is declared as a sequence_id_feature (i.e. it has
-    an entry in `seq_field_delims`), per-row positives may arrive as either
-    a delimited string or a pyarrow list array. Both are normalized to a
-    list array, flattened to 1D, and `user_id_field` (if any) is expanded
-    by per-row positive count so V2 / HardNeg samplers receive aligned
-    (user_id, item_id) pairs.
-
-    The caller's `input_data` is not mutated -- downstream combine logic
-    keeps the original per-row positive grouping.
+    When `item_id_field` is a sequence_id_feature, per-row positives
+    (delimited string or list array) are flattened to 1D and
+    `user_id_field` (if any) is expanded by per-row positive count.
+    Scalar item_id or unconfigured seq_delim falls through unchanged.
+    The caller's `input_data` is not mutated.
 
     Args:
         input_data: per-row input column dict.
         item_id_field: sampler config's `item_id_field`, or None.
-        user_id_field: sampler config's `user_id_field`, or None
-            (NegativeSampler has none; V2 / HardNeg do).
-        seq_field_delims: input_name -> sequence_delim mapping for
-            sequence_id_features (populated by BaseDataset.__init__).
+        user_id_field: sampler config's `user_id_field`, or None.
+        seq_field_delims: input_name -> sequence_delim mapping.
 
     Returns:
-        A new dict (shallow copy of input_data) with `item_id_field`
-        flattened and `user_id_field` expanded when both apply. When
-        item_id is scalar (e.g. int64) or no seq_delim is configured,
-        returns a shallow copy of input_data with no transformation.
+        A new shallow-copy dict with item_id flattened and user_id
+        expanded when both apply.
     """
     sampler_input = dict(input_data)
     if item_id_field is None or item_id_field not in seq_field_delims:
@@ -643,68 +635,44 @@ def combine_negs_to_candidate_sequence(
         row i < B-1:  pos_i values only
         row B-1:      pos_{B-1} values + appended negs
 
-    All N sampled negatives sit in the last row's suffix. After
-    data_parser flattens the resulting JAGGED_SEQUENCE, downstream
-    consumers see the item embeddings laid out flat in the order
-    `[pos_0, ..., pos_{Q-1}, neg_0, ..., neg_{N-1}]` where
-    `Q = sum(K_i)`. ``pos_lengths`` counts only positives per row --
-    not the appended negs.
+    Output type matches input type: `list<T>` / `large_list<T>` pos
+    produces the same list type out (Arrow-native via
+    `ListArray.from_arrays`); delimited string pos produces string out.
 
-    The helper writes the negs verbatim into the suffix in the order
-    provided -- whether the caller distinguishes "simple" vs "hard"
-    negs is the caller's concern (the typical pattern is to use
-    `HARD_NEG_INDICES` from the sampler output to attribute hard negs
-    to specific queries downstream).
+    Simple-vs-hard neg distinction is invisible in the output layout;
+    callers use `HARD_NEG_INDICES` from the sampler to attribute hard
+    negs to queries downstream.
 
-    Output type matches input type:
-
-    - ``list<T>`` / ``large_list<T>`` pos -> ``list<T>`` / ``large_list<T>``
-      out. Arrow-native: builds the result via
-      ``ListArray.from_arrays(offsets, values)``, no Python row
-      materialization. Slice-safe via ``pc.list_flatten``.
-    - delimited string pos -> string out. Computes ``pos_lengths`` via
-      ``pc.count_substring(pos, seq_delim) + 1`` (with empty rows
-      treated as 0) -- no intermediate ``list<string>`` materialization,
-      no per-row positive split + rejoin. Original row strings are
-      preserved verbatim; only the last row gets ``seq_delim + negs``
-      appended.
-
-    String-path input convention: positive rows are canonical
-    delimiter-separated sequences (non-null, non-empty). The
-    ``count_substring + 1`` math is structurally identical to
-    ``len(split_pattern(pos, seq_delim))``.
+    String-path input convention: canonical delimiter-separated rows
+    (non-null, non-empty). `count_substring + 1` is structurally
+    identical to `len(split_pattern)` for those inputs.
 
     Args:
-        pos_data: per-row positives. Either a delimited string array
-            or a list array.
-        negs: sampled negatives. Flat array, or ``list<T>`` of
-            single-element lists (the sampler emits the latter when the
-            attr's field schema is ``pa.list_(...)`` -- normalized via
-            ``pc.list_flatten`` before appending).
+        pos_data: per-row positives, either delimited string or list array.
+        negs: sampled negatives; flat array or `list<T>` of 1-element
+            lists (flattened internally before appending).
         seq_delim: delimiter for the string path; ignored for the list
             path.
 
     Returns:
-        (combined: pa.Array (same structural type as pos_data, length B),
-         pos_lengths: int32 np.ndarray (length B), per-row K_i counting
-         positives only -- not including the appended negs.)
+        (combined: pa.Array (same type as pos_data, length B),
+         pos_lengths: int32 np.ndarray (length B), per-row positive
+         count only -- not including the appended negs.)
     """
-    # Normalize list-typed negs to flat scalar -- the sampler wraps
-    # each scalar in a 1-element list when the attr's field schema is
-    # list-typed (see _to_arrow_array in sampler.py:168).
+    # Sampler wraps each scalar in a 1-element list for list-typed attrs.
     if pa.types.is_list(negs.type) or pa.types.is_large_list(negs.type):
         negs = pc.list_flatten(negs)
     n_negs = len(negs)
 
     if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
-        # list path -- Arrow-native, no Python materialization.
+        # list path -- Arrow-native.
         pos_lengths = pc.list_value_length(pos_data).to_numpy().astype(np.int32)
         if len(pos_data) == 0 or n_negs == 0:
             return pos_data, pos_lengths
         inner_type = pos_data.type.value_type
-        new_values = pa.concat_arrays(
-            [pc.list_flatten(pos_data), negs.cast(inner_type, safe=False)]
-        )
+        if negs.type != inner_type:
+            negs = negs.cast(inner_type, safe=False)
+        new_values = pa.concat_arrays([pc.list_flatten(pos_data), negs])
         new_lengths = pos_lengths.copy()
         new_lengths[-1] += n_negs
         is_large = pa.types.is_large_list(pos_data.type)
@@ -716,9 +684,7 @@ def combine_negs_to_candidate_sequence(
         list_cls = pa.LargeListArray if is_large else pa.ListArray
         return list_cls.from_arrays(new_offsets, new_values), pos_lengths
     else:
-        # string path -- count_substring for pos_lengths (structurally
-        # equivalent to len(split_pattern)), modify only the last row in
-        # place. Assumes canonical input rows (non-null, non-empty).
+        # string path -- count_substring for pos_lengths, modify last row only.
         pos_str = pos_data.cast(pa.string())
         pos_lengths = (
             pc.add(pc.count_substring(pos_str, pattern=seq_delim), 1)
