@@ -36,55 +36,6 @@ WIDE: 广度特征组，主要用于WideAndDeep/DeepFM模型。其中feature_nam
 - 当DEEP feature_group同时设置embedding_name_suffix和嵌套sequence_groups时，后缀会自动传递到嵌套的sequence_groups。`SeqGroupConfig`也支持`embedding_name_suffix`字段，在子sequence_group上显式设置该字段会覆盖父feature_group传递下来的值。
 - 当WIDE feature_group设置embedding_name_suffix时，最终embedding表名为`<emb_name>_wide_<suffix>`。
 
-配置样例（双塔不共享embedding）：
-
-```
-model_config {
-    feature_groups {
-        group_name: "tower_a"
-        feature_names: "cat_a"
-        feature_names: "cat_b"
-        group_type: DEEP
-        embedding_name_suffix: "tower_a"
-    }
-    feature_groups {
-        group_name: "tower_b"
-        feature_names: "cat_a"
-        feature_names: "cat_b"
-        group_type: DEEP
-        embedding_name_suffix: "tower_b"
-    }
-}
-```
-
-配置样例（嵌套sequence_group用自己的后缀覆盖父group的传递值，未设置的sequence_group则继承父group的后缀）：
-
-```
-feature_groups {
-    group_name: "deep"
-    feature_names: "cat_a"
-    group_type: DEEP
-    embedding_name_suffix: "tower_a"
-    sequence_groups {
-        group_name: "click_seq"
-        feature_names: "cat_a"
-        feature_names: "click_seq__cat_a"
-        embedding_name_suffix: "click_only"
-    }
-    sequence_groups {
-        group_name: "buy_seq"
-        feature_names: "cat_a"
-        feature_names: "buy_seq__cat_a"
-    }
-    sequence_encoders {
-        simple_attention { input: "click_seq" }
-    }
-    sequence_encoders {
-        simple_attention { input: "buy_seq" }
-    }
-}
-```
-
 ## 配置样例
 
 ```
@@ -159,4 +110,53 @@ model_config {
     }
 }
 
+```
+
+### embedding_name_suffix 双塔不共享embedding
+
+```
+model_config {
+    feature_groups {
+        group_name: "tower_a"
+        feature_names: "cat_a"
+        feature_names: "cat_b"
+        group_type: DEEP
+        embedding_name_suffix: "tower_a"
+    }
+    feature_groups {
+        group_name: "tower_b"
+        feature_names: "cat_a"
+        feature_names: "cat_b"
+        group_type: DEEP
+        embedding_name_suffix: "tower_b"
+    }
+}
+```
+
+### embedding_name_suffix 嵌套sequence_group 覆盖/继承父group后缀
+
+```
+feature_groups {
+    group_name: "deep"
+    feature_names: "cat_a"
+    group_type: DEEP
+    embedding_name_suffix: "tower_a"
+    sequence_groups {
+        group_name: "click_seq"
+        feature_names: "cat_a"
+        feature_names: "click_seq__cat_a"
+        embedding_name_suffix: "click_only"
+    }
+    sequence_groups {
+        group_name: "buy_seq"
+        feature_names: "cat_a"
+        feature_names: "buy_seq__cat_a"
+    }
+    sequence_encoders {
+        simple_attention { input: "click_seq" }
+    }
+    sequence_encoders {
+        simple_attention { input: "buy_seq" }
+    }
+}
 ```
