@@ -16,7 +16,7 @@ from collections import OrderedDict
 from typing import Dict
 
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch import nn
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
@@ -687,92 +687,66 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # name, deep_a, deep_b, wide, seq_parent, seq_child,
-            #   expected_ebc, forbidden_ebc, expected_ec, forbidden_ec
             # Two DEEP groups, different suffix -> distinct tables.
-            [
+            param(
                 "distinct_suffix_per_tower",
-                "tower_a",
-                "tower_b",
-                None,
-                None,
-                None,
-                {
+                deep_a_suffix="tower_a",
+                deep_b_suffix="tower_b",
+                expected_ebc={
                     "cat_a_emb_tower_a",
                     "cat_a_emb_tower_b",
                     "cat_b_emb_tower_a",
                     "cat_b_emb_tower_b",
                 },
-                {"cat_a_emb", "cat_b_emb"},
-                set(),
-                set(),
-            ],
+                forbidden_ebc={"cat_a_emb", "cat_b_emb"},
+            ),
             # Two DEEP groups with same suffix -> shared (no unsuffixed leakage).
-            [
+            param(
                 "same_suffix_shares",
-                "shared",
-                "shared",
-                None,
-                None,
-                None,
-                {"cat_a_emb_shared", "cat_b_emb_shared"},
-                {"cat_a_emb", "cat_b_emb"},
-                set(),
-                set(),
-            ],
+                deep_a_suffix="shared",
+                deep_b_suffix="shared",
+                expected_ebc={"cat_a_emb_shared", "cat_b_emb_shared"},
+                forbidden_ebc={"cat_a_emb", "cat_b_emb"},
+            ),
             # WIDE + suffix -> "_wide_<suffix>" (additive with _wide).
-            [
+            param(
                 "wide_plus_suffix",
-                None,
-                None,
-                "tower_a",
-                None,
-                None,
-                {"cat_a_emb_wide_tower_a", "cat_b_emb_wide_tower_a"},
-                {"cat_a_emb_wide", "cat_a_emb"},
-                set(),
-                set(),
-            ],
+                wide_suffix="tower_a",
+                expected_ebc={"cat_a_emb_wide_tower_a", "cat_b_emb_wide_tower_a"},
+                forbidden_ebc={"cat_a_emb_wide", "cat_a_emb"},
+            ),
             # Nested seq inherits parent suffix when child doesn't set its own.
-            [
+            param(
                 "nested_seq_inherits_parent",
-                None,
-                None,
-                None,
-                "tower_a",
-                None,
-                {"cat_a_emb_tower_a"},
-                {"cat_a_emb"},
-                {"cat_a_emb_tower_a", "click_seq__cat_a_emb_tower_a"},
-                {"cat_a_emb", "click_seq__cat_a_emb"},
-            ],
+                seq_parent_suffix="tower_a",
+                expected_ebc={"cat_a_emb_tower_a"},
+                forbidden_ebc={"cat_a_emb"},
+                expected_ec={"cat_a_emb_tower_a", "click_seq__cat_a_emb_tower_a"},
+                forbidden_ec={"cat_a_emb", "click_seq__cat_a_emb"},
+            ),
             # Explicit child suffix overrides parent.
-            [
+            param(
                 "explicit_child_overrides_parent",
-                None,
-                None,
-                None,
-                "parent",
-                "child",
-                {"cat_a_emb_parent"},
-                set(),
-                {"cat_a_emb_child", "click_seq__cat_a_emb_child"},
-                {"cat_a_emb_parent", "click_seq__cat_a_emb_parent"},
-            ],
+                seq_parent_suffix="parent",
+                seq_child_suffix="child",
+                expected_ebc={"cat_a_emb_parent"},
+                expected_ec={"cat_a_emb_child", "click_seq__cat_a_emb_child"},
+                forbidden_ec={"cat_a_emb_parent", "click_seq__cat_a_emb_parent"},
+            ),
         ]
     )
     def test_embedding_name_suffix(
         self,
         name,
-        deep_a_suffix,
-        deep_b_suffix,
-        wide_suffix,
-        seq_parent_suffix,
-        seq_child_suffix,
-        expected_ebc,
-        forbidden_ebc,
-        expected_ec,
-        forbidden_ec,
+        deep_a_suffix=None,
+        deep_b_suffix=None,
+        wide_suffix=None,
+        seq_parent_suffix=None,
+        seq_child_suffix=None,
+        expected_ebc=frozenset(),
+        forbidden_ebc=frozenset(),
+        expected_ec=frozenset(),
+        forbidden_ec=frozenset(),
     ) -> None:
         features = _create_test_sequence_features()
         feature_groups = []
