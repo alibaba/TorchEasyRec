@@ -33,7 +33,7 @@ from tzrec.datasets.utils import (
     Batch,
     RecordBatchTensor,
     build_sampler_input,
-    combine_candidate_sequence_block,
+    combine_negs_to_candidate_sequence,
     expand_tdm_sample,
     remove_nullable,
 )
@@ -417,8 +417,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         For each sampled key:
           - new key (not in input_data) -> assigned as-is;
           - key with a seq_delim -> block-(B-1)-suffix combine via
-            ``combine_candidate_sequence_block`` (negatives go into row
-            B-1's suffix);
+            ``combine_negs_to_candidate_sequence`` (negatives go into
+            row B-1's suffix);
           - key without a seq_delim -> ``pa.concat_arrays`` (legacy path).
 
         pos_lengths is sourced from the first sequence-field combine call
@@ -434,7 +434,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if seq_delim is None:
                 input_data[k] = pa.concat_arrays([input_data[k], v])
                 continue
-            combined, pl = combine_candidate_sequence_block(input_data[k], v, seq_delim)
+            combined, pl = combine_negs_to_candidate_sequence(
+                input_data[k], v, seq_delim
+            )
             input_data[k] = combined
             if pos_lengths is None:
                 pos_lengths = pl
