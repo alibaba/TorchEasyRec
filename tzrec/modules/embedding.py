@@ -178,12 +178,6 @@ class EmbeddingGroup(nn.Module):
             group_name = feature_group.group_name
             self._inspect_and_supplement_feature_group(feature_group, seq_group_names)
             # self._add_feature_group_sign_for_sequence_groups(feature_group)
-            # propagate parent's embedding_name_suffix to nested sequence_groups
-            # that don't set their own.
-            if feature_group.embedding_name_suffix:
-                for sg in feature_group.sequence_groups:
-                    if not sg.embedding_name_suffix:
-                        sg.embedding_name_suffix = feature_group.embedding_name_suffix
             features_data_group = defaultdict(list)
             for feature_name in feature_group.feature_names:
                 feature = self._name_to_feature[feature_name]
@@ -211,9 +205,21 @@ class EmbeddingGroup(nn.Module):
             else:
                 self._impl_key_to_feat_groups[impl_key].append(feature_group)
                 if len(feature_group.sequence_groups) > 0:
-                    self._impl_key_to_seq_groups[impl_key].extend(
-                        list(feature_group.sequence_groups)
-                    )
+                    # Copy each nested sequence_group so the caller's proto is
+                    # not mutated, then propagate the parent suffix when the
+                    # child doesn't set its own. Keeps construction idempotent
+                    # across repeated EmbeddingGroup builds (train/eval/export).
+                    for sequence_group in feature_group.sequence_groups:
+                        sg_copy = model_pb2.SeqGroupConfig()
+                        sg_copy.CopyFrom(sequence_group)
+                        if (
+                            feature_group.embedding_name_suffix
+                            and not sg_copy.embedding_name_suffix
+                        ):
+                            sg_copy.embedding_name_suffix = (
+                                feature_group.embedding_name_suffix
+                            )
+                        self._impl_key_to_seq_groups[impl_key].append(sg_copy)
                 if len(feature_group.sequence_encoders) > 0:
                     self._group_name_to_seq_encoder_configs[group_name] = list(
                         feature_group.sequence_encoders
@@ -513,6 +519,32 @@ class EmbeddingGroup(nn.Module):
         return values_list
 
 
+def _check_emb_name_suffix_collisions(
+    feat_to_group_to_emb_name: Dict[str, Dict[str, str]],
+    group_name_to_suffix: Dict[str, str],
+) -> None:
+    """Detect silent emb-name collisions across groups with different suffixes.
+
+    A composed emb_name reachable from two groups whose embedding_name_suffix
+    values differ (e.g. one suffixed group lands on the same name as another
+    group's un-suffixed default) would silently merge tables that the user
+    meant to keep independent. Raise rather than share.
+    """
+    emb_name_to_suffixes = defaultdict(set)
+    for group_to_emb_name in feat_to_group_to_emb_name.values():
+        for grp_name, emb_name in group_to_emb_name.items():
+            emb_name_to_suffixes[emb_name].add(group_name_to_suffix.get(grp_name, ""))
+    for emb_name, suffixes in emb_name_to_suffixes.items():
+        if len(suffixes) > 1:
+            raise ValueError(
+                f"embedding table name {emb_name!r} is produced by groups with "
+                f"different embedding_name_suffix values {sorted(suffixes)}; "
+                "this would silently merge tables that were meant to be "
+                "independent. Rename the feature's embedding_name or change "
+                "the conflicting suffix."
+            )
+
+
 def _add_embedding_bag_config(
     emb_bag_configs: Dict[str, EmbeddingBagConfig], emb_bag_config: EmbeddingBagConfig
 ) -> None:
@@ -640,6 +672,9 @@ class EmbeddingGroupImpl(nn.Module):
         self._group_dense_embedding_feature_names = dict()
 
         feat_to_group_to_emb_name = defaultdict(dict)
+        group_name_to_suffix = {
+            fg.group_name: fg.embedding_name_suffix for fg in feature_groups
+        }
         for feature_group in feature_groups:
             group_name = feature_group.group_name
             for feature_name in feature_group.feature_names:
@@ -653,6 +688,9 @@ class EmbeddingGroupImpl(nn.Module):
                     if feature_group.embedding_name_suffix:
                         emb_name = emb_name + "_" + feature_group.embedding_name_suffix
                     feat_to_group_to_emb_name[feature_name][group_name] = emb_name
+        _check_emb_name_suffix_collisions(
+            feat_to_group_to_emb_name, group_name_to_suffix
+        )
 
         shared_feature_flag = dict()
         for feature_name, group_to_emb_name in feat_to_group_to_emb_name.items():
@@ -940,6 +978,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         self._group_to_sequence_length = OrderedDict()
 
         feat_to_group_to_emb_name = defaultdict(dict)
+        group_name_to_suffix = {
+            fg.group_name: fg.embedding_name_suffix for fg in feature_groups
+        }
         for feature_group in feature_groups:
             group_name = feature_group.group_name
             self._group_to_is_jagged[group_name] = (
@@ -955,6 +996,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     if feature_group.embedding_name_suffix:
                         emb_name = emb_name + "_" + feature_group.embedding_name_suffix
                     feat_to_group_to_emb_name[feature_name][group_name] = emb_name
+        _check_emb_name_suffix_collisions(
+            feat_to_group_to_emb_name, group_name_to_suffix
+        )
 
         shared_feature_flag = dict()
         for feature_name, group_to_emb_name in feat_to_group_to_emb_name.items():
