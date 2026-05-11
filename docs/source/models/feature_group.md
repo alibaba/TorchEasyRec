@@ -57,7 +57,7 @@ model_config {
 }
 ```
 
-配置样例（嵌套sequence_group用自己的后缀覆盖父group的传递值）：
+配置样例（嵌套sequence_group用自己的后缀覆盖父group的传递值，未设置的sequence_group则继承父group的后缀）：
 
 ```
 feature_groups {
@@ -71,8 +71,16 @@ feature_groups {
         feature_names: "click_seq__cat_a"
         embedding_name_suffix: "click_only"
     }
+    sequence_groups {
+        group_name: "buy_seq"
+        feature_names: "cat_a"
+        feature_names: "buy_seq__cat_a"
+    }
     sequence_encoders {
         simple_attention { input: "click_seq" }
+    }
+    sequence_encoders {
+        simple_attention { input: "buy_seq" }
     }
 }
 ```
