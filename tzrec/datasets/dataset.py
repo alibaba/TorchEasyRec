@@ -32,6 +32,7 @@ from tzrec.datasets.utils import (
     HARD_NEG_INDICES,
     Batch,
     RecordBatchTensor,
+    build_sampler_input,
     combine_candidate_sequence_block,
     remove_nullable,
 )
@@ -375,118 +376,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             )
         if self._sampler is not None:
             if isinstance(self._sampler, TDMSampler):
-                pos_sampled, neg_sampled = self._sampler.get(input_data)
-                input_data = _expand_tdm_sample(
-                    input_data, pos_sampled, neg_sampled, self._data_config
-                )
-                if use_sample_mask:
-                    num_pos = len(list(pos_sampled.values())[0])
-                    num_neg = len(list(neg_sampled.values())[0])
-                    total = len(list(input_data.values())[0])
-                    batch_size = total - num_pos - num_neg
-                    # Rows after _expand_tdm_sample are laid out as
-                    # [orig_targets | pos_sampled | neg_sampled]. Mask the
-                    # positives (orig + pos_sampled) with sample_mask_prob and
-                    # the negatives with negative_sample_mask_prob. TDM features
-                    # are never is_neg, so only C_SAMPLE_MASK needs to be set.
-                    input_data[C_SAMPLE_MASK] = pa.array(
-                        np.concatenate(
-                            [
-                                np.random.random(batch_size + num_pos)
-                                < self._data_config.sample_mask_prob,
-                                np.random.random(num_neg)
-                                < self._data_config.negative_sample_mask_prob,
-                            ]
-                        )
-                    )
+                input_data = self._apply_tdm_sampler(input_data, use_sample_mask)
             else:
-                # If item_id_field is a sequence feature, flatten per-row
-                # positives into a 1D array so the sampler treats each
-                # positive as a separate query. Expand user_id in the same
-                # way for samplers that rely on it (V2, HardNeg, HardNegV2).
-                # The sampler computes expand_factor dynamically from the
-                # actual input length, so no padding or batch_size limit.
-                multi_pos_lists: Optional[pa.Array] = None
-                saved_user_ids: Optional[pa.Array] = None
-                if (
-                    self._sampler_item_id_field is not None
-                    and self._sampler_item_id_field in self._seq_field_delims
-                ):
-                    seq_delim = self._seq_field_delims[self._sampler_item_id_field]
-                    raw = input_data[self._sampler_item_id_field]
-                    if pa.types.is_string(raw.type):
-                        multi_pos_lists = pc.split_pattern(raw, seq_delim)
-                        flat_pos = pc.list_flatten(multi_pos_lists)
-                        input_data[self._sampler_item_id_field] = flat_pos
-
-                        # Expand user_id to match flat positives (step 4).
-                        if self._sampler_user_id_field is not None and (
-                            self._sampler_user_id_field in input_data
-                        ):
-                            counts_np = pc.list_value_length(multi_pos_lists).to_numpy()
-                            row_indices = pa.array(
-                                np.repeat(np.arange(len(counts_np)), counts_np)
-                            )
-                            saved_user_ids = input_data[self._sampler_user_id_field]
-                            input_data[self._sampler_user_id_field] = pc.take(
-                                saved_user_ids, row_indices
-                            )
-
-                sampled = self._sampler.get(input_data)
-
-                # Restore multi-value form so the combine helper sees original
-                # per-row positive grouping.
-                if multi_pos_lists is not None:
-                    input_data[self._sampler_item_id_field] = multi_pos_lists
-                if saved_user_ids is not None:
-                    input_data[self._sampler_user_id_field] = saved_user_ids
-
-                # Hard-neg suffix length (sampler appends hard negs after the
-                # shared simple-neg pool when HARD_NEG_INDICES is present).
-                hard_neg_indices = sampled.pop(HARD_NEG_INDICES, None)
-                num_hard = 0 if hard_neg_indices is None else len(hard_neg_indices)
-
-                pos_lengths_arr = None
-                for k, v in sampled.items():
-                    if k in input_data:
-                        seq_delim = self._seq_field_delims.get(k)
-                        if seq_delim is not None:
-                            pos_for_combine = input_data[k]
-                            if num_hard > 0:
-                                simple_negs = v.slice(0, len(v) - num_hard)
-                                hard_negs = v.slice(len(v) - num_hard, num_hard)
-                            else:
-                                simple_negs = v
-                                hard_negs = None
-                            combined, pl = combine_candidate_sequence_block(
-                                pos_for_combine,
-                                simple_negs,
-                                hard_negs,
-                                seq_delim,
-                            )
-                            input_data[k] = combined
-                            if pos_lengths_arr is None:
-                                pos_lengths_arr = pl
-                        else:
-                            input_data[k] = pa.concat_arrays([input_data[k], v])
-                    else:
-                        input_data[k] = v
-
-                if pos_lengths_arr is not None:
-                    input_data[CAND_POS_LENGTHS] = pa.array(pos_lengths_arr)
-                if hard_neg_indices is not None:
-                    input_data[HARD_NEG_INDICES] = hard_neg_indices
-
-                if use_sample_mask:
-                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-                        [
-                            input_data[C_SAMPLE_MASK],
-                            pa.array(
-                                np.random.random(len(list(sampled.values())[0]))
-                                < self._data_config.negative_sample_mask_prob
-                            ),
-                        ]
-                    )
+                input_data = self._apply_negative_sampler(input_data, use_sample_mask)
 
         # TODO(hongsheng.jhs): add additional field like hard_negative
         output_data = self._data_parser.parse(input_data)
@@ -513,6 +405,138 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
         return batch
+
+    def _apply_negative_sampler(
+        self,
+        input_data: Dict[str, pa.Array],
+        use_sample_mask: bool,
+    ) -> Dict[str, pa.Array]:
+        """NegativeSampler / NegativeSamplerV2 / HardNegativeSampler[V2] path.
+
+        Builds a shallow-copy sampler_input (flattens item_id, expands
+        user_id when applicable), calls the sampler, then merges results
+        back into input_data in place.
+        """
+        sampler_input = build_sampler_input(
+            input_data,
+            self._sampler_item_id_field,
+            self._sampler_user_id_field,
+            self._seq_field_delims,
+        )
+        sampled = self._sampler.get(sampler_input)
+
+        # Hard-neg suffix length (sampler appends hard negs after the
+        # shared simple-neg pool when HARD_NEG_INDICES is present).
+        hard_neg_indices = sampled.pop(HARD_NEG_INDICES, None)
+        num_hard = 0 if hard_neg_indices is None else len(hard_neg_indices)
+
+        pos_lengths = self._merge_sampled_features(input_data, sampled, num_hard)
+
+        if pos_lengths is not None:
+            input_data[CAND_POS_LENGTHS] = pa.array(pos_lengths)
+        if hard_neg_indices is not None:
+            input_data[HARD_NEG_INDICES] = hard_neg_indices
+
+        if use_sample_mask:
+            self._append_neg_sample_mask(input_data, sampled)
+        return input_data
+
+    def _apply_tdm_sampler(
+        self,
+        input_data: Dict[str, pa.Array],
+        use_sample_mask: bool,
+    ) -> Dict[str, pa.Array]:
+        """TDMSampler path.
+
+        Rebuilds C_SAMPLE_MASK over the [orig | pos | neg] layout.
+        """
+        pos_sampled, neg_sampled = self._sampler.get(input_data)
+        input_data = _expand_tdm_sample(
+            input_data, pos_sampled, neg_sampled, self._data_config
+        )
+        if use_sample_mask:
+            num_pos = len(next(iter(pos_sampled.values())))
+            num_neg = len(next(iter(neg_sampled.values())))
+            total = len(next(iter(input_data.values())))
+            batch_size = total - num_pos - num_neg
+            # Rows after _expand_tdm_sample are laid out as
+            # [orig_targets | pos_sampled | neg_sampled]. Mask the positives
+            # (orig + pos_sampled) with sample_mask_prob and the negatives
+            # with negative_sample_mask_prob. TDM features are never is_neg,
+            # so only C_SAMPLE_MASK needs to be set.
+            input_data[C_SAMPLE_MASK] = pa.array(
+                np.concatenate(
+                    [
+                        np.random.random(batch_size + num_pos)
+                        < self._data_config.sample_mask_prob,
+                        np.random.random(num_neg)
+                        < self._data_config.negative_sample_mask_prob,
+                    ]
+                )
+            )
+        return input_data
+
+    def _merge_sampled_features(
+        self,
+        input_data: Dict[str, pa.Array],
+        sampled: Dict[str, pa.Array],
+        num_hard: int,
+    ) -> Optional[np.ndarray]:
+        """Merge sampler outputs into input_data in place; return per-row pos lengths.
+
+        For each sampled key:
+          - new key (not in input_data) → assigned as-is;
+          - key with a seq_delim → block-suffix combine via
+            ``combine_candidate_sequence_block`` (simple + hard go into
+            row B-1's suffix);
+          - key without a seq_delim → ``pa.concat_arrays`` (legacy path).
+
+        pos_lengths is sourced from the first sequence-field combine call
+        (all sequence fields share the same per-row pos counts by
+        construction). Returns None if no sequence field was merged.
+        """
+        pos_lengths: Optional[np.ndarray] = None
+        for k, v in sampled.items():
+            if k not in input_data:
+                input_data[k] = v
+                continue
+            seq_delim = self._seq_field_delims.get(k)
+            if seq_delim is None:
+                input_data[k] = pa.concat_arrays([input_data[k], v])
+                continue
+            if num_hard > 0:
+                simple_negs = v.slice(0, len(v) - num_hard)
+                hard_negs = v.slice(len(v) - num_hard, num_hard)
+            else:
+                simple_negs = v
+                hard_negs = None
+            combined, pl = combine_candidate_sequence_block(
+                input_data[k],
+                simple_negs,
+                hard_negs,
+                seq_delim,
+            )
+            input_data[k] = combined
+            if pos_lengths is None:
+                pos_lengths = pl
+        return pos_lengths
+
+    def _append_neg_sample_mask(
+        self,
+        input_data: Dict[str, pa.Array],
+        sampled: Dict[str, pa.Array],
+    ) -> None:
+        """Append per-negative sample mask after the BASE sample mask."""
+        num_sampled = len(next(iter(sampled.values())))
+        input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+            [
+                input_data[C_SAMPLE_MASK],
+                pa.array(
+                    np.random.random(num_sampled)
+                    < self._data_config.negative_sample_mask_prob
+                ),
+            ]
+        )
 
     @property
     def sampled_batch_size(self) -> int:

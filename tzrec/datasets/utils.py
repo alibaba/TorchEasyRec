@@ -504,6 +504,59 @@ class Batch(Pipelineable):
         return tensor_dict
 
 
+def build_sampler_input(
+    input_data: Dict[str, pa.Array],
+    item_id_field: Optional[str],
+    user_id_field: Optional[str],
+    seq_field_delims: Dict[str, str],
+) -> Dict[str, pa.Array]:
+    """Shallow-copy input_data with item_id (and user_id) flattened for the sampler.
+
+    When `item_id_field` is a `sequence_id_feature`, per-row positives may
+    arrive as either a delimited string or a pyarrow list array. Both are
+    normalized to a list array, flattened to 1D, and `user_id_field`
+    (if any) is expanded by per-row positive count so V2 / HardNeg samplers
+    receive aligned (user_id, item_id) pairs.
+
+    The caller's `input_data` is not mutated — downstream combine logic
+    keeps the original per-row positive grouping.
+
+    Args:
+        input_data: per-row data dict.
+        item_id_field: the sampler's item_id_field name, or None.
+        user_id_field: the sampler's user_id_field name, or None
+            (NegativeSampler has no user_id_field; V2 / HardNeg do).
+        seq_field_delims: field_name -> sequence_delim mapping for
+            sequence_id_features.
+
+    Returns:
+        A new dict (shallow copy of input_data) with item_id flattened
+        and user_id expanded when applicable.
+    """
+    sampler_input = dict(input_data)  # shallow; pa.Array values are immutable
+
+    if item_id_field is None or item_id_field not in seq_field_delims:
+        return sampler_input
+
+    seq_delim = seq_field_delims[item_id_field]
+    raw = input_data[item_id_field]
+    if pa.types.is_string(raw.type) or pa.types.is_large_string(raw.type):
+        pos_lists = pc.split_pattern(raw, seq_delim)
+    elif pa.types.is_list(raw.type) or pa.types.is_large_list(raw.type):
+        pos_lists = raw
+    else:
+        # int64 single-positive (e.g. DSSM): pass through unchanged.
+        return sampler_input
+
+    sampler_input[item_id_field] = pc.list_flatten(pos_lists)
+
+    if user_id_field is not None and user_id_field in input_data:
+        counts = pc.list_value_length(pos_lists).to_numpy()
+        row_indices = pa.array(np.repeat(np.arange(len(counts)), counts))
+        sampler_input[user_id_field] = pc.take(input_data[user_id_field], row_indices)
+    return sampler_input
+
+
 def combine_candidate_sequence_block(
     pos_data: pa.Array,
     simple_negs: pa.Array,
@@ -549,6 +602,16 @@ def combine_candidate_sequence_block(
 
     pos_lengths = pc.list_value_length(pos_lists).to_numpy().astype(np.int32)
     pos_flat = pc.list_flatten(pos_lists).cast(pa.string()).to_pylist()
+
+    # The sampler emits list<T> for simple/hard when the attr's field schema is
+    # list-typed (_to_arrow_array wraps each scalar in a 1-element list).
+    # Flatten so the string join below sees scalar elements.
+    if pa.types.is_list(simple_negs.type) or pa.types.is_large_list(simple_negs.type):
+        simple_negs = pc.list_flatten(simple_negs)
+    if hard_negs is not None and (
+        pa.types.is_list(hard_negs.type) or pa.types.is_large_list(hard_negs.type)
+    ):
+        hard_negs = pc.list_flatten(hard_negs)
 
     simple_str = seq_delim.join(simple_negs.cast(pa.string()).to_pylist())
     hard_str = (
