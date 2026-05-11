@@ -942,7 +942,7 @@ class DatasetTest(unittest.TestCase):
         iterator = iter(dataloader)
         batch = next(iterator)
         data_dict = batch.to_dict()
-        # After _expand_tdm_sample, every feature has length 40
+        # After expand_tdm_sample, every feature has length 40
         # (batch_size=4 expanded by TDM sampling to 40 rows). float_b has
         # no use_mask so it is never masked. int_a has use_mask=True so the
         # high sample_mask_prob / negative_sample_mask_prob should null out

@@ -34,6 +34,7 @@ from tzrec.datasets.utils import (
     RecordBatchTensor,
     build_sampler_input,
     combine_candidate_sequence_block,
+    expand_tdm_sample,
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
@@ -80,74 +81,6 @@ AVAILABLE_PA_TYPES = {
     pa.map_(pa.int32(), pa.string()),
     pa.map_(pa.int32(), pa.int32()),
 }
-
-
-def _expand_tdm_sample(
-    input_data: Dict[str, pa.Array],
-    pos_sampled: Dict[str, pa.Array],
-    neg_sampled: Dict[str, pa.Array],
-    data_config: data_pb2.DataConfig,
-) -> Dict[str, pa.Array]:
-    """Expand input data with sampled data for tdm.
-
-    Combine the sampled positive and negative samples with the item
-    features, then expand the user features based on the original user-item
-    relationships, and supplement the corresponding labels according to the
-    positive and negative samples. Note that in the sampling results, the
-    sampled outcomes for each item are contiguous.
-
-    for example:
-        user_fea:[1, 2], item_fea:[0.1, 0.2], labels:[1,1],
-        pos_sample:[0.11, 0.12, 0.21, 0.22], neg_sample:[-0.11, -0.12, -0.21, -0.22]
-
-        concat item_fea:[0.1, 0.2, 0.11, 0.12, 0.21, 0.22, -0.11, -0.12, -0.21, -0.22]
-        duplicate user_fea and keep origin user-item
-        relationship: [1, 2, 1, 1, 2, 2, 1, 1, 2, 2]
-
-        expand label: [1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
-    """
-    item_fea_names = pos_sampled.keys()
-    all_fea_names = input_data.keys()
-    label_fields = set(data_config.label_fields)
-    user_fea_names = all_fea_names - item_fea_names - label_fields
-
-    for item_fea_name in item_fea_names:
-        input_data[item_fea_name] = pa.concat_arrays(
-            [
-                input_data[item_fea_name],
-                pos_sampled[item_fea_name],
-                neg_sampled[item_fea_name],
-            ]
-        )
-
-    # In the sampling results, the sampled outcomes for each item are contiguous.
-    batch_size = len(input_data[list(label_fields)[0]])
-    num_pos_sampled = len(pos_sampled[list(item_fea_names)[0]])
-    num_neg_sampled = len(neg_sampled[list(item_fea_names)[0]])
-    user_pos_index = np.repeat(np.arange(batch_size), num_pos_sampled // batch_size)
-    user_neg_index = np.repeat(np.arange(batch_size), num_neg_sampled // batch_size)
-    for user_fea_name in user_fea_names:
-        user_fea = input_data[user_fea_name]
-        pos_expand_user_fea = user_fea.take(user_pos_index)
-        neg_expand_user_fea = user_fea.take(user_neg_index)
-        input_data[user_fea_name] = pa.concat_arrays(
-            [
-                input_data[user_fea_name],
-                pos_expand_user_fea,
-                neg_expand_user_fea,
-            ]
-        )
-
-    for label_field in label_fields:
-        input_data[label_field] = pa.concat_arrays(
-            [
-                input_data[label_field].cast(pa.int64()),
-                pa.array([1] * num_pos_sampled, type=pa.int64()),
-                pa.array([0] * num_neg_sampled, type=pa.int64()),
-            ]
-        )
-
-    return input_data
 
 
 class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
@@ -446,10 +379,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """TDMSampler path.
 
         Rebuilds C_SAMPLE_MASK over the [orig | pos | neg] layout that
-        _expand_tdm_sample produces.
+        expand_tdm_sample produces.
         """
         pos_sampled, neg_sampled = self._sampler.get(input_data)
-        input_data = _expand_tdm_sample(
+        input_data = expand_tdm_sample(
             input_data, pos_sampled, neg_sampled, self._data_config
         )
         if use_sample_mask:
@@ -457,7 +390,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             num_neg = len(next(iter(neg_sampled.values())))
             total = len(next(iter(input_data.values())))
             batch_size = total - num_pos - num_neg
-            # Rows after _expand_tdm_sample are laid out as
+            # Rows after expand_tdm_sample are laid out as
             # [orig_targets | pos_sampled | neg_sampled]. Mask the positives
             # (orig + pos_sampled) with sample_mask_prob and the negatives
             # with negative_sample_mask_prob. TDM features are never is_neg,
