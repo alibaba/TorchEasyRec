@@ -162,94 +162,6 @@ def _create_test_sequence_features(has_zch=False, has_mulval=False, pooling_type
     return features
 
 
-def _simple_attention_encoder(input_name: str) -> "seq_encoder_pb2.SeqEncoderConfig":
-    return seq_encoder_pb2.SeqEncoderConfig(
-        simple_attention=seq_encoder_pb2.SimpleAttention(input=input_name)
-    )
-
-
-def _fgs_distinct_suffix_per_tower():
-    return [
-        model_pb2.FeatureGroupConfig(
-            group_name="tower_a",
-            feature_names=["cat_a", "cat_b", "int_a"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="tower_a",
-        ),
-        model_pb2.FeatureGroupConfig(
-            group_name="tower_b",
-            feature_names=["cat_a", "cat_b", "int_a"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="tower_b",
-        ),
-    ]
-
-
-def _fgs_same_suffix_shares():
-    return [
-        model_pb2.FeatureGroupConfig(
-            group_name="g1",
-            feature_names=["cat_a", "cat_b"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="shared",
-        ),
-        model_pb2.FeatureGroupConfig(
-            group_name="g2",
-            feature_names=["cat_a"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="shared",
-        ),
-    ]
-
-
-def _fgs_wide_plus_suffix():
-    return [
-        model_pb2.FeatureGroupConfig(
-            group_name="wide",
-            feature_names=["cat_a", "cat_b"],
-            group_type=model_pb2.FeatureGroupType.WIDE,
-            embedding_name_suffix="tower_a",
-        ),
-    ]
-
-
-def _fgs_nested_seq_inherits_parent():
-    return [
-        model_pb2.FeatureGroupConfig(
-            group_name="parent",
-            feature_names=["cat_a"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="tower_a",
-            sequence_groups=[
-                model_pb2.SeqGroupConfig(
-                    group_name="seq",
-                    feature_names=["cat_a", "click_seq__cat_a"],
-                ),
-            ],
-            sequence_encoders=[_simple_attention_encoder("seq")],
-        ),
-    ]
-
-
-def _fgs_explicit_child_overrides_parent():
-    return [
-        model_pb2.FeatureGroupConfig(
-            group_name="parent",
-            feature_names=["cat_a"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="parent",
-            sequence_groups=[
-                model_pb2.SeqGroupConfig(
-                    group_name="seq",
-                    feature_names=["cat_a", "click_seq__cat_a"],
-                    embedding_name_suffix="child",
-                ),
-            ],
-            sequence_encoders=[_simple_attention_encoder("seq")],
-        ),
-    ]
-
-
 class _EGScriptWrapper(nn.Module):
     """Embedding Group inference wrapper for jit.script."""
 
@@ -775,10 +687,16 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # Two DEEP groups, same features, different suffix -> distinct tables.
+            # name, deep_a, deep_b, wide, seq_parent, seq_child,
+            #   expected_ebc, forbidden_ebc, expected_ec, forbidden_ec
+            # Two DEEP groups, different suffix -> distinct tables.
             [
                 "distinct_suffix_per_tower",
-                _fgs_distinct_suffix_per_tower,
+                "tower_a",
+                "tower_b",
+                None,
+                None,
+                None,
                 {
                     "cat_a_emb_tower_a",
                     "cat_a_emb_tower_b",
@@ -789,37 +707,53 @@ class EmbeddingGroupTest(unittest.TestCase):
                 set(),
                 set(),
             ],
-            # Two DEEP groups, same suffix -> shared (no unsuffixed leakage).
+            # Two DEEP groups with same suffix -> shared (no unsuffixed leakage).
             [
                 "same_suffix_shares",
-                _fgs_same_suffix_shares,
+                "shared",
+                "shared",
+                None,
+                None,
+                None,
                 {"cat_a_emb_shared", "cat_b_emb_shared"},
                 {"cat_a_emb", "cat_b_emb"},
                 set(),
                 set(),
             ],
-            # WIDE + suffix -> "_wide_<suffix>" (suffix is additive with _wide).
+            # WIDE + suffix -> "_wide_<suffix>" (additive with _wide).
             [
                 "wide_plus_suffix",
-                _fgs_wide_plus_suffix,
+                None,
+                None,
+                "tower_a",
+                None,
+                None,
                 {"cat_a_emb_wide_tower_a", "cat_b_emb_wide_tower_a"},
                 {"cat_a_emb_wide", "cat_a_emb"},
                 set(),
                 set(),
             ],
-            # Nested seq inherits parent's suffix when child doesn't set its own.
+            # Nested seq inherits parent suffix when child doesn't set its own.
             [
                 "nested_seq_inherits_parent",
-                _fgs_nested_seq_inherits_parent,
+                None,
+                None,
+                None,
+                "tower_a",
+                None,
                 {"cat_a_emb_tower_a"},
                 {"cat_a_emb"},
                 {"cat_a_emb_tower_a", "click_seq__cat_a_emb_tower_a"},
                 {"cat_a_emb", "click_seq__cat_a_emb"},
             ],
-            # Explicit child suffix wins over parent.
+            # Explicit child suffix overrides parent.
             [
                 "explicit_child_overrides_parent",
-                _fgs_explicit_child_overrides_parent,
+                None,
+                None,
+                None,
+                "parent",
+                "child",
                 {"cat_a_emb_parent"},
                 set(),
                 {"cat_a_emb_child", "click_seq__cat_a_emb_child"},
@@ -830,15 +764,70 @@ class EmbeddingGroupTest(unittest.TestCase):
     def test_embedding_name_suffix(
         self,
         name,
-        fg_factory,
+        deep_a_suffix,
+        deep_b_suffix,
+        wide_suffix,
+        seq_parent_suffix,
+        seq_child_suffix,
         expected_ebc,
         forbidden_ebc,
         expected_ec,
         forbidden_ec,
     ) -> None:
         features = _create_test_sequence_features()
+        feature_groups = []
+        if deep_a_suffix is not None:
+            feature_groups.append(
+                model_pb2.FeatureGroupConfig(
+                    group_name="deep_a",
+                    feature_names=["cat_a", "cat_b", "int_a"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                    embedding_name_suffix=deep_a_suffix,
+                )
+            )
+        if deep_b_suffix is not None:
+            feature_groups.append(
+                model_pb2.FeatureGroupConfig(
+                    group_name="deep_b",
+                    feature_names=["cat_a", "cat_b", "int_a"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                    embedding_name_suffix=deep_b_suffix,
+                )
+            )
+        if wide_suffix is not None:
+            feature_groups.append(
+                model_pb2.FeatureGroupConfig(
+                    group_name="wide",
+                    feature_names=["cat_a", "cat_b"],
+                    group_type=model_pb2.FeatureGroupType.WIDE,
+                    embedding_name_suffix=wide_suffix,
+                )
+            )
+        if seq_parent_suffix is not None:
+            seq = model_pb2.SeqGroupConfig(
+                group_name="seq",
+                feature_names=["cat_a", "click_seq__cat_a"],
+            )
+            if seq_child_suffix is not None:
+                seq.embedding_name_suffix = seq_child_suffix
+            feature_groups.append(
+                model_pb2.FeatureGroupConfig(
+                    group_name="parent",
+                    feature_names=["cat_a"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                    embedding_name_suffix=seq_parent_suffix,
+                    sequence_groups=[seq],
+                    sequence_encoders=[
+                        seq_encoder_pb2.SeqEncoderConfig(
+                            simple_attention=seq_encoder_pb2.SimpleAttention(
+                                input="seq"
+                            )
+                        )
+                    ],
+                )
+            )
         embedding_group = EmbeddingGroup(
-            features, fg_factory(), device=torch.device("cpu")
+            features, feature_groups, device=torch.device("cpu")
         )
         ebc_names = {
             cfg.name
