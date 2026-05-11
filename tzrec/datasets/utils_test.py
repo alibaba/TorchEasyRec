@@ -14,16 +14,15 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from tzrec.datasets.utils import (
     _normalize_type_str,
+    build_sampler_input,
     calc_remaining_intervals,
     calc_slice_intervals,
     calc_slice_position,
+    combine_candidate_sequence_block,
     get_input_fields_proto,
-    process_hstu_neg_sample,
-    process_hstu_seq_data,
 )
 from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
@@ -206,80 +205,136 @@ class DatasetUtilsTest(unittest.TestCase):
 
         self.assertEqual(total_rows, 400)  # All remaining rows accounted for
 
-    def test_process_hstu_seq_data(self):
-        """Test processing sequence data for HSTU match model."""
-        input_data = {"sequence": pa.array(["1;2;3;4", "5;6;7;8", "9;10;11;12"])}
-
-        split, slice_result, training_seq = process_hstu_seq_data(
-            input_data=input_data, seq_attr="sequence", seq_str_delim=";"
+    def test_build_sampler_input_string_item_id_no_user_id(self):
+        # NegativeSampler-style: no user_id_field; item_id is delimited string.
+        input_data = {
+            "item_id": pa.array(["1;2", "3"]),
+            "label": pa.array([1, 0]),
+        }
+        out = build_sampler_input(
+            input_data,
+            item_id_field="item_id",
+            user_id_field=None,
+            seq_field_delims={"item_id": ";"},
         )
+        # input_data is not mutated
+        self.assertEqual(input_data["item_id"].to_pylist(), ["1;2", "3"])
+        # output is flat
+        self.assertEqual(out["item_id"].to_pylist(), ["1", "2", "3"])
+        # other keys carry through
+        self.assertEqual(out["label"].to_pylist(), [1, 0])
+        # returned dict is a different object
+        self.assertIsNot(out, input_data)
 
-        # Verify results
-        # Test original split sequences
-        expected_split_values = [
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-            "7",
-            "8",
-            "9",
-            "10",
-            "11",
-            "12",
-        ]
-        self.assertEqual(pc.list_flatten(split).to_pylist(), expected_split_values)
-
-        # Test sliced sequences (target items)
-        expected_slice_values = ["2", "3", "4", "6", "7", "8", "10", "11", "12"]
-        self.assertEqual(slice_result.to_pylist(), expected_slice_values)
-
-        # Test training sequences
-        expected_training_seqs = ["1;2;3", "5;6;7", "9;10;11"]
-        self.assertEqual(training_seq.to_pylist(), expected_training_seqs)
-
-    def test_process_hstu_neg_sample(self):
-        """Test processing negative samples for HSTU match model."""
-        input_data = {"sequence": pa.array(["1", "2", "3"])}
-        neg_samples = pa.array(["101", "102", "103", "104", "105", "106"])
-
-        result = process_hstu_neg_sample(
-            input_data=input_data,
-            v=neg_samples,
-            neg_sample_num=2,
-            seq_str_delim=";",
-            seq_attr="sequence",
+    def test_build_sampler_input_list_item_id_expands_user_id(self):
+        # NegativeSamplerV2 / HardNeg style: item_id arrives as list<int64>;
+        # user_id is expanded by per-row positive count.
+        input_data = {
+            "item_id": pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
+            "user_id": pa.array(["u0", "u1"]),
+        }
+        out = build_sampler_input(
+            input_data,
+            item_id_field="item_id",
+            user_id_field="user_id",
+            seq_field_delims={"item_id": ";"},
         )
+        self.assertEqual(out["item_id"].to_pylist(), [1, 2, 3])
+        self.assertEqual(out["user_id"].to_pylist(), ["u0", "u0", "u1"])
+        # original unchanged
+        self.assertEqual(input_data["item_id"].to_pylist(), [[1, 2], [3]])
+        self.assertEqual(input_data["user_id"].to_pylist(), ["u0", "u1"])
 
-        expected_results = [
-            "1;101;102",
-            "2;103;104",
-            "3;105;106",
-        ]
-        self.assertEqual(result.to_pylist(), expected_results)
-
-    def test_process_hstu_neg_sample_with_different_delim(self):
-        """Test negative sampling with different delimiter."""
-        input_data = {"sequence": pa.array(["1", "2", "3"])}
-
-        neg_samples = pa.array(["101", "102", "103", "104", "105", "106"])
-
-        result = process_hstu_neg_sample(
-            input_data=input_data,
-            v=neg_samples,
-            neg_sample_num=2,
-            seq_str_delim="|",
-            seq_attr="sequence",
+    def test_build_sampler_input_scalar_item_id_passthrough(self):
+        # DSSM-style: item_id is scalar int64 (single positive per row).
+        # No flatten, no user_id expansion.
+        input_data = {
+            "item_id": pa.array([1, 2, 3], type=pa.int64()),
+            "user_id": pa.array(["u0", "u1", "u2"]),
+        }
+        out = build_sampler_input(
+            input_data,
+            item_id_field="item_id",
+            user_id_field="user_id",
+            seq_field_delims={"item_id": ";"},
         )
+        self.assertEqual(out["item_id"].to_pylist(), [1, 2, 3])
+        self.assertEqual(out["user_id"].to_pylist(), ["u0", "u1", "u2"])
 
-        expected_results = [
-            "1|101|102",
-            "2|103|104",
-            "3|105|106",
-        ]
-        self.assertEqual(result.to_pylist(), expected_results)
+    def test_build_sampler_input_item_id_not_in_seq_field_delims(self):
+        # If item_id_field has no seq_delim, treat as scalar and pass through.
+        input_data = {"item_id": pa.array(["1", "2"])}
+        out = build_sampler_input(
+            input_data,
+            item_id_field="item_id",
+            user_id_field=None,
+            seq_field_delims={},
+        )
+        self.assertEqual(out["item_id"].to_pylist(), ["1", "2"])
+
+    def test_build_sampler_input_no_item_id_field(self):
+        # Sampler config without item_id_field at all (defensive path).
+        input_data = {"a": pa.array([1, 2])}
+        out = build_sampler_input(
+            input_data,
+            item_id_field=None,
+            user_id_field=None,
+            seq_field_delims={},
+        )
+        self.assertIsNot(out, input_data)  # still shallow-copied
+        self.assertEqual(out["a"].to_pylist(), [1, 2])
+
+    def test_combine_candidate_sequence_block_single_pos(self):
+        pos_data = pa.array(["1", "2", "3"])
+        negs = pa.array(["10", "20", "30"])
+        result, pos_lengths = combine_candidate_sequence_block(
+            pos_data=pos_data, negs=negs, seq_delim=";"
+        )
+        # Last row carries the shared neg pool; others hold pos only.
+        self.assertEqual(result.to_pylist(), ["1", "2", "3;10;20;30"])
+        np.testing.assert_array_equal(pos_lengths, np.array([1, 1, 1], dtype=np.int32))
+
+    def test_combine_candidate_sequence_block_multivalue_pos(self):
+        pos_data = pa.array(["1;2", "3;4;5"])  # 5 positives total
+        negs = pa.array(["10", "20"])
+        result, pos_lengths = combine_candidate_sequence_block(
+            pos_data=pos_data, negs=negs, seq_delim=";"
+        )
+        # row 0 (i<B-1): "1;2"
+        # row 1 (last):  "3;4;5;10;20"
+        self.assertEqual(result.to_pylist(), ["1;2", "3;4;5;10;20"])
+        np.testing.assert_array_equal(pos_lengths, np.array([2, 3], dtype=np.int32))
+
+    def test_combine_candidate_sequence_block_list_pos(self):
+        # pos_data may arrive already as a list array (e.g. from Parquet).
+        pos_data = pa.array([[1, 2], [3]], type=pa.list_(pa.int64()))
+        negs = pa.array(["10", "20"])
+        result, pos_lengths = combine_candidate_sequence_block(
+            pos_data=pos_data, negs=negs, seq_delim=";"
+        )
+        self.assertEqual(result.to_pylist(), ["1;2", "3;10;20"])
+        np.testing.assert_array_equal(pos_lengths, np.array([2, 1], dtype=np.int32))
+
+    def test_combine_candidate_sequence_block_list_typed_negs(self):
+        # The sampler emits list<T> for negs when the attr's field schema is
+        # list-typed (_to_arrow_array wraps each scalar in a 1-element list).
+        # combine must flatten that shape.
+        pos_data = pa.array(["1", "2"])
+        negs = pa.array([[10], [20], [30]], type=pa.list_(pa.int64()))
+        result, pos_lengths = combine_candidate_sequence_block(
+            pos_data=pos_data, negs=negs, seq_delim=";"
+        )
+        self.assertEqual(result.to_pylist(), ["1", "2;10;20;30"])
+        np.testing.assert_array_equal(pos_lengths, np.array([1, 1], dtype=np.int32))
+
+    def test_combine_candidate_sequence_block_empty_negs(self):
+        pos_data = pa.array(["1", "2"])
+        negs = pa.array([], type=pa.string())
+        result, pos_lengths = combine_candidate_sequence_block(
+            pos_data=pos_data, negs=negs, seq_delim=";"
+        )
+        self.assertEqual(result.to_pylist(), ["1", "2"])
+        np.testing.assert_array_equal(pos_lengths, np.array([1, 1], dtype=np.int32))
 
     def test_normalize_type_str_basic_types(self):
         """Test normalizing basic types."""

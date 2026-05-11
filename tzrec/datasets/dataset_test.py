@@ -27,6 +27,7 @@ from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
+    CAND_POS_LENGTHS,
     NEG_DATA_GROUP,
 )
 from tzrec.features.feature import BaseFeature, create_features
@@ -80,6 +81,26 @@ class _TestReader(BaseReader):
                     if f.type.value_type == pa.string():
                         data = [
                             [str(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.int64():
+                        data = [
+                            [int(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.int32():
+                        data = [
+                            [int(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.float32():
+                        data = [
+                            [float(np.random.rand()) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.float64():
+                        data = [
+                            [float(np.random.rand()) for _ in range(2)]
                             for _ in range(self._batch_size)
                         ]
                     else:
@@ -447,6 +468,86 @@ class DatasetTest(unittest.TestCase):
                 self.assertEqual(
                     batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (12,)
                 )
+
+    @parameterized.expand(
+        [
+            [Mode.TRAIN],
+            [Mode.EVAL],
+        ]
+    )
+    def test_dataset_with_sampler_list_item_id(self, mode):
+        """E2E: list-typed item_id positives through a real NegativeSampler.
+
+        Schema declares `item_id` as `pa.list_(pa.int64())` (Parquet-style
+        multi-value column). Exercises `build_sampler_input`'s list-pass-
+        through + flatten, the dynamic-`expand_factor` path in the
+        sampler, and `combine_candidate_sequence_block`'s list-typed-negs
+        normalization. Parameterized over Mode.TRAIN / Mode.EVAL so the
+        eval-mode `num_eval_sample` path is also covered.
+        """
+        f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(f)
+        f.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(100):
+            f.write(f"{i}\t{1}\t{i}\n")
+        f.flush()
+
+        input_fields = [
+            pa.field(name="item_id", type=pa.list_(pa.int64())),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id",
+                    expression="item:item_id",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    num_buckets=200,
+                    embedding_dim=8,
+                )
+            ),
+        ]
+        features = create_features(
+            feature_cfgs,
+            neg_fields=["item_id"],
+            force_base_data_group=True,
+        )
+
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
+                label_fields=["label"],
+                negative_sampler=sampler_pb2.NegativeSampler(
+                    input_path=f.name,
+                    num_sample=8,
+                    num_eval_sample=4,
+                    attr_fields=["item_id"],
+                    item_id_field="item_id",
+                ),
+                force_base_data_group=True,
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+            mode=mode,
+        )
+        dataset.launch_sampler_cluster(2)
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # _TestReader yields 2 list elements per row; batch_size = 4 -> K_i = 2.
+        pos_lengths = batch.additional_infos[CAND_POS_LENGTHS]
+        self.assertEqual(pos_lengths.tolist(), [2, 2, 2, 2])
 
     def test_dataset_with_sample_mask(self):
         input_fields = [

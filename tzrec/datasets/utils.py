@@ -32,6 +32,7 @@ C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
 HARD_NEG_INDICES = "hard_neg_indices"
+CAND_POS_LENGTHS = "cand_pos_lengths"
 
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
@@ -503,129 +504,124 @@ class Batch(Pipelineable):
         return tensor_dict
 
 
-def process_hstu_seq_data(
+def build_sampler_input(
     input_data: Dict[str, pa.Array],
-    seq_attr: str,
-    seq_str_delim: str,
-) -> Tuple[pa.Array, pa.Array, pa.Array]:
-    """Process sequence data for HSTU match model.
+    item_id_field: Optional[str],
+    user_id_field: Optional[str],
+    seq_field_delims: Dict[str, str],
+) -> Dict[str, pa.Array]:
+    """Shallow-copy input_data with item_id (and user_id) flattened for the sampler.
+
+    When `item_id_field` is declared as a sequence_id_feature (i.e. it has
+    an entry in `seq_field_delims`), per-row positives may arrive as either
+    a delimited string or a pyarrow list array. Both are normalized to a
+    list array, flattened to 1D, and `user_id_field` (if any) is expanded
+    by per-row positive count so V2 / HardNeg samplers receive aligned
+    (user_id, item_id) pairs.
+
+    The caller's `input_data` is not mutated -- downstream combine logic
+    keeps the original per-row positive grouping.
 
     Args:
-        input_data: Dictionary containing input arrays
-        seq_attr: Name of the sequence attribute field
-        seq_str_delim: Delimiter used to separate sequence items
+        input_data: per-row input column dict.
+        item_id_field: sampler config's `item_id_field`, or None.
+        user_id_field: sampler config's `user_id_field`, or None
+            (NegativeSampler has none; V2 / HardNeg do).
+        seq_field_delims: input_name -> sequence_delim mapping for
+            sequence_id_features (populated by BaseDataset.__init__).
 
     Returns:
-        Tuple containing:
-        - input_data_k_split: pa.Array, Original sequence items
-        - input_data_k_split_slice: pa.Array, Target items for autoregressive training
-        - pre_seq_filter_reshaped_joined: pa.Array,
-        Training sequence for autoregressive training
+        A new dict (shallow copy of input_data) with `item_id_field`
+        flattened and `user_id_field` expanded when both apply. When
+        item_id is scalar (e.g. int64) or no seq_delim is configured,
+        returns a shallow copy of input_data with no transformation.
     """
-    # default sequence data is string
-    if pa.types.is_string(input_data[seq_attr].type):
-        input_data_k_split = pc.split_pattern(input_data[seq_attr], seq_str_delim)
-        # Get target items for training for autoregressive training
-        # Example: [1,2,3,4,5] -> [2,3,4,5]
-        input_data_k_split_slice = pc.list_flatten(
-            pc.list_slice(input_data_k_split, start=1)
-        )
+    sampler_input = dict(input_data)
+    if item_id_field is None or item_id_field not in seq_field_delims:
+        return sampler_input
 
-        # Directly extract the training sequence for autoregressive training
-        # Operation target example: [1,2,3,4,5] -> [1,2,3,4]
-        # (corresponding target: [2,3,4,5])
-        # As this can not be achieved by pyarrow.compute, and for loop is costly
-        # we need to do this using pa.ListArray.from_arrays using offsets
-        # 1. transfer to numpy and filter out the last item
-        pre_seq = pc.list_flatten(input_data_k_split).to_numpy(zero_copy_only=False)
-        # Mark last items of each seq with '-1'
-        pre_seq[input_data_k_split.offsets.to_numpy()[1:] - 1] = "-1"
-        # Filter out -1 marker elements
-        mask = pre_seq != "-1"
-        pre_seq_filter = pre_seq[mask]
-        # 2. create offsets for reshaping filtered sequence
-        # The offsets should be created extract the training sequence
-        # Example: if the original offsets are [0,2,5,9], after filter,
-        # for the offsets should be [0, 1, 3, 6]
-        # that is, [0] + [2-1, 5-2, 9-3]
-        pre_seq_filter_offsets = pa.array(
-            np.concatenate(
-                [
-                    np.array([0]),
-                    input_data_k_split.offsets[1:].to_numpy(zero_copy_only=False)
-                    - np.arange(
-                        1,
-                        len(
-                            input_data_k_split.offsets[1:].to_numpy(
-                                zero_copy_only=False
-                            )
-                        )
-                        + 1,
-                    ),
-                ]
-            )
-        )
-        pre_seq_filter_reshaped = pa.ListArray.from_arrays(
-            pre_seq_filter_offsets, pre_seq_filter
-        )
-        # Join filtered sequence with delimiter
-        pre_seq_filter_reshaped_joined = pc.binary_join(
-            pre_seq_filter_reshaped, seq_str_delim
-        )
+    seq_delim = seq_field_delims[item_id_field]
+    raw = input_data[item_id_field]
+    if pa.types.is_string(raw.type) or pa.types.is_large_string(raw.type):
+        pos_lists = pc.split_pattern(raw, seq_delim)
+    elif pa.types.is_list(raw.type) or pa.types.is_large_list(raw.type):
+        pos_lists = raw
+    else:
+        # Scalar (e.g. int64 single-positive for DSSM): pass through.
+        return sampler_input
 
-        return (
-            input_data_k_split,
-            input_data_k_split_slice,
-            pre_seq_filter_reshaped_joined,
-        )
+    sampler_input[item_id_field] = pc.list_flatten(pos_lists)
+
+    if user_id_field is not None and user_id_field in input_data:
+        counts = pc.list_value_length(pos_lists).to_numpy()
+        row_indices = pa.array(np.repeat(np.arange(len(counts)), counts))
+        sampler_input[user_id_field] = pc.take(input_data[user_id_field], row_indices)
+    return sampler_input
 
 
-def process_hstu_neg_sample(
-    input_data: Dict[str, pa.Array],
-    v: pa.Array,
-    neg_sample_num: int,
-    seq_str_delim: str,
-    seq_attr: str,
-) -> pa.Array:
-    """Process negative samples for HSTU match model.
+def combine_candidate_sequence_block(
+    pos_data: pa.Array,
+    negs: pa.Array,
+    seq_delim: str,
+) -> Tuple[pa.Array, np.ndarray]:
+    """Block-(B-1)-suffix combine of per-row positives + shared sampled negs.
+
+    Per-row layout:
+        row i < B-1:  pos_i_0;...;pos_i_{K_i-1}
+        row B-1:      pos_{B-1}_0;...;pos_{B-1}_{K-1};neg_0;...;neg_{N-1}
+
+    All N sampled negatives sit in the last row's suffix. After
+    data_parser flattens the resulting JAGGED_SEQUENCE, downstream
+    consumers see the item embeddings laid out flat in the order
+    `[pos_0, ..., pos_{Q-1}, neg_0, ..., neg_{N-1}]` where
+    `Q = sum(K_i)`.
+
+    The combine helper writes the negs verbatim into the suffix in the
+    order provided -- whether the caller distinguishes "simple" vs
+    "hard" negs is the caller's concern (the typical pattern is to use
+    `HARD_NEG_INDICES` from the sampler output to attribute hard negs
+    to specific queries downstream).
 
     Args:
-        input_data: Dict[str, pa.Array], Dictionary containing input arrays
-        v: pa.Array, negative samples.
-        neg_sample_num: int, number of negative samples.
-        seq_str_delim: str, delimiter for sequence string.
-        seq_attr: str, attribute name of sequence.
+        pos_data: per-row positives. Either a delimited string array
+            (e.g. "1;2") or a list array (e.g. [[1, 2], [3]]).
+        negs: 1D flat sampled negatives, OR a list<T> array of
+            single-element lists -- the sampler emits the latter when
+            the attr's field schema is `pa.list_(...)`. Either shape
+            is flattened to scalar elements before joining.
+        seq_delim: delimiter for joining items into a sequence string.
 
     Returns:
-        pa.Array: Processed negative samples
+        (combined: pa.Array of strings (length B),
+         pos_lengths: int32 np.ndarray (length B), per-row K_i)
     """
-    # The goal is to make neg samples concat to the training sequence
-    # Example:
-    # input_data[seq_attr] = ["1;2;3"]
-    # neg_sample_num = 2
-    # v = [4,5,6,7,8,9]
-    # then the output should be [[1,4,5], [2,6,7], [3,8,9]]
-    v_str = v.cast(pa.string())
-    filtered_v_offsets = pa.array(
-        np.concatenate(
-            [
-                np.array([0]),
-                np.arange(neg_sample_num, len(v_str) + 1, neg_sample_num),
-            ]
-        )
-    )
-    # Reshape v for each input_data[seq_attr]
-    # Example:[4,5,6,7,8,9] -> [[4,5], [6,7], [8,9]]
-    filtered_v_palist = pa.ListArray.from_arrays(filtered_v_offsets, v_str)
-    # Using string for join, as not found operation for ListArray achieving this
-    # Example: [[4,5], [6,7], [8,9]] -> ["4;5", "6;7", "8;9"]
-    sampled_joined = pc.binary_join(filtered_v_palist, seq_str_delim)
-    # Combine training sequence and target items
-    # Example: ["1;2;3"] + ["4;5", "6;7", "8;9"]
-    # -> ["1;4;5", "2;6;7", "3;8;9"]
-    return pc.binary_join_element_wise(
-        input_data[seq_attr], sampled_joined, seq_str_delim
-    )
+    if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
+        pos_lists = pos_data
+    else:
+        pos_lists = pc.split_pattern(pos_data.cast(pa.string()), seq_delim)
+
+    pos_lengths = pc.list_value_length(pos_lists).to_numpy().astype(np.int32)
+    pos_flat = pc.list_flatten(pos_lists).cast(pa.string()).to_pylist()
+
+    # Normalize negs to flat scalar pyarrow array. The sampler wraps each
+    # scalar in a 1-element list when the attr's field schema is
+    # list-typed (see _to_arrow_array in sampler.py:168).
+    if pa.types.is_list(negs.type) or pa.types.is_large_list(negs.type):
+        negs = pc.list_flatten(negs)
+    negs_str = seq_delim.join(negs.cast(pa.string()).to_pylist())
+
+    rows: List[str] = []
+    pos_offset = 0
+    last_idx = len(pos_lengths) - 1
+    for i, k_i in enumerate(pos_lengths):
+        pos_part = seq_delim.join(pos_flat[pos_offset : pos_offset + int(k_i)])
+        pos_offset += int(k_i)
+        if i == last_idx:
+            parts = [p for p in (pos_part, negs_str) if p]
+            rows.append(seq_delim.join(parts))
+        else:
+            rows.append(pos_part)
+    return pa.array(rows), pos_lengths
 
 
 def calc_slice_position(

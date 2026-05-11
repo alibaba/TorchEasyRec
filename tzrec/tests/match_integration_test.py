@@ -440,7 +440,6 @@ class MatchIntegrationTest(unittest.TestCase):
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
-            is_hstu=True,
         )
         if self.success:
             self.success = utils.test_eval(

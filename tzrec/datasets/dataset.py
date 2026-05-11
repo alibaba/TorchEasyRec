@@ -26,12 +26,14 @@ from tzrec.datasets.sampler import BaseSampler, TDMSampler
 from tzrec.datasets.utils import (
     C_NEG_SAMPLE_MASK,
     C_SAMPLE_MASK,
+    CAND_POS_LENGTHS,
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    HARD_NEG_INDICES,
     Batch,
     RecordBatchTensor,
-    process_hstu_neg_sample,
-    process_hstu_seq_data,
+    build_sampler_input,
+    combine_candidate_sequence_block,
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
@@ -177,7 +179,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._reserved_columns = reserved_columns or []
         self._mode = mode
         self._debug_level = debug_level
-        self._enable_hstu = data_config.enable_hstu
         self.sampler_type = (
             self._data_config.WhichOneof("sampler")
             if self._data_config.HasField("sampler")
@@ -208,6 +209,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._selected_input_names |= set(data_config.sample_weight_fields)
         if data_config.HasField("sample_cost_field"):
             self._selected_input_names.add(data_config.sample_cost_field)
+        self._sampler_item_id_field: Optional[str] = None
+        self._sampler_user_id_field: Optional[str] = None
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
@@ -215,10 +218,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 "item_id_field"
             ):
                 self._selected_input_names.add(sampler_config.item_id_field)
+                self._sampler_item_id_field = sampler_config.item_id_field
             if hasattr(sampler_config, "user_id_field") and sampler_config.HasField(
                 "user_id_field"
             ):
                 self._selected_input_names.add(sampler_config.user_id_field)
+                self._sampler_user_id_field = sampler_config.user_id_field
         # if set selected_input_names to None,
         # all columns will be reserved.
         if (
@@ -226,6 +231,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             and self._reserved_columns[0] == "ALL_COLUMNS"
         ):
             self._selected_input_names = None
+
+        # Map of input_name -> sequence_delim for features declared as
+        # sequence_id_feature. _apply_negative_sampler uses this to detect
+        # which sampled-output keys need block-suffix combine vs plain concat.
+        self._seq_field_delims: Dict[str, str] = {}
+        for feature in features:
+            if hasattr(feature, "sequence_delim") and feature.sequence_delim:
+                for input_name in feature.inputs:
+                    self._seq_field_delims[input_name] = feature.sequence_delim
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
@@ -363,85 +377,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             )
         if self._sampler is not None:
             if isinstance(self._sampler, TDMSampler):
-                pos_sampled, neg_sampled = self._sampler.get(input_data)
-                input_data = _expand_tdm_sample(
-                    input_data, pos_sampled, neg_sampled, self._data_config
-                )
-                if use_sample_mask:
-                    num_pos = len(list(pos_sampled.values())[0])
-                    num_neg = len(list(neg_sampled.values())[0])
-                    total = len(list(input_data.values())[0])
-                    batch_size = total - num_pos - num_neg
-                    # Rows after _expand_tdm_sample are laid out as
-                    # [orig_targets | pos_sampled | neg_sampled]. Mask the
-                    # positives (orig + pos_sampled) with sample_mask_prob and
-                    # the negatives with negative_sample_mask_prob. TDM features
-                    # are never is_neg, so only C_SAMPLE_MASK needs to be set.
-                    input_data[C_SAMPLE_MASK] = pa.array(
-                        np.concatenate(
-                            [
-                                np.random.random(batch_size + num_pos)
-                                < self._data_config.sample_mask_prob,
-                                np.random.random(num_neg)
-                                < self._data_config.negative_sample_mask_prob,
-                            ]
-                        )
-                    )
-            elif self._enable_hstu:
-                seq_attr = self._sampler._item_id_field
-
-                (
-                    input_data_k_split,
-                    input_data_k_split_slice,
-                    pre_seq_filter_reshaped_joined,
-                ) = process_hstu_seq_data(
-                    input_data=input_data,
-                    seq_attr=seq_attr,
-                    seq_str_delim=self._sampler.item_id_delim,
-                )
-                if self._mode == Mode.TRAIN:
-                    # Training using all possible target items
-                    input_data[seq_attr] = input_data_k_split_slice
-                elif self._mode == Mode.EVAL:
-                    # Evaluation using the last item for previous sequence
-                    input_data[seq_attr] = input_data_k_split.values.take(
-                        pa.array(input_data_k_split.offsets.to_numpy()[1:] - 1)
-                    )
-                sampled = self._sampler.get(input_data)
-                # To keep consistent with other process, use two functions
-                for k, v in sampled.items():
-                    if k in input_data:
-                        combined = process_hstu_neg_sample(
-                            input_data,
-                            v,
-                            self._sampler._num_sample,
-                            self._sampler.item_id_delim,
-                            seq_attr,
-                        )
-                        # Combine here to make embddings of both user sequence
-                        # and target item are the same
-                        input_data[k] = pa.concat_arrays(
-                            [pre_seq_filter_reshaped_joined, combined]
-                        )
-                    else:
-                        input_data[k] = v
+                input_data = self._apply_tdm_sampler(input_data, use_sample_mask)
             else:
-                sampled = self._sampler.get(input_data)
-                for k, v in sampled.items():
-                    if k in input_data:
-                        input_data[k] = pa.concat_arrays([input_data[k], v])
-                    else:
-                        input_data[k] = v
-                if use_sample_mask:
-                    input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
-                        [
-                            input_data[C_SAMPLE_MASK],
-                            pa.array(
-                                np.random.random(len(list(sampled.values())[0]))
-                                < self._data_config.negative_sample_mask_prob
-                            ),
-                        ]
-                    )
+                input_data = self._apply_negative_sampler(input_data, use_sample_mask)
 
         # TODO(hongsheng.jhs): add additional field like hard_negative
         output_data = self._data_parser.parse(input_data)
@@ -468,6 +406,123 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
         return batch
+
+    def _apply_negative_sampler(
+        self,
+        input_data: Dict[str, pa.Array],
+        use_sample_mask: bool,
+    ) -> Dict[str, pa.Array]:
+        """NegativeSampler / NegativeSamplerV2 / HardNegativeSampler[V2] path.
+
+        Build a shallow-copy sampler_input (item_id flattened, user_id
+        expanded), call the sampler, then merge results into input_data
+        in place.
+        """
+        sampler_input = build_sampler_input(
+            input_data,
+            self._sampler_item_id_field,
+            self._sampler_user_id_field,
+            self._seq_field_delims,
+        )
+        sampled = self._sampler.get(sampler_input)
+
+        hard_neg_indices = sampled.pop(HARD_NEG_INDICES, None)
+        pos_lengths = self._merge_sampled_features(input_data, sampled)
+
+        if pos_lengths is not None:
+            input_data[CAND_POS_LENGTHS] = pa.array(pos_lengths)
+        if hard_neg_indices is not None:
+            input_data[HARD_NEG_INDICES] = hard_neg_indices
+
+        if use_sample_mask:
+            self._append_neg_sample_mask(input_data, sampled)
+        return input_data
+
+    def _apply_tdm_sampler(
+        self,
+        input_data: Dict[str, pa.Array],
+        use_sample_mask: bool,
+    ) -> Dict[str, pa.Array]:
+        """TDMSampler path.
+
+        Rebuilds C_SAMPLE_MASK over the [orig | pos | neg] layout that
+        _expand_tdm_sample produces.
+        """
+        pos_sampled, neg_sampled = self._sampler.get(input_data)
+        input_data = _expand_tdm_sample(
+            input_data, pos_sampled, neg_sampled, self._data_config
+        )
+        if use_sample_mask:
+            num_pos = len(next(iter(pos_sampled.values())))
+            num_neg = len(next(iter(neg_sampled.values())))
+            total = len(next(iter(input_data.values())))
+            batch_size = total - num_pos - num_neg
+            # Rows after _expand_tdm_sample are laid out as
+            # [orig_targets | pos_sampled | neg_sampled]. Mask the positives
+            # (orig + pos_sampled) with sample_mask_prob and the negatives
+            # with negative_sample_mask_prob. TDM features are never is_neg,
+            # so only C_SAMPLE_MASK needs to be set.
+            input_data[C_SAMPLE_MASK] = pa.array(
+                np.concatenate(
+                    [
+                        np.random.random(batch_size + num_pos)
+                        < self._data_config.sample_mask_prob,
+                        np.random.random(num_neg)
+                        < self._data_config.negative_sample_mask_prob,
+                    ]
+                )
+            )
+        return input_data
+
+    def _merge_sampled_features(
+        self,
+        input_data: Dict[str, pa.Array],
+        sampled: Dict[str, pa.Array],
+    ) -> Optional[np.ndarray]:
+        """Merge sampler outputs into input_data in place; return per-row pos lengths.
+
+        For each sampled key:
+          - new key (not in input_data) -> assigned as-is;
+          - key with a seq_delim -> block-(B-1)-suffix combine via
+            ``combine_candidate_sequence_block`` (negatives go into row
+            B-1's suffix);
+          - key without a seq_delim -> ``pa.concat_arrays`` (legacy path).
+
+        pos_lengths is sourced from the first sequence-field combine call
+        (all sequence fields share the same per-row pos counts by
+        construction). Returns None if no sequence field was merged.
+        """
+        pos_lengths: Optional[np.ndarray] = None
+        for k, v in sampled.items():
+            if k not in input_data:
+                input_data[k] = v
+                continue
+            seq_delim = self._seq_field_delims.get(k)
+            if seq_delim is None:
+                input_data[k] = pa.concat_arrays([input_data[k], v])
+                continue
+            combined, pl = combine_candidate_sequence_block(input_data[k], v, seq_delim)
+            input_data[k] = combined
+            if pos_lengths is None:
+                pos_lengths = pl
+        return pos_lengths
+
+    def _append_neg_sample_mask(
+        self,
+        input_data: Dict[str, pa.Array],
+        sampled: Dict[str, pa.Array],
+    ) -> None:
+        """Append per-negative sample mask after the BASE sample mask."""
+        num_sampled = len(next(iter(sampled.values())))
+        input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
+            [
+                input_data[C_SAMPLE_MASK],
+                pa.array(
+                    np.random.random(num_sampled)
+                    < self._data_config.negative_sample_mask_prob
+                ),
+            ]
+        )
 
     @property
     def sampled_batch_size(self) -> int:

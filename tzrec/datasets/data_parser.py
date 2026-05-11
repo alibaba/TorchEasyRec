@@ -28,6 +28,7 @@ from tzrec.acc.utils import (
 )
 from tzrec.constant import Mode
 from tzrec.datasets.utils import (
+    CAND_POS_LENGTHS,
     HARD_NEG_INDICES,
     Batch,
     DenseData,
@@ -268,6 +269,10 @@ class DataParser:
             output_data[HARD_NEG_INDICES] = torch.tensor(
                 input_data[HARD_NEG_INDICES].tolist(), dtype=torch.int32
             )
+        if CAND_POS_LENGTHS in input_data.keys():
+            output_data[CAND_POS_LENGTHS] = torch.tensor(
+                input_data[CAND_POS_LENGTHS].to_numpy(), dtype=torch.int32
+            )
         return output_data
 
     def _parse_feature_normal(
@@ -468,8 +473,12 @@ class DataParser:
         if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
             try:
                 additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
-            except Exception:
+            except KeyError:
                 logger.warning("No hard negative samples exist in the batch.")
+        try:
+            additional_infos[CAND_POS_LENGTHS] = input_data[CAND_POS_LENGTHS]
+        except KeyError:
+            pass
 
         batch = Batch(
             dense_features=dense_features,
