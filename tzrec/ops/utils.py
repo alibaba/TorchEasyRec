@@ -28,7 +28,7 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
         # Tell Dynamo this data-dependent value is in the range (0, 10**9)
         # torch._check(x.size(0) > 0)
         # torch._check(x.size(0) < 10**9)
-        torch._check_is_size(x.size(0))
+        torch._check(x.size(0) >= 0)
     if x.stride(-1) == 1:
         return x
     return x.contiguous()
