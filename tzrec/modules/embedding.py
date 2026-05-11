@@ -178,6 +178,12 @@ class EmbeddingGroup(nn.Module):
             group_name = feature_group.group_name
             self._inspect_and_supplement_feature_group(feature_group, seq_group_names)
             # self._add_feature_group_sign_for_sequence_groups(feature_group)
+            # propagate parent's embedding_name_suffix to nested sequence_groups
+            # that don't set their own.
+            if feature_group.embedding_name_suffix:
+                for sg in feature_group.sequence_groups:
+                    if not sg.embedding_name_suffix:
+                        sg.embedding_name_suffix = feature_group.embedding_name_suffix
             features_data_group = defaultdict(list)
             for feature_name in feature_group.feature_names:
                 feature = self._name_to_feature[feature_name]
@@ -644,6 +650,8 @@ class EmbeddingGroupImpl(nn.Module):
                     emb_name = emb_bag_config.name
                     if feature_group.group_type == model_pb2.WIDE:
                         emb_name = emb_name + "_wide"
+                    if feature_group.embedding_name_suffix:
+                        emb_name = emb_name + "_" + feature_group.embedding_name_suffix
                     feat_to_group_to_emb_name[feature_name][group_name] = emb_name
 
         shared_feature_flag = dict()
@@ -944,6 +952,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     emb_config = feature.emb_config
                     # pyre-ignore [16]
                     emb_name = emb_config.name
+                    if feature_group.embedding_name_suffix:
+                        emb_name = emb_name + "_" + feature_group.embedding_name_suffix
                     feat_to_group_to_emb_name[feature_name][group_name] = emb_name
 
         shared_feature_flag = dict()

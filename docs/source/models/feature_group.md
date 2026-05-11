@@ -26,6 +26,37 @@ DEEP: 深度特征组。其中feature_names只能包含非序列特征（IdFeatu
 
 WIDE: 广度特征组，主要用于WideAndDeep/DeepFM模型。其中feature_names只能包含非序列特征IdFeature/RawFeature/ComboFeature等，embedding_dim固定为4，不根据feature_group中的embedding_dim的配置变化而变化，开发者可以根据group_name从EmbeddingGroup的输出字典中获取到相应的特征组Embedding。不可以包含sequence_groups。
 
+### embedding_name_suffix（可选）
+
+为feature_group内所有特征的embedding_name追加后缀，使不同feature_group即使引用相同特征也能使用独立的embedding表，无需为每个塔重复定义特征配置。
+
+- 不设置或为空：保持默认行为，相同embedding_name的特征跨feature_group共享embedding表。
+- 不同feature_group设置相同的embedding_name_suffix：仍共享同一embedding表。
+- 不同feature_group设置不同的embedding_name_suffix：使用各自独立的embedding表。
+- 当DEEP feature_group同时设置embedding_name_suffix和嵌套sequence_groups时，后缀会自动传递到嵌套的sequence_groups（除非该sequence_group显式设置了自己的embedding_name_suffix）。
+- 当WIDE feature_group设置embedding_name_suffix时，最终embedding表名为`<emb_name>_wide_<suffix>`。
+
+配置样例（双塔不共享embedding）：
+
+```
+model_config {
+    feature_groups {
+        group_name: "tower_a"
+        feature_names: "cat_a"
+        feature_names: "cat_b"
+        group_type: DEEP
+        embedding_name_suffix: "tower_a"
+    }
+    feature_groups {
+        group_name: "tower_b"
+        feature_names: "cat_a"
+        feature_names: "cat_b"
+        group_type: DEEP
+        embedding_name_suffix: "tower_b"
+    }
+}
+```
+
 ## 配置样例
 
 ```
