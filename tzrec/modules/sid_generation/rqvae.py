@@ -353,9 +353,6 @@ class RQVAE(nn.Module):
             "loss": recon_loss + clip_result["clip_loss"] + commitment,
         }
 
-    # ------------------------------------------------------------------
-    # Inference methods
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def get_codes(self, x: torch.Tensor) -> torch.Tensor:

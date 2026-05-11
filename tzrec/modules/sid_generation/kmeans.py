@@ -19,9 +19,6 @@ from torch import nn
 from torch.nn import functional as F
 
 
-# ------------------------------------------------------------------
-# Distance computation
-# ------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -48,9 +45,6 @@ def _squared_euclidean_distance(
     return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
 
 
-# ------------------------------------------------------------------
-# KMeans++ initialization
-# ------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -95,9 +89,6 @@ def _kmeans_plus_plus(
     return centroids
 
 
-# ------------------------------------------------------------------
-# MiniBatchKMeans
-# ------------------------------------------------------------------
 
 
 class MiniBatchKMeans(nn.Module):
@@ -146,7 +137,6 @@ class MiniBatchKMeans(nn.Module):
         """Whether centroids have been initialized via KMeans++."""
         return self._is_initialized.item()
 
-    # ---- initialization ----
 
     @torch.no_grad()
     def _buffer_and_maybe_init(self, batch: torch.Tensor) -> bool:
@@ -185,7 +175,6 @@ class MiniBatchKMeans(nn.Module):
         self._init_buffer = []
         return True
 
-    # ---- predict ----
 
     @torch.no_grad()
     def predict(self, batch: torch.Tensor) -> torch.Tensor:
@@ -200,7 +189,6 @@ class MiniBatchKMeans(nn.Module):
         dists = _squared_euclidean_distance(batch, self.centroids)
         return torch.argmin(dists, dim=-1)
 
-    # ---- train step ----
 
     @torch.no_grad()
     def train_step(

@@ -181,9 +181,6 @@ class VectorQuantize(nn.Module):
                 "embed_ema", self.embedding.weight.detach().clone()
             )
 
-    # ------------------------------------------------------------------
-    # Distance computation
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _compute_distances(self, x: torch.Tensor) -> torch.Tensor:
@@ -218,9 +215,6 @@ class VectorQuantize(nn.Module):
             )
         return distances
 
-    # ------------------------------------------------------------------
-    # Codebook assignment (Sinkhorn or argmin)
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _find_nearest_embedding(
@@ -259,9 +253,6 @@ class VectorQuantize(nn.Module):
 
         return ids, distances
 
-    # ------------------------------------------------------------------
-    # EMA update machinery
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _tile_with_noise(
@@ -381,9 +372,6 @@ class VectorQuantize(nn.Module):
             self.embed_ema / normalized_cluster_size.reshape(-1, 1)
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self,

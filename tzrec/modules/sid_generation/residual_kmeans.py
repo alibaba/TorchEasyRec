@@ -91,9 +91,6 @@ class ResidualKMeans(nn.Module):
         """Output dimension of the module."""
         return self.embed_dim
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self, input: torch.Tensor
@@ -137,9 +134,6 @@ class ResidualKMeans(nn.Module):
         cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
         return cluster_ids, quantized_sum
 
-    # ------------------------------------------------------------------
-    # Inference helpers
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def get_codes(self, input: torch.Tensor) -> torch.Tensor:
@@ -197,9 +191,6 @@ class ResidualKMeans(nn.Module):
         return quantized_sum
 
 
-# ------------------------------------------------------------------
-# RQKMeans top-level wrapper
-# ------------------------------------------------------------------
 
 
 class RQKMeans(nn.Module):

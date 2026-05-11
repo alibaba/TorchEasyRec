@@ -30,10 +30,6 @@ from tzrec.modules.sid_generation.types import (
 from tzrec.modules.sid_generation.vector_quantize import VectorQuantize
 
 
-# ------------------------------------------------------------------
-# KMeans helper functions for codebook initialization
-# (migrated from rq_kmeans.py — only used by ResidualQuantized)
-# ------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -106,9 +102,6 @@ def _residual_kmeans(
     return res_centers
 
 
-# ------------------------------------------------------------------
-# ResidualQuantized
-# ------------------------------------------------------------------
 
 
 class ResidualQuantized(nn.Module):
@@ -260,9 +253,6 @@ class ResidualQuantized(nn.Module):
                 ]
             )
 
-    # ------------------------------------------------------------------
-    # KMeans initialization
-    # ------------------------------------------------------------------
 
     @torch.jit.ignore
     @torch.no_grad()
@@ -291,9 +281,6 @@ class ResidualQuantized(nn.Module):
 
         self.initted.fill_(True)
 
-    # ------------------------------------------------------------------
-    # Commitment loss
-    # ------------------------------------------------------------------
 
     def _single_commitment_loss(
         self,
@@ -346,9 +333,6 @@ class ResidualQuantized(nn.Module):
                 )
         return loss1 + loss2
 
-    # ------------------------------------------------------------------
-    # Rotation trick
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _apply_rotation_trick(
@@ -409,9 +393,6 @@ class ResidualQuantized(nn.Module):
             .squeeze(1)
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
