@@ -647,7 +647,8 @@ def combine_negs_to_candidate_sequence(
     data_parser flattens the resulting JAGGED_SEQUENCE, downstream
     consumers see the item embeddings laid out flat in the order
     `[pos_0, ..., pos_{Q-1}, neg_0, ..., neg_{N-1}]` where
-    `Q = sum(K_i)`.
+    `Q = sum(K_i)`. ``pos_lengths`` counts only positives per row --
+    not the appended negs.
 
     The helper writes the negs verbatim into the suffix in the order
     provided -- whether the caller distinguishes "simple" vs "hard"
@@ -655,101 +656,81 @@ def combine_negs_to_candidate_sequence(
     `HARD_NEG_INDICES` from the sampler output to attribute hard negs
     to specific queries downstream).
 
-    Output type:
-      - `list<T>` / `large_list<T>` pos -> `list<T>` / `large_list<T>` out
-        (Arrow-native, no Python materialization).
-      - delimited string pos -> string out (split + Python join).
+    Output type matches input type:
+
+    - ``list<T>`` / ``large_list<T>`` pos -> ``list<T>`` / ``large_list<T>``
+      out. Arrow-native: builds the result via
+      ``ListArray.from_arrays(offsets, values)``, no Python row
+      materialization. Slice-safe via ``pc.list_flatten``.
+    - delimited string pos -> string out. Computes ``pos_lengths`` via
+      ``pc.count_substring(pos, seq_delim) + 1`` (with empty rows
+      treated as 0) -- no intermediate ``list<string>`` materialization,
+      no per-row positive split + rejoin. Original row strings are
+      preserved verbatim; only the last row gets ``seq_delim + negs``
+      appended.
+
+    String-path input convention: positive rows are canonical
+    delimiter-separated sequences (non-null, non-empty). The
+    ``count_substring + 1`` math is structurally identical to
+    ``len(split_pattern(pos, seq_delim))``.
 
     Args:
         pos_data: per-row positives. Either a delimited string array
-            (e.g. "1;2") or a list array (e.g. [[1, 2], [3]]).
-        negs: sampled negatives. Flat array, or `list<T>` of
+            or a list array.
+        negs: sampled negatives. Flat array, or ``list<T>`` of
             single-element lists (the sampler emits the latter when the
-            attr's field schema is `pa.list_(...)` -- normalized via
-            `pc.list_flatten` before appending).
-        seq_delim: delimiter for the string path; ignored for the list path.
+            attr's field schema is ``pa.list_(...)`` -- normalized via
+            ``pc.list_flatten`` before appending).
+        seq_delim: delimiter for the string path; ignored for the list
+            path.
 
     Returns:
         (combined: pa.Array (same structural type as pos_data, length B),
          pos_lengths: int32 np.ndarray (length B), per-row K_i counting
          positives only -- not including the appended negs.)
     """
-    if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
-        return _combine_list_path(pos_data, negs)
-    return _combine_string_path(pos_data, negs, seq_delim)
-
-
-def _combine_list_path(
-    pos_data: pa.Array,
-    negs: pa.Array,
-) -> Tuple[pa.Array, np.ndarray]:
-    """List-typed pos_data + negs -> list-typed output (Arrow-native).
-
-    Builds the result via `ListArray.from_arrays(offsets, values)` so
-    there's no Python-level row materialization. Slice-safe via
-    `pc.list_flatten` (which respects ListArray slicing).
-    """
-    pos_lengths = pc.list_value_length(pos_data).to_numpy().astype(np.int32)
-    if len(pos_data) == 0:
-        return pos_data, pos_lengths
-
-    # The sampler wraps each scalar in a 1-element list when the attr's
-    # field schema is list-typed (see _to_arrow_array in sampler.py:168);
-    # flatten back to scalar T.
+    # Normalize list-typed negs to flat scalar -- the sampler wraps
+    # each scalar in a 1-element list when the attr's field schema is
+    # list-typed (see _to_arrow_array in sampler.py:168).
     if pa.types.is_list(negs.type) or pa.types.is_large_list(negs.type):
         negs = pc.list_flatten(negs)
     n_negs = len(negs)
-    if n_negs == 0:
-        return pos_data, pos_lengths
 
-    inner_type = pos_data.type.value_type
-    negs_cast = negs.cast(inner_type, safe=False)
-    new_values = pa.concat_arrays([pc.list_flatten(pos_data), negs_cast])
-
-    new_lengths = pos_lengths.copy()
-    new_lengths[-1] += n_negs
-    is_large = pa.types.is_large_list(pos_data.type)
-    offset_dtype = np.int64 if is_large else np.int32
-    pa_offset_type = pa.int64() if is_large else pa.int32()
-    new_offsets = pa.array(
-        np.concatenate([[0], new_lengths.cumsum()]).astype(offset_dtype),
-        type=pa_offset_type,
-    )
-    list_cls = pa.LargeListArray if is_large else pa.ListArray
-    return list_cls.from_arrays(new_offsets, new_values), pos_lengths
-
-
-def _combine_string_path(
-    pos_data: pa.Array,
-    negs: pa.Array,
-    seq_delim: str,
-) -> Tuple[pa.Array, np.ndarray]:
-    """String-delimited pos_data + negs -> string-delimited output.
-
-    Splits pos_data into per-row lists via `pc.split_pattern`, joins
-    with `seq_delim` for output. Negs are flattened (if list<T>) and
-    appended to the last row's joined string.
-    """
-    pos_lists = pc.split_pattern(pos_data.cast(pa.string()), seq_delim)
-    pos_lengths = pc.list_value_length(pos_lists).to_numpy().astype(np.int32)
-    pos_flat = pc.list_flatten(pos_lists).cast(pa.string()).to_pylist()
-
-    if pa.types.is_list(negs.type) or pa.types.is_large_list(negs.type):
-        negs = pc.list_flatten(negs)
-    negs_str = seq_delim.join(negs.cast(pa.string()).to_pylist())
-
-    rows: List[str] = []
-    pos_offset = 0
-    last_idx = len(pos_lengths) - 1
-    for i, k_i in enumerate(pos_lengths):
-        pos_part = seq_delim.join(pos_flat[pos_offset : pos_offset + int(k_i)])
-        pos_offset += int(k_i)
-        if i == last_idx:
-            parts = [p for p in (pos_part, negs_str) if p]
-            rows.append(seq_delim.join(parts))
-        else:
-            rows.append(pos_part)
-    return pa.array(rows), pos_lengths
+    if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
+        # list path -- Arrow-native, no Python materialization.
+        pos_lengths = pc.list_value_length(pos_data).to_numpy().astype(np.int32)
+        if len(pos_data) == 0 or n_negs == 0:
+            return pos_data, pos_lengths
+        inner_type = pos_data.type.value_type
+        new_values = pa.concat_arrays(
+            [pc.list_flatten(pos_data), negs.cast(inner_type, safe=False)]
+        )
+        new_lengths = pos_lengths.copy()
+        new_lengths[-1] += n_negs
+        is_large = pa.types.is_large_list(pos_data.type)
+        offset_dtype = np.int64 if is_large else np.int32
+        new_offsets = pa.array(
+            np.concatenate([[0], new_lengths.cumsum()]).astype(offset_dtype),
+            type=pa.int64() if is_large else pa.int32(),
+        )
+        list_cls = pa.LargeListArray if is_large else pa.ListArray
+        return list_cls.from_arrays(new_offsets, new_values), pos_lengths
+    else:
+        # string path -- count_substring for pos_lengths (structurally
+        # equivalent to len(split_pattern)), modify only the last row in
+        # place. Assumes canonical input rows (non-null, non-empty).
+        pos_str = pos_data.cast(pa.string())
+        pos_lengths = (
+            pc.add(pc.count_substring(pos_str, pattern=seq_delim), 1)
+            .to_numpy()
+            .astype(np.int32)
+        )
+        rows = pos_str.to_pylist()
+        if len(rows) == 0 or n_negs == 0:
+            return pa.array(rows, type=pa.string()), pos_lengths
+        negs_str = seq_delim.join(negs.cast(pa.string()).to_pylist())
+        rows[-1] = rows[-1] + seq_delim + negs_str
+        return pa.array(rows, type=pa.string()), pos_lengths
 
 
 def calc_slice_position(

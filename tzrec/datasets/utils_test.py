@@ -379,6 +379,28 @@ class DatasetUtilsTest(unittest.TestCase):
                 [2, 1],
                 pa.large_list(pa.string()),
             ),
+            (
+                # Empty pos batch + non-empty negs -> empty output.
+                # negs are dropped because there's no last row to land
+                # them in (consistent with the list-path empty-batch
+                # behavior).
+                "empty_pos_batch_string",
+                pa.array([], type=pa.string()),
+                pa.array(["10"]),
+                [],
+                [],
+                pa.string(),
+            ),
+            (
+                # Single-row batch: row 0 is also row B-1, gets the
+                # negs.
+                "single_row_string",
+                pa.array(["1;2"]),
+                pa.array(["10"]),
+                ["1;2;10"],
+                [2],
+                pa.string(),
+            ),
         ]
     )
     def test_combine_negs_to_candidate_sequence(
