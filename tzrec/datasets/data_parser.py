@@ -50,7 +50,6 @@ def _to_tensor(x: npt.NDArray) -> torch.Tensor:
 def _tile_size(x: torch.Tensor) -> int:
     tile_size = x.item()
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        torch._check_is_size(tile_size)
         # check tile_size = 1 to make dynamo check size happy,
         # because in DataParser.parse, we always set tile_size = 1.
         torch._check(tile_size == 1)
