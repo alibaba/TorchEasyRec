@@ -26,11 +26,13 @@ from tzrec.datasets.sampler import BaseSampler, TDMSampler
 from tzrec.datasets.utils import (
     C_NEG_SAMPLE_MASK,
     C_SAMPLE_MASK,
+    CAND_POS_LENGTHS,
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    HARD_NEG_INDICES,
     Batch,
     RecordBatchTensor,
-    combine_neg_as_candidate_sequence,
+    combine_candidate_sequence_block,
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
@@ -432,34 +434,49 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
                 sampled = self._sampler.get(input_data)
 
-                # Restore multi-value form so combine_neg sees original grouping.
+                # Restore multi-value form so the combine helper sees original
+                # per-row positive grouping.
                 if multi_pos_lists is not None:
                     input_data[self._sampler_item_id_field] = multi_pos_lists
                 if saved_user_ids is not None:
                     input_data[self._sampler_user_id_field] = saved_user_ids
 
+                # Hard-neg suffix length (sampler appends hard negs after the
+                # shared simple-neg pool when HARD_NEG_INDICES is present).
+                hard_neg_indices = sampled.pop(HARD_NEG_INDICES, None)
+                num_hard = 0 if hard_neg_indices is None else len(hard_neg_indices)
+
+                pos_lengths_arr = None
                 for k, v in sampled.items():
                     if k in input_data:
                         seq_delim = self._seq_field_delims.get(k)
                         if seq_delim is not None:
                             pos_for_combine = input_data[k]
-                            if pa.types.is_list(pos_for_combine.type):
-                                num_pos = len(pc.list_flatten(pos_for_combine))
+                            if num_hard > 0:
+                                simple_negs = v.slice(0, len(v) - num_hard)
+                                hard_negs = v.slice(len(v) - num_hard, num_hard)
                             else:
-                                num_pos = len(pos_for_combine)
-                            # Sampler returns num_pos * expand_factor negs.
-                            neg_per_pos = max(1, len(v) // max(1, num_pos))
-                            valid_negs = v.slice(0, num_pos * neg_per_pos)
-                            input_data[k] = combine_neg_as_candidate_sequence(
+                                simple_negs = v
+                                hard_negs = None
+                            combined, pl = combine_candidate_sequence_block(
                                 pos_for_combine,
-                                valid_negs,
-                                neg_per_pos,
+                                simple_negs,
+                                hard_negs,
                                 seq_delim,
                             )
+                            input_data[k] = combined
+                            if pos_lengths_arr is None:
+                                pos_lengths_arr = pl
                         else:
                             input_data[k] = pa.concat_arrays([input_data[k], v])
                     else:
                         input_data[k] = v
+
+                if pos_lengths_arr is not None:
+                    input_data[CAND_POS_LENGTHS] = pa.array(pos_lengths_arr)
+                if hard_neg_indices is not None:
+                    input_data[HARD_NEG_INDICES] = hard_neg_indices
+
                 if use_sample_mask:
                     input_data[C_NEG_SAMPLE_MASK] = pa.concat_arrays(
                         [

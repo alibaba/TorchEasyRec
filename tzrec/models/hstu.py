@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import CAND_POS_LENGTHS, HARD_NEG_INDICES, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
@@ -29,7 +29,7 @@ from tzrec.modules.gr.preprocessors import (
 )
 from tzrec.modules.gr.stu import STU, STULayer, STUStack
 from tzrec.modules.norm import LayerNorm
-from tzrec.modules.utils import init_linear_xavier_weights_zero_bias
+from tzrec.modules.utils import div_no_nan, init_linear_xavier_weights_zero_bias
 from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.model_pb2 import ModelConfig
@@ -38,28 +38,6 @@ from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.fx_util import fx_int_item
 
 torch.fx.wrap(fx_int_item)
-
-
-@torch.fx.wrap
-def _jagged_candidate_sim(
-    user_emb: torch.Tensor, item_emb: torch.Tensor
-) -> torch.Tensor:
-    """Compute per-user similarity for JAGGED_SEQUENCE candidates.
-
-    Each user has the same number of candidates (1 pos + num_neg). The item
-    embeddings are organized as: [pos_1, neg_1_1, ..., neg_1_k, pos_2, ...].
-
-    Args:
-        user_emb: (B, D) user embeddings.
-        item_emb: (B * (1 + num_neg), D) candidate embeddings.
-
-    Returns:
-        similarity (B, 1 + num_neg), first column is positive.
-    """
-    batch_size = user_emb.size(0)
-    num_cand = item_emb.size(0) // batch_size
-    item_emb = item_emb.view(batch_size, num_cand, -1)
-    return torch.bmm(item_emb, user_emb.unsqueeze(-1)).squeeze(-1)
 
 
 class HSTUMatchUserTower(MatchTowerWoEG):
@@ -169,7 +147,10 @@ class HSTUMatchUserTower(MatchTowerWoEG):
         seq_embeddings = F.dropout(
             seq_embeddings, p=self._input_dropout_ratio, training=self.training
         )
-        seq_embeddings = self._stu_module(
+        # STUStack returns (x, x_offsets, max_seq_len, plan); HSTUMatch does
+        # not use mid-stack truncation, so plan is always None and the
+        # post-STU offsets/max_seq_len equal the input ones.
+        seq_embeddings, seq_offsets, _max_seq_len, _plan = self._stu_module(
             x=seq_embeddings,
             x_offsets=seq_offsets,
             max_seq_len=max_seq_len,
@@ -276,6 +257,11 @@ class HSTUMatch(MatchModel):
             "invalid model config: %s" % model_config.WhichOneof("model")
         )
         assert isinstance(self._model_config, match_model_pb2.HSTUMatch)
+        assert not self._in_batch_negative, (
+            "HSTUMatch does not support in_batch_negative — multi-positive rows "
+            "(Q queries from B users) make the B×B in-batch path ill-defined. "
+            "Use a NegativeSampler/HardNegativeSampler instead."
+        )
 
         tower_cfg = self._model_config.hstu_tower
         set_static_max_seq_lens([tower_cfg.max_seq_len])
@@ -344,16 +330,61 @@ class HSTUMatch(MatchModel):
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the model.
 
-        Args:
-            batch (Batch): input batch data.
-
-        Return:
-            predictions (dict): a dict of predicted result with 'similarity' key.
+        Candidate sequence carries `[pos_i] * (B-1) + [pos_{B-1}, simple, hard]`,
+        so after the item tower runs once over all values, the resulting
+        `item_emb` is laid out as `[pos(Q), simple(M), hard(H)]` — exactly the
+        layout `MatchModel.sim` / `_sim_with_sampler` expects with `query_emb`
+        of shape `(Q, D)` substituted for the usual `(B, D)` user embedding.
         """
         grouped_features = self.embedding_group(batch)
 
         user_emb = self.user_tower(grouped_features)
         item_emb = self.item_tower(grouped_features)
 
-        ui_sim = _jagged_candidate_sim(user_emb, item_emb) / self._temperature
+        pos_lengths = batch.additional_infos[CAND_POS_LENGTHS].to(
+            item_emb.device, dtype=torch.long
+        )
+        # Repeat each user embedding K_i times so query embeddings are aligned
+        # with their positives in the candidate sequence.
+        query_emb = torch.repeat_interleave(user_emb, pos_lengths, dim=0)
+
+        hard_neg_indices = batch.additional_infos.get(HARD_NEG_INDICES, None)
+        ui_sim = self.sim(query_emb, item_emb, hard_neg_indices) / self._temperature
         return {"similarity": ui_sim}
+
+    def _loss_impl(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        label: torch.Tensor,
+        loss_cfg: Any,
+        suffix: str = "",
+    ) -> Dict[str, torch.Tensor]:
+        """Loss in Q-space: repeat sample_weight by pos_lengths to match (Q,)."""
+        sample_weight = (
+            batch.sample_weights[self._sample_weight]
+            if self._sample_weight
+            else torch.tensor([1.0], device=batch.labels[self._label_name].device)
+        )
+        if self._sample_weight:
+            pos_lengths = batch.additional_infos[CAND_POS_LENGTHS].to(
+                sample_weight.device, dtype=torch.long
+            )
+            sample_weight = torch.repeat_interleave(sample_weight, pos_lengths)
+
+        loss_type = loss_cfg.WhichOneof("loss")
+        loss_name = loss_type + suffix
+        assert loss_type == "softmax_cross_entropy", (
+            "HSTUMatch only supports softmax_cross_entropy loss."
+        )
+        pred = predictions["similarity" + suffix]
+        # Positive is always at column 0 of (Q, 1+M+max_hard).
+        label = torch.zeros(pred.size(0), dtype=torch.long, device=pred.device)
+        losses = {loss_name: self._loss_modules[loss_name](pred, label)}
+
+        if self._sample_weight:
+            losses[loss_name] = div_no_nan(
+                torch.mean(losses[loss_name] * sample_weight),
+                torch.mean(sample_weight),
+            )
+        return losses

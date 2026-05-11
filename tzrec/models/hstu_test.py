@@ -14,7 +14,7 @@ import unittest
 import torch
 from torchrec import KeyedJaggedTensor
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.datasets.utils import BASE_DATA_GROUP, CAND_POS_LENGTHS, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.hstu import HSTUMatch
 from tzrec.models.model import TrainWrapper
@@ -122,20 +122,23 @@ def _build_model(device):
 
 
 def _build_batch(device):
-    """Build test batch with 2 users.
+    """Build test batch with 2 users using the row-(B-1) suffix layout.
 
     UIH: user1 has 3 items, user2 has 4 items.
-    Candidates: each user has a sequence of [pos, neg] (after combine_neg).
+    Candidates: row 0 = [pos_0]; row 1 (last) = [pos_1, simple_neg_0,
+    simple_neg_1] — the shared simple-neg pool sits in the last row's suffix.
+    pos_lengths = [1, 1].
     """
-    # BASE: UIH sequences + per-user candidate sequences (pos+neg)
+    # BASE: UIH sequences + per-row candidate sequences (suffix layout)
     sparse_feature = KeyedJaggedTensor.from_lengths_sync(
         keys=["historical_ids", "item_id"],
         values=torch.tensor([1, 2, 3, 4, 5, 6, 7, 100, 200, 101, 201]),
-        lengths=torch.tensor([3, 4, 2, 2]),
+        lengths=torch.tensor([3, 4, 1, 3]),
     )
     return Batch(
         sparse_features={BASE_DATA_GROUP: sparse_feature},
         labels={"label": torch.tensor([1, 1])},
+        additional_infos={CAND_POS_LENGTHS: torch.tensor([1, 1], dtype=torch.int32)},
     ).to(device)
 
 

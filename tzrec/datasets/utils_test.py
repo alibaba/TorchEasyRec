@@ -20,7 +20,7 @@ from tzrec.datasets.utils import (
     calc_remaining_intervals,
     calc_slice_intervals,
     calc_slice_position,
-    combine_neg_as_candidate_sequence,
+    combine_candidate_sequence_block,
     get_input_fields_proto,
 )
 from tzrec.protos import data_pb2
@@ -204,67 +204,77 @@ class DatasetUtilsTest(unittest.TestCase):
 
         self.assertEqual(total_rows, 400)  # All remaining rows accounted for
 
-    def test_combine_neg_as_candidate_sequence(self):
-        """Test combining positive and negative items into candidate sequences."""
+    def test_combine_candidate_sequence_block_single_pos(self):
         pos_data = pa.array(["1", "2", "3"])
-        neg_data = pa.array(["101", "102", "103", "104", "105", "106"])
+        simple_negs = pa.array(["10", "20", "30"])
 
-        result = combine_neg_as_candidate_sequence(
+        result, pos_lengths = combine_candidate_sequence_block(
             pos_data=pos_data,
-            neg_data=neg_data,
-            neg_sample_num=2,
+            simple_negs=simple_negs,
+            hard_negs=None,
             seq_delim=";",
         )
-        expected = ["1;101;102", "2;103;104", "3;105;106"]
-        self.assertEqual(result.to_pylist(), expected)
+        # Last row carries the shared simple-neg pool; others hold pos only.
+        self.assertEqual(result.to_pylist(), ["1", "2", "3;10;20;30"])
+        np.testing.assert_array_equal(pos_lengths, np.array([1, 1, 1], dtype=np.int32))
 
-    def test_combine_neg_as_candidate_sequence_different_delim(self):
-        """Test candidate sequence combination with different delimiter."""
+    def test_combine_candidate_sequence_block_different_delim(self):
         pos_data = pa.array(["1", "2"])
-        neg_data = pa.array(["10", "20", "30", "40"])
+        simple_negs = pa.array(["10", "20", "30", "40"])
 
-        result = combine_neg_as_candidate_sequence(
+        result, pos_lengths = combine_candidate_sequence_block(
             pos_data=pos_data,
-            neg_data=neg_data,
-            neg_sample_num=2,
+            simple_negs=simple_negs,
+            hard_negs=None,
             seq_delim="|",
         )
-        expected = ["1|10|20", "2|30|40"]
-        self.assertEqual(result.to_pylist(), expected)
+        self.assertEqual(result.to_pylist(), ["1", "2|10|20|30|40"])
+        np.testing.assert_array_equal(pos_lengths, np.array([1, 1], dtype=np.int32))
 
-    def test_combine_neg_as_candidate_sequence_multivalue_pos(self):
-        """Each item in multi-value pos sequence gets its own negatives."""
+    def test_combine_candidate_sequence_block_multivalue_pos(self):
         pos_data = pa.array(["1;2", "3;4;5"])  # 5 positives total
-        neg_data = pa.array(["10", "20", "30", "40", "50"])  # 1 neg per pos
+        simple_negs = pa.array(["10", "20"])
 
-        result = combine_neg_as_candidate_sequence(
+        result, pos_lengths = combine_candidate_sequence_block(
             pos_data=pos_data,
-            neg_data=neg_data,
-            neg_sample_num=1,
+            simple_negs=simple_negs,
+            hard_negs=None,
             seq_delim=";",
         )
-        # row1: pos=1 → "1;10", pos=2 → "2;20" → "1;10;2;20"
-        # row2: pos=3 → "3;30", pos=4 → "4;40", pos=5 → "5;50"
-        #       → "3;30;4;40;5;50"
-        expected = ["1;10;2;20", "3;30;4;40;5;50"]
-        self.assertEqual(result.to_pylist(), expected)
+        # row 0 (i<B-1): "1;2"
+        # row 1 (last):  "3;4;5;10;20"
+        self.assertEqual(result.to_pylist(), ["1;2", "3;4;5;10;20"])
+        np.testing.assert_array_equal(pos_lengths, np.array([2, 3], dtype=np.int32))
 
-    def test_combine_neg_as_candidate_sequence_multivalue_pos_multi_neg(self):
-        """Multi-value pos with multiple negatives per positive."""
+    def test_combine_candidate_sequence_block_with_hard_negs(self):
         pos_data = pa.array(["1;2", "3"])  # 3 positives total
-        # neg_sample_num=2 → need 6 negatives
-        neg_data = pa.array(["10", "20", "30", "40", "50", "60"])
+        simple_negs = pa.array(["10", "20", "30"])
+        hard_negs = pa.array(["100", "200"])
 
-        result = combine_neg_as_candidate_sequence(
+        result, pos_lengths = combine_candidate_sequence_block(
             pos_data=pos_data,
-            neg_data=neg_data,
-            neg_sample_num=2,
+            simple_negs=simple_negs,
+            hard_negs=hard_negs,
             seq_delim=";",
         )
-        # row1: pos=1 → "1;10;20", pos=2 → "2;30;40" → "1;10;20;2;30;40"
-        # row2: pos=3 → "3;50;60"
-        expected = ["1;10;20;2;30;40", "3;50;60"]
-        self.assertEqual(result.to_pylist(), expected)
+        # row 0: "1;2"
+        # row 1 (last): pos=3, simples=10;20;30, hards=100;200
+        self.assertEqual(result.to_pylist(), ["1;2", "3;10;20;30;100;200"])
+        np.testing.assert_array_equal(pos_lengths, np.array([2, 1], dtype=np.int32))
+
+    def test_combine_candidate_sequence_block_empty_hard_negs(self):
+        pos_data = pa.array(["1", "2"])
+        simple_negs = pa.array(["10"])
+        hard_negs = pa.array([], type=pa.string())
+
+        result, pos_lengths = combine_candidate_sequence_block(
+            pos_data=pos_data,
+            simple_negs=simple_negs,
+            hard_negs=hard_negs,
+            seq_delim=";",
+        )
+        self.assertEqual(result.to_pylist(), ["1", "2;10"])
+        np.testing.assert_array_equal(pos_lengths, np.array([1, 1], dtype=np.int32))
 
     def test_normalize_type_str_basic_types(self):
         """Test normalizing basic types."""

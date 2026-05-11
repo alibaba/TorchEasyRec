@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -31,6 +32,7 @@ C_SAMPLE_MASK = "__SAMPLE_MASK__"
 C_NEG_SAMPLE_MASK = "__NEG_SAMPLE_MASK__"
 
 HARD_NEG_INDICES = "hard_neg_indices"
+CAND_POS_LENGTHS = "cand_pos_lengths"
 
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
@@ -502,62 +504,71 @@ class Batch(Pipelineable):
         return tensor_dict
 
 
-def combine_neg_as_candidate_sequence(
+def combine_candidate_sequence_block(
     pos_data: pa.Array,
-    neg_data: pa.Array,
-    neg_sample_num: int,
+    simple_negs: pa.Array,
+    hard_negs: Optional[pa.Array],
     seq_delim: str,
-) -> pa.Array:
-    """Combine positive and negative items into candidate sequences.
+) -> Tuple[pa.Array, np.ndarray]:
+    """Combine positives + shared simple negs + hard negs as a row-(B-1) suffix block.
 
-    Each row's positive items are flattened and each positive gets its own
-    set of `neg_sample_num` negatives. The result interleaves per position:
-    "pos1;neg1_1;...;neg1_n;pos2;neg2_1;...;posK;negK_n".
+    Per-row layout:
+        row i < B-1:  "{pos_i_0};...;{pos_i_{K_i-1}}"
+        row B-1:      "{pos_{B-1}};{simple};{hard}"
 
-    Used when candidate features are sequence_id_features in a JAGGED_SEQUENCE
-    group. Supports both single-value positives ("123") and multi-value
-    positives ("1;2;3") per row.
+    All M shared simple negatives and all H hard negatives sit in the last
+    row's suffix. After data_parser flattens the JAGGED_SEQUENCE, the item
+    tower's output `item_emb` is laid out as `[pos(Q), simple(M), hard(H)]`
+    where `Q = sum(K_i)` — exactly the layout `_sim_with_sampler` assumes.
 
     Args:
         pos_data: positive items per row. Either a 1D array of strings (each
             row may contain a delimited sequence) or a list array.
-        neg_data: flat array of negative items, ordered by positive.
-            Length = total_positives * neg_sample_num.
-        neg_sample_num: number of negative samples per positive.
+        simple_negs: 1D array of length M, the shared simple-neg pool.
+        hard_negs: 1D array of length H, the hard negs in sampler order, or
+            None when the sampler doesn't produce hard negatives.
         seq_delim: delimiter for joining items into a sequence string.
 
     Returns:
-        pa.Array of strings, each row's candidate sequence.
+        (combined: pa.Array of strings (length B), pos_lengths: int32 array (length B))
 
     Example:
         pos_data = ["1", "2;3"]
-        neg_data = ["10", "20", "30"]  # 1 neg per pos, total 3 positives
-        neg_sample_num = 1
+        simple_negs = ["10", "20"]
+        hard_negs = ["30"]
         seq_delim = ";"
-        result = ["1;10", "2;20;3;30"]
+        # row 0: "1"
+        # row 1 (last): "2;3;10;20;30"
+        result = ["1", "2;3;10;20;30"]
+        pos_lengths = [1, 2]
     """
-    # Normalize pos_data to a list array (each row → list of positives)
     if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
         pos_lists = pos_data
     else:
         pos_lists = pc.split_pattern(pos_data.cast(pa.string()), seq_delim)
 
-    counts = pc.list_value_length(pos_lists).to_pylist()
+    pos_lengths = pc.list_value_length(pos_lists).to_numpy().astype(np.int32)
     pos_flat = pc.list_flatten(pos_lists).cast(pa.string()).to_pylist()
-    neg_str_list = neg_data.cast(pa.string()).to_pylist()
+
+    simple_str = seq_delim.join(simple_negs.cast(pa.string()).to_pylist())
+    hard_str = (
+        seq_delim.join(hard_negs.cast(pa.string()).to_pylist())
+        if hard_negs is not None and len(hard_negs) > 0
+        else ""
+    )
 
     result: List[str] = []
     pos_offset = 0
-    neg_offset = 0
-    for k_i in counts:
-        parts: List[str] = []
-        for _ in range(k_i):
-            parts.append(pos_flat[pos_offset])
-            parts.extend(neg_str_list[neg_offset : neg_offset + neg_sample_num])
-            pos_offset += 1
-            neg_offset += neg_sample_num
-        result.append(seq_delim.join(parts))
-    return pa.array(result)
+    last_idx = len(pos_lengths) - 1
+    for i, k_i in enumerate(pos_lengths):
+        pos_part = seq_delim.join(pos_flat[pos_offset : pos_offset + int(k_i)])
+        pos_offset += int(k_i)
+        if i == last_idx:
+            parts = [p for p in (pos_part, simple_str, hard_str) if p]
+            result.append(seq_delim.join(parts))
+        else:
+            result.append(pos_part)
+    return pa.array(result), pos_lengths
 
 
 def calc_slice_position(

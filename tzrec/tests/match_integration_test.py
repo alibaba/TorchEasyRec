@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import mark_ci_scope
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -433,7 +433,6 @@ class MatchIntegrationTest(unittest.TestCase):
         )
 
     @mark_ci_scope("h20")
-    @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_fg_mock.config",
