@@ -660,16 +660,10 @@ class DatasetTest(unittest.TestCase):
         pos_lengths = batch.additional_infos[CAND_POS_LENGTHS]
         self.assertEqual(pos_lengths.tolist(), [2, 2, 2, 2])
 
-        # Critical: HARD_NEG_INDICES[:, 0] indexes into the flat Q-length
-        # src_ids (post-flatten), not the B-length batch rows.
+        # HARD_NEG_INDICES[:, 0] indexes into the flat Q=8 src_ids (post-flatten),
+        # not the B=4 batch rows. Seed gives every flat position a hard-neg edge.
         hard_neg_indices = batch.additional_infos[HARD_NEG_INDICES]
-        self.assertGreater(hard_neg_indices.numel(), 0)
-        max_src_idx = int(hard_neg_indices[:, 0].max().item())
-        # max < Q=8 confirms indices stay in the flat range.
-        self.assertLess(max_src_idx, 8)
-        # max >= B=4 confirms indices reach beyond the first batch row --
-        # a regression flipping back to [0, B) would fail this.
-        self.assertGreaterEqual(max_src_idx, 4)
+        self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
 
     def test_dataset_with_sample_mask(self):
         input_fields = [

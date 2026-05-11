@@ -23,6 +23,7 @@ from torchrec.streamable import Pipelineable
 
 from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
+from tzrec.utils.logging_util import logger
 
 BASE_DATA_GROUP = "__BASE__"
 NEG_DATA_GROUP = "__NEG__"
@@ -667,7 +668,15 @@ def combine_negs_to_candidate_sequence(
     if pa.types.is_list(pos_data.type) or pa.types.is_large_list(pos_data.type):
         # list path -- Arrow-native.
         pos_lengths = pc.list_value_length(pos_data).to_numpy().astype(np.int32)
-        if len(pos_data) == 0 or n_negs == 0:
+        if len(pos_data) == 0:
+            if n_negs > 0:
+                logger.warning(
+                    "combine_negs_to_candidate_sequence: empty pos_data with "
+                    "%d negs; negs dropped.",
+                    n_negs,
+                )
+            return pos_data, pos_lengths
+        if n_negs == 0:
             return pos_data, pos_lengths
         inner_type = pos_data.type.value_type
         if negs.type != inner_type:
@@ -692,7 +701,15 @@ def combine_negs_to_candidate_sequence(
             .astype(np.int32)
         )
         rows = pos_str.to_pylist()
-        if len(rows) == 0 or n_negs == 0:
+        if len(rows) == 0:
+            if n_negs > 0:
+                logger.warning(
+                    "combine_negs_to_candidate_sequence: empty pos_data with "
+                    "%d negs; negs dropped.",
+                    n_negs,
+                )
+            return pa.array(rows, type=pa.string()), pos_lengths
+        if n_negs == 0:
             return pa.array(rows, type=pa.string()), pos_lengths
         negs_str = seq_delim.join(negs.cast(pa.string()).to_pylist())
         rows[-1] = rows[-1] + seq_delim + negs_str

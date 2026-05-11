@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyfg
 import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
@@ -266,12 +267,16 @@ class DataParser:
                 )
 
         if HARD_NEG_INDICES in input_data.keys():
-            output_data[HARD_NEG_INDICES] = torch.tensor(
-                input_data[HARD_NEG_INDICES].tolist(), dtype=torch.int32
+            flat = pc.list_flatten(input_data[HARD_NEG_INDICES]).to_numpy()
+            output_data[HARD_NEG_INDICES] = torch.from_numpy(
+                flat.astype(np.int32, copy=False).reshape(-1, 2)
             )
         if CAND_POS_LENGTHS in input_data.keys():
-            output_data[CAND_POS_LENGTHS] = torch.tensor(
-                input_data[CAND_POS_LENGTHS].to_numpy(), dtype=torch.int32
+            # writable=True copies once -- avoids torch's non-writable warning.
+            output_data[CAND_POS_LENGTHS] = torch.from_numpy(
+                input_data[CAND_POS_LENGTHS].to_numpy(
+                    zero_copy_only=False, writable=True
+                )
             )
         return output_data
 

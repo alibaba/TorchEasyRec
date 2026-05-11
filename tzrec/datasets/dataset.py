@@ -168,9 +168,19 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         # Map input_name -> sequence_delim for sequence_id_features.
         self._seq_field_delims: Dict[str, str] = {}
         for feature in features:
-            if hasattr(feature, "sequence_delim") and feature.sequence_delim:
-                for input_name in feature.inputs:
-                    self._seq_field_delims[input_name] = feature.sequence_delim
+            if not feature.sequence_delim:
+                continue
+            for input_name in feature.inputs:
+                existing = self._seq_field_delims.get(input_name)
+                if existing is not None and existing != feature.sequence_delim:
+                    logger.warning(
+                        "Conflicting sequence_delim for input '%s': %r vs %r; "
+                        "latter wins.",
+                        input_name,
+                        existing,
+                        feature.sequence_delim,
+                    )
+                self._seq_field_delims[input_name] = feature.sequence_delim
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
@@ -427,9 +437,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         item_id_field combine; returns None if no sequence field was
         merged.
         """
-        # Prefer item_id_field; fall back to first-seen if none configured.
+        # Prefer item_id_field; fall back to first-seen seq-field if absent.
         prefer_key = self._sampler_item_id_field
-        pos_lengths: Optional[np.ndarray] = None
+        prefer_pl: Optional[np.ndarray] = None
+        first_pl: Optional[np.ndarray] = None
         for k, v in sampled.items():
             if k not in input_data:
                 input_data[k] = v
@@ -442,9 +453,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 input_data[k], v, seq_delim
             )
             input_data[k] = combined
-            if k == prefer_key or (prefer_key is None and pos_lengths is None):
-                pos_lengths = pl
-        return pos_lengths
+            if k == prefer_key:
+                prefer_pl = pl
+            elif first_pl is None:
+                first_pl = pl
+        return prefer_pl if prefer_pl is not None else first_pl
 
     @property
     def sampled_batch_size(self) -> int:
