@@ -206,13 +206,7 @@ class DatasetUtilsTest(unittest.TestCase):
 
         self.assertEqual(total_rows, 400)  # All remaining rows accounted for
 
-    # Single parameterized test for build_sampler_input covering the
-    # three transform branches (string flatten + user_id expand, list
-    # flatten + user_id expand, scalar pass-through) plus two defensive
-    # pass-through cases. Every case uniformly verifies:
-    #   - output dict equals expected_output
-    #   - input_data is not mutated (shallow-copy contract)
-    #   - returned dict is a different object from input_data
+    # Every case verifies output, input non-mutation, and dict identity.
     @parameterized.expand(
         [
             # (name, input_data, item_id_field, user_id_field,
@@ -302,9 +296,7 @@ class DatasetUtilsTest(unittest.TestCase):
         # Contract 3: returned dict is a different object (shallow copy).
         self.assertIsNot(out, input_data)
 
-    # Single parameterized test for combine_negs_to_candidate_sequence
-    # exercising both the string path (output type preserved as string) and
-    # the list path (output type preserved as list<T> / large_list<T>).
+    # Every case verifies output rows, pos_lengths, and output type.
     @parameterized.expand(
         [
             # name, pos_data, negs, expected_rows, expected_pos_lengths, expected_type

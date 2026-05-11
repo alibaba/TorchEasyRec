@@ -132,13 +132,6 @@ message DataConfig {
     // fg run mode.
     optional FgMode fg_mode = 20 [default = FG_NONE];
 
-    // Field 21 (enable_hstu) was removed when the legacy HSTU dataset-side
-    // preprocessing (process_hstu_seq_data / process_hstu_neg_sample) was
-    // dropped in favor of the modern build_sampler_input flow. Reserved to
-    // prevent silent reuse.
-    reserved 21;
-    reserved "enable_hstu";
-
     // whether to shuffle data
     optional bool shuffle = 22 [default = false];
 
