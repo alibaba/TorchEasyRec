@@ -132,9 +132,6 @@ message DataConfig {
     // fg run mode.
     optional FgMode fg_mode = 20 [default = FG_NONE];
 
-    // hstu enable
-    optional bool enable_hstu = 21 [default = false];
-
     // whether to shuffle data
     optional bool shuffle = 22 [default = false];
 
