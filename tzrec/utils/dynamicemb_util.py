@@ -9,9 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import math
 import os
-from typing import List, Optional, Tuple, Type, cast
+from typing import Any, List, Optional, Tuple, Type, cast
 
 import torch
 from torch import nn
@@ -21,7 +22,10 @@ from torchrec.distributed.planner import (
     planners,
     shard_estimators,
 )
-from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
+from torchrec.distributed.planner.estimator.types import (
+    HardwarePerfConfig,
+    ShardPerfContext,
+)
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     ShardingOption,
@@ -43,6 +47,46 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from tzrec.protos import feature_pb2
+
+DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_ENV = "TZREC_CACHING_HIT_RATE_MULTIPLIER"
+DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_DEFAULT = 10.0
+
+
+def _dynamicemb_effective_cache_ratio(
+    cache_load_factor: Optional[float],
+    caching: bool,
+    stats: Optional[Any] = None,
+) -> float:
+    """Effective HBM-hit ratio for the dynamicemb perf model.
+
+    HYBRID (``caching=False``) is unchanged — every access has probability
+    ``cache_load_factor`` of hitting HBM since the HBM tier is hash-partitioned.
+
+    CACHING (``caching=True``) pins hot rows in HBM regardless of hash; we
+    model that as a boosted hit rate. With the default multiplier (10.0) any
+    cache_load_factor ≥ 0.1 saturates to a full HBM hit. ``stats``, when
+    provided, overrides the multiplier-based estimate via
+    ``1 - stats.expected_miss_rate(cache_load_factor)``.
+
+    Invariant: ``CACHING_bw(x) >= HYBRID_bw(x)`` at every ``x`` because the
+    returned ratio is monotonically ≥ ``cache_load_factor``.
+    """
+    x = float(cache_load_factor) if cache_load_factor is not None else 0.0
+    x = max(0.0, min(1.0, x))
+    if not caching:
+        return x
+    if stats is not None:
+        miss_rate = float(stats.expected_miss_rate(x))
+        return max(x, max(0.0, min(1.0, 1.0 - miss_rate)))
+    multiplier = float(
+        os.environ.get(
+            DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_ENV,
+            DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_DEFAULT,
+        )
+    )
+    multiplier = max(1.0, multiplier)
+    return min(1.0, x * multiplier)
+
 
 has_dynamicemb = False
 try:
@@ -424,6 +468,74 @@ if has_dynamicemb:
 
     # pyre-ignore [9]
     HardwarePerfConfig.get_device_bw = _customized_kernel_aware_get_device_bw
+
+    _orig_build_shard_perf_contexts = (
+        ShardPerfContext.build_shard_perf_contexts.__func__
+    )
+
+    def _dynamicemb_aware_build_shard_perf_contexts(
+        cls,  # pyre-ignore [2]
+        config,  # pyre-ignore [2]
+        shard_sizes,  # pyre-ignore [2]
+        sharding_option,  # pyre-ignore [2]
+        topology,  # pyre-ignore [2]
+        constraints,  # pyre-ignore [2]
+        sharder,  # pyre-ignore [2]
+        *args,  # pyre-ignore [2]
+        **kwargs,  # pyre-ignore [2]
+    ):
+        """Inject CACHING-mode hit-rate boost into the perf estimator.
+
+        For dynamicemb tables in CACHING mode, we temporarily replace
+        ``sharding_option.cache_params`` with a clone whose ``load_factor`` is
+        boosted to the effective HBM-hit ratio. The original cache_params is
+        restored before the patched method returns, so the (separately invoked)
+        storage estimator continues to see the un-boosted ratio.
+        """
+        dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
+        caching = bool(getattr(dynamicemb_options, "caching", False))
+        if not caching:
+            return _orig_build_shard_perf_contexts(
+                cls,
+                config,
+                shard_sizes,
+                sharding_option,
+                topology,
+                constraints,
+                sharder,
+                *args,
+                **kwargs,
+            )
+
+        original_cache_params = sharding_option.cache_params
+        stats = original_cache_params.stats if original_cache_params else None
+        x_eff = _dynamicemb_effective_cache_ratio(
+            sharding_option.cache_load_factor, caching=True, stats=stats
+        )
+        if original_cache_params is not None:
+            boosted = dataclasses.replace(original_cache_params, load_factor=x_eff)
+        else:
+            boosted = CacheParams(load_factor=x_eff)
+        sharding_option.cache_params = boosted
+        try:
+            return _orig_build_shard_perf_contexts(
+                cls,
+                config,
+                shard_sizes,
+                sharding_option,
+                topology,
+                constraints,
+                sharder,
+                *args,
+                **kwargs,
+            )
+        finally:
+            sharding_option.cache_params = original_cache_params
+
+    # pyre-ignore [9]
+    ShardPerfContext.build_shard_perf_contexts = classmethod(
+        _dynamicemb_aware_build_shard_perf_contexts
+    )
 
     def _calculate_dynamicemb_storage_specific_sizes(
         tensor: torch.Tensor,
