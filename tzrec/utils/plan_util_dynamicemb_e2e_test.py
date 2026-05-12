@@ -1,0 +1,135 @@
+# Copyright (c) 2024, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+
+import torch
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.planner.types import Topology
+from torchrec.distributed.test_utils.test_model import TestSparseNN
+from torchrec.distributed.types import ShardingType
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+
+from tzrec.utils.dynamicemb_util import has_dynamicemb
+
+
+@unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
+    """End-to-end exercise of the dynamicemb planner integration."""
+
+    def _build_constraint(self, max_capacity=4096):
+        import dynamicemb
+        from dynamicemb.planner import DynamicEmbParameterConstraints
+
+        opts = dynamicemb.DynamicEmbTableOptions(
+            max_capacity=max_capacity,
+            initializer_args=dynamicemb.DynamicEmbInitializerArgs(
+                mode=dynamicemb.DynamicEmbInitializerMode.UNIFORM,
+                lower=-0.01,
+                upper=0.01,
+            ),
+            eval_initializer_args=dynamicemb.DynamicEmbInitializerArgs(
+                mode=dynamicemb.DynamicEmbInitializerMode.CONSTANT, value=0.0
+            ),
+            score_strategy=dynamicemb.DynamicEmbScoreStrategy.STEP,
+        )
+        return DynamicEmbParameterConstraints(
+            use_dynamicemb=True,
+            sharding_types=[ShardingType.ROW_WISE.value],
+            compute_kernels=[EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value],
+            dynamicemb_options=opts,
+        )
+
+    def _build_model(self):
+        table = EmbeddingBagConfig(
+            num_embeddings=4096,
+            embedding_dim=32,
+            name="table_de",
+            feature_names=["feat_de"],
+        )
+        return TestSparseNN(tables=[table], sparse_device=torch.device("meta"))
+
+    def test_enumerate_yields_both_modes_and_all_factors(self):
+        from tzrec.utils.plan_util import EmbeddingEnumerator, get_default_sharders
+
+        model = self._build_model()
+        topology = Topology(world_size=2, compute_device="cuda")
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertEqual(len(search_space), 20)
+        caching_modes = sorted(
+            {
+                so.dynamicemb_options.caching
+                for so in search_space
+                if getattr(so, "use_dynamicemb", False)
+            }
+        )
+        self.assertEqual(caching_modes, [False, True])
+        load_factors = sorted(
+            {
+                round(so.cache_load_factor, 4)
+                for so in search_space
+                if getattr(so, "use_dynamicemb", False)
+            }
+        )
+        self.assertEqual(load_factors, [round((i + 1) / 10, 4) for i in range(10)])
+        # Each option must carry a non-zero perf and storage estimate.
+        for so in search_space:
+            self.assertGreater(so.total_perf, 0)
+            self.assertGreaterEqual(so.total_storage.hbm, 0)
+            self.assertGreaterEqual(so.total_storage.ddr, 0)
+
+    def test_dp_proposer_picks_feasible_dynamicemb_plan(self):
+        from tzrec.utils.plan_util import (
+            DynamicProgrammingProposer,
+            EmbeddingEnumerator,
+            get_default_sharders,
+        )
+
+        model = self._build_model()
+        topology = Topology(world_size=2, compute_device="cuda")
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+
+        proposer = DynamicProgrammingProposer()
+        proposer.load(search_space)
+        proposal = proposer.propose()
+        self.assertIsNotNone(proposal)
+        proposer.feedback(partitionable=True, storage_constraint=topology)
+
+        # At least one further proposal should be generated by the 2D DP.
+        count = 0
+        proposal = proposer.propose()
+        while proposal is not None and count < 5:
+            count += 1
+            for so in proposal:
+                if getattr(so, "use_dynamicemb", False):
+                    self.assertIn(so.dynamicemb_options.caching, (False, True))
+            proposer.feedback(partitionable=True, storage_constraint=topology)
+            proposal = proposer.propose()
+        self.assertGreater(count, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
