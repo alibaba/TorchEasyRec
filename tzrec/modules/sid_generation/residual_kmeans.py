@@ -13,6 +13,7 @@
 
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -214,12 +215,18 @@ class ResidualKMeans(nn.Module):
 
     @torch.no_grad()
     def train_offline(
-        self, inputs: torch.Tensor, verbose: bool = True
+        self,
+        inputs: Union[torch.Tensor, "np.ndarray"],
+        verbose: bool = True,
     ) -> None:
         """Train the multi-layer codebook via offline FAISS K-Means.
 
         Args:
-            inputs (Tensor): full embedding matrix, shape (N, D).
+            inputs: full embedding matrix, shape (N, D). Either a
+                ``torch.Tensor`` (will be copied to numpy) or a
+                ``np.ndarray`` (ownership transferred; caller MUST
+                release any outside reference — the array is mutated
+                in-place to compute residuals layer by layer).
             verbose (bool): whether to print per-layer reconstruction
                 loss. Default: True.
 
@@ -239,43 +246,68 @@ class ResidualKMeans(nn.Module):
                 "`pip install faiss-cpu` or `pip install faiss-gpu`."
             ) from e
 
-        assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
-            f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
-        )
+        # Materialise to a float32 contiguous numpy array that we own
+        # (so in-place residual updates are safe).
+        if isinstance(inputs, torch.Tensor):
+            assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
+                f"inputs must be (N, {self.embed_dim}), "
+                f"got {tuple(inputs.shape)}"
+            )
+            # Tensor path still requires a copy; caller will hold a
+            # reference until we return, so we must not alias it.
+            x = inputs.detach().cpu().float().numpy().copy()
+        else:
+            assert inputs.ndim == 2 and inputs.shape[1] == self.embed_dim, (
+                f"inputs must be (N, {self.embed_dim}), "
+                f"got {tuple(inputs.shape)}"
+            )
+            # Numpy path: take ownership — no extra copy. Caller promises
+            # the array is no longer used outside. Only ensure dtype
+            # + contiguity (zero-copy when already satisfied).
+            x = np.ascontiguousarray(inputs, dtype=np.float32)
+        N, D = x.shape
+        out = np.zeros((N, D), dtype=np.float32)
 
-        # CPU + float32 for FAISS
-        x = inputs.detach().to(dtype=torch.float32, device="cpu").clone()
-        out = torch.zeros_like(x)
-
-        # 对齐OneRec
+        # 对齐OneRec: 循环外创建一次 kmeans 实例复用
         n_embed = self.n_embed_list[0]
         kmeans = faiss.Kmeans(
-                self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
-            )
+            self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
+        )
+
+        # Chunk size for index.search to limit peak memory.
+        # 500K × 512 × 4B ≈ 1 GB per chunk.
+        SEARCH_CHUNK = 500_000
 
         for layer_idx in range(self.n_layers):
-            x_in = F.normalize(x, dim=-1) if self.normalize_residuals else x
-            # n_embed = self.n_embed_list[layer_idx]
-            # # [WARNING - fangtinglin] Different from OpenOneRec:
-            # #  * per-layer K comes from self.n_embed_list (list, not scalar)
-            # #  * kmeans is re-instantiated per layer (required when K varies)
-            # kmeans = faiss.Kmeans(
-            #     self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
-            # )
-            kmeans.train(x_in)
-            _, idx = kmeans.index.search(x_in, 1)
-            quantized = torch.tensor(kmeans.centroids[idx.reshape(-1)])
+            # ---- normalise residuals in-place (saves N×D allocation) ----
+            if self.normalize_residuals:
+                norms = np.linalg.norm(x, axis=1, keepdims=True)
+                np.maximum(norms, 1e-8, out=norms)
+                x /= norms                             # in-place
 
-            out = out + quantized
+            # ---- FAISS train (internally subsamples) ----
+            kmeans.train(x)
+
+            # ---- chunked search + quantize + residual (in-place) ----
+            for start in range(0, N, SEARCH_CHUNK):
+                end = min(start + SEARCH_CHUNK, N)
+                _, idx = kmeans.index.search(x[start:end], 1)
+                q = kmeans.centroids[idx.ravel()]       # (chunk, D)
+                out[start:end] += q
+                x[start:end] -= q                       # residual
+                del idx, q
+
+            # ---- verbose diagnostic ----
             if verbose:
-                ref = x_in if self.normalize_residuals else inputs.cpu().float()
+                out_t = torch.from_numpy(out)
+                ref_t = torch.from_numpy(out + x)       # x_in = out + residual
                 print(
                     f"[ResidualKMeans][offline_faiss][layer {layer_idx}] "
-                    f"{self._calc_loss(ref, out)}"
+                    f"{self._calc_loss(ref_t, out_t)}"
                 )
-            x = x_in - quantized
+                del out_t, ref_t
 
-            centroids_t = torch.from_numpy(kmeans.centroids)
+            centroids_t = torch.from_numpy(kmeans.centroids.copy())
             self.layers[layer_idx].load_centroids_(centroids_t)
             if verbose:
                 print(
@@ -349,12 +381,16 @@ class RQKMeans(nn.Module):
         )
 
     def train_offline(
-        self, inputs: torch.Tensor, verbose: bool = True
+        self,
+        inputs: Union[torch.Tensor, "np.ndarray"],
+        verbose: bool = True,
     ) -> None:
         """Build codebook offline via FAISS (only in 'offline_faiss' mode).
 
         Args:
-            inputs (Tensor): full embedding matrix, shape (N, embed_dim).
+            inputs: full embedding matrix, shape (N, embed_dim). Either
+                a ``torch.Tensor`` or an ``np.ndarray`` (ownership
+                transferred — array is mutated in-place).
             verbose (bool): print per-layer reconstruction loss.
         """
         assert self.train_mode == "offline_faiss", (

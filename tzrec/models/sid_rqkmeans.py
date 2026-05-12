@@ -22,6 +22,7 @@ Two training backends:
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -346,16 +347,16 @@ class SidRqkmeans(BaseModel):
             )
             return
 
-        local = torch.cat(self._offline_buffer, dim=0)
-        # Free buffer immediately after cat to reduce peak memory
-        # (avoids holding both the list of tensors AND the cat result).
-        del self._offline_buffer
-        self._offline_buffer = []
-
         is_ddp = dist.is_available() and dist.is_initialized() \
             and dist.get_world_size() > 1
 
         if is_ddp:
+            # DDP path: concat locally (torch.cat needed for all_gather
+            # which works on torch tensors), then gather + fit on rank0.
+            local = torch.cat(self._offline_buffer, dim=0)
+            del self._offline_buffer
+            self._offline_buffer = []
+
             full = _all_gather_concat(local)
             del local  # no longer needed after gather
             rank = dist.get_rank()
@@ -374,9 +375,33 @@ class SidRqkmeans(BaseModel):
                 dist.broadcast(layer._offline_locked, src=0)
             dist.barrier()
         else:
+            # Single-process path: build the full numpy matrix directly
+            # from the buffer list, popping each chunk after copy so the
+            # transient memory high-water mark stays ~= final matrix size
+            # (instead of 2× when going through torch.cat).
+            N = sum(t.shape[0] for t in self._offline_buffer)
+            D = self._offline_buffer[0].shape[1]
             logger.info(
                 "[SidRqkmeans.flush_offline_fit] fitting FAISS on "
-                "%d samples (D=%d)." % (local.shape[0], local.shape[1])
+                "%d samples (D=%d)." % (N, D)
             )
-            self._rqkmeans.train_offline(local, verbose=True)
-            del local
+            full_np = np.empty((N, D), dtype=np.float32)
+            offset = 0
+            # Pop from the front; each popped tensor is released before
+            # the next copy so cumulative torch memory shrinks monotonically.
+            while self._offline_buffer:
+                t = self._offline_buffer.pop(0)
+                n = t.shape[0]
+                # .float().numpy() returns a view sharing storage with
+                # the fp32 tensor; the subsequent assignment copies into
+                # full_np, after which ``t`` can be freed.
+                full_np[offset : offset + n] = t.float().numpy()
+                offset += n
+                del t
+            del self._offline_buffer
+            self._offline_buffer = []
+
+            # train_offline takes ownership of ``full_np`` (in-place
+            # residual updates); drop our reference after the call.
+            self._rqkmeans.train_offline(full_np, verbose=True)
+            del full_np
