@@ -247,15 +247,21 @@ class ResidualKMeans(nn.Module):
         x = inputs.detach().to(dtype=torch.float32, device="cpu").clone()
         out = torch.zeros_like(x)
 
-        for layer_idx in range(self.n_layers):
-            x_in = F.normalize(x, dim=-1) if self.normalize_residuals else x
-            n_embed = self.n_embed_list[layer_idx]
-            # [WARNING - fangtinglin] Different from OpenOneRec:
-            #  * per-layer K comes from self.n_embed_list (list, not scalar)
-            #  * kmeans is re-instantiated per layer (required when K varies)
-            kmeans = faiss.Kmeans(
+        # 对齐OneRec
+        n_embed = self.n_embed_list[0]
+        kmeans = faiss.Kmeans(
                 self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
             )
+
+        for layer_idx in range(self.n_layers):
+            x_in = F.normalize(x, dim=-1) if self.normalize_residuals else x
+            # n_embed = self.n_embed_list[layer_idx]
+            # # [WARNING - fangtinglin] Different from OpenOneRec:
+            # #  * per-layer K comes from self.n_embed_list (list, not scalar)
+            # #  * kmeans is re-instantiated per layer (required when K varies)
+            # kmeans = faiss.Kmeans(
+            #     self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
+            # )
             kmeans.train(x_in)
             _, idx = kmeans.index.search(x_in, 1)
             quantized = torch.tensor(kmeans.centroids[idx.reshape(-1)])
