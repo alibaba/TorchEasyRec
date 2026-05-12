@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 from torchrec.distributed.model_parallel import get_default_sharders
@@ -18,9 +19,10 @@ from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
 from torchrec.distributed.planner.types import PlannerError, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
+from torchrec.distributed.types import CacheParams
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
-from tzrec.utils.plan_util import DynamicProgrammingProposer
+from tzrec.utils.plan_util import DynamicProgrammingProposer, _emit_dynamicemb_variants
 
 
 class PlanUtilTest(unittest.TestCase):
@@ -134,6 +136,70 @@ class PlanUtilTest(unittest.TestCase):
             best_dp_proposal["sparse.ebc.table_3"].sharding_type,
             "row_wise" if torch.cuda.is_available() else "table_wise",
         )
+
+
+class EmitDynamicEmbVariantsTest(unittest.TestCase):
+    """``_emit_dynamicemb_variants`` produces { HYBRID, CACHING } × factors."""
+
+    def _make_base(self, cache_params=None):
+        # _emit_dynamicemb_variants only touches cache_params and
+        # dynamicemb_options on the option, so a SimpleNamespace stand-in is
+        # sufficient and avoids the heavy ShardingOption constructor surface.
+        return SimpleNamespace(
+            cache_params=cache_params,
+            dynamicemb_options=SimpleNamespace(caching=False, bucket_capacity=128),
+        )
+
+    def _make_dynamicemb_options(self):
+        return SimpleNamespace(caching=False, bucket_capacity=128)
+
+    def test_unfixed_factor_emits_twenty_variants(self):
+        variants = _emit_dynamicemb_variants(
+            self._make_base(cache_params=None), self._make_dynamicemb_options()
+        )
+        self.assertEqual(len(variants), 20)
+        cache_modes = sorted({v.dynamicemb_options.caching for v in variants})
+        self.assertEqual(cache_modes, [False, True])
+        for caching_mode in (False, True):
+            factors = sorted(
+                v.cache_params.load_factor
+                for v in variants
+                if v.dynamicemb_options.caching is caching_mode
+            )
+            self.assertEqual(factors, [round((i + 1) / 10, 4) for i in range(10)])
+
+    def test_fixed_factor_emits_two_variants(self):
+        variants = _emit_dynamicemb_variants(
+            self._make_base(cache_params=CacheParams(load_factor=0.3)),
+            self._make_dynamicemb_options(),
+        )
+        self.assertEqual(len(variants), 2)
+        cache_modes = sorted(v.dynamicemb_options.caching for v in variants)
+        self.assertEqual(cache_modes, [False, True])
+        for v in variants:
+            self.assertEqual(v.cache_params.load_factor, 0.3)
+
+    def test_variants_own_dynamicemb_options(self):
+        # Per-variant mutation of caching must not bleed across variants.
+        opts = self._make_dynamicemb_options()
+        variants = _emit_dynamicemb_variants(self._make_base(), opts)
+        for v in variants:
+            self.assertIsNot(v.dynamicemb_options, opts)
+
+    def test_stats_preserved_on_clone(self):
+        class _Stats:
+            expected_lookups = 100.0
+
+            def expected_miss_rate(self, ratio):
+                return 0.1
+
+        stats = _Stats()
+        variants = _emit_dynamicemb_variants(
+            self._make_base(cache_params=CacheParams(load_factor=0.2, stats=stats)),
+            self._make_dynamicemb_options(),
+        )
+        for v in variants:
+            self.assertIs(v.cache_params.stats, stats)
 
 
 if __name__ == "__main__":

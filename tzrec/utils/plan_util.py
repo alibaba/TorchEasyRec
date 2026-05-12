@@ -755,6 +755,39 @@ def calculate_shard_storages(
         )
 
 
+def _emit_dynamicemb_variants(
+    base_option: ShardingOption,
+    dynamicemb_options: Any,
+) -> List[ShardingOption]:
+    """Expand a dynamicemb ShardingOption into HYBRID + CACHING variants.
+
+    Sweeps both placement modes (``caching=False`` and ``caching=True``) and,
+    when ``base_option.cache_params`` is unset, ten cache_load_factor values
+    (0.1, 0.2, ..., 1.0). The downstream 2D DP proposer picks per table the
+    best (mode, ratio) that fits both HBM and host topology budgets.
+
+    Each returned ShardingOption owns a freshly deep-copied
+    ``dynamicemb_options`` instance so per-option ``caching`` mutations do not
+    bleed across variants.
+    """
+    if base_option.cache_params is None:
+        load_factors = [(i + 1) / 10 for i in range(10)]
+        stats = None
+    else:
+        load_factors = [base_option.cache_params.load_factor]
+        stats = base_option.cache_params.stats
+    variants: List[ShardingOption] = []
+    for caching_mode in (False, True):
+        for load_factor in load_factors:
+            opt = copy.deepcopy(base_option)
+            opt.cache_params = CacheParams(load_factor=load_factor, stats=stats)
+            # pyre-ignore [16]
+            opt.dynamicemb_options = copy.deepcopy(dynamicemb_options)
+            opt.dynamicemb_options.caching = caching_mode
+            variants.append(opt)
+    return variants
+
+
 class EmbeddingEnumerator(_EmbeddingEnumerator):
     """Generates embedding sharding options for given `nn.Module` with constraints.
 
@@ -934,20 +967,11 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_option.use_dynamicemb = use_dynamicemb
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
-                            if sharding_option.cache_params is None:
-                                # add cache_load_factor automatic search space
-                                for load_factor_step in range(10):
-                                    sharding_option_copy = copy.deepcopy(
-                                        sharding_option
-                                    )
-                                    sharding_option_copy.cache_params = CacheParams(
-                                        load_factor=(load_factor_step + 1) / 10
-                                    )
-                                    sharding_options_per_table.append(
-                                        sharding_option_copy
-                                    )
-                            else:
-                                sharding_options_per_table.append(sharding_option)
+                            sharding_options_per_table.extend(
+                                _emit_dynamicemb_variants(
+                                    sharding_option, dynamicemb_options
+                                )
+                            )
                         else:
                             sharding_options_per_table.append(sharding_option)
 
