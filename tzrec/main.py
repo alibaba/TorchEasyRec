@@ -511,6 +511,10 @@ def _train_and_evaluate(
             if lr.by_epoch:
                 lr.step()
 
+    # kmeans offline-faiss
+    if hasattr(_model, "flush_offline_fit"):
+        _model.flush_offline_fit()
+
     _log_train(
         i_step,
         losses,

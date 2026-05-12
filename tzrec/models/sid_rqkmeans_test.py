@@ -148,5 +148,156 @@ class SidRqkmeansTest(unittest.TestCase):
         self.assertTrue((codes < 16).all())  # n_embed=16
 
 
+class SidRqkmeansOfflineTest(unittest.TestCase):
+    """Tests for SidRqkmeans offline_faiss mode."""
+
+    def _create_offline_model(self, input_dim=32, n_layers=2, niter=5):
+        """Create a SidRqkmeans configured for offline_faiss mode."""
+        from google.protobuf.struct_pb2 import Struct
+        n_embed_str = ",".join(["16"] * n_layers)
+
+        faiss_kwargs = Struct()
+        faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
+
+        sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
+            input_dim=input_dim,
+            codebook=n_embed_str,
+            normalize_residuals=False,
+            init_buffer_size=64,
+            train_mode="offline_faiss",
+            faiss_kmeans_kwargs=faiss_kwargs,
+            embedding_feature_name="item_emb",
+        )
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["item_emb"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            sid_rqkmeans=sid_rqkmeans_cfg,
+        )
+        model = SidRqkmeans(
+            model_config=model_config, features=[], labels=[]
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        return model
+
+    def test_offline_proto_parse(self) -> None:
+        """Verify train_mode + faiss_kmeans_kwargs are parsed correctly."""
+        model = self._create_offline_model()
+        self.assertEqual(model._train_mode, "offline_faiss")
+        self.assertEqual(model._faiss_kwargs.get("niter"), 5)
+        self.assertEqual(model._faiss_kwargs.get("seed"), 1234)
+        self.assertFalse(model._faiss_kwargs.get("verbose"))
+        # Buffer should be initialized as empty list
+        self.assertEqual(model._offline_buffer, [])
+
+    def test_offline_default_train_mode_is_online(self) -> None:
+        """Backward-compat: not setting train_mode should fallback to 'online'."""
+        sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
+            input_dim=32,
+            codebook="16,16",
+            normalize_residuals=True,
+            init_buffer_size=64,
+            embedding_feature_name="item_emb",
+        )
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["item_emb"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            sid_rqkmeans=sid_rqkmeans_cfg,
+        )
+        model = SidRqkmeans(
+            model_config=model_config, features=[], labels=[]
+        )
+        self.assertEqual(model._train_mode, "online")
+        # No offline_buffer attribute in online mode
+        self.assertFalse(hasattr(model, "_offline_buffer"))
+
+    def test_offline_predict_collects_buffer(self) -> None:
+        """In offline+train mode, predict should append to buffer; never fit."""
+        B, input_dim = 8, 32
+        model = self._create_offline_model(input_dim=input_dim)
+        model.train()
+
+        for _ in range(4):
+            batch = _make_batch(B, input_dim)
+            preds = model.predict(batch)
+            self.assertIn("codes", preds)
+
+        # Buffer accumulates 4 batches of B samples each
+        self.assertEqual(len(model._offline_buffer), 4)
+        total = sum(t.shape[0] for t in model._offline_buffer)
+        self.assertEqual(total, 4 * B)
+        # FAISS not yet triggered: layer should be unlocked
+        for layer in model._rqkmeans.quantizer.layers:
+            self.assertFalse(bool(layer._offline_locked.item()))
+
+    def test_offline_flush_runs_faiss_and_locks(self) -> None:
+        """flush_offline_fit triggers FAISS fit, locks layers, clears buffer."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+        B, input_dim = 64, 32
+        model = self._create_offline_model(input_dim=input_dim)
+        model.train()
+
+        # Accumulate enough samples (FAISS K-Means needs at least K points)
+        for _ in range(8):
+            model.predict(_make_batch(B, input_dim))
+        self.assertGreater(len(model._offline_buffer), 0)
+
+        # Trigger one-shot FAISS fit
+        model.flush_offline_fit()
+
+        # Buffer should be cleared
+        self.assertEqual(model._offline_buffer, [])
+        # All layers should be locked + initialized + centroids non-zero
+        for layer in model._rqkmeans.quantizer.layers:
+            self.assertTrue(bool(layer._offline_locked.item()))
+            self.assertTrue(bool(layer._is_initialized.item()))
+            self.assertGreater(layer.centroids.abs().sum().item(), 0.0)
+
+        # After fit, predict on eval should produce valid codes
+        model.eval()
+        preds = model.predict(_make_batch(B, input_dim))
+        codes = preds["codes"]
+        self.assertEqual(codes.shape, (B, 2))
+        self.assertTrue((codes >= 0).all() and (codes < 16).all())
+
+    def test_offline_flush_noop_in_online_mode(self) -> None:
+        """flush_offline_fit should be a no-op for online mode."""
+        sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
+            input_dim=32, codebook="16,16",
+            embedding_feature_name="item_emb",
+        )
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["item_emb"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            sid_rqkmeans=sid_rqkmeans_cfg,
+        )
+        model = SidRqkmeans(
+            model_config=model_config, features=[], labels=[]
+        )
+        # Should not raise
+        model.flush_offline_fit()
+
+
 if __name__ == "__main__":
     unittest.main()

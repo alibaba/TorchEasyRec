@@ -129,6 +129,14 @@ class MiniBatchKMeans(nn.Module):
         )
         self.register_buffer("cluster_counts", torch.zeros(n_clusters))
         self.register_buffer("_is_initialized", torch.tensor(False))
+        # Offline lock: set to True by `load_centroids_()` to mark this layer
+        # as managed by an offline backend (e.g. FAISS). When True, calls to
+        # `train_step()` will raise to prevent silent corruption of the
+        # offline-trained codebook by online mini-batch updates.
+        # Persisted in state_dict so the lock survives ckpt round-trips.
+        self.register_buffer(
+            "_offline_locked", torch.tensor(False, dtype=torch.bool)
+        )
 
         self._init_buffer: List[torch.Tensor] = []
 
@@ -136,6 +144,50 @@ class MiniBatchKMeans(nn.Module):
     def is_initialized(self) -> bool:
         """Whether centroids have been initialized via KMeans++."""
         return self._is_initialized.item()
+
+    @property
+    def offline_locked(self) -> bool:
+        """Whether centroids were injected by an offline backend."""
+        return bool(self._offline_locked.item())
+
+    @torch.no_grad()
+    def load_centroids_(self, centroids: torch.Tensor) -> None:
+        """Externally inject centroids and mark layer as initialized.
+
+        Used by offline training (FAISS) to bypass the online init buffer.
+        After this call, ``train_step()`` is locked and will raise
+        ``RuntimeError`` if invoked, to prevent silent corruption of the
+        offline-trained codebook by online mini-batch updates.
+
+        Args:
+            centroids (Tensor): externally trained centroids,
+                shape (n_clusters, n_features).
+        """
+        assert centroids.shape == self.centroids.shape, (
+            f"centroids shape mismatch: expected {tuple(self.centroids.shape)}, "
+            f"got {tuple(centroids.shape)}"
+        )
+        self.centroids.copy_(
+            centroids.to(dtype=self.centroids.dtype, device=self.centroids.device)
+        )
+        self._is_initialized.fill_(True)
+        # Clear online statistics to avoid contamination if user later
+        # explicitly unlocks this layer for online fine-tuning.
+        self.cluster_counts.zero_()
+        # Drop any pending KMeans++ init buffer.
+        self._init_buffer = []
+        # Mark this layer as managed by the offline backend.
+        self._offline_locked.fill_(True)
+
+    def unlock_for_online_finetune_(self) -> None:
+        """Explicitly opt-in to online fine-tuning after offline init.
+
+        After ``load_centroids_()`` the layer is locked against
+        ``train_step()``. Call this to release the lock when you knowingly
+        want to continue updating centroids online (offline init + online
+        fine-tune scenario).
+        """
+        self._offline_locked.fill_(False)
 
 
     @torch.no_grad()
@@ -208,7 +260,22 @@ class MiniBatchKMeans(nn.Module):
             assignments (Tensor): cluster indices, shape (B,).
             embeddings (Tensor): centroid vectors for assigned clusters,
                 shape (B, D).
+
+        Raises:
+            RuntimeError: if this layer has been initialized by an offline
+                backend via ``load_centroids_()``. Call
+                ``unlock_for_online_finetune_()`` first to opt-in to online
+                fine-tuning of an offline-trained codebook.
         """
+        # Guard: prevent silent contamination of offline codebook.
+        if bool(self._offline_locked.item()):
+            raise RuntimeError(
+                "MiniBatchKMeans.train_step() called on a layer whose centroids "
+                "were injected by offline FAISS training (load_centroids_ was "
+                "used). Online updates would silently corrupt the offline "
+                "codebook. If you really want to fine-tune online, call "
+                "`layer.unlock_for_online_finetune_()` explicitly."
+            )
         batch = batch.detach()
 
         if not self.is_initialized:

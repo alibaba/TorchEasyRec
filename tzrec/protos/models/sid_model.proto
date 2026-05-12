@@ -1,6 +1,8 @@
 syntax = "proto2";
 package tzrec.protos;
 
+import "google/protobuf/struct.proto";
+
 // ============================================================
 // EMA 码本更新配置
 // ============================================================
@@ -93,6 +95,15 @@ message SidRqkmeans {
     optional bool normalize_residuals = 4 [default = true];
     // KMeans++ 初始化缓冲区大小
     optional uint32 init_buffer_size = 5 [default = 3072];
+
+    // 训练后端：'online' 或 'offline_faiss'
+    // - online        : 现有 Mini-Batch KMeans 在线更新
+    // - offline_faiss : train_eval 训练循环结束后由 main.py 触发
+    //                   一次性 FAISS 全量 fit
+    optional string train_mode = 6 [default = "online"];
+    // 透传给 faiss.Kmeans(D, K, **kwargs) 的额外参数（弱类型 dict）
+    // 典型：{niter: 20, gpu: true, verbose: true, spherical: false, seed: 1234}
+    optional google.protobuf.Struct faiss_kmeans_kwargs = 7;
 
     // Batch 中 item embedding 的特征名
     optional string embedding_feature_name = 40 [default = "item_emb"];

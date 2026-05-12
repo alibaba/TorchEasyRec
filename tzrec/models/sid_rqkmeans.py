@@ -11,15 +11,22 @@
 
 """SidRqkmeans: SID generation model using residual Mini-Batch KMeans.
 
-No gradient-based training. Centroids are updated online via
-train_step() during the predict() call in training mode.
+Two training backends:
+  - 'online'        : centroids updated on the fly via train_step()
+                      during predict() in training mode (default).
+  - 'offline_faiss' : predict() only collects embeddings into a CPU
+                      buffer; the actual FAISS fit is triggered ONCE
+                      after the train_eval loop ends, via
+                      `flush_offline_fit()` invoked by main.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torchmetrics
+from google.protobuf.json_format import MessageToDict
 from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -27,11 +34,90 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.sid_generation import RQKMeans
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.logging_util import logger
 
 
 def _parse_int_list(s: str) -> List[int]:
     """Parse comma-separated int string, e.g. '256,128' -> [256, 128]."""
     return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _recon_loss(
+    x: torch.Tensor, out: torch.Tensor, epsilon: float = 1e-4
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruction diagnostics aligned with OpenOneRec::ResKmeans.calc_loss.
+
+    Args:
+        x: ground-truth embedding, shape (B, D).
+        out: quantized reconstruction, shape (B, D).
+        epsilon: numerical stabilizer for rel_loss denominator.
+
+    Returns:
+        mse: ((out - x) ** 2).mean()
+        rel_loss: (|x - out| / (max(|x|, |out|) + eps)).mean()
+    """
+    mse = ((out - x) ** 2).mean()
+    rel = (
+        torch.abs(x - out)
+        / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
+    ).mean()
+    return mse, rel
+
+
+def _coerce_proto_numbers(d: Dict) -> Dict:
+    """Coerce float-typed integers back to int.
+
+    ``google.protobuf.Struct.number_value`` is always float, but most
+    ``faiss.Kmeans`` kwargs (``niter``, ``seed``, ``nredo``, ...) require
+    Python ``int``. This helper converts any float that is an exact
+    integer to ``int`` for downstream consumption.
+    """
+    out: Dict = {}
+    for k, v in d.items():
+        if isinstance(v, float) and v.is_integer():
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _all_gather_concat(local: torch.Tensor) -> torch.Tensor:
+    """All-gather variable-length tensors across DDP ranks and concat.
+
+    Args:
+        local: local tensor on the current rank, shape (n_local, D).
+
+    Returns:
+        Concatenated tensor (sum_n, D) on CPU.
+    """
+    world_size = dist.get_world_size()
+
+    # 1) gather local sizes
+    local_n = torch.tensor(
+        [local.shape[0]], dtype=torch.long, device=local.device
+    )
+    sizes = [torch.zeros_like(local_n) for _ in range(world_size)]
+    dist.all_gather(sizes, local_n)
+    sizes = [int(s.item()) for s in sizes]
+    max_n = max(sizes)
+
+    # 2) pad local to max_n then all_gather
+    if local.shape[0] < max_n:
+        pad = torch.zeros(
+            max_n - local.shape[0],
+            local.shape[1],
+            dtype=local.dtype,
+            device=local.device,
+        )
+        padded = torch.cat([local, pad], dim=0)
+    else:
+        padded = local
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+
+    # 3) trim padding and concat
+    pieces = [g[:n].cpu() for g, n in zip(gathered, sizes) if n > 0]
+    return torch.cat(pieces, dim=0) if pieces else local.cpu()
 
 
 class SidRqkmeans(BaseModel):
@@ -66,13 +152,29 @@ class SidRqkmeans(BaseModel):
         n_embed_list = _parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
+        # Resolve new fields with backward compatibility:
+        # proto2 string default may return empty string if not set in
+        # the textproto, so explicitly fallback to 'online'.
+        self._train_mode = cfg.train_mode or "online"
+        self._faiss_kwargs = (
+            _coerce_proto_numbers(MessageToDict(cfg.faiss_kmeans_kwargs))
+            if cfg.HasField("faiss_kmeans_kwargs")
+            else {}
+        )
+
         self._rqkmeans = RQKMeans(
             embed_dim=cfg.input_dim,
             n_layers=n_layers,
             n_embed=n_embed_list,
             normalize_residuals=cfg.normalize_residuals,
             init_buffer_size=cfg.init_buffer_size,
+            train_mode=self._train_mode,
+            faiss_kmeans_kwargs=self._faiss_kwargs,
         )
+
+        # Offline mode: collect embeddings into a CPU buffer
+        if self._train_mode == "offline_faiss":
+            self._offline_buffer: List[torch.Tensor] = []
 
         # KMeans has no learnable parameters (centroids use register_buffer).
         # Add dummy param to keep optimizer/DDP happy.
@@ -98,7 +200,18 @@ class SidRqkmeans(BaseModel):
         """
         embedding = self._extract_embedding(batch)
 
-        # RQKMeans forward returns {'codes': (B, n_layers), 'quantized': (B, D)}
+        # Offline mode + training stage: only collect; skip _rqkmeans forward.
+        if self._train_mode == "offline_faiss" and self.is_train:
+            self._offline_buffer.append(embedding.detach().cpu())
+            B = embedding.shape[0]
+            n_layers = self._rqkmeans.quantizer.n_layers
+            return {
+                "codes": torch.zeros(
+                    B, n_layers, dtype=torch.long, device=embedding.device
+                )
+            }
+
+        # Online minibatch mode.
         result = self._rqkmeans(embedding)
 
         predictions: Dict[str, torch.Tensor] = {
@@ -141,10 +254,12 @@ class SidRqkmeans(BaseModel):
         """Initialize metric modules."""
         # Eval metrics
         self._metric_modules["mse"] = torchmetrics.MeanMetric()
+        self._metric_modules["rel_loss"] = torchmetrics.MeanMetric()
         self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
-        # Train metrics (loss is dummy, only track mse + unique_sid_ratio)
+        # Train metrics (loss is dummy, only track mse/rel_loss + sid ratio)
         self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
+        self._train_metric_modules["rel_loss"] = torchmetrics.MeanMetric()
         self._train_metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
     def update_train_metric(
@@ -158,14 +273,15 @@ class SidRqkmeans(BaseModel):
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
         """
-        # Quantization MSE
+        # Quantization MSE + rel_loss (skipped in offline_faiss train stage
+        # where predictions carry only dummy codes without input_embedding).
         if "input_embedding" in predictions:
-            mse = F.mse_loss(
-                predictions["quantized"],
+            mse, rel = _recon_loss(
                 predictions["input_embedding"],
-                reduction="mean",
+                predictions["quantized"],
             )
             self._train_metric_modules["mse"].update(mse)
+            self._train_metric_modules["rel_loss"].update(rel)
 
         # Unique SID ratio
         codes = predictions["codes"]
@@ -191,17 +307,71 @@ class SidRqkmeans(BaseModel):
         codes = predictions["codes"]
         B = codes.shape[0]
 
-        # Quantization MSE: ||input - quantized||^2
+        # Quantization MSE + rel_loss (aligned with OpenOneRec calc_loss)
         if "input_embedding" in predictions:
-            mse = F.mse_loss(
-                predictions["quantized"],
+            mse, rel = _recon_loss(
                 predictions["input_embedding"],
-                reduction="mean",
+                predictions["quantized"],
             )
             self._metric_modules["mse"].update(mse)
+            self._metric_modules["rel_loss"].update(rel)
 
         # Unique SID ratio
         unique_sids = torch.unique(codes, dim=0).shape[0]
         self._metric_modules["unique_sid_ratio"].update(
             torch.tensor(unique_sids / B, device=codes.device)
         )
+
+    @torch.no_grad()
+    def flush_offline_fit(self) -> None:
+        """Trigger one-shot FAISS fit after the train_eval loop ends.
+
+        Called by ``tzrec.main.train_and_evaluate`` after the training
+        loop exits. No-op for ``train_mode='online'`` or when the
+        offline buffer is empty.
+
+        DDP behavior:
+            - rank0: all_gather full embedding matrix, run FAISS fit,
+              then broadcast (centroids + _is_initialized + _offline_locked)
+              to all other ranks.
+            - other ranks: send local buffer via all_gather, then wait
+              for broadcast.
+        """
+        if self._train_mode != "offline_faiss":
+            return
+        if not getattr(self, "_offline_buffer", None):
+            logger.warning(
+                "[SidRqkmeans.flush_offline_fit] offline buffer is empty; "
+                "skip FAISS fit. Did the train_eval loop run?"
+            )
+            return
+
+        local = torch.cat(self._offline_buffer, dim=0)
+        is_ddp = dist.is_available() and dist.is_initialized() \
+            and dist.get_world_size() > 1
+
+        if is_ddp:
+            full = _all_gather_concat(local)
+            rank = dist.get_rank()
+            if rank == 0:
+                logger.info(
+                    "[SidRqkmeans.flush_offline_fit] rank0 fitting FAISS "
+                    "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
+                )
+                self._rqkmeans.train_offline(full, verbose=True)
+            # Broadcast all codebook-related buffers (centroids + 2 guards).
+            # Missing any one breaks rank consistency on subsequent forward.
+            for layer in self._rqkmeans.quantizer.layers:
+                dist.broadcast(layer.centroids, src=0)
+                dist.broadcast(layer._is_initialized, src=0)
+                dist.broadcast(layer._offline_locked, src=0)
+            dist.barrier()
+        else:
+            logger.info(
+                "[SidRqkmeans.flush_offline_fit] fitting FAISS on "
+                "%d samples (D=%d)." % (local.shape[0], local.shape[1])
+            )
+            self._rqkmeans.train_offline(local, verbose=True)
+
+        # Free the buffer after fit
+        self._offline_buffer = []
