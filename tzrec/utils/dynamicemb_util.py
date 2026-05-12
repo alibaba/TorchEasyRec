@@ -258,18 +258,30 @@ if has_dynamicemb:
         is_hbm: bool = True,
         only_values: bool = False,
         bucket_capacity: int = 128,
+        caching: bool = False,
     ) -> int:
         """Calculate dynamic embedding table storage.
 
-        total_value_memory = max_capacity x aligned16(embedding+optimizer states)
-        num_buckets = max_capacity/bucket_capacity
-        hbm_budget = min(global_hbm_for_values//world_size, total_value_memory) +
-            max_capacity x (key<8byte> + score<8byte> + digest<1byte>) +
-            num_buckets x (bucket_size<4byte>)
-        ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
+        HYBRID mode (``caching=False``): values are hash-partitioned across HBM
+        and host; HBM holds ``cache_ratio`` of values, host holds
+        ``1 - cache_ratio``.
+
+        CACHING mode (``caching=True``): host holds the full backing store; HBM
+        holds an ``cache_ratio`` fraction as a cache.
+
+            hbm = align(rows) * (round_up16(dim*element) * cache_ratio + metadata)
+            ddr = align(rows) *  round_up16(dim*element) * value_ratio_ddr
+
+        where ``value_ratio_ddr`` is ``1 - cache_ratio`` for HYBRID and ``1.0``
+        for CACHING. Metadata (key + score + digest + bucket) is accounted on
+        HBM only, matching the existing tzrec convention.
         """
         if cache_ratio is None:
             cache_ratio = 1.0
+        if is_hbm:
+            value_ratio = cache_ratio
+        else:
+            value_ratio = 1.0 if caching else (1.0 - cache_ratio)
         return math.ceil(
             align_to_table_size(size[0])
             * (
@@ -277,7 +289,7 @@ if has_dynamicemb:
                     math.ceil(size[1] * (1 + optimizer_multipler) * element_size),
                     16,
                 )
-                * (cache_ratio if is_hbm else 1 - cache_ratio)
+                * value_ratio
                 + (8 + 8 + 1 + 4 / bucket_capacity) * (is_hbm and not only_values)
             )
         )
@@ -420,6 +432,7 @@ if has_dynamicemb:
         cache_ratio: float = 1.0,
         is_inference: bool = False,
         bucket_capacity: int = 128,
+        caching: bool = False,
     ) -> Tuple[List[int], List[int]]:
         """Calculate storage for dynamicemb."""
         optimizer_multipler = 0.0
@@ -437,6 +450,7 @@ if has_dynamicemb:
                 cache_ratio,
                 is_hbm=True,
                 bucket_capacity=bucket_capacity,
+                caching=caching,
             )
             for size in shard_sizes
         ]
@@ -449,6 +463,7 @@ if has_dynamicemb:
                 cache_ratio,
                 is_hbm=False,
                 bucket_capacity=bucket_capacity,
+                caching=caching,
             )
             for size in shard_sizes
         ]
@@ -535,6 +550,7 @@ if has_dynamicemb:
                 cache_ratio=caching_ratio if caching_ratio else 1.0,
                 is_inference=is_inference,
                 bucket_capacity=dynamicemb_options.bucket_capacity,
+                caching=bool(getattr(dynamicemb_options, "caching", False)),
             )
         )
         counter_hbm_specific_size = 0
