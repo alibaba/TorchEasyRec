@@ -202,5 +202,109 @@ class EmitDynamicEmbVariantsTest(unittest.TestCase):
             self.assertIs(v.cache_params.stats, stats)
 
 
+class _FakeStorage:
+    def __init__(self, hbm, ddr):
+        self.hbm = hbm
+        self.ddr = ddr
+
+
+class _FakeShard:
+    def __init__(self, hbm, ddr):
+        self.storage = _FakeStorage(hbm, ddr)
+
+
+class _FakeShardingOption:
+    """Minimal ShardingOption stand-in: only the fields the DP proposer reads."""
+
+    def __init__(self, fqn, hbm, ddr, perf):
+        self.fqn = fqn
+        # Total = single shard for simplicity (single-rank assignment).
+        self.shards = [_FakeShard(hbm, ddr)]
+        self.total_storage = _FakeStorage(hbm, ddr)
+        self.total_perf = perf
+
+
+def _make_topology(num_devices, hbm_per_device, ddr_per_device):
+    return SimpleNamespace(
+        devices=[
+            SimpleNamespace(
+                storage=_FakeStorage(hbm=hbm_per_device, ddr=ddr_per_device)
+            )
+            for _ in range(num_devices)
+        ]
+    )
+
+
+class DynamicProgrammingProposer2DTest(unittest.TestCase):
+    """2D DP across HBM × DDR picks per-table mode under joint budgets."""
+
+    def _run(self, search_space, topology):
+        proposer = DynamicProgrammingProposer(
+            hbm_bins_per_device=20, ddr_bins_per_device=20
+        )
+        proposer.load(search_space)
+        # First propose returns the lowest-mem-per-table seed.
+        proposer.propose()
+        proposer.feedback(partitionable=True, storage_constraint=topology)
+        proposals = []
+        proposal = proposer.propose()
+        while proposal:
+            proposals.append(proposal)
+            proposer.feedback(partitionable=True, storage_constraint=topology)
+            proposal = proposer.propose()
+        return proposals
+
+    def test_caching_preferred_when_ddr_is_generous(self):
+        # Three options for one table:
+        #   HYBRID @ x=1.0: hbm = T,   ddr = 0,   perf = high  (HBM-only)
+        #   HYBRID @ x=0.1: hbm = .1T, ddr = .9T, perf = high  (slow)
+        #   CACHING @ x=0.1: hbm = .1T, ddr = T,  perf = low   (fast — modeled hits)
+        opts = [
+            _FakeShardingOption("table_a", hbm=1000, ddr=0, perf=50.0),
+            _FakeShardingOption("table_a", hbm=100, ddr=900, perf=80.0),
+            _FakeShardingOption("table_a", hbm=100, ddr=1000, perf=10.0),
+        ]
+        topology = _make_topology(
+            num_devices=2, hbm_per_device=2000, ddr_per_device=2000
+        )
+        proposals = self._run(opts, topology)
+        # Best plan must be the CACHING option (perf=10).
+        best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
+        self.assertEqual(best[0].total_perf, 10.0)
+
+    def test_caching_rejected_when_ddr_is_tight(self):
+        # Host budget is only 950 — CACHING (ddr=1000) cannot fit; HYBRID can.
+        opts = [
+            _FakeShardingOption("table_a", hbm=100, ddr=900, perf=80.0),
+            _FakeShardingOption("table_a", hbm=100, ddr=1000, perf=10.0),
+        ]
+        topology = _make_topology(
+            num_devices=1, hbm_per_device=2000, ddr_per_device=950
+        )
+        proposals = self._run(opts, topology)
+        # Every proposed plan must pick the HYBRID option (perf=80).
+        for p in proposals:
+            self.assertEqual(p[0].total_perf, 80.0)
+
+    def test_high_factor_collapses_modes(self):
+        # At x=1.0 HYBRID == CACHING in HBM and CACHING.ddr = T = HYBRID.hbm.
+        # If we offer just the high-factor options, DP picks one of them.
+        opts = [
+            _FakeShardingOption("table_a", hbm=1000, ddr=0, perf=50.0),  # HYBRID x=1.0
+            _FakeShardingOption(
+                "table_a", hbm=1000, ddr=1000, perf=50.0
+            ),  # CACHING x=1.0
+        ]
+        topology = _make_topology(
+            num_devices=1, hbm_per_device=1100, ddr_per_device=2000
+        )
+        proposals = self._run(opts, topology)
+        # Either option is fine — they're tied. Just verify the proposer
+        # returned something feasible.
+        self.assertGreater(len(proposals), 0)
+        for p in proposals:
+            self.assertEqual(p[0].total_perf, 50.0)
+
+
 if __name__ == "__main__":
     unittest.main()
