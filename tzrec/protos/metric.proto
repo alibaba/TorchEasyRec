@@ -45,6 +45,11 @@ message GroupedXAUC {
 
 }
 
+message NormalizedEntropy {
+    // small epsilon clamping preds and the population mean away from {0, 1}.
+    optional float eta = 1 [default = 1e-12];
+}
+
 message MetricConfig {
     oneof metric {
         AUC auc = 1;
@@ -56,6 +61,7 @@ message MetricConfig {
         GroupedAUC grouped_auc = 7;
         XAUC xauc = 8;
         GroupedXAUC grouped_xauc = 9;
+        NormalizedEntropy normalized_entropy = 10;
     }
 }
 

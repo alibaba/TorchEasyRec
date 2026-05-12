@@ -24,6 +24,7 @@ from tzrec.loss.jrc_loss import JRCLoss
 from tzrec.metrics.decay_auc import DecayAUC
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.metrics.grouped_xauc import GroupedXAUC
+from tzrec.metrics.normalized_entropy import NormalizedEntropy
 from tzrec.metrics.train_metric_wrapper import TrainMetricWrapper
 from tzrec.metrics.xauc import XAUC
 from tzrec.models.model import BaseModel
@@ -324,6 +325,11 @@ class RankModel(BaseModel):
             self._metric_modules[metric_name] = GroupedXAUC(
                 metric_kwargs["max_pairs_per_group"]
             )
+        elif metric_type == "normalized_entropy":
+            assert num_class <= 2, (
+                f"num_class must less than 2 when metric type is {metric_type}"
+            )
+            self._metric_modules[metric_name] = NormalizedEntropy(**metric_kwargs)
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
@@ -430,6 +436,9 @@ class RankModel(BaseModel):
                     predictions[TARGET_REPEAT_INTERLEAVE_KEY]
                 )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
+        elif metric_type == "normalized_entropy":
+            pred = predictions["probs" + suffix]
+            self._metric_modules[metric_name].update(pred, label)
         else:
             raise ValueError(f"{metric_type} is not supported for this model")
 
