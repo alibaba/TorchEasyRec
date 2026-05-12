@@ -347,11 +347,17 @@ class SidRqkmeans(BaseModel):
             return
 
         local = torch.cat(self._offline_buffer, dim=0)
+        # Free buffer immediately after cat to reduce peak memory
+        # (avoids holding both the list of tensors AND the cat result).
+        del self._offline_buffer
+        self._offline_buffer = []
+
         is_ddp = dist.is_available() and dist.is_initialized() \
             and dist.get_world_size() > 1
 
         if is_ddp:
             full = _all_gather_concat(local)
+            del local  # no longer needed after gather
             rank = dist.get_rank()
             if rank == 0:
                 logger.info(
@@ -359,6 +365,7 @@ class SidRqkmeans(BaseModel):
                     "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
                 )
                 self._rqkmeans.train_offline(full, verbose=True)
+            del full
             # Broadcast all codebook-related buffers (centroids + 2 guards).
             # Missing any one breaks rank consistency on subsequent forward.
             for layer in self._rqkmeans.quantizer.layers:
@@ -372,6 +379,4 @@ class SidRqkmeans(BaseModel):
                 "%d samples (D=%d)." % (local.shape[0], local.shape[1])
             )
             self._rqkmeans.train_offline(local, verbose=True)
-
-        # Free the buffer after fit
-        self._offline_buffer = []
+            del local
