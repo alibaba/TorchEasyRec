@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-import math
 import unittest
 
 import numpy as np
@@ -18,20 +17,6 @@ import torch
 from parameterized import parameterized
 
 from tzrec.metrics.normalized_entropy import NormalizedEntropy
-
-
-def _reference_ne(preds: np.ndarray, target: np.ndarray, eta: float = 1e-12) -> float:
-    """Numpy reference re-derived from the torchrec/metrics/ne.py spec."""
-    p = np.clip(preds.astype(np.float64), eta, 1.0 - eta)
-    y = target.astype(np.float64)
-    ce = -(y * np.log2(p) + (1.0 - y) * np.log2(1.0 - p))
-    ce_sum = ce.sum()
-    pos = y.sum()
-    neg = (1.0 - y).sum()
-    n = max(y.size, eta)
-    mean_label = np.clip(pos / n, eta, 1.0 - eta)
-    ce_norm = -(pos * math.log2(mean_label) + neg * math.log2(1.0 - mean_label))
-    return ce_sum / ce_norm
 
 
 class NormalizedEntropyTest(unittest.TestCase):
@@ -53,15 +38,19 @@ class NormalizedEntropyTest(unittest.TestCase):
         metric.update(preds, target)
         self.assertLess(metric.compute().item(), 1e-3)
 
-    def test_matches_numpy_reference(self):
-        rng = np.random.default_rng(42)
-        n = 4096
-        target = rng.integers(0, 2, size=n).astype(np.int64)
-        # avoid 0/1 exact boundary in the bulk to keep the comparison tight
-        preds = rng.uniform(0.01, 0.99, size=n).astype(np.float32)
+    @parameterized.expand(
+        [
+            ("balanced_symmetric", [0.1, 0.4, 0.6, 0.9], [0, 0, 1, 1], 0.44448435),
+            ("imbalanced_informed", [0.2, 0.5, 0.8], [0, 1, 1], 0.59670544),
+            ("two_sample", [0.3, 0.7], [0, 1], 0.51457322),
+        ]
+    )
+    def test_known_value(self, _name, preds, target, expected):
         metric = NormalizedEntropy()
-        metric.update(torch.from_numpy(preds), torch.from_numpy(target))
-        expected = _reference_ne(preds, target)
+        metric.update(
+            torch.tensor(preds, dtype=torch.float32),
+            torch.tensor(target, dtype=torch.long),
+        )
         torch.testing.assert_close(
             metric.compute(),
             torch.tensor(expected, dtype=torch.float32),
