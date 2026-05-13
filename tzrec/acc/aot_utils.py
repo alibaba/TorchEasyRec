@@ -16,25 +16,31 @@ from typing import Any, Dict, Optional, Set, Union
 import torch
 from torch import nn
 
-from tzrec.acc.utils import is_unified_aot_predict
+from tzrec.acc.utils import is_autotune_with_sample_inputs, is_unified_aot_predict
 from tzrec.models.model import (
     CombinedModelWrapper,
     CudaAutocastWrapper,
     UnifiedAOTIModelWrapper,
 )
+from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
-# Eagerly register custom ops referenced by AOT-packaged models so that
-# torch._inductor.aoti_load_package() can resolve them by name. AOT packages
-# reference ops via their qualified name (e.g. ``tzrec::cutlass_hstu_mha_fwd``)
-# and PyTorch only knows about an op once its registering module has been
-# imported. Wrap in try/except so this stays optional for environments
-# without the corresponding native dependencies installed.
-try:
-    from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
-except ImportError:
-    logger.debug("cutlass_hstu_attention not available; skipping op registration")
+
+def _aoti_compile_cfg() -> Dict[str, Any]:
+    """torch._inductor.config overrides applied to AOTI compile."""
+    cfg: Dict[str, Any] = {
+        # AssertScalar codegen is incorrect; keep asserts off.
+        "scalar_asserts": False,
+        # Tolerate Triton Autotuner pre_hooks (HSTU TensorDescriptor pre_hook).
+        "unsafe_ignore_unsupported_triton_autotune_args": True,
+        # fp64 alpha forces Newton-Raphson tl.sigmoid on Ada/Ampere where
+        # there is no native ex2.f64; fp32 specialization is the right default.
+        "_use_fp64_for_unbacked_floats": False,
+    }
+    if is_autotune_with_sample_inputs():
+        cfg["triton.autotune_with_sample_inputs"] = True
+    return cfg
 
 
 def load_model_aot(
@@ -101,7 +107,11 @@ def export_model_aot(
             it is only embedding lookups, which don't benefit from AMP and
             which would complicate torch.jit.script compilation.
     """
-    sparse_output, _ = sparse_model(data, "cuda:0")
+    # no_grad: outputs become leaf tensors so AOTI's
+    # extract_autotune_inputs() can deepcopy them when sample-input
+    # autotune is on (upstream pytorch issue: only leaves support deepcopy).
+    with torch.no_grad():
+        sparse_output, _ = sparse_model(data, "cuda:0")
     sparse_model_traced = symbolic_trace(sparse_model)
 
     with open(os.path.join(save_dir, "gm_sparse.code"), "w") as f:
@@ -157,13 +167,7 @@ def export_model_aot(
             args=(sparse_output,),
             dynamic_shapes=(dynamic_shapes,),
         )
-    # AsserScalar codegen is not correct.
-    with torch._inductor.config.patch(
-        {
-            "scalar_asserts": False,
-            "unsafe_ignore_unsupported_triton_autotune_args": True,
-        }
-    ):
+    with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
 
@@ -432,12 +436,7 @@ def export_unified_model_aot(
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
-    with torch._inductor.config.patch(
-        {
-            "scalar_asserts": False,
-            "unsafe_ignore_unsupported_triton_autotune_args": True,
-        }
-    ):
+    with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
 

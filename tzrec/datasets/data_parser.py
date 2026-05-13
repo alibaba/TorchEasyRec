@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyfg
 import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
@@ -28,6 +29,7 @@ from tzrec.acc.utils import (
 )
 from tzrec.constant import Mode
 from tzrec.datasets.utils import (
+    CAND_POS_LENGTHS,
     HARD_NEG_INDICES,
     Batch,
     DenseData,
@@ -50,7 +52,6 @@ def _to_tensor(x: npt.NDArray) -> torch.Tensor:
 def _tile_size(x: torch.Tensor) -> int:
     tile_size = x.item()
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        torch._check_is_size(tile_size)
         # check tile_size = 1 to make dynamo check size happy,
         # because in DataParser.parse, we always set tile_size = 1.
         torch._check(tile_size == 1)
@@ -265,8 +266,13 @@ class DataParser:
                 )
 
         if HARD_NEG_INDICES in input_data.keys():
-            output_data[HARD_NEG_INDICES] = torch.tensor(
-                input_data[HARD_NEG_INDICES].tolist(), dtype=torch.int32
+            flat = pc.list_flatten(input_data[HARD_NEG_INDICES]).to_numpy()
+            output_data[HARD_NEG_INDICES] = _to_tensor(
+                flat.astype(np.int32, copy=False).reshape(-1, 2)
+            )
+        if CAND_POS_LENGTHS in input_data.keys():
+            output_data[CAND_POS_LENGTHS] = _to_tensor(
+                input_data[CAND_POS_LENGTHS].to_numpy()
             )
         return output_data
 
@@ -468,8 +474,16 @@ class DataParser:
         if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
             try:
                 additional_infos[HARD_NEG_INDICES] = input_data[HARD_NEG_INDICES]
-            except Exception:
+            except KeyError:
                 logger.warning("No hard negative samples exist in the batch.")
+        # Gate by sampler_type so torch.fx.symbolic_trace (unified AOT export)
+        # doesn't bake `cand_pos_lengths` into the graph when no sampler is
+        # configured.
+        if self.sampler_type is not None:
+            try:
+                additional_infos[CAND_POS_LENGTHS] = input_data[CAND_POS_LENGTHS]
+            except KeyError:
+                pass
 
         batch = Batch(
             dense_features=dense_features,

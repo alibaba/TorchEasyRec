@@ -123,6 +123,29 @@ class hypothesis_settings(_settings):
         )
 
 
+def mark_ci_scope(*scopes: str) -> Any:
+    """Tag a unittest method or class as in-scope for the given CI lane(s).
+
+    Use at the class or method level only -- module-level fallback is
+    intentionally not supported so each new test class must declare its
+    own scope.
+
+    Examples:
+        @mark_ci_scope("h20")
+        class FooTest(unittest.TestCase): ...
+
+        @mark_ci_scope("h20", "l20")
+        def test_bar(self): ...
+    """
+
+    def decorator(obj: Any) -> Any:
+        existing = set(getattr(obj, "_ci_scopes", ()) or ())
+        obj._ci_scopes = existing | set(scopes)
+        return obj
+
+    return decorator
+
+
 def dicts_are_equal(
     dict1: Dict[str, torch.Tensor], dict2: Dict[str, torch.Tensor]
 ) -> bool:

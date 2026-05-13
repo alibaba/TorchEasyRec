@@ -19,7 +19,11 @@ from hypothesis import strategies as st
 from parameterized import parameterized
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import gpu_unavailable, reference_stu_truncation
+from tzrec.utils.test_util import (
+    gpu_unavailable,
+    mark_ci_scope,
+    reference_stu_truncation,
+)
 
 
 def _inplace_swap(
@@ -35,6 +39,7 @@ def _inplace_swap(
     return x
 
 
+@mark_ci_scope("h20")
 class StuTest(unittest.TestCase):
     # pyre-ignore
     @given(
@@ -521,6 +526,7 @@ class StuTest(unittest.TestCase):
             )
 
 
+@mark_ci_scope("h20")
 class STUStackTruncationTest(unittest.TestCase):
     """Cover the mid-stack truncation block in ``STUStack.forward``.
 

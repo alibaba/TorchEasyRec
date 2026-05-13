@@ -510,7 +510,7 @@ def triton_split_2d_jagged_fwd(
             # assert total_len_left + total_len_right == total_seq_len
             total_len_a = total_len_left
             total_len_b = total_len_right
-            torch._check_is_size(total_len_a)
+            torch._check(total_len_a >= 0)
             # torch._check(total_len_a > 0)
             # torch._check(total_len_a < 10**9)
         else:

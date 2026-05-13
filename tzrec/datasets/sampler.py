@@ -14,7 +14,7 @@ import os
 import random
 import socket
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import graphlearn as gl
 import numpy as np
@@ -358,6 +358,13 @@ class BaseSampler(metaclass=_meta_cls):
     def _parse_sparse_nodes(
         self, nodes: gl.Nodes
     ) -> Tuple[List[pa.Array], npt.NDArray]:
+        """Parse sparse-neighbor sampler output.
+
+        `indices[:, 0]` indexes into the caller-supplied src array:
+        `[0, B)` for row-aligned callers, `[0, Q)` when the caller
+        flattens via `build_sampler_input`. `indices[:, 1]` is the
+        per-source neighbor offset.
+        """
         features = []
         # pyre-ignore [16]
         if len(nodes.indices) == 0:
@@ -428,19 +435,26 @@ class NegativeSampler(BaseSampler):
             ),
         )
         self._item_id_field = config.item_id_field
-        self._sampler = None
+        self._sampler_cache: Dict[int, Any] = {}
         self.item_id_delim = config.item_id_delim
 
     def init(self, client_id: int = -1) -> None:
-        """Init sampler client and samplers."""
+        """Init sampler client; per-expand_factor samplers are created lazily."""
         super().init(client_id)
-        expand_factor = int(math.ceil(self._num_sample / self._batch_size))
-        self._sampler = self._g.negative_sampler(
-            "item", expand_factor, strategy="node_weight"
-        )
+        self._sampler_cache = {}
+
+    def _get_sampler(self, expand_factor: int) -> Any:
+        if expand_factor not in self._sampler_cache:
+            self._sampler_cache[expand_factor] = self._g.negative_sampler(
+                "item", expand_factor, strategy="node_weight"
+            )
+        return self._sampler_cache[expand_factor]
 
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
+
+        `expand_factor` is derived from the actual input length, so
+        flattened multi-positive queries flow through without padding.
 
         Args:
             input_data (dict): input data with item_id.
@@ -449,8 +463,10 @@ class NegativeSampler(BaseSampler):
             Negative sampled feature dict.
         """
         ids = _pa_ids_to_npy(input_data[self._item_id_field])
-        ids = np.pad(ids, (0, self._batch_size - len(ids)), "edge")
-        nodes = self._sampler.get(ids)
+        num_pos = max(1, len(ids))
+        expand_factor = max(1, int(math.ceil(self._num_sample / num_pos)))
+        sampler = self._get_sampler(expand_factor)
+        nodes = sampler.get(ids)
         features = self._parse_nodes(nodes)
         result_dict = dict(zip(self._valid_attr_names, features))
         return result_dict
@@ -509,15 +525,12 @@ class NegativeSamplerV2(BaseSampler):
         )
         self._item_id_field = config.item_id_field
         self._user_id_field = config.user_id_field
-        self._sampler = None
+        self._sampler_cache: Dict[int, Any] = {}
 
     def init(self, client_id: int = -1) -> None:
-        """Init sampler client and samplers."""
+        """Init sampler client; per-expand_factor samplers are created lazily."""
         super().init(client_id)
-        expand_factor = int(math.ceil(self._num_sample / self._batch_size))
-        self._sampler = self._g.negative_sampler(
-            "edge", expand_factor, strategy="random", conditional=True
-        )
+        self._sampler_cache = {}
 
         # prevent gl timeout
         worker_info = get_worker_info()
@@ -528,8 +541,18 @@ class NegativeSamplerV2(BaseSampler):
             {self._user_id_field: pa.array([0]), self._item_id_field: pa.array([0])}
         )
 
+    def _get_sampler(self, expand_factor: int) -> Any:
+        if expand_factor not in self._sampler_cache:
+            self._sampler_cache[expand_factor] = self._g.negative_sampler(
+                "edge", expand_factor, strategy="random", conditional=True
+            )
+        return self._sampler_cache[expand_factor]
+
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
+
+        Caller keeps (user_id, item_id) row-aligned; `build_sampler_input`
+        expands user_id for flattened multi-positive queries.
 
         Args:
             input_data (dict): input data with user_id and item_id.
@@ -539,9 +562,10 @@ class NegativeSamplerV2(BaseSampler):
         """
         src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
         dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
-        src_ids = np.pad(src_ids, (0, self._batch_size - len(src_ids)), "edge")
-        dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
-        nodes = self._sampler.get(src_ids, dst_ids)
+        num_pos = max(1, len(dst_ids))
+        expand_factor = max(1, int(math.ceil(self._num_sample / num_pos)))
+        sampler = self._get_sampler(expand_factor)
+        nodes = sampler.get(src_ids, dst_ids)
         features = self._parse_nodes(nodes)
         result_dict = dict(zip(self._valid_attr_names, features))
         return result_dict
@@ -602,34 +626,49 @@ class HardNegativeSampler(BaseSampler):
         )
         self._item_id_field = config.item_id_field
         self._user_id_field = config.user_id_field
-        self._neg_sampler = None
+        self._neg_sampler_cache: Dict[int, Any] = {}
         self._hard_neg_sampler = None
 
     def init(self, client_id: int = -1) -> None:
-        """Init sampler client and samplers."""
+        """Init sampler client and the hard-neg neighbor sampler.
+
+        Regular-neg samplers are created lazily per expand_factor in
+        :meth:`_get_neg_sampler`.
+        """
         super().init(client_id)
-        expand_factor = int(math.ceil(self._num_sample / self._batch_size))
-        self._neg_sampler = self._g.negative_sampler(
-            "item", expand_factor, strategy="node_weight"
-        )
+        self._neg_sampler_cache = {}
         self._hard_neg_sampler = self._g.neighbor_sampler(
             ["hard_neg_edge"], self._num_hard_sample, strategy="full"
         )
 
+    def _get_neg_sampler(self, expand_factor: int) -> Any:
+        if expand_factor not in self._neg_sampler_cache:
+            self._neg_sampler_cache[expand_factor] = self._g.negative_sampler(
+                "item", expand_factor, strategy="node_weight"
+            )
+        return self._neg_sampler_cache[expand_factor]
+
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
+
+        `hard_neg_indices[:, 0]` indexes into the caller-supplied
+        `input_data[user_id_field]`: `[0, B)` for row-aligned input,
+        `[0, Q)` when the caller flattens via `build_sampler_input`.
 
         Args:
             input_data (dict): input data with user_id and item_id.
 
         Returns:
-            Negative sampled feature dict. The first batch_size is negative samples,
-                remainder is hard negative samples
+            Negative sampled feature dict. First num_sample entries are
+            simple negatives; remaining entries are hard negatives.
+            `HARD_NEG_INDICES` is included when any hard neg exists.
         """
         src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
         dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
-        dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
-        nodes = self._neg_sampler.get(dst_ids)
+        num_pos = max(1, len(dst_ids))
+        expand_factor = max(1, int(math.ceil(self._num_sample / num_pos)))
+        neg_sampler = self._get_neg_sampler(expand_factor)
+        nodes = neg_sampler.get(dst_ids)
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
         hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)
@@ -703,35 +742,50 @@ class HardNegativeSamplerV2(BaseSampler):
         )
         self._item_id_field = config.item_id_field
         self._user_id_field = config.user_id_field
-        self._neg_sampler = None
+        self._neg_sampler_cache: Dict[int, Any] = {}
         self._hard_neg_sampler = None
 
     def init(self, client_id: int = -1) -> None:
-        """Init sampler client and samplers."""
+        """Init sampler client and the hard-neg neighbor sampler.
+
+        Regular-neg samplers are created lazily per expand_factor in
+        :meth:`_get_neg_sampler`.
+        """
         super().init(client_id)
-        expand_factor = int(math.ceil(self._num_sample / self._batch_size))
-        self._neg_sampler = self._g.negative_sampler(
-            "edge", expand_factor, strategy="random", conditional=True
-        )
+        self._neg_sampler_cache = {}
         self._hard_neg_sampler = self._g.neighbor_sampler(
             ["hard_neg_edge"], self._num_hard_sample, strategy="full"
         )
 
+    def _get_neg_sampler(self, expand_factor: int) -> Any:
+        if expand_factor not in self._neg_sampler_cache:
+            self._neg_sampler_cache[expand_factor] = self._g.negative_sampler(
+                "edge", expand_factor, strategy="random", conditional=True
+            )
+        return self._neg_sampler_cache[expand_factor]
+
     def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
         """Sampling method.
+
+        Caller keeps (user_id, item_id) row-aligned; `build_sampler_input`
+        expands user_id for flattened multi-positive queries.
+        `hard_neg_indices[:, 0]` indexes into the caller-supplied
+        `input_data[user_id_field]` (`[0, B)` or `[0, Q)` accordingly).
 
         Args:
             input_data (dict): input data with user_id and item_id.
 
         Returns:
-            Negative sampled feature dict. The first batch_size is negative samples,
-                remainder is hard negative samples
+            Negative sampled feature dict. First num_sample entries are
+            simple negatives; remaining entries are hard negatives.
+            `HARD_NEG_INDICES` is included when any hard neg exists.
         """
         src_ids = _pa_ids_to_npy(input_data[self._user_id_field])
         dst_ids = _pa_ids_to_npy(input_data[self._item_id_field])
-        padded_src_ids = np.pad(src_ids, (0, self._batch_size - len(src_ids)), "edge")
-        dst_ids = np.pad(dst_ids, (0, self._batch_size - len(dst_ids)), "edge")
-        nodes = self._neg_sampler.get(padded_src_ids, dst_ids)
+        num_pos = max(1, len(dst_ids))
+        expand_factor = max(1, int(math.ceil(self._num_sample / num_pos)))
+        neg_sampler = self._get_neg_sampler(expand_factor)
+        nodes = neg_sampler.get(src_ids, dst_ids)
         neg_features = self._parse_nodes(nodes)
         sparse_nodes = self._hard_neg_sampler.get(src_ids).layer_nodes(1)
         hard_neg_features, hard_neg_indices = self._parse_sparse_nodes(sparse_nodes)

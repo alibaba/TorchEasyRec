@@ -43,9 +43,12 @@ train_config {
 ```
 
 - sparse_optimizer
+
   - optimizer: 优化器类型，具体见sparse optimize的[配置文档](../reference.md)
   - learning_rate: sparse_optimizer的学习率计划器,具体见sparse_optimizer中的learning_rate的[配置文档](../reference.md)
+
 - dense_optimizer
+
   - optimizer: 优化器类型，具体见dense optimize的[配置文档](../reference.md)
 
   - learning_rate: dense_optimizer的学习率计划器,具体见dense_optimizer中的learning_rate的[配置文档](../reference.md)

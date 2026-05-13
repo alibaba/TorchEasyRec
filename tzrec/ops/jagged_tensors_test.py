@@ -22,10 +22,12 @@ from tzrec.utils.test_util import (
     generate_sparse_seq_len,
     get_test_dtypes,
     gpu_unavailable,
+    mark_ci_scope,
 )
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
+@mark_ci_scope("h20")
 class JaggedTensorsTest(unittest.TestCase):
     def teardown_example(self, example):
         gc.collect()

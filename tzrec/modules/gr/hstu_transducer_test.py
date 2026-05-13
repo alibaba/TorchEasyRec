@@ -12,16 +12,16 @@
 """Unit + integration tests for ``HSTUTransducer``."""
 
 import unittest
-from typing import Dict, List
+from typing import Dict, List, Optional
 from unittest.mock import patch
 
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention_utils import compute_stu_truncation_plan
-from tzrec.utils.test_util import reference_stu_truncation
+from tzrec.utils.test_util import mark_ci_scope, reference_stu_truncation
 
 
 class _StubInputPreprocessor(torch.nn.Module):
@@ -77,6 +77,7 @@ class _StubOutputPostprocessor(torch.nn.Module):
         return seq_embeddings
 
 
+@mark_ci_scope("h20")
 class HSTUTransducerTest(unittest.TestCase):
     # ---------- _replay_truncation_state unit tests ----------
 
@@ -168,7 +169,13 @@ class HSTUTransducerTest(unittest.TestCase):
         # seq_offsets / max_seq_len come from the post-STU outputs.
         self.assertIs(out_offsets, post_stu_seq_offsets)
         self.assertEqual(out_max, post_stu_max_seq_len)
-        expected_total_uih = s["plan"].total_kept - s["total_targets"]
+        # Post-truncation total UIH includes the contextual prefix per
+        # sample (still alive after truncation) plus the new UIH tail; the
+        # plan's ``total_kept`` is the rest portion only, so add
+        # ``total_prefix = B * contextual_seq_len`` back in.
+        expected_total_uih = (
+            s["plan"].total_kept + s["plan"].total_prefix - s["total_targets"]
+        )
         self.assertEqual(out_total_uih, expected_total_uih)
 
     # ---------- forward() end-to-end integration tests ----------
@@ -183,6 +190,7 @@ class HSTUTransducerTest(unittest.TestCase):
         interleave_targets: bool = False,
         embedding_dim: int = 16,
         attn_num_layers: int = 3,
+        stu_cs_override: Optional[int] = None,
     ) -> HSTUTransducer:
         """Construct a transducer with stubbed preprocessor / postprocessor.
 
@@ -190,6 +198,13 @@ class HSTUTransducerTest(unittest.TestCase):
         action_encoder + content_encoder + MLP chain; for an integration
         test focused on the truncation glue we stub those out via
         :func:`unittest.mock.patch.object` over the factory functions.
+
+        ``stu_cs_override``: pin ``stu["contextual_seq_len"]`` in the
+        dict passed to ``HSTUTransducer.__init__`` to exercise the
+        sentinel-resolution guard.  ``None`` leaves the key absent
+        (matches the legacy non-proto callers).  ``-1`` matches the
+        proto-default ``including_default_value_fields=True`` fill.
+        Any other int matches an explicit user override.
         """
         stub_pre = _StubInputPreprocessor(
             lengths=lengths,
@@ -199,6 +214,17 @@ class HSTUTransducerTest(unittest.TestCase):
             interleave_targets=interleave_targets,
         )
         stub_post = _StubOutputPostprocessor()
+        stu_kwargs: Dict[str, object] = {
+            "embedding_dim": embedding_dim,
+            "num_heads": 2,
+            "hidden_dim": 32,
+            "attention_dim": 32,
+            "output_dropout_ratio": 0.0,
+            "causal": True,
+            "target_aware": True,
+        }
+        if stu_cs_override is not None:
+            stu_kwargs["contextual_seq_len"] = stu_cs_override
         with (
             patch(
                 "tzrec.modules.gr.hstu_transducer.create_input_preprocessor",
@@ -212,15 +238,7 @@ class HSTUTransducerTest(unittest.TestCase):
             transducer = HSTUTransducer(
                 uih_embedding_dim=embedding_dim,
                 target_embedding_dim=embedding_dim,
-                stu={
-                    "embedding_dim": embedding_dim,
-                    "num_heads": 2,
-                    "hidden_dim": 32,
-                    "attention_dim": 32,
-                    "output_dropout_ratio": 0.0,
-                    "causal": True,
-                    "target_aware": True,
-                },
+                stu=stu_kwargs,
                 attn_num_layers=attn_num_layers,
                 input_preprocessor={"contextual_preprocessor": {}},
                 output_postprocessor={"l2norm_postprocessor": {}},
@@ -235,40 +253,141 @@ class HSTUTransducerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # split, tail, interleave, ctx, lengths,         targets
-            [0, 0, False, 0, [12, 20, 5, 30], [2, 3, 1, 2]],  # disabled baseline
-            [1, 4, False, 0, [12, 20, 5, 30], [2, 3, 1, 2]],  # truncation, plain
-            [1, 4, True, 0, [12, 20, 5, 30], [2, 4, 2, 2]],  # interleave (T=10, even)
-            [1, 4, False, 3, [15, 22, 8, 30], [2, 3, 1, 2]],  # contextual prefix
-            [1, 4, True, 3, [15, 22, 8, 30], [2, 4, 2, 2]],  # interleave + ctx
+            # Truncation/interleave matrix -- ``stu_cs=None`` (key absent
+            # from the stu dict) falls back to the preprocessor's value.
+            param(
+                "disabled_baseline",
+                split=0,
+                tail=0,
+                interleave=False,
+                ppr_cs=0,
+                stu_cs=None,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 3, 1, 2],
+            ),
+            param(
+                "truncation_plain",
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=0,
+                stu_cs=None,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 3, 1, 2],
+            ),
+            param(
+                "interleave_no_ctx",
+                split=1,
+                tail=4,
+                interleave=True,
+                ppr_cs=0,
+                stu_cs=None,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 4, 2, 2],
+            ),
+            param(
+                "contextual_prefix",
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=None,
+                expected_cs=3,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 3, 1, 2],
+            ),
+            param(
+                "interleave_plus_ctx",
+                split=1,
+                tail=4,
+                interleave=True,
+                ppr_cs=3,
+                stu_cs=None,
+                expected_cs=3,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 4, 2, 2],
+            ),
+            # Sentinel-resolution contract on the same forward path.
+            # ``stu_cs=-1`` is what config_to_kwargs's
+            # ``including_default_value_fields=True`` fills when the user
+            # hasn't pinned ``stu.contextual_seq_len`` -- must fall back
+            # to the preprocessor's value.  Explicit 0 or positive int
+            # from the user must take precedence.  Catches a regression
+            # to ``not in stu`` (which would silently pass the
+            # ``stu_cs=None`` rows but break the ``stu_cs=-1`` row).
+            param(
+                "sentinel_fill_falls_back",
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=-1,
+                expected_cs=3,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 3, 1, 2],
+            ),
+            param(
+                "explicit_zero_overrides",
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=0,
+                expected_cs=0,
+                lengths=[12, 20, 5, 30],
+                targets=[2, 3, 1, 2],
+            ),
+            param(
+                "explicit_positive_overrides",
+                split=1,
+                tail=4,
+                interleave=False,
+                ppr_cs=3,
+                stu_cs=5,
+                expected_cs=5,
+                lengths=[15, 22, 8, 30],
+                targets=[2, 3, 1, 2],
+            ),
         ]
     )
     def test_forward_end_to_end(
         self,
+        _name: str,
         split: int,
         tail: int,
         interleave: bool,
-        ctx: int,
+        ppr_cs: int,
+        stu_cs: Optional[int],
+        expected_cs: int,
         lengths: List[int],
         targets: List[int],
     ) -> None:
-        """Full ``forward`` runs cleanly across the (interleave, ctx) matrix.
+        """Full ``forward`` runs cleanly across (interleave, ctx, stu_cs).
 
         Catches: wrong field assignment in ``_replay_truncation_state``,
         num_targets / seq_lengths mismatch in ``_postprocess`` after
         truncation, kernel not threading through, shape mismatch on the
         seq_timestamps unsqueeze/squeeze round-trip, the
-        ``view(-1, 2)`` candidate reshape under interleave, and the
-        3-op contextual-prefix path through ``apply_stu_truncation_plan``.
+        ``view(-1, 2)`` candidate reshape under interleave, the 3-op
+        contextual-prefix path through ``apply_stu_truncation_plan``,
+        and the ``stu.get("contextual_seq_len", -1) < 0`` sentinel
+        guard.
         """
         transducer = self._build_transducer(
             attn_truncation_split_layer=split,
             attn_truncation_tail_len=tail,
             lengths=lengths,
             targets=targets,
-            contextual_seq_len=ctx,
+            contextual_seq_len=ppr_cs,
             interleave_targets=interleave,
+            stu_cs_override=stu_cs,
         )
+        # Pin the resolved STULayer.cs against (stu_cs, ppr_cs).
+        for layer in transducer._stu_module._stu_layers:
+            self.assertEqual(layer._contextual_seq_len, expected_cs)
         # grouped_features is consumed by the stubbed preprocessor only.
         grouped_features: Dict[str, torch.Tensor] = {}
         encoded_candidate_embeddings, encoded_embeddings = transducer(grouped_features)

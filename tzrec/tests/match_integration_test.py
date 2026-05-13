@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
+from tzrec.utils.test_util import mark_ci_scope
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -431,6 +432,7 @@ class MatchIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
 
+    @mark_ci_scope("h20")
     @unittest.skip("skip hstu match test")
     def test_hstu_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
@@ -438,7 +440,6 @@ class MatchIntegrationTest(unittest.TestCase):
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
-            is_hstu=True,
         )
         if self.success:
             self.success = utils.test_eval(

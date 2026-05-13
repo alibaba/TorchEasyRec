@@ -27,6 +27,8 @@ from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
+    CAND_POS_LENGTHS,
+    HARD_NEG_INDICES,
     NEG_DATA_GROUP,
 )
 from tzrec.features.feature import BaseFeature, create_features
@@ -80,6 +82,26 @@ class _TestReader(BaseReader):
                     if f.type.value_type == pa.string():
                         data = [
                             [str(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.int64():
+                        data = [
+                            [int(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.int32():
+                        data = [
+                            [int(np.random.randint(100)) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.float32():
+                        data = [
+                            [float(np.random.rand()) for _ in range(2)]
+                            for _ in range(self._batch_size)
+                        ]
+                    elif f.type.value_type == pa.float64():
+                        data = [
+                            [float(np.random.rand()) for _ in range(2)]
                             for _ in range(self._batch_size)
                         ]
                     else:
@@ -447,6 +469,201 @@ class DatasetTest(unittest.TestCase):
                 self.assertEqual(
                     batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (12,)
                 )
+
+    @parameterized.expand(
+        [
+            [Mode.TRAIN],
+            [Mode.EVAL],
+        ]
+    )
+    def test_dataset_with_sampler_list_item_id(self, mode):
+        """E2E: list-typed item_id positives through a real NegativeSampler.
+
+        Schema declares `item_id` as `pa.list_(pa.int64())` (Parquet-style
+        multi-value column). Exercises `build_sampler_input`'s list-pass-
+        through + flatten, the dynamic-`expand_factor` path in the
+        sampler, and `combine_negs_to_candidate_sequence`'s list-typed-negs
+        normalization. Parameterized over Mode.TRAIN / Mode.EVAL so the
+        eval-mode `num_eval_sample` path is also covered.
+        """
+        f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(f)
+        f.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(100):
+            f.write(f"{i}\t{1}\t{i}\n")
+        f.flush()
+
+        input_fields = [
+            pa.field(name="item_id", type=pa.list_(pa.int64())),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id",
+                    expression="item:item_id",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    num_buckets=200,
+                    embedding_dim=8,
+                )
+            ),
+        ]
+        features = create_features(
+            feature_cfgs,
+            neg_fields=["item_id"],
+            force_base_data_group=True,
+        )
+
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
+                label_fields=["label"],
+                negative_sampler=sampler_pb2.NegativeSampler(
+                    input_path=f.name,
+                    num_sample=8,
+                    num_eval_sample=4,
+                    attr_fields=["item_id"],
+                    item_id_field="item_id",
+                ),
+                force_base_data_group=True,
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+            mode=mode,
+        )
+        dataset.launch_sampler_cluster(2)
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # _TestReader yields 2 list elements per row; batch_size = 4 -> K_i = 2.
+        pos_lengths = batch.additional_infos[CAND_POS_LENGTHS]
+        self.assertEqual(pos_lengths.tolist(), [2, 2, 2, 2])
+
+    @parameterized.expand(
+        [
+            [Mode.TRAIN],
+            [Mode.EVAL],
+        ]
+    )
+    def test_dataset_with_hard_negative_sampler_list_item_id(self, mode):
+        """E2E: HardNegativeSampler with list-typed item_id (Q != B contract).
+
+        Locks the contract documented in sampler.py:660 -- after
+        `build_sampler_input` flattens multi-positive queries,
+        `HARD_NEG_INDICES[:, 0]` indexes into the flat Q-length src_ids,
+        not the original B-length batch rows.
+        """
+        # Item file: ids 0..99 + canonical attrs.
+        item_f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(item_f)
+        item_f.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(100):
+            item_f.write(f"{i}\t{1}\t{i}\n")
+        item_f.flush()
+
+        # User file: ids 0..99.
+        user_f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(user_f)
+        user_f.write("id:int64\tweight:float\n")
+        for i in range(100):
+            user_f.write(f"{i}\t{1}\n")
+        user_f.flush()
+
+        # Hard-neg edges: every user u has 2 hard-neg items so any
+        # sampled src_id returns at least one hard-neg row.
+        hard_neg_f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(hard_neg_f)
+        hard_neg_f.write("userid:int64\titemid:int64\tweight:float\n")
+        for u in range(100):
+            for offset in (50, 51):
+                hard_neg_f.write(f"{u}\t{(u + offset) % 100}\t{1}\n")
+        hard_neg_f.flush()
+
+        input_fields = [
+            pa.field(name="user_id", type=pa.int64()),
+            pa.field(name="item_id", type=pa.list_(pa.int64())),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="user_id",
+                    expression="user:user_id",
+                    num_buckets=200,
+                    embedding_dim=8,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id",
+                    expression="item:item_id",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    num_buckets=200,
+                    embedding_dim=8,
+                )
+            ),
+        ]
+        features = create_features(
+            feature_cfgs,
+            neg_fields=["item_id"],
+            force_base_data_group=True,
+        )
+
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
+                label_fields=["label"],
+                hard_negative_sampler=sampler_pb2.HardNegativeSampler(
+                    user_input_path=user_f.name,
+                    item_input_path=item_f.name,
+                    hard_neg_edge_input_path=hard_neg_f.name,
+                    num_sample=8,
+                    num_eval_sample=4,
+                    num_hard_sample=2,
+                    attr_fields=["item_id"],
+                    item_id_field="item_id",
+                    user_id_field="user_id",
+                ),
+                force_base_data_group=True,
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+            mode=mode,
+        )
+        dataset.launch_sampler_cluster(2)
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator = iter(dataloader)
+        batch = next(iterator)
+
+        # _TestReader yields K_i = 2 per row; batch_size = 4 -> Q = 8.
+        pos_lengths = batch.additional_infos[CAND_POS_LENGTHS]
+        self.assertEqual(pos_lengths.tolist(), [2, 2, 2, 2])
+
+        # HARD_NEG_INDICES[:, 0] indexes into the flat Q=8 src_ids (post-flatten),
+        # not the B=4 batch rows. Seed gives every flat position a hard-neg edge.
+        hard_neg_indices = batch.additional_infos[HARD_NEG_INDICES]
+        self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
 
     def test_dataset_with_sample_mask(self):
         input_fields = [
@@ -841,7 +1058,7 @@ class DatasetTest(unittest.TestCase):
         iterator = iter(dataloader)
         batch = next(iterator)
         data_dict = batch.to_dict()
-        # After _expand_tdm_sample, every feature has length 40
+        # After expand_tdm_sample, every feature has length 40
         # (batch_size=4 expanded by TDM sampling to 40 rows). float_b has
         # no use_mask so it is never masked. int_a has use_mask=True so the
         # high sample_mask_prob / negative_sample_mask_prob should null out

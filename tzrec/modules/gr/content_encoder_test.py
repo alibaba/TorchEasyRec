@@ -19,9 +19,10 @@ from tzrec.modules.gr.content_encoder import (
     PadContentEncoder,
     SliceContentEncoder,
 )
-from tzrec.utils.test_util import TestGraphType, gpu_unavailable
+from tzrec.utils.test_util import TestGraphType, gpu_unavailable, mark_ci_scope
 
 
+@mark_ci_scope("h20")
 class ContentEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)

@@ -5,4 +5,4 @@ pip install -r requirements/extra.txt
 bash scripts/gen_proto.sh
 bash scripts/ci/ci_data.sh
 
-MKL_THREADING_LAYER=GNU PYTHONPATH=. python tzrec/tests/run.py
+MKL_THREADING_LAYER=GNU PYTHONPATH=. python tzrec/tests/run.py "$@"

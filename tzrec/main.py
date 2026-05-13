@@ -588,7 +588,7 @@ def train_and_evaluate(
     device, backend = init_process_group()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
-    acc_utils.allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -810,7 +810,7 @@ def evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     train_config = pipeline_config.train_config
-    acc_utils.allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -911,6 +911,9 @@ def export(
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
+
+    # AOTI bakes allow_tf32 into Triton constexprs at trace time.
+    acc_utils.allow_tf32_for_export(pipeline_config)
 
     if is_rank_zero:
         if os.path.exists(export_dir):
@@ -1090,8 +1093,7 @@ def predict(
     if batch_size:
         pipeline_config.data_config.batch_size = batch_size
 
-    train_config = pipeline_config.train_config
-    acc_utils.allow_tf32(train_config, backend)
+    acc_utils.allow_tf32_for_export(pipeline_config)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
@@ -1330,7 +1332,7 @@ def predict_checkpoint(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     train_config = pipeline_config.train_config
-    acc_utils.allow_tf32(train_config, backend)
+    acc_utils.allow_tf32(train_config)
 
     data_config = pipeline_config.data_config
     # Build feature
