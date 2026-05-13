@@ -48,8 +48,22 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from tzrec.protos import feature_pb2
 
-DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_ENV = "TZREC_CACHING_HIT_RATE_MULTIPLIER"
-DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_DEFAULT = 10.0
+# Empirical x_eff constants fitted from an on-device dynamicemb sweep
+# (4M-row table, dim=128, adam, pow-law alpha=1.05, A10 GPU; see
+# experiments/sweep_20260513-161030/full_a10gpu1.json). Median fwd+bwd
+# latency clustered into three regimes:
+#   * HYBRID @ x=1.0:   0.80 ms (HBM-only fast path; runtime drops the
+#                        host tier when total_value_memory <= local_hbm)
+#   * CACHING @ x<1.0:  2.63 ms  (~3.3x slower than HBM-only)
+#   * HYBRID  @ x<1.0:  5.44 ms  (~6.8x slower than HBM-only)
+# Within each <1.0 block the ratio dependence is noise-dominated.
+# Inverting the linear bw model bw = x_eff*HBM + (1-x_eff)*HBM_TO_DDR
+# (torchrec defaults: HBM=897 GB/s, HBM_TO_DDR=32 GB/s) yields the
+# constants below. The +0.01*x term is a tiebreaker so the DP can produce
+# strictly ordered proposals within each block.
+_DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
+_DYNAMICEMB_HYBRID_X_EFF_BASE = 0.11
+_DYNAMICEMB_X_EFF_TIEBREAK = 0.01
 
 
 def _dynamicemb_effective_cache_ratio(
@@ -59,33 +73,33 @@ def _dynamicemb_effective_cache_ratio(
 ) -> float:
     """Effective HBM-hit ratio for the dynamicemb perf model.
 
-    HYBRID (``caching=False``) is unchanged — every access has probability
-    ``cache_load_factor`` of hitting HBM since the HBM tier is hash-partitioned.
+    Returns the value passed to torchrec's perf bandwidth formula
+    ``bw = x_eff*hbm + (1-x_eff)*hbm_to_ddr_bw``. Larger value = faster path.
 
-    CACHING (``caching=True``) pins hot rows in HBM regardless of hash; we
-    model that as a boosted hit rate. With the default multiplier (10.0) any
-    cache_load_factor ≥ 0.1 saturates to a full HBM hit. ``stats``, when
-    provided, overrides the multiplier-based estimate via
-    ``1 - stats.expected_miss_rate(cache_load_factor)``.
+    The ratio is derived from an on-device perf sweep, not a heuristic.
+    Empirical pattern (alpha=1.05 pow-law access on A10):
 
-    Invariant: ``CACHING_bw(x) >= HYBRID_bw(x)`` at every ``x`` because the
-    returned ratio is monotonically ≥ ``cache_load_factor``.
+      * ``x == 1.0``:  the runtime drops the host tier (HBM-only); both
+        modes hit the fastest path. Return ``1.0``.
+      * ``caching=True``, ``x < 1.0``: 3.3x slower than HBM-only -> base 0.28.
+      * ``caching=False``, ``x < 1.0``: 6.8x slower than HBM-only -> base 0.11.
+
+    Within each ``x < 1.0`` block the perf is roughly flat in ratio, but we
+    add a tiny monotonic perturbation so the DP can break ties.
+
+    If ``stats`` is provided, ``1 - stats.expected_miss_rate(x)`` overrides
+    the heuristic verbatim (clamped to ``[0, 1]``); the caller opts in to
+    their own measurement.
     """
     x = float(cache_load_factor) if cache_load_factor is not None else 0.0
     x = max(0.0, min(1.0, x))
-    if not caching:
-        return x
     if stats is not None:
         miss_rate = float(stats.expected_miss_rate(x))
-        return max(x, max(0.0, min(1.0, 1.0 - miss_rate)))
-    multiplier = float(
-        os.environ.get(
-            DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_ENV,
-            DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_DEFAULT,
-        )
-    )
-    multiplier = max(1.0, multiplier)
-    return min(1.0, x * multiplier)
+        return max(0.0, min(1.0, 1.0 - miss_rate))
+    if x >= 1.0:
+        return 1.0
+    base = _DYNAMICEMB_CACHING_X_EFF_BASE if caching else _DYNAMICEMB_HYBRID_X_EFF_BASE
+    return base + _DYNAMICEMB_X_EFF_TIEBREAK * x
 
 
 has_dynamicemb = False
@@ -490,21 +504,21 @@ if has_dynamicemb:
         *args,  # pyre-ignore [2]
         **kwargs,  # pyre-ignore [2]
     ):
-        """Inject the CACHING-mode hit-rate boost into the perf estimator.
+        """Inject the empirical x_eff into the perf estimator for both modes.
 
-        For dynamicemb tables in CACHING mode, temporarily replace
-        ``sharding_option.cache_params`` with a clone whose ``load_factor`` is
-        boosted to the effective HBM-hit ratio. The original cache_params is
-        restored before returning, so the (separately invoked) storage
-        estimator still sees the un-boosted ratio.
+        Temporarily replace ``sharding_option.cache_params`` with a clone
+        whose ``load_factor`` is the empirically-fitted x_eff for the
+        (mode, cache_load_factor) combination. Restored before returning so
+        the (separately invoked) storage estimator still sees the un-boosted
+        ratio.
         """
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
-        caching = bool(getattr(dynamicemb_options, "caching", False))
         original_cache_params = sharding_option.cache_params
-        if caching:
+        if dynamicemb_options is not None:
+            caching = bool(getattr(dynamicemb_options, "caching", False))
             stats = original_cache_params.stats if original_cache_params else None
             x_eff = _dynamicemb_effective_cache_ratio(
-                sharding_option.cache_load_factor, caching=True, stats=stats
+                sharding_option.cache_load_factor, caching=caching, stats=stats
             )
             sharding_option.cache_params = (
                 dataclasses.replace(original_cache_params, load_factor=x_eff)

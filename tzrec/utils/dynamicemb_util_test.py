@@ -9,9 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import unittest
-from unittest import mock
 
 from parameterized import parameterized
 
@@ -109,56 +107,67 @@ class StorageFormulaTest(unittest.TestCase):
 
 
 class EffectiveCacheRatioTest(unittest.TestCase):
-    """``_dynamicemb_effective_cache_ratio`` — HYBRID vs CACHING perf ratio."""
+    """``_dynamicemb_effective_cache_ratio`` -- empirical fit from on-device sweep.
 
-    def test_hybrid_passes_through(self):
-        for x in (0.0, 0.1, 0.5, 1.0):
-            self.assertEqual(
-                dynamicemb_util._dynamicemb_effective_cache_ratio(x, caching=False), x
-            )
+    The formula is fitted to the medians of an A10 benchmark sweep recorded
+    in experiments/sweep_20260513-161030/full_a10gpu1.json. Reproducing the
+    three-regime empirical pattern:
+      * x == 1.0:            HBM-only fast path, x_eff = 1.0
+      * caching=True, x<1.0: x_eff base 0.28
+      * caching=False, x<1.0: x_eff base 0.11
+    """
 
-    def test_caching_default_multiplier_saturates(self):
-        # Default multiplier is 10.0 — any x >= 0.1 saturates to 1.0.
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k != dynamicemb_util.DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_ENV
-        }
-        with mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(
-                dynamicemb_util._dynamicemb_effective_cache_ratio(0.1, caching=True),
-                1.0,
-            )
-            self.assertEqual(
-                dynamicemb_util._dynamicemb_effective_cache_ratio(0.5, caching=True),
-                1.0,
-            )
-            self.assertEqual(
-                dynamicemb_util._dynamicemb_effective_cache_ratio(0.01, caching=True),
-                0.1,
-            )
+    def test_x_eq_1_returns_1_in_both_modes(self):
+        # HBM-only fast path: total fits, runtime drops the host tier.
+        self.assertEqual(
+            dynamicemb_util._dynamicemb_effective_cache_ratio(1.0, caching=False), 1.0
+        )
+        self.assertEqual(
+            dynamicemb_util._dynamicemb_effective_cache_ratio(1.0, caching=True), 1.0
+        )
 
-    def test_caching_env_override(self):
-        with mock.patch.dict(
-            os.environ,
-            {dynamicemb_util.DYNAMICEMB_CACHING_HIT_RATE_MULTIPLIER_ENV: "2.0"},
-        ):
-            # multiplier=2: x=0.3 -> 0.6, x=0.5 -> 1.0 (clamped)
-            self.assertAlmostEqual(
-                dynamicemb_util._dynamicemb_effective_cache_ratio(0.3, caching=True),
-                0.6,
-            )
-            self.assertEqual(
-                dynamicemb_util._dynamicemb_effective_cache_ratio(0.5, caching=True),
-                1.0,
-            )
-
-    def test_caching_invariant_monotonic_ge_hybrid(self):
-        # CACHING ratio >= HYBRID ratio at every cache_load_factor.
-        for x in (0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
+    def test_caching_above_hybrid_for_x_less_than_1(self):
+        # Empirically CACHING is ~2x faster than HYBRID at the same ratio.
+        for x in (0.1, 0.3, 0.5, 0.7, 0.9):
             hybrid = dynamicemb_util._dynamicemb_effective_cache_ratio(x, caching=False)
             caching = dynamicemb_util._dynamicemb_effective_cache_ratio(x, caching=True)
-            self.assertGreaterEqual(caching, hybrid)
+            self.assertGreater(caching, hybrid)
+
+    def test_monotonic_within_block(self):
+        # Within each mode, higher cache_load_factor -> higher x_eff (the
+        # +0.01*x tiebreaker term).
+        for caching in (False, True):
+            prev = None
+            for i in range(1, 10):  # x = 0.1 .. 0.9
+                x = i / 10
+                cur = dynamicemb_util._dynamicemb_effective_cache_ratio(
+                    x, caching=caching
+                )
+                if prev is not None:
+                    self.assertGreater(cur, prev)
+                prev = cur
+
+    def test_strict_block_ranking_matches_empirical(self):
+        # HYBRID@1.0 > CACHING@anything < 1.0 > HYBRID@anything < 1.0
+        ratios = [i / 10 for i in range(1, 10)]  # 0.1 .. 0.9
+        hybrid_at_1 = dynamicemb_util._dynamicemb_effective_cache_ratio(
+            1.0, caching=False
+        )
+        caching_block = {
+            x: dynamicemb_util._dynamicemb_effective_cache_ratio(x, caching=True)
+            for x in ratios
+        }
+        hybrid_block = {
+            x: dynamicemb_util._dynamicemb_effective_cache_ratio(x, caching=False)
+            for x in ratios
+        }
+        # Every CACHING@x<1.0 sits strictly below HYBRID@1.0.
+        for x_eff in caching_block.values():
+            self.assertGreater(hybrid_at_1, x_eff)
+        # Every CACHING@x<1.0 sits strictly above every HYBRID@x<1.0.
+        for c in caching_block.values():
+            for h in hybrid_block.values():
+                self.assertGreater(c, h)
 
     def test_stats_override_uses_expected_miss_rate(self):
         class _Stats:
@@ -172,18 +181,19 @@ class EffectiveCacheRatioTest(unittest.TestCase):
         )
         self.assertAlmostEqual(x_eff, 0.95)
 
-    def test_stats_override_never_drops_below_hybrid(self):
+    def test_stats_override_honored_verbatim(self):
+        # Stats reflect measured behavior; trust them even if they override
+        # the empirical heuristic's preferred ordering.
         class _Stats:
             expected_lookups = 1000.0
 
             def expected_miss_rate(self, ratio):
-                return 0.9  # would give x_eff=0.1, below cache_load_factor=0.5
+                return 0.9  # x_eff = 0.1 even though CACHING base = 0.28
 
         x_eff = dynamicemb_util._dynamicemb_effective_cache_ratio(
             0.5, caching=True, stats=_Stats()
         )
-        # Invariant: CACHING_bw never falls below HYBRID_bw at same ratio.
-        self.assertGreaterEqual(x_eff, 0.5)
+        self.assertAlmostEqual(x_eff, 0.1)
 
 
 if __name__ == "__main__":
