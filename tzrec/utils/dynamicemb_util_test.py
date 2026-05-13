@@ -10,8 +10,12 @@
 # limitations under the License.
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
+import torch
 from parameterized import parameterized
+from torchrec.distributed.types import CacheParams
 
 from tzrec.utils import dynamicemb_util
 
@@ -194,6 +198,201 @@ class EffectiveCacheRatioTest(unittest.TestCase):
             0.5, caching=True, stats=_Stats()
         )
         self.assertAlmostEqual(x_eff, 0.1)
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+class BuildShardPerfContextsWrapperTest(unittest.TestCase):
+    """``_dynamicemb_aware_build_shard_perf_contexts`` swap + restore.
+
+    Mocks ``_orig_build_shard_perf_contexts`` so we can drive the wrapper
+    without the heavy upstream ShardPerfContext machinery, and verify the
+    boost is applied, the cache_params is restored after the call, and the
+    restore still runs when the wrapped call raises.
+    """
+
+    def _call(self, sharding_option):
+        # ShardPerfContext.build_shard_perf_contexts is the patched
+        # classmethod after dynamicemb_util import. The classmethod
+        # descriptor auto-injects ``cls``, so we pass 6 positional args
+        # (config, shard_sizes, sharding_option, topology, constraints,
+        # sharder).
+        from torchrec.distributed.planner.estimator.types import ShardPerfContext
+
+        return ShardPerfContext.build_shard_perf_contexts(
+            None, None, sharding_option, None, None, None
+        )
+
+    def _spy_recording_cache_params(self, recorder):
+        def _spy(cls, config, shard_sizes, sharding_option, *args, **kwargs):
+            recorder.append(sharding_option.cache_params.load_factor)
+            return []
+
+        return _spy
+
+    def test_boost_applied_for_caching(self):
+        seen = []
+        with mock.patch.object(
+            dynamicemb_util,
+            "_orig_build_shard_perf_contexts",
+            self._spy_recording_cache_params(seen),
+        ):
+            so = SimpleNamespace(
+                dynamicemb_options=SimpleNamespace(caching=True),
+                cache_params=CacheParams(load_factor=0.5),
+                cache_load_factor=0.5,
+            )
+            self._call(so)
+        expected = dynamicemb_util._dynamicemb_effective_cache_ratio(0.5, caching=True)
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], expected)
+
+    def test_boost_applied_for_hybrid(self):
+        seen = []
+        with mock.patch.object(
+            dynamicemb_util,
+            "_orig_build_shard_perf_contexts",
+            self._spy_recording_cache_params(seen),
+        ):
+            so = SimpleNamespace(
+                dynamicemb_options=SimpleNamespace(caching=False),
+                cache_params=CacheParams(load_factor=0.5),
+                cache_load_factor=0.5,
+            )
+            self._call(so)
+        expected = dynamicemb_util._dynamicemb_effective_cache_ratio(0.5, caching=False)
+        self.assertAlmostEqual(seen[0], expected)
+
+    def test_no_boost_when_no_dynamicemb_options(self):
+        # Non-dynamicemb ShardingOption has no `dynamicemb_options`
+        # attribute; the wrapper must leave cache_params untouched.
+        seen = []
+        with mock.patch.object(
+            dynamicemb_util,
+            "_orig_build_shard_perf_contexts",
+            self._spy_recording_cache_params(seen),
+        ):
+            so = SimpleNamespace(
+                cache_params=CacheParams(load_factor=0.7),
+                cache_load_factor=0.7,
+            )
+            self._call(so)
+        self.assertEqual(seen[0], 0.7)
+
+    def test_cache_params_restored_on_success(self):
+        original = CacheParams(load_factor=0.3)
+        with mock.patch.object(
+            dynamicemb_util,
+            "_orig_build_shard_perf_contexts",
+            lambda cls, c, s, so, *a, **kw: [],
+        ):
+            so = SimpleNamespace(
+                dynamicemb_options=SimpleNamespace(caching=True),
+                cache_params=original,
+                cache_load_factor=0.3,
+            )
+            self._call(so)
+        # Same identity, not just same load_factor.
+        self.assertIs(so.cache_params, original)
+
+    def test_cache_params_restored_on_exception(self):
+        """Restore must run even when the wrapped call raises (R1).
+
+        Without try/finally this test fails -- the boosted cache_params
+        leaks out and corrupts downstream consumers.
+        """
+        original = CacheParams(load_factor=0.3)
+
+        class _Boom(RuntimeError):
+            pass
+
+        def raiser(cls, c, s, so, *a, **kw):
+            raise _Boom("simulated estimator failure")
+
+        with mock.patch.object(
+            dynamicemb_util, "_orig_build_shard_perf_contexts", raiser
+        ):
+            so = SimpleNamespace(
+                dynamicemb_options=SimpleNamespace(caching=True),
+                cache_params=original,
+                cache_load_factor=0.3,
+            )
+            with self.assertRaises(_Boom):
+                self._call(so)
+        self.assertIs(so.cache_params, original)
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+class DynamicEmbCalcShardStoragesTest(unittest.TestCase):
+    """Direct test of ``dynamicemb_calculate_shard_storages``."""
+
+    def _build_options(self, *, with_admission_counter=False):
+        import dynamicemb
+
+        kwargs = dict(
+            max_capacity=1024,
+            initializer_args=dynamicemb.DynamicEmbInitializerArgs(
+                mode=dynamicemb.DynamicEmbInitializerMode.UNIFORM,
+                lower=-0.01,
+                upper=0.01,
+            ),
+            eval_initializer_args=dynamicemb.DynamicEmbInitializerArgs(
+                mode=dynamicemb.DynamicEmbInitializerMode.CONSTANT, value=0.0
+            ),
+            score_strategy=dynamicemb.DynamicEmbScoreStrategy.STEP,
+        )
+        if with_admission_counter:
+            kwargs["admission_counter"] = dynamicemb.KVCounter(
+                capacity=1024, bucket_capacity=128
+            )
+            kwargs["admit_strategy"] = dynamicemb.FrequencyAdmissionStrategy(
+                threshold=1,
+                initializer_args=dynamicemb.DynamicEmbInitializerArgs(
+                    mode=dynamicemb.DynamicEmbInitializerMode.CONSTANT, value=0.0
+                ),
+            )
+        return dynamicemb.DynamicEmbTableOptions(**kwargs)
+
+    def _base_kwargs(
+        self, dynamicemb_options, *, compute_device="cuda", is_inference=False
+    ):
+        from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+        from torchrec.distributed.types import ShardingType
+
+        return dict(
+            sharder=None,
+            sharding_type=ShardingType.ROW_WISE.value,
+            tensor=torch.empty(1024, 64, dtype=torch.float32),
+            compute_device=compute_device,
+            compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+            shard_sizes=[[512, 64], [512, 64]],
+            batch_sizes=[32, 32],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[1.0],
+            num_poolings=[1.0],
+            caching_ratio=0.5,
+            is_pooled=True,
+            input_data_type_size=8.0,
+            output_data_type_size=4.0,
+            is_inference=is_inference,
+            dynamicemb_options=dynamicemb_options,
+        )
+
+    def test_admission_counter_increases_hbm(self):
+        baseline = dynamicemb_util.dynamicemb_calculate_shard_storages(
+            **self._base_kwargs(self._build_options(with_admission_counter=False))
+        )
+        with_counter = dynamicemb_util.dynamicemb_calculate_shard_storages(
+            **self._base_kwargs(self._build_options(with_admission_counter=True))
+        )
+        # Counter is HBM-side only — DDR matches, HBM grows.
+        for base, w in zip(baseline, with_counter):
+            self.assertGreater(w.hbm, base.hbm)
+            self.assertEqual(w.ddr, base.ddr)
 
 
 if __name__ == "__main__":

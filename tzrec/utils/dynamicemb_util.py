@@ -519,18 +519,23 @@ if has_dynamicemb:
                 if original_cache_params is not None
                 else CacheParams(load_factor=x_eff)
             )
-        result = _orig_build_shard_perf_contexts(
-            cls,
-            config,
-            shard_sizes,
-            sharding_option,
-            topology,
-            constraints,
-            sharder,
-            *args,
-            **kwargs,
-        )
-        sharding_option.cache_params = original_cache_params
+        # try/finally so an estimator exception cannot leak the boosted
+        # cache_params clone into the storage estimator's view of the
+        # same ShardingOption.
+        try:
+            result = _orig_build_shard_perf_contexts(
+                cls,
+                config,
+                shard_sizes,
+                sharding_option,
+                topology,
+                constraints,
+                sharder,
+                *args,
+                **kwargs,
+            )
+        finally:
+            sharding_option.cache_params = original_cache_params
         return result
 
     # pyre-ignore [9]
