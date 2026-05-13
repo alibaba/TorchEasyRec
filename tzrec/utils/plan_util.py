@@ -225,6 +225,13 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
 
 
 _INF = float("inf")
+# Cap per-axis bin count for the 2D DP. Without this, `bins_per_device *
+# num_devices` blows up on multi-host worlds (e.g. 16 GPUs at 100 hbm
+# bins/dev = 1600 bins, * 800 ddr bins = 1.28M cells per table). The
+# budgets are scalar (total HBM, total DDR), so multiplying bins by
+# num_devices stops adding precision past this cap. NumPy vectorization
+# of the inner loop is a follow-up (PR #508 review R5).
+_DP_AXIS_BIN_CAP = 1024
 
 
 class DynamicProgrammingProposer(Proposer):
@@ -360,8 +367,12 @@ class DynamicProgrammingProposer(Proposer):
             )
             max_machine_ddr = max(max_machine_ddr, machine_ddr)
 
-        hbm_bins = max(self._hbm_bins_per_device * num_devices, 1)
-        ddr_bins = max(self._ddr_bins_per_device * num_devices, 1)
+        hbm_bins = max(
+            min(self._hbm_bins_per_device * num_devices, _DP_AXIS_BIN_CAP), 1
+        )
+        ddr_bins = max(
+            min(self._ddr_bins_per_device * num_devices, _DP_AXIS_BIN_CAP), 1
+        )
         # Collapse a degenerate axis to a single bin so we don't waste states
         # on (e.g.) CPU-only topologies that have hbm == 0 everywhere.
         if hbm_total == 0:
