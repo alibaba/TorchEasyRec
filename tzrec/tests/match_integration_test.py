@@ -229,7 +229,6 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         )
 
-    @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
     def test_dssm_with_fg_train_eval_export_aot(self):
         # AOT variant exercises TowerWrapper through the helpers refactored
@@ -257,7 +256,6 @@ class MatchIntegrationTest(unittest.TestCase):
             item_id="item_id",
         )
 
-    @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
     def test_dssm_v2_with_fg_train_eval_export_aot(self):
         # AOT variant exercises TowerWoEGWrapper through the helpers
