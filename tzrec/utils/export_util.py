@@ -56,6 +56,7 @@ from tzrec.features.feature import (
     create_fg_json,
 )
 from tzrec.modules.utils import BaseModule
+from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
@@ -999,7 +1000,7 @@ def export_rtp_model(
 
 def _compute_seq_share_groups(
     features: List[BaseFeature],
-    feature_groups: List[Any],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
 ) -> Dict[str, str]:
     """Map ``{group_name}__sequence`` to a share_key.
 

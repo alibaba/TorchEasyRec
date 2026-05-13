@@ -23,6 +23,7 @@ from tzrec.models.model import (
     UnifiedAOTIModelWrapper,
 )
 from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
+from tzrec.protos import model_pb2
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
@@ -231,7 +232,7 @@ def _pad_empty_sparse_values(
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
-    feature_groups: List[Any],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
