@@ -125,10 +125,11 @@ class TDMEmbedding(nn.Module):
             else:
                 seq_group_query_fea.append(feature)
         self._features = seq_group_query_fea
+        self._feature_groups = [seq_feature_group]
         setattr(
             self,
             embedding_group_name,
-            EmbeddingGroup(seq_group_query_fea, [seq_feature_group]),
+            EmbeddingGroup(seq_group_query_fea, self._feature_groups),
         )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:

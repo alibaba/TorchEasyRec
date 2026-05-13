@@ -60,6 +60,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         self._base_model_config = model_config
         self._model_type = model_config.WhichOneof("model")
         self._features = features
+        self._feature_groups = list(model_config.feature_groups)
         self._labels = labels
         self._model_config = (
             getattr(model_config, self._model_type) if self._model_type else None
@@ -336,6 +337,7 @@ class ScriptWrapper(BaseModule):
         super().__init__()
         self.model = module
         self._features = self.model._features
+        self._feature_groups = self.model._feature_groups
         self._data_parser = DataParser(
             self._features,
             sampler_type=str(module.sampler_type)
