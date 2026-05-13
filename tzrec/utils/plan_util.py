@@ -238,8 +238,11 @@ class DynamicProgrammingProposer(Proposer):
     r"""Proposes sharding plans via 2D (HBM × DDR) dynamic programming.
 
     Given :math:`M` tables each with up to :math:`N` ShardingOptions, pick one
-    option per table to minimize total perf while respecting both per-rank HBM
-    and per-rank DDR budgets from the topology.
+    option per table to minimize total perf while respecting both per-rank
+    HBM and per-machine DDR budgets from the topology. (HBM is GPU-local, so
+    each device gets its own quota; DDR is host-shared across ranks
+    co-located on the same machine, so the prune threshold is the sum over
+    a ``local_world_size``-sized window.)
 
     Each axis (HBM, DDR) is discretized into bins; ``dp[table][h][d]`` holds
     the minimum perf over the first ``table`` tables using ``≈ h`` HBM bins

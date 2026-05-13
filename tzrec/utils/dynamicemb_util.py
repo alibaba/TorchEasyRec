@@ -66,8 +66,15 @@ def _dynamicemb_effective_cache_ratio(
     The ratio is derived from an on-device perf sweep, not a heuristic.
     Empirical pattern (alpha=1.05 pow-law access on A10):
 
-      * ``x == 1.0``:  the runtime drops the host tier (HBM-only); both
-        modes hit the fastest path. Return ``1.0``.
+      * ``x == 1.0``: the runtime *switches kernels* — when
+        ``total_value_memory <= local_hbm_for_values`` the dual-tier
+        ``HybridStorage`` / ``DynamicEmbCache`` paths are dropped in favor
+        of the HBM-only ``DynamicEmbStorage`` kernel
+        (``batched_dynamicemb_tables.py:502-604``). The ~8x jump in ``x_eff``
+        between ``x=0.9`` and ``x=1.0`` is intentional and matches measured
+        latency, not a smoothing artifact. (A future refactor could lift
+        this to a discrete ``mode={HBM_ONLY, HYBRID, CACHING}`` axis on the
+        enumerator side rather than packing the discontinuity into ``x``.)
       * ``caching=True``, ``x < 1.0``: 3.3x slower than HBM-only -> base 0.28.
       * ``caching=False``, ``x < 1.0``: 6.8x slower than HBM-only -> base 0.11.
 
@@ -617,7 +624,10 @@ if has_dynamicemb:
                 factors.
             num_poolings (List[float]): average number of poolings per sample
                 (typically 1.0).
-            caching_ratio (float): ratio of HBM to DDR memory for UVM caching.
+            caching_ratio (float): cache_load_factor for the dynamicemb table.
+                In HYBRID mode HBM holds this fraction of values and host
+                holds the remainder; in CACHING mode HBM is a hot-row cache
+                of this fraction and host holds the full backing store.
             is_pooled (bool): True if embedding output is pooled (ie. `EmbeddingBag`),
                 False if unpooled/sequential (ie. `Embedding`).
             input_data_type_size (int): number of bytes of input data type.
