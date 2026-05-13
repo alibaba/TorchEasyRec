@@ -308,6 +308,58 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         for p in proposals:
             self.assertEqual(p[0].total_perf, 50.0)
 
+    def test_two_tables_pick_mixed_modes_under_joint_budget(self):
+        # Two tables, each with HYBRID@1.0 (all-HBM, no DDR) and CACHING@0.1
+        # (small HBM, full-T DDR). Topology HBM=2000 admits exactly one
+        # full HYBRID + one small CACHING shard (1500+100), and host DDR
+        # admits exactly one full-T CACHING backing (1500). Both-HYBRID is
+        # HBM-infeasible (3000>2000), both-CACHING is DDR-infeasible
+        # (3000>2000). Only the mixed plan fits. Exercises the
+        # cross-table DP transition at plan_util.py table_i==1.
+        opts = [
+            _FakeShardingOption("table_a", hbm=1500, ddr=0, perf=50.0),  # HYBRID@1.0
+            _FakeShardingOption("table_a", hbm=100, ddr=1500, perf=40.0),  # CACHING@0.1
+            _FakeShardingOption("table_b", hbm=1500, ddr=0, perf=50.0),  # HYBRID@1.0
+            _FakeShardingOption("table_b", hbm=100, ddr=1500, perf=40.0),  # CACHING@0.1
+        ]
+        topology = _make_topology(
+            num_devices=1, hbm_per_device=2000, ddr_per_device=2000
+        )
+        proposals = self._run(opts, topology)
+        self.assertGreater(len(proposals), 0)
+        best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
+        styles = sorted(
+            "hybrid" if o.shards[0].storage.ddr == 0 else "caching" for o in best
+        )
+        self.assertEqual(styles, ["caching", "hybrid"])
+
+    def test_legacy_mem_bins_per_device_alias(self):
+        # The legacy kwarg `mem_bins_per_device` is preserved as an alias
+        # for `hbm_bins_per_device`.
+        proposer = DynamicProgrammingProposer(mem_bins_per_device=77)
+        self.assertEqual(proposer._hbm_bins_per_device, 77)
+        # Explicit hbm_bins_per_device takes precedence: when both are
+        # provided, mem_bins_per_device wins (it's the legacy override).
+        proposer = DynamicProgrammingProposer(
+            mem_bins_per_device=77, hbm_bins_per_device=99
+        )
+        self.assertEqual(proposer._hbm_bins_per_device, 77)
+
+    def test_empty_search_space_returns_empty_proposal(self):
+        proposer = DynamicProgrammingProposer()
+        proposer.load([])
+        # Seed proposal is the per-table first option; with no tables the
+        # list is empty.
+        self.assertEqual(proposer.propose(), [])
+        # Feedback must not raise on an empty proposer (it short-circuits
+        # via `table_count == 0`).
+        topology = _make_topology(
+            num_devices=1, hbm_per_device=1000, ddr_per_device=1000
+        )
+        proposer.feedback(partitionable=True, storage_constraint=topology)
+        # After feedback, no proposals are available.
+        self.assertIsNone(proposer.propose())
+
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
