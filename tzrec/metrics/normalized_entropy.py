@@ -38,9 +38,8 @@ class NormalizedEntropy(Metric):
         self.eta = float(eta)
         for name in (
             "cross_entropy_sum",
-            "weighted_num_samples",
+            "num_samples",
             "pos_labels",
-            "neg_labels",
         ):
             self.add_state(
                 name,
@@ -62,18 +61,17 @@ class NormalizedEntropy(Metric):
         # pyre-ignore [16, 29]
         self.cross_entropy_sum += ce.sum().to(torch.float64)
         # pyre-ignore [16, 29]
-        self.weighted_num_samples += labels.numel()
+        self.num_samples += labels.numel()
         # pyre-ignore [16, 29]
         self.pos_labels += labels.sum().to(torch.float64)
-        # pyre-ignore [16, 29]
-        self.neg_labels += (1.0 - labels).sum().to(torch.float64)
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
-        denom = self.weighted_num_samples.clamp(min=self.eta)
+        denom = self.num_samples.clamp(min=self.eta)
         mean_label = (self.pos_labels / denom).clamp(self.eta, 1.0 - self.eta)
+        neg_labels = self.num_samples - self.pos_labels
         ce_norm = -(
             self.pos_labels * torch.log(mean_label)
-            + self.neg_labels * torch.log(1.0 - mean_label)
+            + neg_labels * torch.log(1.0 - mean_label)
         )
         return (self.cross_entropy_sum / ce_norm).to(torch.float32).squeeze()
