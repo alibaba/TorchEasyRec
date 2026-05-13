@@ -189,11 +189,3 @@ message MINDUserTower {
     // concat mlp config for user interests vector
     required MLP concat_mlp = 7;
 }
-
-
-message MINDItemTower {
-    // item feature group name
-    required string input = 1;
-    // mlp config
-    required MLP mlp = 2;
-}

@@ -35,9 +35,12 @@ class DSSMTower(MatchTowerWoEG):
         output_dim (int): user/item output embedding dimension.
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
-        feature_group (FeatureGroupConfig): feature group config.
-        feature_group_dims (list): feature dimension for each feature.
+        feature_groups (list): feature group configs the tower consumes.
         features (list): list of features.
+        embedding_group (EmbeddingGroup): shared embedding group used to
+            resolve per-feature dims at construction time (not stored).
+        model_config (ModelConfig): full model config; used to opt into
+            variational dropout when the model declares one.
     """
 
     def __init__(
@@ -45,18 +48,20 @@ class DSSMTower(MatchTowerWoEG):
         tower_config: tower_pb2.Tower,
         output_dim: int,
         similarity: simi_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
-        feature_dims: Dict[str, int],
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
+        embedding_group: EmbeddingGroup,
         model_config: model_pb2.ModelConfig,
     ) -> None:
-        super().__init__(tower_config, output_dim, similarity, feature_group, features)
+        super().__init__(tower_config, output_dim, similarity, feature_groups, features)
         self._model_config = model_config
-        self._feature_dims = feature_dims
-        self.group_variational_dropouts = None
-        self.group_variational_dropout_loss = {}
+        self._feature_dims: Dict[str, int] = embedding_group.group_feature_dims(
+            tower_config.input
+        )
+        self.group_variational_dropouts: Optional[nn.ModuleDict] = None
+        self.group_variational_dropout_loss: Dict[str, torch.Tensor] = {}
         self.init_variational_dropouts()
-        tower_feature_in = sum(feature_dims.values())
+        tower_feature_in = sum(self._feature_dims.values())
         self.mlp = MLP(tower_feature_in, **config_to_kwargs(tower_config.mlp))
         if self._output_dim > 0:
             self.output = nn.Linear(self.mlp.output_dim(), output_dim)
@@ -69,16 +74,16 @@ class DSSMTower(MatchTowerWoEG):
             variational_dropout_config_dict = config_to_kwargs(
                 variational_dropout_config
             )
-            if self._feature_group.group_type != model_pb2.SEQUENCE:
+            if self._feature_groups[0].group_type != model_pb2.SEQUENCE:
                 if len(self._feature_dims) > 1:
                     variational_dropout = VariationalDropout(
                         self._feature_dims,
-                        self._feature_group.group_name,
+                        self._feature_groups[0].group_name,
                         **variational_dropout_config_dict,
                     )
-                    self.group_variational_dropouts[self._feature_group.group_name] = (
-                        variational_dropout
-                    )
+                    self.group_variational_dropouts[
+                        self._feature_groups[0].group_name
+                    ] = variational_dropout
 
     def run_variational_dropout(self, feature: torch.Tensor) -> torch.Tensor:
         """Run the variational dropout."""
@@ -92,15 +97,17 @@ class DSSMTower(MatchTowerWoEG):
             )
         return feature
 
-    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+    def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the tower.
 
         Args:
-            feature (torch.Tensor): input batch data.
+            grouped_features: dict of grouped feature tensors; the tower
+                extracts its own group via `self._group_name`.
 
         Return:
-            embedding (dict): tower output embedding.
+            embedding tensor.
         """
+        feature = grouped_features[self._group_name]
         feature = self.run_variational_dropout(feature)
         output = self.mlp(feature)
         if self._output_dim > 0:
@@ -144,11 +151,9 @@ class DSSMV2(MatchModel):
             self._model_config.user_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            user_group,
-            self.embedding_group.group_feature_dims(
-                self._model_config.user_tower.input
-            ),
+            [user_group],
             user_features,
+            self.embedding_group,
             model_config,
         )
 
@@ -156,11 +161,9 @@ class DSSMV2(MatchModel):
             self._model_config.item_tower,
             self._model_config.output_dim,
             self._model_config.similarity,
-            item_group,
-            self.embedding_group.group_feature_dims(
-                self._model_config.item_tower.input
-            ),
+            [item_group],
             item_features,
+            self.embedding_group,
             model_config,
         )
 
@@ -174,12 +177,14 @@ class DSSMV2(MatchModel):
             predictions (dict): a dict of predicted result.
         """
         grouped_features = self.embedding_group(batch)
-
         batch_size = batch.labels[self._labels[0]].size(0)
-        user_feat = grouped_features[self._model_config.user_tower.input][:batch_size]
-        item_feat = grouped_features[self._model_config.item_tower.input]
-        user_tower_emb = self.user_tower(user_feat)
-        item_tower_emb = self.item_tower(item_feat)
+        # User-side: slice to batch_size on its single group's tensor before
+        # handing to the user tower. Item tower sees the full, unsliced dict.
+        # (Single-key dict avoids the dict-comprehension FX-trace error.)
+        user_input_name = self._model_config.user_tower.input
+        user_grouped = {user_input_name: grouped_features[user_input_name][:batch_size]}
+        user_tower_emb = self.user_tower(user_grouped)
+        item_tower_emb = self.item_tower(grouped_features)
         _update_dict_tensor(
             self._loss_collection, self.user_tower.group_variational_dropout_loss
         )
