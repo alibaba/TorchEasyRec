@@ -10,11 +10,14 @@
 # limitations under the License.
 
 # Formula referenced from torchrec/metrics/ne.py (BSD-licensed, Meta).
-# Reimplemented here so tzrec owns its metric math surface.
+# Reimplemented here so tzrec owns its metric math surface. Cross-entropy is
+# accumulated in nats via F.binary_cross_entropy (torchrec uses log2/bits);
+# NE is a ratio so the log base cancels.
 
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torchmetrics import Metric
 
 
@@ -26,8 +29,8 @@ class NormalizedEntropy(Metric):
     model beats that baseline.
 
     Args:
-        eta (float): small epsilon used to clamp predictions and the
-            population mean away from 0 and 1.
+        eta (float): small epsilon used to clamp the population mean away
+            from 0 and 1 in :meth:`compute`.
     """
 
     def __init__(self, eta: float = 1e-12, **kwargs: Any) -> None:
@@ -53,27 +56,24 @@ class NormalizedEntropy(Metric):
             preds (Tensor): a float 1d-tensor of probabilities in [0, 1].
             target (Tensor): a 0/1 1d-tensor of binary labels.
         """
-        labels = target.detach().to(torch.float64)
-        preds_f64 = preds.detach().to(torch.float64).clamp(self.eta, 1.0 - self.eta)
-        ce = -(
-            labels * torch.log2(preds_f64)
-            + (1.0 - labels) * torch.log2(1.0 - preds_f64)
-        )
+        preds = preds.detach()
+        labels = target.detach().to(preds.dtype)
+        ce = F.binary_cross_entropy(preds, labels, reduction="none")
         # pyre-ignore [16, 29]
-        self.cross_entropy_sum += ce.sum()
+        self.cross_entropy_sum += ce.sum().to(torch.float64)
         # pyre-ignore [16, 29]
         self.weighted_num_samples += labels.numel()
         # pyre-ignore [16, 29]
-        self.pos_labels += labels.sum()
+        self.pos_labels += labels.sum().to(torch.float64)
         # pyre-ignore [16, 29]
-        self.neg_labels += (1.0 - labels).sum()
+        self.neg_labels += (1.0 - labels).sum().to(torch.float64)
 
     def compute(self) -> torch.Tensor:
         """Compute the metric."""
         denom = self.weighted_num_samples.clamp(min=self.eta)
         mean_label = (self.pos_labels / denom).clamp(self.eta, 1.0 - self.eta)
         ce_norm = -(
-            self.pos_labels * torch.log2(mean_label)
-            + self.neg_labels * torch.log2(1.0 - mean_label)
+            self.pos_labels * torch.log(mean_label)
+            + self.neg_labels * torch.log(1.0 - mean_label)
         )
         return (self.cross_entropy_sum / ce_norm).to(torch.float32).squeeze()
