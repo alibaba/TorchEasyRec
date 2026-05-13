@@ -9,13 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -168,6 +169,39 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         )
 
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dssm_with_fg_train_eval_export_aot(self):
+        # AOT export variant: exercises TowerWrapper through the legacy
+        # two-stage AOT path (`_compute_seq_share_groups` +
+        # `_build_dynamic_shapes`).
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dssm_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+            )
+        self.assertTrue(self.success)
+        for side in ("user", "item"):
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        self.test_dir, f"export/{side}/scripted_sparse_model.pt"
+                    )
+                ),
+                f"missing AOT sparse model for {side} tower",
+            )
+            with open(
+                os.path.join(self.test_dir, f"export/{side}/model_acc.json")
+            ) as f:
+                self.assertEqual(json.load(f).get("ENABLE_AOT"), "1")
+
     def test_dssm_hard_negative_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dssm_fg_hard_negative_mock.config",
@@ -277,6 +311,39 @@ class MatchIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
         )
+
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dssm_v2_with_fg_train_eval_export_aot(self):
+        # AOT export variant: exercises TowerWoEGWrapper through the legacy
+        # two-stage AOT path (`_compute_seq_share_groups` +
+        # `_build_dynamic_shapes`).
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/dssm_v2_fg_mock.config",
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+            )
+        self.assertTrue(self.success)
+        for side in ("user", "item"):
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        self.test_dir, f"export/{side}/scripted_sparse_model.pt"
+                    )
+                ),
+                f"missing AOT sparse model for {side} tower",
+            )
+            with open(
+                os.path.join(self.test_dir, f"export/{side}/model_acc.json")
+            ) as f:
+                self.assertEqual(json.load(f).get("ENABLE_AOT"), "1")
 
     def test_dssm_v2_mlp_emb_with_fg_train_eval_export(self):
         self.success = utils.test_train_eval(
