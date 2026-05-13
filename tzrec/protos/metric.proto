@@ -46,7 +46,7 @@ message GroupedXAUC {
 }
 
 message NormalizedEntropy {
-    // small epsilon clamping preds and the population mean away from {0, 1}.
+    // small epsilon clamping the population mean label rate away from {0, 1}.
     optional float eta = 1 [default = 1e-12];
 }
 
