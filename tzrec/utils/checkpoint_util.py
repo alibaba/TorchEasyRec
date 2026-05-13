@@ -38,6 +38,24 @@ from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
+# Substring substitutions used to fall back from INPUT_TILE=3 user-side state
+# keys to their non-user training-checkpoint counterparts. Mirrors
+# `tzrec/acc/utils.py:write_mapping_file_for_input_tile`. Applied at load time
+# so callers like `export_distributed_embedding` and `export_rtp_model` do not
+# need to pre-generate a mapping file.
+_INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
+    (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
+    (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
+    (
+        ".mc_ebc_user._managed_collision_collection.",
+        ".mc_ebc._managed_collision_collection.",
+    ),
+    (".ec_list_user.", ".ec_list."),
+    (".mc_ec_list_user.", ".mc_ec_list."),
+    (".ec_dict_user.", ".ec_dict."),
+    (".mc_ec_dict_user.", ".mc_ec_dict."),
+)
+
 
 class PartialLoadPlanner(DefaultLoadPlanner):
     """Support restore partial states.
@@ -115,6 +133,26 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                         f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
                         "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
                     )
+
+            # INPUT_TILE=3 export adds user-side twin modules (`ebc_user`,
+            # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) whose
+            # state_dict keys do not exist in the training checkpoint
+            # (training never sets INPUT_TILE). Fall back to the non-user
+            # counterpart that does exist. Equivalent to the explicit
+            # `emb_ckpt_mapping.txt` generated in `export_model_normal`,
+            # but works without the call site pre-computing a mapping.
+            if meta_fqn not in self.metadata.state_dict_metadata:
+                for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
+                    if new_pat not in meta_fqn:
+                        continue
+                    candidate = meta_fqn.replace(new_pat, old_pat)
+                    if candidate in self.metadata.state_dict_metadata:
+                        logger.info(
+                            f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]"
+                        )
+                        meta_fqn = candidate
+                        fqn_remap_set.add(fqn)
+                        break
 
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]

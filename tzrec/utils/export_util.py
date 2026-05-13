@@ -477,6 +477,25 @@ def _get_rtp_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
+        # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
+        # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
+        # `_link_dynamicemb_input_tile_user_paths` in checkpoint_util.py),
+        # so the glob above returns the same physical file under two
+        # collection paths. Without dedup, each dynamic table's key/value
+        # file would be exported twice, causing online serving to insert the
+        # same keys twice into the dynamic embedding table. With score-based
+        # eviction at the capacity boundary, the second insertion shifts the
+        # eviction set and produces small per-key inference drift vs offline
+        # predict.
+        seen_real: set = set()
+        deduped_key_files = []
+        for f in key_files:
+            real = os.path.realpath(f)
+            if real in seen_real:
+                continue
+            seen_real.add(real)
+            deduped_key_files.append(f)
+        key_files = deduped_key_files
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -1495,23 +1514,22 @@ def _merge_sharded_embedding_json(
     for emb_json in emb_json_files:
         for emb_name, info in emb_json.items():
             if emb_name not in merged_json:
-                if info.get("is_dynamic"):
-                    info = dict(info)
-                    info["key_npz_names"] = list(info.get("key_npz_names", []))
-                    info["value_npz_names"] = list(info.get("value_npz_names", []))
                 merged_json[emb_name] = info
             else:
                 merged_json[emb_name]["memory"] += info["memory"]
                 merged_json[emb_name]["shape"][0] += info["shape"][0]
                 if info.get("is_dynamic"):
-                    # npz key names are uniform across ranks (e.g. always
-                    # "user_id_emb.keys"), so dedupe while preserving order.
-                    for k in info.get("key_npz_names", []):
-                        if k not in merged_json[emb_name]["key_npz_names"]:
-                            merged_json[emb_name]["key_npz_names"].append(k)
-                    for v in info.get("value_npz_names", []):
-                        if v not in merged_json[emb_name]["value_npz_names"]:
-                            merged_json[emb_name]["value_npz_names"].append(v)
+                    # Dynamic npz entry names are uniform across ranks
+                    # (e.g. always "user_id_emb.keys"). Serving iterates all
+                    # sparse_dynamic_embedding-*.npz files with the same entry
+                    # names, so keep the single key_name/value_name pair.
+                    for field in ("key_name", "value_name"):
+                        if merged_json[emb_name].get(field) != info.get(field):
+                            raise ValueError(
+                                f"dynamic embedding {emb_name} has inconsistent "
+                                f"{field}: {merged_json[emb_name].get(field)} vs "
+                                f"{info.get(field)}"
+                            )
 
     return merged_json
 
@@ -1616,10 +1634,9 @@ def _get_sparse_embedding_tensor(
     # set of emb_names that are dynamic embedding tables (loaded from
     # checkpoint's `dynamicemb/` directory rather than model state_dict).
     dynamic_emb_names = set()
-    # per-emb_name list of npz keys (composite names) for dynamic tables on
-    # this rank, used to make meta self-contained.
-    dynamic_key_npz_names = defaultdict(list)
-    dynamic_value_npz_names = defaultdict(list)
+    # per-emb_name npz entry names for dynamic tables on this rank.
+    dynamic_key_names = defaultdict(list)
+    dynamic_value_names = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
@@ -1660,6 +1677,25 @@ def _get_sparse_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
+        # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
+        # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
+        # `_link_dynamicemb_input_tile_user_paths` in checkpoint_util.py),
+        # so the glob above returns the same physical file under two
+        # collection paths. Without dedup, each dynamic table's key/value
+        # file would be exported twice, causing online serving to insert the
+        # same keys twice into the dynamic embedding table. With score-based
+        # eviction at the capacity boundary, the second insertion shifts the
+        # eviction set and produces small per-key inference drift vs offline
+        # predict.
+        seen_real: set = set()
+        deduped_key_files = []
+        for f in key_files:
+            real = os.path.realpath(f)
+            if real in seen_real:
+                continue
+            seen_real.add(real)
+            deduped_key_files.append(f)
+        key_files = deduped_key_files
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -1694,8 +1730,8 @@ def _get_sparse_embedding_tensor(
                 emb_name_to_meta_tensor[emb_name] = values_2d
                 value_name_to_key[value_name] = key_name
                 dynamic_emb_names.add(emb_name)
-                dynamic_key_npz_names[emb_name].append(key_name)
-                dynamic_value_npz_names[emb_name].append(value_name)
+                dynamic_key_names[emb_name].append(key_name)
+                dynamic_value_names[emb_name].append(value_name)
 
     # TODO(hongsheng.jhs): support mczch
 
@@ -1722,11 +1758,19 @@ def _get_sparse_embedding_tensor(
             # "pooling": feat_name_to_pooling[name],
         }
         if is_dynamic:
-            # composite npz keys inside sparse_dynamic_embedding-*.npz on this
-            # rank. Merged across ranks by _merge_sharded_embedding_json.
+            # Entry names inside sparse_dynamic_embedding-*.npz. The serving
+            # processor expects one key/value entry pair and applies it to all
+            # dynamic npz shards.
             t_meta["key_dtype"] = "int64"
-            t_meta["key_npz_names"] = list(dynamic_key_npz_names[emb_name])
-            t_meta["value_npz_names"] = list(dynamic_value_npz_names[emb_name])
+            key_names = list(dict.fromkeys(dynamic_key_names[emb_name]))
+            value_names = list(dict.fromkeys(dynamic_value_names[emb_name]))
+            if len(key_names) != 1 or len(value_names) != 1:
+                raise ValueError(
+                    f"dynamic embedding {emb_name} expects one key/value npz "
+                    f"entry pair, got {key_names} / {value_names}"
+                )
+            t_meta["key_name"] = key_names[0]
+            t_meta["value_name"] = value_names[0]
         emb_meta[emb_name] = t_meta
 
     feat_meta = {}
