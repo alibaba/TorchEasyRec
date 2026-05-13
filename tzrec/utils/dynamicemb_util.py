@@ -304,21 +304,27 @@ if has_dynamicemb:
         bucket_capacity: int = 128,
         caching: bool = False,
     ) -> int:
-        """Calculate dynamic embedding table storage.
+        """Per-shard storage size for a dynamicemb table -- HBM or DDR (bytes).
 
-        HYBRID mode (``caching=False``): values are hash-partitioned across HBM
-        and host; HBM holds ``cache_ratio`` of values, host holds
-        ``1 - cache_ratio``.
+        Byte budget (single shard, rows x dim):
 
-        CACHING mode (``caching=True``): host holds the full backing store; HBM
-        holds an ``cache_ratio`` fraction as a cache.
+            value_bytes_per_row = round_up16(dim * (1 + opt_mult) * element)
+            total_value_memory  = align(rows) * value_bytes_per_row
+            num_buckets         = align(rows) / bucket_capacity
 
-            hbm = align(rows) * (round_up16(dim*element) * cache_ratio + metadata)
-            ddr = align(rows) *  round_up16(dim*element) * value_ratio_ddr
+            hbm_budget = cache_ratio * total_value_memory                 # values
+                       + align(rows) * (key<8B> + score<8B> + digest<1B>) # per-row
+                       + num_buckets * bucket_header<4B>                  # per-bucket
 
-        where ``value_ratio_ddr`` is ``1 - cache_ratio`` for HYBRID and ``1.0``
-        for CACHING. Metadata (key + score + digest + bucket) is accounted on
-        HBM only, matching the existing tzrec convention.
+            ddr_budget = HYBRID  (caching=False): (1 - cache_ratio) * total_value_memory
+                         CACHING (caching=True):  total_value_memory  # full backing
+
+        HYBRID hash-partitions values across HBM and host; ``cache_ratio`` is
+        HBM's value share. CACHING keeps the full backing store on host and
+        uses HBM as a hot-row cache of size
+        ``cache_ratio * total_value_memory``. Hash-table metadata
+        (key + score + digest + bucket header) is accounted on HBM only --
+        matches the existing tzrec convention.
         """
         if cache_ratio is None:
             cache_ratio = 1.0
@@ -484,53 +490,40 @@ if has_dynamicemb:
         *args,  # pyre-ignore [2]
         **kwargs,  # pyre-ignore [2]
     ):
-        """Inject CACHING-mode hit-rate boost into the perf estimator.
+        """Inject the CACHING-mode hit-rate boost into the perf estimator.
 
-        For dynamicemb tables in CACHING mode, we temporarily replace
+        For dynamicemb tables in CACHING mode, temporarily replace
         ``sharding_option.cache_params`` with a clone whose ``load_factor`` is
         boosted to the effective HBM-hit ratio. The original cache_params is
-        restored before the patched method returns, so the (separately invoked)
-        storage estimator continues to see the un-boosted ratio.
+        restored before returning, so the (separately invoked) storage
+        estimator still sees the un-boosted ratio.
         """
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
         caching = bool(getattr(dynamicemb_options, "caching", False))
-        if not caching:
-            return _orig_build_shard_perf_contexts(
-                cls,
-                config,
-                shard_sizes,
-                sharding_option,
-                topology,
-                constraints,
-                sharder,
-                *args,
-                **kwargs,
-            )
-
         original_cache_params = sharding_option.cache_params
-        stats = original_cache_params.stats if original_cache_params else None
-        x_eff = _dynamicemb_effective_cache_ratio(
-            sharding_option.cache_load_factor, caching=True, stats=stats
-        )
-        if original_cache_params is not None:
-            boosted = dataclasses.replace(original_cache_params, load_factor=x_eff)
-        else:
-            boosted = CacheParams(load_factor=x_eff)
-        sharding_option.cache_params = boosted
-        try:
-            return _orig_build_shard_perf_contexts(
-                cls,
-                config,
-                shard_sizes,
-                sharding_option,
-                topology,
-                constraints,
-                sharder,
-                *args,
-                **kwargs,
+        if caching:
+            stats = original_cache_params.stats if original_cache_params else None
+            x_eff = _dynamicemb_effective_cache_ratio(
+                sharding_option.cache_load_factor, caching=True, stats=stats
             )
-        finally:
-            sharding_option.cache_params = original_cache_params
+            sharding_option.cache_params = (
+                dataclasses.replace(original_cache_params, load_factor=x_eff)
+                if original_cache_params is not None
+                else CacheParams(load_factor=x_eff)
+            )
+        result = _orig_build_shard_perf_contexts(
+            cls,
+            config,
+            shard_sizes,
+            sharding_option,
+            topology,
+            constraints,
+            sharder,
+            *args,
+            **kwargs,
+        )
+        sharding_option.cache_params = original_cache_params
+        return result
 
     # pyre-ignore [9]
     ShardPerfContext.build_shard_perf_contexts = classmethod(
