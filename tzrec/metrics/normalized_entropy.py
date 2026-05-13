@@ -9,11 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Formula referenced from torchrec/metrics/ne.py (BSD-licensed, Meta).
-# Reimplemented here so tzrec owns its metric math surface. Cross-entropy is
-# accumulated in nats via F.binary_cross_entropy (torchrec uses log2/bits);
-# NE is a ratio so the log base cancels.
-
 from typing import Any
 
 import torch
