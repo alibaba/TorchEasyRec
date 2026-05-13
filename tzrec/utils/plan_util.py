@@ -340,14 +340,25 @@ class DynamicProgrammingProposer(Proposer):
 
         num_devices = len(storage_constraint.devices)
         max_device_hbm = 0
-        max_device_ddr = 0
         hbm_total = 0
         ddr_total = 0
         for device in storage_constraint.devices:
             max_device_hbm = max(max_device_hbm, device.storage.hbm or 0)
-            max_device_ddr = max(max_device_ddr, device.storage.ddr or 0)
             hbm_total += device.storage.hbm or 0
             ddr_total += device.storage.ddr or 0
+        # DDR is host-shared across ranks co-located on one machine, so the
+        # per-option fit check compares against the largest machine's DDR pool
+        # -- not per-device. HBM is GPU-local, so its prune stays per-device.
+        per_host = getattr(storage_constraint, "local_world_size", None) or num_devices
+        per_host = max(per_host, 1)
+        max_machine_ddr = 0
+        for host_start in range(0, num_devices, per_host):
+            host_end = min(host_start + per_host, num_devices)
+            machine_ddr = sum(
+                (storage_constraint.devices[i].storage.ddr or 0)
+                for i in range(host_start, host_end)
+            )
+            max_machine_ddr = max(max_machine_ddr, machine_ddr)
 
         hbm_bins = max(self._hbm_bins_per_device * num_devices, 1)
         ddr_bins = max(self._ddr_bins_per_device * num_devices, 1)
@@ -374,11 +385,10 @@ class DynamicProgrammingProposer(Proposer):
                 max_shard_ddr = max(
                     (shard.storage.ddr or 0) for shard in sharding_option.shards
                 )
-                # Prune options whose largest shard exceeds either per-device
-                # budget — the partitioner would reject them anyway.
+                # HBM is per-device, DDR is per-machine: see comment above.
                 if hbm_total > 0 and max_shard_hbm > max_device_hbm:
                     continue
-                if ddr_total > 0 and max_shard_ddr > max_device_ddr:
+                if ddr_total > 0 and max_shard_ddr > max_machine_ddr:
                     continue
                 hbm_by_fqn[table_id][opt_id] = (
                     _bytes_to_float_bin(

@@ -224,14 +224,15 @@ class _FakeShardingOption:
         self.total_perf = perf
 
 
-def _make_topology(num_devices, hbm_per_device, ddr_per_device):
+def _make_topology(num_devices, hbm_per_device, ddr_per_device, local_world_size=None):
     return SimpleNamespace(
         devices=[
             SimpleNamespace(
                 storage=_FakeStorage(hbm=hbm_per_device, ddr=ddr_per_device)
             )
             for _ in range(num_devices)
-        ]
+        ],
+        local_world_size=local_world_size or num_devices,
     )
 
 
