@@ -48,19 +48,6 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from tzrec.protos import feature_pb2
 
-# Empirical x_eff constants fitted from an on-device dynamicemb sweep
-# (4M-row table, dim=128, adam, pow-law alpha=1.05, A10 GPU; see
-# experiments/sweep_20260513-161030/full_a10gpu1.json). Median fwd+bwd
-# latency clustered into three regimes:
-#   * HYBRID @ x=1.0:   0.80 ms (HBM-only fast path; runtime drops the
-#                        host tier when total_value_memory <= local_hbm)
-#   * CACHING @ x<1.0:  2.63 ms  (~3.3x slower than HBM-only)
-#   * HYBRID  @ x<1.0:  5.44 ms  (~6.8x slower than HBM-only)
-# Within each <1.0 block the ratio dependence is noise-dominated.
-# Inverting the linear bw model bw = x_eff*HBM + (1-x_eff)*HBM_TO_DDR
-# (torchrec defaults: HBM=897 GB/s, HBM_TO_DDR=32 GB/s) yields the
-# constants below. The +0.01*x term is a tiebreaker so the DP can produce
-# strictly ordered proposals within each block.
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
 _DYNAMICEMB_HYBRID_X_EFF_BASE = 0.11
 _DYNAMICEMB_X_EFF_TIEBREAK = 0.01
