@@ -847,9 +847,8 @@ def _emit_dynamicemb_variants(
         for load_factor in load_factors:
             opt = copy.deepcopy(base_option)
             opt.cache_params = CacheParams(load_factor=load_factor, stats=stats)
-            # pyre-ignore [16]
-            opt.dynamicemb_options = copy.deepcopy(dynamicemb_options)
-            opt.dynamicemb_options.caching = caching_mode
+            # deepcopy(base_option) already produced a fresh dynamicemb_options.
+            opt.dynamicemb_options.caching = caching_mode  # pyre-ignore [16]
             variants.append(opt)
     return variants
 
