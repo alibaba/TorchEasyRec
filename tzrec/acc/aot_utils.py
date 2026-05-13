@@ -11,7 +11,7 @@
 
 
 import os
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from torch import nn
@@ -231,11 +231,11 @@ def _pad_empty_sparse_values(
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
-    model_config: Any,
+    feature_groups: List[Any],
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
-    Uses structural knowledge from feature configs and model config:
+    Uses structural knowledge from feature configs and feature groups:
     - .lengths → batch dim (always)
     - .values for non-sequence single-value sparse features → batch dim
     - .values for sequence features → data-dependent Dim, shared by features
@@ -249,7 +249,7 @@ def _build_dynamic_shapes(
     Args:
         data: input tensor dict from Batch.to_dict().
         features: list of BaseFeature from model._features.
-        model_config: ModelConfig proto with feature_groups.
+        feature_groups: list of FeatureGroupConfig from model._feature_groups.
 
     Returns:
         dynamic_shapes dict for torch.export.export().
@@ -287,8 +287,8 @@ def _build_dynamic_shapes(
         return getattr(feat, "value_dim", 1) == 1
 
     # Step 2: For standalone sequence features not yet grouped, fall back to
-    # model_config.feature_groups structure.
-    for fg in model_config.feature_groups:
+    # feature_groups structure.
+    for fg in feature_groups:
         if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
             # In JAGGED_SEQUENCE groups, single-valued features share nnz.
             # Multi-valued features have independent nnz and are NOT grouped.
@@ -419,7 +419,7 @@ def export_unified_model_aot(
     dynamic_shapes = _build_dynamic_shapes(
         data,
         features=model._features,
-        model_config=model.model._base_model_config,
+        feature_groups=model._feature_groups,
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 

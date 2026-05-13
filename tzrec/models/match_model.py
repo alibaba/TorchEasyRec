@@ -457,6 +457,7 @@ class TowerWrapper(nn.Module):
         super().__init__()
         setattr(self, tower_name, module)
         self._features = module._features
+        self._feature_groups = module._feature_groups
         self._tower_name = tower_name
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -476,7 +477,8 @@ class TowerWoEGWrapper(nn.Module):
 
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
-        self.embedding_group = EmbeddingGroup(module._features, [module._feature_group])
+        self._feature_groups = [module._feature_group]
+        self.embedding_group = EmbeddingGroup(module._features, self._feature_groups)
         setattr(self, tower_name, module)
         self._features = module._features
         self._tower_name = tower_name

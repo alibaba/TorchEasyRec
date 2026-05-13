@@ -999,7 +999,7 @@ def export_rtp_model(
 
 def _compute_seq_share_groups(
     features: List[BaseFeature],
-    model_config: Any,
+    feature_groups: List[Any],
 ) -> Dict[str, str]:
     """Map ``{group_name}__sequence`` to a share_key.
 
@@ -1011,7 +1011,7 @@ def _compute_seq_share_groups(
 
     feat_by_name = {f.name: f for f in features}
     share: Dict[str, str] = {}
-    for fg in model_config.feature_groups:
+    for fg in feature_groups:
         if fg.group_type not in (
             FeatureGroupType.SEQUENCE,
             FeatureGroupType.JAGGED_SEQUENCE,
@@ -1160,7 +1160,7 @@ def split_model(
 
     seq_share_groups = _compute_seq_share_groups(
         features=cast(List[BaseFeature], model._features),
-        model_config=model.model._base_model_config,
+        feature_groups=model._feature_groups,
     )
     meta_info = {
         "seq_tensor_names": seq_tensor_names,
