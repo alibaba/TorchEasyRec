@@ -94,3 +94,37 @@ feature_configs {
     --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
     --fine_tune_checkpoint {INIT_CKPT_PATH}/model.ckpt-0
     ```
+
+## 从ZCH训练好的模型迁移
+
+如果已有用 `zch{}` 训练好的模型，希望切换到 `dynamicemb{}` 继续训练，可以使用 `tzrec.tools.zch_to_dynamicemb_convert` 将ZCH checkpoint 转换为 dynamicemb 格式的 checkpoint，下游训练任务直接通过 `--fine_tune_checkpoint` 热启动。
+
+```bash
+python -m tzrec.tools.zch_to_dynamicemb_convert \
+--source_checkpoint_path {ZCH_CKPT_PATH}/model.ckpt-N \
+--source_pipeline_config_path {PATH_TO_CONFIG_WITH_ZCH} \
+--target_pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
+--save_dir {CONVERTED_CKPT_PATH}
+```
+
+- --source_checkpoint_path: ZCH 训练好的 checkpoint 目录（形如 `.../model.ckpt-N/`，需包含 `model/` 子目录的 DCP 分片）
+- --source_pipeline_config_path: 原始训练所用的 pipeline 配置（特征上配置了 `zch{}`）
+- --target_pipeline_config_path: 切换后的 pipeline 配置（同名特征上将 `zch{}` 替换为 `dynamicemb{}`，`embedding_dim` 保持一致）
+- --save_dir: 转换后 checkpoint 的输出目录，工具会写入 `{save_dir}/model.ckpt-0/`
+- --world_size:（可选）转换后 dynamicemb 分片的 world_size，默认从 source checkpoint 的 `.distcp` 文件名自动识别
+
+### 迁移内容
+
+- **Embedding**: 每个 ZCH 表中已学到的 embedding 向量（按 `_mch_remapped_ids_mapping` 索引）会按 `raw_id % world_size` 切分写入 dynamicemb 的每个 rank 分片。
+- **分数（Scores）**: 仅当目标 `score_strategy ∈ {LFU, STEP}` 时会写入分数文件。
+  - 来源 LFU 策略：使用 `_mch_counts`
+  - 来源 LRU 策略：使用 `_mch_last_access_iter`
+  - 来源 DistanceLFU 策略：目标 LFU 使用 counts，目标 STEP 使用 last_access
+  - 目标 `TIMESTAMP / CUSTOMIZED / NO_EVICTION`：跳过分数迁移，dynamicemb 在加载后自行初始化分数
+- **非 ZCH 部分**: 稠密层、非 ZCH embedding 及其 optimizer state 通过整目录复制 `model/` 与 `optimizer/` 保留，加载时 `PartialLoadPlanner` 会自动跳过新模型中已不存在的 MCH/EBC 残留键。
+
+### 未迁移内容
+
+- **MCH-EBC 的 optimizer state**: 不会迁移到 dynamicemb 的 `opt_values`，转换后的条目首次更新时由 dynamicemb 自行冷启动 optimizer state。
+
+ZCH 本身的配置详见 [ZCH](./zch.md)。
