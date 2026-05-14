@@ -631,8 +631,9 @@ class UIHPreprocessor(InputPreprocessor):
         # Optional: action embeddings. Watchtime is gated by the encoder's
         # `need_watchtime` -- mirrors ContextualInterleavePreprocessor.
         if self._action_encoder_cfg is not None:
-            # target_offsets is unused when total_targets=0 (no candidates in
-            # UIH-only mode), so we pass uih_offsets as a placeholder.
+            # total_targets=0: zero offsets keep concat_2D_jagged's Triton
+            # kernel from reading the empty values_right tile.
+            target_offsets = torch.zeros_like(uih_offsets)
             action_embeddings = self._action_encoder(
                 seq_actions=grouped_features[f"{self._uih_action_key}.sequence"].to(
                     torch.int64
@@ -640,7 +641,7 @@ class UIHPreprocessor(InputPreprocessor):
                 max_uih_len=max_uih_len,
                 max_targets=0,
                 uih_offsets=uih_offsets,
-                target_offsets=uih_offsets,
+                target_offsets=target_offsets,
                 total_uih_len=total_uih_len,
                 total_targets=0,
                 seq_watchtimes=grouped_features[f"{self._uih_watchtime_key}.sequence"]
