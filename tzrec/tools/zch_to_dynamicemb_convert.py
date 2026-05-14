@@ -15,28 +15,32 @@ Reads a checkpoint produced by training a tzrec model that uses Zero
 Collision Hashing (ZCH) and emits a checkpoint in the format expected by
 ``DynamicEmbLoad``, so the next training run -- whose pipeline.config has
 swapped ``zch{}`` for ``dynamicemb{}`` on the relevant features -- can warm
-start from the trained embeddings, scores, and (when compatible) optimizer
-states.
+start from the trained embeddings (and scores, when the target score
+strategy is recurrence-compatible).
 
 Output layout (under ``<save_dir>/model.ckpt-0/``)::
 
-    model/                       # copied verbatim from source (loader skips
-                                 # extra ZCH keys absent in the target model)
-    optimizer/                   # copied verbatim from source
-    dynamicemb/<mod_path>/<tbl>_emb_keys.rank_R.world_size_W
-    dynamicemb/<mod_path>/<tbl>_emb_values.rank_R.world_size_W
-    dynamicemb/<mod_path>/<tbl>_emb_scores.rank_R.world_size_W
-    dynamicemb/<mod_path>/<tbl>_emb_opt_values.rank_R.world_size_W   # optional
-    dynamicemb/<mod_path>/<tbl>_opt_args.json
+    model/                       # byte-copied from source; PartialLoadPlanner
+                                 # silently skips MCH/EBC keys absent in the
+                                 # new dynamicemb-flavored model
+    optimizer/                   # byte-copied from source; non-MCH opt state
+                                 # warm-starts as-is, MCH-EBC opt entries are
+                                 # silently ignored on load
+    dynamicemb/<full_mod_path>/<tbl>_emb_keys.rank_R.world_size_W
+    dynamicemb/<full_mod_path>/<tbl>_emb_values.rank_R.world_size_W
+    dynamicemb/<full_mod_path>/<tbl>_emb_scores.rank_R.world_size_W   # only when
+                                 # target score_strategy in {LFU, STEP}
+    dynamicemb/<full_mod_path>/<tbl>_opt_args.json
     plan                         # copied if present (advisory)
     meta                         # {load_model, load_optim,
                                  #  dynamicemb_load_table_names,
-                                 #  dynamicemb_load_optim}
+                                 #  dynamicemb_load_optim=false}
 """
 
 import argparse
 import json
 import os
+import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
@@ -67,23 +71,72 @@ from tzrec.utils.logging_util import logger
 # paths that actually need dynamicemb re-import these names locally and
 # will raise a clear ImportError there.
 
-# Score / value / key dtypes — match dynamicemb.types.
+# Score / value / key dtypes -- match dynamicemb.types.
 _KEY_DTYPE = torch.int64
 _VALUE_DTYPE = torch.float32
 _SCORE_DTYPE = torch.int64
-_OPT_DTYPE = torch.float32
 _IINFO_MAX = torch.iinfo(torch.int64).max
+
+# Target score strategies that the converter migrates from MCH metadata.
+# Other strategies (TIMESTAMP, CUSTOMIZED, NO_EVICTION) have score units or
+# semantics we cannot recover from MCH state, so we skip score migration and
+# let dynamicemb cold-start scores at load time.
+_SCORES_MIGRATABLE = frozenset({"LFU", "STEP"})
+
+# Trailing collection-wrapper suffix of an EBC/EC module path. Pooled
+# collections add one segment (``mc_ebc`` / ``ebc`` / ``..._user``); sequence
+# (EC dict) collections add two segments because ``ec_dict`` is an
+# ``nn.ModuleDict`` keyed by embedding-dim (so the path ends in
+# ``mc_ec_dict.<dim>`` / ``ec_dict.<dim>``). The regex below strips both
+# shapes in one pass.
+_COLLECTION_SUFFIX_RE = re.compile(
+    r"\.(mc_ebc|mc_ebc_user|ebc|ebc_user"
+    r"|mc_ec_dict\.\d+|mc_ec_dict_user\.\d+"
+    r"|ec_dict\.\d+|ec_dict_user\.\d+)$"
+)
+
+
+def _strip_collection_suffix(mod_path: str) -> str:
+    """Strip the trailing EBC/EC collection-wrapper segment(s).
+
+    ``model.<...>.<group_impl>.mc_ebc`` -> ``model.<...>.<group_impl>``
+    ``model.<...>.<group_impl>.mc_ec_dict.16`` -> ``model.<...>.<group_impl>``
+
+    Both shapes reduce to the path of the containing
+    EmbeddingGroupImpl / SequenceEmbeddingGroupImpl.
+    """
+    m = _COLLECTION_SUFFIX_RE.search(mod_path)
+    if m is None:
+        raise ValueError(
+            f"path {mod_path!r} does not end with a known EBC/EC collection wrapper"
+        )
+    return mod_path[: m.start()]
+
+
+def _normalize_group_key(path: str) -> str:
+    """Strip leading ``model.`` prefixes so source and target paths line up.
+
+    Source-side paths have one ``model.`` (from ``named_modules()``);
+    target-side paths have two (from the init-script-style BFS +
+    ``parameter_constraints`` walk). Both forms reduce to the same
+    ``embedding_group.<group_impl>`` key.
+    """
+    while path.startswith("model."):
+        path = path[len("model.") :]
+    return path
 
 
 @dataclass
 class _SourceZchTable:
     """One ZCH-wrapped logical table discovered in the source model.
 
-    Fields capture everything we need to drive the conversion: where its
-    state lives in the source DCP, its global zch_size, and which MCH
-    metadata buffers exist (so we know the eviction policy).
+    ``group_key`` discriminates between tables with the same ``emb_name``
+    appearing in different EmbeddingGroupImpl / SequenceEmbeddingGroupImpl
+    instances. It is the wrapper-stripped, leading-``model.``-normalized
+    path of the containing group impl.
     """
 
+    group_key: str
     emb_name: str
     embedding_dim: int
     zch_size: int
@@ -95,14 +148,25 @@ class _SourceZchTable:
 
 @dataclass
 class _TargetDynamicEmbTable:
-    """One dynamicemb-bound logical table in the target model."""
+    """One dynamicemb-bound logical table in the target model.
 
+    ``group_key`` mirrors ``_SourceZchTable.group_key``.
+
+    ``full_mod_path`` keeps the wrapper segments and the doubled-``model.``
+    prefix because that's the on-disk directory ``DynamicEmbLoad`` looks
+    for when restoring shards (verified in
+    ``recsys-examples/corelib/dynamicemb/dynamicemb/dump_load.py``:
+    ``find_sharded_modules`` walks down to the ShardedEmbeddingCollection
+    living *inside* ``ec_dict[dim]``, and ``DynamicEmbLoad`` does
+    ``os.path.join(path, collection_path)``).
+    """
+
+    group_key: str
     emb_name: str
-    mod_path: str
+    full_mod_path: str
     embedding_dim: int
     score_strategy: str
     dist_type: str
-    opt_label: Optional[str] = None  # filled by inspecting source opt state
 
 
 def _classify_eviction_policy(metadata_buffer_names: List[str]) -> str:
@@ -118,14 +182,16 @@ def _classify_eviction_policy(metadata_buffer_names: List[str]) -> str:
     return "none"
 
 
-def _find_zch_tables(model: torch.nn.Module) -> Dict[str, _SourceZchTable]:
+def _find_zch_tables(
+    model: torch.nn.Module,
+) -> Dict[Tuple[str, str], _SourceZchTable]:
     """Walk source model and discover MCH-wrapped tables.
 
-    Returns a dict keyed by logical embedding name (the EBC/EC table name,
-    which is also the embedding-config ``name`` field tzrec uses to match
-    source and target).
+    Returns a dict keyed by ``(group_key, emb_name)`` so that two tables
+    with the same logical name living under different EmbeddingGroupImpl
+    instances do not collide.
     """
-    out: Dict[str, _SourceZchTable] = {}
+    out: Dict[Tuple[str, str], _SourceZchTable] = {}
     for raw_mod_name, m in model.named_modules():
         if not isinstance(
             m,
@@ -136,6 +202,9 @@ def _find_zch_tables(model: torch.nn.Module) -> Dict[str, _SourceZchTable]:
         ):
             continue
         mod_name = checkpoint_util._strip_dmp_prefix(raw_mod_name)
+        group_path = _strip_collection_suffix(mod_name)
+        group_key = _normalize_group_key(group_path)
+
         mc_coll = m._managed_collision_collection
         emb_coll = m._embedding_module
 
@@ -175,19 +244,20 @@ def _find_zch_tables(model: torch.nn.Module) -> Dict[str, _SourceZchTable]:
                 f"{mod_name}._managed_collision_collection."
                 f"_managed_collision_modules.{tbl_name}"
             )
-            if tbl_name in out:
-                # Two MC collections cannot share an embedding name; if they
-                # do, tzrec is misconfigured -- fail loud.
+            key = (group_key, tbl_name)
+            if key in out:
                 raise RuntimeError(
-                    f"Duplicate ZCH-wrapped table name '{tbl_name}' found at "
-                    f"both {out[tbl_name].mch_prefix} and {mch_prefix}."
+                    f"Duplicate ZCH-wrapped table '{tbl_name}' found under the "
+                    f"same group '{group_key}' (existing: {out[key].mch_prefix}, "
+                    f"new: {mch_prefix}). This indicates a misconfigured model."
                 )
             if tbl_name not in name_to_dim:
                 raise RuntimeError(
                     f"Table '{tbl_name}' has an MCH module but no matching "
                     f"embedding config under {mod_name}._embedding_module."
                 )
-            out[tbl_name] = _SourceZchTable(
+            out[key] = _SourceZchTable(
+                group_key=group_key,
                 emb_name=tbl_name,
                 embedding_dim=int(name_to_dim[tbl_name]),
                 zch_size=zch_size,
@@ -201,20 +271,24 @@ def _find_zch_tables(model: torch.nn.Module) -> Dict[str, _SourceZchTable]:
 
 def _find_dynamicemb_tables(
     target_model: torch.nn.Module,
-) -> Dict[str, _TargetDynamicEmbTable]:
+) -> Dict[Tuple[str, str], _TargetDynamicEmbTable]:
     """Mirror of create_dynamicemb_init_ckpt.py's walk to discover dynamicemb tables.
 
-    Returns dict keyed by emb_name. Asserts no table appears under more
-    than one module path (each emb_name -> one mod_path).
+    Returns dict keyed by ``(group_key, emb_name)``. ``full_mod_path`` (the
+    on-disk directory under ``dynamicemb/``) keeps the wrapper segments and
+    the doubled-``model.`` prefix so ``DynamicEmbLoad`` finds the shards.
     """
     from dynamicemb.planner import DynamicEmbParameterConstraints
 
-    out: Dict[str, _TargetDynamicEmbTable] = {}
+    out: Dict[Tuple[str, str], _TargetDynamicEmbTable] = {}
     q: Queue = Queue()
     q.put(("", target_model))
     while not q.empty():
         path, m = q.get()
         if hasattr(m, "parameter_constraints"):
+            # ``path`` here is exactly the group-impl path (with trailing dot)
+            # passed in by the BFS as the prefix to ``parameter_constraints``.
+            group_key = _normalize_group_key(path.rstrip("."))
             for fqn, const in m.parameter_constraints(path).items():
                 if not isinstance(const, DynamicEmbParameterConstraints):
                     continue
@@ -227,16 +301,17 @@ def _find_dynamicemb_tables(
                     else "TIMESTAMP"
                 )
                 dist_type = getattr(opts, "dist_type", None) or "roundrobin"
-                if emb_name in out:
+                key = (group_key, emb_name)
+                if key in out:
                     raise RuntimeError(
-                        f"Dynamicemb table '{emb_name}' is bound under two "
-                        f"distinct module paths "
-                        f"({out[emb_name].mod_path} and {full_mod_path}); "
-                        "this is not supported."
+                        f"Duplicate dynamicemb table '{emb_name}' under group "
+                        f"'{group_key}' (existing: {out[key].full_mod_path}, "
+                        f"new: {full_mod_path})."
                     )
-                out[emb_name] = _TargetDynamicEmbTable(
+                out[key] = _TargetDynamicEmbTable(
+                    group_key=group_key,
                     emb_name=emb_name,
-                    mod_path=full_mod_path,
+                    full_mod_path=full_mod_path,
                     embedding_dim=int(opts.dim) if opts.dim else -1,
                     score_strategy=score_strategy,
                     dist_type=dist_type,
@@ -309,158 +384,76 @@ def _load_dcp_subset(
     }
 
 
-def _classify_source_optimizer_for_weight(
-    opt_meta: Mapping[str, object], weight_fqn: str, zch_size: int, dim: int
-) -> Tuple[str, Dict[str, str]]:
-    """Infer the source optimizer type from per-weight state-dict keys.
-
-    Returns ``(label, {state_name -> full_meta_fqn})``. ``label`` is one of
-    ``{"sgd", "adagrad", "rowwise_adagrad", "adam", "unknown"}``.
-    """
-    # The optimizer state_dict, when DCP-saved, flattens to keys that contain
-    # the param FQN (or its stripped form) plus the opt-state name. We match
-    # on substring of the weight FQN.
-    state_name_to_fqn: Dict[str, str] = {}
-    for full_fqn, md in opt_meta.items():
-        if not isinstance(md, TensorStorageMetadata):
-            continue
-        stripped = checkpoint_util._strip_dmp_prefix(full_fqn)
-        if weight_fqn not in stripped:
-            continue
-        # The trailing component is the opt-state name. For example
-        # ``state.<param_fqn>.exp_avg`` -> ``exp_avg``.
-        tail = stripped.rsplit(".", 1)[-1]
-        # Filter to known opt-state names so we don't misread the .weight key.
-        if tail in ("exp_avg", "exp_avg_sq", "sum", "momentum_buffer"):
-            state_name_to_fqn[tail] = full_fqn
-
-    names = set(state_name_to_fqn)
-    if names == set():
-        return "sgd", state_name_to_fqn
-    if names == {"exp_avg", "exp_avg_sq"}:
-        return "adam", state_name_to_fqn
-    if names == {"sum"}:
-        sum_fqn = state_name_to_fqn["sum"]
-        sum_shape = tuple(opt_meta[sum_fqn].size)
-        if sum_shape == (zch_size, dim):
-            return "adagrad", state_name_to_fqn
-        if sum_shape == (zch_size,):
-            return "rowwise_adagrad", state_name_to_fqn
-        logger.warning(
-            f"Unexpected shape {sum_shape} for AdaGrad-style state at "
-            f"{sum_fqn}; expected ({zch_size}, {dim}) or ({zch_size},). "
-            "Treating as unknown."
-        )
-        return "unknown", state_name_to_fqn
-    return "unknown", state_name_to_fqn
-
-
-_SPARSE_OPT_LABELS = {
-    "sgd_optimizer": "sgd",
-    "adagrad_optimizer": "adagrad",
-    "adam_optimizer": "adam",
-    "rowwise_adagrad_optimizer": "rowwise_adagrad",
-}
-
-
-def _infer_target_opt_label_from_pipeline_config(pipeline_config) -> str:
-    """Read pipeline_config.train_config.sparse_optimizer to label the target opt.
-
-    tzrec wires the sparse-optimizer choice globally; that's the optimizer
-    every embedding (incl. dynamicemb-bound tables) ends up using. Returns
-    ``"unknown"`` for optimizers we don't know how to migrate (LARS, LAMB,
-    RMSprop, Adadelta, partial-rowwise variants).
-    """
-    if not pipeline_config.HasField("train_config"):
-        return "unknown"
-    train_cfg = pipeline_config.train_config
-    if not train_cfg.HasField("sparse_optimizer"):
-        return "unknown"
-    kind = train_cfg.sparse_optimizer.WhichOneof("optimizer")
-    return _SPARSE_OPT_LABELS.get(kind, "unknown")
-
-
 def _derive_scores(
     metadata_tensors: Dict[str, torch.Tensor],
     eviction_policy: str,
     target_score_strategy: str,
     valid_mask: torch.Tensor,
-    init_score_offset: int,
-) -> torch.Tensor:
+) -> Optional[torch.Tensor]:
     """Project MCH eviction metadata onto dynamicemb's int64 score.
 
-    Direction is consistent in both systems (higher = keep longer). For
-    LFU-target we prefer counts; for STEP/TIMESTAMP/CUSTOMIZED we prefer
-    last_access. NO_EVICTION ignores the score, so we emit a constant.
+    Returns ``None`` for target score strategies whose units / semantics
+    don't admit a faithful mapping from MCH counters (TIMESTAMP scores are
+    ``device_timestamp()`` ns ~ 10^18; CUSTOMIZED is user-defined;
+    NO_EVICTION ignores scores). The caller then omits score files for the
+    affected table and dynamicemb cold-starts scores at load.
 
-    See plan §5 for the full mapping table. ``init_score_offset`` is added
-    to every score after the base mapping (useful to shift LRU iter values
-    into the wall-clock-ns range when target is TIMESTAMP).
+    Also returns ``None`` when the source MCH module has no eviction
+    metadata at all (eviction_policy='none') -- nothing to migrate.
+
+    Otherwise returns an int64 tensor of length ``valid_mask.sum()`` where
+    each entry is taken from the per-slot MCH metadata that best matches
+    the target strategy (counts for LFU, last_access_iter for STEP).
     """
     target = (target_score_strategy or "").upper()
-    n_valid = int(valid_mask.sum().item())
-
-    if target == "NO_EVICTION":
-        base = torch.zeros(n_valid, dtype=_SCORE_DTYPE)
-        return base + int(init_score_offset)
+    if target not in _SCORES_MIGRATABLE:
+        return None
 
     counts = metadata_tensors.get("_mch_counts")
     last = metadata_tensors.get("_mch_last_access_iter")
 
     if target == "LFU":
         preferred = counts if counts is not None else last
-    else:
-        # STEP / TIMESTAMP / CUSTOMIZED / unknown -> recency wins
+    else:  # STEP
         preferred = last if last is not None else counts
 
     if preferred is None:
         logger.warning(
             f"ZCH module has no MCH eviction metadata "
-            f"(eviction_policy={eviction_policy!r}); falling back to score=0."
+            f"(eviction_policy={eviction_policy!r}); omitting score files."
         )
-        base = torch.zeros(n_valid, dtype=_SCORE_DTYPE)
-    else:
-        base = preferred[valid_mask].to(_SCORE_DTYPE)
-
-    if target == "TIMESTAMP" and preferred is not None and base.numel() > 0:
-        if int(base.max().item()) < 10**15 and init_score_offset == 0:
-            logger.warning(
-                "Target score_strategy=TIMESTAMP but mapped scores are far "
-                "below typical device_timestamp() values (~1e18 ns). "
-                "Converted entries will be evicted first when new entries "
-                "are inserted. Consider passing --init_score_offset close "
-                "to the current device_timestamp() to protect them until "
-                "first touch."
-            )
-    return base + int(init_score_offset)
+        return None
+    return preferred[valid_mask].to(_SCORE_DTYPE)
 
 
 def _gather_and_shard_writes(
     raw_ids: torch.Tensor,
     values: torch.Tensor,
-    scores: torch.Tensor,
-    opt_values: Optional[torch.Tensor],
+    scores: Optional[torch.Tensor],
     table_name: str,
     save_path: str,
     world_size: int,
 ) -> None:
     """Shard converted entries by raw_id % world_size and write per-rank files.
 
-    Empty shards still get zero-byte files so ``find_files`` sees the full
-    expected count of W shards per item.
+    When ``scores is None`` no ``_emb_scores.*`` file is written for any
+    rank -- dynamicemb's load path tolerates absent score files and falls
+    back to runtime score generation.
+
+    Empty shards still get zero-byte ``keys``/``values`` files so
+    ``dynamicemb.batched_dynamicemb_tables.find_files`` counts a full set
+    of W shards per item.
     """
     from dynamicemb.batched_dynamicemb_tables import encode_checkpoint_file_path
 
     assert raw_ids.dim() == 1
     assert values.dim() == 2 and values.shape[0] == raw_ids.shape[0]
-    assert scores.dim() == 1 and scores.shape[0] == raw_ids.shape[0]
-    if opt_values is not None:
-        assert opt_values.dim() == 2 and opt_values.shape[0] == raw_ids.shape[0]
+    if scores is not None:
+        assert scores.dim() == 1 and scores.shape[0] == raw_ids.shape[0]
 
     raw_ids_np = raw_ids.to(_KEY_DTYPE).cpu().numpy()
     values_np = values.to(_VALUE_DTYPE).cpu().numpy()
-    scores_np = scores.to(_SCORE_DTYPE).cpu().numpy()
-    opt_np = opt_values.to(_OPT_DTYPE).cpu().numpy() if opt_values is not None else None
+    scores_np = scores.to(_SCORE_DTYPE).cpu().numpy() if scores is not None else None
 
     keys_mod = raw_ids_np % world_size if world_size > 1 else np.zeros_like(raw_ids_np)
     for rank in range(world_size):
@@ -481,51 +474,15 @@ def _gather_and_shard_writes(
         ) as f:
             if mask.any():
                 f.write(values_np[mask].astype(np.float32).tobytes())
-        with open(
-            encode_checkpoint_file_path(
-                save_path, table_name, rank, world_size, "scores"
-            ),
-            "wb",
-        ) as f:
-            if mask.any():
-                f.write(scores_np[mask].astype(np.int64).tobytes())
-        if opt_np is not None:
+        if scores_np is not None:
             with open(
                 encode_checkpoint_file_path(
-                    save_path, table_name, rank, world_size, "opt_values"
+                    save_path, table_name, rank, world_size, "scores"
                 ),
                 "wb",
             ) as f:
                 if mask.any():
-                    f.write(opt_np[mask].astype(np.float32).tobytes())
-
-
-def _gather_opt_rows(
-    opt_state_tensors: Dict[str, torch.Tensor],
-    label: str,
-    remapped: torch.Tensor,
-    dim: int,
-) -> torch.Tensor:
-    """Pack source optimizer state rows into dynamicemb's flat opt_values layout.
-
-    Output shape: ``(N, opt_state_dim)`` where ``opt_state_dim`` is the
-    checkpoint-on-disk width expected by dynamicemb (see
-    ``dynamicemb.optimizer.get_optimizer_ckpt_state_dim``).
-    """
-    if label == "sgd":
-        # opt_state_dim == 0 -> no opt file written; caller should not call us.
-        return torch.empty((remapped.shape[0], 0), dtype=_OPT_DTYPE)
-    if label == "adam":
-        m = opt_state_tensors["exp_avg"][remapped].to(_OPT_DTYPE)
-        v = opt_state_tensors["exp_avg_sq"][remapped].to(_OPT_DTYPE)
-        return torch.cat([m, v], dim=1)
-    if label == "adagrad":
-        return opt_state_tensors["sum"][remapped].to(_OPT_DTYPE)
-    if label == "rowwise_adagrad":
-        # Per-row scalar -> reshape to (N, 1) so the on-disk layout matches
-        # get_optimizer_ckpt_state_dim() == 1.
-        return opt_state_tensors["sum"][remapped].to(_OPT_DTYPE).reshape(-1, 1)
-    raise ValueError(f"Unsupported optimizer label '{label}' for opt-state packing")
+                    f.write(scores_np[mask].astype(np.int64).tobytes())
 
 
 def _copy_dcp_dir(src: str, dst: str) -> None:
@@ -546,7 +503,6 @@ def convert(
     target_pipeline_config_path: str,
     save_dir: str,
     world_size: Optional[int],
-    init_score_offset: int,
 ) -> None:
     """Top-level conversion routine. See module docstring."""
     if not os.path.isdir(source_checkpoint_path):
@@ -612,44 +568,36 @@ def convert(
             "that the target pipeline.config has features with dynamicemb{} set."
         )
 
-    # 4. Match by emb_name, validate dim equality.
-    matched: Dict[str, Tuple[_SourceZchTable, _TargetDynamicEmbTable]] = {}
-    for name, demb in tgt_demb.items():
-        if name not in src_zch:
+    # 4. Match by (group_key, emb_name), validate dim equality.
+    matched: Dict[Tuple[str, str], Tuple[_SourceZchTable, _TargetDynamicEmbTable]] = {}
+    for key, demb in tgt_demb.items():
+        if key not in src_zch:
             raise RuntimeError(
-                f"Target dynamicemb table '{name}' has no matching ZCH "
+                f"Target dynamicemb table {key} has no matching ZCH "
                 f"table in source. Source ZCH tables: {sorted(src_zch)}."
             )
-        zch = src_zch[name]
+        zch = src_zch[key]
         if demb.embedding_dim > 0 and demb.embedding_dim != zch.embedding_dim:
             raise RuntimeError(
-                f"Table '{name}': source dim={zch.embedding_dim} vs target "
+                f"Table {key}: source dim={zch.embedding_dim} vs target "
                 f"dim={demb.embedding_dim}."
             )
         if demb.dist_type != "roundrobin":
             raise RuntimeError(
-                f"Table '{name}': target dist_type={demb.dist_type!r} not "
+                f"Table {key}: target dist_type={demb.dist_type!r} not "
                 "supported. Only 'roundrobin' is implemented in v1."
             )
-        matched[name] = (zch, demb)
-
-    # Per-table opt-label inference uses target pipeline_config's sparse
-    # optimizer choice -- tzrec applies this uniformly to every embedding.
-    target_opt_label = _infer_target_opt_label_from_pipeline_config(tgt_pipeline)
-    logger.info(f"Target dynamicemb optimizer label: {target_opt_label}")
+        matched[key] = (zch, demb)
 
     # 5. Per-table conversion.
-    opt_reader_meta = None
-    if os.path.isdir(source_opt_dir):
-        opt_reader_meta = FileSystemReader(path=source_opt_dir).read_metadata()
-
-    # Whether *every* table got opt_values written -- needed to set the
-    # top-level dynamicemb_load_optim flag honestly.
-    all_tables_have_opt_values = True
     dynamicemb_load_table_names: Dict[str, List[str]] = defaultdict(list)
 
-    for name, (zch, demb) in matched.items():
-        logger.info(f"Converting table '{name}' (zch_size={zch.zch_size})...")
+    for key, (zch, demb) in matched.items():
+        group_key, name = key
+        logger.info(
+            f"Converting table '{name}' under group '{group_key}' "
+            f"(zch_size={zch.zch_size})..."
+        )
 
         # 5a. Load MCH state + EBC weight in one shot.
         canonical_sorted = zch.mch_prefix + "._mch_sorted_raw_ids"
@@ -668,7 +616,7 @@ def convert(
         weight = loaded.get(canonical_weight)
         if sorted_raw is None or remapped_global is None or weight is None:
             raise RuntimeError(
-                f"Table '{name}': missing required tensors in source checkpoint. "
+                f"Table {key}: missing required tensors in source checkpoint. "
                 f"Found: sorted_raw={'ok' if sorted_raw is not None else 'MISSING'}, "
                 f"remapped={'ok' if remapped_global is not None else 'MISSING'}, "
                 f"weight={'ok' if weight is not None else 'MISSING'}."
@@ -684,77 +632,21 @@ def convert(
         remapped = remapped_global[valid_mask].to(torch.long)
         if int(remapped.max().item() if remapped.numel() else -1) >= weight.shape[0]:
             raise RuntimeError(
-                f"Table '{name}': remapped id {int(remapped.max().item())} "
+                f"Table {key}: remapped id {int(remapped.max().item())} "
                 f"out of range for weight shape {tuple(weight.shape)}."
             )
         values = weight.index_select(0, remapped).to(_VALUE_DTYPE)
 
-        # 5b. Scores.
+        # 5b. Scores (may be None for TIMESTAMP/CUSTOMIZED/NO_EVICTION).
         scores = _derive_scores(
             metadata_tensors,
             zch.eviction_policy,
             demb.score_strategy,
             valid_mask,
-            init_score_offset,
         )
 
-        # 5c. Optimizer state -> opt_values (best effort).
-        opt_values: Optional[torch.Tensor] = None
-        if opt_reader_meta is not None and target_opt_label not in ("unknown", "sgd"):
-            src_opt_label, name_to_fqn = _classify_source_optimizer_for_weight(
-                opt_reader_meta.state_dict_metadata,
-                zch.weight_fqn,
-                zch.zch_size,
-                zch.embedding_dim,
-            )
-            if src_opt_label != target_opt_label:
-                logger.warning(
-                    f"Table '{name}': source optimizer label '{src_opt_label}' "
-                    f"!= target '{target_opt_label}'. Skipping opt-state migration "
-                    "for this table -- dynamicemb will initialize fresh state on load."
-                )
-                all_tables_have_opt_values = False
-            elif not name_to_fqn:
-                logger.warning(
-                    f"Table '{name}': no optimizer state tensors found in source "
-                    "checkpoint for this weight; skipping opt-state migration."
-                )
-                all_tables_have_opt_values = False
-            else:
-                # Load each opt-state tensor (canonical form == stripped saved key).
-                canonical_opt_suffixes = [
-                    checkpoint_util._strip_dmp_prefix(fqn)
-                    for fqn in name_to_fqn.values()
-                ]
-                opt_loaded = _load_dcp_subset(source_opt_dir, canonical_opt_suffixes)
-                opt_state_tensors: Dict[str, torch.Tensor] = {}
-                for state_name, full_fqn in name_to_fqn.items():
-                    stripped = checkpoint_util._strip_dmp_prefix(full_fqn)
-                    t = opt_loaded.get(stripped)
-                    if t is None:
-                        opt_state_tensors = {}
-                        break
-                    opt_state_tensors[state_name] = t
-                if not opt_state_tensors:
-                    logger.warning(
-                        f"Table '{name}': opt-state tensors could not be loaded "
-                        "from source DCP; skipping opt-state migration."
-                    )
-                    all_tables_have_opt_values = False
-                else:
-                    opt_values = _gather_opt_rows(
-                        opt_state_tensors,
-                        src_opt_label,
-                        remapped,
-                        zch.embedding_dim,
-                    )
-        else:
-            # No source optimizer/, OR target is sgd/unknown -> no opt_values.
-            if target_opt_label not in ("sgd", "unknown"):
-                all_tables_have_opt_values = False
-
-        # 5d. Write the dynamicemb files for this table.
-        save_path = os.path.join(out_dir, "dynamicemb", demb.mod_path)
+        # 5c. Write the dynamicemb files for this table.
+        save_path = os.path.join(out_dir, "dynamicemb", demb.full_mod_path)
         os.makedirs(save_path, exist_ok=True)
         with open(encode_meta_json_file_path(save_path, name), "w") as f:
             f.write(json.dumps({}))
@@ -763,22 +655,22 @@ def convert(
             raw_ids=raw_ids,
             values=values,
             scores=scores,
-            opt_values=opt_values,
             table_name=name,
             save_path=save_path,
             world_size=world_size,
         )
 
-        dynamicemb_load_table_names[demb.mod_path].append(name)
-        has_opt = "yes" if opt_values is not None else "no"
+        dynamicemb_load_table_names[demb.full_mod_path].append(name)
+        has_scores = "yes" if scores is not None else "no"
         logger.info(
             f"  table '{name}': wrote {raw_ids.shape[0]} entries across "
-            f"{world_size} ranks (opt_state={has_opt})."
+            f"{world_size} ranks (scores={has_scores})."
         )
 
-    # 6. Copy model/ and optimizer/ verbatim.
+    # 6. Byte-copy model/ and optimizer/ verbatim. No filtering.
     _copy_dcp_dir(source_model_dir, os.path.join(out_dir, "model"))
-    if os.path.isdir(source_opt_dir):
+    has_optim = os.path.isdir(source_opt_dir)
+    if has_optim:
         _copy_dcp_dir(source_opt_dir, os.path.join(out_dir, "optimizer"))
 
     # Copy plan if present (advisory).
@@ -786,22 +678,18 @@ def convert(
     if os.path.isfile(plan_src):
         shutil.copyfile(plan_src, os.path.join(out_dir, "plan"))
 
-    # 7. Top-level meta.
+    # 7. Top-level meta. dynamicemb_load_optim is hard-coded false in v1
+    # since we don't migrate MCH-EBC optimizer state into dynamicemb opt_values.
     meta = {
         "load_model": True,
-        "load_optim": os.path.isdir(source_opt_dir),
+        "load_optim": has_optim,
         "dynamicemb_load_table_names": dict(dynamicemb_load_table_names),
-        "dynamicemb_load_optim": (
-            all_tables_have_opt_values and target_opt_label not in ("sgd", "unknown")
-        ),
+        "dynamicemb_load_optim": False,
     }
     with open(os.path.join(out_dir, "meta"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    logger.info(
-        f"Conversion complete. Output: {out_dir}. "
-        f"dynamicemb_load_optim={meta['dynamicemb_load_optim']}."
-    )
+    logger.info(f"Conversion complete. Output: {out_dir}.")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -846,17 +734,6 @@ def _parse_args() -> argparse.Namespace:
             "source checkpoint's world size (auto-detected from .distcp files)."
         ),
     )
-    parser.add_argument(
-        "--init_score_offset",
-        type=int,
-        default=0,
-        help=(
-            "Constant int64 added to every derived score. Useful for "
-            "TIMESTAMP score_strategy targets (set close to current "
-            "device_timestamp() to protect converted entries from being "
-            "evicted by fresh inserts)."
-        ),
-    )
     args, _ = parser.parse_known_args()
     return args
 
@@ -869,5 +746,4 @@ if __name__ == "__main__":
         target_pipeline_config_path=args.target_pipeline_config_path,
         save_dir=args.save_dir,
         world_size=args.world_size,
-        init_score_offset=args.init_score_offset,
     )
