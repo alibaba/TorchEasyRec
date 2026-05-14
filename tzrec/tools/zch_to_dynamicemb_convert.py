@@ -45,11 +45,6 @@ from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
-from dynamicemb.batched_dynamicemb_tables import (
-    encode_checkpoint_file_path,
-    encode_meta_json_file_path,
-)
-from dynamicemb.planner import DynamicEmbParameterConstraints
 from torch.distributed.checkpoint import (
     FileSystemReader,
     TensorStorageMetadata,
@@ -65,6 +60,12 @@ from tzrec.main import _create_features, _create_model
 from tzrec.models.model import TrainWrapper
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.logging_util import logger
+
+# dynamicemb is an optional dependency. Import lazily so the module is
+# loadable on CPU-only / non-dynamicemb environments (e.g. CI test discovery
+# imports every *_test.py, which in turn imports this module). All call
+# paths that actually need dynamicemb re-import these names locally and
+# will raise a clear ImportError there.
 
 # Score / value / key dtypes — match dynamicemb.types.
 _KEY_DTYPE = torch.int64
@@ -206,6 +207,8 @@ def _find_dynamicemb_tables(
     Returns dict keyed by emb_name. Asserts no table appears under more
     than one module path (each emb_name -> one mod_path).
     """
+    from dynamicemb.planner import DynamicEmbParameterConstraints
+
     out: Dict[str, _TargetDynamicEmbTable] = {}
     q: Queue = Queue()
     q.put(("", target_model))
@@ -446,6 +449,8 @@ def _gather_and_shard_writes(
     Empty shards still get zero-byte files so ``find_files`` sees the full
     expected count of W shards per item.
     """
+    from dynamicemb.batched_dynamicemb_tables import encode_checkpoint_file_path
+
     assert raw_ids.dim() == 1
     assert values.dim() == 2 and values.shape[0] == raw_ids.shape[0]
     assert scores.dim() == 1 and scores.shape[0] == raw_ids.shape[0]
@@ -552,6 +557,10 @@ def convert(
     source_opt_dir = os.path.join(source_checkpoint_path, "optimizer")
     if not os.path.isdir(source_model_dir):
         raise RuntimeError(f"Missing model/ subdir under {source_checkpoint_path}.")
+
+    # Import dynamicemb here so the module stays importable in environments
+    # without it (CI test discovery). Raises a clear ImportError if missing.
+    from dynamicemb.batched_dynamicemb_tables import encode_meta_json_file_path
 
     out_dir = os.path.join(save_dir, "model.ckpt-0")
     os.makedirs(out_dir, exist_ok=True)

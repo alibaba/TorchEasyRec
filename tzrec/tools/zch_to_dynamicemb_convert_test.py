@@ -20,7 +20,6 @@ from unittest import mock
 
 import numpy as np
 import torch
-from dynamicemb.planner import DynamicEmbParameterConstraints
 from torch import nn
 from torch.distributed import checkpoint as dcp
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -38,6 +37,12 @@ from torchrec.modules.mc_modules import (
 from tzrec.protos import pipeline_pb2
 from tzrec.tools import zch_to_dynamicemb_convert as conv
 from tzrec.utils import config_util
+from tzrec.utils.dynamicemb_util import has_dynamicemb
+
+try:
+    from dynamicemb.planner import DynamicEmbParameterConstraints
+except Exception:
+    DynamicEmbParameterConstraints = None  # type: ignore[assignment]
 
 _IINFO_MAX = torch.iinfo(torch.int64).max
 
@@ -349,6 +354,7 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(names, {})
 
 
+@unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
 class ShardWriteTests(unittest.TestCase):
     """Tests for _gather_and_shard_writes binary file output."""
 
@@ -583,6 +589,9 @@ class _StubEmbeddingGroupImpl(nn.Module):
 
     Tests use this to feed _find_dynamicemb_tables a controllable target
     model without depending on full tzrec model construction.
+
+    Only instantiable when dynamicemb is installed; tests that build one
+    are guarded with ``@unittest.skipUnless(has_dynamicemb, ...)``.
     """
 
     def __init__(self, table_specs):
@@ -618,6 +627,7 @@ def _make_minimal_pipeline_config():
     return cfg
 
 
+@unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
 class ConvertE2ETests(unittest.TestCase):
     """End-to-end test of ``convert()`` orchestration with patched builders."""
 
