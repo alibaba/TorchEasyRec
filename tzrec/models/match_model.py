@@ -207,7 +207,7 @@ class MatchTowerWoEG(nn.Module):
         self,
         tower_config: Union[
             tower_pb2.Tower,
-            tower_pb2.HSTUMatchTower,
+            tower_pb2.HSTUUserTower,
         ],
         output_dim: int,
         similarity: simi_pb2.Similarity,

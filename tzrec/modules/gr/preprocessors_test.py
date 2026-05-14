@@ -250,5 +250,70 @@ class PreprocessorTest(unittest.TestCase):
         )
 
 
+@mark_ci_scope("h20")
+class UIHPreprocessorTest(unittest.TestCase):
+    @unittest.skipIf(*gpu_unavailable)
+    def test_uih_preprocessor_contextual(self) -> None:
+        from tzrec.modules.gr.preprocessors import UIHPreprocessor
+
+        device = torch.device("cuda")
+
+        uih_embedding_dim = 32
+        output_embedding_dim = 16
+        contextual_feature_dim = 8
+        contextual_len = 3
+
+        preprocessor = UIHPreprocessor(
+            uih_embedding_dim=uih_embedding_dim,
+            output_embedding_dim=output_embedding_dim,
+            contextual_feature_dim=contextual_feature_dim,
+            max_contextual_seq_len=contextual_len,
+            is_inference=False,
+        ).to(device)
+
+        uih_lengths = [4, 2]
+        (
+            output_max_seq_len,
+            output_total_uih_len,
+            output_total_targets,
+            output_seq_lengths,
+            output_seq_offsets,
+            output_seq_timestamps,
+            output_seq_embeddings,
+            output_num_targets,
+        ) = preprocessor(
+            grouped_features={
+                "uih.sequence": torch.rand(
+                    (sum(uih_lengths), uih_embedding_dim), device=device
+                ),
+                "uih.sequence_length": torch.tensor(uih_lengths, device=device),
+                "contextual": torch.rand(
+                    (len(uih_lengths), contextual_len * contextual_feature_dim),
+                    device=device,
+                ),
+                "uih_timestamp.sequence": torch.tensor(
+                    list(range(sum(uih_lengths))), device=device
+                ),
+            }
+        )
+
+        # contextual concat extends every UIH row by `contextual_len`.
+        expected_seq_lengths = [s + contextual_len for s in uih_lengths]
+        self.assertEqual(output_max_seq_len, max(uih_lengths) + contextual_len)
+        self.assertEqual(output_seq_lengths.tolist(), expected_seq_lengths)
+        self.assertEqual(output_total_uih_len, sum(expected_seq_lengths))
+        self.assertEqual(output_total_targets, 0)
+        self.assertEqual(
+            output_seq_embeddings.size(),
+            (sum(expected_seq_lengths), output_embedding_dim),
+        )
+        self.assertEqual(output_seq_timestamps.size(), (sum(expected_seq_lengths),))
+        self.assertTrue(torch.all(output_num_targets == 0))
+        torch.testing.assert_close(
+            torch.ops.fbgemm.asynchronous_complete_cumsum(output_seq_lengths),
+            output_seq_offsets,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,3 +6,4 @@
 
    dlrm_hstu
    ultra_hstu
+   hstu_match
