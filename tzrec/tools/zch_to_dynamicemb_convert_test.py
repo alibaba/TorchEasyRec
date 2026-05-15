@@ -11,12 +11,10 @@
 
 """Tests for tzrec.tools.zch_to_dynamicemb_convert."""
 
-import json
 import os
 import shutil
 import tempfile
 import unittest
-from unittest import mock
 
 import numpy as np
 import torch
@@ -27,10 +25,12 @@ from torch.distributed import checkpoint as dcp
 from tzrec.features.feature import create_features
 from tzrec.models.model import TrainWrapper
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.protos import feature_pb2, model_pb2, pipeline_pb2
+from tzrec.protos import feature_pb2, model_pb2
+from tzrec.tests import utils
 from tzrec.tools import zch_to_dynamicemb_convert as conv
-from tzrec.utils import config_util
+from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.test_util import gpu_unavailable
 
 _IINFO_MAX = torch.iinfo(torch.int64).max
 
@@ -553,387 +553,76 @@ class DcpRoundTripTests(unittest.TestCase):
 
 
 # -----------------------------------------------------------------------------
-# convert() end-to-end (real EmbeddingGroup + real DynamicEmbParameterConstraints)
+# convert() end-to-end (subprocess-driven, mirrors create_dynamicemb_init_ckpt_test)
 # -----------------------------------------------------------------------------
 
 
-def _make_minimal_pipeline_config():
-    """Construct an in-memory EasyRecConfig with the fields convert() reads.
-
-    convert() only touches ``feature_configs``, ``data_config.label_fields``,
-    ``data_config.sample_weight_fields``, and ``model_config`` — and we mock
-    ``_create_features`` / ``_create_model`` to bypass the real construction
-    path. So a default-constructed proto with the three required string
-    fields is sufficient.
-    """
-    return pipeline_pb2.EasyRecConfig(
-        train_input_path="", eval_input_path="", model_dir=""
-    )
+_SRC_CONFIG = "tzrec/tests/configs/zch_to_dynamicemb_convert_src.config"
+_TGT_CONFIG = "tzrec/tests/configs/zch_to_dynamicemb_convert_tgt.config"
 
 
-@unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
 class ConvertE2ETests(unittest.TestCase):
-    """End-to-end ``convert()`` covering the v3 most-complex scenario.
+    """End-to-end test of the converter CLI.
 
-    Exercises DEEP + SEQUENCE groups, shared and unique embedding names, and
-    a matrix of source-policy × target-strategy migrations.
+    Trains a ZCH model briefly, runs the converter as a subprocess, then
+    confirms the converted checkpoint can be used as a fine-tune source for
+    a dynamicemb-flavored training run. Mirrors the existing pattern in
+    ``tzrec/tools/dynamicemb/create_dynamicemb_init_ckpt_test.py:43-93``.
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="zch_dyemb_e2e_")
+        self.success = False
+        if not os.path.exists("./tmp"):
+            os.makedirs("./tmp")
+        self.test_dir = tempfile.mkdtemp(prefix="tzrec_zch_to_dyemb_", dir="./tmp")
+        os.chmod(self.test_dir, 0o755)
 
     def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.success and os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
 
-    # The migration matrix this test covers (4 features, 5 tables, all dim=4,
-    # zch_size=8 / max_capacity=64):
-    #
-    #   feature_name    | zch  | target  | groups        | covers
-    #   ----------------+------+---------+---------------+----------------------------
-    #   shared_lfu      | lfu  | STEP    | DEEP+SEQUENCE | LFU→STEP proxy; group_key
-    #                   |      |         |               |   disambiguation across
-    #                   |      |         |               |   pooled + sequence impls
-    #   deep_only_lfu   | lfu  | LFU     | DEEP          | LFU→LFU direct counts
-    #   deep_only_lru   | lru  | TIMESTAMP | DEEP        | LRU→TIMESTAMP omit scores
-    #   seq_only_lru    | lru  | STEP    | SEQUENCE      | LRU→STEP direct last_access
+    @unittest.skipIf(
+        gpu_unavailable[0] or not has_dynamicemb,
+        "dynamicemb not available.",
+    )
+    def test_convert_e2e(self):
+        # 1. Train a ZCH model briefly to produce a real source checkpoint.
+        src_train_dir = os.path.join(self.test_dir, "src_train")
+        os.makedirs(src_train_dir, exist_ok=True)
+        ok = utils.test_train_eval(_SRC_CONFIG, src_train_dir)
+        self.assertTrue(ok, "Source ZCH training failed.")
 
-    _DIM = 4
-    _ZCH_SIZE = 8
-    _MAX_CAP = 64
-
-    def _build_source_model(self):
-        feature_cfgs = [
-            _id_feature_with_zch("shared_lfu", self._DIM, self._ZCH_SIZE, "lfu"),
-            _id_feature_with_zch("deep_only_lfu", self._DIM, self._ZCH_SIZE, "lfu"),
-            _id_feature_with_zch("deep_only_lru", self._DIM, self._ZCH_SIZE, "lru"),
-            _id_feature_with_zch("seq_only_lru", self._DIM, self._ZCH_SIZE, "lru"),
-        ]
-        groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["shared_lfu", "deep_only_lfu", "deep_only_lru"],
-                group_type=model_pb2.DEEP,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="seq",
-                feature_names=["shared_lfu", "seq_only_lru"],
-                group_type=model_pb2.SEQUENCE,
-            ),
-        ]
-        emb_group = _make_emb_group(feature_cfgs, groups)
-        return _TestBaseModel(emb_group)
-
-    def _build_target_model(self):
-        feature_cfgs = [
-            _id_feature_with_dynamicemb("shared_lfu", self._DIM, self._MAX_CAP, "STEP"),
-            _id_feature_with_dynamicemb(
-                "deep_only_lfu", self._DIM, self._MAX_CAP, "LFU"
-            ),
-            _id_feature_with_dynamicemb(
-                "deep_only_lru", self._DIM, self._MAX_CAP, "TIMESTAMP"
-            ),
-            _id_feature_with_dynamicemb(
-                "seq_only_lru", self._DIM, self._MAX_CAP, "STEP"
-            ),
-        ]
-        groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["shared_lfu", "deep_only_lfu", "deep_only_lru"],
-                group_type=model_pb2.DEEP,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="seq",
-                feature_names=["shared_lfu", "seq_only_lru"],
-                group_type=model_pb2.SEQUENCE,
-            ),
-        ]
-        emb_group = _make_emb_group(feature_cfgs, groups)
-        return _TestBaseModel(emb_group)
-
-    def _populate_source(self, src_inner):
-        """Populate ZCH state on every MCH-wrapped table via direct attribute access.
-
-        For ``shared_lfu`` (two instances), the DEEP and SEQUENCE instances
-        get *different* value patterns and remapped permutations so any
-        cross-group merge bug would surface as a value mismatch.
-        """
-        eg = src_inner.embedding_group
-        pooled = _pooled_mc_ebc(eg)
-        sequence = _sequence_mc_ec(eg, self._DIM)
-
-        # (table_name, mc_coll, inner_weight, eviction, value_base, remapped)
-        plans = [
-            (
-                "shared_lfu",
-                pooled,
-                pooled._embedding_module.embedding_bags["shared_lfu"].weight,
-                "lfu",
-                10.0,
-                [3, 2, 1, 0],
-            ),
-            (
-                "shared_lfu",
-                sequence,
-                sequence._embedding_module.embeddings["shared_lfu"].weight,
-                "lfu",
-                100.0,
-                [0, 1, 2, 3],
-            ),
-            (
-                "deep_only_lfu",
-                pooled,
-                pooled._embedding_module.embedding_bags["deep_only_lfu"].weight,
-                "lfu",
-                1.0,
-                [2, 0, 1, 3],
-            ),
-            (
-                "deep_only_lru",
-                pooled,
-                pooled._embedding_module.embedding_bags["deep_only_lru"].weight,
-                "lru",
-                5.0,
-                [1, 3, 0, 2],
-            ),
-            (
-                "seq_only_lru",
-                sequence,
-                sequence._embedding_module.embeddings["seq_only_lru"].weight,
-                "lru",
-                50.0,
-                [3, 1, 0, 2],
-            ),
-        ]
-
-        raw_ids = [100, 101, 102, 103]
-
-        for table_name, mc_coll, weight, eviction, base_val, remapped in plans:
-            mch = mc_coll._managed_collision_collection._managed_collision_modules[
-                table_name
-            ]
-
-            # _mch_sorted_raw_ids: 4 valid + 4 sentinel.
-            sorted_raw = mch._buffers["_mch_sorted_raw_ids"].clone()
-            sorted_raw[: len(raw_ids)] = torch.tensor(raw_ids, dtype=torch.int64)
-            mch._buffers["_mch_sorted_raw_ids"].copy_(sorted_raw)
-
-            # _mch_remapped_ids_mapping: non-trivial permutation on the 4
-            # valid slots; sentinel slots get safe distinct defaults. The
-            # output_global_offset is added so values are in the module's
-            # local range and validate_state() invariants hold.
-            offset = int(getattr(mch, "_output_global_offset", 0))
-            remapped_buf = torch.tensor(
-                [r + offset for r in remapped]
-                + [4 + offset, 5 + offset, 6 + offset, 7 + offset],
-                dtype=torch.int64,
-            )
-            mch._buffers["_mch_remapped_ids_mapping"].copy_(remapped_buf)
-
-            # Eviction metadata.
-            if eviction == "lfu":
-                counts = torch.zeros(self._ZCH_SIZE, dtype=torch.int64)
-                counts[: len(raw_ids)] = torch.tensor([10, 20, 30, 40])
-                mch._buffers["_mch_counts"].copy_(counts)
-            else:  # lru
-                last = torch.zeros(self._ZCH_SIZE, dtype=torch.int64)
-                last[: len(raw_ids)] = torch.tensor([101, 202, 303, 404])
-                mch._buffers["_mch_last_access_iter"].copy_(last)
-
-            # Inner weight row r -> all base_val + r. Distinct base per table
-            # so any cross-merge bug surfaces in value assertions later.
-            with torch.no_grad():
-                for r in range(self._ZCH_SIZE):
-                    weight[r].fill_(base_val + float(r))
-
-    def test_convert_e2e_complex_scenario(self):
-        src_inner = self._build_source_model()
-        self._populate_source(src_inner)
-
-        # Save source model and a tiny optimizer DCP.
-        src_ckpt = os.path.join(self.tmp, "model.ckpt-100")
-        os.makedirs(src_ckpt, exist_ok=True)
-        src_wrapped = TrainWrapper(src_inner)
-        dcp.save(
-            src_wrapped.state_dict(), checkpoint_id=os.path.join(src_ckpt, "model")
+        src_ckpt_path, _ = checkpoint_util.latest_checkpoint(
+            os.path.join(src_train_dir, "train")
         )
-        dcp.save(
-            {"state.linear.weight.exp_avg": torch.full((1, 4), 0.5)},
-            checkpoint_id=os.path.join(src_ckpt, "optimizer"),
+        self.assertIsNotNone(src_ckpt_path, "No ZCH checkpoint produced.")
+
+        # 2. Run the converter via the actual CLI, no mocks.
+        converted_dir = os.path.join(self.test_dir, "converted")
+        cmd_str = (
+            "PYTHONPATH=. python -m tzrec.tools.zch_to_dynamicemb_convert "
+            f"--source_checkpoint_path {src_ckpt_path} "
+            f"--source_pipeline_config_path {_SRC_CONFIG} "
+            f"--target_pipeline_config_path {_TGT_CONFIG} "
+            f"--save_dir {converted_dir}"
         )
-
-        # Stub pipeline-config files (convert reads them, but
-        # _create_features/_create_model are mocked, so content can be minimal).
-        src_cfg_path = os.path.join(self.tmp, "src.config")
-        tgt_cfg_path = os.path.join(self.tmp, "tgt.config")
-        config_util.save_message(_make_minimal_pipeline_config(), src_cfg_path)
-        config_util.save_message(_make_minimal_pipeline_config(), tgt_cfg_path)
-
-        tgt_inner = self._build_target_model()
-        # We have already wrapped src_inner once above; convert() will wrap
-        # again, but Module re-wrapping is fine -- the state_dict was saved
-        # off the once-wrapped form. To avoid double-wrap path drift, return
-        # the *inner* models from the mock and let convert()'s real
-        # TrainWrapper produce the same single-prefix shape that we saved.
-        models = iter([src_inner, tgt_inner])
-
-        save_dir = os.path.join(self.tmp, "out")
-        with (
-            mock.patch.object(conv, "_create_features", lambda *a, **k: []),
-            mock.patch.object(conv, "_create_model", lambda *a, **k: next(models)),
-        ):
-            conv.convert(
-                source_checkpoint_path=src_ckpt,
-                source_pipeline_config_path=src_cfg_path,
-                target_pipeline_config_path=tgt_cfg_path,
-                save_dir=save_dir,
-                world_size=2,
-            )
-
-        out = os.path.join(save_dir, "model.ckpt-0")
-
-        # ----- meta -----
-        with open(os.path.join(out, "meta")) as f:
-            meta = json.load(f)
-        self.assertTrue(meta["load_model"])
-        self.assertTrue(meta["load_optim"])
-        self.assertFalse(meta["dynamicemb_load_optim"])
-        tables_by_mod_path = meta["dynamicemb_load_table_names"]
-        # Exactly two distinct mod_paths: pooled vs sequence group_impls.
-        self.assertEqual(len(tables_by_mod_path), 2)
-        pooled_mod_paths = [
-            p for p in tables_by_mod_path if ".ebc" in p and "ec_dict" not in p
-        ]
-        seq_mod_paths = [p for p in tables_by_mod_path if "ec_dict" in p]
-        self.assertEqual(len(pooled_mod_paths), 1, tables_by_mod_path)
-        self.assertEqual(len(seq_mod_paths), 1, tables_by_mod_path)
-        pooled_mod_path = pooled_mod_paths[0]
-        seq_mod_path = seq_mod_paths[0]
-        # 3 tables under pooled, 2 under sequence.
-        self.assertEqual(
-            sorted(tables_by_mod_path[pooled_mod_path]),
-            sorted(["shared_lfu", "deep_only_lfu", "deep_only_lru"]),
+        ok = misc_util.run_cmd(
+            cmd_str,
+            os.path.join(self.test_dir, "log_zch_to_dynamicemb_convert.txt"),
+            timeout=600,
         )
-        self.assertEqual(
-            sorted(tables_by_mod_path[seq_mod_path]),
-            sorted(["shared_lfu", "seq_only_lru"]),
+        self.assertTrue(ok, "Converter subprocess failed.")
+
+        # 3. Verify the converted checkpoint loads as a fine-tune source.
+        tgt_train_dir = os.path.join(self.test_dir, "tgt_train")
+        os.makedirs(tgt_train_dir, exist_ok=True)
+        ok = utils.test_train_eval(
+            _TGT_CONFIG,
+            tgt_train_dir,
+            f"--fine_tune_checkpoint {os.path.join(converted_dir, 'model.ckpt-0')}",
         )
-
-        # ----- model/ and optimizer/ byte-copied -----
-        self.assertTrue(os.path.exists(os.path.join(out, "model", ".metadata")))
-        self.assertTrue(os.path.exists(os.path.join(out, "optimizer", ".metadata")))
-
-        # ----- per-table file presence -----
-        # Scores files are present only when source eviction policy
-        # semantically matches the target score_strategy.
-        score_expected = {
-            # LFU source + STEP target -> cross-policy, omit (v4 fix #1).
-            (pooled_mod_path, "shared_lfu"): False,
-            # LFU source + LFU target -> migrate counts.
-            (pooled_mod_path, "deep_only_lfu"): True,
-            # LRU source + TIMESTAMP target -> omit.
-            (pooled_mod_path, "deep_only_lru"): False,
-            # LFU source + STEP target -> cross-policy, omit (v4 fix #1).
-            (seq_mod_path, "shared_lfu"): False,
-            # LRU source + STEP target -> migrate last_access.
-            (seq_mod_path, "seq_only_lru"): True,
-        }
-        for (mod_path, table), should_have_scores in score_expected.items():
-            shard_dir = os.path.join(out, "dynamicemb", mod_path)
-            for rank in (0, 1):
-                k = os.path.join(
-                    shard_dir, f"{table}_emb_keys.rank_{rank}.world_size_2"
-                )
-                v = os.path.join(
-                    shard_dir, f"{table}_emb_values.rank_{rank}.world_size_2"
-                )
-                s = os.path.join(
-                    shard_dir, f"{table}_emb_scores.rank_{rank}.world_size_2"
-                )
-                self.assertTrue(os.path.exists(k), f"missing {k}")
-                self.assertTrue(os.path.exists(v), f"missing {v}")
-                if should_have_scores:
-                    self.assertTrue(os.path.exists(s), f"missing {s}")
-                else:
-                    self.assertFalse(os.path.exists(s), f"unexpected {s}")
-
-        # ----- content checks: keys are roundrobin-distributed -----
-        for (mod_path, table), _ in score_expected.items():
-            shard_dir = os.path.join(out, "dynamicemb", mod_path)
-            all_keys = []
-            for rank in (0, 1):
-                p = os.path.join(
-                    shard_dir, f"{table}_emb_keys.rank_{rank}.world_size_2"
-                )
-                arr = _read_int64(p)
-                self.assertTrue(np.all(arr % 2 == rank), f"{table}/r{rank}: {arr}")
-                all_keys.extend(arr.tolist())
-            self.assertEqual(sorted(all_keys), [100, 101, 102, 103])
-
-        # ----- shared_lfu values are distinct between DEEP and SEQUENCE -----
-        # Pooled shared_lfu used base_val=10.0; sequence used base_val=100.0.
-        for mod_path, expected_base in (
-            (pooled_mod_path, 10.0),
-            (seq_mod_path, 100.0),
-        ):
-            shard_dir = os.path.join(out, "dynamicemb", mod_path)
-            for rank in (0, 1):
-                vpath = os.path.join(
-                    shard_dir, f"shared_lfu_emb_values.rank_{rank}.world_size_2"
-                )
-                vals = _read_float32(vpath).reshape(-1, self._DIM)
-                if vals.size == 0:
-                    continue
-                # weight[r] = base + r. Every entry on a row must equal the same value.
-                for row in vals:
-                    self.assertEqual(len(set(row.tolist())), 1, row.tolist())
-                    v = row[0]
-                    self.assertGreaterEqual(
-                        v, expected_base, f"{mod_path}/r{rank}: {v} < {expected_base}"
-                    )
-
-        # ----- scores for an LFU→LFU table mirror the populated counts -----
-        # deep_only_lfu has counts [10, 20, 30, 40] for raw_ids [100, 101, 102, 103].
-        for rank in (0, 1):
-            keys_p = os.path.join(
-                out,
-                "dynamicemb",
-                pooled_mod_path,
-                f"deep_only_lfu_emb_keys.rank_{rank}.world_size_2",
-            )
-            scores_p = os.path.join(
-                out,
-                "dynamicemb",
-                pooled_mod_path,
-                f"deep_only_lfu_emb_scores.rank_{rank}.world_size_2",
-            )
-            keys = _read_int64(keys_p).tolist()
-            scores = _read_int64(scores_p).tolist()
-            self.assertEqual(len(keys), len(scores))
-            expected_score = {100: 10, 101: 20, 102: 30, 103: 40}
-            for k, s in zip(keys, scores):
-                self.assertEqual(s, expected_score[k], f"k={k} got score {s}")
-
-        # ----- scores for an LRU→STEP table mirror the populated last_access -----
-        # seq_only_lru has last_access [101, 202, 303, 404] for raw_ids [100..103].
-        for rank in (0, 1):
-            keys_p = os.path.join(
-                out,
-                "dynamicemb",
-                seq_mod_path,
-                f"seq_only_lru_emb_keys.rank_{rank}.world_size_2",
-            )
-            scores_p = os.path.join(
-                out,
-                "dynamicemb",
-                seq_mod_path,
-                f"seq_only_lru_emb_scores.rank_{rank}.world_size_2",
-            )
-            keys = _read_int64(keys_p).tolist()
-            scores = _read_int64(scores_p).tolist()
-            expected = {100: 101, 101: 202, 102: 303, 103: 404}
-            for k, s in zip(keys, scores):
-                self.assertEqual(s, expected[k], f"k={k} got score {s}")
+        self.assertTrue(ok, "Fine-tune-resume training with converted ckpt failed.")
+        self.success = True
 
 
 if __name__ == "__main__":
