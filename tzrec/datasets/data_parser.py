@@ -11,7 +11,7 @@
 
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -152,6 +152,16 @@ class DataParser:
                     continue
                 self.feature_input_names |= set(feature.inputs)
 
+        # Sequence-typed input columns the C++ FG handler will tokenize.
+        # PREDICT bypasses the sampler that normally casts these via
+        # combine_negs_to_candidate_sequence, so we cast int -> string in
+        # `parse()` to satisfy the handler's input contract.
+        self._sequence_input_names: Set[str] = set()
+        if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_NORMAL):
+            self._sequence_input_names = {
+                name for feature in features for name in feature.sequence_input_names
+            }
+
         self.user_inputs = set()
         self.user_feats = set()
         if is_input_tile():
@@ -211,6 +221,11 @@ class DataParser:
             else:
                 # For offline predict, len(data) is batch_size, tile_size need set to 1.
                 output_data["batch_size"] = torch.tensor(1)
+
+        for col_name in self._sequence_input_names:
+            arr = input_data.get(col_name)
+            if arr is not None and pa.types.is_integer(arr.type):
+                input_data[col_name] = arr.cast(pa.string(), safe=False)
 
         if self._fg_mode in (FgMode.FG_DAG, FgMode.FG_BUCKETIZE):
             self._parse_feature_fg_handler(input_data, output_data)
