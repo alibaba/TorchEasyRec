@@ -1258,10 +1258,26 @@ def export_distributed_embedding(
         sharders=sharders,
         device=device,
         plan=plan,
-        init_parameters=False,
+        init_parameters=True,
         init_data_parallel=False,
     )
     dmp_model.eval()
+
+    # Materialize lazy modules before FX tracing. Some modules build submodules
+    # from concrete tensor shapes on their first forward; during FX trace those
+    # shapes become Proxy objects and cannot be used to construct Parameters.
+    #
+    # Keep the existing sparse/dense GraphModule restore steps below as the
+    # final source of exported weights. This warm-up is only to make the module
+    # structure traceable.
+    logger.info("running pre-trace warm-up for distributed embedding export...")
+    checkpoint_util.restore_model(checkpoint_path, dmp_model)
+    dmp_model.to(device)
+    with torch.no_grad():
+        warmup_result = dmp_model(data, device=device)
+    del warmup_result
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     unwrap_model = dmp_model.module
     tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
