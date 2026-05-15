@@ -23,10 +23,6 @@ import torch
 from parameterized import parameterized
 from torch import nn
 from torch.distributed import checkpoint as dcp
-from torchrec.modules.mc_embedding_modules import (
-    ManagedCollisionEmbeddingBagCollection,
-    ManagedCollisionEmbeddingCollection,
-)
 
 from tzrec.features.feature import create_features
 from tzrec.models.model import TrainWrapper
@@ -124,48 +120,17 @@ def _make_emb_group(feature_cfgs, feature_groups):
     return EmbeddingGroup(features, feature_groups, device=torch.device("cpu"))
 
 
-def _find_mch_modules_for_table(model, table_name, kind=None):
-    """Yield (containing_module_path, mch_module) for owners of ``table_name``.
-
-    ``kind`` filters by wrapper type: ``"pooled"`` (DEEP / WIDE →
-    ``ManagedCollisionEmbeddingBagCollection``), ``"sequence"`` (SEQUENCE /
-    JAGGED_SEQUENCE → ``ManagedCollisionEmbeddingCollection``), or ``None``
-    (no filter).
-    """
-    if kind == "pooled":
-        types = (ManagedCollisionEmbeddingBagCollection,)
-    elif kind == "sequence":
-        types = (ManagedCollisionEmbeddingCollection,)
-    else:
-        types = (
-            ManagedCollisionEmbeddingBagCollection,
-            ManagedCollisionEmbeddingCollection,
-        )
-    for name, m in model.named_modules():
-        if isinstance(m, types):
-            mc = m._managed_collision_collection._managed_collision_modules
-            if table_name in mc:
-                yield name, mc[table_name]
+_BASE_IMPL_KEY = "__BASE__"
 
 
-def _find_inner_weights_for_table(model, table_name, kind=None):
-    """Yield (containing_module_path, inner_weight_param) for ``table_name``.
+def _pooled_mc_ebc(emb_group):
+    """Return the DEEP-group ``ManagedCollisionEmbeddingBagCollection``."""
+    return emb_group.emb_impls[_BASE_IMPL_KEY].mc_ebc
 
-    Same ``kind`` filter as :func:`_find_mch_modules_for_table`.
-    """
-    for name, m in model.named_modules():
-        if isinstance(m, ManagedCollisionEmbeddingBagCollection):
-            if kind == "sequence":
-                continue
-            ebc = m._embedding_module
-            if table_name in ebc.embedding_bags:
-                yield name, ebc.embedding_bags[table_name].weight
-        elif isinstance(m, ManagedCollisionEmbeddingCollection):
-            if kind == "pooled":
-                continue
-            ec = m._embedding_module
-            if table_name in ec.embeddings:
-                yield name, ec.embeddings[table_name].weight
+
+def _sequence_mc_ec(emb_group, dim):
+    """Return the SEQUENCE-group ``ManagedCollisionEmbeddingCollection`` for ``dim``."""
+    return emb_group.seq_emb_impls[_BASE_IMPL_KEY].mc_ec_dict[str(dim)]
 
 
 # -----------------------------------------------------------------------------
@@ -541,8 +506,10 @@ class DcpRoundTripTests(unittest.TestCase):
         emb_group = _make_emb_group(feature_cfgs, groups)
         model = TrainWrapper(_TestBaseModel(emb_group))
 
-        # Locate and populate the MCH module + inner weight.
-        ((mch_path, mch),) = list(_find_mch_modules_for_table(model, "user_id"))
+        mc_ebc = _pooled_mc_ebc(emb_group)
+        mch = mc_ebc._managed_collision_collection._managed_collision_modules["user_id"]
+        weight = mc_ebc._embedding_module.embedding_bags["user_id"].weight
+
         sorted_raw = mch._buffers["_mch_sorted_raw_ids"].clone()
         sorted_raw[:6] = torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.int64)
         mch._buffers["_mch_sorted_raw_ids"].copy_(sorted_raw)
@@ -552,7 +519,6 @@ class DcpRoundTripTests(unittest.TestCase):
         counts = torch.tensor([1, 2, 3, 4, 5, 6, 0, 0], dtype=torch.int64)
         mch._buffers["_mch_counts"].copy_(counts)
 
-        ((_, weight),) = list(_find_inner_weights_for_table(model, "user_id"))
         with torch.no_grad():
             for r in range(8):
                 weight[r].fill_(float(r))
@@ -686,38 +652,66 @@ class ConvertE2ETests(unittest.TestCase):
         return _TestBaseModel(emb_group)
 
     def _populate_source(self, src_inner):
-        """Populate ZCH state on every MCH-wrapped table.
+        """Populate ZCH state on every MCH-wrapped table via direct attribute access.
 
         For ``shared_lfu`` (two instances), the DEEP and SEQUENCE instances
         get *different* value patterns and remapped permutations so any
         cross-group merge bug would surface as a value mismatch.
         """
-        wrapped = TrainWrapper(src_inner)
+        eg = src_inner.embedding_group
+        pooled = _pooled_mc_ebc(eg)
+        sequence = _sequence_mc_ec(eg, self._DIM)
 
-        # raw_ids = [100, 101, 102, 103] for every table (4 valid out of 8 slots).
-        # ``kind`` discriminates between the pooled (DEEP) and sequence
-        # (SEQUENCE) instances when the same feature appears in both groups.
+        # (table_name, mc_coll, inner_weight, eviction, value_base, remapped)
         plans = [
-            # (table_name, kind, eviction, value_base, remapped)
-            ("shared_lfu", "pooled", "lfu", 10.0, [3, 2, 1, 0]),
-            ("shared_lfu", "sequence", "lfu", 100.0, [0, 1, 2, 3]),
-            ("deep_only_lfu", "pooled", "lfu", 1.0, [2, 0, 1, 3]),
-            ("deep_only_lru", "pooled", "lru", 5.0, [1, 3, 0, 2]),
-            ("seq_only_lru", "sequence", "lru", 50.0, [3, 1, 0, 2]),
+            (
+                "shared_lfu",
+                pooled,
+                pooled._embedding_module.embedding_bags["shared_lfu"].weight,
+                "lfu",
+                10.0,
+                [3, 2, 1, 0],
+            ),
+            (
+                "shared_lfu",
+                sequence,
+                sequence._embedding_module.embeddings["shared_lfu"].weight,
+                "lfu",
+                100.0,
+                [0, 1, 2, 3],
+            ),
+            (
+                "deep_only_lfu",
+                pooled,
+                pooled._embedding_module.embedding_bags["deep_only_lfu"].weight,
+                "lfu",
+                1.0,
+                [2, 0, 1, 3],
+            ),
+            (
+                "deep_only_lru",
+                pooled,
+                pooled._embedding_module.embedding_bags["deep_only_lru"].weight,
+                "lru",
+                5.0,
+                [1, 3, 0, 2],
+            ),
+            (
+                "seq_only_lru",
+                sequence,
+                sequence._embedding_module.embeddings["seq_only_lru"].weight,
+                "lru",
+                50.0,
+                [3, 1, 0, 2],
+            ),
         ]
 
         raw_ids = [100, 101, 102, 103]
 
-        for table_name, kind, eviction, base_val, remapped in plans:
-            matches = list(_find_mch_modules_for_table(wrapped, table_name, kind=kind))
-            self.assertEqual(len(matches), 1, f"{table_name}/{kind}: {matches}")
-            _, mch = matches[0]
-
-            weight_matches = list(
-                _find_inner_weights_for_table(wrapped, table_name, kind=kind)
-            )
-            self.assertEqual(len(weight_matches), 1)
-            _, weight = weight_matches[0]
+        for table_name, mc_coll, weight, eviction, base_val, remapped in plans:
+            mch = mc_coll._managed_collision_collection._managed_collision_modules[
+                table_name
+            ]
 
             # _mch_sorted_raw_ids: 4 valid + 4 sentinel.
             sorted_raw = mch._buffers["_mch_sorted_raw_ids"].clone()
