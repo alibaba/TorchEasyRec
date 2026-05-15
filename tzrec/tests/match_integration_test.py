@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -368,15 +368,8 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
-    @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval(self):
-        # Train + eval end-to-end on real data; verifies the full HSTUMatch
-        # pipeline (UIHPreprocessor -> HSTUPositionalEncoder -> STUStack ->
-        # OutputPostprocessor + the row-(B-1) suffix candidate scoring).
-        # Export + predict coverage lives in hstu_test (FX_TRACE / JIT_SCRIPT
-        # graph types) because sequence_id_feature parsing requires a
-        # sampler-fed delimited string and Mode.PREDICT has no sampler.
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_kuairand_1k.config",
             self.test_dir,
