@@ -212,20 +212,20 @@ class DeriveScoresTests(unittest.TestCase):
                 [100, 300, 400],
             ),
             (
-                "lfu_to_step_falls_back_to_counts",
+                "lfu_source_to_step_target_returns_none",
                 {"_mch_counts": [5, 6, 7, 8]},
                 "lfu",
                 "STEP",
                 [True, True, True, True],
-                [5, 6, 7, 8],
+                None,
             ),
             (
-                "lru_to_lfu_falls_back_to_last_access",
+                "lru_source_to_lfu_target_returns_none",
                 {"_mch_last_access_iter": [1, 2, 3, 4]},
                 "lru",
                 "LFU",
                 [True, True, True, True],
-                [1, 2, 3, 4],
+                None,
             ),
             (
                 "distance_lfu_to_lfu_prefers_counts",
@@ -824,13 +824,19 @@ class ConvertE2ETests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(out, "optimizer", ".metadata")))
 
         # ----- per-table file presence -----
-        # LFU/STEP targets: scores files present. TIMESTAMP target: scores absent.
+        # Scores files are present only when source eviction policy
+        # semantically matches the target score_strategy.
         score_expected = {
-            (pooled_mod_path, "shared_lfu"): True,  # LFU → STEP (proxy)
-            (pooled_mod_path, "deep_only_lfu"): True,  # LFU → LFU
-            (pooled_mod_path, "deep_only_lru"): False,  # LRU → TIMESTAMP omit
-            (seq_mod_path, "shared_lfu"): True,  # LFU → STEP (proxy)
-            (seq_mod_path, "seq_only_lru"): True,  # LRU → STEP direct
+            # LFU source + STEP target -> cross-policy, omit (v4 fix #1).
+            (pooled_mod_path, "shared_lfu"): False,
+            # LFU source + LFU target -> migrate counts.
+            (pooled_mod_path, "deep_only_lfu"): True,
+            # LRU source + TIMESTAMP target -> omit.
+            (pooled_mod_path, "deep_only_lru"): False,
+            # LFU source + STEP target -> cross-policy, omit (v4 fix #1).
+            (seq_mod_path, "shared_lfu"): False,
+            # LRU source + STEP target -> migrate last_access.
+            (seq_mod_path, "seq_only_lru"): True,
         }
         for (mod_path, table), should_have_scores in score_expected.items():
             shard_dir = os.path.join(out, "dynamicemb", mod_path)

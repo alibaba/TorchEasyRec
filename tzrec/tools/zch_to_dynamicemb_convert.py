@@ -35,6 +35,12 @@ Output layout (under ``<save_dir>/model.ckpt-0/``)::
     meta                         # {load_model, load_optim,
                                  #  dynamicemb_load_table_names,
                                  #  dynamicemb_load_optim=false}
+
+Memory: one ZCH table is processed at a time, but the source DCP load
+materializes the *unsharded* weight plus per-table MCH state in host RAM.
+Peak host memory ≈ ``zch_size * (embedding_dim * 4 + 24)`` bytes per
+table (e.g. a 100M x 128 fp32 table is ~50 GB). Scale up the conversion
+host accordingly; streaming-load is not implemented in v1.
 """
 
 import argparse
@@ -289,6 +295,24 @@ def _find_dynamicemb_tables(
             # ``path`` here is exactly the group-impl path (with trailing dot)
             # passed in by the BFS as the prefix to ``parameter_constraints``.
             group_key = _normalize_group_key(path.rstrip("."))
+
+            # Read embedding_dim from the impl's actual EBC/EC configs --
+            # ``opts.dim`` is unset before the planner runs, so the v3 fallback
+            # of ``int(opts.dim) if opts.dim else -1`` silently allowed dim
+            # mismatches through.
+            name_to_dim: Dict[str, int] = {}
+            for attr in ("ebc", "ebc_user"):
+                coll = getattr(m, attr, None)
+                if coll is not None:
+                    for c in coll.embedding_bag_configs():
+                        name_to_dim[c.name] = int(c.embedding_dim)
+            for attr in ("ec_dict", "ec_dict_user"):
+                d = getattr(m, attr, None)
+                if d is not None:
+                    for ec in d.values():
+                        for c in ec.embedding_configs():
+                            name_to_dim[c.name] = int(c.embedding_dim)
+
             for fqn, const in m.parameter_constraints(path).items():
                 if not isinstance(const, DynamicEmbParameterConstraints):
                     continue
@@ -301,6 +325,12 @@ def _find_dynamicemb_tables(
                     else "TIMESTAMP"
                 )
                 dist_type = getattr(opts, "dist_type", None) or "roundrobin"
+                if emb_name not in name_to_dim:
+                    raise RuntimeError(
+                        f"Target dynamicemb table '{emb_name}' under group "
+                        f"'{group_key}' has no matching embedding config; "
+                        "check the target pipeline.config."
+                    )
                 key = (group_key, emb_name)
                 if key in out:
                     raise RuntimeError(
@@ -312,7 +342,7 @@ def _find_dynamicemb_tables(
                     group_key=group_key,
                     emb_name=emb_name,
                     full_mod_path=full_mod_path,
-                    embedding_dim=int(opts.dim) if opts.dim else -1,
+                    embedding_dim=name_to_dim[emb_name],
                     score_strategy=score_strategy,
                     dist_type=dist_type,
                 )
@@ -398,32 +428,36 @@ def _derive_scores(
     NO_EVICTION ignores scores). The caller then omits score files for the
     affected table and dynamicemb cold-starts scores at load.
 
-    Also returns ``None`` when the source MCH module has no eviction
-    metadata at all (eviction_policy='none') -- nothing to migrate.
+    Cross-policy combinations also return ``None`` with a warning: there is
+    no faithful unit mapping from LFU counts to STEP iteration numbers (or
+    vice versa). Only same-semantic source/target pairs migrate:
 
-    Otherwise returns an int64 tensor of length ``valid_mask.sum()`` where
-    each entry is taken from the per-slot MCH metadata that best matches
-    the target strategy (counts for LFU, last_access_iter for STEP).
+      - target=LFU   ← source has ``_mch_counts`` (LFU or DistanceLFU)
+      - target=STEP  ← source has ``_mch_last_access_iter`` (LRU or DistanceLFU)
     """
     target = (target_score_strategy or "").upper()
     if target not in _SCORES_MIGRATABLE:
         return None
 
-    counts = metadata_tensors.get("_mch_counts")
-    last = metadata_tensors.get("_mch_last_access_iter")
-
     if target == "LFU":
-        preferred = counts if counts is not None else last
-    else:  # STEP
-        preferred = last if last is not None else counts
+        src = metadata_tensors.get("_mch_counts")
+        if src is None:
+            logger.warning(
+                f"Target score_strategy=LFU but source has no _mch_counts "
+                f"(eviction_policy={eviction_policy!r}); omitting score files."
+            )
+            return None
+        return src[valid_mask].to(_SCORE_DTYPE)
 
-    if preferred is None:
+    # target == "STEP"
+    src = metadata_tensors.get("_mch_last_access_iter")
+    if src is None:
         logger.warning(
-            f"ZCH module has no MCH eviction metadata "
+            f"Target score_strategy=STEP but source has no _mch_last_access_iter "
             f"(eviction_policy={eviction_policy!r}); omitting score files."
         )
         return None
-    return preferred[valid_mask].to(_SCORE_DTYPE)
+    return src[valid_mask].to(_SCORE_DTYPE)
 
 
 def _gather_and_shard_writes(
@@ -455,34 +489,46 @@ def _gather_and_shard_writes(
     values_np = values.to(_VALUE_DTYPE).cpu().numpy()
     scores_np = scores.to(_SCORE_DTYPE).cpu().numpy() if scores is not None else None
 
+    # Bucket-sort by destination rank in O(N) instead of W mask scans. The
+    # stable argsort groups same-rank entries together so per-rank slices
+    # (views, not copies) are contiguous in the rank order. Empty shards
+    # still produce zero-byte files because the slice is empty.
     keys_mod = raw_ids_np % world_size if world_size > 1 else np.zeros_like(raw_ids_np)
+    order = np.argsort(keys_mod, kind="stable")
+    sizes = np.bincount(keys_mod, minlength=world_size)
+    ends = np.cumsum(sizes)
+    starts = ends - sizes
+    raw_ids_sorted = raw_ids_np[order]
+    values_sorted = values_np[order]
+    scores_sorted = scores_np[order] if scores_np is not None else None
+
     for rank in range(world_size):
-        mask = keys_mod == rank
+        s, e = int(starts[rank]), int(ends[rank])
         with open(
             encode_checkpoint_file_path(
                 save_path, table_name, rank, world_size, "keys"
             ),
             "wb",
         ) as f:
-            if mask.any():
-                f.write(raw_ids_np[mask].astype(np.int64).tobytes())
+            if e > s:
+                f.write(raw_ids_sorted[s:e].astype(np.int64).tobytes())
         with open(
             encode_checkpoint_file_path(
                 save_path, table_name, rank, world_size, "values"
             ),
             "wb",
         ) as f:
-            if mask.any():
-                f.write(values_np[mask].astype(np.float32).tobytes())
-        if scores_np is not None:
+            if e > s:
+                f.write(values_sorted[s:e].astype(np.float32).tobytes())
+        if scores_sorted is not None:
             with open(
                 encode_checkpoint_file_path(
                     save_path, table_name, rank, world_size, "scores"
                 ),
                 "wb",
             ) as f:
-                if mask.any():
-                    f.write(scores_np[mask].astype(np.int64).tobytes())
+                if e > s:
+                    f.write(scores_sorted[s:e].astype(np.int64).tobytes())
 
 
 def _copy_dcp_dir(src: str, dst: str) -> None:
@@ -519,13 +565,21 @@ def convert(
     from dynamicemb.batched_dynamicemb_tables import encode_meta_json_file_path
 
     out_dir = os.path.join(save_dir, "model.ckpt-0")
-    os.makedirs(out_dir, exist_ok=True)
+    # Fail loudly rather than silently mixing fresh shards with stale ones --
+    # per-rank shard filenames embed ``world_size_W``, so a re-run with a
+    # different ``--world_size`` would leave both sets co-resident.
+    if os.path.exists(out_dir):
+        raise RuntimeError(
+            f"Output directory {out_dir} already exists. Remove it before re-running."
+        )
+    os.makedirs(out_dir, exist_ok=False)
 
     # 1. Auto-detect world_size from the source DCP if not provided.
     if world_size is None:
         world_size = checkpoint_util._ckpt_world_size(source_model_dir)
         logger.info(f"Auto-detected source world_size={world_size}.")
-    assert world_size >= 1
+    if world_size < 1:
+        raise ValueError(f"--world_size must be >= 1, got {world_size}.")
 
     # 2. Build source + target models on CPU.
     src_pipeline = config_util.load_pipeline_config(source_pipeline_config_path)
@@ -577,7 +631,7 @@ def convert(
                 f"table in source. Source ZCH tables: {sorted(src_zch)}."
             )
         zch = src_zch[key]
-        if demb.embedding_dim > 0 and demb.embedding_dim != zch.embedding_dim:
+        if demb.embedding_dim != zch.embedding_dim:
             raise RuntimeError(
                 f"Table {key}: source dim={zch.embedding_dim} vs target "
                 f"dim={demb.embedding_dim}."
@@ -734,8 +788,7 @@ def _parse_args() -> argparse.Namespace:
             "source checkpoint's world size (auto-detected from .distcp files)."
         ),
     )
-    args, _ = parser.parse_known_args()
-    return args
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
