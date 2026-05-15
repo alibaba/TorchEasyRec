@@ -115,16 +115,12 @@ python -m tzrec.tools.zch_to_dynamicemb_convert \
 
 ### 迁移内容
 
-- **Embedding**: 每个 ZCH 表中已学到的 embedding 向量（按 `_mch_remapped_ids_mapping` 索引）会按 `raw_id % world_size` 切分写入 dynamicemb 的每个 rank 分片。
-- **分数（Scores）**: 仅当目标 `score_strategy ∈ {LFU, STEP}` 时会写入分数文件。
-  - 来源 LFU 策略：使用 `_mch_counts`
-  - 来源 LRU 策略：使用 `_mch_last_access_iter`
-  - 来源 DistanceLFU 策略：目标 LFU 使用 counts，目标 STEP 使用 last_access
-  - 目标 `TIMESTAMP / CUSTOMIZED / NO_EVICTION`：跳过分数迁移，dynamicemb 在加载后自行初始化分数
-- **非 ZCH 部分**: 稠密层、非 ZCH embedding 及其 optimizer state 通过整目录复制 `model/` 与 `optimizer/` 保留，加载时 `PartialLoadPlanner` 会自动跳过新模型中已不存在的 MCH/EBC 残留键。
+- **Embedding**: ZCH 表中已学到的 embedding 向量会迁移到 dynamicemb。
+- **分数（Scores）**: 仅当目标 `score_strategy` 为 `LFU` 或 `STEP` 时迁移；其它策略 dynamicemb 会自行初始化分数。
+- **非 ZCH 部分**: 稠密层、非 ZCH embedding 及其对应 optimizer state 直接保留。
 
 ### 未迁移内容
 
-- **MCH-EBC 的 optimizer state**: 不会迁移到 dynamicemb 的 `opt_values`，转换后的条目首次更新时由 dynamicemb 自行冷启动 optimizer state。
+- ZCH embedding 的 optimizer state 不迁移，dynamicemb 加载后自行冷启动。
 
 ZCH 本身的配置详见 [ZCH](./zch.md)。
