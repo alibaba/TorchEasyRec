@@ -27,7 +27,7 @@ from tzrec.models.model import TrainWrapper
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.protos import feature_pb2, model_pb2
 from tzrec.tests import utils
-from tzrec.tools import zch_to_dynamicemb_convert as conv
+from tzrec.tools.dynamicemb import zch_to_dynamicemb_convert as conv
 from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.test_util import gpu_unavailable
@@ -600,7 +600,7 @@ class ConvertE2ETests(unittest.TestCase):
         # 2. Run the converter via the actual CLI, no mocks.
         converted_dir = os.path.join(self.test_dir, "converted")
         cmd_str = (
-            "PYTHONPATH=. python -m tzrec.tools.zch_to_dynamicemb_convert "
+            "PYTHONPATH=. python -m tzrec.tools.dynamicemb.zch_to_dynamicemb_convert "
             f"--source_checkpoint_path {src_ckpt_path} "
             f"--source_pipeline_config_path {_SRC_CONFIG} "
             f"--target_pipeline_config_path {_TGT_CONFIG} "
