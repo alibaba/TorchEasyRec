@@ -16,7 +16,6 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.nn import functional as F
 
 
 
@@ -28,9 +27,6 @@ def _squared_euclidean_distance(
     chunk_size: int = 50000,
 ) -> torch.Tensor:
     """Squared L2 distance with chunked computation for memory efficiency.
-
-    Reference: al_sid/SID_generation/rqvae_embed/grid_kmeans.py
-        ::squared_euclidean_distance
 
     Args:
         x (Tensor): data points, shape (N, D).
@@ -56,9 +52,6 @@ def _kmeans_plus_plus(
 
     Selects initial centroids via distance-weighted probability sampling
     to ensure well-spread starting points.
-
-    Reference: al_sid/SID_generation/rqvae_embed/grid_kmeans.py
-        ::kmeans_plus_plus
 
     Args:
         data (Tensor): data points, shape (N, D).
@@ -96,9 +89,6 @@ class MiniBatchKMeans(nn.Module):
 
     Online K-Means (Sculley 2010) with KMeans++ initialization.
     Supports distributed training via all-reduce synchronization.
-
-    Reference: al_sid/SID_generation/rqvae_embed/grid_kmeans.py
-        ::MiniBatchKMeans
 
     Update rule for each cluster c in current batch:
         eta_c = batch_count_c / total_count_c
@@ -289,15 +279,22 @@ class MiniBatchKMeans(nn.Module):
         # Assign to nearest centroid
         assignments = self.predict(batch)
 
-        # Accumulate per-cluster statistics
-        one_hot = F.one_hot(assignments, self.n_clusters).float()  # (B, K)
-        batch_counts = one_hot.sum(dim=0)  # (K,)
-        batch_sums = one_hot.t() @ batch  # (K, D)
+        # Accumulate per-cluster statistics without materialising a [B, K]
+        # one-hot (would be ~128 MB at K=4096, B=8192).
+        K = self.n_clusters
+        D = batch.shape[1]
+        batch_counts = torch.bincount(assignments, minlength=K).to(batch.dtype)
+        batch_sums = torch.zeros(
+            K, D, dtype=batch.dtype, device=batch.device
+        ).index_add_(0, assignments, batch)
 
-        # Distributed synchronization
+        # One coalesced all_reduce instead of two: pack counts as a final
+        # extra column on batch_sums, reduce, then split back.
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(batch_counts, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_sums, op=dist.ReduceOp.SUM)
+            packed = torch.cat([batch_sums, batch_counts.unsqueeze(1)], dim=1)
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            batch_sums = packed[:, :D]
+            batch_counts = packed[:, D]
 
         # Update centroids
         self.cluster_counts += batch_counts

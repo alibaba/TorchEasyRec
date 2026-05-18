@@ -25,8 +25,6 @@ class GatherLayer(torch.autograd.Function):
     Standard ``dist.all_gather`` detaches gradients; this custom
     ``autograd.Function`` keeps the computation graph connected so
     that contrastive losses can backpropagate through gathered tensors.
-
-    Reference: al_sid/SID_generation/utils/dist_utils.py::GatherLayer
     """
 
     @staticmethod
@@ -50,9 +48,6 @@ def _all_gather_with_grad(
     In single-process mode, returns input tensors unchanged.
     In multi-process mode, uses GatherLayer for backward-compatible
     all_gather.
-
-    Reference: al_sid/SID_generation/utils/dist_utils.py
-        ::all_gather_batch_with_grad
 
     Args:
         tensors (List[Tensor]): list of tensors to gather.
@@ -85,8 +80,6 @@ class CLIPLoss(nn.Module):
 
     Supports distributed all_gather to aggregate global batch.
 
-    Reference: al_sid/SID_generation/rqvae_embed/rqvae_clip.py::CLIPLoss
-
     Input dict keys:
         'image_embed':      (B, D)  quantized output of first feature
         'text_embed':       (B, D)  quantized output of second feature
@@ -108,6 +101,7 @@ class CLIPLoss(nn.Module):
         super().__init__()
         self.labels: Optional[torch.Tensor] = None
         self.last_local_batch_size: Optional[int] = None
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
 
     def forward(
         self, outputs: Dict[str, torch.Tensor]
@@ -132,8 +126,7 @@ class CLIPLoss(nn.Module):
 
         # Update labels when batch size changes (multi-GPU offset)
         if local_batch_size != self.last_local_batch_size:
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            self.labels = local_batch_size * rank + torch.arange(
+            self.labels = local_batch_size * self._rank + torch.arange(
                 local_batch_size, device=image_embed.device
             )
             self.last_local_batch_size = local_batch_size
@@ -177,22 +170,20 @@ class CLIPLoss(nn.Module):
 
         loss = (loss_self + loss_ori + loss_cl) / 3
 
-        # Compute accuracy
-        with torch.no_grad():
-            pred1 = torch.argmax(logits_img_self, dim=-1)
-            correct1 = pred1.eq(self.labels).sum()
-            pred2 = torch.argmax(logits_txt_self, dim=-1)
-            correct2 = pred2.eq(self.labels).sum()
-            pred3 = torch.argmax(logits_img_ori, dim=-1)
-            correct3 = pred3.eq(self.labels).sum()
-            pred4 = torch.argmax(logits_txt_ori, dim=-1)
-            correct4 = pred4.eq(self.labels).sum()
-            acc = (
-                100
-                * (correct1 + correct2 + correct3 + correct4)
-                / local_batch_size
-                / 4
-            )
+        # Retrieval accuracy is a diagnostic, not a training signal — only
+        # spend the four argmax + eq + sum reductions in eval (training-loop
+        # accuracy can be reconstructed from the eval pass).
+        if self.training:
+            acc = torch.zeros((), device=loss.device)
+        else:
+            with torch.no_grad():
+                correct = (
+                    logits_img_self.argmax(-1).eq(self.labels).sum()
+                    + logits_txt_self.argmax(-1).eq(self.labels).sum()
+                    + logits_img_ori.argmax(-1).eq(self.labels).sum()
+                    + logits_txt_ori.argmax(-1).eq(self.labels).sum()
+                )
+                acc = 100 * correct / (local_batch_size * 4)
 
         return {
             "clip_loss": loss,
@@ -211,14 +202,13 @@ class MaskedCLIPLoss(nn.Module):
     negatives.  This module applies row and column masks to achieve
     selective contrastive learning without data-dependent branching,
     ensuring ``torch.compile`` compatibility.
-
-    Reference: masked_clip_design.md §6.1
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.labels: Optional[torch.Tensor] = None
         self.last_local_batch_size: Optional[int] = None
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
 
     @staticmethod
     def _gather_bool_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -278,8 +268,7 @@ class MaskedCLIPLoss(nn.Module):
 
         # Update labels when batch size changes (multi-GPU offset)
         if local_batch_size != self.last_local_batch_size:
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            self.labels = local_batch_size * rank + torch.arange(
+            self.labels = local_batch_size * self._rank + torch.arange(
                 local_batch_size, device=image_embed.device
             )
             self.last_local_batch_size = local_batch_size
@@ -337,22 +326,20 @@ class MaskedCLIPLoss(nn.Module):
 
         clip_loss = (loss_self + loss_ori + loss_cl) / 3
 
-        # --- Clip-only accuracy: only count clip rows ---
-        with torch.no_grad():
-            n_valid = clip_mask.float().sum().clamp(min=1)
-            correct1 = (
-                logits_img_self.argmax(-1).eq(safe_labels) & clip_mask
-            ).sum()
-            correct2 = (
-                logits_txt_self.argmax(-1).eq(safe_labels) & clip_mask
-            ).sum()
-            correct3 = (
-                logits_img_ori.argmax(-1).eq(safe_labels) & clip_mask
-            ).sum()
-            correct4 = (
-                logits_txt_ori.argmax(-1).eq(safe_labels) & clip_mask
-            ).sum()
-            acc = 100 * (correct1 + correct2 + correct3 + correct4) / n_valid / 4
+        # Retrieval accuracy is diagnostic-only; skip the four argmax+eq+sum
+        # reductions during training (recover via the eval pass).
+        if self.training:
+            acc = torch.zeros((), device=clip_loss.device)
+        else:
+            with torch.no_grad():
+                n_valid = clip_mask.float().sum().clamp(min=1)
+                correct = (
+                    (logits_img_self.argmax(-1).eq(safe_labels) & clip_mask).sum()
+                    + (logits_txt_self.argmax(-1).eq(safe_labels) & clip_mask).sum()
+                    + (logits_img_ori.argmax(-1).eq(safe_labels) & clip_mask).sum()
+                    + (logits_txt_ori.argmax(-1).eq(safe_labels) & clip_mask).sum()
+                )
+                acc = 100 * correct / (n_valid * 4)
 
         return {
             "clip_loss": clip_loss,

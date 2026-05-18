@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
+from tzrec.modules.sid_generation.kmeans import _squared_euclidean_distance
 from tzrec.modules.sid_generation.types import (
     QuantizeForwardMode,
     QuantizeOutput,
@@ -55,8 +56,6 @@ def _sinkhorn(
     Transforms a distance matrix into a soft assignment matrix via exponential
     kernel and alternating row-column normalization, approximating a doubly
     stochastic matrix to ensure uniform codebook utilization.
-
-    Reference: al_sid/SID_generation/rqvae_embed/quantizations.py::sinkhorn
 
     Args:
         cost (Tensor): distance matrix, shape (B, K) where K is codebook size.
@@ -114,8 +113,6 @@ class VectorQuantize(nn.Module):
 
     Supports EMA codebook updates, Sinkhorn uniform assignment, dead code
     restart, and multiple distance metrics.
-
-    Reference: al_sid/SID_generation/rqvae_embed/quantizations.py::VQEmbedding
 
     Args:
         embed_dim (int): dimension of each codebook embedding.
@@ -197,14 +194,8 @@ class VectorQuantize(nn.Module):
         codebook = self.embedding.weight  # (n_embed, D)
 
         if self.distance_type == "l2":
-            # ||x - e||^2 = ||x||^2 + ||e||^2 - 2 * x @ e^T
-            distances = (
-                x.pow(2).sum(dim=1, keepdim=True)
-                + codebook.pow(2).sum(dim=1, keepdim=True).t()
-                - 2.0 * x @ codebook.t()
-            )
+            distances = _squared_euclidean_distance(x, codebook)
         elif self.distance_type == "cosine":
-            # Cosine distance: -normalize(x) @ normalize(c)^T
             x_norm = F.normalize(x, p=2, dim=1)
             codebook_norm = F.normalize(codebook, p=2, dim=1)
             distances = -torch.matmul(x_norm, codebook_norm.t())
@@ -236,8 +227,9 @@ class VectorQuantize(nn.Module):
         distances = self._compute_distances(x)  # (B, n_embed)
 
         if self.training and self.use_sinkhorn:
-            # z-score normalization + shift to non-negative (critical!)
-            distances = (distances - distances.mean()) / (distances.std() + 1e-6)
+            # Sinkhorn requires non-negative cost; z-score then shift.
+            var, mean = torch.var_mean(distances, unbiased=False)
+            distances = (distances - mean) * var.add(1e-12).rsqrt()
             distances = distances - distances.min()
 
             # Sinkhorn optimal-transport assignment
@@ -301,28 +293,32 @@ class VectorQuantize(nn.Module):
 
         x_flat = x.reshape(-1, embed_dim)
         ids_flat = ids.reshape(-1)
-        n_vectors = x_flat.shape[0]
 
-        # One-hot scatter: (n_embed, n_vectors)
-        one_hot = x_flat.new_zeros(n_embed, n_vectors)
-        one_hot.scatter_(
-            dim=0,
-            index=ids_flat.unsqueeze(0),
-            src=x_flat.new_ones(1, n_vectors),
-        )
-
-        # Per-row EMA mask: masked rows contribute zero
+        # Per-row EMA mask: zero out masked rows before accumulation so they
+        # contribute neither to cluster_size nor to vectors_sum.
         if ema_mask is not None:
-            # ema_mask: (B,) float, 1.0 = participate, 0.0 = skip
-            one_hot = one_hot * ema_mask.reshape(1, -1)  # (n_embed, B) * (1, B)
+            ema_mask_flat = ema_mask.reshape(-1)
+            x_for_sum = x_flat * ema_mask_flat.unsqueeze(1)
+            cluster_size = torch.zeros(
+                n_embed, dtype=x_flat.dtype, device=x_flat.device
+            ).index_add_(0, ids_flat, ema_mask_flat.to(x_flat.dtype))
+        else:
+            x_for_sum = x_flat
+            cluster_size = torch.bincount(
+                ids_flat, minlength=n_embed
+            ).to(x_flat.dtype)
 
-        cluster_size = one_hot.sum(dim=1)            # (n_embed,)
-        vectors_sum = one_hot @ x_flat               # (n_embed, embed_dim)
+        vectors_sum = torch.zeros(
+            n_embed, embed_dim, dtype=x_flat.dtype, device=x_flat.device
+        ).index_add_(0, ids_flat, x_for_sum)
 
-        # Distributed synchronization
+        # One coalesced all_reduce instead of two: pack cluster_size as a
+        # final extra column on vectors_sum, reduce, then split back.
         if dist.is_initialized():
-            dist.all_reduce(vectors_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(cluster_size, op=dist.ReduceOp.SUM)
+            packed = torch.cat([vectors_sum, cluster_size.unsqueeze(1)], dim=1)
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            vectors_sum = packed[:, :embed_dim]
+            cluster_size = packed[:, embed_dim]
 
         # EMA decay update
         self.cluster_size_ema.mul_(self.ema_decay).add_(
@@ -332,8 +328,10 @@ class VectorQuantize(nn.Module):
             vectors_sum, alpha=1 - self.ema_decay
         )
 
-        # Restart unused codes: replace dead codes with random batch samples
-        if self.restart_unused_codes:
+        # Restart unused codes: only when there is something to restart.
+        # Skipping the randperm + broadcast every step is the common case.
+        if self.restart_unused_codes and (self.cluster_size_ema < 1).any():
+            n_vectors = x_flat.shape[0]
             vectors_for_restart = x_flat
             if n_vectors < n_embed:
                 vectors_for_restart = self._tile_with_noise(
@@ -348,7 +346,6 @@ class VectorQuantize(nn.Module):
             if dist.is_initialized():
                 dist.broadcast(random_vectors, 0)
 
-            # usage mask: 1 = alive, 0 = dead (cluster_size_ema < 1)
             usage = (self.cluster_size_ema.view(-1, 1) >= 1).float()
             self.embed_ema.mul_(usage).add_(random_vectors * (1 - usage))
             self.cluster_size_ema.mul_(usage.view(-1))
@@ -418,29 +415,31 @@ class VectorQuantize(nn.Module):
             self._update_ema_buffers(x, ids, ema_mask)
 
         # Step 5: compute differentiable embedding
-        if self.training:
-            if self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-                weights = _gumbel_softmax_sample(
-                    -distances, temperature=temperature, hard=True
-                )
-                emb = weights @ self.embedding.weight
-            elif self.forward_mode == QuantizeForwardMode.STE:
-                emb = self.embedding(ids)
-                # Straight-Through Estimator: gradient passes through
-                emb = x + (emb - x).detach()
-            else:
-                raise ValueError(
-                    f"Unsupported forward mode: {self.forward_mode}"
-                )
+        # Single embedding lookup feeds both the differentiable output and
+        # the commitment loss (Gumbel takes a different path entirely).
+        if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
+            weights = _gumbel_softmax_sample(
+                -distances, temperature=temperature, hard=True
+            )
+            emb = weights @ self.embedding.weight
+            quantized_for_loss = self.embedding(ids)
+        elif self.training and self.forward_mode == QuantizeForwardMode.STE:
+            quantized_for_loss = self.embedding(ids)
+            # Straight-Through Estimator: gradient passes through
+            emb = x + (quantized_for_loss - x).detach()
+        elif self.training:
+            raise ValueError(
+                f"Unsupported forward mode: {self.forward_mode}"
+            )
         else:
-            emb = self.embedding(ids)
+            quantized_for_loss = self.embedding(ids)
+            emb = quantized_for_loss
 
         # Step 4 continued: refresh weights from EMA (after embedding lookup)
         if self.training and self.use_ema:
             self._update_embedding_from_ema()
 
         # Step 6: commitment loss
-        quantized_for_loss = self.embedding(ids)
         e_latent_loss = F.mse_loss(x, quantized_for_loss.detach())
         if self.use_ema:
             # EMA mode: codebook not updated via gradient, no q_latent_loss

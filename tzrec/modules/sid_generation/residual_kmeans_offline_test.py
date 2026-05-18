@@ -14,7 +14,6 @@
 Skipped automatically if ``faiss`` is not importable.
 """
 
-import io
 import unittest
 
 import torch

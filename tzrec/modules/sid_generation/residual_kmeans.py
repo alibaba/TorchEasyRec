@@ -19,6 +19,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from tzrec.modules.sid_generation.kmeans import MiniBatchKMeans
+from tzrec.utils.logging_util import logger
 
 VALID_TRAIN_MODES = ("online", "offline_faiss")
 
@@ -36,9 +37,6 @@ class ResidualKMeans(nn.Module):
         output = sum of all quantized_i
 
     Semantic ID = (code_0, code_1, ..., code_{n_layers-1})
-
-    Reference: al_sid/SID_generation/rqvae_embed/grid_kmeans.py
-        ::ResidualMiniBatchKMeans
 
     Args:
         embed_dim (int): feature dimension.
@@ -239,7 +237,7 @@ class ResidualKMeans(nn.Module):
             f"got {self.train_mode}"
         )
         try:
-            import faiss  # noqa: F401
+            import faiss
         except ImportError as e:
             raise ImportError(
                 "faiss is required for offline_faiss mode. Install via "
@@ -268,7 +266,8 @@ class ResidualKMeans(nn.Module):
         N, D = x.shape
         out = np.zeros((N, D), dtype=np.float32)
 
-        # 对齐OneRec: 循环外创建一次 kmeans 实例复用
+        # Reuse one Kmeans instance across all layers (matches OneRec impl):
+        # rebuilding the FAISS object per layer doubles index-init cost.
         n_embed = self.n_embed_list[0]
         kmeans = faiss.Kmeans(
             self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
@@ -279,16 +278,14 @@ class ResidualKMeans(nn.Module):
         SEARCH_CHUNK = 500_000
 
         for layer_idx in range(self.n_layers):
-            # ---- normalise residuals in-place (saves N×D allocation) ----
             if self.normalize_residuals:
                 norms = np.linalg.norm(x, axis=1, keepdims=True)
                 np.maximum(norms, 1e-8, out=norms)
                 x /= norms                             # in-place
 
-            # ---- FAISS train (internally subsamples) ----
             kmeans.train(x)
 
-            # ---- chunked search + quantize + residual (in-place) ----
+            # reduce memory usage
             for start in range(0, N, SEARCH_CHUNK):
                 end = min(start + SEARCH_CHUNK, N)
                 _, idx = kmeans.index.search(x[start:end], 1)
@@ -297,31 +294,28 @@ class ResidualKMeans(nn.Module):
                 x[start:end] -= q                       # residual
                 del idx, q
 
-            # ---- verbose diagnostic ----
             if verbose:
                 out_t = torch.from_numpy(out)
                 ref_t = torch.from_numpy(out + x)       # x_in = out + residual
-                print(
-                    f"[ResidualKMeans][offline_faiss][layer {layer_idx}] "
-                    f"{self._calc_loss(ref_t, out_t)}"
+                logger.info(
+                    "[ResidualKMeans][offline_faiss][layer %d] %s",
+                    layer_idx, self._calc_loss(ref_t, out_t),
                 )
                 del out_t, ref_t
 
             centroids_t = torch.from_numpy(kmeans.centroids.copy())
             self.layers[layer_idx].load_centroids_(centroids_t)
             if verbose:
-                print(
-                    f"[ResidualKMeans][offline_faiss] layer {layer_idx} finished"
+                logger.info(
+                    "[ResidualKMeans][offline_faiss] layer %d finished",
+                    layer_idx,
                 )
 
     @staticmethod
     def _calc_loss(
         x: torch.Tensor, out: torch.Tensor, epsilon: float = 1e-4
     ) -> Dict[str, float]:
-        """Reconstruction loss diagnostics (MSE + relative L1).
-
-        Mirrors ``OpenOneRec/tokenizer/res_kmeans.py::ResKmeans.calc_loss``.
-        """
+        """Reconstruction loss diagnostics (MSE + relative L1)."""
         loss = ((out - x) ** 2).mean()
         rel_loss = (
             torch.abs(x - out)
@@ -337,9 +331,6 @@ class RQKMeans(nn.Module):
 
     No Encoder/Decoder — directly clusters input vectors via residual
     K-Means, updating centroids online without gradient backpropagation.
-
-    Reference: al_sid/SID_generation/rqvae_embed/grid_kmeans.py
-        ::ResidualMiniBatchKMeans (top-level usage)
 
     Args:
         embed_dim (int): feature dimension. Default: 64.

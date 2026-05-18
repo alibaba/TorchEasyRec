@@ -35,9 +35,6 @@ class RQVAE(nn.Module):
     ReLU activation between hidden layers. Decoder reverses hidden_dims
     for symmetric structure.
 
-    Reference: al_sid/SID_generation/rqvae_embed/rqvae.py -> RQVAE_EMBED
-               al_sid/SID_generation/rqvae_embed/rqvae_clip.py -> RQVAE_EMBED_CLIP
-
     Args:
         input_dim (int): original embedding dimension. Default: 512.
         embed_dim (int): latent space dimension. Default: 64.

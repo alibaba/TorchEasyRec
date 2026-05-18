@@ -25,22 +25,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torchmetrics
 from google.protobuf.json_format import MessageToDict
 from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.models._sid_helpers import parse_int_list
 from tzrec.models.model import BaseModel
 from tzrec.modules.sid_generation import RQKMeans
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.logging_util import logger
-
-
-def _parse_int_list(s: str) -> List[int]:
-    """Parse comma-separated int string, e.g. '256,128' -> [256, 128]."""
-    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
 def _recon_loss(
@@ -150,7 +145,7 @@ class SidRqkmeans(BaseModel):
         assert cfg.codebook, (
             "codebook must be set, e.g. '256,256,256'"
         )
-        n_embed_list = _parse_int_list(cfg.codebook)
+        n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
         # Resolve new fields with backward compatibility:

@@ -24,19 +24,10 @@ from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.models._sid_helpers import parse_float_list, parse_int_list
 from tzrec.models.model import BaseModel
 from tzrec.modules.sid_generation import RQVAE
 from tzrec.protos.model_pb2 import ModelConfig
-
-
-def _parse_int_list(s: str) -> List[int]:
-    """Parse comma-separated int string, e.g. '256,128' -> [256, 128]."""
-    return [int(x.strip()) for x in s.split(",") if x.strip()]
-
-
-def _parse_float_list(s: str) -> List[float]:
-    """Parse comma-separated float string, e.g. '1.0,0.5' -> [1.0, 0.5]."""
-    return [float(x.strip()) for x in s.split(",") if x.strip()]
 
 
 class SidRqvae(BaseModel):
@@ -70,15 +61,15 @@ class SidRqvae(BaseModel):
             cfg.clip_config.clip_feature_name if self._use_clip else None
         )
 
-        hidden_dims = _parse_int_list(cfg.hidden_dims) if cfg.hidden_dims else None
+        hidden_dims = parse_int_list(cfg.hidden_dims) if cfg.hidden_dims else None
         latent_weight = (
-            _parse_float_list(cfg.latent_weight) if cfg.latent_weight else None
+            parse_float_list(cfg.latent_weight) if cfg.latent_weight else None
         )
 
         assert cfg.codebook, (
             "codebook must be set, e.g. '256,256,256'"
         )
-        n_embed_list = _parse_int_list(cfg.codebook)
+        n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
         # Parse EMA sub-config (disabled unless ema_config is explicitly set)
@@ -170,25 +161,19 @@ class SidRqvae(BaseModel):
 
         return predictions
 
-    def _predict_clip(
-        self, embedding: torch.Tensor, batch: Batch
-    ) -> Dict[str, torch.Tensor]:
-        """DEPRECATED: use _predict_mixed instead."""
-        return self._predict_mixed(embedding, batch)
-
     def _predict_mixed(
         self, embedding: torch.Tensor, batch: Batch
     ) -> Dict[str, torch.Tensor]:
         """Mixed recon + CLIP: extract fea2 and clip_mask, call forward_mixed."""
-        fea2 = self._extract_feature(batch, self._clip_feature_name)
-
-        # Derive clip_mask: recon rows have fea2 == fea1 (bit-identical)
-        clip_mask = ~torch.all(embedding == fea2, dim=-1)  # (B,) bool
-
         # Inference: only path 1, only return codes
         if self._is_inference:
             result = self._rqvae.forward_rqvae(embedding)
             return {"codes": result["codes"]}
+
+        fea2 = self._extract_feature(batch, self._clip_feature_name)
+
+        # Derive clip_mask: recon rows have fea2 == fea1 (bit-identical)
+        clip_mask = ~torch.all(embedding == fea2, dim=-1)  # (B,) bool
 
         # Train / eval: mixed forward
         result = self._rqvae.forward_mixed(embedding, fea2, clip_mask)

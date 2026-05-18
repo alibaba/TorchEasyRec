@@ -40,8 +40,6 @@ def _kmeans(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Lloyd's K-Means algorithm with KMeans++ initialization.
 
-    Reference: al_sid/SID_generation/utils/kmeans.py::kmeans
-
     Args:
         samples (Tensor): data points, shape (N, D).
         n_clusters (int): number of clusters K.
@@ -84,8 +82,6 @@ def _residual_kmeans(
 ) -> List[torch.Tensor]:
     """Residual K-Means: sequentially cluster and subtract centroids.
 
-    Reference: al_sid/SID_generation/utils/kmeans.py::residual_kmeans
-
     Args:
         samples (Tensor): data points, shape (N, D).
         n_clusters_list (List[int]): per-layer cluster counts.
@@ -116,9 +112,6 @@ class ResidualQuantized(nn.Module):
         output = sum of all quantized_i
 
     Semantic ID = (code_0, code_1, ..., code_{n_layers-1})
-
-    Reference: al_sid/SID_generation/rqvae_embed/quantizations.py
-        ::RQBottleneck
 
     Args:
         embed_dim (int): dimension of input embeddings.
@@ -293,8 +286,6 @@ class ResidualQuantized(nn.Module):
           - l2:  (x - quant)^2.mean() * weight
         EMA mode zeros out the codebook-toward-encoder term.
 
-        Reference: al_sid::RQBottleneck.compute_commitment_loss
-
         Args:
             x (Tensor): original input, shape (B, D).
             quant (Tensor): cumulative quantized output at one layer,
@@ -344,9 +335,6 @@ class ResidualQuantized(nn.Module):
         Implements equation 4.2 from https://arxiv.org/abs/2410.06424.
         Replaces standard STE with a Householder reflection that rotates
         the gradient direction from x toward quant.
-
-        Reference: GRID/src/components/quantization_strategies.py
-            ::RotationTrickQuantization.rotate_and_scale_batch
 
         Args:
             x (Tensor): original input with gradient, shape (B, D).
@@ -433,8 +421,9 @@ class ResidualQuantized(nn.Module):
         if self.training:
             self.init_embed_(input)
 
-        # Detach residual for VQ assignment (gradient flows via STE only)
-        residual = input.detach().clone()
+        # Detach residual for VQ assignment (gradient flows via STE only).
+        # No clone needed: residual is rebound below, never mutated in-place.
+        residual = input.detach()
         all_ids: List[torch.Tensor] = []
         commitment_loss_list: List[torch.Tensor] = []
         aggregated_quants = torch.zeros_like(input)
