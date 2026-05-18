@@ -166,10 +166,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._selected_input_names = None
 
         # Map input_name -> sequence_delim for true sequence inputs only
-        # (per the C++ SequenceFeature seq_fields_mask_ rule via
-        # feature.sequence_input_names). Excludes non-sequence sub-inputs
-        # of grouped sequence_feature (e.g. user:-side companions of a
-        # multi-input LookupFeature sub).
+        # (via feature.sequence_input_names). Excludes non-sequence
+        # sub-inputs of grouped sequence_feature.
         self._seq_field_delims: Dict[str, str] = {}
         for feature in features:
             if not feature.sequence_delim:

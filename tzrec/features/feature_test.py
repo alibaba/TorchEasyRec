@@ -655,17 +655,13 @@ class FeatureTest(unittest.TestCase):
     def test_sequence_input_names(self, fg_mode):
         """Sequence-input detection across feature types and fg_modes.
 
-        One full config covers all C++ ``SequenceFeature::Init`` branches
-        (mirrored by ``_is_sequence_input``):
-            - non-sequence feature -> always empty.
-            - top-level ``sequence_id_feature`` (single-input class).
-            - grouped ``sequence_feature`` sub: single-input.
-            - grouped ``sequence_feature`` sub: multi-input with explicit
-              ``sequence_fields`` excluding the non-sequence ``map`` input.
+        One full config covers each ``_is_sequence_input`` branch:
+        non-sequence feature, top-level ``sequence_id_feature``, grouped
+        single-input sub, grouped multi-input sub with explicit
+        ``sequence_fields`` excluding the non-sequence ``map`` input.
 
-        FG_NORMAL / FG_DAG: returned names are the prefixed side-input
-        names. FG_NONE / FG_BUCKETIZE: returned names are ``[self.name]``
-        (the entire pre-encoded column).
+        FG_NORMAL / FG_DAG return prefixed side-input names;
+        FG_NONE / FG_BUCKETIZE return ``[self.name]``.
         """
         feature_cfgs = [
             feature_pb2.FeatureConfig(

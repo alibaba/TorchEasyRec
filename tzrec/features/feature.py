@@ -736,10 +736,8 @@ class BaseFeature(object, metaclass=_meta_cls):
     def _is_sequence_input(self, side: str, name: str) -> bool:
         """Whether an input is sequence-typed at the FG handler interface.
 
-        Mirrors ``SequenceFeature::Initialize`` in feature_generator
-        (``src/main/cpp/fg/sequence_feature.cc``): explicit
-        ``sequence_fields`` wins; else single-input class auto-marks (with
-        the Python-side ``side != 'feature'`` filter); else multi-input
+        Rule: explicit ``sequence_fields`` wins; else single-input class
+        auto-marks (with ``side != 'feature'``); else multi-input
         item-side default.
         """
         if not self.is_sequence:
@@ -791,20 +789,26 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Names in ``self.inputs`` that are sequence inputs at the FG handler.
 
         Returned names match ``self.inputs``: ``[self.name]`` for
-        ``FG_NONE`` / ``FG_BUCKETIZE``; the grouped-sequence-prefixed names
-        for ``FG_DAG`` / ``FG_NORMAL``. Empty for non-sequence features.
+        ``FG_NONE`` / ``FG_BUCKETIZE``; the grouped-sequence-prefixed
+        names for ``FG_DAG`` / ``FG_NORMAL``. Empty for non-sequence
+        features.
         """
         if not self.is_sequence:
             return []
         if self.fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
             return [self.name]
-        raw = self._build_side_inputs()
-        if not raw:
-            return []
+        prefix = (
+            f"{self.sequence_name}{self._underline}" if self._is_grouped_seq else ""
+        )
         return [
             full_name
-            for (side, raw_name), (_, full_name) in zip(raw, self.side_inputs)
-            if self._is_sequence_input(side, raw_name)
+            for side, full_name in self.side_inputs
+            if self._is_sequence_input(
+                side,
+                full_name[len(prefix) :]
+                if prefix and full_name.startswith(prefix)
+                else full_name,
+            )
         ]
 
     @property
