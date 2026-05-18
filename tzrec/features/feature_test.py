@@ -644,6 +644,110 @@ class FeatureTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
         self.assertEqual(repr(feature_cfgs), repr(again_feature_cfgs))
 
+    def test_sequence_input_names_non_sequence_feature(self):
+        cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cat_a", expression="item:cat_a", num_buckets=100
+            )
+        )
+        feat = id_feature.IdFeature(cfg, fg_mode=FgMode.FG_DAG)
+        self.assertEqual(feat.sequence_input_names, [])
+        self.assertFalse(feat._is_sequence_input("item", "cat_a"))
+
+    def test_sequence_input_names_top_level_sequence_id_feature(self):
+        cfg = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="item_id",
+                expression="item:item_id",
+                sequence_length=50,
+                sequence_delim=";",
+                num_buckets=100,
+            )
+        )
+        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
+        feat = features[0]
+        self.assertTrue(feat.is_sequence)
+        self.assertFalse(feat.is_grouped_sequence)
+        self.assertTrue(feat._is_sequence_input("item", "item_id"))
+        self.assertFalse(feat._is_sequence_input("feature", "item_id"))
+        self.assertEqual(feat.sequence_input_names, feat.inputs)
+
+    def test_sequence_input_names_grouped_single_input_sub(self):
+        cfg = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="click_seq",
+                sequence_length=50,
+                sequence_delim=";",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="cat_a",
+                            expression="item:cat_a",
+                            num_buckets=100,
+                        )
+                    ),
+                ],
+            )
+        )
+        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
+        sub = features[0]
+        self.assertTrue(sub.is_sequence)
+        self.assertTrue(sub.is_grouped_sequence)
+        self.assertTrue(sub._is_sequence_input("item", "cat_a"))
+        self.assertEqual(sub.sequence_input_names, ["click_seq__cat_a"])
+        self.assertEqual(sub.sequence_input_names, sub.inputs)
+
+    def test_sequence_input_names_grouped_multi_input_sub_only_item_side(self):
+        cfg = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="click_50_seq",
+                sequence_length=50,
+                sequence_delim=";",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        lookup_feature=feature_pb2.LookupFeature(
+                            feature_name="lookup_d",
+                            map="user:kv_cate",
+                            key="item:cate",
+                            num_buckets=10,
+                        )
+                    ),
+                ],
+            )
+        )
+        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
+        sub = features[0]
+        self.assertTrue(sub.is_grouped_sequence)
+        self.assertTrue(sub._is_sequence_input("item", "cate"))
+        self.assertFalse(sub._is_sequence_input("user", "kv_cate"))
+        self.assertEqual(sub.inputs, ["kv_cate", "click_50_seq__cate"])
+        self.assertEqual(sub.sequence_input_names, ["click_50_seq__cate"])
+
+    def test_sequence_input_names_explicit_sequence_fields_override(self):
+        cfg = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="click_50_seq",
+                sequence_length=50,
+                sequence_delim=";",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        lookup_feature=feature_pb2.LookupFeature(
+                            feature_name="lookup_d",
+                            map="user:kv_cate",
+                            key="item:cate",
+                            num_buckets=10,
+                            sequence_fields=["kv_cate"],
+                        )
+                    ),
+                ],
+            )
+        )
+        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
+        sub = features[0]
+        self.assertTrue(sub._is_sequence_input("user", "kv_cate"))
+        self.assertFalse(sub._is_sequence_input("item", "cate"))
+        self.assertEqual(sub.sequence_input_names, ["click_50_seq__kv_cate"])
+
 
 if __name__ == "__main__":
     unittest.main()

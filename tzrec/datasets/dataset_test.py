@@ -536,6 +536,13 @@ class DatasetTest(unittest.TestCase):
             mode=mode,
         )
         dataset.launch_sampler_cluster(2)
+
+        # Multi-positive mode (item_id is sequence-positive in train):
+        # launch_sampler_cluster strips the outer list so the sampler emits
+        # scalar item_id negs, not 1-elem lists via the multival_sep round-trip.
+        item_id_idx = dataset._sampler._attr_names.index("item_id")
+        self.assertEqual(dataset._sampler._attr_types[item_id_idx], pa.int64())
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
@@ -646,6 +653,11 @@ class DatasetTest(unittest.TestCase):
             mode=mode,
         )
         dataset.launch_sampler_cluster(2)
+
+        # Multi-positive mode: outer list stripped so sampler emits scalar negs.
+        item_id_idx = dataset._sampler._attr_names.index("item_id")
+        self.assertEqual(dataset._sampler._attr_types[item_id_idx], pa.int64())
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
@@ -664,6 +676,57 @@ class DatasetTest(unittest.TestCase):
         # not the B=4 batch rows. Seed gives every flat position a hard-neg edge.
         hard_neg_indices = batch.additional_infos[HARD_NEG_INDICES]
         self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
+
+    def test_seq_field_delims_excludes_non_seq_inputs(self):
+        """Grouped sequence_feature: only item:-side sub-inputs are sequence.
+
+        Verifies the narrowed _seq_field_delims build excludes the user:-side
+        companions of a multi-input LookupFeature sub, mirroring the C++
+        SequenceFeature seq_fields_mask_ rule (via
+        feature.sequence_input_names).
+        """
+        input_fields = [
+            pa.field(name="kv_cate", type=pa.string()),
+            pa.field(name="click_50_seq__cate", type=pa.string()),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_50_seq",
+                    sequence_length=50,
+                    sequence_delim=";",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            lookup_feature=feature_pb2.LookupFeature(
+                                feature_name="lookup_d",
+                                map="user:kv_cate",
+                                key="item:cate",
+                                num_buckets=10,
+                                embedding_dim=8,
+                            )
+                        ),
+                    ],
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs, fg_mode=data_pb2.FgMode.FG_NORMAL)
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
+                label_fields=["label"],
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+            mode=Mode.TRAIN,
+        )
+        # Only the item:-side sub-input is registered as a sequence input;
+        # the user:-side companion (kv_cate) is excluded.
+        self.assertIn("click_50_seq__cate", dataset._seq_field_delims)
+        self.assertNotIn("kv_cate", dataset._seq_field_delims)
 
     def test_dataset_with_sample_mask(self):
         input_fields = [
