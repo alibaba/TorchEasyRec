@@ -165,12 +165,17 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Map input_name -> sequence_delim for sequence_id_features.
+        # Map input_name -> sequence_delim for true sequence inputs only
+        # (via feature.sequence_input_names). Excludes non-sequence
+        # sub-inputs of grouped sequence_feature.
         self._seq_field_delims: Dict[str, str] = {}
         for feature in features:
             if not feature.sequence_delim:
                 continue
+            seq_inputs = set(feature.sequence_input_names)
             for input_name in feature.inputs:
+                if input_name not in seq_inputs:
+                    continue
                 existing = self._seq_field_delims.get(input_name)
                 if existing is not None and existing != feature.sequence_delim:
                     logger.warning(
@@ -205,10 +210,33 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
+
+            # Multi-positive sampling: when the sampler's item_id_field is
+            # itself a sequence-positive train column, the per-row outer list
+            # on every item-side attr is the positive-grouping container, not
+            # a multi-value field. Strip the outer list so the sampler sees
+            # the pool's native scalar storage and _to_arrow_array emits
+            # scalar negs directly (avoiding the multival_sep split that
+            # would wrap each scalar in a 1-elem list).
+            sampler_fields = self.input_fields
+            if (
+                self._sampler_item_id_field is not None
+                and self._sampler_item_id_field in self._seq_field_delims
+            ):
+                sampler_fields = [
+                    pa.field(f.name, f.type.value_type)
+                    if (
+                        f.name in self._seq_field_delims
+                        and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
+                    )
+                    else f
+                    for f in self.input_fields
+                ]
+
             # pyre-ignore [16]
             self._sampler = BaseSampler.create_class(sampler_config.__class__.__name__)(
                 sampler_config,
-                self.input_fields,
+                sampler_fields,
                 self._batch_size,
                 is_training=self._mode == Mode.TRAIN,
                 multival_sep=self._fg_encoded_multival_sep
