@@ -223,11 +223,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 self._sampler_item_id_field is not None
                 and self._sampler_item_id_field in self._seq_field_delims
             ):
-                seq_inputs = set(self._seq_field_delims)
                 sampler_fields = [
                     pa.field(f.name, f.type.value_type)
                     if (
-                        f.name in seq_inputs
+                        f.name in self._seq_field_delims
                         and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
                     )
                     else f
