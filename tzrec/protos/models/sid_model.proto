@@ -83,28 +83,31 @@ message SidRqvae {
 }
 
 // ============================================================
-// SidRqkmeans: 残差 Mini-Batch KMeans 模型
+// SidRqkmeans: residual K-Means SID model (FAISS-only training)
 // ============================================================
 message SidRqkmeans {
-    // 输入 embedding 维度（KMeans 直接操作原始维度，无 Encoder）
-    optional uint32 input_dim = 1 [default = 512];
-    // 每层聚类数，逗号分隔，如 "256,256,256"
-    // 列表长度即残差量化层数（n_layers），支持非均匀码表如 "512,256,128"
-    optional string codebook = 3;
-    // 是否 L2 归一化残差
-    optional bool normalize_residuals = 4 [default = true];
-    // KMeans++ 初始化缓冲区大小
-    optional uint32 init_buffer_size = 5 [default = 3072];
+    // Reserved field numbers / names from the dropped online MiniBatch
+    // backend. Do not reuse — old textprotos may still contain these,
+    // and reusing the tag would silently mis-parse them.
+    //   5 = init_buffer_size (uint32, online KMeans++ init buffer)
+    //   6 = train_mode       (string, "online" | "offline_faiss")
+    reserved 5, 6;
+    reserved "init_buffer_size", "train_mode";
 
-    // 训练后端：'online' 或 'offline_faiss'
-    // - online        : 现有 Mini-Batch KMeans 在线更新
-    // - offline_faiss : train_eval 训练循环结束后由 main.py 触发
-    //                   一次性 FAISS 全量 fit
-    optional string train_mode = 6 [default = "online"];
-    // 透传给 faiss.Kmeans(D, K, **kwargs) 的额外参数（弱类型 dict）
-    // 典型：{niter: 20, gpu: true, verbose: true, spherical: false, seed: 1234}
+    // Input embedding dimension (K-Means runs directly on raw embeddings,
+    // no encoder).
+    optional uint32 input_dim = 1 [default = 512];
+    // Per-layer cluster counts, comma-separated, e.g. "256,256,256".
+    // List length is the number of residual quantization layers; non-uniform
+    // codebooks such as "512,256,128" are supported.
+    optional string codebook = 3;
+    // L2-normalize residuals before each layer.
+    optional bool normalize_residuals = 4 [default = true];
+    // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a
+    // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
+    // spherical: false, seed: 1234}.
     optional google.protobuf.Struct faiss_kmeans_kwargs = 7;
 
-    // Batch 中 item embedding 的特征名
+    // Name of the item embedding feature inside the input Batch.
     optional string embedding_feature_name = 40 [default = "item_emb"];
 }

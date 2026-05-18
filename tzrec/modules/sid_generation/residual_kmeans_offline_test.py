@@ -25,7 +25,7 @@ try:
 except ImportError:
     FAISS_AVAILABLE = False
 
-from tzrec.modules.sid_generation.kmeans import MiniBatchKMeans
+from tzrec.modules.sid_generation.kmeans import KMeansLayer
 from tzrec.modules.sid_generation.residual_kmeans import RQKMeans
 
 
@@ -108,11 +108,11 @@ class ResidualKMeansOfflineTest(unittest.TestCase):
         self.assertEqual(codes.shape, (self.x.shape[0], self.n_layers))
 
 
-class MiniBatchKMeansLoadTest(unittest.TestCase):
-    """Direct tests for the centroid-injection API on MiniBatchKMeans."""
+class KMeansLayerLoadTest(unittest.TestCase):
+    """Direct tests for the centroid-injection API on KMeansLayer."""
 
     def test_load_centroids_marks_initialized(self) -> None:
-        layer = MiniBatchKMeans(n_clusters=4, n_features=3)
+        layer = KMeansLayer(n_clusters=4, n_features=3)
         self.assertFalse(layer.is_initialized)
 
         centroids = torch.randn(4, 3)
@@ -122,7 +122,7 @@ class MiniBatchKMeansLoadTest(unittest.TestCase):
         self.assertTrue(torch.allclose(layer.centroids, centroids))
 
     def test_predict_after_load(self) -> None:
-        layer = MiniBatchKMeans(n_clusters=4, n_features=3)
+        layer = KMeansLayer(n_clusters=4, n_features=3)
         layer.load_centroids_(torch.randn(4, 3))
         codes = layer.predict(torch.randn(8, 3))
         self.assertEqual(codes.shape, (8,))

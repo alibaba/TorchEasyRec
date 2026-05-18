@@ -80,16 +80,14 @@ def _kmeans_plus_plus(
     return centroids
 
 
-class MiniBatchKMeans(nn.Module):
-    """Single-layer K-Means centroid container.
+class KMeansLayer(nn.Module):
+    """Single layer of a residual K-Means stack.
 
-    Centroids are populated externally by ``load_centroids_`` (called by
-    the offline FAISS backend in :class:`ResidualKMeans`). The module
-    provides only nearest-centroid assignment via ``predict``; there is
-    no online training path.
-
-    The class name is retained for state-dict compatibility with earlier
-    checkpoints; functionally this is a pure centroid store.
+    Centroids are populated externally by ``load_centroids_`` (called per
+    layer by the FAISS backend in :class:`ResidualKMeans`); ``predict``
+    is the only forward path. PyTorch state-dict keys are scoped by
+    attribute path (``layers.<i>.centroids``), so renaming the class
+    does not break existing checkpoints.
 
     Args:
         n_clusters (int): number of clusters (codebook size).

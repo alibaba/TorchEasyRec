@@ -14,7 +14,7 @@ from tzrec.modules.sid_generation.clip_loss import (
     GatherLayer,
 )
 from tzrec.modules.sid_generation.kmeans import (
-    MiniBatchKMeans,
+    KMeansLayer,
 )
 from tzrec.modules.sid_generation.residual_kmeans import (
     ResidualKMeans,
@@ -44,7 +44,7 @@ __all__ = [
     "CLIPLoss",
     "ResidualQuantized",
     "RQVAE",
-    "MiniBatchKMeans",
+    "KMeansLayer",
     "ResidualKMeans",
     "RQKMeans",
 ]

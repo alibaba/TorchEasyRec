@@ -145,19 +145,6 @@ class SidRqkmeans(BaseModel):
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
-        # The legacy ``train_mode`` field is ignored — FAISS is the only
-        # backend. Warn the user only if they explicitly set it to
-        # something other than offline_faiss (proto default of "online"
-        # is silently accepted to avoid noise on every construction).
-        if (
-            cfg.HasField("train_mode")
-            and cfg.train_mode != "offline_faiss"
-        ):
-            logger.warning(
-                "SidRqkmeans.train_mode=%r is deprecated; the only "
-                "supported backend is offline FAISS. Ignoring.",
-                cfg.train_mode,
-            )
         self._faiss_kwargs = (
             _coerce_proto_numbers(MessageToDict(cfg.faiss_kmeans_kwargs))
             if cfg.HasField("faiss_kmeans_kwargs")

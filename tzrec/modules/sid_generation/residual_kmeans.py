@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.kmeans import MiniBatchKMeans
+from tzrec.modules.sid_generation.kmeans import KMeansLayer
 from tzrec.utils.logging_util import logger
 
 
@@ -77,7 +77,7 @@ class ResidualKMeans(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                MiniBatchKMeans(
+                KMeansLayer(
                     n_clusters=n_embed_list[i],
                     n_features=embed_dim,
                 )

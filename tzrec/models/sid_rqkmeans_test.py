@@ -76,30 +76,6 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertFalse(model._faiss_kwargs.get("verbose"))
         self.assertEqual(model._offline_buffer, [])
 
-    def test_legacy_train_mode_ignored(self) -> None:
-        """A legacy ``train_mode`` value is accepted but ignored."""
-        sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
-            input_dim=32,
-            codebook="16,16",
-            train_mode="online",  # legacy value — should be ignored
-            embedding_feature_name="item_emb",
-        )
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["item_emb"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-        ]
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups,
-            sid_rqkmeans=sid_rqkmeans_cfg,
-        )
-        # Should construct without error; train_mode field is ignored.
-        SidRqkmeans(
-            model_config=model_config, features=[], labels=[]
-        )
-
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict should append to buffer; never fit."""
         B, input_dim = 8, 32
