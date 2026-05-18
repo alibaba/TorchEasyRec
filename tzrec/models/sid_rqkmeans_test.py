@@ -95,8 +95,8 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         for layer in model._rqkmeans.quantizer.layers:
             self.assertFalse(layer.is_initialized)
 
-    def test_flush_runs_faiss(self) -> None:
-        """flush_offline_fit triggers FAISS fit and clears buffer."""
+    def test_on_train_end_runs_faiss(self) -> None:
+        """on_train_end triggers FAISS fit and clears buffer."""
         try:
             import faiss  # noqa: F401
         except ImportError:
@@ -112,7 +112,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertGreater(len(model._offline_buffer), 0)
 
         # Trigger one-shot FAISS fit
-        model.flush_offline_fit()
+        model.on_train_end()
 
         # Buffer should be cleared
         self.assertEqual(model._offline_buffer, [])
@@ -128,10 +128,10 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertEqual(codes.shape, (B, 2))
         self.assertTrue((codes >= 0).all() and (codes < 16).all())
 
-    def test_flush_noop_on_empty_buffer(self) -> None:
-        """flush_offline_fit on an empty buffer is a warned no-op."""
+    def test_on_train_end_noop_on_empty_buffer(self) -> None:
+        """on_train_end on an empty buffer is a warned no-op."""
         model = self._create_model()
-        model.flush_offline_fit()  # should not raise
+        model.on_train_end()  # should not raise
 
 
 if __name__ == "__main__":

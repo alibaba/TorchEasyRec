@@ -13,7 +13,8 @@
 
 Training is FAISS-only: ``predict`` collects embeddings into a CPU
 buffer; the actual FAISS fit is triggered ONCE after the train_eval
-loop ends, via ``flush_offline_fit()`` invoked by ``tzrec.main``.
+loop ends, via the :meth:`BaseModel.on_train_end` lifecycle hook
+(``tzrec.main`` calls ``_model.on_train_end()`` unconditionally).
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -160,7 +161,7 @@ class SidRqkmeans(BaseModel):
         )
 
         # CPU buffer for embeddings collected during training; FAISS
-        # consumes it in flush_offline_fit() at end-of-loop.
+        # consumes it in on_train_end() at end-of-loop.
         self._offline_buffer: List[torch.Tensor] = []
 
         # KMeans has no learnable parameters (centroids use register_buffer).
@@ -176,7 +177,7 @@ class SidRqkmeans(BaseModel):
         """Predict the model.
 
         Training: buffer embeddings only (codes are dummy until FAISS fits).
-        Eval/inference (after ``flush_offline_fit``): real predict + lookup.
+        Eval/inference (after ``on_train_end``): real predict + lookup.
 
         Args:
             batch (Batch): input batch data.
@@ -214,7 +215,7 @@ class SidRqkmeans(BaseModel):
         """Initialize loss modules.
 
         KMeans has no gradient loss; the codebook is built in
-        ``flush_offline_fit`` at end of training.
+        ``on_train_end`` at end of training.
         """
         pass
 
@@ -309,11 +310,12 @@ class SidRqkmeans(BaseModel):
         )
 
     @torch.no_grad()
-    def flush_offline_fit(self) -> None:
+    def on_train_end(self) -> None:
         """Trigger one-shot FAISS fit after the train_eval loop ends.
 
-        Called by ``tzrec.main.train_and_evaluate`` after the training
-        loop exits. No-op when the buffer is empty.
+        Overrides :meth:`BaseModel.on_train_end`. Called unconditionally
+        by ``tzrec.main.train_and_evaluate`` after the training loop
+        exits. No-op when the buffer is empty.
 
         DDP behavior:
             - rank0: all_gather full embedding matrix, run FAISS fit,
@@ -323,7 +325,7 @@ class SidRqkmeans(BaseModel):
         """
         if not self._offline_buffer:
             logger.warning(
-                "[SidRqkmeans.flush_offline_fit] offline buffer is empty; "
+                "[SidRqkmeans.on_train_end] offline buffer is empty; "
                 "skip FAISS fit. Did the train_eval loop run?"
             )
             return
@@ -343,7 +345,7 @@ class SidRqkmeans(BaseModel):
             rank = dist.get_rank()
             if rank == 0:
                 logger.info(
-                    "[SidRqkmeans.flush_offline_fit] rank0 fitting FAISS "
+                    "[SidRqkmeans.on_train_end] rank0 fitting FAISS "
                     "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
                 )
                 self._rqkmeans.train_offline(full, verbose=True)
@@ -360,7 +362,7 @@ class SidRqkmeans(BaseModel):
             N = sum(t.shape[0] for t in self._offline_buffer)
             D = self._offline_buffer[0].shape[1]
             logger.info(
-                "[SidRqkmeans.flush_offline_fit] fitting FAISS on "
+                "[SidRqkmeans.on_train_end] fitting FAISS on "
                 "%d samples (D=%d)." % (N, D)
             )
             full_np = np.empty((N, D), dtype=np.float32)
