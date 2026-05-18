@@ -536,6 +536,13 @@ class DatasetTest(unittest.TestCase):
             mode=mode,
         )
         dataset.launch_sampler_cluster(2)
+
+        # Multi-positive mode (item_id is sequence-positive in train):
+        # launch_sampler_cluster strips the outer list so the sampler emits
+        # scalar item_id negs, not 1-elem lists via the multival_sep round-trip.
+        item_id_idx = dataset._sampler._attr_names.index("item_id")
+        self.assertEqual(dataset._sampler._attr_types[item_id_idx], pa.int64())
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
@@ -646,6 +653,11 @@ class DatasetTest(unittest.TestCase):
             mode=mode,
         )
         dataset.launch_sampler_cluster(2)
+
+        # Multi-positive mode: outer list stripped so sampler emits scalar negs.
+        item_id_idx = dataset._sampler._attr_names.index("item_id")
+        self.assertEqual(dataset._sampler._attr_types[item_id_idx], pa.int64())
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
@@ -664,6 +676,92 @@ class DatasetTest(unittest.TestCase):
         # not the B=4 batch rows. Seed gives every flat position a hard-neg edge.
         hard_neg_indices = batch.additional_infos[HARD_NEG_INDICES]
         self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
+
+    def test_launch_sampler_cluster_multi_attr_strip_decision_matrix(self):
+        """End-to-end strip decisions across the per-attr filter.
+
+        Grouped LookupFeature sub with two item-side inputs; only ``cat_key``
+        is in ``sequence_fields`` so only it enters ``_seq_field_delims``.
+        ``cat_key`` is typed ``list<list<int64>>`` (multi-value attr layered
+        under multi-positive grouping); after strip it becomes
+        ``list<int64>`` (ONE level stripped, not bare-stripped to ``int64``).
+        ``cat_map`` is item-side but excluded from ``_seq_field_delims``,
+        so it stays ``list<string>`` unchanged.
+        """
+        f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(f)
+        f.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(100):
+            f.write(f"{i}\t1.0\t{i}:{i + 1000}\n")
+        f.flush()
+
+        input_fields = [
+            pa.field(name="cat_map", type=pa.list_(pa.string())),
+            pa.field(name="click_seq__cat_key", type=pa.list_(pa.list_(pa.int64()))),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_seq",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            lookup_feature=feature_pb2.LookupFeature(
+                                feature_name="lookup_c",
+                                map="item:cat_map",
+                                key="item:cat_key",
+                                sequence_fields=["cat_key"],
+                                num_buckets=10,
+                                embedding_dim=8,
+                            )
+                        ),
+                    ],
+                )
+            ),
+        ]
+        features = create_features(
+            feature_cfgs,
+            fg_mode=data_pb2.FgMode.FG_NORMAL,
+            neg_fields=["cat_map", "cat_key"],
+            force_base_data_group=True,
+        )
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
+                label_fields=["label"],
+                negative_sampler=sampler_pb2.NegativeSampler(
+                    input_path=f.name,
+                    num_sample=4,
+                    attr_fields=["cat_map", "click_seq__cat_key"],
+                    item_id_field="click_seq__cat_key",
+                ),
+                force_base_data_group=True,
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+            mode=Mode.TRAIN,
+        )
+        # Narrowed _seq_field_delims excludes the non-sequence item-side input.
+        self.assertIn("click_seq__cat_key", dataset._seq_field_delims)
+        self.assertNotIn("cat_map", dataset._seq_field_delims)
+
+        dataset.launch_sampler_cluster(2)
+        # outer guard True (item_id_field is sequence-positive):
+        # - cat_key: list<list<int64>> -> list<int64> (one strip).
+        # - cat_map: list<string>, not in _seq_field_delims -> unstripped.
+        cat_key_idx = dataset._sampler._attr_names.index("click_seq__cat_key")
+        cat_map_idx = dataset._sampler._attr_names.index("cat_map")
+        self.assertEqual(
+            dataset._sampler._attr_types[cat_key_idx], pa.list_(pa.int64())
+        )
+        self.assertEqual(
+            dataset._sampler._attr_types[cat_map_idx], pa.list_(pa.string())
+        )
 
     def test_dataset_with_sample_mask(self):
         input_fields = [

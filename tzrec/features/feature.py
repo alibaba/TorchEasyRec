@@ -733,20 +733,34 @@ class BaseFeature(object, metaclass=_meta_cls):
                 self._inputs = [v for _, v in self.side_inputs]
         return self._inputs
 
+    def _is_sequence_input(self, side: str, name: str) -> bool:
+        """Whether an input is sequence-typed at the FG handler interface.
+
+        Rule: explicit ``sequence_fields`` wins; else single-input class
+        auto-marks (with ``side != 'feature'``); else multi-input
+        item-side default.
+
+        ``name`` may be either the raw input name or its grouped-sequence
+        prefixed form; the prefix is stripped internally.
+        """
+        if not self.is_sequence:
+            return False
+        if self._is_grouped_seq and self.sequence_name:
+            prefix = f"{self.sequence_name}{self._underline}"
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+        if (
+            hasattr(self.config, "sequence_fields")
+            and len(self.config.sequence_fields) > 0
+        ):
+            return name in self.config.sequence_fields
+        if self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
+            return side != "feature"
+        return side == "item"
+
     def _need_seq_prefix(self, side: str, name: str) -> bool:
         """Check input fields should add prefix of group sequence or not."""
-        if self._is_grouped_seq:
-            if (
-                hasattr(self.config, "sequence_fields")
-                and len(self.config.sequence_fields) > 0
-            ):
-                return name in self.config.sequence_fields
-            elif self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
-                return side != "feature"
-            else:
-                return side == "item"
-        else:
-            return False
+        return self._is_grouped_seq and self._is_sequence_input(side, name)
 
     @property
     def side_inputs(self) -> List[Tuple[str, str]]:
@@ -776,6 +790,25 @@ class BaseFeature(object, metaclass=_meta_cls):
                 )
                 self._side_inputs.append((side, f"{seq_prefix}{name}"))
         return self._side_inputs
+
+    @property
+    def sequence_input_names(self) -> List[str]:
+        """A subset of ``self.inputs`` that are sequence inputs at the FG handler.
+
+        Returns ``[self.name]`` for ``FG_NONE`` / ``FG_BUCKETIZE``; the
+        grouped-sequence-prefixed names that satisfy
+        ``_is_sequence_input`` for ``FG_DAG`` / ``FG_NORMAL``. Empty for
+        non-sequence features.
+        """
+        if not self.is_sequence:
+            return []
+        if self.fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+            return [self.name]
+        return [
+            full_name
+            for side, full_name in self.side_inputs
+            if self._is_sequence_input(side, full_name)
+        ]
 
     @property
     def stub_type(self) -> bool:
