@@ -9,9 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import math
 import os
-from typing import List, Optional, Tuple, Type, cast
+from typing import Any, List, Optional, Tuple, Type, cast
 
 import torch
 from torch import nn
@@ -21,7 +22,10 @@ from torchrec.distributed.planner import (
     planners,
     shard_estimators,
 )
-from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
+from torchrec.distributed.planner.estimator.types import (
+    HardwarePerfConfig,
+    ShardPerfContext,
+)
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     ShardingOption,
@@ -43,6 +47,54 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from tzrec.protos import feature_pb2
+
+_DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
+_DYNAMICEMB_HYBRID_X_EFF_BASE = 0.11
+_DYNAMICEMB_X_EFF_TIEBREAK = 0.01
+
+
+def _dynamicemb_effective_cache_ratio(
+    cache_load_factor: Optional[float],
+    caching: bool,
+    stats: Optional[Any] = None,
+) -> float:
+    """Effective HBM-hit ratio for the dynamicemb perf model.
+
+    Returns the value passed to torchrec's perf bandwidth formula
+    ``bw = x_eff*hbm + (1-x_eff)*hbm_to_ddr_bw``. Larger value = faster path.
+
+    The ratio is derived from an on-device perf sweep, not a heuristic.
+    Empirical pattern (alpha=1.05 pow-law access on A10):
+
+      * ``x == 1.0``: the runtime *switches kernels* — when
+        ``total_value_memory <= local_hbm_for_values`` the dual-tier
+        ``HybridStorage`` / ``DynamicEmbCache`` paths are dropped in favor
+        of the HBM-only ``DynamicEmbStorage`` kernel
+        (``batched_dynamicemb_tables.py:502-604``). The ~8x jump in ``x_eff``
+        between ``x=0.9`` and ``x=1.0`` is intentional and matches measured
+        latency, not a smoothing artifact. (A future refactor could lift
+        this to a discrete ``mode={HBM_ONLY, HYBRID, CACHING}`` axis on the
+        enumerator side rather than packing the discontinuity into ``x``.)
+      * ``caching=True``, ``x < 1.0``: 3.3x slower than HBM-only -> base 0.28.
+      * ``caching=False``, ``x < 1.0``: 6.8x slower than HBM-only -> base 0.11.
+
+    Within each ``x < 1.0`` block the perf is roughly flat in ratio, but we
+    add a tiny monotonic perturbation so the DP can break ties.
+
+    If ``stats`` is provided, ``1 - stats.expected_miss_rate(x)`` overrides
+    the heuristic verbatim (clamped to ``[0, 1]``); the caller opts in to
+    their own measurement.
+    """
+    x = float(cache_load_factor) if cache_load_factor is not None else 0.0
+    x = max(0.0, min(1.0, x))
+    if stats is not None:
+        miss_rate = float(stats.expected_miss_rate(x))
+        return max(0.0, min(1.0, 1.0 - miss_rate))
+    if x >= 1.0:
+        return 1.0
+    base = _DYNAMICEMB_CACHING_X_EFF_BASE if caching else _DYNAMICEMB_HYBRID_X_EFF_BASE
+    return base + _DYNAMICEMB_X_EFF_TIEBREAK * x
+
 
 has_dynamicemb = False
 try:
@@ -258,18 +310,36 @@ if has_dynamicemb:
         is_hbm: bool = True,
         only_values: bool = False,
         bucket_capacity: int = 128,
+        caching: bool = False,
     ) -> int:
-        """Calculate dynamic embedding table storage.
+        """Per-shard storage size for a dynamicemb table -- HBM or DDR (bytes).
 
-        total_value_memory = max_capacity x aligned16(embedding+optimizer states)
-        num_buckets = max_capacity/bucket_capacity
-        hbm_budget = min(global_hbm_for_values//world_size, total_value_memory) +
-            max_capacity x (key<8byte> + score<8byte> + digest<1byte>) +
-            num_buckets x (bucket_size<4byte>)
-        ddr_budget = max(total_value_memory - global_hbm_for_values//world_size, 0)
+        Byte budget (single shard, rows x dim):
+
+            value_bytes_per_row = round_up16(dim * (1 + opt_mult) * element)
+            total_value_memory  = align(rows) * value_bytes_per_row
+            num_buckets         = align(rows) / bucket_capacity
+
+            hbm_budget = cache_ratio * total_value_memory                 # values
+                       + align(rows) * (key<8B> + score<8B> + digest<1B>) # per-row
+                       + num_buckets * bucket_header<4B>                  # per-bucket
+
+            ddr_budget = HYBRID  (caching=False): (1 - cache_ratio) * total_value_memory
+                         CACHING (caching=True):  total_value_memory  # full backing
+
+        HYBRID hash-partitions values across HBM and host; ``cache_ratio`` is
+        HBM's value share. CACHING keeps the full backing store on host and
+        uses HBM as a hot-row cache of size
+        ``cache_ratio * total_value_memory``. Hash-table metadata
+        (key + score + digest + bucket header) is accounted on HBM only --
+        matches the existing tzrec convention.
         """
         if cache_ratio is None:
             cache_ratio = 1.0
+        if is_hbm:
+            value_ratio = cache_ratio
+        else:
+            value_ratio = 1.0 if caching else (1.0 - cache_ratio)
         return math.ceil(
             align_to_table_size(size[0])
             * (
@@ -277,7 +347,7 @@ if has_dynamicemb:
                     math.ceil(size[1] * (1 + optimizer_multipler) * element_size),
                     16,
                 )
-                * (cache_ratio if is_hbm else 1 - cache_ratio)
+                * value_ratio
                 + (8 + 8 + 1 + 4 / bucket_capacity) * (is_hbm and not only_values)
             )
         )
@@ -413,6 +483,66 @@ if has_dynamicemb:
     # pyre-ignore [9]
     HardwarePerfConfig.get_device_bw = _customized_kernel_aware_get_device_bw
 
+    _orig_build_shard_perf_contexts = (
+        ShardPerfContext.build_shard_perf_contexts.__func__
+    )
+
+    def _dynamicemb_aware_build_shard_perf_contexts(
+        cls,  # pyre-ignore [2]
+        config,  # pyre-ignore [2]
+        shard_sizes,  # pyre-ignore [2]
+        sharding_option,  # pyre-ignore [2]
+        topology,  # pyre-ignore [2]
+        constraints,  # pyre-ignore [2]
+        sharder,  # pyre-ignore [2]
+        *args,  # pyre-ignore [2]
+        **kwargs,  # pyre-ignore [2]
+    ):
+        """Inject the empirical x_eff into the perf estimator for both modes.
+
+        Temporarily replace ``sharding_option.cache_params`` with a clone
+        whose ``load_factor`` is the empirically-fitted x_eff for the
+        (mode, cache_load_factor) combination. Restored before returning so
+        the (separately invoked) storage estimator still sees the un-boosted
+        ratio.
+        """
+        dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
+        original_cache_params = sharding_option.cache_params
+        if dynamicemb_options is not None:
+            caching = bool(getattr(dynamicemb_options, "caching", False))
+            stats = original_cache_params.stats if original_cache_params else None
+            x_eff = _dynamicemb_effective_cache_ratio(
+                sharding_option.cache_load_factor, caching=caching, stats=stats
+            )
+            sharding_option.cache_params = (
+                dataclasses.replace(original_cache_params, load_factor=x_eff)
+                if original_cache_params is not None
+                else CacheParams(load_factor=x_eff)
+            )
+        # try/finally so an estimator exception cannot leak the boosted
+        # cache_params clone into the storage estimator's view of the
+        # same ShardingOption.
+        try:
+            result = _orig_build_shard_perf_contexts(
+                cls,
+                config,
+                shard_sizes,
+                sharding_option,
+                topology,
+                constraints,
+                sharder,
+                *args,
+                **kwargs,
+            )
+        finally:
+            sharding_option.cache_params = original_cache_params
+        return result
+
+    # pyre-ignore [9]
+    ShardPerfContext.build_shard_perf_contexts = classmethod(
+        _dynamicemb_aware_build_shard_perf_contexts
+    )
+
     def _calculate_dynamicemb_storage_specific_sizes(
         tensor: torch.Tensor,
         shard_sizes: List[List[int]],
@@ -420,6 +550,7 @@ if has_dynamicemb:
         cache_ratio: float = 1.0,
         is_inference: bool = False,
         bucket_capacity: int = 128,
+        caching: bool = False,
     ) -> Tuple[List[int], List[int]]:
         """Calculate storage for dynamicemb."""
         optimizer_multipler = 0.0
@@ -437,6 +568,7 @@ if has_dynamicemb:
                 cache_ratio,
                 is_hbm=True,
                 bucket_capacity=bucket_capacity,
+                caching=caching,
             )
             for size in shard_sizes
         ]
@@ -449,6 +581,7 @@ if has_dynamicemb:
                 cache_ratio,
                 is_hbm=False,
                 bucket_capacity=bucket_capacity,
+                caching=caching,
             )
             for size in shard_sizes
         ]
@@ -496,7 +629,10 @@ if has_dynamicemb:
                 factors.
             num_poolings (List[float]): average number of poolings per sample
                 (typically 1.0).
-            caching_ratio (float): ratio of HBM to DDR memory for UVM caching.
+            caching_ratio (float): cache_load_factor for the dynamicemb table.
+                In HYBRID mode HBM holds this fraction of values and host
+                holds the remainder; in CACHING mode HBM is a hot-row cache
+                of this fraction and host holds the full backing store.
             is_pooled (bool): True if embedding output is pooled (ie. `EmbeddingBag`),
                 False if unpooled/sequential (ie. `Embedding`).
             input_data_type_size (int): number of bytes of input data type.
@@ -535,6 +671,7 @@ if has_dynamicemb:
                 cache_ratio=caching_ratio if caching_ratio else 1.0,
                 is_inference=is_inference,
                 bucket_capacity=dynamicemb_options.bucket_capacity,
+                caching=bool(getattr(dynamicemb_options, "caching", False)),
             )
         )
         counter_hbm_specific_size = 0
