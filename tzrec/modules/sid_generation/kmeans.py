@@ -9,12 +9,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""K-Means single-layer container.
+"""K-Means utilities for the SID-generation stack.
 
-Centroids are owned by an offline backend (FAISS) and injected via
-``load_centroids_``. This module no longer performs any online training;
-``predict`` is the only forward path.
+This module is the single home for torch-native K-Means code used by
+SID models:
+
+* :class:`KMeansLayer` — per-layer centroid container used by
+  :class:`ResidualKMeans` / :class:`RQKMeans`. Centroids are injected
+  by the FAISS backend via ``load_centroids_``; the only forward path
+  is ``predict``.
+* :func:`_kmeans` / :func:`_residual_kmeans` — pure-torch Lloyd's
+  K-Means + residual variant, used by :class:`ResidualQuantized` to
+  warm-start the RQ-VAE codebook on the first training batch. They run
+  once on a single batch of encoder outputs (typically ~2k × 64), so
+  pulling in FAISS here would be all overhead and no benefit.
 """
+
+from typing import List, Tuple
 
 import torch
 from torch import nn
@@ -78,6 +89,78 @@ def _kmeans_plus_plus(
         centroids[i] = data[next_idx]
 
     return centroids
+
+
+@torch.no_grad()
+def _kmeans(
+    samples: torch.Tensor,
+    n_clusters: int,
+    n_iters: int = 100,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lloyd's K-Means with KMeans++ initialization.
+
+    Used by :class:`ResidualQuantized.init_embed_` to warm-start the
+    RQ-VAE codebook on the first training batch.
+
+    Args:
+        samples (Tensor): data points, shape (N, D).
+        n_clusters (int): number of clusters K.
+        n_iters (int): number of Lloyd iterations. Default: 100.
+
+    Returns:
+        centroids (Tensor): cluster centers, shape (K, D).
+        assignments (Tensor): cluster indices, shape (N,).
+    """
+    N, D = samples.shape
+    centroids = _kmeans_plus_plus(samples, n_clusters)
+
+    for _ in range(n_iters):
+        dists = _squared_euclidean_distance(samples, centroids)  # (N, K)
+        assignments = dists.argmin(dim=-1)  # (N,)
+
+        bins = torch.bincount(assignments, minlength=n_clusters)
+        zero_mask = bins == 0
+        bins_clamped = bins.masked_fill(zero_mask, 1)
+
+        new_centroids = torch.zeros_like(centroids)
+        new_centroids.scatter_add_(
+            0, assignments.unsqueeze(1).expand(-1, D), samples
+        )
+        new_centroids = new_centroids / bins_clamped.unsqueeze(1)
+
+        # Keep old centroids for empty clusters
+        centroids = torch.where(
+            zero_mask.unsqueeze(1), centroids, new_centroids
+        )
+
+    return centroids, assignments
+
+
+@torch.no_grad()
+def _residual_kmeans(
+    samples: torch.Tensor,
+    n_clusters_list: List[int],
+    n_iters: int = 100,
+) -> List[torch.Tensor]:
+    """Residual K-Means: per-layer cluster then subtract centroids.
+
+    Used by :class:`ResidualQuantized.init_embed_` to seed every RQ
+    codebook layer in one pass over the first training batch.
+
+    Args:
+        samples (Tensor): data points, shape (N, D).
+        n_clusters_list (List[int]): per-layer cluster counts.
+        n_iters (int): K-Means iterations per layer. Default: 100.
+
+    Returns:
+        List[Tensor]: per-layer centroids ``[(K0, D), (K1, D), ...]``.
+    """
+    res_centers = []
+    for n_clusters in n_clusters_list:
+        centroids, assignments = _kmeans(samples, n_clusters, n_iters)
+        res_centers.append(centroids)
+        samples = samples - centroids[assignments]
+    return res_centers
 
 
 class KMeansLayer(nn.Module):
