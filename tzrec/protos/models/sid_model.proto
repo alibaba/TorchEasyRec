@@ -86,14 +86,6 @@ message SidRqvae {
 // SidRqkmeans: residual K-Means SID model (FAISS-only training)
 // ============================================================
 message SidRqkmeans {
-    // Reserved field numbers / names from the dropped online MiniBatch
-    // backend. Do not reuse — old textprotos may still contain these,
-    // and reusing the tag would silently mis-parse them.
-    //   5 = init_buffer_size (uint32, online KMeans++ init buffer)
-    //   6 = train_mode       (string, "online" | "offline_faiss")
-    reserved 5, 6;
-    reserved "init_buffer_size", "train_mode";
-
     // Input embedding dimension (K-Means runs directly on raw embeddings,
     // no encoder).
     optional uint32 input_dim = 1 [default = 512];
@@ -106,7 +98,7 @@ message SidRqkmeans {
     // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a
     // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
     // spherical: false, seed: 1234}.
-    optional google.protobuf.Struct faiss_kmeans_kwargs = 7;
+    optional google.protobuf.Struct faiss_kmeans_kwargs = 5;
 
     // Name of the item embedding feature inside the input Batch.
     optional string embedding_feature_name = 40 [default = "item_emb"];
