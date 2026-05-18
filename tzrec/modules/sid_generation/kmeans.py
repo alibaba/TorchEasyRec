@@ -9,15 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""K-Means base utilities: distance, KMeans++ init, and MiniBatchKMeans."""
+"""K-Means single-layer container.
 
-from typing import List, Tuple
+Centroids are owned by an offline backend (FAISS) and injected via
+``load_centroids_``. This module no longer performs any online training;
+``predict`` is the only forward path.
+"""
 
 import torch
-import torch.distributed as dist
 from torch import nn
-
-
 
 
 @torch.no_grad()
@@ -41,8 +41,6 @@ def _squared_euclidean_distance(
     return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
 
 
-
-
 @torch.no_grad()
 def _kmeans_plus_plus(
     data: torch.Tensor,
@@ -51,7 +49,9 @@ def _kmeans_plus_plus(
     """KMeans++ initialization (Arthur & Vassilvitskii 2007).
 
     Selects initial centroids via distance-weighted probability sampling
-    to ensure well-spread starting points.
+    to ensure well-spread starting points. Used by the RQ-VAE codebook
+    init path (``ResidualQuantized.kmeans_init``); RQKMeans itself no
+    longer needs it.
 
     Args:
         data (Tensor): data points, shape (N, D).
@@ -63,7 +63,6 @@ def _kmeans_plus_plus(
     N, D = data.shape
     centroids = torch.zeros(n_clusters, D, device=data.device, dtype=data.dtype)
 
-    # First centroid: random
     idx = torch.randint(0, N, (1,), device=data.device)
     centroids[0] = data[idx]
 
@@ -71,7 +70,6 @@ def _kmeans_plus_plus(
         dists = _squared_euclidean_distance(data, centroids[:i])  # (N, i)
         min_dists = dists.min(dim=1)[0]  # (N,)
         if min_dists.sum() == 0:
-            # All remaining centroids chosen randomly
             centroids[i:] = data[
                 torch.randint(0, N, (n_clusters - i,), device=data.device)
             ]
@@ -82,72 +80,44 @@ def _kmeans_plus_plus(
     return centroids
 
 
-
-
 class MiniBatchKMeans(nn.Module):
-    """Mini-Batch K-Means single-layer clustering module.
+    """Single-layer K-Means centroid container.
 
-    Online K-Means (Sculley 2010) with KMeans++ initialization.
-    Supports distributed training via all-reduce synchronization.
+    Centroids are populated externally by ``load_centroids_`` (called by
+    the offline FAISS backend in :class:`ResidualKMeans`). The module
+    provides only nearest-centroid assignment via ``predict``; there is
+    no online training path.
 
-    Update rule for each cluster c in current batch:
-        eta_c = batch_count_c / total_count_c
-        centroid_c = (1 - eta_c) * centroid_c + eta_c * batch_mean_c
+    The class name is retained for state-dict compatibility with earlier
+    checkpoints; functionally this is a pure centroid store.
 
     Args:
         n_clusters (int): number of clusters (codebook size).
         n_features (int): feature dimension.
-        init_buffer_size (int): buffer size for initialization pool.
-            After collecting enough samples, initialize centroids via
-            KMeans++. Default: 3072.
     """
 
     def __init__(
         self,
         n_clusters: int,
         n_features: int,
-        init_buffer_size: int = 3072,
     ) -> None:
         super().__init__()
         self.n_clusters = n_clusters
         self.n_features = n_features
-        self.init_buffer_size = max(init_buffer_size, n_clusters)
 
-        # Centroids are manually updated, no gradient needed
         self.register_buffer(
             "centroids", torch.zeros(n_clusters, n_features)
         )
-        self.register_buffer("cluster_counts", torch.zeros(n_clusters))
         self.register_buffer("_is_initialized", torch.tensor(False))
-        # Offline lock: set to True by `load_centroids_()` to mark this layer
-        # as managed by an offline backend (e.g. FAISS). When True, calls to
-        # `train_step()` will raise to prevent silent corruption of the
-        # offline-trained codebook by online mini-batch updates.
-        # Persisted in state_dict so the lock survives ckpt round-trips.
-        self.register_buffer(
-            "_offline_locked", torch.tensor(False, dtype=torch.bool)
-        )
-
-        self._init_buffer: List[torch.Tensor] = []
 
     @property
     def is_initialized(self) -> bool:
-        """Whether centroids have been initialized via KMeans++."""
+        """Whether centroids have been injected via ``load_centroids_``."""
         return self._is_initialized.item()
-
-    @property
-    def offline_locked(self) -> bool:
-        """Whether centroids were injected by an offline backend."""
-        return bool(self._offline_locked.item())
 
     @torch.no_grad()
     def load_centroids_(self, centroids: torch.Tensor) -> None:
-        """Externally inject centroids and mark layer as initialized.
-
-        Used by offline training (FAISS) to bypass the online init buffer.
-        After this call, ``train_step()`` is locked and will raise
-        ``RuntimeError`` if invoked, to prevent silent corruption of the
-        offline-trained codebook by online mini-batch updates.
+        """Inject offline-trained centroids.
 
         Args:
             centroids (Tensor): externally trained centroids,
@@ -161,66 +131,10 @@ class MiniBatchKMeans(nn.Module):
             centroids.to(dtype=self.centroids.dtype, device=self.centroids.device)
         )
         self._is_initialized.fill_(True)
-        # Clear online statistics to avoid contamination if user later
-        # explicitly unlocks this layer for online fine-tuning.
-        self.cluster_counts.zero_()
-        # Drop any pending KMeans++ init buffer.
-        self._init_buffer = []
-        # Mark this layer as managed by the offline backend.
-        self._offline_locked.fill_(True)
-
-    def unlock_for_online_finetune_(self) -> None:
-        """Explicitly opt-in to online fine-tuning after offline init.
-
-        After ``load_centroids_()`` the layer is locked against
-        ``train_step()``. Call this to release the lock when you knowingly
-        want to continue updating centroids online (offline init + online
-        fine-tune scenario).
-        """
-        self._offline_locked.fill_(False)
-
-
-    @torch.no_grad()
-    def _buffer_and_maybe_init(self, batch: torch.Tensor) -> bool:
-        """Buffer data and initialize when enough is collected.
-
-        Collects incoming batches into an internal buffer. Once the total
-        buffered samples reach init_buffer_size, runs KMeans++ on rank 0
-        and broadcasts the result to all ranks.
-
-        Args:
-            batch (Tensor): data points, shape (B, D).
-
-        Returns:
-            bool: True if initialization was performed in this call.
-        """
-        self._init_buffer.append(batch.detach())
-        total = sum(b.shape[0] for b in self._init_buffer)
-        if total < self.init_buffer_size:
-            return False
-
-        buffer = torch.cat(self._init_buffer, dim=0)[: self.init_buffer_size]
-
-        # Rank 0 does KMeans++, then broadcast to all ranks
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            if dist.get_rank() == 0:
-                init_centroids = _kmeans_plus_plus(buffer, self.n_clusters)
-            else:
-                init_centroids = torch.zeros_like(self.centroids)
-            dist.broadcast(init_centroids, src=0)
-        else:
-            init_centroids = _kmeans_plus_plus(buffer, self.n_clusters)
-
-        self.centroids.copy_(init_centroids)
-        self._is_initialized.fill_(True)
-        self.cluster_counts.zero_()
-        self._init_buffer = []
-        return True
-
 
     @torch.no_grad()
     def predict(self, batch: torch.Tensor) -> torch.Tensor:
-        """Assign points to nearest centroid without update.
+        """Assign points to nearest centroid.
 
         Args:
             batch (Tensor): data points, shape (B, D).
@@ -230,83 +144,3 @@ class MiniBatchKMeans(nn.Module):
         """
         dists = _squared_euclidean_distance(batch, self.centroids)
         return torch.argmin(dists, dim=-1)
-
-
-    @torch.no_grad()
-    def train_step(
-        self, batch: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One Mini-Batch K-Means update step.
-
-        Assigns each data point to the nearest centroid, then updates
-        centroids using the online update rule:
-            eta = batch_count / total_count
-            centroid = (1 - eta) * old + eta * batch_mean
-
-        Args:
-            batch (Tensor): data points, shape (B, D).
-
-        Returns:
-            assignments (Tensor): cluster indices, shape (B,).
-            embeddings (Tensor): centroid vectors for assigned clusters,
-                shape (B, D).
-
-        Raises:
-            RuntimeError: if this layer has been initialized by an offline
-                backend via ``load_centroids_()``. Call
-                ``unlock_for_online_finetune_()`` first to opt-in to online
-                fine-tuning of an offline-trained codebook.
-        """
-        # Guard: prevent silent contamination of offline codebook.
-        if bool(self._offline_locked.item()):
-            raise RuntimeError(
-                "MiniBatchKMeans.train_step() called on a layer whose centroids "
-                "were injected by offline FAISS training (load_centroids_ was "
-                "used). Online updates would silently corrupt the offline "
-                "codebook. If you really want to fine-tune online, call "
-                "`layer.unlock_for_online_finetune_()` explicitly."
-            )
-        batch = batch.detach()
-
-        if not self.is_initialized:
-            initialized = self._buffer_and_maybe_init(batch)
-            if not initialized:
-                dummy = torch.zeros(
-                    batch.shape[0], dtype=torch.long, device=batch.device
-                )
-                return dummy, torch.zeros_like(batch)
-
-        # Assign to nearest centroid
-        assignments = self.predict(batch)
-
-        # Accumulate per-cluster statistics without materialising a [B, K]
-        # one-hot (would be ~128 MB at K=4096, B=8192).
-        K = self.n_clusters
-        D = batch.shape[1]
-        batch_counts = torch.bincount(assignments, minlength=K).to(batch.dtype)
-        batch_sums = torch.zeros(
-            K, D, dtype=batch.dtype, device=batch.device
-        ).index_add_(0, assignments, batch)
-
-        # One coalesced all_reduce instead of two: pack counts as a final
-        # extra column on batch_sums, reduce, then split back.
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            packed = torch.cat([batch_sums, batch_counts.unsqueeze(1)], dim=1)
-            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-            batch_sums = packed[:, :D]
-            batch_counts = packed[:, D]
-
-        # Update centroids
-        self.cluster_counts += batch_counts
-        mask = batch_counts > 0
-        if mask.any():
-            batch_means = batch_sums[mask] / batch_counts[mask].unsqueeze(1)
-            eta = (
-                batch_counts[mask] / self.cluster_counts[mask]
-            ).unsqueeze(1)
-            self.centroids[mask] = (
-                self.centroids[mask] * (1.0 - eta) + batch_means * eta
-            )
-
-        embeddings = self.centroids[assignments]
-        return assignments, embeddings

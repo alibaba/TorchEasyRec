@@ -9,7 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-layer residual K-Means: ResidualKMeans and RQKMeans wrapper."""
+"""Multi-layer residual K-Means: ResidualKMeans and RQKMeans wrapper.
+
+Training is FAISS-only: the codebook is built once via ``train_offline``
+over the full embedding matrix; ``forward`` is read-only (predict + lookup).
+"""
 
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -21,18 +25,16 @@ from torch.nn import functional as F
 from tzrec.modules.sid_generation.kmeans import MiniBatchKMeans
 from tzrec.utils.logging_util import logger
 
-VALID_TRAIN_MODES = ("online", "offline_faiss")
-
 
 class ResidualKMeans(nn.Module):
-    """Multi-layer residual Mini-Batch K-Means.
+    """Multi-layer residual K-Means with offline FAISS training.
 
-    Each layer quantizes the residual from the previous layer using
-    MiniBatchKMeans online clustering:
+    Each layer quantizes the residual from the previous layer:
         residual_0 = input
         for each layer i:
             (optionally) residual_i = L2_normalize(residual_i)
-            code_i, quantized_i = layer_i.train_step(residual_i)
+            code_i = layer_i.predict(residual_i)
+            quantized_i = layer_i.centroids[code_i]
             residual_{i+1} = residual_i - quantized_i
         output = sum of all quantized_i
 
@@ -41,24 +43,12 @@ class ResidualKMeans(nn.Module):
     Args:
         embed_dim (int): feature dimension.
         n_layers (int): number of residual quantization layers.
-        n_embed (int|List[int]): number of clusters per layer.
-            Default: 256.
+        n_embed (int|List[int]): number of clusters per layer. Default: 256.
         normalize_residuals (bool): whether to L2-normalize residuals
             before each layer. Default: False.
-        init_buffer_size (int): buffer size for KMeans++ initialization
-            (only used in 'online' mode). Default: 3072.
-        train_mode (str): training backend, one of {'online',
-            'offline_faiss'}. Default: 'online'.
-            * 'online'        : original Mini-Batch K-Means; centroids are
-                                updated incrementally inside ``forward``.
-            * 'offline_faiss' : codebook is built once via ``train_offline``
-                                using FAISS over the full embedding matrix;
-                                ``forward`` becomes effectively read-only
-                                (predict + lookup).
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
-            ``faiss.Kmeans(D, K, **kwargs)`` when ``train_mode ==
-            'offline_faiss'`` (e.g. {'niter': 20, 'gpu': True,
-            'verbose': True, 'spherical': False}). Ignored otherwise.
+            ``faiss.Kmeans(D, K, **kwargs)`` (e.g. {'niter': 20,
+            'gpu': True, 'verbose': True, 'spherical': False}).
     """
 
     def __init__(
@@ -67,18 +57,12 @@ class ResidualKMeans(nn.Module):
         n_layers: int,
         n_embed: Union[int, List[int]] = 256,
         normalize_residuals: bool = False,
-        init_buffer_size: int = 3072,
-        train_mode: str = "online",
         faiss_kmeans_kwargs: Optional[Dict] = None,
     ) -> None:
         super().__init__()
-        assert train_mode in VALID_TRAIN_MODES, (
-            f"train_mode must be one of {VALID_TRAIN_MODES}, got {train_mode}"
-        )
         self.embed_dim = embed_dim
         self.n_layers = n_layers
         self.normalize_residuals = normalize_residuals
-        self.train_mode = train_mode
         self.faiss_kmeans_kwargs = dict(faiss_kmeans_kwargs or {})
 
         if isinstance(n_embed, int):
@@ -96,7 +80,6 @@ class ResidualKMeans(nn.Module):
                 MiniBatchKMeans(
                     n_clusters=n_embed_list[i],
                     n_features=embed_dim,
-                    init_buffer_size=init_buffer_size,
                 )
                 for i in range(n_layers)
             ]
@@ -104,30 +87,28 @@ class ResidualKMeans(nn.Module):
 
     @property
     def all_initialized(self) -> bool:
-        """Whether all layers have been initialized via KMeans++."""
+        """Whether all layers have been initialized via offline FAISS."""
         return all(layer.is_initialized for layer in self.layers)
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
         return self.embed_dim
 
-
     def forward(
         self, input: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward the multi-layer residual K-Means.
+        """Assign codes per layer and sum the centroids.
 
-        During training: calls layer.train_step() to update centroids.
-        During inference: calls layer.predict() without update.
+        Codebook is read-only here; training happens in ``train_offline``.
+        Uninitialized layers return dummy zeros so the model is callable
+        before the one-shot FAISS fit completes.
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
 
         Returns:
-            codes (Tensor): cluster indices per layer,
-                shape (B, n_layers).
-            quantized (Tensor): sum of quantized embeddings,
-                shape (B, D).
+            codes (Tensor): cluster indices per layer, shape (B, n_layers).
+            quantized (Tensor): sum of quantized embeddings, shape (B, D).
         """
         residual = input
         all_codes: List[torch.Tensor] = []
@@ -137,34 +118,23 @@ class ResidualKMeans(nn.Module):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
 
-            if self.training and self.train_mode == "online":
-                codes, quantized = layer.train_step(residual)
-            else:
+            if layer.is_initialized:
                 codes = layer.predict(residual)
                 quantized = layer.centroids[codes]
-
-            all_codes.append(codes)
-
-            # Only update residual if layer is initialized
-            # (uninitialized layers return dummy zeros)
-            if layer.is_initialized:
                 residual = residual - quantized
                 quantized_sum = quantized_sum + quantized
+            else:
+                codes = torch.zeros(
+                    input.shape[0], dtype=torch.long, device=input.device
+                )
+            all_codes.append(codes)
 
         cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
         return cluster_ids, quantized_sum
 
-
     @torch.no_grad()
     def get_codes(self, input: torch.Tensor) -> torch.Tensor:
-        """Assign semantic IDs without updating centroids.
-
-        Args:
-            input (Tensor): input embeddings, shape (B, D).
-
-        Returns:
-            Tensor: cluster ids, shape (B, n_layers).
-        """
+        """Assign semantic IDs without updating centroids."""
         residual = input
         all_codes: List[torch.Tensor] = []
 
@@ -210,7 +180,6 @@ class ResidualKMeans(nn.Module):
             quantized_sum = quantized_sum + emb
         return quantized_sum
 
-
     @torch.no_grad()
     def train_offline(
         self,
@@ -229,18 +198,13 @@ class ResidualKMeans(nn.Module):
                 loss. Default: True.
 
         Raises:
-            AssertionError: if ``train_mode != 'offline_faiss'``.
             ImportError: if ``faiss`` is not installed.
         """
-        assert self.train_mode == "offline_faiss", (
-            "train_offline() requires train_mode='offline_faiss', "
-            f"got {self.train_mode}"
-        )
         try:
             import faiss
         except ImportError as e:
             raise ImportError(
-                "faiss is required for offline_faiss mode. Install via "
+                "faiss is required for RQKMeans training. Install via "
                 "`pip install faiss-cpu` or `pip install faiss-gpu`."
             ) from e
 
@@ -324,13 +288,12 @@ class ResidualKMeans(nn.Module):
         return {"loss": float(loss.item()), "rel_loss": float(rel_loss.item())}
 
 
-
-
 class RQKMeans(nn.Module):
-    """RQ-KMeans: multi-layer residual Mini-Batch K-Means.
+    """RQ-KMeans: multi-layer residual K-Means trained offline via FAISS.
 
     No Encoder/Decoder — directly clusters input vectors via residual
-    K-Means, updating centroids online without gradient backpropagation.
+    K-Means. Codebook is built once by :meth:`train_offline`; ``forward``
+    is read-only (assign + lookup).
 
     Args:
         embed_dim (int): feature dimension. Default: 64.
@@ -338,14 +301,8 @@ class RQKMeans(nn.Module):
         n_embed (int|List[int]): number of clusters per layer. Default: 256.
         normalize_residuals (bool): L2-normalize residuals before each
             layer. Default: False.
-        init_buffer_size (int): buffer size for KMeans++ initialization
-            (only used in 'online' mode). Default: 3072.
-        train_mode (str): training backend, one of {'online',
-            'offline_faiss'}. Default: 'online'. See
-            :class:`ResidualKMeans` for semantics.
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
-            ``faiss.Kmeans(...)`` when ``train_mode == 'offline_faiss'``.
-            Ignored otherwise.
+            ``faiss.Kmeans(...)``.
     """
 
     def __init__(
@@ -354,20 +311,15 @@ class RQKMeans(nn.Module):
         n_layers: int = 3,
         n_embed: Union[int, List[int]] = 256,
         normalize_residuals: bool = False,
-        init_buffer_size: int = 3072,
-        train_mode: str = "online",
         faiss_kmeans_kwargs: Optional[Dict] = None,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.train_mode = train_mode
         self.quantizer = ResidualKMeans(
             embed_dim=embed_dim,
             n_layers=n_layers,
             n_embed=n_embed,
             normalize_residuals=normalize_residuals,
-            init_buffer_size=init_buffer_size,
-            train_mode=train_mode,
             faiss_kmeans_kwargs=faiss_kmeans_kwargs,
         )
 
@@ -376,7 +328,7 @@ class RQKMeans(nn.Module):
         inputs: Union[torch.Tensor, "np.ndarray"],
         verbose: bool = True,
     ) -> None:
-        """Build codebook offline via FAISS (only in 'offline_faiss' mode).
+        """Build codebook offline via FAISS.
 
         Args:
             inputs: full embedding matrix, shape (N, embed_dim). Either
@@ -384,17 +336,10 @@ class RQKMeans(nn.Module):
                 transferred — array is mutated in-place).
             verbose (bool): print per-layer reconstruction loss.
         """
-        assert self.train_mode == "offline_faiss", (
-            "RQKMeans.train_offline() only valid in offline_faiss mode, "
-            f"got {self.train_mode}"
-        )
         self.quantizer.train_offline(inputs, verbose=verbose)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Forward: direct residual K-Means quantization.
-
-        During training: updates centroids via mini-batch steps.
-        During inference: assigns to nearest centroids without update.
+        """Forward: residual K-Means assignment (no training).
 
         Args:
             x: (B, embed_dim) input features.
@@ -412,36 +357,15 @@ class RQKMeans(nn.Module):
 
     @torch.no_grad()
     def get_codes(self, x: torch.Tensor) -> torch.Tensor:
-        """Inference: get semantic IDs.
-
-        Args:
-            x: (B, embed_dim) input features.
-
-        Returns:
-            Tensor: codes, shape (B, n_layers).
-        """
+        """Inference: get semantic IDs."""
         return self.quantizer.get_codes(x)
 
     @torch.no_grad()
     def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Reconstruct vectors from semantic IDs (centroid lookup + sum).
-
-        Args:
-            codes: (B, n_layers) semantic ID codes.
-
-        Returns:
-            Tensor: quantized, shape (B, embed_dim).
-        """
+        """Reconstruct vectors from semantic IDs (centroid lookup + sum)."""
         return self.quantizer.decode_codes(codes)
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:
-        """Get centroid weights for a specific layer.
-
-        Args:
-            layer_idx: index of the quantization layer.
-
-        Returns:
-            Tensor: centroids, shape (n_embed, embed_dim).
-        """
+        """Get centroid weights for a specific layer."""
         return self.quantizer.get_codebook_embeddings(layer_idx)

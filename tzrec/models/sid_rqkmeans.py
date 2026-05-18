@@ -9,15 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SidRqkmeans: SID generation model using residual Mini-Batch KMeans.
+"""SidRqkmeans: SID generation model using residual K-Means.
 
-Two training backends:
-  - 'online'        : centroids updated on the fly via train_step()
-                      during predict() in training mode (default).
-  - 'offline_faiss' : predict() only collects embeddings into a CPU
-                      buffer; the actual FAISS fit is triggered ONCE
-                      after the train_eval loop ends, via
-                      `flush_offline_fit()` invoked by main.py.
+Training is FAISS-only: ``predict`` collects embeddings into a CPU
+buffer; the actual FAISS fit is triggered ONCE after the train_eval
+loop ends, via ``flush_offline_fit()`` invoked by ``tzrec.main``.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -117,10 +113,11 @@ def _all_gather_concat(local: torch.Tensor) -> torch.Tensor:
 
 
 class SidRqkmeans(BaseModel):
-    """SID generation model using residual Mini-Batch KMeans.
+    """SID generation model using residual K-Means (FAISS-only).
 
-    No gradient-based training. Centroids are updated online via
-    train_step() during the predict() call in training mode.
+    No gradient-based training. The codebook is built once at the end
+    of the train_eval loop via a single FAISS K-Means pass over the
+    embeddings collected during training.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -148,10 +145,19 @@ class SidRqkmeans(BaseModel):
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
-        # Resolve new fields with backward compatibility:
-        # proto2 string default may return empty string if not set in
-        # the textproto, so explicitly fallback to 'online'.
-        self._train_mode = cfg.train_mode or "online"
+        # The legacy ``train_mode`` field is ignored — FAISS is the only
+        # backend. Warn the user only if they explicitly set it to
+        # something other than offline_faiss (proto default of "online"
+        # is silently accepted to avoid noise on every construction).
+        if (
+            cfg.HasField("train_mode")
+            and cfg.train_mode != "offline_faiss"
+        ):
+            logger.warning(
+                "SidRqkmeans.train_mode=%r is deprecated; the only "
+                "supported backend is offline FAISS. Ignoring.",
+                cfg.train_mode,
+            )
         self._faiss_kwargs = (
             _coerce_proto_numbers(MessageToDict(cfg.faiss_kmeans_kwargs))
             if cfg.HasField("faiss_kmeans_kwargs")
@@ -163,14 +169,12 @@ class SidRqkmeans(BaseModel):
             n_layers=n_layers,
             n_embed=n_embed_list,
             normalize_residuals=cfg.normalize_residuals,
-            init_buffer_size=cfg.init_buffer_size,
-            train_mode=self._train_mode,
             faiss_kmeans_kwargs=self._faiss_kwargs,
         )
 
-        # Offline mode: collect embeddings into a CPU buffer
-        if self._train_mode == "offline_faiss":
-            self._offline_buffer: List[torch.Tensor] = []
+        # CPU buffer for embeddings collected during training; FAISS
+        # consumes it in flush_offline_fit() at end-of-loop.
+        self._offline_buffer: List[torch.Tensor] = []
 
         # KMeans has no learnable parameters (centroids use register_buffer).
         # Add dummy param to keep optimizer/DDP happy.
@@ -184,9 +188,8 @@ class SidRqkmeans(BaseModel):
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
 
-        RQKMeans.forward() internally distinguishes training/eval:
-          training: calls layer.train_step() to update centroids
-          eval:     calls layer.predict() for assignment only
+        Training: buffer embeddings only (codes are dummy until FAISS fits).
+        Eval/inference (after ``flush_offline_fit``): real predict + lookup.
 
         Args:
             batch (Batch): input batch data.
@@ -196,8 +199,8 @@ class SidRqkmeans(BaseModel):
         """
         embedding = self._extract_embedding(batch)
 
-        # Offline mode + training stage: only collect; skip _rqkmeans forward.
-        if self._train_mode == "offline_faiss" and self.is_train:
+        # Training stage: buffer for offline FAISS fit, return dummy codes.
+        if self.is_train:
             self._offline_buffer.append(embedding.detach().cpu())
             B = embedding.shape[0]
             n_layers = self._rqkmeans.quantizer.n_layers
@@ -207,14 +210,14 @@ class SidRqkmeans(BaseModel):
                 )
             }
 
-        # Online minibatch mode.
+        # Eval / inference: codebook has been fit; run assignment + lookup.
         result = self._rqkmeans(embedding)
 
         predictions: Dict[str, torch.Tensor] = {
             "codes": result["codes"],
         }
 
-        if self.is_train or self.is_eval:
+        if self.is_eval:
             predictions["quantized"] = result["quantized"]
             predictions["input_embedding"] = embedding
 
@@ -223,8 +226,8 @@ class SidRqkmeans(BaseModel):
     def init_loss(self) -> None:
         """Initialize loss modules.
 
-        KMeans has no gradient loss. Centroids are updated
-        in predict() via train_step().
+        KMeans has no gradient loss; the codebook is built in
+        ``flush_offline_fit`` at end of training.
         """
         pass
 
@@ -323,19 +326,15 @@ class SidRqkmeans(BaseModel):
         """Trigger one-shot FAISS fit after the train_eval loop ends.
 
         Called by ``tzrec.main.train_and_evaluate`` after the training
-        loop exits. No-op for ``train_mode='online'`` or when the
-        offline buffer is empty.
+        loop exits. No-op when the buffer is empty.
 
         DDP behavior:
             - rank0: all_gather full embedding matrix, run FAISS fit,
-              then broadcast (centroids + _is_initialized + _offline_locked)
-              to all other ranks.
+              then broadcast (centroids + _is_initialized) to other ranks.
             - other ranks: send local buffer via all_gather, then wait
               for broadcast.
         """
-        if self._train_mode != "offline_faiss":
-            return
-        if not getattr(self, "_offline_buffer", None):
+        if not self._offline_buffer:
             logger.warning(
                 "[SidRqkmeans.flush_offline_fit] offline buffer is empty; "
                 "skip FAISS fit. Did the train_eval loop run?"
@@ -362,12 +361,9 @@ class SidRqkmeans(BaseModel):
                 )
                 self._rqkmeans.train_offline(full, verbose=True)
             del full
-            # Broadcast all codebook-related buffers (centroids + 2 guards).
-            # Missing any one breaks rank consistency on subsequent forward.
             for layer in self._rqkmeans.quantizer.layers:
                 dist.broadcast(layer.centroids, src=0)
                 dist.broadcast(layer._is_initialized, src=0)
-                dist.broadcast(layer._offline_locked, src=0)
             dist.barrier()
         else:
             # Single-process path: build the full numpy matrix directly
