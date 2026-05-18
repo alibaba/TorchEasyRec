@@ -14,7 +14,7 @@ import math
 import os
 import random
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -82,17 +82,19 @@ class IdMockInput(MockInput):
         num_ids: Optional[int] = None,
         vocab_list: Optional[List[str]] = None,
         multival_sep: str = chr(3),
+        as_string: bool = False,
     ) -> None:
         super().__init__(name)
         self.is_multi = is_multi
         self.num_ids = num_ids
         self.vocab_list = vocab_list
         self.multival_sep = multival_sep
+        self.as_string = as_string
 
     def create_data(self, num_rows: int, has_null: bool = True) -> pa.Array:
         """Create mock data."""
         if not self.is_multi:
-            # int64
+            # int64 (or string if as_string=True)
             num_valid_rows = (
                 random.randint(num_rows // 2, num_rows) if has_null else num_rows
             )
@@ -101,6 +103,8 @@ class IdMockInput(MockInput):
             )
             data = data + [None] * (num_rows - num_valid_rows)
             random.shuffle(data)
+            if self.as_string:
+                data = [str(x) if x is not None else None for x in data]
         else:
             # string
             num_multi_rows = random.randint(num_rows // 3, 2 * num_rows // 3)
@@ -664,6 +668,7 @@ def build_mock_input_with_fg(
     features: List[BaseFeature],
     user_id: str = "",
     item_id: str = "",
+    neg_fields: Optional[Set[str]] = None,
 ) -> Dict[str, MockInput]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
@@ -787,14 +792,30 @@ def build_mock_input_with_fg(
                         if isinstance(inputs[side][sub_name], IdMockInput):
                             inputs[side][sub_name].is_multi = False
                 else:
-                    inputs[side][input_name] = IdMockInput(
-                        input_name,
-                        is_multi=True,
-                        num_ids=10
-                        if isinstance(feature, CustomFeature)
-                        else feature.num_embeddings,
-                        multival_sep=feature.sequence_delim,
-                    )
+                    if neg_fields and input_name in neg_fields:
+                        # Sampler-targeted sequence features must have
+                        # single-value mock data so it can serve both as the
+                        # join key (unique int64 in item_t) and the candidate
+                        # source column (sequence_id_feature reads single
+                        # int64, casts to string, splits on delim --
+                        # combine_negs_to_candidate_sequence builds the
+                        # row-(B-1) suffix at runtime).
+                        inputs[side][input_name] = IdMockInput(
+                            input_name,
+                            is_multi=False,
+                            num_ids=10
+                            if isinstance(feature, CustomFeature)
+                            else feature.num_embeddings,
+                        )
+                    else:
+                        inputs[side][input_name] = IdMockInput(
+                            input_name,
+                            is_multi=True,
+                            num_ids=10
+                            if isinstance(feature, CustomFeature)
+                            else feature.num_embeddings,
+                            multival_sep=feature.sequence_delim,
+                        )
     return inputs["user"], inputs["item"]
 
 
@@ -840,7 +861,18 @@ def load_config_for_test(
             num_parts=num_parts,
         )
     else:
-        user_inputs, item_inputs = build_mock_input_with_fg(features, user_id, item_id)
+        # Determine sampler attr_fields so the mock generator can produce
+        # single-value data for sequence features that the sampler will
+        # use as item_id (sampler casts field values to int64).
+        sampler_neg_fields: Set[str] = set()
+        if data_config.HasField("sampler"):
+            sampler_type_name = data_config.WhichOneof("sampler")
+            sampler_cfg = getattr(data_config, sampler_type_name)
+            if hasattr(sampler_cfg, "attr_fields"):
+                sampler_neg_fields = set(sampler_cfg.attr_fields)
+        user_inputs, item_inputs = build_mock_input_with_fg(
+            features, user_id, item_id, neg_fields=sampler_neg_fields
+        )
         _, item_t = create_mock_data(
             os.path.join(test_dir, "item_data"),
             item_inputs,

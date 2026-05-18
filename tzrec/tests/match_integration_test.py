@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -368,11 +368,10 @@ class MatchIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
-    @mark_ci_scope("h20")
-    @unittest.skip("skip hstu match test")
-    def test_hstu_with_fg_train_eval_export(self):
+    @unittest.skipIf(*gpu_unavailable)
+    def test_hstu_with_fg_train_eval(self):
         self.success = utils.test_train_eval(
-            "tzrec/tests/configs/hstu_fg_mock.config",
+            "tzrec/tests/configs/hstu_kuairand_1k.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
@@ -381,18 +380,7 @@ class MatchIntegrationTest(unittest.TestCase):
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
-        if self.success:
-            self.success = utils.test_export(
-                os.path.join(self.test_dir, "pipeline.config"),
-                self.test_dir,
-            )
         self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/user/scripted_model.pt"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/item/scripted_model.pt"))
-        )
 
 
 if __name__ == "__main__":
