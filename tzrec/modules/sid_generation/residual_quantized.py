@@ -317,7 +317,6 @@ class ResidualQuantized(nn.Module):
         self,
         input: torch.Tensor,
         temperature: float = 1.0,
-        reference_code: Optional[torch.Tensor] = None,
         ema_mask: Optional[torch.Tensor] = None,
     ) -> ResidualQuantizedOutput:
         """Forward the multi-layer residual quantization.
@@ -327,16 +326,12 @@ class ResidualQuantized(nn.Module):
             2. For each layer: quantize detached residual, accumulate
                into aggregated_quants and compute per-layer commitment loss
                in-place (avoids storing a quant_list of clones).
-               - pass reference_code[:, i] if provided
             3. Mean of per-layer commitment losses (cos/l2 with latent_weight)
             4. STE gradient pass-through (or rotation trick)
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
             temperature (float): temperature for Gumbel-Softmax.
-            reference_code (Tensor, optional): reference codebook indices,
-                shape (B, n_layers). If provided, each layer receives
-                reference_code[:, i] for probabilistic replacement.
             ema_mask (Tensor, optional): per-row EMA mask, shape (B,)
                 float. Passed through to each VectorQuantize layer.
 
@@ -360,16 +355,9 @@ class ResidualQuantized(nn.Module):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
 
-            ref_code_i = (
-                reference_code[:, i]
-                if reference_code is not None
-                else None
-            )
-
             # VQ forward: assignment + EMA update (internally)
             quantized = layer(
                 residual, temperature=temperature,
-                reference_code=ref_code_i,
                 ema_mask=ema_mask,
             )
             all_ids.append(quantized.ids)

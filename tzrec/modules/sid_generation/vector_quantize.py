@@ -374,7 +374,6 @@ class VectorQuantize(nn.Module):
         self,
         x: torch.Tensor,
         temperature: float = 1.0,
-        reference_code: Optional[torch.Tensor] = None,
         ema_mask: Optional[torch.Tensor] = None,
     ) -> QuantizeOutput:
         """Forward the vector quantization layer.
@@ -383,17 +382,13 @@ class VectorQuantize(nn.Module):
             1. compute distances (L2 or cosine)
             2. if use_sinkhorn: z-score normalize + Sinkhorn -> argmax
                else: argmin
-            3. if reference_code: replace ids with reference at prob 0.04
-            4. if use_ema: update EMA buffers + refresh embedding weights
-            5. compute differentiable embedding (STE or Gumbel-Softmax)
-            6. compute commitment loss
+            3. if use_ema: update EMA buffers + refresh embedding weights
+            4. compute differentiable embedding (STE or Gumbel-Softmax)
+            5. compute commitment loss
 
         Args:
             x (Tensor): input vectors, shape (B, D).
             temperature (float): temperature for Gumbel-Softmax.
-            reference_code (Tensor, optional): reference codebook indices,
-                shape (B,). If provided, randomly replace assigned ids
-                with reference codes at probability 0.04.
             ema_mask (Tensor, optional): per-row EMA mask, shape (B,)
                 float. 1.0 = contribute to EMA update, 0.0 = skip.
                 Used by mixed mode path2 to exclude recon rows.
@@ -404,17 +399,11 @@ class VectorQuantize(nn.Module):
         # Step 1-2: find nearest codebook entry
         ids, distances = self._find_nearest_embedding(x)
 
-        # Step 3: reference_code probabilistic replacement
-        if reference_code is not None:
-            p = 0.04
-            mask = torch.rand(ids.size(0), device=x.device) < p
-            ids = torch.where(mask, reference_code, ids)
-
-        # Step 4: EMA codebook update (training only)
+        # Step 3: EMA codebook update (training only)
         if self.training and self.use_ema:
             self._update_ema_buffers(x, ids, ema_mask)
 
-        # Step 5: compute differentiable embedding
+        # Step 4: compute differentiable embedding
         # Single embedding lookup feeds both the differentiable output and
         # the commitment loss (Gumbel takes a different path entirely).
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
@@ -439,7 +428,7 @@ class VectorQuantize(nn.Module):
         if self.training and self.use_ema:
             self._update_embedding_from_ema()
 
-        # Step 6: commitment loss
+        # Step 5: commitment loss
         e_latent_loss = F.mse_loss(x, quantized_for_loss.detach())
         if self.use_ema:
             # EMA mode: codebook not updated via gradient, no q_latent_loss
