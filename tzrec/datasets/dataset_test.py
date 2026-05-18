@@ -677,31 +677,32 @@ class DatasetTest(unittest.TestCase):
         hard_neg_indices = batch.additional_infos[HARD_NEG_INDICES]
         self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
 
-    def test_seq_field_delims_excludes_non_seq_inputs(self):
-        """Grouped sequence_feature: only item:-side sub-inputs are sequence.
+    def test_seq_field_delims_uses_sequence_input_names(self):
+        """BaseDataset._seq_field_delims filters by feature.sequence_input_names.
 
-        Verifies the narrowed _seq_field_delims build excludes the user:-side
-        companions of a multi-input LookupFeature sub, mirroring the C++
-        SequenceFeature seq_fields_mask_ rule (via
-        feature.sequence_input_names).
+        Two item-side inputs of a grouped LookupFeature sub: only the one
+        listed in ``sequence_fields`` is registered. The other item-side
+        input (``cat_map``) is excluded by the C++-mirrored rule even
+        though the parent sequence_feature has a ``sequence_delim`` set.
         """
         input_fields = [
-            pa.field(name="kv_cate", type=pa.string()),
-            pa.field(name="click_50_seq__cate", type=pa.string()),
+            pa.field(name="cat_map", type=pa.string()),
+            pa.field(name="click_seq__cat_key", type=pa.string()),
             pa.field(name="label", type=pa.int32()),
         ]
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 sequence_feature=feature_pb2.SequenceFeature(
-                    sequence_name="click_50_seq",
-                    sequence_length=50,
+                    sequence_name="click_seq",
+                    sequence_length=10,
                     sequence_delim=";",
                     features=[
                         feature_pb2.SeqFeatureConfig(
                             lookup_feature=feature_pb2.LookupFeature(
-                                feature_name="lookup_d",
-                                map="user:kv_cate",
-                                key="item:cate",
+                                feature_name="lookup_c",
+                                map="item:cat_map",
+                                key="item:cat_key",
+                                sequence_fields=["cat_key"],
                                 num_buckets=10,
                                 embedding_dim=8,
                             )
@@ -723,10 +724,8 @@ class DatasetTest(unittest.TestCase):
             input_fields=input_fields,
             mode=Mode.TRAIN,
         )
-        # Only the item:-side sub-input is registered as a sequence input;
-        # the user:-side companion (kv_cate) is excluded.
-        self.assertIn("click_50_seq__cate", dataset._seq_field_delims)
-        self.assertNotIn("kv_cate", dataset._seq_field_delims)
+        self.assertIn("click_seq__cat_key", dataset._seq_field_delims)
+        self.assertNotIn("cat_map", dataset._seq_field_delims)
 
     def test_dataset_with_sample_mask(self):
         input_fields = [

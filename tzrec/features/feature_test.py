@@ -644,109 +644,114 @@ class FeatureTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
         self.assertEqual(repr(feature_cfgs), repr(again_feature_cfgs))
 
-    def test_sequence_input_names_non_sequence_feature(self):
-        cfg = feature_pb2.FeatureConfig(
-            id_feature=feature_pb2.IdFeature(
-                feature_name="cat_a", expression="item:cat_a", num_buckets=100
-            )
-        )
-        feat = id_feature.IdFeature(cfg, fg_mode=FgMode.FG_DAG)
-        self.assertEqual(feat.sequence_input_names, [])
-        self.assertFalse(feat._is_sequence_input("item", "cat_a"))
+    @parameterized.expand(
+        [
+            [FgMode.FG_NORMAL],
+            [FgMode.FG_DAG],
+            [FgMode.FG_NONE],
+            [FgMode.FG_BUCKETIZE],
+        ]
+    )
+    def test_sequence_input_names(self, fg_mode):
+        """Sequence-input detection across feature types and fg_modes.
 
-    def test_sequence_input_names_top_level_sequence_id_feature(self):
-        cfg = feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="item_id",
-                expression="item:item_id",
-                sequence_length=50,
-                sequence_delim=";",
-                num_buckets=100,
-            )
-        )
-        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
-        feat = features[0]
-        self.assertTrue(feat.is_sequence)
-        self.assertFalse(feat.is_grouped_sequence)
-        self.assertTrue(feat._is_sequence_input("item", "item_id"))
-        self.assertFalse(feat._is_sequence_input("feature", "item_id"))
-        self.assertEqual(feat.sequence_input_names, feat.inputs)
+        One full config covers all C++ ``SequenceFeature::Init`` branches
+        (mirrored by ``_is_sequence_input``):
+            - non-sequence feature -> always empty.
+            - top-level ``sequence_id_feature`` (single-input class).
+            - grouped ``sequence_feature`` sub: single-input.
+            - grouped ``sequence_feature`` sub: multi-input with explicit
+              ``sequence_fields`` excluding the non-sequence ``map`` input.
 
-    def test_sequence_input_names_grouped_single_input_sub(self):
-        cfg = feature_pb2.FeatureConfig(
-            sequence_feature=feature_pb2.SequenceFeature(
-                sequence_name="click_seq",
-                sequence_length=50,
-                sequence_delim=";",
-                features=[
-                    feature_pb2.SeqFeatureConfig(
-                        id_feature=feature_pb2.IdFeature(
-                            feature_name="cat_a",
-                            expression="item:cat_a",
-                            num_buckets=100,
-                        )
-                    ),
-                ],
-            )
+        FG_NORMAL / FG_DAG: returned names are the prefixed side-input
+        names. FG_NONE / FG_BUCKETIZE: returned names are ``[self.name]``
+        (the entire pre-encoded column).
+        """
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a",
+                    expression="item:cat_a",
+                    num_buckets=100,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.IdFeature(
+                    feature_name="seq_a",
+                    expression="item:seq_a",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    num_buckets=100,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_seq",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="cat_b",
+                                expression="item:cat_b",
+                                num_buckets=100,
+                            )
+                        ),
+                        feature_pb2.SeqFeatureConfig(
+                            lookup_feature=feature_pb2.LookupFeature(
+                                feature_name="lookup_c",
+                                map="item:cat_map",
+                                key="item:cat_key",
+                                sequence_fields=["cat_key"],
+                                num_buckets=10,
+                                embedding_dim=8,
+                            )
+                        ),
+                    ],
+                )
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs, fg_mode=fg_mode)
+        by_name = {f.name: f for f in features}
+        self.assertEqual(
+            set(by_name),
+            {"cat_a", "seq_a", "click_seq__cat_b", "click_seq__lookup_c"},
         )
-        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
-        sub = features[0]
-        self.assertTrue(sub.is_sequence)
-        self.assertTrue(sub.is_grouped_sequence)
-        self.assertTrue(sub._is_sequence_input("item", "cat_a"))
-        self.assertEqual(sub.sequence_input_names, ["click_seq__cat_a"])
-        self.assertEqual(sub.sequence_input_names, sub.inputs)
 
-    def test_sequence_input_names_grouped_multi_input_sub_only_item_side(self):
-        cfg = feature_pb2.FeatureConfig(
-            sequence_feature=feature_pb2.SequenceFeature(
-                sequence_name="click_50_seq",
-                sequence_length=50,
-                sequence_delim=";",
-                features=[
-                    feature_pb2.SeqFeatureConfig(
-                        lookup_feature=feature_pb2.LookupFeature(
-                            feature_name="lookup_d",
-                            map="user:kv_cate",
-                            key="item:cate",
-                            num_buckets=10,
-                        )
-                    ),
-                ],
-            )
-        )
-        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
-        sub = features[0]
-        self.assertTrue(sub.is_grouped_sequence)
-        self.assertTrue(sub._is_sequence_input("item", "cate"))
-        self.assertFalse(sub._is_sequence_input("user", "kv_cate"))
-        self.assertEqual(sub.inputs, ["kv_cate", "click_50_seq__cate"])
-        self.assertEqual(sub.sequence_input_names, ["click_50_seq__cate"])
+        # Non-sequence: always empty regardless of fg_mode.
+        self.assertEqual(by_name["cat_a"].sequence_input_names, [])
 
-    def test_sequence_input_names_explicit_sequence_fields_override(self):
-        cfg = feature_pb2.FeatureConfig(
-            sequence_feature=feature_pb2.SequenceFeature(
-                sequence_name="click_50_seq",
-                sequence_length=50,
-                sequence_delim=";",
-                features=[
-                    feature_pb2.SeqFeatureConfig(
-                        lookup_feature=feature_pb2.LookupFeature(
-                            feature_name="lookup_d",
-                            map="user:kv_cate",
-                            key="item:cate",
-                            num_buckets=10,
-                            sequence_fields=["kv_cate"],
-                        )
-                    ),
-                ],
+        if fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+            # Pre-encoded mode: the entire self.name column is the sequence.
+            self.assertEqual(by_name["seq_a"].sequence_input_names, ["seq_a"])
+            self.assertEqual(
+                by_name["click_seq__cat_b"].sequence_input_names,
+                ["click_seq__cat_b"],
             )
-        )
-        features = feature_lib.create_features([cfg], fg_mode=FgMode.FG_DAG)
-        sub = features[0]
-        self.assertTrue(sub._is_sequence_input("user", "kv_cate"))
-        self.assertFalse(sub._is_sequence_input("item", "cate"))
-        self.assertEqual(sub.sequence_input_names, ["click_50_seq__kv_cate"])
+            self.assertEqual(
+                by_name["click_seq__lookup_c"].sequence_input_names,
+                ["click_seq__lookup_c"],
+            )
+        else:
+            # FG_DAG / FG_NORMAL: prefix applied to true sequence inputs only.
+            # top-level single-input -> [raw_name] (no group prefix).
+            self.assertEqual(by_name["seq_a"].sequence_input_names, ["seq_a"])
+            # grouped single-input item-side -> ["click_seq__cat_b"].
+            self.assertEqual(
+                by_name["click_seq__cat_b"].sequence_input_names,
+                ["click_seq__cat_b"],
+            )
+            # grouped multi-input with explicit sequence_fields=["cat_key"]:
+            # cat_map is item-side but excluded; cat_key is the only sequence
+            # input and gets the group prefix.
+            self.assertEqual(
+                by_name["click_seq__lookup_c"].inputs,
+                ["cat_map", "click_seq__cat_key"],
+            )
+            self.assertEqual(
+                by_name["click_seq__lookup_c"].sequence_input_names,
+                ["click_seq__cat_key"],
+            )
 
 
 if __name__ == "__main__":
