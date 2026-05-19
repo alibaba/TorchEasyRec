@@ -27,6 +27,7 @@ from tzrec.protos import (
     metric_pb2,
     model_pb2,
     module_pb2,
+    simi_pb2,
     tower_pb2,
 )
 from tzrec.protos.models import match_model_pb2
@@ -107,8 +108,11 @@ def _build_model(device: torch.device) -> HSTUMatch:
                 ),
                 max_seq_len=210,
             ),
-            item_tower=tower_pb2.Tower(input="candidate"),
-            output_dim=64,
+            item_tower=tower_pb2.Tower(
+                input="candidate",
+                mlp=module_pb2.MLP(hidden_units=[64], activation=""),
+            ),
+            similarity=simi_pb2.Similarity.COSINE,
             temperature=0.05,
         ),
         losses=[

@@ -11,12 +11,97 @@ HSTU Match 是基于 HSTU (Hierarchical Sequential Transduction Units) 生成式
 ```
 data_config {
     ...
+    label_fields: ["cand_seq__action_weight", "cand_seq__watch_time"]
+    force_base_data_group: true
     negative_sampler {
         input_path: "odps://{PROJECT}/tables/taobao_ad_feature_gl_bucketized_v1"
         num_sample: 128
-        attr_fields: "item_id"
-        item_id_field: "item_id"
+        attr_fields: "cand_seq__video_id"
+        item_id_field: "cand_seq__video_id"
         attr_delimiter: "\t"
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "user_id"
+        expression: "user:user_id"
+        embedding_dim: 32
+        num_buckets: 10000000
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "user_active_degree"
+        expression: "user:user_active_degree"
+        embedding_dim: 32
+        num_buckets: 8
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "follow_user_num_range"
+        expression: "user:follow_user_num_range"
+        embedding_dim: 32
+        num_buckets: 9
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "fans_user_num_range"
+        expression: "user:fans_user_num_range"
+        embedding_dim: 32
+        num_buckets: 9
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "friend_user_num_range"
+        expression: "user:friend_user_num_range"
+        embedding_dim: 32
+        num_buckets: 8
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "register_days_range"
+        expression: "user:register_days_range"
+        embedding_dim: 32
+        num_buckets: 8
+    }
+}
+feature_configs {
+    sequence_feature {
+        sequence_name: "uih_seq"
+        sequence_length: 4096
+        sequence_delim: "|"
+        features {
+            id_feature {
+                feature_name: "video_id"
+                expression: "item:video_id"
+                embedding_name: "video_id_emb"
+                embedding_dim: 512
+                num_buckets: 10000000
+            }
+        }
+        features { raw_feature { feature_name: "action_timestamp" expression: "user:action_timestamp" } }
+        features { raw_feature { feature_name: "action_weight"    expression: "user:action_weight"    } }
+        features { raw_feature { feature_name: "watch_time"       expression: "user:watch_time"       } }
+    }
+}
+feature_configs {
+    sequence_feature {
+        sequence_name: "cand_seq"
+        sequence_length: 100
+        sequence_delim: "|"
+        features {
+            id_feature {
+                feature_name: "video_id"
+                expression: "item:video_id"
+                embedding_name: "video_id_emb"
+                embedding_dim: 512
+                num_buckets: 10000000
+            }
+        }
     }
 }
 model_config {
@@ -24,16 +109,20 @@ model_config {
         group_name: "contextual"
         feature_names: "user_id"
         feature_names: "user_active_degree"
+        feature_names: "follow_user_num_range"
+        feature_names: "fans_user_num_range"
+        feature_names: "friend_user_num_range"
+        feature_names: "register_days_range"
         group_type: DEEP
     }
     feature_groups {
         group_name: "uih"
-        feature_names: "uih_seq__item_id"
+        feature_names: "uih_seq__video_id"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
         group_name: "candidate"
-        feature_names: "item_id"
+        feature_names: "cand_seq__video_id"
         group_type: JAGGED_SEQUENCE
     }
     feature_groups {
@@ -56,15 +145,17 @@ model_config {
             input: "uih"
             hstu {
                 stu {
-                    embedding_dim: 32
-                    num_heads: 1
-                    hidden_dim: 32
-                    attention_dim: 32
-                    output_dropout_ratio: 0.2
+                    embedding_dim: 512
+                    num_heads: 4
+                    hidden_dim: 128
+                    attention_dim: 128
+                    output_dropout_ratio: 0.1
+                    use_group_norm: true
                 }
-                attn_num_layers: 2
+                input_dropout_ratio: 0.2
+                attn_num_layers: 3
                 positional_encoder {
-                    num_position_buckets: 512
+                    num_position_buckets: 8192
                     num_time_buckets: 2048
                     use_time_encoding: true
                 }
@@ -87,12 +178,16 @@ model_config {
                     l2norm_postprocessor {}
                 }
             }
-            max_seq_len: 100
+            max_seq_len: 4096
         }
         item_tower {
             input: "candidate"
+            mlp {
+                hidden_units: 512
+                activation: ""
+            }
         }
-        output_dim: 32
+        similarity: COSINE
         temperature: 0.05
     }
     metrics {
@@ -111,6 +206,8 @@ model_config {
     kernel: TRITON
 }
 ```
+
+> The full runnable counterpart of this snippet is `tzrec/tests/configs/hstu_kuairand_1k.config` — it drives the HSTUMatch integration test on the KuaiRand-1K fixture and mirrors the sample above one-to-one.
 
 - data_config: 数据配置，其中需要配置负采样 Sampler，负采样 Sampler 的配置详见 [DSSM](dssm.md) 文档中的**负采样配置**章节
 
@@ -139,9 +236,9 @@ model_config {
     - max_seq_len: 最大序列长度
   - item_tower: 物品塔
     - input: 候选 Item 序列 feature_group 名 (一般为 "candidate")
-    - mlp: 可选的 MLP 投影；当不配置时直接对候选 Embedding 应用输出 Linear 层
-  - output_dim: user/item 输出 embedding 维度
-  - similarity: 向量相似度函数，包括 [COSINE, INNER_PRODUCT]，默认 INNER_PRODUCT
+    - mlp: MLP 投影；当未配置 `output_dim` 时 (默认)，需将 mlp 的最后一层 `hidden_units` 设置为 `user_tower.hstu.stu.embedding_dim`，使 user/item 输出维度匹配
+  - output_dim: 可选，user/item 输出 embedding 维度；默认 0，表示不再追加 output Linear，由 user 塔的 STU 输出与 item 塔的 MLP 输出直接对齐
+  - similarity: 向量相似度函数，包括 [COSINE, INNER_PRODUCT]，默认 INNER_PRODUCT (示例使用 COSINE)
   - temperature: 相似度缩放因子，softmax 前对 logits 除以该值，默认 1.0
 
 - kernel: 算子实现，可选 TRITON/PYTORCH/CUTLASS，详见 [DLRM-HSTU](dlrm_hstu.md) 文档

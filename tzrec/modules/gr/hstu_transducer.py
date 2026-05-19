@@ -435,7 +435,7 @@ class HSTUTransducer(_HSTUPipelineBase):
 
         full = encoded_embeddings if self._return_full_embeddings else None
         if not self._is_inference and self._return_full_embeddings:
-            fx_unwrap_optional_tensor(full)
+            full = fx_unwrap_optional_tensor(full)
         return (candidate_embeddings, full)
 
 
@@ -529,6 +529,5 @@ class HSTUMatchEncoder(_HSTUPipelineBase):
         # index points to an unrelated row; mask those rows back to zero.
         last_idx = torch.clamp_min(seq_offsets[1:] - 1, 0)
         last = encoded[last_idx]
-        return torch.where(
-            (seq_lengths > 0).unsqueeze(-1), last, torch.zeros_like(last)
-        )
+        last.masked_fill_((seq_lengths == 0).unsqueeze(-1), 0)
+        return last
