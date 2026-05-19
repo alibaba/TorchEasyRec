@@ -21,7 +21,6 @@ from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.gr.hstu_transducer import HSTUMatchEncoder
 from tzrec.modules.mlp import MLP
-from tzrec.modules.utils import div_no_nan
 from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.model_pb2 import ModelConfig
@@ -312,44 +311,41 @@ class HSTUMatch(MatchModel):
         ui_sim = self.sim(query_emb, item_emb, hard_neg_indices) / self._temperature
         return {"similarity": ui_sim}
 
-    def _loss_impl(
+    def _get_label(self, batch: Batch) -> torch.Tensor:
+        """Read the candidate-side jagged label."""
+        return batch.jagged_labels[self._label_name].values().to(torch.int64)
+
+    def loss(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Compute loss; reads the jagged label rather than a scalar bare label."""
+        losses = {}
+        label = self._get_label(batch)
+        for loss_cfg in self._base_model_config.losses:
+            losses.update(self._loss_impl(predictions, batch, label, loss_cfg))
+        losses.update(self._loss_collection)
+        return losses
+
+    def update_metric(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        label: torch.Tensor,
-        loss_cfg: Any,
-        suffix: str = "",
-    ) -> Dict[str, torch.Tensor]:
-        """Loss in Q-space: repeat sample_weight by pos_lengths to match (Q,)."""
-        sample_weight = (
-            batch.sample_weights[self._sample_weight]
-            if self._sample_weight
-            else torch.tensor([1.0], device=batch.labels[self._label_name].device)
-        )
-        if self._sample_weight:
-            pos_lengths_t = batch.additional_infos.get(CAND_POS_LENGTHS, None)
-            assert pos_lengths_t is not None, (
-                "HSTUMatch requires a sampler that produces per-row positive "
-                "lengths (CAND_POS_LENGTHS). Check that negative_sampler is "
-                "configured with attr_fields matching the candidate "
-                "sequence_id_feature's name."
-            )
-            pos_lengths = pos_lengths_t.to(sample_weight.device, dtype=torch.long)
-            sample_weight = torch.repeat_interleave(sample_weight, pos_lengths)
+        losses: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """Update metric state; reads the jagged label."""
+        label = self._get_label(batch)
+        for metric_cfg in self._base_model_config.metrics:
+            self._update_metric_impl(predictions, batch, label, metric_cfg)
+        if losses is not None:
+            for loss_cfg in self._base_model_config.losses:
+                self._update_loss_metric_impl(losses, batch, label, loss_cfg)
 
-        loss_type = loss_cfg.WhichOneof("loss")
-        loss_name = loss_type + suffix
-        assert loss_type == "softmax_cross_entropy", (
-            "HSTUMatch only supports softmax_cross_entropy loss."
-        )
-        pred = predictions["similarity" + suffix]
-        # Positive is always at column 0 of (Q, 1+M+max_hard).
-        label = torch.zeros(pred.size(0), dtype=torch.long, device=pred.device)
-        losses = {loss_name: self._loss_modules[loss_name](pred, label)}
-
-        if self._sample_weight:
-            losses[loss_name] = div_no_nan(
-                torch.mean(losses[loss_name] * sample_weight),
-                torch.mean(sample_weight),
-            )
-        return losses
+    def update_train_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+    ) -> None:
+        """Update train metric state; reads the jagged label."""
+        label = self._get_label(batch)
+        for metric_cfg in self._base_model_config.train_metrics:
+            self._update_train_metric_impl(predictions, batch, label, metric_cfg)
