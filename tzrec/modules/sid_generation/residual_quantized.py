@@ -107,7 +107,8 @@ class ResidualQuantized(nn.Module):
 
         self.commitment_w1, self.commitment_w2 = latent_weight
 
-        # KMeans initialization control
+        # ``initted`` is the kmeans_init guard: True means "codebook has
+        # been seeded", so init_embed_() becomes a no-op on later forwards.
         self.register_buffer("initted", torch.tensor([not kmeans_init]))
 
         if forward_mode not in self._FORWARD_MODE_MAP:
@@ -117,7 +118,6 @@ class ResidualQuantized(nn.Module):
             )
         mode_enum = self._FORWARD_MODE_MAP[forward_mode]
 
-        # Parse n_embed list
         if isinstance(n_embed, int):
             n_embed_list = [n_embed] * n_layers
         else:
@@ -128,7 +128,6 @@ class ResidualQuantized(nn.Module):
             n_embed_list = list(n_embed)
         self.n_embed_list = n_embed_list
 
-        # Parse distance_type list
         if isinstance(distance_type, str):
             distance_types = [distance_type] * n_layers
         else:
@@ -138,7 +137,6 @@ class ResidualQuantized(nn.Module):
             )
             distance_types = list(distance_type)
 
-        # Build VQ layers
         if shared_codebook:
             base_layer = VectorQuantize(
                 embed_dim=embed_dim,
@@ -194,7 +192,8 @@ class ResidualQuantized(nn.Module):
 
         centers = _residual_kmeans(data, self.n_embed_list)
 
-        # Distributed sync
+        # Average per-layer centroids across DDP ranks so every rank
+        # starts from the same codebook.
         if dist.is_initialized() and dist.get_world_size() > 1:
             for c in centers:
                 dist.all_reduce(c, op=dist.ReduceOp.SUM)
@@ -358,23 +357,20 @@ class ResidualQuantized(nn.Module):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
 
-            # VQ forward: assignment + EMA update (internally)
             quantized = layer(
                 residual, temperature=temperature,
                 ema_mask=ema_mask,
             )
             all_ids.append(quantized.ids)
 
-            # Raw embedding lookup for commitment loss accumulation
+            # Separate raw lookup: ``quantized.embeddings`` already applies
+            # STE (gradient -> encoder), but the commitment loss + residual
+            # update need the un-STE'd codebook vector with gradient still
+            # flowing into ``layer.embedding.weight``.
             raw_emb = layer.embedding(quantized.ids)
-
-            # Update residual with detached embedding
             residual = residual - raw_emb.detach()
-
-            # Accumulate raw embeddings (preserves gradient to codebook)
             aggregated_quants = aggregated_quants + raw_emb
 
-            # Compute per-layer commitment loss in-place (no quant_list clone)
             commitment_loss_list.append(
                 self._single_commitment_loss(input, aggregated_quants)
             )

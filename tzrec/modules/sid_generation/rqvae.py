@@ -121,15 +121,13 @@ class RQVAE(nn.Module):
         if commitment_loss is None:
             commitment_loss = "l2" if loss_type == "mse" else loss_type
 
-        # Encoder: input_dim -> hidden_dims -> embed_dim
         enc_dims = [input_dim] + list(hidden_dims) + [embed_dim]
         self.encoder = self._build_mlp(enc_dims)
 
-        # Decoder: embed_dim -> reversed(hidden_dims) -> input_dim (symmetric)
+        # Decoder is the symmetric reverse of the encoder.
         dec_dims = [embed_dim] + list(reversed(hidden_dims)) + [input_dim]
         self.decoder = self._build_mlp(dec_dims)
 
-        # Quantizer
         self.quantizer = ResidualQuantized(
             embed_dim=embed_dim,
             n_layers=n_layers,
@@ -151,7 +149,6 @@ class RQVAE(nn.Module):
         )
 
         # CLIP contrastive learning (optional)
-        self.use_clip = use_clip
         if use_clip:
             self.logit_scale_self = nn.Parameter(
                 torch.ones([]) * np.log(1 / 0.07)

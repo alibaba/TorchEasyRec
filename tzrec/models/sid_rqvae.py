@@ -167,17 +167,19 @@ class SidRqvae(BaseModel):
         self, embedding: torch.Tensor, batch: Batch
     ) -> Dict[str, torch.Tensor]:
         """Mixed recon + CLIP: extract fea2 and clip_mask, call forward_mixed."""
-        # Inference: only path 1, only return codes
+        # Inference skips the dual path: fea2 / clip_mask aren't needed
+        # when we only emit codes.
         if self._is_inference:
             result = self._rqvae.forward_rqvae(embedding)
             return {"codes": result["codes"]}
 
         fea2 = self._extract_feature(batch, self._clip_feature_name)
 
-        # Derive clip_mask: recon rows have fea2 == fea1 (bit-identical)
+        # Recon rows are signalled by fea2 == fea1 bit-for-bit (the data
+        # loader writes the same tensor into both columns); everything
+        # else is a clip pair.
         clip_mask = ~torch.all(embedding == fea2, dim=-1)  # (B,) bool
 
-        # Train / eval: mixed forward
         result = self._rqvae.forward_mixed(embedding, fea2, clip_mask)
 
         predictions: Dict[str, torch.Tensor] = {
@@ -222,12 +224,11 @@ class SidRqvae(BaseModel):
 
     def init_metric(self) -> None:
         """Initialize metric modules."""
-        # Eval metrics
         self._metric_modules["mse"] = torchmetrics.MeanMetric()
         self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
-        # Train metrics: mse + unique_sid_ratio only
-        # (loss values are already logged by the framework via loss() return)
+        # Loss values are already logged by the framework via loss(); only
+        # quantization quality + sid uniqueness need the metric path.
         self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
         self._train_metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
@@ -242,13 +243,11 @@ class SidRqvae(BaseModel):
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
         """
-        # Reconstruction MSE
         if "x_hat" in predictions:
             embedding = self._extract_feature(batch)
             mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
             self._train_metric_modules["mse"].update(mse)
 
-        # Unique SID ratio
         codes = predictions["codes"]
         B = codes.shape[0]
         unique_sids = torch.unique(codes, dim=0).shape[0]
@@ -272,13 +271,11 @@ class SidRqvae(BaseModel):
         codes = predictions["codes"]
         B = codes.shape[0]
 
-        # Reconstruction MSE
         if "x_hat" in predictions:
             embedding = self._extract_feature(batch)
             mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
             self._metric_modules["mse"].update(mse)
 
-        # Unique SID ratio
         unique_sids = torch.unique(codes, dim=0).shape[0]
         self._metric_modules["unique_sid_ratio"].update(
             torch.tensor(unique_sids / B, device=codes.device)

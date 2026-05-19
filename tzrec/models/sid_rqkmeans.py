@@ -148,7 +148,8 @@ class SidRqkmeans(BaseModel):
         """
         embedding = self._extract_embedding(batch)
 
-        # Training stage: buffer for offline FAISS fit, return dummy codes.
+        # Training: buffer for the end-of-loop FAISS fit and return dummy
+        # codes — the codebook does not exist yet.
         if self.is_train:
             self._offline_buffer.append(embedding.detach().cpu())
             B = embedding.shape[0]
@@ -159,7 +160,6 @@ class SidRqkmeans(BaseModel):
                 )
             }
 
-        # Eval / inference: codebook has been fit; run assignment + lookup.
         result = self._rqkmeans(embedding)
 
         predictions: Dict[str, torch.Tensor] = {
@@ -199,45 +199,25 @@ class SidRqkmeans(BaseModel):
         return {"dummy_loss": self._dummy_param.sum() * 0.0}
 
     def init_metric(self) -> None:
-        """Initialize metric modules."""
-        # Eval metrics
+        """Initialize metric modules.
+
+        Only eval metrics are registered. During training ``predict``
+        returns dummy zero codes (the codebook does not exist yet), so
+        any train-time metric would be either NaN or trivially constant.
+        ``compute_train_metric`` therefore returns an empty dict, which
+        the framework already tolerates.
+        """
         self._metric_modules["mse"] = torchmetrics.MeanMetric()
         self._metric_modules["rel_loss"] = torchmetrics.MeanMetric()
         self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
-
-        # Train metrics (loss is dummy, only track mse/rel_loss + sid ratio)
-        self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
-        self._train_metric_modules["rel_loss"] = torchmetrics.MeanMetric()
-        self._train_metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
     def update_train_metric(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
     ) -> None:
-        """Update train metric state.
-
-        Args:
-            predictions (dict): a dict of predicted result.
-            batch (Batch): input batch data.
-        """
-        # Quantization MSE + rel_loss (skipped in offline_faiss train stage
-        # where predictions carry only dummy codes without input_embedding).
-        if "input_embedding" in predictions:
-            mse, rel = _recon_loss(
-                predictions["input_embedding"],
-                predictions["quantized"],
-            )
-            self._train_metric_modules["mse"].update(mse)
-            self._train_metric_modules["rel_loss"].update(rel)
-
-        # Unique SID ratio
-        codes = predictions["codes"]
-        B = codes.shape[0]
-        unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._train_metric_modules["unique_sid_ratio"].update(
-            torch.tensor(unique_sids / B, device=codes.device)
-        )
+        """No-op — see :meth:`init_metric`."""
+        return
 
     def update_metric(
         self,
@@ -255,7 +235,6 @@ class SidRqkmeans(BaseModel):
         codes = predictions["codes"]
         B = codes.shape[0]
 
-        # Quantization MSE + rel_loss (aligned with OpenOneRec calc_loss)
         if "input_embedding" in predictions:
             mse, rel = _recon_loss(
                 predictions["input_embedding"],
@@ -264,7 +243,6 @@ class SidRqkmeans(BaseModel):
             self._metric_modules["mse"].update(mse)
             self._metric_modules["rel_loss"].update(rel)
 
-        # Unique SID ratio
         unique_sids = torch.unique(codes, dim=0).shape[0]
         self._metric_modules["unique_sid_ratio"].update(
             torch.tensor(unique_sids / B, device=codes.device)

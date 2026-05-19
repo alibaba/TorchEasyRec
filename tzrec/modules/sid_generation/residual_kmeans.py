@@ -249,7 +249,6 @@ class ResidualKMeans(nn.Module):
 
             kmeans.train(x)
 
-            # reduce memory usage
             for start in range(0, N, SEARCH_CHUNK):
                 end = min(start + SEARCH_CHUNK, N)
                 _, idx = kmeans.index.search(x[start:end], 1)
