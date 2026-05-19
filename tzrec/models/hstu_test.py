@@ -149,7 +149,12 @@ def _build_batch(device: torch.device) -> Batch:
     return Batch(
         sparse_features={BASE_DATA_GROUP: sparse_feature},
         sequence_dense_features=sequence_dense_features,
-        labels={"label": torch.tensor([1, 1])},
+        jagged_labels={
+            "label": JaggedTensor(
+                values=torch.tensor([1, 1], dtype=torch.int64),
+                lengths=torch.tensor([1, 1]),
+            ),
+        },
         additional_infos={CAND_POS_LENGTHS: torch.tensor([1, 1], dtype=torch.int32)},
     ).to(device)
 
