@@ -74,45 +74,6 @@ def _coerce_proto_numbers(d: Dict) -> Dict:
     return out
 
 
-def _all_gather_concat(local: torch.Tensor) -> torch.Tensor:
-    """All-gather variable-length tensors across DDP ranks and concat.
-
-    Args:
-        local: local tensor on the current rank, shape (n_local, D).
-
-    Returns:
-        Concatenated tensor (sum_n, D) on CPU.
-    """
-    world_size = dist.get_world_size()
-
-    # 1) gather local sizes
-    local_n = torch.tensor(
-        [local.shape[0]], dtype=torch.long, device=local.device
-    )
-    sizes = [torch.zeros_like(local_n) for _ in range(world_size)]
-    dist.all_gather(sizes, local_n)
-    sizes = [int(s.item()) for s in sizes]
-    max_n = max(sizes)
-
-    # 2) pad local to max_n then all_gather
-    if local.shape[0] < max_n:
-        pad = torch.zeros(
-            max_n - local.shape[0],
-            local.shape[1],
-            dtype=local.dtype,
-            device=local.device,
-        )
-        padded = torch.cat([local, pad], dim=0)
-    else:
-        padded = local
-    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
-    dist.all_gather(gathered, padded)
-
-    # 3) trim padding and concat
-    pieces = [g[:n].cpu() for g, n in zip(gathered, sizes) if n > 0]
-    return torch.cat(pieces, dim=0) if pieces else local.cpu()
-
-
 class SidRqkmeans(BaseModel):
     """SID generation model using residual K-Means (FAISS-only).
 
@@ -334,14 +295,20 @@ class SidRqkmeans(BaseModel):
             and dist.get_world_size() > 1
 
         if is_ddp:
-            # DDP path: concat locally (torch.cat needed for all_gather
-            # which works on torch tensors), then gather + fit on rank0.
+            # DDP path: concat locally, all_gather (variable-length via
+            # pickle path — fine for this one-shot, CPU-resident gather),
+            # then fit on rank0.
             local = torch.cat(self._offline_buffer, dim=0)
             del self._offline_buffer
             self._offline_buffer = []
 
-            full = _all_gather_concat(local)
+            gathered: List[Optional[torch.Tensor]] = (
+                [None] * dist.get_world_size()
+            )
+            dist.all_gather_object(gathered, local)
             del local  # no longer needed after gather
+            full = torch.cat([g for g in gathered if g is not None], dim=0)
+            del gathered
             rank = dist.get_rank()
             if rank == 0:
                 logger.info(

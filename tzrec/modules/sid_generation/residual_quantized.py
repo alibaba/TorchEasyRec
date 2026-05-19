@@ -11,7 +11,7 @@
 
 """ResidualQuantized: multi-layer residual vector quantization with VQ layers."""
 
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -25,6 +25,7 @@ from tzrec.modules.sid_generation.types import (
     ResidualQuantizedOutput,
 )
 from tzrec.modules.sid_generation.vector_quantize import VectorQuantize
+from tzrec.utils.logging_util import logger
 
 
 class ResidualQuantized(nn.Module):
@@ -85,7 +86,7 @@ class ResidualQuantized(nn.Module):
         shared_codebook: bool = False,
         distance_type: Union[str, List[str]] = "l2",
         commitment_loss: str = "l2",
-        latent_weight: Optional[List[float]] = None,
+        latent_weight: Sequence[float] = (1.0, 0.5),
         rotation_trick: bool = False,
         kmeans_init: bool = False,
         use_ema: bool = True,
@@ -104,8 +105,6 @@ class ResidualQuantized(nn.Module):
         self.use_ema = use_ema
         self.rotation_trick = rotation_trick
 
-        if latent_weight is None:
-            latent_weight = [1.0, 0.5]
         self.commitment_w1, self.commitment_w2 = latent_weight
 
         # KMeans initialization control
@@ -172,6 +171,11 @@ class ResidualQuantized(nn.Module):
                     for i in range(n_layers)
                 ]
             )
+
+        logger.info("ResidualQuantized init: %s", {
+            k: v for k, v in vars(self).items()
+            if not k.startswith("_") and k != "training"
+        })
 
 
     @torch.jit.ignore
@@ -344,7 +348,6 @@ class ResidualQuantized(nn.Module):
             self.init_embed_(input)
 
         # Detach residual for VQ assignment (gradient flows via STE only).
-        # No clone needed: residual is rebound below, never mutated in-place.
         residual = input.detach()
         all_ids: List[torch.Tensor] = []
         commitment_loss_list: List[torch.Tensor] = []

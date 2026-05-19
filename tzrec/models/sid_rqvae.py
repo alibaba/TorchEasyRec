@@ -62,9 +62,11 @@ class SidRqvae(BaseModel):
         )
 
         hidden_dims = parse_int_list(cfg.hidden_dims) if cfg.hidden_dims else None
-        latent_weight = (
-            parse_float_list(cfg.latent_weight) if cfg.latent_weight else None
-        )
+        # Only forward latent_weight when proto sets it; otherwise let
+        # RQVAE / ResidualQuantized apply their signature default (1.0, 0.5).
+        rqvae_extra: Dict[str, Any] = {}
+        if cfg.latent_weight:
+            rqvae_extra["latent_weight"] = parse_float_list(cfg.latent_weight)
 
         assert cfg.codebook, (
             "codebook must be set, e.g. '256,256,256'"
@@ -99,7 +101,6 @@ class SidRqvae(BaseModel):
             shared_codebook=cfg.shared_codebook,
             distance_type=cfg.distance_type,
             commitment_loss=cfg.commitment_loss,
-            latent_weight=latent_weight,
             rotation_trick=cfg.rotation_trick,
             kmeans_init=cfg.kmeans_init,
             use_ema=use_ema,
@@ -110,6 +111,7 @@ class SidRqvae(BaseModel):
             sinkhorn_epsilon=sinkhorn_epsilon,
             loss_type=cfg.loss_type,
             use_clip=self._use_clip,
+            **rqvae_extra,
         )
 
     def _extract_feature(

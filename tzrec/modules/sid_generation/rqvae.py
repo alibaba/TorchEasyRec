@@ -11,7 +11,7 @@
 
 """RQVAE: Encoder + ResidualQuantized + Decoder top-level wrapper."""
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from torch.nn import functional as F
 
 from tzrec.modules.sid_generation.clip_loss import CLIPLoss, MaskedCLIPLoss
 from tzrec.modules.sid_generation.residual_quantized import ResidualQuantized
+from tzrec.utils.logging_util import logger
 
 
 class RQVAE(nn.Module):
@@ -88,7 +89,7 @@ class RQVAE(nn.Module):
         shared_codebook: bool = False,
         distance_type: Union[str, List[str]] = "l2",
         commitment_loss: Optional[str] = None,
-        latent_weight: Optional[List[float]] = None,
+        latent_weight: Sequence[float] = (1.0, 0.5),
         rotation_trick: bool = False,
         kmeans_init: bool = True,
         use_ema: bool = True,
@@ -110,7 +111,8 @@ class RQVAE(nn.Module):
         self.input_dim = input_dim
         self.embed_dim = embed_dim
 
-        # Default hidden_dims
+        self._is_inference = False
+
         if hidden_dims is None:
             hidden_dims = [input_dim // 2]
 
@@ -161,6 +163,11 @@ class RQVAE(nn.Module):
                 torch.ones([]) * np.log(1 / 0.07)
             )
             self.masked_clip_loss_fn = MaskedCLIPLoss()
+
+        logger.info("RQVAE init: %s", {
+            k: v for k, v in vars(self).items()
+            if not k.startswith("_") and k != "training"
+        })
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode. (B, input_dim) -> (B, embed_dim)."""
@@ -219,12 +226,12 @@ class RQVAE(nn.Module):
         use_clip=False: forward(x) -> forward_rqvae(x)
         use_clip=True:  forward(fea1, fea2, clip_mask) -> forward_mixed(...)
         """
-        if self.use_clip:
+        if self._is_inference or not self.use_clip:
+            assert len(args) >= 1, "Standard mode requires (x,)"
+            return self.forward_rqvae(args[0], **kwargs)
+        else:
             assert len(args) == 3, "Mixed mode requires (fea1, fea2, clip_mask)"
             return self.forward_mixed(args[0], args[1], args[2], **kwargs)
-        else:
-            assert len(args) == 1, "Standard mode requires (x,)"
-            return self.forward_rqvae(args[0], **kwargs)
 
     def forward_rqvae(
         self, x: torch.Tensor, temperature: float = 1.0
