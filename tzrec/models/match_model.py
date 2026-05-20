@@ -144,6 +144,16 @@ class MatchTower(BaseModule):
         self.group_variational_dropouts = None
         self.group_variational_dropout_loss = {}
 
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Features the tower exposes to its wrapper."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Feature groups the tower exposes to its wrapper."""
+        return self._feature_groups
+
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
