@@ -144,6 +144,16 @@ class MatchTower(BaseModule):
         self.group_variational_dropouts = None
         self.group_variational_dropout_loss = {}
 
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Tower's features (default property forwarding to ``self._features``)."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Tower's feature_groups (default forward to ``self._feature_groups``)."""
+        return self._feature_groups
+
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
@@ -221,6 +231,16 @@ class MatchTowerWoEG(nn.Module):
         self._similarity = similarity
         self._feature_groups = feature_groups
         self._features = features
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Tower's features (default property forwarding to ``self._features``)."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Tower's feature_groups (default forward to ``self._feature_groups``)."""
+        return self._feature_groups
 
 
 class MatchModel(BaseModel):
