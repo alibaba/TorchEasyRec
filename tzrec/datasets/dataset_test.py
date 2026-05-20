@@ -678,16 +678,25 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
 
     def test_launch_sampler_cluster_multi_attr_strip_decision_matrix(self):
-        """End-to-end strip decisions across the per-attr filter.
+        """End-to-end attr-rewrite + strip decisions across the per-attr filter.
 
-        Grouped LookupFeature sub with two item-side inputs; only ``cat_key``
-        is in ``sequence_fields`` so only it is a candidate-sequence input.
-        ``cat_key`` is typed ``list<list<int64>>`` (multi-value attr layered
-        under multi-positive grouping); after strip it becomes
-        ``list<int64>`` (ONE level stripped, not bare-stripped to ``int64``).
-        ``cat_map`` is item-side but NOT a candidate-sequence input
-        (excluded from ``_sampler_seq_inputs``), so it stays
-        ``list<string>`` unchanged.
+        Grouped LookupFeature sub with two item-side inputs; only
+        ``cat_key`` is in ``sequence_fields`` so only it is a
+        candidate-sequence input. ``attr_fields`` mixes the two
+        user-facing forms the new convention supports:
+
+        - ``cat_key`` (bare grouped-sequence sub-feature name): alias-
+          map rewrites to ``click_seq__cat_key`` before sampler launch.
+        - ``cat_map`` (top-level item-side input from the same lookup
+          feature): not a sequence input, no alias entry, passes
+          through unchanged.
+
+        Outer-list strip on ``input_fields`` then applies independently:
+        ``click_seq__cat_key`` is typed ``list<list<int64>>`` (multi-
+        value attr layered under multi-positive grouping); after strip
+        it becomes ``list<int64>`` (ONE level stripped, not bare-
+        stripped to ``int64``). ``cat_map`` is ``list<string>``, not in
+        ``_sampler_seq_inputs``, stays unchanged.
         """
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
@@ -737,7 +746,9 @@ class DatasetTest(unittest.TestCase):
                 negative_sampler=sampler_pb2.NegativeSampler(
                     input_path=f.name,
                     num_sample=4,
-                    attr_fields=["cat_map", "click_seq__cat_key"],
+                    # Bare `cat_key` (gets rewritten) + top-level
+                    # `cat_map` (no alias entry, passes through).
+                    attr_fields=["cat_map", "cat_key"],
                     item_id_field="click_seq__cat_key",
                 ),
                 force_base_data_group=True,
@@ -747,17 +758,31 @@ class DatasetTest(unittest.TestCase):
             input_fields=input_fields,
             mode=Mode.TRAIN,
         )
-        # Candidate-side sequence state is derived from item_id_field's
-        # matching feature. `click_seq__cat_key` is a grouped sequence
-        # input; `cat_map` is a non-sequence item-side attr of the same
-        # lookup feature and is excluded.
+        # Candidate-side sequence state derived from item_id_field's
+        # matching feature. Only sequence-input sub-features end up in
+        # `_sampler_seq_inputs`; the alias map's keys are the bare
+        # forms.
         self.assertEqual(dataset._sampler_seq_delim, ";")
-        self.assertIn("click_seq__cat_key", dataset._sampler_seq_inputs)
-        self.assertNotIn("cat_map", dataset._sampler_seq_inputs)
+        self.assertEqual(dataset._sampler_seq_inputs, {"click_seq__cat_key"})
+        self.assertEqual(
+            dataset._sampler_bare_attr_to_sequence_input,
+            {"cat_key": "click_seq__cat_key"},
+        )
 
         dataset.launch_sampler_cluster(2)
-        # item_id_field is a candidate-sequence sub-feature:
-        # - cat_key: list<list<int64>> -> list<int64> (one strip).
+        # data_config.sampler not mutated by the rewrite (deep-copied).
+        self.assertEqual(
+            list(dataset._data_config.negative_sampler.attr_fields),
+            ["cat_map", "cat_key"],
+        )
+        # Sampler sees the QUALIFIED column name after rewrite, plus
+        # the unchanged top-level `cat_map`.
+        self.assertIn("click_seq__cat_key", dataset._sampler._attr_names)
+        self.assertIn("cat_map", dataset._sampler._attr_names)
+        # Rewrite replaces, doesn't append: bare `cat_key` is gone.
+        self.assertNotIn("cat_key", dataset._sampler._attr_names)
+        # Outer-list strip:
+        # - click_seq__cat_key: list<list<int64>> -> list<int64> (one strip).
         # - cat_map: list<string>, not in _sampler_seq_inputs -> unstripped.
         cat_key_idx = dataset._sampler._attr_names.index("click_seq__cat_key")
         cat_map_idx = dataset._sampler._attr_names.index("cat_map")
@@ -767,86 +792,6 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(
             dataset._sampler._attr_types[cat_map_idx], pa.list_(pa.string())
         )
-
-    def test_launch_sampler_cluster_bare_attr_resolves_against_seq_prefix(self):
-        """Bare `attr_fields` get rewritten to the qualified flatten name.
-
-        HSTUMatch-style sampler config: `attr_fields: "cat_key"` (bare
-        sub-feature name) + `item_id_field: "click_seq__cat_key"`
-        (qualified). The dataset boundary maps the bare name to the
-        qualified parquet column via
-        ``_sampler_bare_attr_to_sequence_input``, so the sampler sees
-        the fully-flattened input name.
-        """
-        f = tempfile.NamedTemporaryFile("w")
-        self._temp_files.append(f)
-        f.write("id:int64\tweight:float\tattrs:string\n")
-        for i in range(100):
-            f.write(f"{i}\t1.0\t{i}\n")
-        f.flush()
-
-        input_fields = [
-            pa.field(name="click_seq__cat_key", type=pa.list_(pa.int64())),
-            pa.field(name="label", type=pa.int32()),
-        ]
-        feature_cfgs = [
-            feature_pb2.FeatureConfig(
-                sequence_feature=feature_pb2.SequenceFeature(
-                    sequence_name="click_seq",
-                    sequence_length=10,
-                    sequence_delim=";",
-                    features=[
-                        feature_pb2.SeqFeatureConfig(
-                            id_feature=feature_pb2.IdFeature(
-                                feature_name="cat_key",
-                                expression="item:cat_key",
-                                num_buckets=10,
-                                embedding_dim=8,
-                            )
-                        ),
-                    ],
-                )
-            ),
-        ]
-        features = create_features(
-            feature_cfgs,
-            fg_mode=data_pb2.FgMode.FG_NORMAL,
-            neg_fields=["cat_key"],
-            force_base_data_group=True,
-        )
-        dataset = _TestDataset(
-            data_config=data_pb2.DataConfig(
-                batch_size=4,
-                dataset_type=data_pb2.DatasetType.OdpsDataset,
-                fg_mode=data_pb2.FgMode.FG_NORMAL,
-                label_fields=["label"],
-                negative_sampler=sampler_pb2.NegativeSampler(
-                    input_path=f.name,
-                    num_sample=4,
-                    attr_fields=["cat_key"],  # bare; gets rewritten
-                    item_id_field="click_seq__cat_key",  # qualified
-                ),
-                force_base_data_group=True,
-            ),
-            features=features,
-            input_path="",
-            input_fields=input_fields,
-            mode=Mode.TRAIN,
-        )
-        # Alias map is built from the grouped sequence's flatten prefix.
-        self.assertEqual(
-            dataset._sampler_bare_attr_to_sequence_input,
-            {"cat_key": "click_seq__cat_key"},
-        )
-        # data_config.sampler is not mutated by the rewrite (deep-copied).
-        self.assertEqual(
-            list(dataset._data_config.negative_sampler.attr_fields), ["cat_key"]
-        )
-
-        dataset.launch_sampler_cluster(2)
-        # Sampler sees the QUALIFIED column name after rewrite.
-        self.assertIn("click_seq__cat_key", dataset._sampler._attr_names)
-        self.assertNotIn("cat_key", dataset._sampler._attr_names)
 
     def test_dataset_with_sample_mask(self):
         input_fields = [
