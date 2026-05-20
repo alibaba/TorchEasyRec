@@ -26,13 +26,4 @@ message EasyRecConfig {
     repeated FeatureConfig feature_configs = 8;
 
     optional ModelConfig model_config = 9;
-
-    // Optional item-only table for recall-model item-tower export.
-    // When set, item-tower export reads its sample batch from this
-    // path (one row per item, schema matching the scalar export view)
-    // instead of from `train_input_path`. The item table is typically
-    // already prepared upstream (used by `negative_sampler.input_path`
-    // too) -- this avoids feeding the export path with training-shape
-    // sequence rows.
-    optional string item_input_path = 10;
 }

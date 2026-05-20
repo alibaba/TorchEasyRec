@@ -392,6 +392,7 @@ class MatchIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str=f"{hstu_env} ENABLE_AOT=1",
+                data_input_path="data/test/kuairand-1k-match-item-c1.parquet",
             )
         if self.success:
             # Item tower scalar export view: predict over the item-only

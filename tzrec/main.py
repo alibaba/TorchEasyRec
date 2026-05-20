@@ -895,6 +895,7 @@ def export(
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
+    data_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -906,6 +907,11 @@ def export(
         asset_files (str, optional): more files will be copied to export_dir.
         additional_export_config (dict, optional): extra key/value pairs merged
             into model_acc.json (e.g. ``{"cand_seq_pk": "cand_seq"}`` for DlrmHSTU).
+        data_input_path (str, optional): override for export's predict-mode
+            dataloader input path. When set, used instead of
+            `pipeline_config.train_input_path`. For recall models this only
+            applies to the item-tower export (the user tower keeps reading
+            `train_input_path`).
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
@@ -974,6 +980,11 @@ def export(
                 # built off scalar features.
                 tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
+                # data_input_path applies only to the item tower (whose
+                # scalar export view can't parse `train_input_path`'s
+                # training-shape sequence rows). The user tower reads
+                # the standard `train_input_path`.
+                tower_input_path = data_input_path if name == "item_tower" else None
                 export_model(
                     ori_pipeline_config,
                     tower,
@@ -981,6 +992,7 @@ def export(
                     tower_export_dir,
                     assets=assets,
                     additional_export_config=additional_export_config,
+                    data_input_path=tower_input_path,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
