@@ -13,7 +13,7 @@ import copy
 import os
 import random
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -166,51 +166,36 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Candidate-side sequence state derived from the matching feature
-        # config when `item_id_field` is a sequence input (top-level
-        # `sequence_id_feature` OR grouped sequence sub-feature).
-        # `_sampler_seq_delim` is the parent feature's `sequence_delim`;
-        # `_sampler_seq_inputs` is the set of sequence input names that
-        # share the candidate's sequence context -- {feature.name} for
-        # top-level, the union of `sequence_input_names` across all
-        # sub-features sharing `sequence_name` for grouped. Used by the
-        # outer-list strip in `launch_sampler_cluster` and by the per-key
-        # branch in `_merge_sampled_features`.
-        # `_sampler_bare_attr_to_sequence_input` is the bare->qualified
-        # alias map used to rewrite `attr_fields` at sampler-launch time
-        # (only meaningful for the grouped case; empty otherwise -> the
-        # rewrite is a no-op). HSTUMatch's `attr_fields: "video_id"`
-        # writes the bare sub-feature name; the alias maps it to the
-        # flattened parquet column `cand_seq__video_id` the sampler pool
-        # actually carries. The flatten prefix uses `feature._underline`
-        # so RTP-safe (no "_" vs "__" guessing).
+        # Candidate-side sequence state for sampler I/O. HSTUMatch writes
+        # bare sub-feature names in `attr_fields`; the alias map rewrites
+        # them to the flattened parquet columns (`<seq>__<sub>`) the
+        # sampler pool actually carries. Prefix derived from
+        # `feature._underline` (not "__" literal) so RTP-safe.
         self._sampler_seq_delim: str = ""
-        self._sampler_seq_inputs: set = set()
+        self._sampler_seq_inputs: Set[str] = set()
         self._sampler_bare_attr_to_sequence_input: Dict[str, str] = {}
         if self._sampler_item_id_field is not None:
             for feature in features:
-                if (
-                    feature.sequence_delim
-                    and self._sampler_item_id_field in feature.sequence_input_names
-                ):
-                    self._sampler_seq_delim = feature.sequence_delim
-                    if feature.is_grouped_sequence:
-                        seq_name = feature.sequence_name
-                        # pyre-ignore [16]: _underline is the source of
-                        # truth for the flatten separator.
-                        prefix = seq_name + feature._underline
-                        self._sampler_seq_inputs = {
-                            inp
-                            for f in features
-                            if f.is_grouped_sequence and f.sequence_name == seq_name
-                            for inp in f.sequence_input_names
-                        }
-                        self._sampler_bare_attr_to_sequence_input = {
-                            inp[len(prefix) :]: inp for inp in self._sampler_seq_inputs
-                        }
-                    else:
-                        self._sampler_seq_inputs = set(feature.sequence_input_names)
-                    break
+                if not feature.sequence_delim:
+                    continue
+                if self._sampler_item_id_field not in feature.sequence_input_names:
+                    continue
+                self._sampler_seq_delim = feature.sequence_delim
+                if feature.is_grouped_sequence:
+                    seq_name = feature.sequence_name
+                    prefix = seq_name + feature._underline
+                    self._sampler_seq_inputs = {
+                        inp
+                        for f in features
+                        if f.is_grouped_sequence and f.sequence_name == seq_name
+                        for inp in f.sequence_input_names
+                    }
+                    self._sampler_bare_attr_to_sequence_input = {
+                        inp[len(prefix) :]: inp for inp in self._sampler_seq_inputs
+                    }
+                else:
+                    self._sampler_seq_inputs = set(feature.sequence_input_names)
+                break
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
@@ -259,15 +244,17 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             # candidate-sequence inputs set, so unrelated grouped sequences
             # (e.g. uih_seq__*) and non-sequence item-side attrs from the
             # same lookup feature (e.g. `cat_map`) are left untouched.
-            sampler_fields = [
-                pa.field(f.name, f.type.value_type)
-                if (
-                    f.name in self._sampler_seq_inputs
-                    and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
-                )
-                else f
-                for f in self.input_fields
-            ]
+            sampler_fields = self.input_fields
+            if self._sampler_seq_inputs:
+                sampler_fields = [
+                    pa.field(f.name, f.type.value_type)
+                    if (
+                        f.name in self._sampler_seq_inputs
+                        and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
+                    )
+                    else f
+                    for f in self.input_fields
+                ]
 
             # pyre-ignore [16]
             self._sampler = BaseSampler.create_class(sampler_config.__class__.__name__)(
