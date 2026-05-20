@@ -681,12 +681,13 @@ class DatasetTest(unittest.TestCase):
         """End-to-end strip decisions across the per-attr filter.
 
         Grouped LookupFeature sub with two item-side inputs; only ``cat_key``
-        is in ``sequence_fields`` so only it enters ``_seq_field_delims``.
+        is in ``sequence_fields`` so only it is a candidate-sequence input.
         ``cat_key`` is typed ``list<list<int64>>`` (multi-value attr layered
         under multi-positive grouping); after strip it becomes
         ``list<int64>`` (ONE level stripped, not bare-stripped to ``int64``).
-        ``cat_map`` is item-side but excluded from ``_seq_field_delims``,
-        so it stays ``list<string>`` unchanged.
+        ``cat_map`` is item-side but NOT a candidate-sequence input
+        (excluded from ``_sampler_seq_inputs``), so it stays
+        ``list<string>`` unchanged.
         """
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
@@ -746,14 +747,18 @@ class DatasetTest(unittest.TestCase):
             input_fields=input_fields,
             mode=Mode.TRAIN,
         )
-        # Narrowed _seq_field_delims excludes the non-sequence item-side input.
-        self.assertIn("click_seq__cat_key", dataset._seq_field_delims)
-        self.assertNotIn("cat_map", dataset._seq_field_delims)
+        # Candidate-side sequence state is derived from item_id_field's
+        # matching feature. `click_seq__cat_key` is a grouped sequence
+        # input; `cat_map` is a non-sequence item-side attr of the same
+        # lookup feature and is excluded.
+        self.assertEqual(dataset._sampler_seq_delim, ";")
+        self.assertIn("click_seq__cat_key", dataset._sampler_seq_inputs)
+        self.assertNotIn("cat_map", dataset._sampler_seq_inputs)
 
         dataset.launch_sampler_cluster(2)
-        # outer guard True (item_id_field is sequence-positive):
+        # item_id_field is a candidate-sequence sub-feature:
         # - cat_key: list<list<int64>> -> list<int64> (one strip).
-        # - cat_map: list<string>, not in _seq_field_delims -> unstripped.
+        # - cat_map: list<string>, not in _sampler_seq_inputs -> unstripped.
         cat_key_idx = dataset._sampler._attr_names.index("click_seq__cat_key")
         cat_map_idx = dataset._sampler._attr_names.index("cat_map")
         self.assertEqual(

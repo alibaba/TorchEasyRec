@@ -165,27 +165,36 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Map input_name -> sequence_delim for true sequence inputs only
-        # (via feature.sequence_input_names). Excludes non-sequence
-        # sub-inputs of grouped sequence_feature.
-        self._seq_field_delims: Dict[str, str] = {}
-        for feature in features:
-            if not feature.sequence_delim:
-                continue
-            seq_inputs = set(feature.sequence_input_names)
-            for input_name in feature.inputs:
-                if input_name not in seq_inputs:
-                    continue
-                existing = self._seq_field_delims.get(input_name)
-                if existing is not None and existing != feature.sequence_delim:
-                    logger.warning(
-                        "Conflicting sequence_delim for input '%s': %r vs %r; "
-                        "latter wins.",
-                        input_name,
-                        existing,
-                        feature.sequence_delim,
-                    )
-                self._seq_field_delims[input_name] = feature.sequence_delim
+        # Candidate-side sequence state derived from the matching feature
+        # config when `item_id_field` is a sequence input (top-level
+        # `sequence_id_feature` OR grouped sequence sub-feature).
+        # `_sampler_seq_delim` is the parent feature's `sequence_delim`;
+        # `_sampler_seq_inputs` is the set of sequence input names that
+        # share the candidate's sequence context -- {feature.name} for
+        # top-level, the union of `sequence_input_names` across all
+        # sub-features sharing `sequence_name` for grouped. Used by the
+        # outer-list strip in `launch_sampler_cluster` and by the per-key
+        # branch in `_merge_sampled_features`.
+        self._sampler_seq_delim: str = ""
+        self._sampler_seq_inputs: set = set()
+        if self._sampler_item_id_field is not None:
+            for feature in features:
+                if (
+                    feature.sequence_delim
+                    and self._sampler_item_id_field in feature.sequence_input_names
+                ):
+                    self._sampler_seq_delim = feature.sequence_delim
+                    if feature.is_grouped_sequence:
+                        seq_name = feature.sequence_name
+                        self._sampler_seq_inputs = {
+                            inp
+                            for f in features
+                            if f.is_grouped_sequence and f.sequence_name == seq_name
+                            for inp in f.sequence_input_names
+                        }
+                    else:
+                        self._sampler_seq_inputs = set(feature.sequence_input_names)
+                    break
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
@@ -212,26 +221,23 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sampler_config = getattr(self._data_config, sampler_type)
 
             # Multi-positive sampling: when the sampler's item_id_field is
-            # itself a sequence-positive train column, the per-row outer list
-            # on every item-side attr is the positive-grouping container, not
-            # a multi-value field. Strip the outer list so the sampler sees
-            # the pool's native scalar storage and _to_arrow_array emits
-            # scalar negs directly (avoiding the multival_sep split that
-            # would wrap each scalar in a 1-elem list).
-            sampler_fields = self.input_fields
-            if (
-                self._sampler_item_id_field is not None
-                and self._sampler_item_id_field in self._seq_field_delims
-            ):
-                sampler_fields = [
-                    pa.field(f.name, f.type.value_type)
-                    if (
-                        f.name in self._seq_field_delims
-                        and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
-                    )
-                    else f
-                    for f in self.input_fields
-                ]
+            # itself a sequence-positive train column, the per-row outer
+            # list on every candidate-sequence attr is the positive-
+            # grouping container, not a multi-value field. Strip the outer
+            # list so the sampler sees the pool's native scalar storage and
+            # _to_arrow_array emits scalar negs directly. Filter is the
+            # candidate-sequence inputs set, so unrelated grouped sequences
+            # (e.g. uih_seq__*) and non-sequence item-side attrs from the
+            # same lookup feature (e.g. `cat_map`) are left untouched.
+            sampler_fields = [
+                pa.field(f.name, f.type.value_type)
+                if (
+                    f.name in self._sampler_seq_inputs
+                    and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
+                )
+                else f
+                for f in self.input_fields
+            ]
 
             # pyre-ignore [16]
             self._sampler = BaseSampler.create_class(sampler_config.__class__.__name__)(
@@ -391,7 +397,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             input_data,
             self._sampler_item_id_field,
             self._sampler_user_id_field,
-            self._seq_field_delims,
+            self._sampler_seq_delim,
         )
         sampled = self._sampler.get(sampler_input)
 
@@ -459,11 +465,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     ) -> Optional[np.ndarray]:
         """Merge sampler outputs into input_data in place; return per-row pos lengths.
 
-        Per sampled key: new keys are assigned as-is, keys with a
-        `seq_delim` use the block-suffix combine, others fall back to
-        `pa.concat_arrays`. `pos_lengths` is sourced from the configured
-        item_id_field combine; returns None if no sequence field was
-        merged.
+        Per sampled key: new keys are assigned as-is; candidate-sequence
+        keys (those in `_sampler_seq_inputs`) use the block-suffix
+        combine; others fall back to `pa.concat_arrays`. `pos_lengths` is
+        sourced from the configured item_id_field combine; returns None
+        if no candidate-sequence field was merged.
         """
         # Prefer item_id_field; fall back to first-seen seq-field if absent.
         prefer_key = self._sampler_item_id_field
@@ -473,12 +479,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if k not in input_data:
                 input_data[k] = v
                 continue
-            seq_delim = self._seq_field_delims.get(k)
-            if seq_delim is None:
+            if k not in self._sampler_seq_inputs:
                 input_data[k] = pa.concat_arrays([input_data[k], v])
                 continue
             combined, pl = combine_negs_to_candidate_sequence(
-                input_data[k], v, seq_delim
+                input_data[k], v, self._sampler_seq_delim
             )
             input_data[k] = combined
             if k == prefer_key:
