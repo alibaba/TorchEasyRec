@@ -471,24 +471,21 @@ class TowerWrapper(nn.Module):
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
         setattr(self, tower_name, module)
-        # Snapshot the tower's current view via the property (which for
-        # `HSTUMatchItemTower` returns the scalar view iff
-        # `_is_inference=True`). Wrapper construction must happen *after*
-        # the inference flag is set on the inner tower (see
-        # `tzrec/main.py::export`).
-        self._features = module.features
-        self._feature_groups = module.feature_groups
         self._tower_name = tower_name
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Snapshot of the wrapped tower's features at construction time."""
-        return self._features
+        """Live read of the wrapped tower's features.
+
+        For `HSTUMatchItemTower`, this reflects the current view (training
+        or scalar export) per `_is_inference`. No snapshot.
+        """
+        return getattr(self, self._tower_name).features
 
     @property
     def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
-        """Snapshot of the wrapped tower's feature_groups at construction time."""
-        return self._feature_groups
+        """Live read of the wrapped tower's feature_groups."""
+        return getattr(self, self._tower_name).feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -511,24 +508,23 @@ class TowerWoEGWrapper(nn.Module):
         # `HSTUMatchItemTower` after `set_is_inference(True)`, this is the
         # scalar export view (one row per item, `{group_name}.query`);
         # otherwise it's the training view (jagged, `{group_name}.sequence`).
-        # Wrapper construction must happen *after* the inference flag is
-        # set on the inner tower -- see `tzrec/main.py::export`.
+        # The EmbeddingGroup itself owns nn.Parameters so it must be a
+        # construction-time snapshot; the `features`/`feature_groups`
+        # properties below stay live via lazy reads on the inner tower.
         self.embedding_group = EmbeddingGroup(module.features, module.feature_groups)
         setattr(self, tower_name, module)
-        self._features = module.features
-        self._feature_groups = module.feature_groups
         self._tower_name = tower_name
         self._group_name = module._group_name
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Snapshot of the wrapped tower's features at construction time."""
-        return self._features
+        """Live read of the wrapped tower's features (no snapshot)."""
+        return getattr(self, self._tower_name).features
 
     @property
     def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
-        """Snapshot of the wrapped tower's feature_groups at construction time."""
-        return self._feature_groups
+        """Live read of the wrapped tower's feature_groups."""
+        return getattr(self, self._tower_name).feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.

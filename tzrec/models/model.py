@@ -73,6 +73,16 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
 
         self._train_metric_modules = nn.ModuleDict()
 
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Model's features (default property forwarding to `self._features`)."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """Model's feature_groups (default forward to `self._feature_groups`)."""
+        return self._feature_groups
+
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
 
@@ -336,43 +346,27 @@ class ScriptWrapper(BaseModule):
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
-        # Snapshot via the inner module's view properties (defaults forward
-        # to the underscore fields; HSTUMatchItemTower / wrapper towers
-        # override). Wrapper construction must happen *after* the inference
-        # flag is set on the inner module -- see `tzrec/main.py::export`.
-        self._features = self._features_from(module)
-        self._feature_groups = self._feature_groups_from(module)
         # Propagate tower identity (set by TowerWoEGWrapper / TowerWrapper)
         # so export_util.py can route item-tower export through
         # `pipeline_config.item_input_path` instead of `train_input_path`.
         if hasattr(self.model, "_tower_name"):
             self._tower_name = self.model._tower_name
         self._data_parser = DataParser(
-            self._features,
+            self.model.features,
             sampler_type=str(module.sampler_type)
             if hasattr(module, "sampler_type")
             else None,
         )
 
-    @staticmethod
-    def _features_from(module: nn.Module) -> List["BaseFeature"]:
-        return module.features if hasattr(module, "features") else module._features
-
-    @staticmethod
-    def _feature_groups_from(module: nn.Module) -> List:
-        if hasattr(module, "feature_groups"):
-            return module.feature_groups
-        return module._feature_groups
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped module's features (no snapshot)."""
+        return self.model.features
 
     @property
-    def features(self) -> List["BaseFeature"]:
-        """Snapshot of the wrapped module's features at construction time."""
-        return self._features
-
-    @property
-    def feature_groups(self) -> List:
-        """Snapshot of the wrapped module's feature_groups at construction time."""
-        return self._feature_groups
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """Live read of the wrapped module's feature_groups."""
+        return self.model.feature_groups
 
     def get_batch(
         self,

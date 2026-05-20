@@ -245,21 +245,6 @@ class HSTUMatchItemTower(MatchTowerWoEG):
             )
         ]
 
-    def set_is_inference(self, is_inference: bool) -> None:
-        """Toggle the export-view flag without structural mutation.
-
-        Cheap; the scalar features/groups are materialized lazily on first
-        property read (typically by `TowerWoEGWrapper.__init__` rebuilding
-        its EmbeddingGroup). `set_is_inference(False)` reverts the view;
-        the lazy caches survive but are unused.
-
-        `MatchTowerWoEG` derives from `nn.Module`, not `BaseModule`, so
-        this method doesn't call `super().set_is_inference()`. The
-        `_is_inference` flag on sub-modules is set separately by the
-        caller's `BaseModule.set_is_inference` (recursive_setattr).
-        """
-        self._is_inference = is_inference
-
     def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the item tower.
 
