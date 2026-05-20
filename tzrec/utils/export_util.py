@@ -168,9 +168,17 @@ def export_model_normal(
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
         logger.info("using new batch_size: %s in export", data_config.batch_size)
     data_config.num_workers = 1
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    # Item-tower export: read the sample batch from `item_input_path`
+    # (one row per item, schema matching the scalar export view) instead
+    # of `train_input_path` (which holds training-shape sequence rows).
+    # Also clear the sampler so the predict dataloader doesn't try to
+    # launch a sampler for item-only rows.
+    is_item_tower = getattr(model, "_tower_name", None) == "item_tower"
+    input_path = pipeline_config.train_input_path
+    if is_item_tower and pipeline_config.HasField("item_input_path"):
+        input_path = pipeline_config.item_input_path
+        data_config.ClearField("sampler")
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
 
     ckpt_param_map_path = None
     if checkpoint_path:
@@ -722,9 +730,13 @@ def export_rtp_model(
     features = cast(List[BaseFeature], model._features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    # Item-tower export: same routing as `export_model_normal`.
+    is_item_tower = getattr(model, "_tower_name", None) == "item_tower"
+    input_path = pipeline_config.train_input_path
+    if is_item_tower and pipeline_config.HasField("item_input_path"):
+        input_path = pipeline_config.item_input_path
+        data_config.ClearField("sampler")
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 

@@ -957,7 +957,16 @@ def export(
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                tower = InferWrapper(wrapper(module, name))
+                # Towers that own a view switch (e.g. `HSTUMatchItemTower`
+                # flipping from training `candidate.sequence` to scalar
+                # `candidate.query`) need to flip BEFORE the wrapper rebuilds
+                # `EmbeddingGroup(module._features, module._feature_groups)`.
+                # Deep-copy so the original training tower is preserved.
+                module_for_export = module
+                if hasattr(module, "set_is_inference") and name == "item_tower":
+                    module_for_export = copy.deepcopy(module)
+                    module_for_export.set_is_inference(True)
+                tower = InferWrapper(wrapper(module_for_export, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 export_model(
                     ori_pipeline_config,

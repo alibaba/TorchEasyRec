@@ -191,8 +191,13 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         no-op. `set_is_inference(False)` does NOT rebuild the training view;
         callers must export from a copy so the original training tower is
         preserved.
+
+        Note: `MatchTowerWoEG` derives from `nn.Module`, not `BaseModule`,
+        so this method doesn't call `super().set_is_inference()`. The
+        `_is_inference` attribute is propagated to sub-modules separately by
+        `ScriptWrapper.set_is_inference()` via `recursive_setattr` during
+        export.
         """
-        super().set_is_inference(is_inference)
         if not is_inference:
             return
         if self._cand_key.endswith(".query"):

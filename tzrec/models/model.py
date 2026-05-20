@@ -338,6 +338,11 @@ class ScriptWrapper(BaseModule):
         self.model = module
         self._features = self.model._features
         self._feature_groups = self.model._feature_groups
+        # Propagate tower identity (set by TowerWoEGWrapper / TowerWrapper)
+        # so export_util.py can route item-tower export through
+        # `pipeline_config.item_input_path` instead of `train_input_path`.
+        if hasattr(self.model, "_tower_name"):
+            self._tower_name = self.model._tower_name
         self._data_parser = DataParser(
             self._features,
             sampler_type=str(module.sampler_type)
