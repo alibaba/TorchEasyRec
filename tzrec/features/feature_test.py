@@ -750,5 +750,90 @@ class FeatureTest(unittest.TestCase):
             )
 
 
+class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
+    def _build_grouped(self, seq_sub_cfg):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="cand_seq",
+                    sequence_delim="|",
+                    sequence_length=100,
+                    features=[seq_sub_cfg],
+                )
+            ),
+        ]
+        return feature_lib.create_features(feature_cfgs)
+
+    def test_id_feature_projection_materializes_seq_defaults(self):
+        sub_cfg = feature_pb2.SeqFeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="video_id",
+                expression="item:video_id",
+                embedding_dim=32,
+                num_buckets=10000000,
+            )
+        )
+        features = self._build_grouped(sub_cfg)
+        self.assertEqual(len(features), 1)
+        sub_feature = features[0]
+        self.assertTrue(sub_feature.is_grouped_sequence)
+        # Sequence-effective defaults on the source feature.
+        self.assertEqual(sub_feature.default_value, "0")
+        self.assertEqual(sub_feature.value_dim, 1)
+
+        scalar_cfg = feature_lib.project_grouped_sequence_feature_to_scalar(sub_feature)
+        self.assertEqual(scalar_cfg.WhichOneof("feature"), "id_feature")
+        # default_value / value_dim materialized into the scalar proto.
+        self.assertEqual(scalar_cfg.id_feature.default_value, "0")
+        self.assertTrue(scalar_cfg.id_feature.HasField("value_dim"))
+        self.assertEqual(scalar_cfg.id_feature.value_dim, 1)
+        # Original sub-feature proto is not mutated.
+        self.assertEqual(sub_feature.feature_config.id_feature.default_value, "")
+        self.assertFalse(sub_feature.feature_config.id_feature.HasField("value_dim"))
+
+    def test_projection_passes_through_create_features_as_scalar(self):
+        sub_cfg = feature_pb2.SeqFeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="video_id",
+                expression="item:video_id",
+                embedding_dim=32,
+                num_buckets=10000000,
+            )
+        )
+        features = self._build_grouped(sub_cfg)
+        scalar_cfg = feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
+        scalar_features = feature_lib.create_features([scalar_cfg])
+        self.assertEqual(len(scalar_features), 1)
+        scalar = scalar_features[0]
+        # Bare sub-feature name without the cand_seq__ prefix.
+        self.assertEqual(scalar.name, "video_id")
+        self.assertFalse(scalar.is_grouped_sequence)
+        # Scalar context: is_sequence is False so value_dim default would be
+        # 0, but our projection materialized it from the source.
+        self.assertEqual(scalar.value_dim, 1)
+
+    def test_projection_rejects_non_grouped_feature(self):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="user_id")
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs)
+        with self.assertRaisesRegex(ValueError, "is_grouped_sequence=False"):
+            feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
+
+    def test_raw_feature_projection_generic_oneof(self):
+        # Confirms the helper is not hard-coded to id_feature; raw_feature
+        # works the same way.
+        sub_cfg = feature_pb2.SeqFeatureConfig(
+            raw_feature=feature_pb2.RawFeature(
+                feature_name="watch_time", expression="user:watch_time"
+            )
+        )
+        features = self._build_grouped(sub_cfg)
+        scalar_cfg = feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
+        self.assertEqual(scalar_cfg.WhichOneof("feature"), "raw_feature")
+
+
 if __name__ == "__main__":
     unittest.main()

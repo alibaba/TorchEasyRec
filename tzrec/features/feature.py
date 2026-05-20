@@ -1228,6 +1228,46 @@ def create_features(
     return features
 
 
+def project_grouped_sequence_feature_to_scalar(
+    feature: BaseFeature,
+) -> feature_pb2.FeatureConfig:
+    """Return a scalar export FeatureConfig for a grouped sequence sub-feature.
+
+    Materializes sequence-effective behaviour (default_value, value_dim) into
+    the scalar proto so the exported scalar feature semantically matches the
+    training sub-feature -- without this, defaults drift from "0" / 1 to
+    "" / 0 because `is_sequence=False` resolves differently. The grouped
+    sub-feature's config is a `SeqFeatureConfig`; rewrap it as a top-level
+    `FeatureConfig` so `create_features` builds it as a scalar feature.
+
+    Args:
+        feature: a grouped sequence sub-feature.
+
+    Returns:
+        a fresh FeatureConfig suitable for `create_features()` to construct
+        as a top-level scalar feature.
+    """
+    if not feature.is_grouped_sequence:
+        raise ValueError(
+            "project_grouped_sequence_feature_to_scalar only accepts grouped "
+            f"sequence sub-features; got {feature.name} "
+            "(is_grouped_sequence=False)"
+        )
+    src_cfg = feature.feature_config  # SeqFeatureConfig
+    feat_type = src_cfg.WhichOneof("feature")
+    src_msg = getattr(src_cfg, feat_type)
+
+    scalar_cfg = feature_pb2.FeatureConfig()
+    dst_msg = getattr(scalar_cfg, feat_type)
+    dst_msg.CopyFrom(src_msg)
+
+    if hasattr(dst_msg, "default_value") and not dst_msg.default_value:
+        dst_msg.default_value = feature.default_value
+    if hasattr(dst_msg, "value_dim") and not dst_msg.HasField("value_dim"):
+        dst_msg.value_dim = feature.value_dim
+    return scalar_cfg
+
+
 def _copy_assets(
     feature: BaseFeature,
     asset_dir: Optional[str] = None,
