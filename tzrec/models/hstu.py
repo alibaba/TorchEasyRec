@@ -15,8 +15,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tzrec.datasets.utils import CAND_POS_LENGTHS, HARD_NEG_INDICES, Batch
-from tzrec.features.feature import BaseFeature
+from tzrec.datasets.utils import (
+    BASE_DATA_GROUP,
+    CAND_POS_LENGTHS,
+    HARD_NEG_INDICES,
+    Batch,
+)
+from tzrec.features.feature import (
+    BaseFeature,
+    create_features,
+    project_grouped_sequence_feature_to_scalar,
+)
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.gr.hstu_transducer import HSTUMatchEncoder
@@ -151,7 +160,13 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         # tower_config.input names on the user-tower proto). Use the item-side
         # tower_config.input here, which equals feature_groups[0].group_name.
         self._group_name = tower_config.input
-        candidate_dims = embedding_group.group_dims(f"{self._group_name}.sequence")
+        # Training view: candidate group is JAGGED_SEQUENCE; embedding_group
+        # emits the per-row jagged tensor at `{group_name}.sequence`. The
+        # export-time scalar view (see `set_is_inference(True)`) swaps this
+        # to `{group_name}.query` -- one row per item, no positive-set
+        # grouping container.
+        self._cand_key = f"{self._group_name}.sequence"
+        candidate_dims = embedding_group.group_dims(self._cand_key)
         candidate_total_dim = sum(candidate_dims)
         if tower_config.HasField("mlp"):
             self.mlp: torch.nn.Module = MLP(
@@ -166,6 +181,48 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         if self._output_dim > 0:
             self.output = nn.Linear(mlp_out_dim, output_dim)
 
+    def set_is_inference(self, is_inference: bool) -> None:
+        """Switch the tower into the scalar item-export view (one-way).
+
+        Training stays at `candidate.sequence` (jagged sub-feature). Export
+        copies the tower (`copy.deepcopy`), calls this with `True`, and the
+        wrapper picks up the swapped `_features` / `_feature_groups` /
+        `_cand_key` for serving. Idempotent: re-entering after the swap is a
+        no-op. `set_is_inference(False)` does NOT rebuild the training view;
+        callers must export from a copy so the original training tower is
+        preserved.
+        """
+        super().set_is_inference(is_inference)
+        if not is_inference:
+            return
+        if self._cand_key.endswith(".query"):
+            return  # already swapped (idempotent)
+
+        # Project each grouped sequence sub-feature into a scalar export
+        # FeatureConfig, then rebuild as top-level scalar features.
+        scalar_configs = [
+            project_grouped_sequence_feature_to_scalar(f) for f in self._features
+        ]
+        source = self._features[0]
+        scalar_features = create_features(
+            scalar_configs,
+            fg_mode=source.fg_mode,
+            neg_fields=None,
+            fg_encoded_multival_sep=source._fg_encoded_multival_sep,
+            force_base_data_group=any(
+                f.data_group == BASE_DATA_GROUP for f in self._features
+            ),
+        )
+        self._features = scalar_features
+        self._feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name=self._group_name,
+                feature_names=[f.name for f in scalar_features],
+                group_type=model_pb2.JAGGED_SEQUENCE,
+            )
+        ]
+        self._cand_key = f"{self._group_name}.query"
+
     def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the item tower.
 
@@ -175,7 +232,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             item embeddings of shape (sum_candidates, D).
         """
-        cand_emb = grouped_features[f"{self._group_name}.sequence"]
+        cand_emb = grouped_features[self._cand_key]
         item_emb = self.mlp(cand_emb)
         if self._output_dim > 0:
             item_emb = self.output(item_emb)

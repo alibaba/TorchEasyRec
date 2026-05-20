@@ -281,6 +281,14 @@ def export_model_normal(
         pipeline_config = copy.copy(pipeline_config)
         pipeline_config.ClearField("feature_configs")
         pipeline_config.feature_configs.extend(feature_configs)
+        # Towers that own a view-specific feature_groups (e.g.
+        # `HSTUMatchItemTower` after `set_is_inference(True)` swaps to the
+        # scalar item view) must save those groups too, otherwise the
+        # exported pipeline.config pairs scalar feature_configs with stale
+        # training feature_group names.
+        if hasattr(model, "_feature_groups"):
+            pipeline_config.model_config.ClearField("feature_groups")
+            pipeline_config.model_config.feature_groups.extend(model._feature_groups)
         config_util.save_message(
             pipeline_config, os.path.join(save_dir, "pipeline.config")
         )
