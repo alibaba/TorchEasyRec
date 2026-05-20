@@ -346,14 +346,22 @@ class ScriptWrapper(BaseModule):
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
-        self._features = self.model._features
-        self._feature_groups = self.model._feature_groups
         self._data_parser = DataParser(
-            self._features,
+            self.model.features,
             sampler_type=str(module.sampler_type)
             if hasattr(module, "sampler_type")
             else None,
         )
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped module's features (no snapshot)."""
+        return self.model.features
+
+    @property
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """Live read of the wrapped module's feature_groups."""
+        return self.model.feature_groups
 
     def get_batch(
         self,

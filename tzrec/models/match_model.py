@@ -477,9 +477,17 @@ class TowerWrapper(nn.Module):
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
         setattr(self, tower_name, module)
-        self._features = module._features
-        self._feature_groups = module._feature_groups
         self._tower_name = tower_name
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped tower's features (no snapshot)."""
+        return getattr(self, self._tower_name).features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Live read of the wrapped tower's feature_groups."""
+        return getattr(self, self._tower_name).feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -498,12 +506,20 @@ class TowerWoEGWrapper(nn.Module):
 
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
-        self.embedding_group = EmbeddingGroup(module._features, module._feature_groups)
+        self.embedding_group = EmbeddingGroup(module.features, module.feature_groups)
         setattr(self, tower_name, module)
-        self._features = module._features
-        self._feature_groups = module._feature_groups
         self._tower_name = tower_name
         self._group_name = module._group_name
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped tower's features (no snapshot)."""
+        return getattr(self, self._tower_name).features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Live read of the wrapped tower's feature_groups."""
+        return getattr(self, self._tower_name).feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
