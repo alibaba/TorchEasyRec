@@ -768,6 +768,86 @@ class DatasetTest(unittest.TestCase):
             dataset._sampler._attr_types[cat_map_idx], pa.list_(pa.string())
         )
 
+    def test_launch_sampler_cluster_bare_attr_resolves_against_seq_prefix(self):
+        """Bare `attr_fields` get rewritten to the qualified flatten name.
+
+        HSTUMatch-style sampler config: `attr_fields: "cat_key"` (bare
+        sub-feature name) + `item_id_field: "click_seq__cat_key"`
+        (qualified). The dataset boundary maps the bare name to the
+        qualified parquet column via
+        ``_sampler_bare_attr_to_sequence_input``, so the sampler sees
+        the fully-flattened input name.
+        """
+        f = tempfile.NamedTemporaryFile("w")
+        self._temp_files.append(f)
+        f.write("id:int64\tweight:float\tattrs:string\n")
+        for i in range(100):
+            f.write(f"{i}\t1.0\t{i}\n")
+        f.flush()
+
+        input_fields = [
+            pa.field(name="click_seq__cat_key", type=pa.list_(pa.int64())),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_seq",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="cat_key",
+                                expression="item:cat_key",
+                                num_buckets=10,
+                                embedding_dim=8,
+                            )
+                        ),
+                    ],
+                )
+            ),
+        ]
+        features = create_features(
+            feature_cfgs,
+            fg_mode=data_pb2.FgMode.FG_NORMAL,
+            neg_fields=["cat_key"],
+            force_base_data_group=True,
+        )
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NORMAL,
+                label_fields=["label"],
+                negative_sampler=sampler_pb2.NegativeSampler(
+                    input_path=f.name,
+                    num_sample=4,
+                    attr_fields=["cat_key"],  # bare; gets rewritten
+                    item_id_field="click_seq__cat_key",  # qualified
+                ),
+                force_base_data_group=True,
+            ),
+            features=features,
+            input_path="",
+            input_fields=input_fields,
+            mode=Mode.TRAIN,
+        )
+        # Alias map is built from the grouped sequence's flatten prefix.
+        self.assertEqual(
+            dataset._sampler_bare_attr_to_sequence_input,
+            {"cat_key": "click_seq__cat_key"},
+        )
+        # data_config.sampler is not mutated by the rewrite (deep-copied).
+        self.assertEqual(
+            list(dataset._data_config.negative_sampler.attr_fields), ["cat_key"]
+        )
+
+        dataset.launch_sampler_cluster(2)
+        # Sampler sees the QUALIFIED column name after rewrite.
+        self.assertIn("click_seq__cat_key", dataset._sampler._attr_names)
+        self.assertNotIn("cat_key", dataset._sampler._attr_names)
+
     def test_dataset_with_sample_mask(self):
         input_fields = [
             pa.field(name="int_a", type=pa.int64()),

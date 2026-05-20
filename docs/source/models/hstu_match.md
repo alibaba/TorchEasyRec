@@ -16,7 +16,7 @@ data_config {
     negative_sampler {
         input_path: "odps://{PROJECT}/tables/taobao_ad_feature_gl_bucketized_v1"
         num_sample: 128
-        attr_fields: "cand_seq__video_id"
+        attr_fields: "video_id"
         item_id_field: "cand_seq__video_id"
         attr_delimiter: "\t"
     }
@@ -210,6 +210,8 @@ model_config {
 > The full runnable counterpart of this snippet is `tzrec/tests/configs/hstu_kuairand_1k.config` — it drives the HSTUMatch integration test on the KuaiRand-1K fixture and mirrors the sample above one-to-one.
 
 - data_config: 数据配置，其中需要配置负采样 Sampler，负采样 Sampler 的配置详见 [DSSM](dssm.md) 文档中的**负采样配置**章节
+
+  - HSTUMatch 的候选侧是 `sequence_feature` 的子特征。在 `negative_sampler` 中，`item_id_field` 写为带 `sequence_name` 前缀的名（例如 `cand_seq__video_id`），`attr_fields` 写为不带前缀的子特征名（例如 `video_id`）。
 
 - feature_groups: 特征组
 

@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import random
 from collections import OrderedDict
@@ -175,8 +176,17 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         # sub-features sharing `sequence_name` for grouped. Used by the
         # outer-list strip in `launch_sampler_cluster` and by the per-key
         # branch in `_merge_sampled_features`.
+        # `_sampler_bare_attr_to_sequence_input` is the bare->qualified
+        # alias map used to rewrite `attr_fields` at sampler-launch time
+        # (only meaningful for the grouped case; empty otherwise -> the
+        # rewrite is a no-op). HSTUMatch's `attr_fields: "video_id"`
+        # writes the bare sub-feature name; the alias maps it to the
+        # flattened parquet column `cand_seq__video_id` the sampler pool
+        # actually carries. The flatten prefix uses `feature._underline`
+        # so RTP-safe (no "_" vs "__" guessing).
         self._sampler_seq_delim: str = ""
         self._sampler_seq_inputs: set = set()
+        self._sampler_bare_attr_to_sequence_input: Dict[str, str] = {}
         if self._sampler_item_id_field is not None:
             for feature in features:
                 if (
@@ -186,11 +196,17 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     self._sampler_seq_delim = feature.sequence_delim
                     if feature.is_grouped_sequence:
                         seq_name = feature.sequence_name
+                        # pyre-ignore [16]: _underline is the source of
+                        # truth for the flatten separator.
+                        prefix = seq_name + feature._underline
                         self._sampler_seq_inputs = {
                             inp
                             for f in features
                             if f.is_grouped_sequence and f.sequence_name == seq_name
                             for inp in f.sequence_input_names
+                        }
+                        self._sampler_bare_attr_to_sequence_input = {
+                            inp[len(prefix) :]: inp for inp in self._sampler_seq_inputs
                         }
                     else:
                         self._sampler_seq_inputs = set(feature.sequence_input_names)
@@ -219,6 +235,20 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
+
+            # Resolve bare sub-feature `attr_fields` against the grouped-
+            # sequence flatten prefix when applicable. Bare names (HSTUMatch
+            # convention, `attr_fields: "video_id"`) map to the qualified
+            # parquet column (`cand_seq__video_id`); already-qualified
+            # names and unrelated top-level item-side attrs pass through
+            # the alias map's `.get(a, a)` fallthrough. Deep-copy so the
+            # in-place mutation here doesn't leak back to `self._data_config`.
+            if self._sampler_bare_attr_to_sequence_input:
+                sampler_config = copy.deepcopy(sampler_config)
+                sampler_config.attr_fields[:] = [
+                    self._resolve_sampler_attr_field(a)
+                    for a in sampler_config.attr_fields
+                ]
 
             # Multi-positive sampling: when the sampler's item_id_field is
             # itself a sequence-positive train column, the per-row outer
@@ -381,6 +411,20 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
         return batch
+
+    def _resolve_sampler_attr_field(self, attr_field: str) -> str:
+        """Translate a sampler `attr_field` from the user-facing namespace.
+
+        For grouped-sequence candidate configs (e.g. HSTUMatch), the
+        user-facing `attr_fields` entry can be a bare sub-feature name
+        (e.g. ``"video_id"``); we resolve it to the flattened parquet
+        column the sampler pool actually carries (e.g.
+        ``"cand_seq__video_id"``). For already-qualified names and for
+        unrelated top-level item-side attrs (e.g. lookup_feature's
+        ``"cat_map"``), the alias map has no entry and the input is
+        returned unchanged.
+        """
+        return self._sampler_bare_attr_to_sequence_input.get(attr_field, attr_field)
 
     def _apply_negative_sampler(
         self,
