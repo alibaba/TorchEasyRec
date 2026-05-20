@@ -88,9 +88,11 @@ jobs:
           fetch-depth: 1
           path: pr-code
 
-      # Copy trusted agent files into PR checkout
+      # rm first: cp -r into an existing dir nests instead of replacing (GHSA-f9x3-9rgg-92p7).
       - name: Use trusted agent files
-        run: cp -r trusted-claude/.claude pr-code/.claude
+        run: |
+          rm -rf pr-code/.claude
+          cp -r trusted-claude/.claude pr-code/.claude
 
       - name: RunCodeReview
         working-directory: pr-code
