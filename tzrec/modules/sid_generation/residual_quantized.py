@@ -156,11 +156,14 @@ class ResidualQuantized(nn.Module):
                 ]
             )
 
-        logger.info("ResidualQuantized init: %s", {
-            k: v for k, v in vars(self).items()
-            if not k.startswith("_") and k != "training"
-        })
-
+        logger.info(
+            "ResidualQuantized init: %s",
+            {
+                k: v
+                for k, v in vars(self).items()
+                if not k.startswith("_") and k != "training"
+            },
+        )
 
     @torch.jit.ignore
     @torch.no_grad()
@@ -190,7 +193,6 @@ class ResidualQuantized(nn.Module):
 
         self.initted.fill_(True)
 
-
     def _single_commitment_loss(
         self,
         x: torch.Tensor,
@@ -215,26 +217,15 @@ class ResidualQuantized(nn.Module):
         """
         if self.commitment_loss_type == "cos":
             loss1 = (
-                (1 - F.cosine_similarity(x, quant.detach(), dim=-1))
-                .mean()
-                * self.commitment_w1
-            )
+                1 - F.cosine_similarity(x, quant.detach(), dim=-1)
+            ).mean() * self.commitment_w1
             loss2 = (
-                (1 - F.cosine_similarity(x.detach(), quant, dim=-1))
-                .mean()
-                * self.commitment_w2
-            )
+                1 - F.cosine_similarity(x.detach(), quant, dim=-1)
+            ).mean() * self.commitment_w2
         else:  # 'l2'
-            loss1 = (
-                (x - quant.detach()).pow(2.0).mean()
-                * self.commitment_w1
-            )
-            loss2 = (
-                (x.detach() - quant).pow(2.0).mean()
-                * self.commitment_w2
-            )
+            loss1 = (x - quant.detach()).pow(2.0).mean() * self.commitment_w1
+            loss2 = (x.detach() - quant).pow(2.0).mean() * self.commitment_w2
         return loss1 + loss2
-
 
     @staticmethod
     def _apply_rotation_trick(
@@ -258,40 +249,29 @@ class ResidualQuantized(nn.Module):
         quant_detached = quant.detach()
         x_detached = x.detach()
 
-        quant_norms = torch.linalg.vector_norm(
-            quant_detached, dim=-1
-        ).unsqueeze(1)  # (B, 1)
-        x_norms = torch.linalg.vector_norm(
-            x_detached, dim=-1
-        ).unsqueeze(1)  # (B, 1)
+        quant_norms = torch.linalg.vector_norm(quant_detached, dim=-1).unsqueeze(
+            1
+        )  # (B, 1)
+        x_norms = torch.linalg.vector_norm(x_detached, dim=-1).unsqueeze(1)  # (B, 1)
         lambda_ = quant_norms / (x_norms + 1e-8)  # (B, 1)
 
         x_hat = x_detached / (x_norms + 1e-8)  # (B, D)
         quant_hat = quant_detached / (quant_norms + 1e-8)  # (B, D)
 
-        normalized_sum = F.normalize(
-            x_hat + quant_hat, p=2, dim=1
-        )  # (B, D)
+        normalized_sum = F.normalize(x_hat + quant_hat, p=2, dim=1)  # (B, D)
 
         x_unsq = x.unsqueeze(1)  # (B, 1, D)
 
         # Eq 4.2: Householder reflection
         sum_projection = (
-            x_unsq
-            @ normalized_sum.unsqueeze(2)
-            @ normalized_sum.unsqueeze(1)
+            x_unsq @ normalized_sum.unsqueeze(2) @ normalized_sum.unsqueeze(1)
         )  # (B, 1, D)
         rescaled_embeddings = (
-            x_unsq
-            @ x_hat.unsqueeze(2)
-            @ quant_hat.unsqueeze(1)
+            x_unsq @ x_hat.unsqueeze(2) @ quant_hat.unsqueeze(1)
         )  # (B, 1, D)
-        return (
-            lambda_
-            * (x_unsq - 2 * sum_projection + 2 * rescaled_embeddings)
-            .squeeze(1)
-        )
-
+        return lambda_ * (
+            x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
+        ).squeeze(1)
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
@@ -359,9 +339,7 @@ class ResidualQuantized(nn.Module):
         quants_trunc = aggregated_quants
         if self.training:
             if self.rotation_trick:
-                quants_trunc = self._apply_rotation_trick(
-                    input, quants_trunc
-                )
+                quants_trunc = self._apply_rotation_trick(input, quants_trunc)
             else:
                 quants_trunc = input + (quants_trunc - input).detach()
 
@@ -407,8 +385,10 @@ class ResidualQuantized(nn.Module):
             Tensor: reconstructed embeddings, shape (B, D).
         """
         quantized_sum = torch.zeros(
-            codes.shape[0], self.embed_dim,
-            device=codes.device, dtype=torch.float,
+            codes.shape[0],
+            self.embed_dim,
+            device=codes.device,
+            dtype=torch.float,
         )
         for i, layer in enumerate(self.layers):
             emb = layer.embedding(codes[:, i])

@@ -84,7 +84,7 @@ def _sinkhorn(
     sum_Q = torch.sum(Q)
     if is_distributed and dist.is_initialized():
         dist.all_reduce(sum_Q)
-    Q /= (sum_Q + 1e-8)
+    Q /= sum_Q + 1e-8
 
     # Step 3: alternating row-column normalization
     for _ in range(n_iters):
@@ -92,11 +92,11 @@ def _sinkhorn(
         sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
         if is_distributed and dist.is_initialized():
             dist.all_reduce(sum_of_rows)
-        Q /= (sum_of_rows + 1e-8)
+        Q /= sum_of_rows + 1e-8
         Q /= K
 
         # Column normalization: each sample's total weight = 1/B
-        Q /= (torch.sum(Q, dim=0, keepdim=True) + 1e-8)
+        Q /= torch.sum(Q, dim=0, keepdim=True) + 1e-8
         Q /= B
 
     # Step 4: scale back so columns sum to 1 (assignment)
@@ -257,9 +257,7 @@ class VectorQuantize(nn.Module):
             # Straight-Through Estimator: gradient passes through
             emb = x + (quantized_for_loss - x).detach()
         elif self.training:
-            raise ValueError(
-                f"Unsupported forward mode: {self.forward_mode}"
-            )
+            raise ValueError(f"Unsupported forward mode: {self.forward_mode}")
         else:
             quantized_for_loss = self.embedding(ids)
             emb = quantized_for_loss

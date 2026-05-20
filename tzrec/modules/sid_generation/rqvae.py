@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.clip_loss import CLIPLoss, MaskedCLIPLoss
+from tzrec.modules.sid_generation.clip_loss import MaskedCLIPLoss
 from tzrec.modules.sid_generation.residual_quantized import ResidualQuantized
 from tzrec.utils.logging_util import logger
 
@@ -141,21 +141,19 @@ class RQVAE(nn.Module):
 
         # CLIP contrastive learning (optional)
         if use_clip:
-            self.logit_scale_self = nn.Parameter(
-                torch.ones([]) * np.log(1 / 0.07)
-            )
-            self.logit_scale_cl = nn.Parameter(
-                torch.ones([]) * np.log(1 / 0.07)
-            )
-            self.logit_scale = nn.Parameter(
-                torch.ones([]) * np.log(1 / 0.07)
-            )
+            self.logit_scale_self = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self.logit_scale_cl = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             self.masked_clip_loss_fn = MaskedCLIPLoss()
 
-        logger.info("RQVAE init: %s", {
-            k: v for k, v in vars(self).items()
-            if not k.startswith("_") and k != "training"
-        })
+        logger.info(
+            "RQVAE init: %s",
+            {
+                k: v
+                for k, v in vars(self).items()
+                if not k.startswith("_") and k != "training"
+            },
+        )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode. (B, input_dim) -> (B, embed_dim)."""
@@ -165,9 +163,7 @@ class RQVAE(nn.Module):
         """Decode. (B, embed_dim) -> (B, input_dim)."""
         return self.decoder(z_q)
 
-    def _cosine_loss(
-        self, x1: torch.Tensor, x2: torch.Tensor
-    ) -> torch.Tensor:
+    def _cosine_loss(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """Cosine distance loss: 1 - mean(cos_sim)."""
         return (1 - F.cosine_similarity(x1, x2, dim=1)).mean()
 
@@ -238,9 +234,7 @@ class RQVAE(nn.Module):
         quant_output = self.quantizer(z_e, temperature=temperature)
         x_hat = self.decode(quant_output.quantized_embeddings)
 
-        losses = self.compute_loss(
-            x, x_hat, quant_output.quantization_loss
-        )
+        losses = self.compute_loss(x, x_hat, quant_output.quantization_loss)
 
         return {
             "x_hat": x_hat,
@@ -266,13 +260,9 @@ class RQVAE(nn.Module):
             recon_mask: (B,) bool, True = recon row.
         """
         if self.loss_type == "mse":
-            per_sample = F.mse_loss(
-                x_hat, x, reduction="none"
-            ).mean(dim=-1)
+            per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
         elif self.loss_type == "l1":
-            per_sample = F.l1_loss(
-                x_hat, x, reduction="none"
-            ).mean(dim=-1)
+            per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
         elif self.loss_type == "cosine":
             per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
         else:
@@ -324,9 +314,7 @@ class RQVAE(nn.Module):
         clip_result = self.masked_clip_loss_fn(features, clip_mask)
 
         # Step 4: commitment loss (average of two paths)
-        commitment = (
-            quant1.quantization_loss + quant2.quantization_loss
-        ) / 2
+        commitment = (quant1.quantization_loss + quant2.quantization_loss) / 2
 
         return {
             "codes": quant1.cluster_ids,
@@ -341,7 +329,6 @@ class RQVAE(nn.Module):
             "commitment_loss": commitment,
             "loss": recon_loss + clip_result["clip_loss"] + commitment,
         }
-
 
     @torch.no_grad()
     def get_codes(self, x: torch.Tensor) -> torch.Tensor:

@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 import torchmetrics
-from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
@@ -68,9 +67,7 @@ class SidRqvae(BaseModel):
         if cfg.latent_weight:
             rqvae_extra["latent_weight"] = parse_float_list(cfg.latent_weight)
 
-        assert cfg.codebook, (
-            "codebook must be set, e.g. '256,256,256'"
-        )
+        assert cfg.codebook, "codebook must be set, e.g. '256,256,256'"
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
@@ -134,9 +131,7 @@ class SidRqvae(BaseModel):
         else:
             return self._predict_rqvae(embedding)
 
-    def _predict_rqvae(
-        self, embedding: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
+    def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Standard RQ-VAE: encode -> quantize -> decode -> loss."""
         result = self._rqvae.forward_rqvae(embedding)
 

@@ -123,15 +123,11 @@ def _kmeans(
         bins_clamped = bins.masked_fill(zero_mask, 1)
 
         new_centroids = torch.zeros_like(centroids)
-        new_centroids.scatter_add_(
-            0, assignments.unsqueeze(1).expand(-1, D), samples
-        )
+        new_centroids.scatter_add_(0, assignments.unsqueeze(1).expand(-1, D), samples)
         new_centroids = new_centroids / bins_clamped.unsqueeze(1)
 
         # Keep old centroids for empty clusters
-        centroids = torch.where(
-            zero_mask.unsqueeze(1), centroids, new_centroids
-        )
+        centroids = torch.where(zero_mask.unsqueeze(1), centroids, new_centroids)
 
     return centroids, assignments
 
@@ -186,9 +182,7 @@ class KMeansLayer(nn.Module):
         self.n_clusters = n_clusters
         self.n_features = n_features
 
-        self.register_buffer(
-            "centroids", torch.zeros(n_clusters, n_features)
-        )
+        self.register_buffer("centroids", torch.zeros(n_clusters, n_features))
         self.register_buffer("_is_initialized", torch.tensor(False))
 
     @property

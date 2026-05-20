@@ -94,9 +94,7 @@ class ResidualKMeans(nn.Module):
         """Output dimension of the module."""
         return self.embed_dim
 
-    def forward(
-        self, input: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assign codes per layer and sum the centroids.
 
         Codebook is read-only here; training happens in ``train_offline``.
@@ -172,8 +170,10 @@ class ResidualKMeans(nn.Module):
             Tensor: reconstructed embeddings, shape (B, D).
         """
         quantized_sum = torch.zeros(
-            codes.shape[0], self.embed_dim,
-            device=codes.device, dtype=torch.float,
+            codes.shape[0],
+            self.embed_dim,
+            device=codes.device,
+            dtype=torch.float,
         )
         for i, layer in enumerate(self.layers):
             emb = layer.centroids[codes[:, i]]
@@ -212,16 +212,14 @@ class ResidualKMeans(nn.Module):
         # (so in-place residual updates are safe).
         if isinstance(inputs, torch.Tensor):
             assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
-                f"inputs must be (N, {self.embed_dim}), "
-                f"got {tuple(inputs.shape)}"
+                f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
             )
             # Tensor path still requires a copy; caller will hold a
             # reference until we return, so we must not alias it.
             x = inputs.detach().cpu().float().numpy().copy()
         else:
             assert inputs.ndim == 2 and inputs.shape[1] == self.embed_dim, (
-                f"inputs must be (N, {self.embed_dim}), "
-                f"got {tuple(inputs.shape)}"
+                f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
             )
             # Numpy path: take ownership — no extra copy. Caller promises
             # the array is no longer used outside. Only ensure dtype
@@ -233,9 +231,7 @@ class ResidualKMeans(nn.Module):
         # Reuse one Kmeans instance across all layers (matches OneRec impl):
         # rebuilding the FAISS object per layer doubles index-init cost.
         n_embed = self.n_embed_list[0]
-        kmeans = faiss.Kmeans(
-            self.embed_dim, n_embed, **self.faiss_kmeans_kwargs
-        )
+        kmeans = faiss.Kmeans(self.embed_dim, n_embed, **self.faiss_kmeans_kwargs)
 
         # Chunk size for index.search to limit peak memory.
         # 500K × 512 × 4B ≈ 1 GB per chunk.
@@ -245,24 +241,25 @@ class ResidualKMeans(nn.Module):
             if self.normalize_residuals:
                 norms = np.linalg.norm(x, axis=1, keepdims=True)
                 np.maximum(norms, 1e-8, out=norms)
-                x /= norms                             # in-place
+                x /= norms  # in-place
 
             kmeans.train(x)
 
             for start in range(0, N, SEARCH_CHUNK):
                 end = min(start + SEARCH_CHUNK, N)
                 _, idx = kmeans.index.search(x[start:end], 1)
-                q = kmeans.centroids[idx.ravel()]       # (chunk, D)
+                q = kmeans.centroids[idx.ravel()]  # (chunk, D)
                 out[start:end] += q
-                x[start:end] -= q                       # residual
+                x[start:end] -= q  # residual
                 del idx, q
 
             if verbose:
                 out_t = torch.from_numpy(out)
-                ref_t = torch.from_numpy(out + x)       # x_in = out + residual
+                ref_t = torch.from_numpy(out + x)  # x_in = out + residual
                 logger.info(
                     "[ResidualKMeans][offline_faiss][layer %d] %s",
-                    layer_idx, self._calc_loss(ref_t, out_t),
+                    layer_idx,
+                    self._calc_loss(ref_t, out_t),
                 )
                 del out_t, ref_t
 
@@ -281,8 +278,7 @@ class ResidualKMeans(nn.Module):
         """Reconstruction loss diagnostics (MSE + relative L1)."""
         loss = ((out - x) ** 2).mean()
         rel_loss = (
-            torch.abs(x - out)
-            / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
+            torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
         ).mean()
         return {"loss": float(loss.item()), "rel_loss": float(rel_loss.item())}
 

@@ -73,9 +73,7 @@ class SidRqvaeTest(unittest.TestCase):
             feature_groups=feature_groups,
             sid_rqvae=sid_rqvae_cfg,
         )
-        model = SidRqvae(
-            model_config=model_config, features=[], labels=[]
-        )
+        model = SidRqvae(model_config=model_config, features=[], labels=[])
         init_parameters(model, device=torch.device("cpu"))
         return model
 
@@ -155,16 +153,14 @@ class SidRqvaeTest(unittest.TestCase):
         # second half clip (image_emb != item_emb)
         item_emb = torch.randn(B, input_dim)
         image_emb = item_emb.clone()
-        image_emb[B // 2:] = torch.randn(B - B // 2, input_dim)  # clip rows
+        image_emb[B // 2 :] = torch.randn(B - B // 2, input_dim)  # clip rows
 
         extra = {"image_emb": image_emb}
         batch = _make_batch(B, input_dim, extra_features=extra)
         # Override item_emb in batch to match our crafted tensor
-        batch.dense_features[BASE_DATA_GROUP] = (
-            KeyedTensor.from_tensor_list(
-                keys=["item_emb", "image_emb"],
-                tensors=[item_emb, image_emb],
-            )
+        batch.dense_features[BASE_DATA_GROUP] = KeyedTensor.from_tensor_list(
+            keys=["item_emb", "image_emb"],
+            tensors=[item_emb, image_emb],
         )
 
         predictions = model.predict(batch)
@@ -189,8 +185,7 @@ class SidRqvaeTest(unittest.TestCase):
         # Backward should work
         total_loss.backward()
         has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in model.parameters()
+            p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
         )
         self.assertTrue(has_grad)
 
@@ -269,8 +264,7 @@ class SidRqvaeTest(unittest.TestCase):
 
         # Encoder params should have gradients
         has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in model.parameters()
+            p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
         )
         self.assertTrue(has_grad)
 

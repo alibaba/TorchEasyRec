@@ -51,8 +51,7 @@ def _recon_loss(
     """
     mse = ((out - x) ** 2).mean()
     rel = (
-        torch.abs(x - out)
-        / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
+        torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
     ).mean()
     return mse, rel
 
@@ -101,9 +100,7 @@ class SidRqkmeans(BaseModel):
         cfg = self._model_config  # SidRqkmeans proto message
         self._embedding_feature_name = cfg.embedding_feature_name
 
-        assert cfg.codebook, (
-            "codebook must be set, e.g. '256,256,256'"
-        )
+        assert cfg.codebook, "codebook must be set, e.g. '256,256,256'"
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
@@ -269,8 +266,9 @@ class SidRqkmeans(BaseModel):
             )
             return
 
-        is_ddp = dist.is_available() and dist.is_initialized() \
-            and dist.get_world_size() > 1
+        is_ddp = (
+            dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        )
 
         if is_ddp:
             # DDP path: concat locally, all_gather (variable-length via
@@ -280,9 +278,7 @@ class SidRqkmeans(BaseModel):
             del self._offline_buffer
             self._offline_buffer = []
 
-            gathered: List[Optional[torch.Tensor]] = (
-                [None] * dist.get_world_size()
-            )
+            gathered: List[Optional[torch.Tensor]] = [None] * dist.get_world_size()
             dist.all_gather_object(gathered, local)
             del local  # no longer needed after gather
             full = torch.cat([g for g in gathered if g is not None], dim=0)

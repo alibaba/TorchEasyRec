@@ -67,8 +67,6 @@ def _all_gather_with_grad(
     return gathered
 
 
-
-
 class CLIPLoss(nn.Module):
     """Multi-level CLIP contrastive learning loss.
 
@@ -105,9 +103,7 @@ class CLIPLoss(nn.Module):
         self.last_local_batch_size: Optional[int] = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
 
-    def forward(
-        self, outputs: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Compute multi-level CLIP contrastive loss.
 
         Args:
@@ -217,9 +213,7 @@ class MaskedCLIPLoss(nn.Module):
         """All-gather bool mask across distributed workers."""
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return mask
-        mask_list = [
-            torch.zeros_like(mask) for _ in range(dist.get_world_size())
-        ]
+        mask_list = [torch.zeros_like(mask) for _ in range(dist.get_world_size())]
         dist.all_gather(mask_list, mask)
         return torch.cat(mask_list, dim=0)
 
@@ -311,9 +305,7 @@ class MaskedCLIPLoss(nn.Module):
         # --- Safe labels: recon rows fallback to first clip column ---
         labels = self.labels
         fallback = clip_mask.long().argmax()  # first clip sample index
-        safe_labels = torch.where(
-            clip_mask, labels, fallback.expand_as(labels)
-        )
+        safe_labels = torch.where(clip_mask, labels, fallback.expand_as(labels))
 
         # --- Masked CE for three loss groups ---
         loss_self = self._masked_cross_entropy(

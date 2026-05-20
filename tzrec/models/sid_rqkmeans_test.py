@@ -39,6 +39,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
     def _create_model(self, input_dim=32, n_layers=2, niter=5):
         """Create a SidRqkmeans configured for offline FAISS fit."""
         from google.protobuf.struct_pb2 import Struct
+
         n_embed_str = ",".join(["16"] * n_layers)
 
         faiss_kwargs = Struct()
@@ -62,9 +63,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             feature_groups=feature_groups,
             sid_rqkmeans=sid_rqkmeans_cfg,
         )
-        model = SidRqkmeans(
-            model_config=model_config, features=[], labels=[]
-        )
+        model = SidRqkmeans(model_config=model_config, features=[], labels=[])
         init_parameters(model, device=torch.device("cpu"))
         return model
 
