@@ -764,7 +764,7 @@ class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
         ]
         return feature_lib.create_features(feature_cfgs)
 
-    def test_id_feature_projection_preserves_scalar_defaults(self):
+    def test_id_feature_projection_materializes_seq_defaults(self):
         sub_cfg = feature_pb2.SeqFeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="video_id",
@@ -783,12 +783,14 @@ class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
 
         scalar_cfg = feature_lib.project_grouped_sequence_feature_to_scalar(sub_feature)
         self.assertEqual(scalar_cfg.WhichOneof("feature"), "id_feature")
-        # Scalar-mode defaults are intentional: predict-time parquet provides
-        # one value per row, so the sequence-effective "0" / 1 defaults are
-        # not carried into the scalar proto -- FG handles the value-per-row
-        # input via the scalar id_feature path.
-        self.assertEqual(scalar_cfg.id_feature.default_value, "")
-        self.assertFalse(scalar_cfg.id_feature.HasField("value_dim"))
+        # Sequence-effective defaults carried into the scalar proto so the
+        # exported feature is behaviorally identical to the training
+        # sub-feature -- otherwise an id_feature in scalar mode resolves
+        # default_value to "" and value_dim to 0, diverging from the
+        # training "0" / 1 it was projected from.
+        self.assertEqual(scalar_cfg.id_feature.default_value, "0")
+        self.assertTrue(scalar_cfg.id_feature.HasField("value_dim"))
+        self.assertEqual(scalar_cfg.id_feature.value_dim, 1)
         # Original sub-feature proto is not mutated.
         self.assertEqual(sub_feature.feature_config.id_feature.default_value, "")
         self.assertFalse(sub_feature.feature_config.id_feature.HasField("value_dim"))
@@ -810,9 +812,9 @@ class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
         # Bare sub-feature name without the cand_seq__ prefix.
         self.assertEqual(scalar.name, "video_id")
         self.assertFalse(scalar.is_grouped_sequence)
-        # Scalar context: value_dim resolves to 0 (variable length) via
-        # the non-sequence path in IdFeature.value_dim.
-        self.assertEqual(scalar.value_dim, 0)
+        # Scalar context: value_dim is materialized to 1 from the source
+        # sub-feature's sequence-effective default.
+        self.assertEqual(scalar.value_dim, 1)
 
     def test_projection_rejects_non_grouped_feature(self):
         feature_cfgs = [

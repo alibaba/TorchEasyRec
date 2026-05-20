@@ -222,6 +222,20 @@ class MatchTowerWoEG(nn.Module):
         self._feature_groups = feature_groups
         self._features = features
 
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Item-side features the tower exposes to its wrapper.
+
+        Default reads `self._features`; overridden by towers that switch
+        views between training and export (see `HSTUMatchItemTower`).
+        """
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Item-side feature_groups the tower exposes to its wrapper."""
+        return self._feature_groups
+
 
 class MatchModel(BaseModel):
     """Base model for match.
@@ -457,9 +471,24 @@ class TowerWrapper(nn.Module):
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
         setattr(self, tower_name, module)
-        self._features = module._features
-        self._feature_groups = module._feature_groups
+        # Snapshot the tower's current view via the property (which for
+        # `HSTUMatchItemTower` returns the scalar view iff
+        # `_is_inference=True`). Wrapper construction must happen *after*
+        # the inference flag is set on the inner tower (see
+        # `tzrec/main.py::export`).
+        self._features = module.features
+        self._feature_groups = module.feature_groups
         self._tower_name = tower_name
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Snapshot of the wrapped tower's features at construction time."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Snapshot of the wrapped tower's feature_groups at construction time."""
+        return self._feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -478,12 +507,28 @@ class TowerWoEGWrapper(nn.Module):
 
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
-        self.embedding_group = EmbeddingGroup(module._features, module._feature_groups)
+        # Build EmbeddingGroup from the tower's *current view*: for
+        # `HSTUMatchItemTower` after `set_is_inference(True)`, this is the
+        # scalar export view (one row per item, `{group_name}.query`);
+        # otherwise it's the training view (jagged, `{group_name}.sequence`).
+        # Wrapper construction must happen *after* the inference flag is
+        # set on the inner tower -- see `tzrec/main.py::export`.
+        self.embedding_group = EmbeddingGroup(module.features, module.feature_groups)
         setattr(self, tower_name, module)
-        self._features = module._features
-        self._feature_groups = module._feature_groups
+        self._features = module.features
+        self._feature_groups = module.feature_groups
         self._tower_name = tower_name
         self._group_name = module._group_name
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Snapshot of the wrapped tower's features at construction time."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Snapshot of the wrapped tower's feature_groups at construction time."""
+        return self._feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.

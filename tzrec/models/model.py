@@ -336,8 +336,12 @@ class ScriptWrapper(BaseModule):
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
-        self._features = self.model._features
-        self._feature_groups = self.model._feature_groups
+        # Snapshot via the inner module's view properties (defaults forward
+        # to the underscore fields; HSTUMatchItemTower / wrapper towers
+        # override). Wrapper construction must happen *after* the inference
+        # flag is set on the inner module -- see `tzrec/main.py::export`.
+        self._features = self._features_from(module)
+        self._feature_groups = self._feature_groups_from(module)
         # Propagate tower identity (set by TowerWoEGWrapper / TowerWrapper)
         # so export_util.py can route item-tower export through
         # `pipeline_config.item_input_path` instead of `train_input_path`.
@@ -349,6 +353,26 @@ class ScriptWrapper(BaseModule):
             if hasattr(module, "sampler_type")
             else None,
         )
+
+    @staticmethod
+    def _features_from(module: nn.Module) -> List["BaseFeature"]:
+        return module.features if hasattr(module, "features") else module._features
+
+    @staticmethod
+    def _feature_groups_from(module: nn.Module) -> List:
+        if hasattr(module, "feature_groups"):
+            return module.feature_groups
+        return module._feature_groups
+
+    @property
+    def features(self) -> List["BaseFeature"]:
+        """Snapshot of the wrapped module's features at construction time."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List:
+        """Snapshot of the wrapped module's feature_groups at construction time."""
+        return self._feature_groups
 
     def get_batch(
         self,

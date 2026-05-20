@@ -198,7 +198,11 @@ def export_model_normal(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        model.set_is_inference(True)
+        # `set_is_inference(True)` is the caller's responsibility; it must
+        # be applied to the inner model *before* wrapping with
+        # `InferWrapper` (see `tzrec/main.py::export`) so wrapper-level
+        # snapshots (EmbeddingGroup, view-dependent features) pick up the
+        # inference-mode view at construction time.
 
         init_parameters(model, torch.device("cpu"))
         checkpoint_util.restore_model(
@@ -740,7 +744,8 @@ def export_rtp_model(
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
-    model.set_is_inference(True)
+    # `set_is_inference(True)` was applied in `tzrec/main.py::export` before
+    # wrapping -- the inner model + all sub-modules already carry the flag.
 
     # Build Sharded Model
     planner = create_planner(
@@ -1062,7 +1067,8 @@ def split_model(
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
 
-    model.set_is_inference(True)
+    # `set_is_inference(True)` was applied in `tzrec/main.py::export` before
+    # wrapping -- the inner model + all sub-modules already carry the flag.
     model.eval()
 
     tracer = Tracer()

@@ -1235,10 +1235,12 @@ def project_grouped_sequence_feature_to_scalar(
 
     The grouped sub-feature's config is a `SeqFeatureConfig`; rewrap it as a
     top-level `FeatureConfig` so `create_features` builds it as a scalar
-    feature. The scalar-mode defaults (empty `default_value`, dynamic
-    `value_dim=0` for id_feature) are intentional: at item-export predict
-    time the parquet provides one value per row, so the sequence-effective
-    defaults (`"0"` / `1`) don't apply.
+    feature. Materializes the source feature's effective `default_value` and
+    `value_dim` onto the scalar proto so the exported feature is
+    behaviorally identical to the training sub-feature -- without this,
+    `id_feature.value_dim` and `default_value` resolve differently in
+    scalar mode (`0` / `""`) than in sequence mode (`1` / `"0"`)
+    (see feature.py:515-517, 556-561).
 
     Args:
         feature: a grouped sequence sub-feature.
@@ -1260,6 +1262,11 @@ def project_grouped_sequence_feature_to_scalar(
     scalar_cfg = feature_pb2.FeatureConfig()
     dst_msg = getattr(scalar_cfg, feat_type)
     dst_msg.CopyFrom(src_msg)
+
+    if hasattr(dst_msg, "default_value") and not dst_msg.default_value:
+        dst_msg.default_value = feature.default_value
+    if hasattr(dst_msg, "value_dim") and not dst_msg.HasField("value_dim"):
+        dst_msg.value_dim = feature.value_dim
     return scalar_cfg
 
 

@@ -199,7 +199,12 @@ class HSTUMatchTest(unittest.TestCase):
         batch = _build_batch(device=device)
 
         if graph_type == TestGraphType.JIT_SCRIPT:
-            hstu.set_is_inference(True)
+            # Don't flip the inference flag here: the test batch is in the
+            # training-view shape (jagged `candidate.sequence`), and the
+            # item tower's forward branches on `_is_inference` to choose
+            # `.sequence` vs `.query`. The JIT-scripted forward still
+            # compiles both branches; the runtime path is the training
+            # branch, matching the batch shape.
             hstu = create_test_model(hstu, graph_type)
             predictions = hstu(batch.to_dict(), device)
         elif graph_type == TestGraphType.FX_TRACE:

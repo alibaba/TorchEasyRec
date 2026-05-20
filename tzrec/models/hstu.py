@@ -161,13 +161,24 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         # tower_config.input here, which equals feature_groups[0].group_name.
         self._group_name = tower_config.input
         # Training view: candidate group is JAGGED_SEQUENCE; embedding_group
-        # emits the per-row jagged tensor at `{group_name}.sequence`. The
-        # export-time scalar view (see `set_is_inference(True)`) swaps this
-        # to `{group_name}.query` -- one row per item, no positive-set
-        # grouping container.
-        self._cand_key = f"{self._group_name}.sequence"
-        candidate_dims = embedding_group.group_dims(self._cand_key)
+        # emits the per-row jagged tensor at `{group_name}.sequence`. At
+        # export, `set_is_inference(True)` flips the flag below; the
+        # `features` / `feature_groups` properties then return the lazily-
+        # built scalar view (one row per item), and `forward()` reads
+        # `{group_name}.query` instead. Mlp / output Linear are sized off
+        # the training candidate group; the scalar view's per-feature
+        # embedding dim is identical, so no resize is needed.
+        candidate_dims = embedding_group.group_dims(f"{self._group_name}.sequence")
         candidate_total_dim = sum(candidate_dims)
+
+        # Lazy caches for the scalar export view; populated on first
+        # property access when `_is_inference` is True. None at training
+        # time -- non-export consumers pay zero cost.
+        self._features_scalar: Optional[List[BaseFeature]] = None
+        self._feature_groups_scalar: Optional[List[model_pb2.FeatureGroupConfig]] = None
+        # Initialize explicitly: `MatchTowerWoEG` derives from `nn.Module`,
+        # not `BaseModule`, so `_is_inference` isn't set by the parent.
+        self._is_inference: bool = False
         if tower_config.HasField("mlp"):
             self.mlp: torch.nn.Module = MLP(
                 in_features=candidate_total_dim,
@@ -181,30 +192,37 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         if self._output_dim > 0:
             self.output = nn.Linear(mlp_out_dim, output_dim)
 
-    def set_is_inference(self, is_inference: bool) -> None:
-        """Switch the tower into the scalar item-export view (one-way).
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Item-side features in the current view (training or scalar export).
 
-        Training stays at `candidate.sequence` (jagged sub-feature). Export
-        copies the tower (`copy.deepcopy`), calls this with `True`, and the
-        wrapper picks up the swapped `_features` / `_feature_groups` /
-        `_cand_key` for serving. Idempotent: re-entering after the swap is a
-        no-op. `set_is_inference(False)` does NOT rebuild the training view;
-        callers must export from a copy so the original training tower is
-        preserved.
-
-        Note: `MatchTowerWoEG` derives from `nn.Module`, not `BaseModule`,
-        so this method doesn't call `super().set_is_inference()`. The
-        `_is_inference` attribute is propagated to sub-modules separately by
-        `ScriptWrapper.set_is_inference()` via `recursive_setattr` during
-        export.
+        At training (`_is_inference=False`), returns the grouped sequence
+        sub-features the tower was constructed with. At export
+        (`_is_inference=True`), returns the lazily-built scalar
+        projection, cached for subsequent reads.
         """
-        if not is_inference:
-            return
-        if self._cand_key.endswith(".query"):
-            return  # already swapped (idempotent)
+        if self._is_inference:
+            if self._features_scalar is None:
+                self._build_scalar_features()
+            return self._features_scalar
+        return self._features
 
-        # Project each grouped sequence sub-feature into a scalar export
-        # FeatureConfig, then rebuild as top-level scalar features.
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Item-side feature_groups in the current view (see `features`)."""
+        if self._is_inference:
+            if self._feature_groups_scalar is None:
+                self._build_scalar_features()
+            return self._feature_groups_scalar
+        return self._feature_groups
+
+    def _build_scalar_features(self) -> None:
+        """Build the scalar export view caches from the training features.
+
+        Projects each grouped sequence sub-feature into a scalar export
+        feature; populates `_features_scalar` and `_feature_groups_scalar`.
+        Called at most once per tower instance (cached via the properties).
+        """
         scalar_configs = [
             project_grouped_sequence_feature_to_scalar(f) for f in self._features
         ]
@@ -218,18 +236,38 @@ class HSTUMatchItemTower(MatchTowerWoEG):
                 f.data_group == BASE_DATA_GROUP for f in self._features
             ),
         )
-        self._features = scalar_features
-        self._feature_groups = [
+        self._features_scalar = scalar_features
+        self._feature_groups_scalar = [
             model_pb2.FeatureGroupConfig(
                 group_name=self._group_name,
                 feature_names=[f.name for f in scalar_features],
                 group_type=model_pb2.JAGGED_SEQUENCE,
             )
         ]
-        self._cand_key = f"{self._group_name}.query"
+
+    def set_is_inference(self, is_inference: bool) -> None:
+        """Toggle the export-view flag without structural mutation.
+
+        Cheap; the scalar features/groups are materialized lazily on first
+        property read (typically by `TowerWoEGWrapper.__init__` rebuilding
+        its EmbeddingGroup). `set_is_inference(False)` reverts the view;
+        the lazy caches survive but are unused.
+
+        `MatchTowerWoEG` derives from `nn.Module`, not `BaseModule`, so
+        this method doesn't call `super().set_is_inference()`. The
+        `_is_inference` flag on sub-modules is set separately by the
+        caller's `BaseModule.set_is_inference` (recursive_setattr).
+        """
+        self._is_inference = is_inference
 
     def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the item tower.
+
+        Reads from `{group_name}.sequence` (jagged) at training and from
+        `{group_name}.query` (scalar) at export. One-line conditional;
+        no cached `cand_key` attribute. The branch is on `_is_inference`
+        rather than dict-membership so the choice is FX/JIT traceable
+        (dict-membership checks aren't traceable as control flow).
 
         Args:
             grouped_features: dictionary of embedded features from EmbeddingGroup.
@@ -237,7 +275,8 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             item embeddings of shape (sum_candidates, D).
         """
-        cand_emb = grouped_features[self._cand_key]
+        suffix = ".query" if self._is_inference else ".sequence"
+        cand_emb = grouped_features[self._group_name + suffix]
         item_emb = self.mlp(cand_emb)
         if self._output_dim > 0:
             item_emb = self.output(item_emb)

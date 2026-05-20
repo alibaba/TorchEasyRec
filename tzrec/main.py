@@ -936,6 +936,16 @@ def export(
         sampler_type=None,
     )
     InferWrapper = ScriptWrapper
+    # Set the inference flag on the inner model *before* wrapping. Every
+    # downstream wrapper (ScriptWrapper for non-match, TowerWoEGWrapper /
+    # TowerWrapper per match tower) snapshots view-dependent state at
+    # construction time (e.g. `HSTUMatchItemTower`'s lazy
+    # `features`/`feature_groups` properties; the wrappers' EmbeddingGroup),
+    # so the flag must already be True when the wrapping happens.
+    # `recursive_setattr` propagates the flag to all sub-modules including
+    # the inner towers, so the per-tower wrap below doesn't need its own
+    # toggle.
+    model.set_is_inference(True)
     model = InferWrapper(model)
 
     if not checkpoint_path:
@@ -957,16 +967,12 @@ def export(
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                # Towers that own a view switch (e.g. `HSTUMatchItemTower`
-                # flipping from training `candidate.sequence` to scalar
-                # `candidate.query`) need to flip BEFORE the wrapper rebuilds
-                # `EmbeddingGroup(module._features, module._feature_groups)`.
-                # Deep-copy so the original training tower is preserved.
-                module_for_export = module
-                if hasattr(module, "set_is_inference") and name == "item_tower":
-                    module_for_export = copy.deepcopy(module)
-                    module_for_export.set_is_inference(True)
-                tower = InferWrapper(wrapper(module_for_export, name))
+                # The inference flag was already set on every sub-module by
+                # `model.set_is_inference(True)` above, so `HSTUMatchItemTower`'s
+                # lazy `features` / `feature_groups` properties return the
+                # scalar view here and the wrapper's `EmbeddingGroup` is
+                # built off scalar features.
+                tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 export_model(
                     ori_pipeline_config,
