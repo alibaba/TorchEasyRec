@@ -222,12 +222,22 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if self._sampler_seq_delim:
                 if self._sampler_seq_prefix:
                     # Grouped sequence: resolve bare candidate sub-feature
-                    # names against the qualified flattened schema using
-                    # the authoritative parent prefix from feature configs
-                    # (RTP-safe, no name string split). Has to run *before*
-                    # the outer-list strip so `consumed` carries resolved
-                    # names. Top-level `sequence_id_feature` skips this --
-                    # its attr_fields are already bare/qualified-as-itself.
+                    # names against the flattened schema using the
+                    # authoritative parent prefix from feature configs
+                    # (RTP-safe, no name string split). Literal match wins,
+                    # so:
+                    #   - already-qualified attrs (e.g. "cand_seq__video_id")
+                    #     stay as-is;
+                    #   - bare candidate sub-features (e.g. "video_id") get
+                    #     prefixed to "cand_seq__video_id";
+                    #   - top-level item-side attrs in the same sampler
+                    #     config (e.g. lookup_feature's `cat_map` whose
+                    #     sequence_fields exclude it) stay as-is because
+                    #     they literally exist in the parquet schema.
+                    # Must run *before* the outer-list strip so `consumed`
+                    # carries resolved names. Top-level `sequence_id_feature`
+                    # skips this -- its attr_fields are bare top-level
+                    # columns.
                     field_names = {f.name for f in sampler_fields}
                     sampler_config.attr_fields[:] = [
                         self._sampler_seq_prefix + a
