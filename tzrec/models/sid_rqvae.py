@@ -74,14 +74,6 @@ class SidRqvae(BaseModel):
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
-        # Parse EMA sub-config (disabled unless ema_config is explicitly set)
-        use_ema = cfg.HasField("ema_config")
-        ema_decay = 0.99
-        restart_unused_codes = True
-        if use_ema:
-            ema_decay = cfg.ema_config.decay
-            restart_unused_codes = cfg.ema_config.restart_unused_codes
-
         # Parse Sinkhorn sub-config (defaults: enabled, iters=5, epsilon=10.0)
         use_sinkhorn = True
         sinkhorn_iters = 5
@@ -103,9 +95,6 @@ class SidRqvae(BaseModel):
             commitment_loss=cfg.commitment_loss,
             rotation_trick=cfg.rotation_trick,
             kmeans_init=cfg.kmeans_init,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            restart_unused_codes=restart_unused_codes,
             use_sinkhorn=use_sinkhorn,
             sinkhorn_iters=sinkhorn_iters,
             sinkhorn_epsilon=sinkhorn_epsilon,

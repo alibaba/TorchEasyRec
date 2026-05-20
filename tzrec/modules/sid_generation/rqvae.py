@@ -56,9 +56,6 @@ class RQVAE(nn.Module):
             Default: [1.0, 0.5].
         rotation_trick (bool): STE rotation trick. Default: False.
         kmeans_init (bool): KMeans codebook initialization. Default: True.
-        use_ema (bool): EMA codebook update. Default: True.
-        ema_decay (float): EMA decay coefficient. Default: 0.99.
-        restart_unused_codes (bool): reset dead codes. Default: True.
         use_sinkhorn (bool): Sinkhorn uniform assignment. Default: True.
         sinkhorn_iters (int): Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness. Default: 10.0.
@@ -92,9 +89,6 @@ class RQVAE(nn.Module):
         latent_weight: Sequence[float] = (1.0, 0.5),
         rotation_trick: bool = False,
         kmeans_init: bool = True,
-        use_ema: bool = True,
-        ema_decay: float = 0.99,
-        restart_unused_codes: bool = True,
         use_sinkhorn: bool = True,
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
@@ -140,9 +134,6 @@ class RQVAE(nn.Module):
             latent_weight=latent_weight,
             rotation_trick=rotation_trick,
             kmeans_init=kmeans_init,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            restart_unused_codes=restart_unused_codes,
             use_sinkhorn=use_sinkhorn,
             sinkhorn_iters=sinkhorn_iters,
             sinkhorn_epsilon=sinkhorn_epsilon,
@@ -313,10 +304,7 @@ class RQVAE(nn.Module):
         x_hat1 = self.decode(quant1.quantized_embeddings)
 
         z_e2 = self.encode(fea2)
-        quant2 = self.quantizer(
-            z_e2, temperature=temperature,
-            ema_mask=clip_mask.float(),
-        )
+        quant2 = self.quantizer(z_e2, temperature=temperature)
         x_hat2 = self.decode(quant2.quantized_embeddings)
 
         # Step 2: recon loss (only recon rows, no branching)

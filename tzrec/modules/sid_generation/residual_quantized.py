@@ -11,7 +11,7 @@
 
 """ResidualQuantized: multi-layer residual vector quantization with VQ layers."""
 
-from typing import List, Optional, Sequence, Union
+from typing import List, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -21,7 +21,6 @@ from torch.nn import functional as F
 from tzrec.modules.sid_generation.kmeans import _residual_kmeans
 from tzrec.modules.sid_generation.types import (
     QuantizeForwardMode,
-    QuantizeOutput,
     ResidualQuantizedOutput,
 )
 from tzrec.modules.sid_generation.vector_quantize import VectorQuantize
@@ -56,16 +55,13 @@ class ResidualQuantized(nn.Module):
         commitment_loss (str): commitment loss type, 'l2' or 'cos'.
             Default: 'l2'.
         latent_weight (List[float]): commitment loss weights [w1, w2].
-            w1: x toward quant (always active).
-            w2: quant toward x (only when use_ema=False).
+            w1: x toward quant (encoder side).
+            w2: quant toward x (codebook side).
             Default: [1.0, 0.5].
         rotation_trick (bool): use rotation trick for improved STE
             gradient estimation (arXiv:2410.06424). Default: False.
         kmeans_init (bool): use residual K-Means codebook initialization
             on first forward. Default: False.
-        use_ema (bool): EMA codebook update. Default: True.
-        ema_decay (float): EMA decay coefficient. Default: 0.99.
-        restart_unused_codes (bool): reset dead codes. Default: True.
         use_sinkhorn (bool): Sinkhorn uniform assignment. Default: True.
         sinkhorn_iters (int): Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness. Default: 10.0.
@@ -89,9 +85,6 @@ class ResidualQuantized(nn.Module):
         latent_weight: Sequence[float] = (1.0, 0.5),
         rotation_trick: bool = False,
         kmeans_init: bool = False,
-        use_ema: bool = True,
-        ema_decay: float = 0.99,
-        restart_unused_codes: bool = True,
         use_sinkhorn: bool = True,
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
@@ -102,7 +95,6 @@ class ResidualQuantized(nn.Module):
         self.normalize_residuals = normalize_residuals
         self.shared_codebook = shared_codebook
         self.commitment_loss_type = commitment_loss
-        self.use_ema = use_ema
         self.rotation_trick = rotation_trick
 
         self.commitment_w1, self.commitment_w2 = latent_weight
@@ -143,9 +135,6 @@ class ResidualQuantized(nn.Module):
                 n_embed=n_embed_list[0],
                 forward_mode=mode_enum,
                 distance_type=distance_types[0],
-                use_ema=use_ema,
-                ema_decay=ema_decay,
-                restart_unused_codes=restart_unused_codes,
                 use_sinkhorn=use_sinkhorn,
                 sinkhorn_iters=sinkhorn_iters,
                 sinkhorn_epsilon=sinkhorn_epsilon,
@@ -159,9 +148,6 @@ class ResidualQuantized(nn.Module):
                         n_embed=n_embed_list[i],
                         forward_mode=mode_enum,
                         distance_type=distance_types[i],
-                        use_ema=use_ema,
-                        ema_decay=ema_decay,
-                        restart_unused_codes=restart_unused_codes,
                         use_sinkhorn=use_sinkhorn,
                         sinkhorn_iters=sinkhorn_iters,
                         sinkhorn_epsilon=sinkhorn_epsilon,
@@ -214,7 +200,10 @@ class ResidualQuantized(nn.Module):
 
           - cos: (1 - cosine_similarity) * weight
           - l2:  (x - quant)^2.mean() * weight
-        EMA mode zeros out the codebook-toward-encoder term.
+
+        Both directions are always summed:
+            loss1 = encoder-toward-quant (gradient flows into encoder)
+            loss2 = quant-toward-encoder (gradient flows into codebook)
 
         Args:
             x (Tensor): original input, shape (B, D).
@@ -230,28 +219,20 @@ class ResidualQuantized(nn.Module):
                 .mean()
                 * self.commitment_w1
             )
-            if self.use_ema:
-                loss2 = torch.tensor(0.0, device=x.device)
-            else:
-                loss2 = (
-                    (1 - F.cosine_similarity(
-                        x.detach(), quant, dim=-1
-                    ))
-                    .mean()
-                    * self.commitment_w2
-                )
+            loss2 = (
+                (1 - F.cosine_similarity(x.detach(), quant, dim=-1))
+                .mean()
+                * self.commitment_w2
+            )
         else:  # 'l2'
             loss1 = (
                 (x - quant.detach()).pow(2.0).mean()
                 * self.commitment_w1
             )
-            if self.use_ema:
-                loss2 = torch.tensor(0.0, device=x.device)
-            else:
-                loss2 = (
-                    (x.detach() - quant).pow(2.0).mean()
-                    * self.commitment_w2
-                )
+            loss2 = (
+                (x.detach() - quant).pow(2.0).mean()
+                * self.commitment_w2
+            )
         return loss1 + loss2
 
 
@@ -320,7 +301,6 @@ class ResidualQuantized(nn.Module):
         self,
         input: torch.Tensor,
         temperature: float = 1.0,
-        ema_mask: Optional[torch.Tensor] = None,
     ) -> ResidualQuantizedOutput:
         """Forward the multi-layer residual quantization.
 
@@ -335,8 +315,6 @@ class ResidualQuantized(nn.Module):
         Args:
             input (Tensor): input embeddings, shape (B, D).
             temperature (float): temperature for Gumbel-Softmax.
-            ema_mask (Tensor, optional): per-row EMA mask, shape (B,)
-                float. Passed through to each VectorQuantize layer.
 
         Returns:
             ResidualQuantizedOutput: (cluster_ids, quantized_embeddings,
@@ -357,10 +335,7 @@ class ResidualQuantized(nn.Module):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
 
-            quantized = layer(
-                residual, temperature=temperature,
-                ema_mask=ema_mask,
-            )
+            quantized = layer(residual, temperature=temperature)
             all_ids.append(quantized.ids)
 
             # Separate raw lookup: ``quantized.embeddings`` already applies

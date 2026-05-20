@@ -9,11 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single codebook vector quantization with EMA, Sinkhorn, and dead code restart."""
+"""Single codebook vector quantization with Sinkhorn uniform assignment."""
 
-from typing import List, Optional, Tuple
+from typing import Tuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -106,13 +105,14 @@ def _sinkhorn(
 
 
 class VectorQuantize(nn.Module):
-    """Single codebook vector quantization layer with EMA and Sinkhorn.
+    """Single codebook vector quantization layer.
 
     Maps continuous input vectors to the nearest codebook entry and returns
     the quantized embeddings, codebook indices, and commitment loss.
 
-    Supports EMA codebook updates, Sinkhorn uniform assignment, dead code
-    restart, and multiple distance metrics.
+    The codebook is updated via the commitment-loss gradient (no EMA path).
+    During training, Sinkhorn optimal-transport assignment is optionally
+    used to encourage uniform codebook utilization.
 
     Args:
         embed_dim (int): dimension of each codebook embedding.
@@ -123,18 +123,11 @@ class VectorQuantize(nn.Module):
             either GUMBEL_SOFTMAX or STE. Default: STE.
         distance_type (str): distance metric, 'l2' or 'cosine'.
             Default: 'l2'.
-        use_ema (bool): whether to use EMA to update codebook weights
-            instead of gradient descent. Default: True.
-        ema_decay (float): EMA decay coefficient. Default: 0.99.
-        restart_unused_codes (bool): whether to reset dead codes to random
-            batch samples. Only effective when use_ema=True. Default: True.
         use_sinkhorn (bool): whether to use Sinkhorn uniform assignment
             during training. Default: True.
         sinkhorn_iters (int): number of Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness parameter for
             exp(-cost * epsilon). Default: 10.0.
-        eps (float): numerical stability term for Laplace smoothing.
-            Default: 1e-5.
     """
 
     def __init__(
@@ -144,13 +137,9 @@ class VectorQuantize(nn.Module):
         commitment_weight: float = 0.25,
         forward_mode: QuantizeForwardMode = QuantizeForwardMode.STE,
         distance_type: str = "l2",
-        use_ema: bool = True,
-        ema_decay: float = 0.99,
-        restart_unused_codes: bool = True,
         use_sinkhorn: bool = True,
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
-        eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -158,26 +147,12 @@ class VectorQuantize(nn.Module):
         self.commitment_weight = commitment_weight
         self.forward_mode = forward_mode
         self.distance_type = distance_type
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
-        self.restart_unused_codes = restart_unused_codes
         self.use_sinkhorn = use_sinkhorn
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_epsilon = sinkhorn_epsilon
-        self.eps = eps
 
         self.embedding = nn.Embedding(n_embed, embed_dim)
         nn.init.kaiming_uniform_(self.embedding.weight)
-
-        # EMA buffers (only registered when use_ema=True)
-        if self.use_ema:
-            self.register_buffer(
-                "cluster_size_ema", torch.zeros(n_embed)
-            )
-            self.register_buffer(
-                "embed_ema", self.embedding.weight.detach().clone()
-            )
-
 
     @torch.no_grad()
     def _compute_distances(self, x: torch.Tensor) -> torch.Tensor:
@@ -205,7 +180,6 @@ class VectorQuantize(nn.Module):
                 f"choose from ('l2', 'cosine')"
             )
         return distances
-
 
     @torch.no_grad()
     def _find_nearest_embedding(
@@ -245,136 +219,10 @@ class VectorQuantize(nn.Module):
 
         return ids, distances
 
-
-    @torch.no_grad()
-    def _tile_with_noise(
-        self, x: torch.Tensor, target_n: int
-    ) -> torch.Tensor:
-        """Tile input vectors with small noise to reach target_n rows.
-
-        Used when batch size < n_embed and we need enough candidates
-        for dead code replacement.
-
-        Args:
-            x (Tensor): input vectors, shape (B, D).
-            target_n (int): target number of rows.
-
-        Returns:
-            Tensor: tiled vectors, shape (>=target_n, D).
-        """
-        B, embed_dim = x.shape
-        n_repeats = (target_n + B - 1) // B
-        std = x.new_ones(embed_dim) * 0.01 / np.sqrt(embed_dim)
-        x = x.repeat(n_repeats, 1)
-        x = x + torch.rand_like(x) * std
-        return x
-
-    @torch.no_grad()
-    def _update_ema_buffers(
-        self,
-        x: torch.Tensor,
-        ids: torch.Tensor,
-        ema_mask: Optional[torch.Tensor] = None,
-    ) -> None:
-        """EMA update cluster_size_ema and embed_ema buffers.
-
-        Includes distributed all_reduce synchronization and dead code
-        restart when restart_unused_codes=True.
-
-        Args:
-            x (Tensor): input vectors, shape (B, D).
-            ids (Tensor): assigned codebook indices, shape (B,).
-            ema_mask (Tensor, optional): per-row mask, shape (B,) float.
-                1.0 = contribute to EMA, 0.0 = skip. Used by mixed
-                mode to prevent recon rows from updating path2 EMA.
-        """
-        n_embed = self.n_embed
-        embed_dim = self.embed_dim
-
-        x_flat = x.reshape(-1, embed_dim)
-        ids_flat = ids.reshape(-1)
-
-        # Per-row EMA mask: zero out masked rows before accumulation so they
-        # contribute neither to cluster_size nor to vectors_sum.
-        if ema_mask is not None:
-            ema_mask_flat = ema_mask.reshape(-1)
-            x_for_sum = x_flat * ema_mask_flat.unsqueeze(1)
-            cluster_size = torch.zeros(
-                n_embed, dtype=x_flat.dtype, device=x_flat.device
-            ).index_add_(0, ids_flat, ema_mask_flat.to(x_flat.dtype))
-        else:
-            x_for_sum = x_flat
-            cluster_size = torch.bincount(
-                ids_flat, minlength=n_embed
-            ).to(x_flat.dtype)
-
-        vectors_sum = torch.zeros(
-            n_embed, embed_dim, dtype=x_flat.dtype, device=x_flat.device
-        ).index_add_(0, ids_flat, x_for_sum)
-
-        # One coalesced all_reduce instead of two: pack cluster_size as a
-        # final extra column on vectors_sum, reduce, then split back.
-        if dist.is_initialized():
-            packed = torch.cat([vectors_sum, cluster_size.unsqueeze(1)], dim=1)
-            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-            vectors_sum = packed[:, :embed_dim]
-            cluster_size = packed[:, embed_dim]
-
-        # EMA decay update
-        self.cluster_size_ema.mul_(self.ema_decay).add_(
-            cluster_size, alpha=1 - self.ema_decay
-        )
-        self.embed_ema.mul_(self.ema_decay).add_(
-            vectors_sum, alpha=1 - self.ema_decay
-        )
-
-        # Restart unused codes: only when there is something to restart.
-        # Skipping the randperm + broadcast every step is the common case.
-        if self.restart_unused_codes and (self.cluster_size_ema < 1).any():
-            n_vectors = x_flat.shape[0]
-            vectors_for_restart = x_flat
-            if n_vectors < n_embed:
-                vectors_for_restart = self._tile_with_noise(
-                    x_flat, n_embed
-                )
-            n_avail = vectors_for_restart.shape[0]
-            random_vectors = vectors_for_restart[
-                torch.randperm(n_avail, device=x.device)
-            ][:n_embed]
-
-            # Broadcast from rank 0 for consistency across GPUs
-            if dist.is_initialized():
-                dist.broadcast(random_vectors, 0)
-
-            usage = (self.cluster_size_ema.view(-1, 1) >= 1).float()
-            self.embed_ema.mul_(usage).add_(random_vectors * (1 - usage))
-            self.cluster_size_ema.mul_(usage.view(-1))
-            self.cluster_size_ema.add_(
-                torch.ones_like(self.cluster_size_ema) * (1 - usage).view(-1)
-            )
-
-    @torch.no_grad()
-    def _update_embedding_from_ema(self) -> None:
-        """Refresh codebook weights from EMA buffers.
-
-        Uses Laplace smoothing to avoid division by zero:
-            weight = embed_ema / ((n * (c_ema + eps)) / (n + K * eps))
-        """
-        n = self.cluster_size_ema.sum()
-        normalized_cluster_size = (
-            n * (self.cluster_size_ema + self.eps)
-            / (n + self.n_embed * self.eps)
-        )
-        self.embedding.weight.data.copy_(
-            self.embed_ema / normalized_cluster_size.reshape(-1, 1)
-        )
-
-
     def forward(
         self,
         x: torch.Tensor,
         temperature: float = 1.0,
-        ema_mask: Optional[torch.Tensor] = None,
     ) -> QuantizeOutput:
         """Forward the vector quantization layer.
 
@@ -382,16 +230,12 @@ class VectorQuantize(nn.Module):
             1. compute distances (L2 or cosine)
             2. if use_sinkhorn: z-score normalize + Sinkhorn -> argmax
                else: argmin
-            3. if use_ema: update EMA buffers + refresh embedding weights
-            4. compute differentiable embedding (STE or Gumbel-Softmax)
-            5. compute commitment loss
+            3. compute differentiable embedding (STE or Gumbel-Softmax)
+            4. compute commitment loss
 
         Args:
             x (Tensor): input vectors, shape (B, D).
             temperature (float): temperature for Gumbel-Softmax.
-            ema_mask (Tensor, optional): per-row EMA mask, shape (B,)
-                float. 1.0 = contribute to EMA update, 0.0 = skip.
-                Used by mixed mode path2 to exclude recon rows.
 
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids, loss).
@@ -399,13 +243,9 @@ class VectorQuantize(nn.Module):
         # Step 1-2: find nearest codebook entry
         ids, distances = self._find_nearest_embedding(x)
 
-        # Step 3: EMA codebook update (training only)
-        if self.training and self.use_ema:
-            self._update_ema_buffers(x, ids, ema_mask)
-
-        # Step 4: compute differentiable embedding
-        # Single embedding lookup feeds both the differentiable output and
-        # the commitment loss (Gumbel takes a different path entirely).
+        # Step 3: differentiable embedding. A single embedding lookup
+        # feeds both the differentiable output and the commitment loss;
+        # Gumbel takes a separate path that combines all codebook entries.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             weights = _gumbel_softmax_sample(
                 -distances, temperature=temperature, hard=True
@@ -424,17 +264,11 @@ class VectorQuantize(nn.Module):
             quantized_for_loss = self.embedding(ids)
             emb = quantized_for_loss
 
-        # Step 4 continued: refresh weights from EMA (after embedding lookup)
-        if self.training and self.use_ema:
-            self._update_embedding_from_ema()
-
-        # Step 5: commitment loss
+        # Step 4: commitment loss — codebook is gradient-updated, so both
+        # the encoder-side (e_latent_loss) and codebook-side (q_latent_loss)
+        # terms always contribute.
         e_latent_loss = F.mse_loss(x, quantized_for_loss.detach())
-        if self.use_ema:
-            # EMA mode: codebook not updated via gradient, no q_latent_loss
-            loss = self.commitment_weight * e_latent_loss
-        else:
-            q_latent_loss = F.mse_loss(quantized_for_loss, x.detach())
-            loss = self.commitment_weight * e_latent_loss + q_latent_loss
+        q_latent_loss = F.mse_loss(quantized_for_loss, x.detach())
+        loss = self.commitment_weight * e_latent_loss + q_latent_loss
 
         return QuantizeOutput(embeddings=emb, ids=ids, loss=loss)

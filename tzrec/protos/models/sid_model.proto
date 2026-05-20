@@ -3,14 +3,6 @@ package tzrec.protos;
 
 import "google/protobuf/struct.proto";
 
-message EmaConfig {
-    // EMA decay coefficient.
-    optional float decay = 1 [default = 0.99];
-    // Reset dead codes by replacing inactive codebook entries with
-    // random samples from the current batch.
-    optional bool restart_unused_codes = 2 [default = true];
-}
-
 message SinkhornConfig {
     // Number of Sinkhorn iterations.
     optional uint32 iters = 1 [default = 5];
@@ -57,8 +49,6 @@ message SidRqvae {
     optional bool kmeans_init = 13 [default = true];
 
     // === Optional sub-module configs ===
-    // EMA codebook update (defaults to enabled with decay=0.99 when unset).
-    optional EmaConfig ema_config = 14;
     // Sinkhorn uniform assignment (defaults to enabled with
     // iters=5, epsilon=10.0 when unset).
     optional SinkhornConfig sinkhorn_config = 15;
