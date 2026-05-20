@@ -161,7 +161,7 @@ def export_model_normal(
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
@@ -711,7 +711,7 @@ def export_rtp_model(
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
     dataloader = create_dataloader(
@@ -1160,8 +1160,8 @@ def split_model(
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
-        features=cast(List[BaseFeature], model._features),
-        feature_groups=model._feature_groups,
+        features=cast(List[BaseFeature], model.features),
+        feature_groups=model.feature_groups,
     )
     meta_info = {
         "seq_tensor_names": seq_tensor_names,
