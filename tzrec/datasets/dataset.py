@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import random
 from collections import OrderedDict
@@ -209,7 +210,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Launch sampler cluster and server."""
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
-            sampler_config = getattr(self._data_config, sampler_type)
+            # Deep-copy so any in-place rewrites below don't mutate
+            # `self._data_config`'s sampler sub-message.
+            sampler_config = copy.deepcopy(getattr(self._data_config, sampler_type))
 
             # Multi-positive sampling: when the sampler's item_id_field is
             # itself a sequence-positive train column, the per-row outer list
@@ -232,6 +235,27 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     else f
                     for f in self.input_fields
                 ]
+
+            # Resolve bare candidate sub-feature names in `attr_fields` against
+            # `sampler_fields` (flattened parquet schema), using the prefix
+            # carried by a qualified `item_id_field` (e.g. "cand_seq__video_id"
+            # -> "cand_seq__"). When `item_id_field` is itself bare
+            # (DSSM/MIND/TDM top-level case), `seq_prefix` is empty and the
+            # loop is a no-op -- existing configs are unchanged.
+            if hasattr(sampler_config, "item_id_field") and sampler_config.HasField(
+                "item_id_field"
+            ):
+                id_field = sampler_config.item_id_field
+                field_names = {f.name for f in sampler_fields}
+                if "__" in id_field and id_field in field_names:
+                    seq_prefix = id_field.split("__", 1)[0] + "__"
+                    if hasattr(sampler_config, "attr_fields"):
+                        sampler_config.attr_fields[:] = [
+                            seq_prefix + a
+                            if a not in field_names and seq_prefix + a in field_names
+                            else a
+                            for a in sampler_config.attr_fields
+                        ]
 
             # pyre-ignore [16]
             self._sampler = BaseSampler.create_class(sampler_config.__class__.__name__)(
