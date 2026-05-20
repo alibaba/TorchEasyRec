@@ -29,12 +29,14 @@ class GatherLayer(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """All-gather ``x`` across ranks, returning one tensor per rank."""
         output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
         dist.all_gather(output, x)
         return tuple(output)
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor) -> torch.Tensor:
+        """Sum-reduce the per-rank grads and return this rank's slice."""
         all_gradients = torch.stack(grads)
         dist.all_reduce(all_gradients)
         return all_gradients[dist.get_rank()]

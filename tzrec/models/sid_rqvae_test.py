@@ -217,7 +217,7 @@ class SidRqvaeTest(unittest.TestCase):
         )
 
         predictions = model.predict(batch)
-        losses = model.loss(predictions, batch)
+        model.loss(predictions, batch)
 
         # clip_loss should be 0 (no clip rows)
         self.assertEqual(predictions["clip_loss"].item(), 0.0)
@@ -247,7 +247,7 @@ class SidRqvaeTest(unittest.TestCase):
         )
 
         predictions = model.predict(batch)
-        losses = model.loss(predictions, batch)
+        model.loss(predictions, batch)
 
         # recon_loss should be 0 (no recon rows)
         self.assertEqual(predictions["recon_loss"].item(), 0.0)

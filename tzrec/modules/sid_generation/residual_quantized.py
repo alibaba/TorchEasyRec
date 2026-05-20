@@ -331,7 +331,7 @@ class ResidualQuantized(nn.Module):
         aggregated_quants = torch.zeros_like(input)
 
         # Step 2: per-layer residual quantization
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
 
