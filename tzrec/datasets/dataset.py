@@ -169,14 +169,21 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         # Candidate-side sequence state. When `item_id_field` is a sequence
         # input (top-level `sequence_id_feature` OR grouped sequence
         # sub-feature input), `_sampler_seq_delim` is the parent feature's
-        # `sequence_delim`. For grouped sub-features only, `_sampler_seq_prefix`
-        # is the flatten prefix `f"{sequence_name}{_underline}"` (used to
-        # resolve bare `attr_fields` to the qualified parquet column name).
-        # For top-level `sequence_id_feature` (no flatten), the prefix stays
-        # empty and the resolve is a no-op. All sourced from the matching
-        # `BaseFeature` via `sequence_input_names`, the authoritative input.
+        # `sequence_delim`. For grouped sub-features only:
+        #   * `_sampler_seq_prefix` is the flatten prefix
+        #     `f"{sequence_name}{_underline}"`.
+        #   * `_sampler_seq_inputs` is the set of all candidate-side
+        #     sequence input names (union of `sequence_input_names` across
+        #     features that share `sequence_name` with item_id_field's
+        #     parent). Used to gate bare-attr resolution: an attr is
+        #     prefixed iff `prefix + a` is a known candidate sequence
+        #     input. Avoids false positives on top-level item-side attrs
+        #     (e.g. lookup_feature's `cat_map` whose sequence_fields
+        #     exclude it). Sourced from feature configs only -- no
+        #     parquet-schema dependency.
         self._sampler_seq_delim: str = ""
         self._sampler_seq_prefix: str = ""
+        self._sampler_seq_inputs: set = set()
         if self._sampler_item_id_field is not None:
             for feature in features:
                 if (
@@ -190,6 +197,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         self._sampler_seq_prefix = (
                             feature.sequence_name + feature._underline
                         )
+                        seq_name = feature.sequence_name
+                        for f in features:
+                            if f.is_grouped_sequence and f.sequence_name == seq_name:
+                                self._sampler_seq_inputs.update(f.sequence_input_names)
                     break
 
         self._fg_mode = data_config.fg_mode
@@ -221,28 +232,19 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sampler_fields = self.input_fields
             if self._sampler_seq_delim:
                 if self._sampler_seq_prefix:
-                    # Grouped sequence: resolve bare candidate sub-feature
-                    # names against the flattened schema using the
-                    # authoritative parent prefix from feature configs
-                    # (RTP-safe, no name string split). Literal match wins,
-                    # so:
-                    #   - already-qualified attrs (e.g. "cand_seq__video_id")
-                    #     stay as-is;
-                    #   - bare candidate sub-features (e.g. "video_id") get
-                    #     prefixed to "cand_seq__video_id";
-                    #   - top-level item-side attrs in the same sampler
-                    #     config (e.g. lookup_feature's `cat_map` whose
-                    #     sequence_fields exclude it) stay as-is because
-                    #     they literally exist in the parquet schema.
-                    # Must run *before* the outer-list strip so `consumed`
-                    # carries resolved names. Top-level `sequence_id_feature`
-                    # skips this -- its attr_fields are bare top-level
-                    # columns.
-                    field_names = {f.name for f in sampler_fields}
+                    # Grouped sequence: prefix a bare attr iff `prefix + a`
+                    # is a known candidate-side sequence input (from
+                    # feature configs). Already-qualified attrs land
+                    # outside the candidate input set (their `prefix + a`
+                    # double-prefixes), so they stay as-is. Top-level
+                    # item-side attrs (e.g. lookup_feature's `cat_map`
+                    # whose sequence_fields exclude it) likewise stay
+                    # as-is. RTP-safe, no name string split, no parquet-
+                    # schema dependency. Must run *before* the outer-list
+                    # strip so `consumed` carries resolved names.
                     sampler_config.attr_fields[:] = [
                         self._sampler_seq_prefix + a
-                        if a not in field_names
-                        and self._sampler_seq_prefix + a in field_names
+                        if self._sampler_seq_prefix + a in self._sampler_seq_inputs
                         else a
                         for a in sampler_config.attr_fields
                     ]
