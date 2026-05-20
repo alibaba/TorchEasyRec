@@ -166,27 +166,31 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Map input_name -> sequence_delim for true sequence inputs only
-        # (via feature.sequence_input_names). Excludes non-sequence
-        # sub-inputs of grouped sequence_feature.
-        self._seq_field_delims: Dict[str, str] = {}
-        for feature in features:
-            if not feature.sequence_delim:
-                continue
-            seq_inputs = set(feature.sequence_input_names)
-            for input_name in feature.inputs:
-                if input_name not in seq_inputs:
-                    continue
-                existing = self._seq_field_delims.get(input_name)
-                if existing is not None and existing != feature.sequence_delim:
-                    logger.warning(
-                        "Conflicting sequence_delim for input '%s': %r vs %r; "
-                        "latter wins.",
-                        input_name,
-                        existing,
-                        feature.sequence_delim,
-                    )
-                self._seq_field_delims[input_name] = feature.sequence_delim
+        # Candidate-side sequence state. When `item_id_field` is a sequence
+        # input (top-level `sequence_id_feature` OR grouped sequence
+        # sub-feature input), `_sampler_seq_delim` is the parent feature's
+        # `sequence_delim`. For grouped sub-features only, `_sampler_seq_prefix`
+        # is the flatten prefix `f"{sequence_name}{_underline}"` (used to
+        # resolve bare `attr_fields` to the qualified parquet column name).
+        # For top-level `sequence_id_feature` (no flatten), the prefix stays
+        # empty and the resolve is a no-op. All sourced from the matching
+        # `BaseFeature` via `sequence_input_names`, the authoritative input.
+        self._sampler_seq_delim: str = ""
+        self._sampler_seq_prefix: str = ""
+        if self._sampler_item_id_field is not None:
+            for feature in features:
+                if (
+                    feature.sequence_delim
+                    and self._sampler_item_id_field in feature.sequence_input_names
+                ):
+                    self._sampler_seq_delim = feature.sequence_delim
+                    if feature.is_grouped_sequence:
+                        # pyre-ignore [16]: BaseFeature._underline is intentional;
+                        # avoids re-deriving the "_" vs "__" choice ourselves.
+                        self._sampler_seq_prefix = (
+                            feature.sequence_name + feature._underline
+                        )
+                    break
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
@@ -214,48 +218,51 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             # `self._data_config`'s sampler sub-message.
             sampler_config = copy.deepcopy(getattr(self._data_config, sampler_type))
 
-            # Multi-positive sampling: when the sampler's item_id_field is
-            # itself a sequence-positive train column, the per-row outer list
-            # on every item-side attr is the positive-grouping container, not
-            # a multi-value field. Strip the outer list so the sampler sees
-            # the pool's native scalar storage and _to_arrow_array emits
-            # scalar negs directly (avoiding the multival_sep split that
-            # would wrap each scalar in a 1-elem list).
             sampler_fields = self.input_fields
-            if (
-                self._sampler_item_id_field is not None
-                and self._sampler_item_id_field in self._seq_field_delims
-            ):
+            if self._sampler_seq_delim:
+                if self._sampler_seq_prefix:
+                    # Grouped sequence: resolve bare candidate sub-feature
+                    # names against the qualified flattened schema using
+                    # the authoritative parent prefix from feature configs
+                    # (RTP-safe, no name string split). Has to run *before*
+                    # the outer-list strip so `consumed` carries resolved
+                    # names. Top-level `sequence_id_feature` skips this --
+                    # its attr_fields are already bare/qualified-as-itself.
+                    field_names = {f.name for f in sampler_fields}
+                    sampler_config.attr_fields[:] = [
+                        self._sampler_seq_prefix + a
+                        if a not in field_names
+                        and self._sampler_seq_prefix + a in field_names
+                        else a
+                        for a in sampler_config.attr_fields
+                    ]
+
+                # Multi-positive sampling: when the sampler's item_id_field
+                # is itself a sequence-positive train column, the per-row
+                # outer list on the candidate sequence's item-side attrs is
+                # the positive-grouping container. Strip the outer list
+                # only for the candidate-sequence attrs in `attr_fields`
+                # (filtered by `_sampler_seq_prefix`; top-level sequence
+                # has prefix="" so all attr_fields match). Excluded:
+                # top-level item-side attrs from the same lookup feature
+                # whose outer list is multi-value (e.g. `cat_map`); other
+                # grouped sequences' sub-features (e.g. uih_seq__*); and
+                # the `item_id_field` itself -- the sampler never inspects
+                # their type.
+                consumed = {
+                    a
+                    for a in sampler_config.attr_fields
+                    if a.startswith(self._sampler_seq_prefix)
+                }
                 sampler_fields = [
                     pa.field(f.name, f.type.value_type)
                     if (
-                        f.name in self._seq_field_delims
+                        f.name in consumed
                         and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
                     )
                     else f
                     for f in self.input_fields
                 ]
-
-            # Resolve bare candidate sub-feature names in `attr_fields` against
-            # `sampler_fields` (flattened parquet schema), using the prefix
-            # carried by a qualified `item_id_field` (e.g. "cand_seq__video_id"
-            # -> "cand_seq__"). When `item_id_field` is itself bare
-            # (DSSM/MIND/TDM top-level case), `seq_prefix` is empty and the
-            # loop is a no-op -- existing configs are unchanged.
-            if hasattr(sampler_config, "item_id_field") and sampler_config.HasField(
-                "item_id_field"
-            ):
-                id_field = sampler_config.item_id_field
-                field_names = {f.name for f in sampler_fields}
-                if "__" in id_field and id_field in field_names:
-                    seq_prefix = id_field.split("__", 1)[0] + "__"
-                    if hasattr(sampler_config, "attr_fields"):
-                        sampler_config.attr_fields[:] = [
-                            seq_prefix + a
-                            if a not in field_names and seq_prefix + a in field_names
-                            else a
-                            for a in sampler_config.attr_fields
-                        ]
 
             # pyre-ignore [16]
             self._sampler = BaseSampler.create_class(sampler_config.__class__.__name__)(
@@ -415,7 +422,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             input_data,
             self._sampler_item_id_field,
             self._sampler_user_id_field,
-            self._seq_field_delims,
+            self._sampler_seq_delim,
         )
         sampled = self._sampler.get(sampler_input)
 
@@ -497,12 +504,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if k not in input_data:
                 input_data[k] = v
                 continue
-            seq_delim = self._seq_field_delims.get(k)
-            if seq_delim is None:
+            if not self._sampler_seq_delim:
                 input_data[k] = pa.concat_arrays([input_data[k], v])
                 continue
             combined, pl = combine_negs_to_candidate_sequence(
-                input_data[k], v, seq_delim
+                input_data[k], v, self._sampler_seq_delim
             )
             input_data[k] = combined
             if k == prefer_key:

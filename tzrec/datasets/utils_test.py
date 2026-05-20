@@ -210,7 +210,7 @@ class DatasetUtilsTest(unittest.TestCase):
     @parameterized.expand(
         [
             # (name, input_data, item_id_field, user_id_field,
-            #  seq_field_delims, expected_output)
+            #  seq_delim, expected_output)
             (
                 # NegativeSampler-style: no user_id_field; item_id is
                 # delimited string; gets flattened.
@@ -218,7 +218,7 @@ class DatasetUtilsTest(unittest.TestCase):
                 {"item_id": pa.array(["1;2", "3"]), "label": pa.array([1, 0])},
                 "item_id",
                 None,
-                {"item_id": ";"},
+                ";",
                 {"item_id": ["1", "2", "3"], "label": [1, 0]},
             ),
             (
@@ -231,7 +231,7 @@ class DatasetUtilsTest(unittest.TestCase):
                 },
                 "item_id",
                 "user_id",
-                {"item_id": ";"},
+                ";",
                 {"item_id": [1, 2, 3], "user_id": ["u0", "u0", "u1"]},
             ),
             (
@@ -244,16 +244,16 @@ class DatasetUtilsTest(unittest.TestCase):
                 },
                 "item_id",
                 "user_id",
-                {"item_id": ";"},
+                ";",
                 {"item_id": [1, 2, 3], "user_id": ["u0", "u1", "u2"]},
             ),
             (
-                # item_id_field has no seq_delim entry -> pass through.
-                "item_id_not_in_seq_field_delims",
+                # item_id_field is a top-level scalar -> seq_delim="" -> pass through.
+                "empty_seq_delim_passthrough",
                 {"item_id": pa.array(["1", "2"])},
                 "item_id",
                 None,
-                {},
+                "",
                 {"item_id": ["1", "2"]},
             ),
             (
@@ -263,7 +263,7 @@ class DatasetUtilsTest(unittest.TestCase):
                 {"a": pa.array([1, 2])},
                 None,
                 None,
-                {},
+                "",
                 {"a": [1, 2]},
             ),
         ]
@@ -274,7 +274,7 @@ class DatasetUtilsTest(unittest.TestCase):
         input_data,
         item_id_field,
         user_id_field,
-        seq_field_delims,
+        seq_delim,
         expected_output,
     ):
         # Snapshot input_data so we can verify the function didn't mutate it.
@@ -284,7 +284,7 @@ class DatasetUtilsTest(unittest.TestCase):
             input_data,
             item_id_field=item_id_field,
             user_id_field=user_id_field,
-            seq_field_delims=seq_field_delims,
+            seq_delim=seq_delim,
         )
 
         # Contract 1: output equals expected (per-column pylist compare).

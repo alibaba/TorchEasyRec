@@ -582,31 +582,31 @@ def build_sampler_input(
     input_data: Dict[str, pa.Array],
     item_id_field: Optional[str],
     user_id_field: Optional[str],
-    seq_field_delims: Dict[str, str],
+    seq_delim: str,
 ) -> Dict[str, pa.Array]:
     """Shallow-copy input_data with item_id (and user_id) flattened for the sampler.
 
-    When `item_id_field` is a sequence_id_feature, per-row positives
-    (delimited string or list array) are flattened to 1D and
+    When `item_id_field` is a grouped sequence sub-feature, per-row
+    positives (delimited string or list array) are flattened to 1D and
     `user_id_field` (if any) is expanded by per-row positive count.
-    Scalar item_id or unconfigured seq_delim falls through unchanged.
-    The caller's `input_data` is not mutated.
+    Scalar item_id (`seq_delim=""`) falls through unchanged. The caller's
+    `input_data` is not mutated.
 
     Args:
         input_data: per-row input column dict.
         item_id_field: sampler config's `item_id_field`, or None.
         user_id_field: sampler config's `user_id_field`, or None.
-        seq_field_delims: input_name -> sequence_delim mapping.
+        seq_delim: candidate sequence's `sequence_delim`, or "" when
+            `item_id_field` is a top-level scalar feature.
 
     Returns:
         A new shallow-copy dict with item_id flattened and user_id
         expanded when both apply.
     """
     sampler_input = dict(input_data)
-    if item_id_field is None or item_id_field not in seq_field_delims:
+    if item_id_field is None or not seq_delim:
         return sampler_input
 
-    seq_delim = seq_field_delims[item_id_field]
     raw = input_data[item_id_field]
     if pa.types.is_string(raw.type) or pa.types.is_large_string(raw.type):
         pos_lists = pc.split_pattern(raw, seq_delim)
