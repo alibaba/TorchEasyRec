@@ -13,7 +13,7 @@ import copy
 import os
 import random
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -166,35 +166,27 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Candidate-side sequence state for sampler I/O. HSTUMatch writes
-        # bare sub-feature names in `attr_fields`; the alias map rewrites
-        # them to the flattened parquet columns (`<seq>__<sub>`) the
-        # sampler pool actually carries. Prefix derived from
-        # `feature._underline` (not "__" literal) so RTP-safe.
+        # When item_id_field is a grouped sequence sub-feature (HSTUMatch's
+        # candidate side), attr_fields are uniformly sequence too -- item-
+        # side per-positive, never mixed with top-level scalars. So a
+        # single delim + prefix capture the entire sequence path; no
+        # per-attr branching. Prefix uses feature._underline (not "__"
+        # literal) so RTP-safe. Top-level sequence_id_feature as
+        # item_id_field is rejected: only grouped is supported.
         self._sampler_seq_delim: str = ""
-        self._sampler_seq_inputs: Set[str] = set()
-        self._sampler_bare_attr_to_sequence_input: Dict[str, str] = {}
+        self._sampler_seq_prefix: str = ""
         if self._sampler_item_id_field is not None:
             for feature in features:
-                if not feature.sequence_delim:
-                    continue
                 if self._sampler_item_id_field not in feature.sequence_input_names:
                     continue
+                assert feature.is_grouped_sequence, (
+                    f"item_id_field '{self._sampler_item_id_field}' is a "
+                    f"sequence input but its matching feature is not a "
+                    f"grouped sequence; only grouped sequence sub-features "
+                    f"are supported as item_id_field."
+                )
                 self._sampler_seq_delim = feature.sequence_delim
-                if feature.is_grouped_sequence:
-                    seq_name = feature.sequence_name
-                    prefix = seq_name + feature._underline
-                    self._sampler_seq_inputs = {
-                        inp
-                        for f in features
-                        if f.is_grouped_sequence and f.sequence_name == seq_name
-                        for inp in f.sequence_input_names
-                    }
-                    self._sampler_bare_attr_to_sequence_input = {
-                        inp[len(prefix) :]: inp for inp in self._sampler_seq_inputs
-                    }
-                else:
-                    self._sampler_seq_inputs = set(feature.sequence_input_names)
+                self._sampler_seq_prefix = feature.sequence_name + feature._underline
                 break
 
         self._fg_mode = data_config.fg_mode
@@ -221,35 +213,31 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
 
-            # Resolve bare sub-feature `attr_fields` against the grouped-
-            # sequence flatten prefix when applicable. Bare names (HSTUMatch
-            # convention, `attr_fields: "video_id"`) map to the qualified
-            # parquet column (`cand_seq__video_id`); already-qualified
-            # names and unrelated top-level item-side attrs pass through
-            # the alias map's `.get(a, a)` fallthrough. Deep-copy so the
-            # in-place mutation here doesn't leak back to `self._data_config`.
-            if self._sampler_bare_attr_to_sequence_input:
+            # Prepend the candidate sequence's flatten prefix to bare
+            # `attr_fields` entries (HSTUMatch's `"video_id"` becomes the
+            # qualified parquet column `"cand_seq__video_id"`). Deep-copy
+            # so the in-place mutation doesn't leak back to
+            # `self._data_config`.
+            if self._sampler_seq_prefix:
                 sampler_config = copy.deepcopy(sampler_config)
                 sampler_config.attr_fields[:] = [
-                    self._resolve_sampler_attr_field(a)
-                    for a in sampler_config.attr_fields
+                    self._sampler_seq_prefix + a for a in sampler_config.attr_fields
                 ]
 
-            # Multi-positive sampling: when the sampler's item_id_field is
-            # itself a sequence-positive train column, the per-row outer
-            # list on every candidate-sequence attr is the positive-
-            # grouping container, not a multi-value field. Strip the outer
-            # list so the sampler sees the pool's native scalar storage and
-            # _to_arrow_array emits scalar negs directly. Filter is the
-            # candidate-sequence inputs set, so unrelated grouped sequences
-            # (e.g. uih_seq__*) and non-sequence item-side attrs from the
-            # same lookup feature (e.g. `cat_map`) are left untouched.
+            # Multi-positive sampling: when item_id_field is a candidate-
+            # sequence sub-feature, the per-row outer list on every
+            # attr_fields column is the positive-grouping container, not a
+            # multi-value field. Strip that outer list so the sampler sees
+            # the pool's native scalar storage and _to_arrow_array emits
+            # scalar negs directly. item_id_field is one of attr_fields in
+            # every real sampler config, so no separate union is needed.
             sampler_fields = self.input_fields
-            if self._sampler_seq_inputs:
+            if self._sampler_seq_delim:
+                sampler_attrs = set(sampler_config.attr_fields)
                 sampler_fields = [
                     pa.field(f.name, f.type.value_type)
                     if (
-                        f.name in self._sampler_seq_inputs
+                        f.name in sampler_attrs
                         and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
                     )
                     else f
@@ -399,20 +387,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         batch.checkpoint_info = checkpoint_info
         return batch
 
-    def _resolve_sampler_attr_field(self, attr_field: str) -> str:
-        """Translate a sampler `attr_field` from the user-facing namespace.
-
-        For grouped-sequence candidate configs (e.g. HSTUMatch), the
-        user-facing `attr_fields` entry can be a bare sub-feature name
-        (e.g. ``"video_id"``); we resolve it to the flattened parquet
-        column the sampler pool actually carries (e.g.
-        ``"cand_seq__video_id"``). For already-qualified names and for
-        unrelated top-level item-side attrs (e.g. lookup_feature's
-        ``"cat_map"``), the alias map has no entry and the input is
-        returned unchanged.
-        """
-        return self._sampler_bare_attr_to_sequence_input.get(attr_field, attr_field)
-
     def _apply_negative_sampler(
         self,
         input_data: Dict[str, pa.Array],
@@ -496,11 +470,13 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     ) -> Optional[np.ndarray]:
         """Merge sampler outputs into input_data in place; return per-row pos lengths.
 
-        Per sampled key: new keys are assigned as-is; candidate-sequence
-        keys (those in `_sampler_seq_inputs`) use the block-suffix
-        combine; others fall back to `pa.concat_arrays`. `pos_lengths` is
-        sourced from the configured item_id_field combine; returns None
-        if no candidate-sequence field was merged.
+        Per sampled key: new keys are assigned as-is. When
+        `_sampler_seq_delim` is empty (scalar item_id_field), existing
+        keys are concatenated via `pa.concat_arrays`. When it's set
+        (candidate-sequence item_id_field), `attr_fields` are uniformly
+        sequence so every existing key goes through the block-suffix
+        combine. `pos_lengths` is sourced from the configured
+        item_id_field combine; returns None when not in sequence mode.
         """
         # Prefer item_id_field; fall back to first-seen seq-field if absent.
         prefer_key = self._sampler_item_id_field
@@ -510,7 +486,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if k not in input_data:
                 input_data[k] = v
                 continue
-            if k not in self._sampler_seq_inputs:
+            if not self._sampler_seq_delim:
                 input_data[k] = pa.concat_arrays([input_data[k], v])
                 continue
             combined, pl = combine_negs_to_candidate_sequence(

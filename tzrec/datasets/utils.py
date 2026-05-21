@@ -586,8 +586,7 @@ def build_sampler_input(
 ) -> Dict[str, pa.Array]:
     """Shallow-copy input_data with item_id (and user_id) flattened for the sampler.
 
-    When `item_id_field` is a sequence input (top-level
-    `sequence_id_feature` or grouped sequence sub-feature), per-row
+    When `item_id_field` is a grouped sequence sub-feature, per-row
     positives (delimited string or list array) are flattened to 1D and
     `user_id_field` (if any) is expanded by per-row positive count.
     Scalar item_id (`seq_delim=""`) falls through unchanged. The
