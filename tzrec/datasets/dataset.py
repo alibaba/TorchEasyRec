@@ -173,14 +173,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             for feature in features:
                 if self._sampler_item_id_field not in feature.sequence_input_names:
                     continue
-                assert feature.is_grouped_sequence, (
-                    f"item_id_field '{self._sampler_item_id_field}' is a "
-                    f"sequence input but its matching feature is not a "
-                    f"grouped sequence; only grouped sequence sub-features "
-                    f"are supported as item_id_field."
-                )
+                if not feature.is_grouped_sequence:
+                    raise ValueError(
+                        f"item_id_field '{self._sampler_item_id_field}' is a "
+                        "sequence input but its matching feature is not a "
+                        "grouped sequence; only grouped sequence sub-features "
+                        "are supported as item_id_field."
+                    )
                 self._sampler_seq_delim = feature.sequence_delim
-                self._sampler_seq_prefix = feature.sequence_name + feature._underline
+                self._sampler_seq_prefix = feature.grouped_sequence_prefix
                 break
 
         self._fg_mode = data_config.fg_mode
