@@ -14,6 +14,7 @@ jobs:
   ci-test:
     # `container:` would inject -v /var/run/docker.sock which DSW authZ blocks here.
     runs-on: tzrec-ppu-runner
+    timeout-minutes: 1440
     steps:
       - name: FetchCommit
         uses: actions/checkout@v4
