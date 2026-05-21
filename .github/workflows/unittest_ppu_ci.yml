@@ -33,4 +33,4 @@ jobs:
             -v "$WORK_ROOT/_temp/_github_home":/github/home \
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-test:1.1-ppu \
-            bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test.sh'
+            bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
