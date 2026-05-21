@@ -219,9 +219,6 @@ class HSTUMatchTest(unittest.TestCase):
         hstu = _build_model(device=device)
         hstu.set_kernel(kernel)
         batch = _build_batch(device=device)
-        # Stash the inner item_tower before the graph_type branch wraps
-        # `hstu` -- the wrapper doesn't expose `item_tower`.
-        item_tower = hstu.item_tower
 
         if graph_type == TestGraphType.JIT_SCRIPT:
             hstu_wrapped = create_test_model(hstu, graph_type)
@@ -240,9 +237,9 @@ class HSTUMatchTest(unittest.TestCase):
         # Scalar-view contract: set_is_inference(True) flips item_tower
         # to the scalar export view (bare sub-feature names).
         hstu.set_is_inference(True)
-        self.assertTrue(item_tower._is_inference)
-        scalar_features = item_tower.features
-        scalar_feature_groups = item_tower.feature_groups
+        self.assertTrue(hstu.item_tower._is_inference)
+        scalar_features = hstu.item_tower.features
+        scalar_feature_groups = hstu.item_tower.feature_groups
         self.assertEqual(scalar_features[0].name, "video_id")
         self.assertFalse(scalar_features[0].is_grouped_sequence)
         self.assertEqual(scalar_feature_groups[0].feature_names, ["video_id"])

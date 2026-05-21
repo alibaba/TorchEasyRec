@@ -285,11 +285,6 @@ def export_model_normal(
         pipeline_config = copy.copy(pipeline_config)
         pipeline_config.ClearField("feature_configs")
         pipeline_config.feature_configs.extend(feature_configs)
-        # Persist the model's current feature_groups so towers with a
-        # view-specific group set (e.g. HSTUMatchItemTower scalar view)
-        # don't ship stale training-view group names.
-        pipeline_config.model_config.ClearField("feature_groups")
-        pipeline_config.model_config.feature_groups.extend(model.feature_groups)
         config_util.save_message(
             pipeline_config, os.path.join(save_dir, "pipeline.config")
         )
