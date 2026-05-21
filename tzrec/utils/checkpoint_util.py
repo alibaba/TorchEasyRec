@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import re
+import tempfile
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
@@ -490,36 +491,41 @@ def _redistribute_mch_state(model: nn.Module) -> None:
 _INPUT_TILE_USER_SEGMENTS = frozenset({"ebc", "mc_ebc", "ec_dict", "mc_ec_dict"})
 
 
-def _link_dynamicemb_input_tile_user_paths(dynamicemb_path: str) -> None:
-    """Symlink user-side dynamicemb dirs added by INPUT_TILE=3 export.
+def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) -> str:
+    """Create a local symlink view for INPUT_TILE=3 dynamicemb loading.
 
-    Each entry under ``dynamicemb_path`` is a dotted module path. For
-    every entry containing a segment in ``_INPUT_TILE_USER_SEGMENTS``,
-    create a sibling symlink whose matching segment carries a ``_user``
-    suffix so DynamicEmbLoad can resolve the twin path used by the
-    INPUT_TILE=3 model.
+    The training checkpoint has non-user module paths, while INPUT_TILE=3
+    export adds user-side twins. Build aliases in a temporary local directory
+    instead of mutating the checkpoint directory.
     """
+    entries = []
     for entry in os.listdir(dynamicemb_path):
         full_path = os.path.join(dynamicemb_path, entry)
-        if os.path.islink(full_path) or not os.path.isdir(full_path):
+        if not os.path.isdir(full_path):
             continue
+        entries.append((entry, full_path))
+        link_path = os.path.join(view_path, entry)
+        if not os.path.lexists(link_path):
+            os.symlink(full_path, link_path, target_is_directory=True)
+
+    for entry, full_path in entries:
         segs = entry.split(".")
+        if any(seg.endswith("_user") for seg in segs):
+            continue
         for i, seg in enumerate(segs):
             if seg not in _INPUT_TILE_USER_SEGMENTS:
                 continue
             user_segs = list(segs)
             user_segs[i] = f"{seg}_user"
             user_entry = ".".join(user_segs)
-            user_path = os.path.join(dynamicemb_path, user_entry)
+            user_path = os.path.join(view_path, user_entry)
             if os.path.lexists(user_path):
                 continue
-            try:
-                os.symlink(entry, user_path)
-                logger.info(
-                    f"created INPUT_TILE=3 dynamicemb symlink {user_entry} -> {entry}"
-                )
-            except OSError as e:
-                logger.warning(f"failed to create dynamicemb symlink {user_entry}: {e}")
+            os.symlink(full_path, user_path, target_is_directory=True)
+            logger.info(
+                f"created INPUT_TILE=3 dynamicemb alias {user_entry} -> {entry}"
+            )
+    return view_path
 
 
 def restore_model(
@@ -603,26 +609,33 @@ def restore_model(
             # Training never sets INPUT_TILE, but exporting with
             # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
             # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) that
-            # share dynamic-embedding tables with their non-user
-            # counterparts. The checkpoint only has the non-user paths,
-            # so DynamicEmbLoad raises "can't find path to load" for
-            # the user-side ones. Symlink the missing twin paths.
+            # share dynamic-embedding tables with their non-user counterparts.
+            # Build a local symlink view instead of mutating the checkpoint
+            # directory, which may be read-only or remote-mounted.
             input_tile = os.environ.get("INPUT_TILE", "")
+            dynamicemb_load_path = dynamicemb_path
+            dynamicemb_view = None
             if input_tile.startswith("3"):
-                if int(os.environ.get("RANK", 0)) == 0:
-                    _link_dynamicemb_input_tile_user_paths(dynamicemb_path)
-                if dist.is_initialized() and dist.get_world_size() > 1:
-                    dist.barrier()
+                dynamicemb_view = tempfile.TemporaryDirectory(
+                    prefix=f"tzrec_dynamicemb_rank{os.environ.get('RANK', '0')}_"
+                )
+                dynamicemb_load_path = _make_dynamicemb_input_tile_user_view(
+                    dynamicemb_path, dynamicemb_view.name
+                )
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding..."
             )
-            DynamicEmbLoad(
-                dynamicemb_path,
-                model,
-                table_names=meta.get("dynamicemb_load_table_names", None),
-                optim=meta.get("dynamicemb_load_optim", optimizer is not None),
-                counter=True,
-            )
+            try:
+                DynamicEmbLoad(
+                    dynamicemb_load_path,
+                    model,
+                    table_names=meta.get("dynamicemb_load_table_names", None),
+                    optim=meta.get("dynamicemb_load_optim", optimizer is not None),
+                    counter=True,
+                )
+            finally:
+                if dynamicemb_view is not None:
+                    dynamicemb_view.cleanup()
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
             )

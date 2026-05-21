@@ -479,7 +479,7 @@ def _get_rtp_embedding_tensor(
         )
         # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
         # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
-        # `_link_dynamicemb_input_tile_user_paths` in checkpoint_util.py),
+        # `_make_dynamicemb_input_tile_user_view` in checkpoint_util.py),
         # so the glob above returns the same physical file under two
         # collection paths. Without dedup, each dynamic table's key/value
         # file would be exported twice, causing online serving to insert the
@@ -1696,7 +1696,7 @@ def _get_sparse_embedding_tensor(
         )
         # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
         # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
-        # `_link_dynamicemb_input_tile_user_paths` in checkpoint_util.py),
+        # `_make_dynamicemb_input_tile_user_view` in checkpoint_util.py),
         # so the glob above returns the same physical file under two
         # collection paths. Without dedup, each dynamic table's key/value
         # file would be exported twice, causing online serving to insert the
