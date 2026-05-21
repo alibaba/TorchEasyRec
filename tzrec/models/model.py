@@ -346,10 +346,6 @@ class ScriptWrapper(BaseModule):
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
-        # Propagate tower identity (set by TowerWoEGWrapper / TowerWrapper)
-        # so callers can identify which tower this wrapper exports.
-        if hasattr(self.model, "_tower_name"):
-            self._tower_name = self.model._tower_name
         self._data_parser = DataParser(
             self.model.features,
             sampler_type=str(module.sampler_type)

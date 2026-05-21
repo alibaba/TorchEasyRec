@@ -36,29 +36,51 @@ from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavaila
 
 
 def _build_model(device: torch.device) -> HSTUMatch:
-    """Build an HSTUMatch model with standard test configuration."""
+    """Build an HSTUMatch model with standard test configuration.
+
+    Mirrors the production grouped-sequence pattern: `uih_seq` and
+    `cand_seq` each carry a `video_id` sub-feature with aligned bucket /
+    dim / `embedding_name` so the two flattened features share one
+    embedding table. `uih_seq` also carries the `historical_ts` raw
+    sub-feature for the timestamp dense path.
+    """
     feature_cfgs = [
         feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="historical_ids",
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="uih_seq",
                 sequence_length=210,
-                embedding_dim=64,
-                num_buckets=3953,
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="video_id",
+                            embedding_dim=64,
+                            num_buckets=1000,
+                            embedding_name="video_id_emb",
+                        )
+                    ),
+                    feature_pb2.SeqFeatureConfig(
+                        raw_feature=feature_pb2.RawFeature(
+                            feature_name="historical_ts",
+                        )
+                    ),
+                ],
             )
         ),
         feature_pb2.FeatureConfig(
-            sequence_id_feature=feature_pb2.IdFeature(
-                feature_name="item_id",
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="cand_seq",
                 sequence_length=10,
                 sequence_delim=";",
-                embedding_dim=64,
-                num_buckets=1000,
-            )
-        ),
-        feature_pb2.FeatureConfig(
-            sequence_raw_feature=feature_pb2.RawFeature(
-                feature_name="historical_ts",
-                sequence_length=210,
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="video_id",
+                            embedding_dim=64,
+                            num_buckets=1000,
+                            embedding_name="video_id_emb",
+                        )
+                    ),
+                ],
             )
         ),
     ]
@@ -66,17 +88,17 @@ def _build_model(device: torch.device) -> HSTUMatch:
     feature_groups = [
         model_pb2.FeatureGroupConfig(
             group_name="uih",
-            feature_names=["historical_ids"],
+            feature_names=["uih_seq__video_id"],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
         model_pb2.FeatureGroupConfig(
             group_name="candidate",
-            feature_names=["item_id"],
+            feature_names=["cand_seq__video_id"],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
         model_pb2.FeatureGroupConfig(
             group_name="uih_timestamp",
-            feature_names=["historical_ts"],
+            feature_names=["uih_seq__historical_ts"],
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
     ]
@@ -140,12 +162,12 @@ def _build_batch(device: torch.device) -> Batch:
     pos_lengths = [1, 1].
     """
     sparse_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=["historical_ids", "item_id"],
+        keys=["uih_seq__video_id", "cand_seq__video_id"],
         values=torch.tensor([1, 2, 3, 4, 5, 6, 7, 100, 200, 101, 201]),
         lengths=torch.tensor([3, 4, 1, 3]),
     )
     sequence_dense_features = {
-        "historical_ts": JaggedTensor(
+        "uih_seq__historical_ts": JaggedTensor(
             values=torch.tensor([[1], [2], [3], [4], [5], [6], [7]]),
             lengths=torch.tensor([3, 4]),
         ),
@@ -197,26 +219,34 @@ class HSTUMatchTest(unittest.TestCase):
         hstu = _build_model(device=device)
         hstu.set_kernel(kernel)
         batch = _build_batch(device=device)
+        # Stash the inner item_tower before the graph_type branch wraps
+        # `hstu` -- the wrapper doesn't expose `item_tower`.
+        item_tower = hstu.item_tower
 
         if graph_type == TestGraphType.JIT_SCRIPT:
-            # Don't flip the inference flag here: the test batch is in the
-            # training-view shape (jagged `candidate.sequence`), and the
-            # item tower's forward branches on `_is_inference` to choose
-            # `.sequence` vs `.query`. The JIT-scripted forward still
-            # compiles both branches; the runtime path is the training
-            # branch, matching the batch shape.
-            hstu = create_test_model(hstu, graph_type)
-            predictions = hstu(batch.to_dict(), device)
+            hstu_wrapped = create_test_model(hstu, graph_type)
+            predictions = hstu_wrapped(batch.to_dict(), device)
         elif graph_type == TestGraphType.FX_TRACE:
-            hstu = create_test_model(hstu, graph_type)
-            predictions = hstu(batch)
+            hstu_wrapped = create_test_model(hstu, graph_type)
+            predictions = hstu_wrapped(batch)
         else:
-            hstu = TrainWrapper(hstu, device=device).to(device)
-            _, (_, predictions, _) = hstu(batch)
+            hstu_wrapped = TrainWrapper(hstu, device=device).to(device)
+            _, (_, predictions, _) = hstu_wrapped(batch)
 
         self.assertIn("similarity", predictions)
         # Q = sum(pos_lengths) = 2; column count = 1 (pos) + neg count.
         self.assertEqual(predictions["similarity"].size(0), 2)
+
+        # Scalar-view contract: set_is_inference(True) flips item_tower
+        # to the scalar export view (bare sub-feature names).
+        hstu.set_is_inference(True)
+        self.assertTrue(item_tower._is_inference)
+        scalar_features = item_tower.features
+        scalar_feature_groups = item_tower.feature_groups
+        self.assertEqual(scalar_features[0].name, "video_id")
+        self.assertFalse(scalar_features[0].is_grouped_sequence)
+        self.assertEqual(scalar_feature_groups[0].feature_names, ["video_id"])
+        self.assertEqual(scalar_feature_groups[0].group_name, "candidate")
 
 
 if __name__ == "__main__":

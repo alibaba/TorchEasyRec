@@ -370,25 +370,22 @@ class MatchIntegrationTest(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval(self):
-        hstu_env = "DISABLE_MMA_V3=1"
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_kuairand_1k.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
-            env_str=hstu_env,
         )
         if self.success:
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str=hstu_env,
             )
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str=f"{hstu_env} ENABLE_AOT=1",
+                env_str="ENABLE_AOT=1",
                 item_input_path="data/test/kuairand-1k-match-item-c1.parquet",
             )
         if self.success:

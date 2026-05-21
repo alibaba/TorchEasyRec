@@ -196,9 +196,6 @@ def export_model_normal(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        # `set_is_inference(True)` applied in `tzrec/main.py::export`
-        # before wrapping; wrappers already see the inference-mode view.
-
         init_parameters(model, torch.device("cpu"))
         checkpoint_util.restore_model(
             checkpoint_path, model, ckpt_param_map_path=ckpt_param_map_path
@@ -291,9 +288,8 @@ def export_model_normal(
         # Persist the model's current feature_groups so towers with a
         # view-specific group set (e.g. HSTUMatchItemTower scalar view)
         # don't ship stale training-view group names.
-        if hasattr(model, "_feature_groups"):
-            pipeline_config.model_config.ClearField("feature_groups")
-            pipeline_config.model_config.feature_groups.extend(model.feature_groups)
+        pipeline_config.model_config.ClearField("feature_groups")
+        pipeline_config.model_config.feature_groups.extend(model.feature_groups)
         config_util.save_message(
             pipeline_config, os.path.join(save_dir, "pipeline.config")
         )
