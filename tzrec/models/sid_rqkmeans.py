@@ -241,8 +241,6 @@ class SidRqkmeans(BaseModel):
             self._metric_modules["rel_loss"].update(rel)
 
         unique_sids = torch.unique(codes, dim=0).shape[0]
-        # Pass a Python float — torchmetrics.MeanMetric accepts scalars
-        # natively and avoids a host→device sync per step.
         self._metric_modules["unique_sid_ratio"].update(unique_sids / B)
 
     @torch.no_grad()

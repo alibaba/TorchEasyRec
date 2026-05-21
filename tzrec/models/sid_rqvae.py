@@ -234,8 +234,6 @@ class SidRqvae(BaseModel):
         codes = predictions["codes"]
         B = codes.shape[0]
         unique_sids = torch.unique(codes, dim=0).shape[0]
-        # Pass a Python float — torchmetrics.MeanMetric accepts scalars
-        # natively and avoids a host→device sync per step.
         self._train_metric_modules["unique_sid_ratio"].update(unique_sids / B)
 
     def update_metric(
