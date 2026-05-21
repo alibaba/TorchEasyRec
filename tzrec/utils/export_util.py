@@ -84,6 +84,18 @@ def export_model(
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = env_util.use_rtp()
     use_dist_embedding = env_util.use_distributed_embedding()
+    if use_dist_embedding:
+        # Distributed embedding export only supports INPUT_TILE=3.
+        # Default to 3 when unset; warn and override if set to anything else.
+        current_input_tile = os.environ.get("INPUT_TILE")
+        if current_input_tile is None:
+            os.environ["INPUT_TILE"] = "3"
+        elif current_input_tile != "3":
+            logger.warning(
+                "use_distributed_embedding=1 requires INPUT_TILE=3, "
+                f"got INPUT_TILE={current_input_tile}. Overriding to 3."
+            )
+            os.environ["INPUT_TILE"] = "3"
     if use_rtp:
         impl = export_rtp_model
     elif use_dist_embedding:
