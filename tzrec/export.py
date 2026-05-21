@@ -48,6 +48,15 @@ if __name__ == "__main__":
         help="JSON string of extra key/value pairs merged into model_acc.json, "
         'e.g. \'{"cand_seq_pk": "cand_seq"}\' for DlrmHSTU.',
     )
+    parser.add_argument(
+        "--item_input_path",
+        type=str,
+        default=None,
+        help="Optional input path for the item-tower's predict-mode "
+        "dataloader. When set, the item tower reads from this path "
+        "(a one-row-per-item table matching the scalar export view) "
+        "instead of `train_input_path`.",
+    )
     args, extra_args = parser.parse_known_args()
 
     additional_export_config = (
@@ -62,4 +71,5 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint_path,
         asset_files=args.asset_files,
         additional_export_config=additional_export_config,
+        item_input_path=args.item_input_path,
     )

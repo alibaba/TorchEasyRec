@@ -125,7 +125,6 @@ class MatchTower(BaseModule):
             tower_pb2.Tower,
             tower_pb2.DATTower,
             tower_pb2.MINDUserTower,
-            tower_pb2.MINDItemTower,
         ],
         output_dim: int,
         similarity: simi_pb2.Similarity,
@@ -144,6 +143,16 @@ class MatchTower(BaseModule):
         self.embedding_group = None
         self.group_variational_dropouts = None
         self.group_variational_dropout_loss = {}
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Tower's features (default property forwarding to ``self._features``)."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Tower's feature_groups (default forward to ``self._feature_groups``)."""
+        return self._feature_groups
 
     def init_input(self) -> None:
         """Build embedding group and group variational dropout."""
@@ -191,14 +200,16 @@ class MatchTower(BaseModule):
 
 
 class MatchTowerWoEG(nn.Module):
-    """Base match tower without embedding group for share embedding.
+    """Base match tower without embedding group (uses shared embedding).
 
     Args:
         tower_config (Tower): user/item tower config.
         output_dim (int): user/item output embedding dimension.
         similarity (Similarity): when use COSINE similarity,
             will norm the output embedding.
-        feature_group (FeatureGroupConfig): feature group config.
+        feature_groups (list): feature group configs the tower consumes.
+            The primary group (named by `tower_config.input`) is the first;
+            additional groups (e.g. contextual) follow.
         features (list): list of features.
     """
 
@@ -206,11 +217,11 @@ class MatchTowerWoEG(nn.Module):
         self,
         tower_config: Union[
             tower_pb2.Tower,
-            tower_pb2.HSTUMatchTower,
+            tower_pb2.HSTUUserTower,
         ],
         output_dim: int,
         similarity: simi_pb2.Similarity,
-        feature_group: model_pb2.FeatureGroupConfig,
+        feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
     ) -> None:
         super().__init__()
@@ -218,8 +229,18 @@ class MatchTowerWoEG(nn.Module):
         self._group_name = tower_config.input
         self._output_dim = output_dim
         self._similarity = similarity
-        self._feature_group = feature_group
+        self._feature_groups = feature_groups
         self._features = features
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Tower's features (default property forwarding to ``self._features``)."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Tower's feature_groups (default forward to ``self._feature_groups``)."""
+        return self._feature_groups
 
 
 class MatchModel(BaseModel):
@@ -456,8 +477,17 @@ class TowerWrapper(nn.Module):
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
         setattr(self, tower_name, module)
-        self._features = module._features
         self._tower_name = tower_name
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped tower's features (no snapshot)."""
+        return getattr(self, self._tower_name).features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Live read of the wrapped tower's feature_groups."""
+        return getattr(self, self._tower_name).feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -476,11 +506,20 @@ class TowerWoEGWrapper(nn.Module):
 
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
-        self.embedding_group = EmbeddingGroup(module._features, [module._feature_group])
+        self.embedding_group = EmbeddingGroup(module.features, module.feature_groups)
         setattr(self, tower_name, module)
-        self._features = module._features
         self._tower_name = tower_name
         self._group_name = module._group_name
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped tower's features (no snapshot)."""
+        return getattr(self, self._tower_name).features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Live read of the wrapped tower's feature_groups."""
+        return getattr(self, self._tower_name).feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Forward the tower.
@@ -492,8 +531,5 @@ class TowerWoEGWrapper(nn.Module):
             embedding (dict): tower output embedding.
         """
         grouped_features = self.embedding_group(batch)
-        return {
-            f"{self._tower_name}_emb": getattr(self, self._tower_name)(
-                grouped_features[self._group_name]
-            )
-        }
+        tower = getattr(self, self._tower_name)
+        return {f"{self._tower_name}_emb": tower(grouped_features)}

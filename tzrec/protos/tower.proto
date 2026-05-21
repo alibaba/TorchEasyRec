@@ -4,19 +4,20 @@ package tzrec.protos;
 import "tzrec/protos/module.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
-import "tzrec/protos/seq_encoder.proto";
 message Tower {
     // input feature group name
     required string input = 1;
-    // mlp config
-    required MLP mlp = 2;
+    // mlp config (optional; when unset the tower applies no projection)
+    optional MLP mlp = 2;
 };
 
-message HSTUMatchTower {
-    // input feature group name
+message HSTUUserTower {
+    // input feature group name (uih group)
     required string input = 1;
-    // hstu_encoder config
-    required HSTUEncoder hstu_encoder = 2;
+    // HSTU config (STU, positional_encoder, input_preprocessor, output_postprocessor)
+    required HSTU hstu = 2;
+    // max sequence length
+    required uint32 max_seq_len = 3;
 }
 
 message DINTower {
@@ -188,12 +189,4 @@ message MINDUserTower {
     required B2ICapsule capsule_config = 6;
     // concat mlp config for user interests vector
     required MLP concat_mlp = 7;
-}
-
-
-message MINDItemTower {
-    // item feature group name
-    required string input = 1;
-    // mlp config
-    required MLP mlp = 2;
 }

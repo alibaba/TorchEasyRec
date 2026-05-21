@@ -53,15 +53,7 @@ class InputPreprocessor(BaseModule):
     @abc.abstractmethod
     def forward(
         self,
-        max_uih_len: int,
-        max_targets: int,
-        total_uih_len: int,
-        total_targets: int,
-        seq_lengths: torch.Tensor,
-        seq_timestamps: torch.Tensor,
-        seq_embeddings: torch.Tensor,
-        num_targets: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
+        grouped_features: Dict[str, torch.Tensor],
     ) -> Tuple[
         int,
         int,
@@ -75,22 +67,14 @@ class InputPreprocessor(BaseModule):
         """Forward the module.
 
         Args:
-            max_uih_len (int): maximum user history sequence length.
-            max_targets (int): maximum candidates length.
-            total_uih_len (int): total user history sequence length.
-            total_targets (int): total candidates length.
-            seq_lengths (torch.Tensor): input sequence lengths.
-            seq_timestamps (torch.Tensor): input sequence timestamp tensor.
-            seq_embeddings (torch.Tensor): input sequence embedding tensor.
-            num_targets (torch.Tensor): number of targets.
-            seq_payloads (Dict[str, torch.Tensor]): sequence payload features.
+            grouped_features (Dict[str, torch.Tensor]): embedding group features.
 
         Returns:
             output_max_seq_len (int): output maximum sequence length.
             output_total_uih_len (int): output total user history sequence length.
             output_total_targets (int): output total candidates length.
             output_seq_lengths (torch.Tensor): output sequence lengths.
-            output_seq_offsets (torch.Tensor): output sequence lengths.
+            output_seq_offsets (torch.Tensor): output sequence offsets.
             output_seq_timestamps (torch.Tensor): output sequence timestamp tensor.
             output_seq_embeddings (torch.Tensor): output sequence embedding tensor.
             output_num_targets (torch.Tensor): output number of targets.
@@ -497,6 +481,243 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
         return self._max_contextual_seq_len
 
 
+class UIHPreprocessor(InputPreprocessor):
+    """Preprocessor for sequence-only models without candidate concatenation.
+
+    Processes UIH (User Interaction History) sequences with optional contextual
+    features, timestamps, and actions. Projects UIH embeddings to the STU
+    embedding dimension. Suitable for two-tower match/retrieval models where
+    user and item towers are independent.
+
+    Args:
+        uih_embedding_dim (int): dimension of UIH input embeddings.
+        output_embedding_dim (int): dimension of output embeddings (STU dim).
+        contextual_feature_dim (int): dimension of each contextual feature.
+            Inferred from embedding_group at model init time.
+        max_contextual_seq_len (int): number of contextual features.
+            Inferred from embedding_group at model init time.
+        contextual_group_name (str): name of contextual group in grouped features.
+        action_encoder (Dict[str, Any]): optional ActionEncoder config.
+        action_mlp (Dict[str, Any]): optional action MLP config.
+        is_inference (bool): whether to run in inference mode.
+    """
+
+    def __init__(
+        self,
+        uih_embedding_dim: int,
+        output_embedding_dim: int,
+        contextual_feature_dim: int = 0,
+        max_contextual_seq_len: int = 0,
+        contextual_group_name: str = "contextual",
+        action_encoder: Optional[Dict[str, Any]] = None,
+        action_mlp: Optional[Dict[str, Any]] = None,
+        is_inference: bool = False,
+        name: str = "",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(is_inference=is_inference)
+        self._uih_embedding_dim: int = uih_embedding_dim
+        self._output_embedding_dim: int = output_embedding_dim
+        self._contextual_feature_dim: int = contextual_feature_dim
+        self._max_contextual_seq_len: int = max_contextual_seq_len
+        self._contextual_group_name: str = contextual_group_name
+        # Group-name prefixes; `name` allows MoT-style channel scoping (matches
+        # ContextualInterleavePreprocessor). Default "" keeps the canonical
+        # uih / uih_action / uih_watchtime / uih_timestamp keys.
+        self._uih_key: str = name if name else "uih"
+        self._uih_action_key: str = f"{name}_action" if name else "uih_action"
+        self._uih_watchtime_key: str = f"{name}_watchtime" if name else "uih_watchtime"
+        self._uih_timestamp_key: str = f"{name}_timestamp" if name else "uih_timestamp"
+
+        # Project UIH to STU embedding dim
+        self._input_projection: torch.nn.Module = torch.nn.Linear(
+            uih_embedding_dim, output_embedding_dim
+        )
+
+        # Optional contextual feature projection
+        if max_contextual_seq_len > 0:
+            std = 1.0 * sqrt(2.0 / float(contextual_feature_dim + output_embedding_dim))
+            self._batched_contextual_linear_weights = torch.nn.Parameter(
+                torch.empty(
+                    (
+                        max_contextual_seq_len,
+                        contextual_feature_dim,
+                        output_embedding_dim,
+                    )
+                ).normal_(0.0, std)
+            )
+            self._batched_contextual_linear_bias = torch.nn.Parameter(
+                torch.empty((max_contextual_seq_len, 1, output_embedding_dim)).fill_(
+                    0.0
+                )
+            )
+
+        # Optional action encoder
+        self._action_encoder_cfg = action_encoder
+        if action_encoder is not None:
+            contextual_embedding_dim: int = (
+                max_contextual_seq_len * contextual_feature_dim
+            )
+            self._action_encoder: ActionEncoder = create_action_encoder(
+                action_encoder,
+                is_inference=is_inference,
+            )
+            assert action_mlp is not None, (
+                "action_mlp must be set when action_encoder is set."
+            )
+            self._action_embedding_mlp: ContextualizedMLP = create_contextualized_mlp(
+                action_mlp,
+                contextual_embedding_dim=contextual_embedding_dim,
+                sequential_input_dim=self._action_encoder.output_dim,
+                sequential_output_dim=output_embedding_dim,
+                is_inference=is_inference,
+            )
+
+    def forward(
+        self, grouped_features: Dict[str, torch.Tensor]
+    ) -> Tuple[
+        int,
+        int,
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Forward the module.
+
+        Args:
+            grouped_features (Dict[str, torch.Tensor]): embedding group features.
+
+        Returns:
+            output_max_seq_len (int): output maximum sequence length.
+            output_total_uih_len (int): output total user history sequence length.
+            output_total_targets (int): always 0 (no candidates).
+            output_seq_lengths (torch.Tensor): output sequence lengths.
+            output_seq_offsets (torch.Tensor): output sequence offsets.
+            output_seq_timestamps (torch.Tensor): output sequence timestamps.
+            output_seq_embeddings (torch.Tensor): output sequence embeddings.
+            output_num_targets (torch.Tensor): always zeros (no candidates).
+        """
+        uih_embeddings = grouped_features[f"{self._uih_key}.sequence"]
+        uih_seq_lengths = grouped_features[f"{self._uih_key}.sequence_length"]
+        max_uih_len = fx_int_item(uih_seq_lengths.max())
+        total_uih_len = fx_int_item(uih_seq_lengths.sum())
+        uih_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(uih_seq_lengths)
+
+        # Project UIH to output dim
+        seq_embeddings = self._input_projection(uih_embeddings)
+
+        # Optional: contextual features
+        contextual_input_embeddings: Optional[torch.Tensor] = None
+        contextual_embeddings: Optional[torch.Tensor] = None
+        if self._max_contextual_seq_len > 0:
+            contextual_input_embeddings = grouped_features[self._contextual_group_name]
+            contextual_embeddings = torch.baddbmm(
+                self._batched_contextual_linear_bias.to(
+                    contextual_input_embeddings.dtype
+                ),
+                contextual_input_embeddings.view(
+                    -1,
+                    self._max_contextual_seq_len,
+                    self._contextual_feature_dim,
+                ).transpose(0, 1),
+                self._batched_contextual_linear_weights.to(
+                    contextual_input_embeddings.dtype
+                ),
+            ).transpose(0, 1)
+
+        # Optional: action embeddings. Watchtime is gated by the encoder's
+        # `need_watchtime` -- mirrors ContextualInterleavePreprocessor.
+        if self._action_encoder_cfg is not None:
+            # total_targets=0: zero offsets keep concat_2D_jagged's Triton
+            # kernel from reading the empty values_right tile.
+            target_offsets = torch.zeros_like(uih_offsets)
+            action_embeddings = self._action_encoder(
+                seq_actions=grouped_features[f"{self._uih_action_key}.sequence"].to(
+                    torch.int64
+                ),
+                max_uih_len=max_uih_len,
+                max_targets=0,
+                uih_offsets=uih_offsets,
+                target_offsets=target_offsets,
+                total_uih_len=total_uih_len,
+                total_targets=0,
+                seq_watchtimes=grouped_features[f"{self._uih_watchtime_key}.sequence"]
+                if self._action_encoder.need_watchtime
+                else None,
+            ).to(uih_embeddings.dtype)
+            action_embeddings = self._action_embedding_mlp(
+                seq_embeddings=action_embeddings,
+                seq_offsets=uih_offsets,
+                max_seq_len=max_uih_len,
+                contextual_embeddings=contextual_input_embeddings,
+            )
+            seq_embeddings = seq_embeddings + action_embeddings
+
+        seq_timestamps = grouped_features[
+            f"{self._uih_timestamp_key}.sequence"
+        ].squeeze(-1)
+
+        output_max_seq_len = max_uih_len
+        output_seq_lengths = uih_seq_lengths
+        output_seq_offsets = uih_offsets
+        output_total_uih_len = total_uih_len
+
+        # Concat contextual embeddings if present
+        if self._max_contextual_seq_len > 0:
+            seq_embeddings = concat_2D_jagged(
+                values_left=fx_unwrap_optional_tensor(contextual_embeddings).reshape(
+                    -1, self._output_embedding_dim
+                ),
+                values_right=seq_embeddings,
+                max_len_left=self._max_contextual_seq_len,
+                max_len_right=max_uih_len,
+                offsets_left=None,
+                offsets_right=uih_offsets,
+                kernel=self.kernel(),
+            )
+            seq_timestamps = concat_2D_jagged(
+                values_left=_fx_timestamp_contextual_zeros(
+                    seq_timestamps,
+                    uih_seq_lengths,
+                    self._max_contextual_seq_len,
+                ),
+                values_right=seq_timestamps.unsqueeze(-1),
+                max_len_left=self._max_contextual_seq_len,
+                max_len_right=max_uih_len,
+                offsets_left=None,
+                offsets_right=uih_offsets,
+                kernel=self.kernel(),
+            ).squeeze(-1)
+            output_max_seq_len = max_uih_len + self._max_contextual_seq_len
+            output_total_uih_len = (
+                total_uih_len + self._max_contextual_seq_len * uih_seq_lengths.size(0)
+            )
+            output_seq_lengths = uih_seq_lengths + self._max_contextual_seq_len
+            output_seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                output_seq_lengths
+            )
+
+        num_targets = torch.zeros_like(output_seq_lengths)
+
+        return (
+            output_max_seq_len,
+            output_total_uih_len,
+            0,
+            output_seq_lengths,
+            output_seq_offsets,
+            seq_timestamps,
+            seq_embeddings,
+            num_targets,
+        )
+
+    def contextual_seq_len(self) -> int:
+        """Contextual feature sequence length."""
+        return self._max_contextual_seq_len
+
+
 def create_input_preprocessor(
     preprocessor_cfg: Union[module_pb2.GRInputPreprocessor, Dict[str, Any]],
     **kwargs: Any,
@@ -519,5 +740,7 @@ def create_input_preprocessor(
         )
     elif preprocessor_type == "contextual_interleave_preprocessor":
         return ContextualInterleavePreprocessor(**config_dict)
+    elif preprocessor_type == "uih_preprocessor":
+        return UIHPreprocessor(**config_dict)
     else:
         raise RuntimeError(f"Unknown preprocessor type: {preprocessor_type}")

@@ -895,6 +895,7 @@ def export(
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
+    item_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -906,6 +907,9 @@ def export(
         asset_files (str, optional): more files will be copied to export_dir.
         additional_export_config (dict, optional): extra key/value pairs merged
             into model_acc.json (e.g. ``{"cand_seq_pk": "cand_seq"}`` for DlrmHSTU).
+        item_input_path (str, optional): override for the item tower's
+            predict-mode dataloader input path. When set, the item tower
+            reads from this path instead of ``train_input_path``.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
@@ -936,6 +940,10 @@ def export(
         sampler_type=None,
     )
     InferWrapper = ScriptWrapper
+    # Flip to inference *before* wrapping so view-dependent state
+    # (e.g. HSTUMatchItemTower's lazy properties, wrapper EmbeddingGroups)
+    # is snapshot from the scalar view.
+    model.set_is_inference(True)
     model = InferWrapper(model)
 
     if not checkpoint_path:
@@ -959,6 +967,10 @@ def export(
                 )
                 tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
+                # item-tower-only; user tower falls back to `train_input_path`.
+                tower_data_input_path = (
+                    item_input_path if name == "item_tower" else None
+                )
                 export_model(
                     ori_pipeline_config,
                     tower,
@@ -966,6 +978,7 @@ def export(
                     tower_export_dir,
                     assets=assets,
                     additional_export_config=additional_export_config,
+                    data_input_path=tower_data_input_path,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():

@@ -8,7 +8,7 @@ DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`ha
 
 ```bash
 # DEVICE 可选: cu126/cu129 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260420.c7b9ea2.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb==0.1.0+20260519.e0c1fbb.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
@@ -94,3 +94,33 @@ feature_configs {
     --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
     --fine_tune_checkpoint {INIT_CKPT_PATH}/model.ckpt-0
     ```
+
+## 从ZCH训练好的模型迁移
+
+如果已有用 `zch{}` 训练好的模型，希望切换到 `dynamicemb{}` 继续训练，可以使用 `tzrec.tools.dynamicemb.zch_to_dynamicemb_convert` 将ZCH checkpoint 转换为 dynamicemb 格式的 checkpoint，下游训练任务直接通过 `--fine_tune_checkpoint` 热启动。
+
+```bash
+python -m tzrec.tools.dynamicemb.zch_to_dynamicemb_convert \
+--source_checkpoint_path {ZCH_CKPT_PATH}/model.ckpt-N \
+--source_pipeline_config_path {PATH_TO_CONFIG_WITH_ZCH} \
+--target_pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
+--save_dir {CONVERTED_CKPT_PATH}
+```
+
+- --source_checkpoint_path: ZCH 训练好的 checkpoint 目录（形如 `.../model.ckpt-N/`，需包含 `model/` 子目录的 DCP 分片）
+- --source_pipeline_config_path: 原始训练所用的 pipeline 配置（特征上配置了 `zch{}`）
+- --target_pipeline_config_path: 切换后的 pipeline 配置（同名特征上将 `zch{}` 替换为 `dynamicemb{}`，`embedding_dim` 保持一致）
+- --save_dir: 转换后 checkpoint 的输出目录，工具会写入 `{save_dir}/model.ckpt-0/`
+- --world_size:（可选）转换后 dynamicemb 分片的 world_size，默认从 source checkpoint 的 `.distcp` 文件名自动识别
+
+### 迁移内容
+
+- **Embedding**: ZCH 表中已学到的 embedding 向量会迁移到 dynamicemb。
+- **分数（Scores）**: 仅当目标 `score_strategy` 为 `LFU` 或 `STEP` 时迁移；其它策略 dynamicemb 会自行初始化分数。
+- **非 ZCH 部分**: 稠密层、非 ZCH embedding 及其对应 optimizer state 直接保留。
+
+### 未迁移内容
+
+- ZCH embedding 的 optimizer state 不迁移，dynamicemb 加载后自行冷启动。
+
+ZCH 本身的配置详见 [ZCH](./zch.md)。

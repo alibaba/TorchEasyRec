@@ -56,6 +56,7 @@ from tzrec.features.feature import (
     create_fg_json,
 )
 from tzrec.modules.utils import BaseModule
+from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
@@ -79,8 +80,13 @@ def export_model(
     save_dir: str,
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
+    data_input_path: Optional[str] = None,
 ) -> None:
-    """Export a EasyRec model, may be a part of model in PipelineConfig."""
+    """Export a EasyRec model, may be a part of model in PipelineConfig.
+
+    `data_input_path` (optional): override for the predict-mode dataloader
+    input path; falls back to `pipeline_config.train_input_path` when None.
+    """
     use_rtp = env_util.use_rtp()
 
     impl = export_rtp_model if use_rtp else export_model_normal
@@ -99,6 +105,7 @@ def export_model(
         assets=assets,
         use_local_cache_dir=use_local_cache_dir,
         additional_export_config=additional_export_config,
+        data_input_path=data_input_path,
     )
     if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
@@ -141,6 +148,7 @@ def export_model_normal(
     save_dir: str,
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
+    data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
@@ -160,16 +168,15 @@ def export_model_normal(
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
         logger.info("using new batch_size: %s in export", data_config.batch_size)
     data_config.num_workers = 1
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
 
     ckpt_param_map_path = None
     if checkpoint_path:
@@ -189,8 +196,6 @@ def export_model_normal(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        model.set_is_inference(True)
-
         init_parameters(model, torch.device("cpu"))
         checkpoint_util.restore_model(
             checkpoint_path, model, ckpt_param_map_path=ckpt_param_map_path
@@ -665,6 +670,7 @@ def export_rtp_model(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
+    data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""
@@ -710,16 +716,13 @@ def export_rtp_model(
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
-
-    model.set_is_inference(True)
 
     # Build Sharded Model
     planner = create_planner(
@@ -999,7 +1002,7 @@ def export_rtp_model(
 
 def _compute_seq_share_groups(
     features: List[BaseFeature],
-    model_config: Any,
+    feature_groups: List[model_pb2.FeatureGroupConfig],
 ) -> Dict[str, str]:
     """Map ``{group_name}__sequence`` to a share_key.
 
@@ -1011,7 +1014,7 @@ def _compute_seq_share_groups(
 
     feat_by_name = {f.name: f for f in features}
     share: Dict[str, str] = {}
-    for fg in model_config.feature_groups:
+    for fg in feature_groups:
         if fg.group_type not in (
             FeatureGroupType.SEQUENCE,
             FeatureGroupType.JAGGED_SEQUENCE,
@@ -1041,7 +1044,6 @@ def split_model(
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
 
-    model.set_is_inference(True)
     model.eval()
 
     tracer = Tracer()
@@ -1159,8 +1161,8 @@ def split_model(
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
-        features=cast(List[BaseFeature], model._features),
-        model_config=model.model._base_model_config,
+        features=cast(List[BaseFeature], model.features),
+        feature_groups=model.feature_groups,
     )
     meta_info = {
         "seq_tensor_names": seq_tensor_names,

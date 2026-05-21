@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import random
 from collections import OrderedDict
@@ -165,22 +166,23 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Map input_name -> sequence_delim for sequence_id_features.
-        self._seq_field_delims: Dict[str, str] = {}
-        for feature in features:
-            if not feature.sequence_delim:
-                continue
-            for input_name in feature.inputs:
-                existing = self._seq_field_delims.get(input_name)
-                if existing is not None and existing != feature.sequence_delim:
-                    logger.warning(
-                        "Conflicting sequence_delim for input '%s': %r vs %r; "
-                        "latter wins.",
-                        input_name,
-                        existing,
-                        feature.sequence_delim,
+        # Sequence state when item_id_field is a grouped sequence sub-feature.
+        self._sampler_seq_delim: str = ""
+        self._sampler_seq_prefix: str = ""
+        if self._sampler_item_id_field is not None:
+            for feature in features:
+                if self._sampler_item_id_field not in feature.sequence_input_names:
+                    continue
+                if not feature.is_grouped_sequence:
+                    raise ValueError(
+                        f"item_id_field '{self._sampler_item_id_field}' is a "
+                        "sequence input but its matching feature is not a "
+                        "grouped sequence; only grouped sequence sub-features "
+                        "are supported as item_id_field."
                     )
-                self._seq_field_delims[input_name] = feature.sequence_delim
+                self._sampler_seq_delim = feature.sequence_delim
+                self._sampler_seq_prefix = feature.grouped_sequence_prefix
+                break
 
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
@@ -205,10 +207,34 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
+
+            # Rewrite bare attr_fields to flattened (`video_id` ->
+            # `cand_seq__video_id`); deep-copy so data_config isn't mutated.
+            if self._sampler_seq_prefix:
+                sampler_config = copy.deepcopy(sampler_config)
+                sampler_config.attr_fields[:] = [
+                    self._sampler_seq_prefix + a for a in sampler_config.attr_fields
+                ]
+
+            # Strip the per-row positive-grouping outer list on attr_fields
+            # columns so the sampler emits scalar negs.
+            sampler_fields = self.input_fields
+            if self._sampler_seq_delim:
+                sampler_attrs = set(sampler_config.attr_fields)
+                sampler_fields = [
+                    pa.field(f.name, f.type.value_type)
+                    if (
+                        f.name in sampler_attrs
+                        and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
+                    )
+                    else f
+                    for f in self.input_fields
+                ]
+
             # pyre-ignore [16]
             self._sampler = BaseSampler.create_class(sampler_config.__class__.__name__)(
                 sampler_config,
-                self.input_fields,
+                sampler_fields,
                 self._batch_size,
                 is_training=self._mode == Mode.TRAIN,
                 multival_sep=self._fg_encoded_multival_sep
@@ -363,7 +389,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             input_data,
             self._sampler_item_id_field,
             self._sampler_user_id_field,
-            self._seq_field_delims,
+            self._sampler_seq_delim,
         )
         sampled = self._sampler.get(sampler_input)
 
@@ -431,11 +457,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     ) -> Optional[np.ndarray]:
         """Merge sampler outputs into input_data in place; return per-row pos lengths.
 
-        Per sampled key: new keys are assigned as-is, keys with a
-        `seq_delim` use the block-suffix combine, others fall back to
-        `pa.concat_arrays`. `pos_lengths` is sourced from the configured
-        item_id_field combine; returns None if no sequence field was
-        merged.
+        Per sampled key: new keys assigned as-is; otherwise routed via
+        `pa.concat_arrays` (scalar item_id_field) or the block-suffix
+        combine (grouped-sequence item_id_field). `pos_lengths` returns
+        None when not in sequence mode.
         """
         # Prefer item_id_field; fall back to first-seen seq-field if absent.
         prefer_key = self._sampler_item_id_field
@@ -445,12 +470,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             if k not in input_data:
                 input_data[k] = v
                 continue
-            seq_delim = self._seq_field_delims.get(k)
-            if seq_delim is None:
+            if not self._sampler_seq_delim:
                 input_data[k] = pa.concat_arrays([input_data[k], v])
                 continue
             combined, pl = combine_negs_to_candidate_sequence(
-                input_data[k], v, seq_delim
+                input_data[k], v, self._sampler_seq_delim
             )
             input_data[k] = combined
             if k == prefer_key:
