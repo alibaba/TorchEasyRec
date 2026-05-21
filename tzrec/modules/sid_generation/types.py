@@ -35,12 +35,10 @@ class QuantizeOutput(NamedTuple):
     Attributes:
         embeddings (Tensor): quantized embeddings, shape (B, D).
         ids (Tensor): codebook indices, shape (B,).
-        loss (Tensor): commitment loss scalar.
     """
 
     embeddings: torch.Tensor
     ids: torch.Tensor
-    loss: torch.Tensor
 
 
 class ResidualQuantizedOutput(NamedTuple):

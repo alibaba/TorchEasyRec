@@ -36,10 +36,15 @@ class GatherLayer(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor) -> torch.Tensor:
-        """Sum-reduce the per-rank grads and return this rank's slice."""
-        all_gradients = torch.stack(grads)
-        dist.all_reduce(all_gradients)
-        return all_gradients[dist.get_rank()]
+        """Sum-reduce the per-rank grads and return this rank's slice.
+
+        ``all_reduce`` is sum, so reducing only this rank's slice gives
+        the same result as stacking + reducing + slicing, but avoids
+        materialising the full ``(world_size, B, D)`` buffer.
+        """
+        grad_local = grads[dist.get_rank()].contiguous()
+        dist.all_reduce(grad_local)
+        return grad_local
 
 
 def _all_gather_with_grad(

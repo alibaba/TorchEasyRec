@@ -39,6 +39,9 @@ def _squared_euclidean_distance(
 ) -> torch.Tensor:
     """Squared L2 distance with chunked computation for memory efficiency.
 
+    Chunks the rows of ``x`` so peak memory is bounded by
+    ``chunk_size * K * 4 bytes`` (fp32) regardless of ``N``.
+
     Args:
         x (Tensor): data points, shape (N, D).
         y (Tensor): centroids, shape (K, D).
@@ -47,9 +50,18 @@ def _squared_euclidean_distance(
     Returns:
         Tensor: squared distances, shape (N, K).
     """
-    x_sq = x.pow(2).sum(dim=1, keepdim=True)
-    y_sq = y.pow(2).sum(dim=1, keepdim=True).t()
-    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
+    x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
+    y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
+    N = x.shape[0]
+    if N <= chunk_size:
+        return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
+    out = x.new_empty(N, y.shape[0])
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        out[start:end] = (x_sq[start:end] + y_sq - 2.0 * x[start:end] @ y.t()).clamp_(
+            min=0.0
+        )
+    return out
 
 
 @torch.no_grad()

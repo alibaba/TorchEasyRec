@@ -87,7 +87,6 @@ class SidRqvae(BaseModel):
             n_embed=n_embed_list,
             forward_mode=cfg.forward_mode,
             normalize_residuals=cfg.normalize_residuals,
-            shared_codebook=cfg.shared_codebook,
             distance_type=cfg.distance_type,
             commitment_loss=cfg.commitment_loss,
             rotation_trick=cfg.rotation_trick,
@@ -235,9 +234,9 @@ class SidRqvae(BaseModel):
         codes = predictions["codes"]
         B = codes.shape[0]
         unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._train_metric_modules["unique_sid_ratio"].update(
-            torch.tensor(unique_sids / B, device=codes.device)
-        )
+        # Pass a Python float — torchmetrics.MeanMetric accepts scalars
+        # natively and avoids a host→device sync per step.
+        self._train_metric_modules["unique_sid_ratio"].update(unique_sids / B)
 
     def update_metric(
         self,
@@ -261,6 +260,4 @@ class SidRqvae(BaseModel):
             self._metric_modules["mse"].update(mse)
 
         unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._metric_modules["unique_sid_ratio"].update(
-            torch.tensor(unique_sids / B, device=codes.device)
-        )
+        self._metric_modules["unique_sid_ratio"].update(unique_sids / B)

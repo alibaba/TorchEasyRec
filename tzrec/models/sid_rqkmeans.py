@@ -241,9 +241,9 @@ class SidRqkmeans(BaseModel):
             self._metric_modules["rel_loss"].update(rel)
 
         unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._metric_modules["unique_sid_ratio"].update(
-            torch.tensor(unique_sids / B, device=codes.device)
-        )
+        # Pass a Python float — torchmetrics.MeanMetric accepts scalars
+        # natively and avoids a host→device sync per step.
+        self._metric_modules["unique_sid_ratio"].update(unique_sids / B)
 
     @torch.no_grad()
     def on_train_end(self) -> None:
@@ -254,10 +254,10 @@ class SidRqkmeans(BaseModel):
         exits. No-op when the buffer is empty.
 
         DDP behavior:
-            - rank0: all_gather full embedding matrix, run FAISS fit,
-              then broadcast (centroids + _is_initialized) to other ranks.
-            - other ranks: send local buffer via all_gather, then wait
-              for broadcast.
+            - rank0: receive local buffers via gather_object, concat,
+              run FAISS fit, then broadcast centroids to other ranks.
+            - other ranks: ship local buffer via gather_object(dst=0)
+              and wait for the broadcast.
         """
         if not self._offline_buffer:
             logger.warning(
@@ -271,29 +271,39 @@ class SidRqkmeans(BaseModel):
         )
 
         if is_ddp:
-            # DDP path: concat locally, all_gather (variable-length via
-            # pickle path — fine for this one-shot, CPU-resident gather),
-            # then fit on rank0.
+            # DDP path: every rank ships its local buffer to rank 0 via
+            # gather_object (variable-length pickle — fine for this one-
+            # shot, CPU-resident gather). Only rank 0 holds the corpus,
+            # so peak memory is O(world_size) on rank 0 and O(1) elsewhere
+            # (vs O(world_size²) for all_gather_object).
             local = torch.cat(self._offline_buffer, dim=0)
             del self._offline_buffer
             self._offline_buffer = []
 
-            gathered: List[Optional[torch.Tensor]] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, local)
-            del local  # no longer needed after gather
-            full = torch.cat([g for g in gathered if g is not None], dim=0)
-            del gathered
             rank = dist.get_rank()
+            gathered: Optional[List[Optional[torch.Tensor]]] = (
+                [None] * dist.get_world_size() if rank == 0 else None
+            )
+            dist.gather_object(local, gathered, dst=0)
+            del local
             if rank == 0:
+                assert gathered is not None
+                full = torch.cat([g for g in gathered if g is not None], dim=0)
+                del gathered
                 logger.info(
                     "[SidRqkmeans.on_train_end] rank0 fitting FAISS "
                     "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
                 )
                 self._rqkmeans.train_offline(full, verbose=True)
-            del full
+                del full
+            # Broadcast centroids and set the init flag locally on every
+            # rank. ``_is_initialized`` is a bool buffer and NCCL's bool
+            # dtype support is inconsistent across versions, so we avoid
+            # a separate broadcast for it — all ranks enter this block in
+            # lockstep, so a local fill_() keeps state consistent.
             for layer in self._rqkmeans.quantizer.layers:
                 dist.broadcast(layer.centroids, src=0)
-                dist.broadcast(layer._is_initialized, src=0)
+                layer._is_initialized.fill_(True)
             dist.barrier()
         else:
             # Single-process path: build the full numpy matrix directly

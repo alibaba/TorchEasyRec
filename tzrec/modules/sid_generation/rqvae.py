@@ -47,7 +47,6 @@ class RQVAE(nn.Module):
         forward_mode (str): VQ forward mode ('ste'|'gumbel_softmax').
             Default: 'ste'.
         normalize_residuals (bool): L2-normalize residuals. Default: False.
-        shared_codebook (bool): share codebook across layers. Default: False.
         distance_type (str|List[str]): distance metric ('l2'|'cosine').
             Default: 'l2'.
         commitment_loss (str|None): commitment loss type ('l2'|'cos').
@@ -83,7 +82,6 @@ class RQVAE(nn.Module):
         n_embed: Union[int, List[int]] = 256,
         forward_mode: str = "ste",
         normalize_residuals: bool = False,
-        shared_codebook: bool = False,
         distance_type: Union[str, List[str]] = "l2",
         commitment_loss: Optional[str] = None,
         latent_weight: Sequence[float] = (1.0, 0.5),
@@ -128,7 +126,6 @@ class RQVAE(nn.Module):
             n_embed=n_embed,
             forward_mode=forward_mode,
             normalize_residuals=normalize_residuals,
-            shared_codebook=shared_codebook,
             distance_type=distance_type,
             commitment_loss=commitment_loss,
             latent_weight=latent_weight,
@@ -147,12 +144,30 @@ class RQVAE(nn.Module):
             self.masked_clip_loss_fn = MaskedCLIPLoss()
 
         logger.info(
-            "RQVAE init: %s",
-            {
-                k: v
-                for k, v in vars(self).items()
-                if not k.startswith("_") and k != "training"
-            },
+            "RQVAE init: input_dim=%d, embed_dim=%d, hidden_dims=%s, "
+            "n_layers=%d, n_embed=%s, forward_mode=%s, "
+            "normalize_residuals=%s, distance_type=%s, "
+            "commitment_loss=%s, latent_weight=%s, rotation_trick=%s, "
+            "kmeans_init=%s, use_sinkhorn=%s, "
+            "sinkhorn_iters=%d, sinkhorn_epsilon=%s, "
+            "loss_type=%s, use_clip=%s",
+            input_dim,
+            embed_dim,
+            hidden_dims,
+            n_layers,
+            n_embed,
+            forward_mode,
+            normalize_residuals,
+            distance_type,
+            commitment_loss,
+            list(latent_weight),
+            rotation_trick,
+            kmeans_init,
+            use_sinkhorn,
+            sinkhorn_iters,
+            sinkhorn_epsilon,
+            loss_type,
+            use_clip,
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:

@@ -48,8 +48,6 @@ class ResidualQuantized(nn.Module):
             Default: 'ste'.
         normalize_residuals (bool): L2-normalize residuals before each
             quantization layer. Default: False.
-        shared_codebook (bool): share codebook across all layers.
-            Default: False.
         distance_type (str|List[str]): distance metric per layer,
             'l2' or 'cosine'. Supports per-layer list. Default: 'l2'.
         commitment_loss (str): commitment loss type, 'l2' or 'cos'.
@@ -79,7 +77,6 @@ class ResidualQuantized(nn.Module):
         n_embed: Union[int, List[int]] = 256,
         forward_mode: str = "ste",
         normalize_residuals: bool = False,
-        shared_codebook: bool = False,
         distance_type: Union[str, List[str]] = "l2",
         commitment_loss: str = "l2",
         latent_weight: Sequence[float] = (1.0, 0.5),
@@ -93,7 +90,6 @@ class ResidualQuantized(nn.Module):
         self.embed_dim = embed_dim
         self.n_layers = n_layers
         self.normalize_residuals = normalize_residuals
-        self.shared_codebook = shared_codebook
         self.commitment_loss_type = commitment_loss
         self.rotation_trick = rotation_trick
 
@@ -129,40 +125,40 @@ class ResidualQuantized(nn.Module):
             )
             distance_types = list(distance_type)
 
-        if shared_codebook:
-            base_layer = VectorQuantize(
-                embed_dim=embed_dim,
-                n_embed=n_embed_list[0],
-                forward_mode=mode_enum,
-                distance_type=distance_types[0],
-                use_sinkhorn=use_sinkhorn,
-                sinkhorn_iters=sinkhorn_iters,
-                sinkhorn_epsilon=sinkhorn_epsilon,
-            )
-            self.layers = nn.ModuleList([base_layer] * n_layers)
-        else:
-            self.layers = nn.ModuleList(
-                [
-                    VectorQuantize(
-                        embed_dim=embed_dim,
-                        n_embed=n_embed_list[i],
-                        forward_mode=mode_enum,
-                        distance_type=distance_types[i],
-                        use_sinkhorn=use_sinkhorn,
-                        sinkhorn_iters=sinkhorn_iters,
-                        sinkhorn_epsilon=sinkhorn_epsilon,
-                    )
-                    for i in range(n_layers)
-                ]
-            )
+        self.layers = nn.ModuleList(
+            [
+                VectorQuantize(
+                    embed_dim=embed_dim,
+                    n_embed=n_embed_list[i],
+                    forward_mode=mode_enum,
+                    distance_type=distance_types[i],
+                    use_sinkhorn=use_sinkhorn,
+                    sinkhorn_iters=sinkhorn_iters,
+                    sinkhorn_epsilon=sinkhorn_epsilon,
+                )
+                for i in range(n_layers)
+            ]
+        )
 
         logger.info(
-            "ResidualQuantized init: %s",
-            {
-                k: v
-                for k, v in vars(self).items()
-                if not k.startswith("_") and k != "training"
-            },
+            "ResidualQuantized init: embed_dim=%d, n_layers=%d, "
+            "n_embed=%s, forward_mode=%s, normalize_residuals=%s, "
+            "distance_type=%s, commitment_loss=%s, latent_weight=%s, "
+            "rotation_trick=%s, kmeans_init=%s, use_sinkhorn=%s, "
+            "sinkhorn_iters=%d, sinkhorn_epsilon=%s",
+            embed_dim,
+            n_layers,
+            n_embed,
+            forward_mode,
+            normalize_residuals,
+            distance_type,
+            commitment_loss,
+            list(latent_weight),
+            rotation_trick,
+            kmeans_init,
+            use_sinkhorn,
+            sinkhorn_iters,
+            sinkhorn_epsilon,
         )
 
     @torch.jit.ignore

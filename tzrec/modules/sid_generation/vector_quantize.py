@@ -108,17 +108,18 @@ class VectorQuantize(nn.Module):
     """Single codebook vector quantization layer.
 
     Maps continuous input vectors to the nearest codebook entry and returns
-    the quantized embeddings, codebook indices, and commitment loss.
+    the quantized embeddings + codebook indices. The commitment loss is
+    computed at the residual-aggregator level by
+    :meth:`ResidualQuantized._single_commitment_loss` over the cumulative
+    quants (matching al_sid's ``RQBottleneck.compute_commitment_loss``);
+    this layer is intentionally loss-free.
 
-    The codebook is updated via the commitment-loss gradient (no EMA path).
     During training, Sinkhorn optimal-transport assignment is optionally
     used to encourage uniform codebook utilization.
 
     Args:
         embed_dim (int): dimension of each codebook embedding.
         n_embed (int): number of codebook entries.
-        commitment_weight (float): weight for the commitment loss term.
-            Default: 0.25.
         forward_mode (QuantizeForwardMode): quantization forward mode,
             either GUMBEL_SOFTMAX or STE. Default: STE.
         distance_type (str): distance metric, 'l2' or 'cosine'.
@@ -134,7 +135,6 @@ class VectorQuantize(nn.Module):
         self,
         embed_dim: int,
         n_embed: int,
-        commitment_weight: float = 0.25,
         forward_mode: QuantizeForwardMode = QuantizeForwardMode.STE,
         distance_type: str = "l2",
         use_sinkhorn: bool = True,
@@ -144,7 +144,6 @@ class VectorQuantize(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.n_embed = n_embed
-        self.commitment_weight = commitment_weight
         self.forward_mode = forward_mode
         self.distance_type = distance_type
         self.use_sinkhorn = use_sinkhorn
@@ -231,42 +230,35 @@ class VectorQuantize(nn.Module):
             2. if use_sinkhorn: z-score normalize + Sinkhorn -> argmax
                else: argmin
             3. compute differentiable embedding (STE or Gumbel-Softmax)
-            4. compute commitment loss
+
+        Commitment loss is computed by the caller
+        (:meth:`ResidualQuantized._single_commitment_loss`).
 
         Args:
             x (Tensor): input vectors, shape (B, D).
             temperature (float): temperature for Gumbel-Softmax.
 
         Returns:
-            QuantizeOutput: named tuple of (embeddings, ids, loss).
+            QuantizeOutput: named tuple of (embeddings, ids).
         """
         # Step 1-2: find nearest codebook entry
         ids, distances = self._find_nearest_embedding(x)
 
-        # Step 3: differentiable embedding. A single embedding lookup
-        # feeds both the differentiable output and the commitment loss;
-        # Gumbel takes a separate path that combines all codebook entries.
+        # Step 3: differentiable embedding. Gumbel takes a separate path
+        # that combines all codebook entries; STE goes through a single
+        # embedding lookup.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             weights = _gumbel_softmax_sample(
                 -distances, temperature=temperature, hard=True
             )
             emb = weights @ self.embedding.weight
-            quantized_for_loss = self.embedding(ids)
         elif self.training and self.forward_mode == QuantizeForwardMode.STE:
-            quantized_for_loss = self.embedding(ids)
+            quantized = self.embedding(ids)
             # Straight-Through Estimator: gradient passes through
-            emb = x + (quantized_for_loss - x).detach()
+            emb = x + (quantized - x).detach()
         elif self.training:
             raise ValueError(f"Unsupported forward mode: {self.forward_mode}")
         else:
-            quantized_for_loss = self.embedding(ids)
-            emb = quantized_for_loss
+            emb = self.embedding(ids)
 
-        # Step 4: commitment loss — codebook is gradient-updated, so both
-        # the encoder-side (e_latent_loss) and codebook-side (q_latent_loss)
-        # terms always contribute.
-        e_latent_loss = F.mse_loss(x, quantized_for_loss.detach())
-        q_latent_loss = F.mse_loss(quantized_for_loss, x.detach())
-        loss = self.commitment_weight * e_latent_loss + q_latent_loss
-
-        return QuantizeOutput(embeddings=emb, ids=ids, loss=loss)
+        return QuantizeOutput(embeddings=emb, ids=ids)

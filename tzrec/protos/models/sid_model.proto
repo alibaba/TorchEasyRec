@@ -35,8 +35,6 @@ message SidRqvae {
     optional string forward_mode = 6 [default = "ste"];
     // L2-normalize residuals before each quantization layer.
     optional bool normalize_residuals = 7 [default = false];
-    // Share a single codebook across all layers.
-    optional bool shared_codebook = 8 [default = false];
     // Distance metric: "l2" or "cosine".
     optional string distance_type = 9 [default = "l2"];
     // Commitment loss type: "l2" or "cos".
@@ -67,8 +65,10 @@ message SidRqkmeans {
     // no encoder).
     optional uint32 input_dim = 1 [default = 512];
     // Per-layer cluster counts, comma-separated, e.g. "256,256,256".
-    // List length is the number of residual quantization layers; non-uniform
-    // codebooks such as "512,256,128" are supported.
+    // List length is the number of residual quantization layers. All
+    // entries must be equal — the FAISS backend reuses a single
+    // ``faiss.Kmeans`` object across layers, so non-uniform codebooks
+    // are not supported (a uniformity assert fires at construction).
     optional string codebook = 3;
     // L2-normalize residuals before each layer.
     optional bool normalize_residuals = 4 [default = true];

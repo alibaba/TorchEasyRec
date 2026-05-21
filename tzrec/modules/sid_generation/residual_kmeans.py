@@ -44,6 +44,9 @@ class ResidualKMeans(nn.Module):
         embed_dim (int): feature dimension.
         n_layers (int): number of residual quantization layers.
         n_embed (int|List[int]): number of clusters per layer. Default: 256.
+            All layers must share the same ``K`` — a single FAISS ``Kmeans``
+            object is reused across layers (matches the OneRec reference).
+            Non-uniform codebooks are not supported.
         normalize_residuals (bool): whether to L2-normalize residuals
             before each layer. Default: False.
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
@@ -73,6 +76,13 @@ class ResidualKMeans(nn.Module):
                 f"but got {len(n_embed)} vs {n_layers}"
             )
             n_embed_list = list(n_embed)
+        # ``train_offline`` reuses a single ``faiss.Kmeans`` instance across
+        # layers, so non-uniform codebooks would silently train layers 1+
+        # with ``K=n_embed_list[0]``. Fail fast instead.
+        assert len(set(n_embed_list)) == 1, (
+            "ResidualKMeans / RQKMeans require a uniform codebook size "
+            f"across layers; got {n_embed_list}."
+        )
         self.n_embed_list = n_embed_list
 
         self.layers = nn.ModuleList(
