@@ -256,13 +256,16 @@ model_config {
 
 ## 模型导出
 
-HSTU Match 模型导出时需要设置环境变量 `ENABLE_AOT=1` 启用 AOT Inductor 导出。例如:
+HSTU Match 模型导出时，若使用 Triton kernel，需要设置环境变量 `ENABLE_AOT=1` 启用 AOT Inductor 导出。
+
+同时需要通过命令行参数 `--item_input_path` 指定 item 侧的输入数据路径（一行一个 item 的 parquet，schema 与候选序列子特征对齐，例如包含 `video_id` 列）。item tower 导出时会从该路径读取一个样本 batch 用于 trace；user tower 不受影响，仍使用 `train_input_path`。例如：
 
 ```
 ENABLE_AOT=1 torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=1 --node_rank=0 \
     -m tzrec.export \
     --pipeline_config_path experiments/hstu_match/pipeline.config \
+    --item_input_path experiments/hstu_match/item_data/*.parquet \
     --export_dir experiments/hstu_match/export
 ```
 
