@@ -146,12 +146,12 @@ class MatchTower(BaseModule):
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Features the tower exposes to its wrapper."""
+        """Tower's features (default property forwarding to ``self._features``)."""
         return self._features
 
     @property
     def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
-        """Feature groups the tower exposes to its wrapper."""
+        """Tower's feature_groups (default forward to ``self._feature_groups``)."""
         return self._feature_groups
 
     def init_input(self) -> None:
@@ -234,16 +234,16 @@ class MatchTowerWoEG(nn.Module):
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Item-side features the tower exposes to its wrapper.
+        """Tower's features.
 
-        Default reads `self._features`; overridden by towers that switch
-        views between training and export (see `HSTUMatchItemTower`).
+        Default reads ``self._features``; overridden by towers that switch
+        views between training and export (see ``HSTUMatchItemTower``).
         """
         return self._features
 
     @property
     def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
-        """Item-side feature_groups the tower exposes to its wrapper."""
+        """Tower's feature_groups (default forward to ``self._feature_groups``)."""
         return self._feature_groups
 
 
@@ -485,10 +485,10 @@ class TowerWrapper(nn.Module):
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Live read of the wrapped tower's features.
+        """Live read of the wrapped tower's features (no snapshot).
 
-        For `HSTUMatchItemTower`, this reflects the current view (training
-        or scalar export) per `_is_inference`. No snapshot.
+        For ``HSTUMatchItemTower``, reflects the current view (training
+        or scalar export) per ``_is_inference``.
         """
         return getattr(self, self._tower_name).features
 

@@ -75,12 +75,12 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Model's features (default property forwarding to `self._features`)."""
+        """Model's features (default property forwarding to ``self._features``)."""
         return self._features
 
     @property
     def feature_groups(self) -> List[FeatureGroupConfig]:
-        """Model's feature_groups (default forward to `self._feature_groups`)."""
+        """Model's feature_groups (default forward to ``self._feature_groups``)."""
         return self._feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -347,8 +347,7 @@ class ScriptWrapper(BaseModule):
         super().__init__()
         self.model = module
         # Propagate tower identity (set by TowerWoEGWrapper / TowerWrapper)
-        # so export_util.py can route item-tower export through
-        # `pipeline_config.item_input_path` instead of `train_input_path`.
+        # so callers can identify which tower this wrapper exports.
         if hasattr(self.model, "_tower_name"):
             self._tower_name = self.model._tower_name
         self._data_parser = DataParser(

@@ -469,10 +469,7 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def name(self) -> str:
         """Feature name."""
-        if self._is_grouped_seq:
-            return f"{self.sequence_name}{self._underline}{self.config.feature_name}"
-        else:
-            return self.config.feature_name
+        return f"{self.grouped_sequence_prefix}{self.config.feature_name}"
 
     @property
     def is_neg(self) -> bool:
@@ -567,6 +564,11 @@ class BaseFeature(object, metaclass=_meta_cls):
     def is_grouped_sequence(self) -> bool:
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
+
+    @property
+    def grouped_sequence_prefix(self) -> str:
+        """Flatten prefix ``<sequence_name><_underline>``; empty if not grouped."""
+        return f"{self.sequence_name}{self._underline}" if self._is_grouped_seq else ""
 
     @property
     def is_weighted(self) -> bool:
@@ -746,7 +748,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         if not self.is_sequence:
             return False
         if self._is_grouped_seq and self.sequence_name:
-            prefix = f"{self.sequence_name}{self._underline}"
+            prefix = self.grouped_sequence_prefix
             if name.startswith(prefix):
                 name = name[len(prefix) :]
         if (
@@ -784,7 +786,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                     )
                 side, name = x[0], x[1]
                 seq_prefix = (
-                    f"{self.sequence_name}{self._underline}"
+                    self.grouped_sequence_prefix
                     if self._need_seq_prefix(side, name)
                     else ""
                 )

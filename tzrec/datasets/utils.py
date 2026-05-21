@@ -589,8 +589,8 @@ def build_sampler_input(
     When `item_id_field` is a grouped sequence sub-feature, per-row
     positives (delimited string or list array) are flattened to 1D and
     `user_id_field` (if any) is expanded by per-row positive count.
-    Scalar item_id (`seq_delim=""`) falls through unchanged. The caller's
-    `input_data` is not mutated.
+    Scalar item_id (`seq_delim=""`) falls through unchanged. The
+    caller's `input_data` is not mutated.
 
     Args:
         input_data: per-row input column dict.

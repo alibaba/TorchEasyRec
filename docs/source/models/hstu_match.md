@@ -211,7 +211,7 @@ model_config {
 
 - data_config: 数据配置，其中需要配置负采样 Sampler，负采样 Sampler 的配置详见 [DSSM](dssm.md) 文档中的**负采样配置**章节
 
-  - HSTUMatch 的候选侧是 `sequence_feature` 的子特征。在 `negative_sampler` 中，`item_id_field` 写为带 sequence_name 的序列前缀的名 (例如 `cand_seq__video_id`)，`attr_fields` 写为不带前缀的子特征名 (例如 `video_id`)
+  - HSTUMatch 的候选侧是 `sequence_feature` 的子特征。在 `negative_sampler` 中，`item_id_field` 写为带 `sequence_name` 前缀的名（例如 `cand_seq__video_id`），`attr_fields` 写为不带前缀的子特征名（例如 `video_id`）。
 
 - feature_groups: 特征组
 
