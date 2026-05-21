@@ -693,18 +693,12 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(set(hard_neg_indices[:, 0].tolist()), {0, 1, 2, 3, 4, 5, 6, 7})
 
     def test_launch_sampler_cluster_grouped_sequence_strip_and_rewrite(self):
-        """End-to-end prefix-rewrite + outer-list strip for HSTUMatch-shaped configs.
+        """Prefix-rewrite + outer-list strip for HSTUMatch-shaped configs.
 
-        Grouped LookupFeature sub with ``cat_key`` in ``sequence_fields``.
-        The sampler's ``attr_fields`` uses the new bare convention
-        (``"cat_key"``); the dataset boundary prepends the candidate
-        sequence's flatten prefix (``"click_seq__"``) before sampler
-        launch. Outer-list strip then applies to attr_fields columns
-        only: ``click_seq__cat_key`` (``list<list<int64>>``) loses ONE
-        level (multi-positive container) and stays ``list<int64>``
-        (multi-value layer). ``cat_map`` (``list<string>``) is an
-        unrelated parquet column not in ``attr_fields`` -- strip skips
-        it, so it stays ``list<string>`` unchanged.
+        Bare ``attr_fields=["cat_key"]`` is rewritten to
+        ``["click_seq__cat_key"]``; strip drops the multi-positive outer
+        list (``list<list<int64>>`` -> ``list<int64>``). ``cat_map``, a
+        parquet column not in ``attr_fields``, is left untouched.
         """
         f = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(f)
@@ -768,16 +762,12 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(dataset._sampler_seq_prefix, "click_seq__")
 
         dataset.launch_sampler_cluster(2)
-        # data_config.sampler not mutated by the rewrite (deep-copied).
+        # Deep-copy guard: data_config not mutated by the rewrite.
         self.assertEqual(
             list(dataset._data_config.negative_sampler.attr_fields), ["cat_key"]
         )
-        # Sampler sees the QUALIFIED column name; bare `cat_key` is gone.
         self.assertIn("click_seq__cat_key", dataset._sampler._attr_names)
         self.assertNotIn("cat_key", dataset._sampler._attr_names)
-        # Outer-list strip:
-        # - click_seq__cat_key (in attr_fields): list<list<int64>> -> list<int64>.
-        # - cat_map (parquet column NOT in attr_fields): stays list<string>.
         cat_key_idx = dataset._sampler._attr_names.index("click_seq__cat_key")
         self.assertEqual(
             dataset._sampler._attr_types[cat_key_idx], pa.list_(pa.int64())

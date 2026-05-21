@@ -166,13 +166,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # When item_id_field is a grouped sequence sub-feature (HSTUMatch's
-        # candidate side), attr_fields are uniformly sequence too -- item-
-        # side per-positive, never mixed with top-level scalars. So a
-        # single delim + prefix capture the entire sequence path; no
-        # per-attr branching. Prefix uses feature._underline (not "__"
-        # literal) so RTP-safe. Top-level sequence_id_feature as
-        # item_id_field is rejected: only grouped is supported.
+        # Sequence state when item_id_field is a grouped sequence sub-feature.
         self._sampler_seq_delim: str = ""
         self._sampler_seq_prefix: str = ""
         if self._sampler_item_id_field is not None:
@@ -213,24 +207,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sampler_type = self._data_config.WhichOneof("sampler")
             sampler_config = getattr(self._data_config, sampler_type)
 
-            # Prepend the candidate sequence's flatten prefix to bare
-            # `attr_fields` entries (HSTUMatch's `"video_id"` becomes the
-            # qualified parquet column `"cand_seq__video_id"`). Deep-copy
-            # so the in-place mutation doesn't leak back to
-            # `self._data_config`.
+            # Rewrite bare attr_fields to flattened (`video_id` ->
+            # `cand_seq__video_id`); deep-copy so data_config isn't mutated.
             if self._sampler_seq_prefix:
                 sampler_config = copy.deepcopy(sampler_config)
                 sampler_config.attr_fields[:] = [
                     self._sampler_seq_prefix + a for a in sampler_config.attr_fields
                 ]
 
-            # Multi-positive sampling: when item_id_field is a candidate-
-            # sequence sub-feature, the per-row outer list on every
-            # attr_fields column is the positive-grouping container, not a
-            # multi-value field. Strip that outer list so the sampler sees
-            # the pool's native scalar storage and _to_arrow_array emits
-            # scalar negs directly. item_id_field is one of attr_fields in
-            # every real sampler config, so no separate union is needed.
+            # Strip the per-row positive-grouping outer list on attr_fields
+            # columns so the sampler emits scalar negs.
             sampler_fields = self.input_fields
             if self._sampler_seq_delim:
                 sampler_attrs = set(sampler_config.attr_fields)
@@ -470,13 +456,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
     ) -> Optional[np.ndarray]:
         """Merge sampler outputs into input_data in place; return per-row pos lengths.
 
-        Per sampled key: new keys are assigned as-is. When
-        `_sampler_seq_delim` is empty (scalar item_id_field), existing
-        keys are concatenated via `pa.concat_arrays`. When it's set
-        (candidate-sequence item_id_field), `attr_fields` are uniformly
-        sequence so every existing key goes through the block-suffix
-        combine. `pos_lengths` is sourced from the configured
-        item_id_field combine; returns None when not in sequence mode.
+        Per sampled key: new keys assigned as-is; otherwise routed via
+        `pa.concat_arrays` (scalar item_id_field) or the block-suffix
+        combine (grouped-sequence item_id_field). `pos_lengths` returns
+        None when not in sequence mode.
         """
         # Prefer item_id_field; fall back to first-seen seq-field if absent.
         prefer_key = self._sampler_item_id_field
