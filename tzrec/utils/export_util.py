@@ -85,8 +85,7 @@ def export_model(
     """Export a EasyRec model, may be a part of model in PipelineConfig.
 
     `data_input_path` (optional): override for the predict-mode dataloader
-    input path. When set, used instead of `pipeline_config.train_input_path`.
-    Wired from the `tzrec/export.py` CLI's `--data_input_path` flag.
+    input path; falls back to `pipeline_config.train_input_path` when None.
     """
     use_rtp = env_util.use_rtp()
 
@@ -176,11 +175,6 @@ def export_model_normal(
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
         logger.info("using new batch_size: %s in export", data_config.batch_size)
     data_config.num_workers = 1
-    # Predict-mode dataloader input: caller may override `train_input_path`
-    # via `data_input_path` (CLI flag `--data_input_path` on
-    # `tzrec/export.py`). Used by recall-model item-tower export to read a
-    # one-row-per-item table matching the scalar export view; the user
-    # tower receives `data_input_path=None` and reads `train_input_path`.
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
 
@@ -202,11 +196,8 @@ def export_model_normal(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        # `set_is_inference(True)` is the caller's responsibility; it must
-        # be applied to the inner model *before* wrapping with
-        # `InferWrapper` (see `tzrec/main.py::export`) so wrapper-level
-        # snapshots (EmbeddingGroup, view-dependent features) pick up the
-        # inference-mode view at construction time.
+        # `set_is_inference(True)` applied in `tzrec/main.py::export`
+        # before wrapping; wrappers already see the inference-mode view.
 
         init_parameters(model, torch.device("cpu"))
         checkpoint_util.restore_model(
@@ -297,11 +288,9 @@ def export_model_normal(
         pipeline_config = copy.copy(pipeline_config)
         pipeline_config.ClearField("feature_configs")
         pipeline_config.feature_configs.extend(feature_configs)
-        # Towers that own a view-specific feature_groups (e.g.
-        # `HSTUMatchItemTower` after `set_is_inference(True)` swaps to the
-        # scalar item view) must save those groups too, otherwise the
-        # exported pipeline.config pairs scalar feature_configs with stale
-        # training feature_group names.
+        # Persist the model's current feature_groups so towers with a
+        # view-specific group set (e.g. HSTUMatchItemTower scalar view)
+        # don't ship stale training-view group names.
         if hasattr(model, "_feature_groups"):
             pipeline_config.model_config.ClearField("feature_groups")
             pipeline_config.model_config.feature_groups.extend(model.feature_groups)
@@ -739,15 +728,10 @@ def export_rtp_model(
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
-    # Same routing as `export_model_normal`: caller-supplied
-    # `data_input_path` overrides `train_input_path`.
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
-
-    # `set_is_inference(True)` was applied in `tzrec/main.py::export` before
-    # wrapping -- the inner model + all sub-modules already carry the flag.
 
     # Build Sharded Model
     planner = create_planner(
@@ -1069,8 +1053,6 @@ def split_model(
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
 
-    # `set_is_inference(True)` was applied in `tzrec/main.py::export` before
-    # wrapping -- the inner model + all sub-modules already carry the flag.
     model.eval()
 
     tracer = Tracer()

@@ -895,7 +895,7 @@ def export(
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
-    data_input_path: Optional[str] = None,
+    item_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -907,11 +907,9 @@ def export(
         asset_files (str, optional): more files will be copied to export_dir.
         additional_export_config (dict, optional): extra key/value pairs merged
             into model_acc.json (e.g. ``{"cand_seq_pk": "cand_seq"}`` for DlrmHSTU).
-        data_input_path (str, optional): override for export's predict-mode
-            dataloader input path. When set, used instead of
-            `pipeline_config.train_input_path`. For recall models this only
-            applies to the item-tower export (the user tower keeps reading
-            `train_input_path`).
+        item_input_path (str, optional): override for the item tower's
+            predict-mode dataloader input path. When set, the item tower
+            reads from this path instead of ``train_input_path``.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
@@ -942,15 +940,9 @@ def export(
         sampler_type=None,
     )
     InferWrapper = ScriptWrapper
-    # Set the inference flag on the inner model *before* wrapping. Every
-    # downstream wrapper (ScriptWrapper for non-match, TowerWoEGWrapper /
-    # TowerWrapper per match tower) snapshots view-dependent state at
-    # construction time (e.g. `HSTUMatchItemTower`'s lazy
-    # `features`/`feature_groups` properties; the wrappers' EmbeddingGroup),
-    # so the flag must already be True when the wrapping happens.
-    # `recursive_setattr` propagates the flag to all sub-modules including
-    # the inner towers, so the per-tower wrap below doesn't need its own
-    # toggle.
+    # Flip to inference *before* wrapping so view-dependent state
+    # (e.g. HSTUMatchItemTower's lazy properties, wrapper EmbeddingGroups)
+    # is snapshot from the scalar view.
     model.set_is_inference(True)
     model = InferWrapper(model)
 
@@ -973,18 +965,12 @@ def export(
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                # The inference flag was already set on every sub-module by
-                # `model.set_is_inference(True)` above, so `HSTUMatchItemTower`'s
-                # lazy `features` / `feature_groups` properties return the
-                # scalar view here and the wrapper's `EmbeddingGroup` is
-                # built off scalar features.
                 tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
-                # data_input_path applies only to the item tower (whose
-                # scalar export view can't parse `train_input_path`'s
-                # training-shape sequence rows). The user tower reads
-                # the standard `train_input_path`.
-                tower_input_path = data_input_path if name == "item_tower" else None
+                # item-tower-only; user tower falls back to `train_input_path`.
+                tower_data_input_path = (
+                    item_input_path if name == "item_tower" else None
+                )
                 export_model(
                     ori_pipeline_config,
                     tower,
@@ -992,7 +978,7 @@ def export(
                     tower_export_dir,
                     assets=assets,
                     additional_export_config=additional_export_config,
-                    data_input_path=tower_input_path,
+                    data_input_path=tower_data_input_path,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():

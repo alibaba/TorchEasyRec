@@ -1235,21 +1235,16 @@ def project_grouped_sequence_feature_to_scalar(
 ) -> feature_pb2.FeatureConfig:
     """Return a scalar export FeatureConfig for a grouped sequence sub-feature.
 
-    The grouped sub-feature's config is a `SeqFeatureConfig`; rewrap it as a
-    top-level `FeatureConfig` so `create_features` builds it as a scalar
-    feature. Materializes the source feature's effective `default_value` and
-    `value_dim` onto the scalar proto so the exported feature is
-    behaviorally identical to the training sub-feature -- without this,
-    `id_feature.value_dim` and `default_value` resolve differently in
-    scalar mode (`0` / `""`) than in sequence mode (`1` / `"0"`)
-    (see feature.py:515-517, 556-561).
+    Rewraps the inner ``SeqFeatureConfig`` as a top-level ``FeatureConfig``
+    and materializes the source's effective ``default_value`` / ``value_dim``
+    so the exported scalar feature matches the training sub-feature
+    (otherwise scalar mode defaults differ from sequence mode).
 
     Args:
         feature: a grouped sequence sub-feature.
 
     Returns:
-        a fresh FeatureConfig suitable for `create_features()` to construct
-        as a top-level scalar feature.
+        a fresh FeatureConfig for ``create_features()`` to build as scalar.
     """
     if not feature.is_grouped_sequence:
         raise ValueError(

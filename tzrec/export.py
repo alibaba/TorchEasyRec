@@ -49,15 +49,13 @@ if __name__ == "__main__":
         'e.g. \'{"cand_seq_pk": "cand_seq"}\' for DlrmHSTU.',
     )
     parser.add_argument(
-        "--data_input_path",
+        "--item_input_path",
         type=str,
         default=None,
-        help="Optional input path override for export's predict-mode "
-        "dataloader. When set, the sample batch is read from this path "
-        "instead of `train_input_path`. Useful for recall-model item-tower "
-        "export with a one-row-per-item table whose schema matches the "
-        "scalar export view (training-shape sequence rows in "
-        "`train_input_path` would fail the scalar parser).",
+        help="Optional input path for the item-tower's predict-mode "
+        "dataloader. When set, the item tower reads from this path "
+        "(a one-row-per-item table matching the scalar export view) "
+        "instead of `train_input_path`.",
     )
     args, extra_args = parser.parse_known_args()
 
@@ -73,5 +71,5 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint_path,
         asset_files=args.asset_files,
         additional_export_config=additional_export_config,
-        data_input_path=args.data_input_path,
+        item_input_path=args.item_input_path,
     )

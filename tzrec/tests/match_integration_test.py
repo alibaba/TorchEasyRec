@@ -370,9 +370,6 @@ class MatchIntegrationTest(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     def test_hstu_with_fg_train_eval(self):
-        # DISABLE_MMA_V3=1: Triton 3.6 sm_90 WGMMA bug. ENABLE_AOT=1: HSTU
-        # uses TRITON kernels which require CUDA; AOT export keeps the
-        # forward on CUDA. Same pattern as dlrm_hstu's export test.
         hstu_env = "DISABLE_MMA_V3=1"
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_kuairand_1k.config",
@@ -392,7 +389,7 @@ class MatchIntegrationTest(unittest.TestCase):
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
                 env_str=f"{hstu_env} ENABLE_AOT=1",
-                data_input_path="data/test/kuairand-1k-match-item-c1.parquet",
+                item_input_path="data/test/kuairand-1k-match-item-c1.parquet",
             )
         if self.success:
             # Item tower scalar export view: predict over the item-only

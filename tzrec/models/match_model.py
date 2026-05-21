@@ -234,11 +234,7 @@ class MatchTowerWoEG(nn.Module):
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Tower's features.
-
-        Default reads ``self._features``; overridden by towers that switch
-        views between training and export (see ``HSTUMatchItemTower``).
-        """
+        """Tower's features (default property forwarding to ``self._features``)."""
         return self._features
 
     @property
@@ -485,11 +481,7 @@ class TowerWrapper(nn.Module):
 
     @property
     def features(self) -> List[BaseFeature]:
-        """Live read of the wrapped tower's features (no snapshot).
-
-        For ``HSTUMatchItemTower``, reflects the current view (training
-        or scalar export) per ``_is_inference``.
-        """
+        """Live read of the wrapped tower's features (no snapshot)."""
         return getattr(self, self._tower_name).features
 
     @property
@@ -514,13 +506,6 @@ class TowerWoEGWrapper(nn.Module):
 
     def __init__(self, module: nn.Module, tower_name: str = "user_tower") -> None:
         super().__init__()
-        # Build EmbeddingGroup from the tower's *current view*: for
-        # `HSTUMatchItemTower` after `set_is_inference(True)`, this is the
-        # scalar export view (one row per item, `{group_name}.query`);
-        # otherwise it's the training view (jagged, `{group_name}.sequence`).
-        # The EmbeddingGroup itself owns nn.Parameters so it must be a
-        # construction-time snapshot; the `features`/`feature_groups`
-        # properties below stay live via lazy reads on the inner tower.
         self.embedding_group = EmbeddingGroup(module.features, module.feature_groups)
         setattr(self, tower_name, module)
         self._tower_name = tower_name

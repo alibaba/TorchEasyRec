@@ -166,23 +166,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         ):
             self._selected_input_names = None
 
-        # Candidate-side sequence state. When `item_id_field` is a grouped
-        # sequence sub-feature input:
-        #   * `_sampler_seq_delim` is the parent feature's `sequence_delim`.
-        #   * `_sampler_seq_prefix` is the flatten prefix
-        #     `feature.grouped_sequence_prefix`.
-        #   * `_sampler_seq_inputs` is the set of all candidate-side
-        #     sequence input names (union of `sequence_input_names` across
-        #     features that share `sequence_name` with item_id_field's
-        #     parent). Used to gate bare-attr resolution: an attr is
-        #     prefixed iff `prefix + a` is a known candidate sequence
-        #     input. Avoids false positives on top-level item-side attrs
-        #     (e.g. lookup_feature's `cat_map` whose sequence_fields
-        #     exclude it). Sourced from feature configs only -- no
-        #     parquet-schema dependency.
+        # Sequence state when item_id_field is a grouped sequence sub-feature.
         self._sampler_seq_delim: str = ""
         self._sampler_seq_prefix: str = ""
-        self._sampler_seq_inputs: set = set()
         if self._sampler_item_id_field is not None:
             for feature in features:
                 if self._sampler_item_id_field not in feature.sequence_input_names:
@@ -196,10 +182,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     )
                 self._sampler_seq_delim = feature.sequence_delim
                 self._sampler_seq_prefix = feature.grouped_sequence_prefix
-                seq_name = feature.sequence_name
-                for f in features:
-                    if f.is_grouped_sequence and f.sequence_name == seq_name:
-                        self._sampler_seq_inputs.update(f.sequence_input_names)
                 break
 
         self._fg_mode = data_config.fg_mode
@@ -224,50 +206,25 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Launch sampler cluster and server."""
         if self._data_config.HasField("sampler") and self._mode != Mode.PREDICT:
             sampler_type = self._data_config.WhichOneof("sampler")
-            # Deep-copy so any in-place rewrites below don't mutate
-            # `self._data_config`'s sampler sub-message.
-            sampler_config = copy.deepcopy(getattr(self._data_config, sampler_type))
+            sampler_config = getattr(self._data_config, sampler_type)
 
-            sampler_fields = self.input_fields
+            # Rewrite bare attr_fields to flattened (`video_id` ->
+            # `cand_seq__video_id`); deep-copy so data_config isn't mutated.
             if self._sampler_seq_prefix:
-                # Grouped sequence: prefix a bare attr iff `prefix + a`
-                # is a known candidate-side sequence input (from
-                # feature configs). Already-qualified attrs land
-                # outside the candidate input set (their `prefix + a`
-                # double-prefixes), so they stay as-is. Top-level
-                # item-side attrs (e.g. lookup_feature's `cat_map`
-                # whose sequence_fields exclude it) likewise stay
-                # as-is. RTP-safe, no name string split, no parquet-
-                # schema dependency. Must run *before* the outer-list
-                # strip so `consumed` carries resolved names.
+                sampler_config = copy.deepcopy(sampler_config)
                 sampler_config.attr_fields[:] = [
-                    self._sampler_seq_prefix + a
-                    if self._sampler_seq_prefix + a in self._sampler_seq_inputs
-                    else a
-                    for a in sampler_config.attr_fields
+                    self._sampler_seq_prefix + a for a in sampler_config.attr_fields
                 ]
 
+            # Strip the per-row positive-grouping outer list on attr_fields
+            # columns so the sampler emits scalar negs.
+            sampler_fields = self.input_fields
             if self._sampler_seq_delim:
-                # Multi-positive sampling: when the sampler's item_id_field
-                # is itself a sequence-positive train column, the per-row
-                # outer list on the candidate sequence's item-side attrs is
-                # the positive-grouping container. Strip the outer list
-                # only for the candidate-sequence attrs in `attr_fields`
-                # (filtered by `_sampler_seq_prefix`). Excluded: top-level
-                # item-side attrs from the same lookup feature whose outer
-                # list is multi-value (e.g. `cat_map`); other grouped
-                # sequences' sub-features (e.g. uih_seq__*); and the
-                # `item_id_field` itself -- the sampler never inspects
-                # their type.
-                consumed = {
-                    a
-                    for a in sampler_config.attr_fields
-                    if a.startswith(self._sampler_seq_prefix)
-                }
+                sampler_attrs = set(sampler_config.attr_fields)
                 sampler_fields = [
                     pa.field(f.name, f.type.value_type)
                     if (
-                        f.name in consumed
+                        f.name in sampler_attrs
                         and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))
                     )
                     else f
