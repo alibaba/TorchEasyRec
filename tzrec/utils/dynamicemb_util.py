@@ -47,6 +47,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from tzrec.protos import feature_pb2
+from tzrec.utils.logging_util import logger
 
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
 _DYNAMICEMB_HYBRID_X_EFF_BASE = 0.11
@@ -433,6 +434,28 @@ if has_dynamicemb:
                     dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
                 )
+                # Log the runtime mode each dynamicemb table will see.
+                # Mirrors BatchedDynamicEmbeddingTablesV2._create_cache_storage:
+                #   total_value_memory <= local_hbm_for_values  -> HBM_ONLY
+                #   else if caching                             -> CACHING
+                #   else                                        -> HYBRID
+                # HOST_ONLY is unreachable since cache_load_factor in
+                # {0.1, ..., 1.0} and local_hbm_for_values > 0 always.
+                if int(os.environ.get("RANK", 0)) == 0:
+                    cache_load_factor = float(sharding_option.cache_load_factor)
+                    if cache_load_factor >= 1.0:
+                        mode = "HBM_ONLY"
+                    elif dynamicemb_options.caching:
+                        mode = "CACHING"
+                    else:
+                        mode = "HYBRID"
+                    hbm_gib = dynamicemb_options.local_hbm_for_values / (1 << 30)
+                    fqn = f"{sharding_option.path}.{sharding_option.name}"
+                    logger.info(
+                        f"[dynamicemb plan] {fqn}: mode={mode} "
+                        f"cache_load_factor={cache_load_factor:.2f} "
+                        f"local_hbm_for_values={hbm_gib:.3f}GiB"
+                    )
             else:
                 module_plan[sharding_option.name] = ParameterSharding(
                     sharding_spec=sharding_spec,
