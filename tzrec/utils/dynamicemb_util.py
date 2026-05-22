@@ -434,21 +434,10 @@ if has_dynamicemb:
                     dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
                 )
-                # Log the runtime mode each dynamicemb table will see.
-                # Mirrors BatchedDynamicEmbeddingTablesV2._create_cache_storage:
-                #   total_value_memory <= local_hbm_for_values  -> HBM_ONLY
-                #   else if caching                             -> CACHING
-                #   else                                        -> HYBRID
-                # HOST_ONLY is unreachable since cache_load_factor in
-                # {0.1, ..., 1.0} and local_hbm_for_values > 0 always.
-                # ``shards[0].storage.ddr`` was already populated by the
-                # storage estimator as the per-rank value bytes for the
-                # chosen mode ((1-x)*T for HYBRID, full T for CACHING;
-                # metadata is HBM-side only in tzrec, I/O is not added on
-                # cuda). Use it directly so we do not redo the calculation.
-                # Upstream ``_print_memory_consume`` is mode-blind (always
-                # ``dram = total - hbm``) and under-reports the host
-                # backing for CACHING -- this log line has the right value.
+                # Per-table mode log on rank 0. cache_load_factor=1.0 forces
+                # the runtime into HBM_ONLY (host tier dropped) regardless of
+                # ``caching`` -- mirror that override here so the log matches
+                # the runtime, not the planner's recorded (caching, factor).
                 if int(os.environ.get("RANK", 0)) == 0:
                     cache_load_factor = float(sharding_option.cache_load_factor)
                     if cache_load_factor >= 1.0:
@@ -457,14 +446,14 @@ if has_dynamicemb:
                     else:
                         mode = "CACHING" if dynamicemb_options.caching else "HYBRID"
                         dram_bytes = shards[0].storage.ddr
-                    hbm_gib = dynamicemb_options.local_hbm_for_values / (1 << 30)
+                    hbm_gib = shards[0].storage.hbm / (1 << 30)
                     dram_gib = dram_bytes / (1 << 30)
                     fqn = f"{sharding_option.path}.{sharding_option.name}"
                     logger.info(
                         f"[dynamicemb plan] {fqn}: mode={mode} "
                         f"cache_load_factor={cache_load_factor:.2f} "
-                        f"local_hbm_for_values={hbm_gib:.3f}GiB "
-                        f"local_dram_for_values={dram_gib:.3f}GiB"
+                        f"local_hbm={hbm_gib:.3f}GiB "
+                        f"local_dram={dram_gib:.3f}GiB"
                     )
             else:
                 module_plan[sharding_option.name] = ParameterSharding(
