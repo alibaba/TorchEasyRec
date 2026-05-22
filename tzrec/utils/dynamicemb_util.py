@@ -441,34 +441,22 @@ if has_dynamicemb:
                 #   else                                        -> HYBRID
                 # HOST_ONLY is unreachable since cache_load_factor in
                 # {0.1, ..., 1.0} and local_hbm_for_values > 0 always.
-                # We also report ``local_dram_for_values`` per mode because
-                # upstream ``_print_memory_consume`` is mode-blind (always
-                # ``dram = total - hbm``) and under-reports the host backing
-                # for CACHING.
+                # ``shards[0].storage.ddr`` was already populated by the
+                # storage estimator as the per-rank value bytes for the
+                # chosen mode ((1-x)*T for HYBRID, full T for CACHING;
+                # metadata is HBM-side only in tzrec, I/O is not added on
+                # cuda). Use it directly so we do not redo the calculation.
+                # Upstream ``_print_memory_consume`` is mode-blind (always
+                # ``dram = total - hbm``) and under-reports the host
+                # backing for CACHING -- this log line has the right value.
                 if int(os.environ.get("RANK", 0)) == 0:
                     cache_load_factor = float(sharding_option.cache_load_factor)
-                    total_value_bytes = (
-                        _calculate_dynamicemb_table_storage_specific_size(
-                            shards[0].size,
-                            tensor.element_size(),
-                            optimizer_multipler,
-                            cache_ratio=1.0,
-                            is_hbm=True,
-                            only_values=True,
-                            bucket_capacity=dynamicemb_options.bucket_capacity,
-                        )
-                    )
                     if cache_load_factor >= 1.0:
                         mode = "HBM_ONLY"
-                        dram_bytes = 0
-                    elif dynamicemb_options.caching:
-                        mode = "CACHING"
-                        dram_bytes = total_value_bytes  # full backing on host
+                        dram_bytes = 0  # runtime drops the host tier
                     else:
-                        mode = "HYBRID"
-                        dram_bytes = (
-                            total_value_bytes - dynamicemb_options.local_hbm_for_values
-                        )
+                        mode = "CACHING" if dynamicemb_options.caching else "HYBRID"
+                        dram_bytes = shards[0].storage.ddr
                     hbm_gib = dynamicemb_options.local_hbm_for_values / (1 << 30)
                     dram_gib = dram_bytes / (1 << 30)
                     fqn = f"{sharding_option.path}.{sharding_option.name}"
