@@ -222,7 +222,16 @@ class KMeansLayer(nn.Module):
         self.n_features = n_features
 
         self.register_buffer("centroids", torch.zeros(n_clusters, n_features))
-        self.register_buffer("_is_initialized", torch.tensor(False))
+        # ``_is_initialized`` is flipped by ``load_centroids_`` after the
+        # offline FAISS fit completes. Keep it OUT of the state dict
+        # (``persistent=False``): a checkpoint taken mid-training would
+        # otherwise ship ``True`` alongside still-zero centroids, and a
+        # later resume-then-infer would silently return dummy zero codes
+        # instead of raising. Each load must re-run ``load_centroids_``
+        # (or the FAISS fit) to set the flag.
+        self.register_buffer(
+            "_is_initialized", torch.tensor(False), persistent=False
+        )
 
     @property
     def is_initialized(self) -> bool:

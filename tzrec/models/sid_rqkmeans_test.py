@@ -132,6 +132,20 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         model = self._create_model()
         model.on_train_end()  # should not raise
 
+    def test_is_initialized_not_in_state_dict(self) -> None:
+        """``_is_initialized`` must be ``persistent=False`` so a
+        mid-training checkpoint can't ship ``True`` next to still-zero
+        centroids.
+        """
+        model = self._create_model()
+        sd_keys = list(model.state_dict().keys())
+        leaked = [k for k in sd_keys if k.endswith("_is_initialized")]
+        self.assertEqual(
+            leaked,
+            [],
+            f"_is_initialized leaked into state_dict: {leaked}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
