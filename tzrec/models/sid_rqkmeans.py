@@ -17,7 +17,7 @@ loop ends, via the :meth:`BaseModel.on_train_end` lifecycle hook
 (``tzrec.main`` calls ``_model.on_train_end()`` unconditionally).
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -31,29 +31,9 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models._sid_helpers import parse_int_list
 from tzrec.models.model import BaseModel
 from tzrec.modules.sid_generation import RQKMeans
+from tzrec.modules.sid_generation.kmeans import recon_diagnostics
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.logging_util import logger
-
-
-def _recon_loss(
-    x: torch.Tensor, out: torch.Tensor, epsilon: float = 1e-4
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reconstruction diagnostics aligned with OpenOneRec::ResKmeans.calc_loss.
-
-    Args:
-        x: ground-truth embedding, shape (B, D).
-        out: quantized reconstruction, shape (B, D).
-        epsilon: numerical stabilizer for rel_loss denominator.
-
-    Returns:
-        mse: ((out - x) ** 2).mean()
-        rel_loss: (|x - out| / (max(|x|, |out|) + eps)).mean()
-    """
-    mse = ((out - x) ** 2).mean()
-    rel = (
-        torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
-    ).mean()
-    return mse, rel
 
 
 def _coerce_proto_numbers(d: Dict) -> Dict:
@@ -233,7 +213,7 @@ class SidRqkmeans(BaseModel):
         B = codes.shape[0]
 
         if "input_embedding" in predictions:
-            mse, rel = _recon_loss(
+            mse, rel = recon_diagnostics(
                 predictions["input_embedding"],
                 predictions["quantized"],
             )

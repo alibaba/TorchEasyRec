@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.kmeans import KMeansLayer
+from tzrec.modules.sid_generation.kmeans import KMeansLayer, recon_diagnostics
 from tzrec.utils.logging_util import logger
 
 
@@ -286,10 +286,7 @@ class ResidualKMeans(nn.Module):
         x: torch.Tensor, out: torch.Tensor, epsilon: float = 1e-4
     ) -> Dict[str, float]:
         """Reconstruction loss diagnostics (MSE + relative L1)."""
-        loss = ((out - x) ** 2).mean()
-        rel_loss = (
-            torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
-        ).mean()
+        loss, rel_loss = recon_diagnostics(x, out, epsilon=epsilon)
         return {"loss": float(loss.item()), "rel_loss": float(rel_loss.item())}
 
 

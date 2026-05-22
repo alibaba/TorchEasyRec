@@ -31,6 +31,33 @@ import torch
 from torch import nn
 
 
+def recon_diagnostics(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    epsilon: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MSE + relative-L1 reconstruction diagnostics.
+
+    Shared by :meth:`SidRqkmeans.update_metric` (which wants tensors for
+    ``torchmetrics.MeanMetric``) and :meth:`ResidualKMeans.train_offline`'s
+    per-layer log line (which converts to Python floats via ``.item()``).
+
+    Args:
+        x: ground-truth embedding, shape (B, D).
+        out: quantized reconstruction, shape (B, D).
+        epsilon: numerical stabilizer for the relative-L1 denominator.
+
+    Returns:
+        mse:  scalar ``((out - x) ** 2).mean()``.
+        rel:  scalar relative-L1 ``mean(|x - out| / (max(|x|, |out|) + eps))``.
+    """
+    mse = ((out - x) ** 2).mean()
+    rel = (
+        torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
+    ).mean()
+    return mse, rel
+
+
 @torch.no_grad()
 def _squared_euclidean_distance(
     x: torch.Tensor,
