@@ -144,6 +144,12 @@ def build_dynamicemb_constraints(
     dynamicemb_cfg: feature_pb2.DynamicEmbedding, emb_config: BaseEmbeddingConfig
 ) -> ParameterConstraints:
     """Build ParameterConstraints for DynamicEmbedding."""
+    if not has_dynamicemb:
+        raise RuntimeError(
+            "dynamicemb is not installed; cannot build constraints for "
+            "features with `dynamicemb { }` set. Install dynamicemb or "
+            "remove the dynamicemb block from the feature config."
+        )
     embedding_dim = emb_config.embedding_dim
     num_embeddings = emb_config.num_embeddings
 

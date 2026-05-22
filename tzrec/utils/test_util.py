@@ -51,6 +51,18 @@ cutlass_hstu_unavailable: Tuple[bool, str] = (
     "hstu_attn_2_cuda wheel is not installed",
 )
 
+try:
+    import torch_fx_tool  # noqa: F401
+
+    _has_torch_fx_tool = True
+except ImportError:
+    _has_torch_fx_tool = False
+
+torch_fx_tool_unavailable: Tuple[bool, str] = (
+    not _has_torch_fx_tool,
+    "torch_fx_tool wheel is not installed (required for RTP export)",
+)
+
 
 def get_compare_tolerance(
     dtype: torch.dtype,
