@@ -72,18 +72,14 @@ def _all_gather_with_grad(
     return gathered
 
 
-class CLIPLoss(nn.Module):
-    """Multi-level CLIP contrastive learning loss.
+class MaskedCLIPLoss(nn.Module):
+    """Masked CLIP loss for mixed recon+clip batches.
 
-    Computes three InfoNCE contrastive losses and returns their mean:
-    - loss_self:  quantized features vs quantized features
-                  (paired items remain similar after quantization)
-    - loss_ori:   quantized features vs original features
-                  (quantization preserves original semantics)
-    - loss_cl:    quantized features vs counterpart original features
-                  (cross-modal alignment)
-
-    Supports distributed all_gather to aggregate global batch.
+    In a mixed batch, recon rows (clip_mask=False) should not
+    contribute to CLIP loss, and recon columns should not serve as
+    negatives.  This module applies row and column masks to achieve
+    selective contrastive learning without data-dependent branching,
+    ensuring ``torch.compile`` compatibility.
 
     Input dict keys:
         'image_embed':      (B, D)  quantized output of first feature
@@ -95,116 +91,11 @@ class CLIPLoss(nn.Module):
         'logit_scale':      scalar  original feature contrast temperature
 
     Output dict keys:
-        'clip_loss':  scalar  mean of three losses
-        'loss_self':  scalar
-        'loss_ori':   scalar
-        'loss_cl':    scalar
-        'clip_acc':   scalar  contrast accuracy (%)
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.labels: Optional[torch.Tensor] = None
-        self.last_local_batch_size: Optional[int] = None
-        self._rank = dist.get_rank() if dist.is_initialized() else 0
-
-    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Compute multi-level CLIP contrastive loss.
-
-        Args:
-            outputs (Dict[str, Tensor]): feature dict, see class docstring.
-
-        Returns:
-            Dict[str, Tensor]: losses and accuracy.
-        """
-        image_embed = outputs["image_embed"]
-        text_embed = outputs["text_embed"]
-        image_embed_ori = outputs["image_embed_ori"]
-        text_embed_ori = outputs["text_embed_ori"]
-        logit_scale = outputs["logit_scale"]
-        logit_scale_self = outputs["logit_scale_self"]
-        logit_scale_cl = outputs["logit_scale_cl"]
-
-        local_batch_size = image_embed.size(0)
-
-        # Update labels when batch size changes (multi-GPU offset)
-        if local_batch_size != self.last_local_batch_size:
-            self.labels = local_batch_size * self._rank + torch.arange(
-                local_batch_size, device=image_embed.device
-            )
-            self.last_local_batch_size = local_batch_size
-
-        # L2 normalize quantized features
-        image_embed = F.normalize(image_embed, dim=-1, p=2)
-        text_embed = F.normalize(text_embed, dim=-1, p=2)
-
-        # All-gather across GPUs (with gradient support)
-        image_embed_all, text_embed_all = _all_gather_with_grad(
-            [image_embed, text_embed]
-        )
-        image_embed_all_ori, text_embed_all_ori = _all_gather_with_grad(
-            [image_embed_ori, text_embed_ori]
-        )
-
-        # --- loss_self: quantized vs quantized ---
-        logits_img_self = logit_scale_self * image_embed @ text_embed_all.t()
-        logits_txt_self = logit_scale_self * text_embed @ image_embed_all.t()
-
-        # --- loss_ori: quantized vs original ---
-        logits_img_ori = logit_scale * image_embed @ text_embed_all_ori.t()
-        logits_txt_ori = logit_scale * text_embed @ image_embed_all_ori.t()
-
-        # --- loss_cl: quantized vs counterpart original ---
-        logits_img_cl = logit_scale_cl * image_embed @ image_embed_all_ori.t()
-        logits_txt_cl = logit_scale_cl * text_embed @ text_embed_all_ori.t()
-
-        loss_self = (
-            F.cross_entropy(logits_img_self, self.labels)
-            + F.cross_entropy(logits_txt_self, self.labels)
-        ) / 2
-        loss_ori = (
-            F.cross_entropy(logits_img_ori, self.labels)
-            + F.cross_entropy(logits_txt_ori, self.labels)
-        ) / 2
-        loss_cl = (
-            F.cross_entropy(logits_img_cl, self.labels)
-            + F.cross_entropy(logits_txt_cl, self.labels)
-        ) / 2
-
-        loss = (loss_self + loss_ori + loss_cl) / 3
-
-        # Retrieval accuracy is a diagnostic, not a training signal — only
-        # spend the four argmax + eq + sum reductions in eval (training-loop
-        # accuracy can be reconstructed from the eval pass).
-        if self.training:
-            acc = torch.zeros((), device=loss.device)
-        else:
-            with torch.no_grad():
-                correct = (
-                    logits_img_self.argmax(-1).eq(self.labels).sum()
-                    + logits_txt_self.argmax(-1).eq(self.labels).sum()
-                    + logits_img_ori.argmax(-1).eq(self.labels).sum()
-                    + logits_txt_ori.argmax(-1).eq(self.labels).sum()
-                )
-                acc = 100 * correct / (local_batch_size * 4)
-
-        return {
-            "clip_loss": loss,
-            "loss_self": loss_self,
-            "loss_ori": loss_ori,
-            "loss_cl": loss_cl,
-            "clip_acc": acc,
-        }
-
-
-class MaskedCLIPLoss(nn.Module):
-    """Masked CLIP loss for mixed recon+clip batches.
-
-    In a mixed batch, recon rows (clip_mask=False) should not
-    contribute to CLIP loss, and recon columns should not serve as
-    negatives.  This module applies row and column masks to achieve
-    selective contrastive learning without data-dependent branching,
-    ensuring ``torch.compile`` compatibility.
+        'clip_loss':  scalar  mean of three losses (self/ori/cl)
+        'clip_acc':   scalar  contrast accuracy (%); 0 during training
+        'loss_self':  scalar  quantized vs quantized
+        'loss_ori':   scalar  quantized vs original
+        'loss_cl':    scalar  quantized vs counterpart original
     """
 
     def __init__(self) -> None:
@@ -254,7 +145,7 @@ class MaskedCLIPLoss(nn.Module):
         """Forward with mask.
 
         Args:
-            outputs: same format as CLIPLoss input dict.
+            outputs: feature dict, see class docstring.
             clip_mask: (B,) bool, True = clip sample.
         """
         image_embed = outputs["image_embed"]
@@ -286,7 +177,7 @@ class MaskedCLIPLoss(nn.Module):
             [image_embed_ori, text_embed_ori]
         )
 
-        # --- Compute six groups of logits (same as CLIPLoss) ---
+        # --- Compute six groups of logits (image/text × self/ori/cl) ---
         logits_img_self = logit_scale_self * image_embed @ text_embed_all.t()
         logits_txt_self = logit_scale_self * text_embed @ image_embed_all.t()
 
