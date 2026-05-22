@@ -370,6 +370,97 @@ class PEPNetTest(unittest.TestCase):
         self.assertEqual(predictions["logits_t2"].size(), (2,))
         self.assertEqual(predictions["probs_t2"].size(), (2,))
 
+    def test_select_domain_task_output(self) -> None:
+        """Test domain selection correctness and numeric sort for ≥10 domains."""
+        tower_names = ["t1", "t2"]
+        domain_count = 10
+        batch_size = 4
+        domain_labels = torch.tensor([0, 3, 9, 5])
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="f1", embedding_dim=4, num_buckets=10
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="domainf", embedding_dim=4, num_buckets=10
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        pepnet_config = multi_task_rank_pb2.PEPNet(
+            task_domain_num=domain_count,
+            domain_input_name="domainf",
+            task_towers=[
+                tower_pb2.TaskTower(
+                    tower_name=tn,
+                    label_name=f"label{i}",
+                    mlp=module_pb2.MLP(hidden_units=[4]),
+                    losses=[
+                        loss_pb2.LossConfig(
+                            binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                        )
+                    ],
+                )
+                for i, tn in enumerate(tower_names)
+            ],
+        )
+        model_config = model_pb2.ModelConfig(
+            feature_groups=[
+                model_pb2.FeatureGroupConfig(
+                    group_name="all",
+                    feature_names=["f1"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                ),
+                model_pb2.FeatureGroupConfig(
+                    group_name="domain",
+                    feature_names=["domainf"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                ),
+            ],
+            pepnet=pepnet_config,
+        )
+        pepnet = PEPNet(
+            model_config=model_config,
+            features=features,
+            labels=["label0", "label1", "domainf"],
+        )
+        init_parameters(pepnet, device=torch.device("cpu"))
+
+        predictions = {}
+        for tower_name in tower_names:
+            for d in range(domain_count):
+                pred_val = torch.full((batch_size,), float(d), dtype=torch.float32)
+                predictions[f"logits_{tower_name}_{d}"] = pred_val
+                predictions[f"probs_{tower_name}_{d}"] = torch.sigmoid(pred_val)
+
+        batch = Batch(
+            dense_features={},
+            sparse_features={},
+            labels={"domainf": domain_labels},
+        )
+
+        selected = pepnet._select_domain_task_output(predictions, batch)
+
+        for tower_name in tower_names:
+            for suffix in ("logits", "probs"):
+                key = f"{suffix}_{tower_name}"
+                self.assertIn(key, selected)
+                got = selected[key]
+                expected = torch.full((batch_size,), float("nan"))
+                for i in range(batch_size):
+                    expected[i] = {
+                        suffix == "logits": float(domain_labels[i].item()),
+                        suffix == "probs": torch.sigmoid(
+                            torch.tensor(float(domain_labels[i].item()))
+                        ).item(),
+                    }[True]
+                self.assertTrue(
+                    torch.allclose(got, expected),
+                    f"{key}: expected {expected}, got {got}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
