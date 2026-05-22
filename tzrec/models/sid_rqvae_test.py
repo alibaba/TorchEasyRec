@@ -59,7 +59,10 @@ class SidRqvaeTest(unittest.TestCase):
         )
         if use_clip:
             sid_rqvae_cfg.clip_config.CopyFrom(
-                sid_model_pb2.ClipConfig(clip_feature_name="image_emb")
+                sid_model_pb2.ClipConfig(
+                    clip_feature_name="image_emb",
+                    is_clip_pair_feature_name="is_clip_pair",
+                )
             )
 
         feature_groups = [
@@ -149,18 +152,23 @@ class SidRqvaeTest(unittest.TestCase):
         model.train()
         model.init_loss()
 
-        # Build mixed batch: first half recon (image_emb == item_emb),
-        # second half clip (image_emb != item_emb)
+        # Build mixed batch: first half recon, second half clip.
+        # With the explicit is_clip_pair column the actual tensor values
+        # no longer matter — the flag column drives routing.
         item_emb = torch.randn(B, input_dim)
-        image_emb = item_emb.clone()
-        image_emb[B // 2 :] = torch.randn(B - B // 2, input_dim)  # clip rows
+        image_emb = torch.randn(B, input_dim)
+        is_clip_pair = torch.zeros(B, 1)
+        is_clip_pair[B // 2 :] = 1.0  # clip rows
 
-        extra = {"image_emb": image_emb}
-        batch = _make_batch(B, input_dim, extra_features=extra)
-        # Override item_emb in batch to match our crafted tensor
-        batch.dense_features[BASE_DATA_GROUP] = KeyedTensor.from_tensor_list(
-            keys=["item_emb", "image_emb"],
-            tensors=[item_emb, image_emb],
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    tensors=[item_emb, image_emb, is_clip_pair],
+                )
+            },
+            sparse_features={},
+            labels={},
         )
 
         predictions = model.predict(batch)
@@ -196,15 +204,16 @@ class SidRqvaeTest(unittest.TestCase):
         model.train()
         model.init_loss()
 
-        # All recon: image_emb == item_emb
+        # All recon: is_clip_pair = 0 everywhere
         item_emb = torch.randn(B, input_dim)
-        image_emb = item_emb.clone()
+        image_emb = torch.randn(B, input_dim)
+        is_clip_pair = torch.zeros(B, 1)
 
         batch = Batch(
             dense_features={
                 BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb"],
-                    tensors=[item_emb, image_emb],
+                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    tensors=[item_emb, image_emb, is_clip_pair],
                 )
             },
             sparse_features={},
@@ -226,15 +235,16 @@ class SidRqvaeTest(unittest.TestCase):
         model.train()
         model.init_loss()
 
-        # All clip: image_emb != item_emb
+        # All clip: is_clip_pair = 1 everywhere
         item_emb = torch.randn(B, input_dim)
         image_emb = torch.randn(B, input_dim)
+        is_clip_pair = torch.ones(B, 1)
 
         batch = Batch(
             dense_features={
                 BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb"],
-                    tensors=[item_emb, image_emb],
+                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    tensors=[item_emb, image_emb, is_clip_pair],
                 )
             },
             sparse_features={},
@@ -267,6 +277,38 @@ class SidRqvaeTest(unittest.TestCase):
             p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
         )
         self.assertTrue(has_grad)
+
+    def test_clip_mask_uses_flag_not_equality(self) -> None:
+        """The is_clip_pair flag (not bit-exact embedding equality) drives
+        routing. Build a batch where ``image_emb == item_emb`` numerically
+        but ``is_clip_pair=1``: row must route to the CLIP branch (under
+        the old bit-exact logic it would have been silently relabeled as
+        recon).
+        """
+        B, input_dim = 4, 32
+        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model.train()
+        model.init_loss()
+
+        item_emb = torch.randn(B, input_dim)
+        image_emb = item_emb.clone()  # bit-identical
+        is_clip_pair = torch.ones(B, 1)  # but flagged as clip
+
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    tensors=[item_emb, image_emb, is_clip_pair],
+                )
+            },
+            sparse_features={},
+            labels={},
+        )
+
+        predictions = model.predict(batch)
+        # All rows flagged as clip -> recon_loss should be 0, clip_loss > 0
+        self.assertEqual(predictions["recon_loss"].item(), 0.0)
+        self.assertGreater(predictions["clip_loss"].item(), 0.0)
 
     def test_commitment_loss_l1_branch(self) -> None:
         """Verify the new commitment_loss='l1' branch is actually taken

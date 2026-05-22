@@ -59,6 +59,13 @@ class SidRqvae(BaseModel):
         self._clip_feature_name = (
             cfg.clip_config.clip_feature_name if self._use_clip else None
         )
+        # Per-sample boolean column flagging clip-vs-recon rows. Required
+        # in clip mode; replaces the prior bit-exact embedding==fea2
+        # discrimination (which silently mislabeled rows on any upstream
+        # float cast / normalization).
+        self._is_clip_pair_feature_name = (
+            cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
+        )
 
         hidden_dims = parse_int_list(cfg.hidden_dims) if cfg.hidden_dims else None
         # Only forward latent_weight when proto sets it; otherwise let
@@ -161,10 +168,13 @@ class SidRqvae(BaseModel):
 
         fea2 = self._extract_feature(batch, self._clip_feature_name)
 
-        # Recon rows are signalled by fea2 == fea1 bit-for-bit (the data
-        # loader writes the same tensor into both columns); everything
-        # else is a clip pair.
-        clip_mask = ~torch.all(embedding == fea2, dim=-1)  # (B,) bool
+        # Read the explicit per-sample flag emitted by the FG layer.
+        # Shape: (B, 1) raw_feature → squeeze to (B,). Any non-zero value
+        # marks a clip pair.
+        is_clip_pair_raw = self._extract_feature(
+            batch, self._is_clip_pair_feature_name
+        )
+        clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
 
         result = self._rqvae.forward_mixed(embedding, fea2, clip_mask)
 

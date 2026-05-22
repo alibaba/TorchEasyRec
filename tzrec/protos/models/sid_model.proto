@@ -18,6 +18,13 @@ message ClipConfig {
     // Name of the second feature (paired with embedding_feature_name
     // to form a contrastive pair).
     required string clip_feature_name = 1;
+    // Name of the per-sample boolean feature (0/1, value_dim=1) that
+    // flags whether the row is a CLIP pair (1) or a reconstruction-only
+    // row (0). Required for mixed recon+clip batches: the model uses
+    // this column directly as the ``clip_mask``. Replaces the prior
+    // bit-exact ``embedding == fea2`` discrimination, which silently
+    // mislabeled rows on any upstream float cast / normalization.
+    required string is_clip_pair_feature_name = 2;
 }
 
 message SidRqvae {
