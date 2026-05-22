@@ -439,8 +439,12 @@ if has_dynamicemb:
                 # ``caching`` -- mirror that override here so the log matches
                 # the runtime, not the planner's recorded (caching, factor).
                 if int(os.environ.get("RANK", 0)) == 0:
+                    # cache_load_factor is bounded to {0.1, ..., 1.0} by the
+                    # enumerator; use `==` so a >1.0 escape fails loud
+                    # downstream (negative HYBRID DDR) instead of being
+                    # silently relabelled HBM_ONLY here.
                     cache_load_factor = float(sharding_option.cache_load_factor)
-                    if cache_load_factor >= 1.0:
+                    if cache_load_factor == 1.0:
                         mode = "HBM_ONLY"
                         dram_bytes = 0  # runtime drops the host tier
                     else:
