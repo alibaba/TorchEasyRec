@@ -152,13 +152,8 @@ class EmitDynamicEmbVariantsTest(unittest.TestCase):
             dynamicemb_options=SimpleNamespace(caching=False, bucket_capacity=128),
         )
 
-    def _make_dynamicemb_options(self):
-        return SimpleNamespace(caching=False, bucket_capacity=128)
-
     def test_unfixed_factor_emits_twenty_variants(self):
-        variants = _emit_dynamicemb_variants(
-            self._make_base(cache_params=None), self._make_dynamicemb_options()
-        )
+        variants = _emit_dynamicemb_variants(self._make_base(cache_params=None))
         self.assertEqual(len(variants), 20)
         cache_modes = sorted({v.dynamicemb_options.caching for v in variants})
         self.assertEqual(cache_modes, [False, True])
@@ -172,8 +167,7 @@ class EmitDynamicEmbVariantsTest(unittest.TestCase):
 
     def test_fixed_factor_emits_two_variants(self):
         variants = _emit_dynamicemb_variants(
-            self._make_base(cache_params=CacheParams(load_factor=0.3)),
-            self._make_dynamicemb_options(),
+            self._make_base(cache_params=CacheParams(load_factor=0.3))
         )
         self.assertEqual(len(variants), 2)
         cache_modes = sorted(v.dynamicemb_options.caching for v in variants)
@@ -183,10 +177,11 @@ class EmitDynamicEmbVariantsTest(unittest.TestCase):
 
     def test_variants_own_dynamicemb_options(self):
         # Per-variant mutation of caching must not bleed across variants.
-        opts = self._make_dynamicemb_options()
-        variants = _emit_dynamicemb_variants(self._make_base(), opts)
+        base = self._make_base()
+        original_opts = base.dynamicemb_options
+        variants = _emit_dynamicemb_variants(base)
         for v in variants:
-            self.assertIsNot(v.dynamicemb_options, opts)
+            self.assertIsNot(v.dynamicemb_options, original_opts)
 
     def test_stats_preserved_on_clone(self):
         class _Stats:
@@ -197,8 +192,7 @@ class EmitDynamicEmbVariantsTest(unittest.TestCase):
 
         stats = _Stats()
         variants = _emit_dynamicemb_variants(
-            self._make_base(cache_params=CacheParams(load_factor=0.2, stats=stats)),
-            self._make_dynamicemb_options(),
+            self._make_base(cache_params=CacheParams(load_factor=0.2, stats=stats))
         )
         for v in variants:
             self.assertIs(v.cache_params.stats, stats)
@@ -332,18 +326,6 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
             "hybrid" if o.shards[0].storage.ddr == 0 else "caching" for o in best
         )
         self.assertEqual(styles, ["caching", "hybrid"])
-
-    def test_legacy_mem_bins_per_device_alias(self):
-        # The legacy kwarg `mem_bins_per_device` is preserved as an alias
-        # for `hbm_bins_per_device`.
-        proposer = DynamicProgrammingProposer(mem_bins_per_device=77)
-        self.assertEqual(proposer._hbm_bins_per_device, 77)
-        # Explicit hbm_bins_per_device takes precedence: when both are
-        # provided, mem_bins_per_device wins (it's the legacy override).
-        proposer = DynamicProgrammingProposer(
-            mem_bins_per_device=77, hbm_bins_per_device=99
-        )
-        self.assertEqual(proposer._hbm_bins_per_device, 77)
 
     def test_empty_search_space_returns_empty_proposal(self):
         proposer = DynamicProgrammingProposer()

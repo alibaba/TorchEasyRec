@@ -227,10 +227,7 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
 _INF = float("inf")
 # Cap per-axis bin count for the 2D DP. Without this, `bins_per_device *
 # num_devices` blows up on multi-host worlds (e.g. 16 GPUs at 100 hbm
-# bins/dev = 1600 bins, * 800 ddr bins = 1.28M cells per table). The
-# budgets are scalar (total HBM, total DDR), so multiplying bins by
-# num_devices stops adding precision past this cap. NumPy vectorization
-# of the inner loop is a follow-up (PR #508 review R5).
+# bins/dev = 1600 bins, * 800 ddr bins = 1.28M cells per table).
 _DP_AXIS_BIN_CAP = 1024
 
 
@@ -252,15 +249,15 @@ class DynamicProgrammingProposer(Proposer):
         dp[i][h][d] = \min_{j} dp[i-1][h - A_h[i][j]][d - A_d[i][j]]
                               + B[i][j]
 
-    Backtracking from each feasible ``(h, d)`` at the last table yields
-    Pareto-optimal proposals across the joint memory budget. The host axis is
+    Backtracking emits one proposal per HBM bin -- the perf-best plan
+    across all DDR bins at that HBM level -- in decreasing HBM order.
+    Plans at the same HBM bin with worse perf are strictly dominated
+    (same HBM cost, higher perf), so they are skipped. The host axis is
     load-bearing for dynamicemb CACHING mode (where DDR = full table) vs
     HYBRID (DDR = ``(1 - load_factor) · table``).
 
     Args:
         hbm_bins_per_device: HBM discretization bins per device. Default 100.
-            (Accepts legacy ``mem_bins_per_device`` as an alias for
-            backwards compatibility.)
         ddr_bins_per_device: DDR discretization bins per device. Default 50 —
             DDR budgets dominate embedding demand, so a coarser axis suffices.
     """
@@ -269,16 +266,9 @@ class DynamicProgrammingProposer(Proposer):
         self,
         hbm_bins_per_device: int = 100,
         ddr_bins_per_device: int = 50,
-        mem_bins_per_device: Optional[int] = None,
     ) -> None:
         self._inited: bool = False
-        # back-compat alias: ``mem_bins_per_device`` mapped to the HBM axis.
-        bins_h = (
-            mem_bins_per_device
-            if mem_bins_per_device is not None
-            else hbm_bins_per_device
-        )
-        self._hbm_bins_per_device: int = max(bins_h, 1)
+        self._hbm_bins_per_device: int = max(hbm_bins_per_device, 1)
         self._ddr_bins_per_device: int = max(ddr_bins_per_device, 1)
         self._sharding_options_by_fqn: OrderedDict[str, List[ShardingOption]] = (
             OrderedDict()
@@ -476,26 +466,24 @@ class DynamicProgrammingProposer(Proposer):
                             cur_dp[new_h_i][new_d_i] = (new_perf, new_h, new_d)
                             cur_back[new_h_i][new_d_i] = (opt_j, h, d)
 
-        # Enumerate proposals in decreasing total memory order. Total memory
-        # is a tie-break heuristic — Pareto-optimal (perf, hbm, ddr) frontier
-        # tends to live at the high end, so larger-mem cells are explored
-        # first and small-mem fallbacks come later.
+        # For each HBM bin, emit only the lowest-perf DDR cell. Any other
+        # (h, d') at the same h has the same HBM cost and worse-or-equal
+        # perf -- strictly dominated, no point proposing. Caps the proposal
+        # count at hbm_bins (<= _DP_AXIS_BIN_CAP), down from
+        # hbm_bins x ddr_bins.
         self._proposal_list = []
+        last_dp = dp[table_count - 1]
         last_back = backtrack[table_count - 1]
-        coords = sorted(
-            (
-                (h, d)
-                for h in range(hbm_bins)
-                for d in range(ddr_bins)
-                if last_back[h][d][0] >= 0
-            ),
-            key=lambda hd: hd[0] + hd[1],
-            reverse=True,
-        )
-        for h, d in coords:
-            cur_opt_idx, prev_h, prev_d = last_back[h][d]
-            if cur_opt_idx < 0:
+        for h in range(hbm_bins - 1, -1, -1):  # high HBM first
+            best_perf = _INF
+            best_d = -1
+            for d in range(ddr_bins):
+                if last_back[h][d][0] >= 0 and last_dp[h][d][0] < best_perf:
+                    best_perf = last_dp[h][d][0]
+                    best_d = d
+            if best_d < 0:
                 continue
+            cur_opt_idx, prev_h, prev_d = last_back[h][best_d]
             proposal_indices = [-1] * table_count
             proposal_indices[table_count - 1] = cur_opt_idx
             for i in range(table_count - 2, -1, -1):
@@ -837,7 +825,6 @@ def calculate_shard_storages(
 
 def _emit_dynamicemb_variants(
     base_option: ShardingOption,
-    dynamicemb_options: Any,
 ) -> List[ShardingOption]:
     """Expand a dynamicemb ShardingOption into HYBRID + CACHING variants.
 
@@ -846,9 +833,10 @@ def _emit_dynamicemb_variants(
     (0.1, 0.2, ..., 1.0). The downstream 2D DP proposer picks per table the
     best (mode, ratio) that fits both HBM and host topology budgets.
 
-    Each returned ShardingOption owns a freshly deep-copied
-    ``dynamicemb_options`` instance so per-option ``caching`` mutations do not
-    bleed across variants.
+    ``base_option.dynamicemb_options`` must already be attached by the
+    caller; each returned ShardingOption owns a freshly deep-copied
+    ``dynamicemb_options`` instance so per-option ``caching`` mutations do
+    not bleed across variants.
     """
     if base_option.cache_params is None:
         load_factors = [(i + 1) / 10 for i in range(10)]
@@ -1047,9 +1035,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
                             sharding_options_per_table.extend(
-                                _emit_dynamicemb_variants(
-                                    sharding_option, dynamicemb_options
-                                )
+                                _emit_dynamicemb_variants(sharding_option)
                             )
                         else:
                             sharding_options_per_table.append(sharding_option)
