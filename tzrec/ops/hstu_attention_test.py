@@ -21,6 +21,7 @@ from tzrec.ops import (
     Kernel,
 )
 from tzrec.utils.test_util import (
+    cutlass_hstu_unavailable,
     generate_sparse_seq_len,
     get_test_dtypes,
     get_test_enable_tma,
@@ -491,6 +492,7 @@ class HSTUAttentionTest(unittest.TestCase):
             real_delta_out,
         )
 
+    @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
@@ -528,6 +530,7 @@ class HSTUAttentionTest(unittest.TestCase):
     # CUTLASS implementation and falls back to Triton internally. The
     # delta/cached path is already covered by ``test_delta_attn_triton``.
 
+    @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     @given(
         batch_size=st.sampled_from([1, 4]),

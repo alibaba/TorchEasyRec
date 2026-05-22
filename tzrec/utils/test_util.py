@@ -39,6 +39,18 @@ gpu_unavailable: Tuple[bool, str] = (
     "CUDA/HIP is not available or no GPUs detected",
 )
 
+try:
+    import hstu_attn_2_cuda  # noqa: F401
+
+    _has_hstu_attn_2_cuda = True
+except ImportError:
+    _has_hstu_attn_2_cuda = False
+
+cutlass_hstu_unavailable: Tuple[bool, str] = (
+    not _has_hstu_attn_2_cuda,
+    "hstu_attn_2_cuda wheel is not installed",
+)
+
 _settings.register_profile(
     "default", _settings(_settings.get_profile("default"), print_blob=True)
 )
