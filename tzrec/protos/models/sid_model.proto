@@ -8,6 +8,10 @@ message SinkhornConfig {
     optional uint32 iters = 1 [default = 5];
     // Sinkhorn sharpness parameter (epsilon).
     optional float epsilon = 2 [default = 10.0];
+    // Whether Sinkhorn uniform assignment is enabled. Default: true.
+    // Set ``enabled: false`` to turn Sinkhorn off while still providing
+    // the sub-config (e.g. to override iters/epsilon for an A/B comparison).
+    optional bool enabled = 3 [default = true];
 }
 
 message ClipConfig {
@@ -47,8 +51,9 @@ message SidRqvae {
     optional bool kmeans_init = 13 [default = true];
 
     // === Optional sub-module configs ===
-    // Sinkhorn uniform assignment (defaults to enabled with
-    // iters=5, epsilon=10.0 when unset).
+    // Sinkhorn uniform assignment. Default behavior when this block is
+    // omitted: enabled with iters=5, epsilon=10.0. Include the sub-config
+    // to override params; set ``enabled: false`` inside it to disable.
     optional SinkhornConfig sinkhorn_config = 15;
     // CLIP contrastive learning (disabled when unset).
     optional ClipConfig clip_config = 16;

@@ -297,6 +297,49 @@ class SidRqvaeTest(unittest.TestCase):
         out.quantization_loss.backward()
         self.assertIsNotNone(x.grad)
 
+    def test_sinkhorn_config_enabled_false(self) -> None:
+        """``sinkhorn_config { enabled: false }`` must turn Sinkhorn off
+        (previously hard-coded ``True`` and the proto block ignored except
+        for iters/epsilon).
+        """
+        n_embed_str = ",".join(["16"] * 2)
+        sid_rqvae_cfg = sid_model_pb2.SidRqvae(
+            input_dim=32,
+            embed_dim=8,
+            codebook=n_embed_str,
+            forward_mode="ste",
+            loss_type="mse",
+            kmeans_init=False,
+            embedding_feature_name="item_emb",
+        )
+        sid_rqvae_cfg.sinkhorn_config.CopyFrom(
+            sid_model_pb2.SinkhornConfig(enabled=False)
+        )
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["item_emb"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups,
+            sid_rqvae=sid_rqvae_cfg,
+        )
+        model = SidRqvae(model_config=model_config, features=[], labels=[])
+        init_parameters(model, device=torch.device("cpu"))
+
+        for layer in model._rqvae.quantizer.layers:
+            self.assertFalse(layer.use_sinkhorn)
+
+    def test_sinkhorn_config_default_enabled(self) -> None:
+        """Omitting ``sinkhorn_config`` preserves the pre-existing
+        on-by-default behavior (back-compat for legacy configs).
+        """
+        model = self._create_model()  # no sinkhorn_config set
+        for layer in model._rqvae.quantizer.layers:
+            self.assertTrue(layer.use_sinkhorn)
+
     def test_commitment_loss_invalid_raises(self) -> None:
         """ResidualQuantized rejects unknown commitment_loss spellings."""
         from tzrec.modules.sid_generation.residual_quantized import (

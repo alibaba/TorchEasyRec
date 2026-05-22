@@ -71,11 +71,14 @@ class SidRqvae(BaseModel):
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
-        # Parse Sinkhorn sub-config (defaults: enabled, iters=5, epsilon=10.0)
+        # Parse Sinkhorn sub-config (defaults: enabled, iters=5, epsilon=10.0).
+        # When the block is provided, ``enabled`` defaults to True so legacy
+        # configs that set only iters/epsilon stay opt-in to Sinkhorn.
         use_sinkhorn = True
         sinkhorn_iters = 5
         sinkhorn_epsilon = 10.0
         if cfg.HasField("sinkhorn_config"):
+            use_sinkhorn = cfg.sinkhorn_config.enabled
             sinkhorn_iters = cfg.sinkhorn_config.iters
             sinkhorn_epsilon = cfg.sinkhorn_config.epsilon
 
