@@ -223,8 +223,6 @@ class ResidualQuantized(nn.Module):
                 1 - F.cosine_similarity(x.detach(), quant, dim=-1)
             ).mean() * self.commitment_w2
         elif self.commitment_loss_type == "l1":
-            # Mirrors the l2 branch with elementwise abs; same reduction
-            # so the two w1/w2 knobs scale identically across loss types.
             loss1 = (x - quant.detach()).abs().mean() * self.commitment_w1
             loss2 = (x.detach() - quant).abs().mean() * self.commitment_w2
         else:  # 'l2'

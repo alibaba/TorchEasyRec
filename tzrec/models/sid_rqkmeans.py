@@ -127,6 +127,12 @@ class SidRqkmeans(BaseModel):
 
         # Training: buffer for the end-of-loop FAISS fit and return dummy
         # codes — the codebook does not exist yet.
+        # TODO(perf): .cpu() is a synchronous D2H per step and the buffer
+        # grows unbounded with steps. Rework to either (a) GPU-resident
+        # buffer + bulk D2H in on_train_end with size cap, or (b) replace
+        # the train pass with an inference_mode corpus walk launched from
+        # on_train_end. Skipped here to avoid OOM-vs-refactor tradeoffs;
+        # tracked separately.
         if self.is_train:
             self._offline_buffer.append(embedding.detach().cpu())
             B = embedding.shape[0]
@@ -241,21 +247,12 @@ class SidRqkmeans(BaseModel):
             dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         )
 
-        # The bare ``if not self._offline_buffer: return`` is a LOCAL
-        # decision and deadlocks under DDP: a rank whose loader shipped
-        # zero samples would return immediately, while peers fall through
-        # into ``dist.gather_object(...)`` and block forever waiting for
-        # the absentee. Vote collectively with an OR (``ReduceOp.MAX`` on
-        # a bool tensor) and have every rank bail together if ANY rank's
-        # buffer is empty. Strict-but-safe: an empty rank in this
-        # end-of-training path is almost always a misconfig (skewed
-        # loader, dataset smaller than world_size) — better to surface it
-        # via the warning than to silently fit on a truncated corpus.
+        # A local-only empty check would deadlock: the empty rank returns
+        # while peers block in gather_object below. OR the flag across
+        # ranks and bail together if any rank is empty.
         local_empty = len(self._offline_buffer) == 0
         if is_ddp:
-            # Use int32 on the model's device (NCCL is finicky about bool
-            # dtype across versions; same reasoning as the comment on
-            # `_is_initialized` broadcast below).
+            # int32, not bool — NCCL bool support is version-dependent.
             flag = torch.tensor(
                 int(local_empty),
                 dtype=torch.int32,

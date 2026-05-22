@@ -48,7 +48,7 @@ message SidRqvae {
     optional bool normalize_residuals = 7 [default = false];
     // Distance metric: "l2" or "cosine".
     optional string distance_type = 9 [default = "l2"];
-    // Commitment loss type: "l2" or "cos".
+    // Commitment loss type: "l2", "l1" or "cos".
     optional string commitment_loss = 10 [default = "l2"];
     // Commitment loss weights [w1, w2], comma-separated.
     optional string latent_weight = 11 [default = "1.0,0.5"];

@@ -59,10 +59,6 @@ class SidRqvae(BaseModel):
         self._clip_feature_name = (
             cfg.clip_config.clip_feature_name if self._use_clip else None
         )
-        # Per-sample boolean column flagging clip-vs-recon rows. Required
-        # in clip mode; replaces the prior bit-exact embedding==fea2
-        # discrimination (which silently mislabeled rows on any upstream
-        # float cast / normalization).
         self._is_clip_pair_feature_name = (
             cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
         )
@@ -78,9 +74,6 @@ class SidRqvae(BaseModel):
         n_embed_list = parse_int_list(cfg.codebook)
         n_layers = len(n_embed_list)
 
-        # Parse Sinkhorn sub-config (defaults: enabled, iters=5, epsilon=10.0).
-        # When the block is provided, ``enabled`` defaults to True so legacy
-        # configs that set only iters/epsilon stay opt-in to Sinkhorn.
         use_sinkhorn = True
         sinkhorn_iters = 5
         sinkhorn_epsilon = 10.0
@@ -168,9 +161,6 @@ class SidRqvae(BaseModel):
 
         fea2 = self._extract_feature(batch, self._clip_feature_name)
 
-        # Read the explicit per-sample flag emitted by the FG layer.
-        # Shape: (B, 1) raw_feature → squeeze to (B,). Any non-zero value
-        # marks a clip pair.
         is_clip_pair_raw = self._extract_feature(batch, self._is_clip_pair_feature_name)
         clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
 
