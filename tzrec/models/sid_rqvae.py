@@ -214,9 +214,11 @@ class SidRqvae(BaseModel):
         self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
         # Loss values are already logged by the framework via loss(); only
-        # quantization quality + sid uniqueness need the metric path.
+        # quantization quality needs the train-path metric. unique_sid_ratio
+        # is intentionally eval-only: torch.unique(codes, dim=0).shape[0]
+        # forces a GPU->host sync every step, and codebook coverage is a
+        # diagnostic, not a training signal.
         self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
-        self._train_metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
 
     def update_train_metric(
         self,
@@ -233,11 +235,6 @@ class SidRqvae(BaseModel):
             embedding = self._extract_feature(batch)
             mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
             self._train_metric_modules["mse"].update(mse)
-
-        codes = predictions["codes"]
-        B = codes.shape[0]
-        unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._train_metric_modules["unique_sid_ratio"].update(unique_sids / B)
 
     def update_metric(
         self,
