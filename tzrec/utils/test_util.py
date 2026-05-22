@@ -51,6 +51,32 @@ cutlass_hstu_unavailable: Tuple[bool, str] = (
     "hstu_attn_2_cuda wheel is not installed",
 )
 
+
+def get_compare_tolerance(
+    dtype: torch.dtype,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return (atol, rtol) for Triton-vs-PyTorch tensor comparisons.
+
+    PyTorch's defaults are tuned to CUDA's reduction order. On PPU
+    (alixpu), Triton-compiled matmul / fp32 reductions land at a
+    slightly wider ULP envelope (observed rel ~5e-6 in test_addmm,
+    abs ~3e-5 in test_jagged_dense_bmm). Returns the PyTorch defaults
+    (None, None) on non-PPU hosts so we don't widen the NV regression
+    guard.
+    """
+    from tzrec.ops import is_ppu_arch
+
+    if not is_ppu_arch():
+        return (None, None)
+    if dtype == torch.float32:
+        return (1e-4, 1e-5)
+    if dtype == torch.bfloat16:
+        return (1e-2, 1e-2)
+    if dtype == torch.float16:
+        return (1e-3, 1e-3)
+    return (None, None)
+
+
 _settings.register_profile(
     "default", _settings(_settings.get_profile("default"), print_blob=True)
 )
