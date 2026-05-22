@@ -395,5 +395,91 @@ class DynamicEmbCalcShardStoragesTest(unittest.TestCase):
             self.assertEqual(w.ddr, base.ddr)
 
 
+import os  # noqa: E402  (placed after the parameterized import block above)
+
+
+class PlanLogLineTest(unittest.TestCase):
+    """``_log_dynamicemb_table_plan`` -- mode label + GiB unit + rank gating."""
+
+    def _capture(self, **kwargs):
+        with mock.patch.object(dynamicemb_util.logger, "info") as m:
+            dynamicemb_util._log_dynamicemb_table_plan(**kwargs)
+        return [c.args[0] for c in m.call_args_list]
+
+    def test_hybrid_partial_factor_logs_hybrid(self):
+        msgs = self._capture(
+            fqn="m.t",
+            cache_load_factor=0.5,
+            caching=False,
+            hbm_bytes=1 << 30,
+            ddr_bytes=2 << 30,
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("mode=HYBRID", msgs[0])
+        self.assertIn("cache_load_factor=0.50", msgs[0])
+        self.assertIn("local_hbm=1.000GiB", msgs[0])
+        self.assertIn("local_dram=2.000GiB", msgs[0])
+
+    def test_caching_partial_factor_logs_caching(self):
+        msgs = self._capture(
+            fqn="m.t",
+            cache_load_factor=0.3,
+            caching=True,
+            hbm_bytes=1 << 30,
+            ddr_bytes=5 << 30,
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("mode=CACHING", msgs[0])
+        self.assertIn("local_dram=5.000GiB", msgs[0])
+
+    def test_hybrid_at_1_0_logs_hbm_only(self):
+        msgs = self._capture(
+            fqn="m.t",
+            cache_load_factor=1.0,
+            caching=False,
+            hbm_bytes=4 << 30,
+            ddr_bytes=0,
+        )
+        self.assertIn("mode=HBM_ONLY", msgs[0])
+        self.assertIn("local_dram=0.000GiB", msgs[0])
+
+    def test_caching_at_1_0_logs_hbm_only(self):
+        # Override path: even though caching=True, x=1.0 collapses to
+        # HBM_ONLY at runtime and ddr is reported as 0 (would be 5GiB
+        # without the override).
+        msgs = self._capture(
+            fqn="m.t",
+            cache_load_factor=1.0,
+            caching=True,
+            hbm_bytes=4 << 30,
+            ddr_bytes=5 << 30,
+        )
+        self.assertIn("mode=HBM_ONLY", msgs[0])
+        self.assertIn("local_dram=0.000GiB", msgs[0])
+
+    def test_non_rank_zero_is_silent(self):
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            msgs = self._capture(
+                fqn="m.t",
+                cache_load_factor=0.5,
+                caching=False,
+                hbm_bytes=1 << 30,
+                ddr_bytes=2 << 30,
+            )
+        self.assertEqual(msgs, [])
+
+    def test_just_above_1_0_does_not_relabel(self):
+        # Exact-equality guard: a hypothetical leak of cache_load_factor
+        # >1.0 from upstream must NOT be silently relabelled HBM_ONLY.
+        msgs = self._capture(
+            fqn="m.t",
+            cache_load_factor=1.0001,
+            caching=True,
+            hbm_bytes=1 << 30,
+            ddr_bytes=2 << 30,
+        )
+        self.assertIn("mode=CACHING", msgs[0])  # not HBM_ONLY
+
+
 if __name__ == "__main__":
     unittest.main()

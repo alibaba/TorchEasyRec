@@ -327,6 +327,28 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         )
         self.assertEqual(styles, ["caching", "hybrid"])
 
+    def test_per_machine_ddr_prune_on_multi_host_topology(self):
+        # 4 GPUs across 2 machines (local_world_size=2). Each machine has
+        # 1000 DDR; total = 2000. An option whose per-shard ddr is 1500
+        # exceeds the 1000 per-machine cap and must be pruned, even
+        # though 1500 < ddr_total. The 900-ddr option fits.
+        topology = _make_topology(
+            num_devices=4,
+            local_world_size=2,
+            hbm_per_device=2000,
+            ddr_per_device=500,
+        )
+        # 1500 > per-machine cap (1000) -> pruned, no proposal.
+        proposals_pruned = self._run(
+            [_FakeShardingOption("t", hbm=100, ddr=1500, perf=10.0)], topology
+        )
+        self.assertEqual(proposals_pruned, [])
+        # 900 <= per-machine cap (1000) -> survives, proposal emitted.
+        proposals_fit = self._run(
+            [_FakeShardingOption("t", hbm=100, ddr=900, perf=10.0)], topology
+        )
+        self.assertGreater(len(proposals_fit), 0)
+
     def test_empty_search_space_returns_empty_proposal(self):
         proposer = DynamicProgrammingProposer()
         proposer.load([])

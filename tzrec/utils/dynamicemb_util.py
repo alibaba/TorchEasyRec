@@ -97,6 +97,40 @@ def _dynamicemb_effective_cache_ratio(
     return base + _DYNAMICEMB_X_EFF_TIEBREAK * x
 
 
+def _log_dynamicemb_table_plan(
+    *,
+    fqn: str,
+    cache_load_factor: float,
+    caching: bool,
+    hbm_bytes: int,
+    ddr_bytes: int,
+) -> None:
+    """Per-table mode log on rank 0.
+
+    cache_load_factor=1.0 forces the runtime into HBM_ONLY (host tier
+    dropped) regardless of ``caching`` -- mirror that override here so
+    the log matches the runtime, not the planner's recorded
+    (caching, factor). Use exact equality so a stray >1.0 fails loud
+    downstream instead of being silently relabelled HBM_ONLY.
+    """
+    if int(os.environ.get("RANK", 0)) != 0:
+        return
+    if cache_load_factor == 1.0:
+        mode = "HBM_ONLY"
+        dram_bytes = 0  # runtime drops the host tier
+    else:
+        mode = "CACHING" if caching else "HYBRID"
+        dram_bytes = ddr_bytes
+    hbm_gib = hbm_bytes / (1 << 30)
+    dram_gib = dram_bytes / (1 << 30)
+    logger.info(
+        f"[dynamicemb plan] {fqn}: mode={mode} "
+        f"cache_load_factor={cache_load_factor:.2f} "
+        f"local_hbm={hbm_gib:.3f}GiB "
+        f"local_dram={dram_gib:.3f}GiB"
+    )
+
+
 has_dynamicemb = False
 try:
     import dynamicemb
@@ -434,31 +468,13 @@ if has_dynamicemb:
                     dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
                 )
-                # Per-table mode log on rank 0. cache_load_factor=1.0 forces
-                # the runtime into HBM_ONLY (host tier dropped) regardless of
-                # ``caching`` -- mirror that override here so the log matches
-                # the runtime, not the planner's recorded (caching, factor).
-                if int(os.environ.get("RANK", 0)) == 0:
-                    # cache_load_factor is bounded to {0.1, ..., 1.0} by the
-                    # enumerator; use `==` so a >1.0 escape fails loud
-                    # downstream (negative HYBRID DDR) instead of being
-                    # silently relabelled HBM_ONLY here.
-                    cache_load_factor = float(sharding_option.cache_load_factor)
-                    if cache_load_factor == 1.0:
-                        mode = "HBM_ONLY"
-                        dram_bytes = 0  # runtime drops the host tier
-                    else:
-                        mode = "CACHING" if dynamicemb_options.caching else "HYBRID"
-                        dram_bytes = shards[0].storage.ddr
-                    hbm_gib = shards[0].storage.hbm / (1 << 30)
-                    dram_gib = dram_bytes / (1 << 30)
-                    fqn = f"{sharding_option.path}.{sharding_option.name}"
-                    logger.info(
-                        f"[dynamicemb plan] {fqn}: mode={mode} "
-                        f"cache_load_factor={cache_load_factor:.2f} "
-                        f"local_hbm={hbm_gib:.3f}GiB "
-                        f"local_dram={dram_gib:.3f}GiB"
-                    )
+                _log_dynamicemb_table_plan(
+                    fqn=f"{sharding_option.path}.{sharding_option.name}",
+                    cache_load_factor=float(sharding_option.cache_load_factor),
+                    caching=bool(dynamicemb_options.caching),
+                    hbm_bytes=int(shards[0].storage.hbm),
+                    ddr_bytes=int(shards[0].storage.ddr),
+                )
             else:
                 module_plan[sharding_option.name] = ParameterSharding(
                     sharding_spec=sharding_spec,
