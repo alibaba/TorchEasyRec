@@ -67,25 +67,11 @@ torch_fx_tool_unavailable: Tuple[bool, str] = (
 def get_compare_tolerance(
     dtype: torch.dtype,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Return (atol, rtol) for Triton-vs-PyTorch tensor comparisons.
-
-    PyTorch's defaults are tuned to CUDA's reduction order. On PPU
-    (alixpu), Triton-compiled matmul / fp32 reductions land at a
-    slightly wider ULP envelope (observed rel ~5e-6 in test_addmm,
-    abs ~3e-5 in test_jagged_dense_bmm). Returns the PyTorch defaults
-    (None, None) on non-PPU hosts so we don't widen the NV regression
-    guard.
-    """
+    """Return (atol, rtol) for Triton-vs-PyTorch comparisons; widen fp32 on PPU."""
     from tzrec.ops import is_ppu_arch
 
-    if not is_ppu_arch():
-        return (None, None)
-    if dtype == torch.float32:
-        return (1e-4, 1e-5)
-    if dtype == torch.bfloat16:
-        return (1e-2, 1e-2)
-    if dtype == torch.float16:
-        return (1e-3, 1e-3)
+    if is_ppu_arch() and dtype == torch.float32:
+        return (3e-5, 2e-5)
     return (None, None)
 
 

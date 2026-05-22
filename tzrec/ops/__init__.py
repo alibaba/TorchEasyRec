@@ -28,13 +28,7 @@ _is_ppu_arch_cached: Optional[bool] = None
 
 
 def is_ppu_arch() -> bool:
-    """Return True if a CUDA device is the Alibaba PPU (alixpu) accelerator.
-
-    PPUs surface to torch as CUDA devices via the alixpu shim and report
-    capability (8, 0), so they look like Ampere on every other detector.
-    We distinguish them by device-name substring. Cached after first call;
-    safe to call before CUDA init (returns False on any error).
-    """
+    """Return True if a CUDA device is an Alibaba PPU (alixpu) accelerator."""
     global _is_ppu_arch_cached
     if _is_ppu_arch_cached is None:
         try:

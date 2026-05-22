@@ -258,9 +258,7 @@ def _weighted_layer_norm_bwd_dx(
 
 
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
-    # Cap num_warps at 16 on PPU: alixpu Triton mis-compiles num_warps=32
-    # for this reduction kernel and produces wrong dw for rms_norm bwd at
-    # bf16 D=257 (observed at PR #522 / run 26218011590).
+    # PPU Triton mis-compiles num_warps=32 for this reduction kernel.
     from tzrec.ops import is_ppu_arch
 
     skip_32_warps = torch.ops.hip or is_ppu_arch()
