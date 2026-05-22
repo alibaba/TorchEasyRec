@@ -303,8 +303,8 @@ def _build_dynamic_shapes(
 
     Args:
         data: input tensor dict from Batch.to_dict().
-        features: list of BaseFeature from model._features.
-        feature_groups: list of FeatureGroupConfig from model._feature_groups.
+        features: list of BaseFeature from model.features.
+        feature_groups: list of FeatureGroupConfig from model.feature_groups.
 
     Returns:
         dynamic_shapes dict for torch.export.export().
@@ -467,14 +467,14 @@ def export_unified_model_aot(
 
     # Pad any 0-size non-sequence sparse .values tensors so torch.export
     # doesn't specialize on the empty size (which conflicts with dynamic Dims).
-    seq_feat_names = {f.name for f in model._features if f.is_sequence}
+    seq_feat_names = {f.name for f in model.features if f.is_sequence}
     data = _pad_empty_sparse_values(data, seq_feat_names)
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
         data,
-        features=model._features,
-        feature_groups=model._feature_groups,
+        features=model.features,
+        feature_groups=model.feature_groups,
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 

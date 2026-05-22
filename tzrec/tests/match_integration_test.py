@@ -378,9 +378,50 @@ class MatchIntegrationTest(unittest.TestCase):
         )
         if self.success:
             self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+            )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="ENABLE_AOT=1",
+                item_input_path="data/test/kuairand-1k-match-item-c1.parquet",
+            )
+        if self.success:
+            # Item tower scalar export view: predict over the item-only
+            # parquet (one row per video_id) and emit item embeddings.
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/item"),
+                predict_input_path="data/test/kuairand-1k-match-item-c1.parquet",
+                predict_output_path=os.path.join(self.test_dir, "item_emb"),
+                reserved_columns="video_id",
+                output_columns="item_tower_emb",
+                test_dir=self.test_dir,
+            )
+        if self.success:
+            # User tower keeps the training-shape sequence view: predict
+            # over the eval parquet (which carries the user-side columns).
+            self.success = utils.test_predict(
+                scripted_model_path=os.path.join(self.test_dir, "export/user"),
+                predict_input_path=(
+                    "data/test/kuairand-1k-match-eval-c4096-s100.parquet"
+                ),
+                predict_output_path=os.path.join(self.test_dir, "user_emb"),
+                reserved_columns="user_id",
+                output_columns="user_tower_emb",
+                test_dir=self.test_dir,
             )
         self.assertTrue(self.success)
+        for side in ("user", "item"):
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        self.test_dir, f"export/{side}/scripted_sparse_model.pt"
+                    )
+                ),
+                f"missing AOT scripted sparse model for {side} tower",
+            )
 
 
 if __name__ == "__main__":
