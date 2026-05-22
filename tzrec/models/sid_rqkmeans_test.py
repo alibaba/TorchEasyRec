@@ -132,21 +132,52 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         model = self._create_model()
         model.on_train_end()  # should not raise
 
-    def test_is_initialized_not_in_state_dict(self) -> None:
-        """``_is_initialized`` must be ``persistent=False``.
+    def test_post_fit_checkpoint_round_trips(self) -> None:
+        """Fit → save state_dict → load into fresh instance → predict.
 
-        Otherwise a mid-training checkpoint would ship ``True`` next to
-        still-zero centroids, and a resume-then-infer would silently
-        return dummy zero codes.
+        After loading, ``predict`` must return real (non-zero) codes —
+        the centroids and the ``_is_initialized`` flag both need to come
+        through the state_dict.
         """
-        model = self._create_model()
-        sd_keys = list(model.state_dict().keys())
-        leaked = [k for k in sd_keys if k.endswith("_is_initialized")]
-        self.assertEqual(
-            leaked,
-            [],
-            f"_is_initialized leaked into state_dict: {leaked}",
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+        B, input_dim = 64, 32
+        src = self._create_model(input_dim=input_dim)
+        src.train()
+        for _ in range(8):
+            src.predict(_make_batch(B, input_dim))
+        src.on_train_end()
+        sd = src.state_dict()
+
+        dst = self._create_model(input_dim=input_dim)
+        dst.load_state_dict(sd)
+        dst.eval()
+        codes = dst.predict(_make_batch(B, input_dim))["codes"]
+        self.assertGreater(
+            codes.abs().sum().item(),
+            0,
+            "post-fit checkpoint resume produced all-zero codes",
         )
+
+    def test_mid_fit_checkpoint_rejected_on_load(self) -> None:
+        """Tampered state (_is_initialized=True + zero centroids) raises."""
+        model = self._create_model()
+        sd = model.state_dict()
+        # Simulate a checkpoint that captured the flag mid-fit (before
+        # load_centroids_ ran): True flag, zero centroids.
+        layer0_prefix = next(
+            k.rsplit("._is_initialized", 1)[0]
+            for k in sd
+            if k.endswith("._is_initialized")
+        )
+        sd[f"{layer0_prefix}._is_initialized"] = torch.tensor(True)
+
+        fresh = self._create_model()
+        with self.assertRaisesRegex(RuntimeError, "mid-FAISS-fit"):
+            fresh.load_state_dict(sd)
 
 
 if __name__ == "__main__":

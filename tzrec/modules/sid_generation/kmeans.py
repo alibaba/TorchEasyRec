@@ -222,14 +222,10 @@ class KMeansLayer(nn.Module):
         self.n_features = n_features
 
         self.register_buffer("centroids", torch.zeros(n_clusters, n_features))
-        # ``_is_initialized`` is flipped by ``load_centroids_`` after the
-        # offline FAISS fit completes. Keep it OUT of the state dict
-        # (``persistent=False``): a checkpoint taken mid-training would
-        # otherwise ship ``True`` alongside still-zero centroids, and a
-        # later resume-then-infer would silently return dummy zero codes
-        # instead of raising. Each load must re-run ``load_centroids_``
-        # (or the FAISS fit) to set the flag.
-        self.register_buffer("_is_initialized", torch.tensor(False), persistent=False)
+        # Flipped by ``load_centroids_`` after the FAISS fit. Persistent
+        # so a normal post-fit checkpoint round-trips; mid-fit poisoning
+        # (True flag + still-zero centroids) is caught in _load_from_state_dict.
+        self.register_buffer("_is_initialized", torch.tensor(False))
 
     @property
     def is_initialized(self) -> bool:
@@ -252,6 +248,33 @@ class KMeansLayer(nn.Module):
             centroids.to(dtype=self.centroids.dtype, device=self.centroids.device)
         )
         self._is_initialized.fill_(True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Reject mid-fit-checkpoint state dicts (True flag + zero centroids)."""
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if bool(self._is_initialized.item()) and self.centroids.abs().sum() == 0:
+            error_msgs.append(
+                f"KMeansLayer at '{prefix}': _is_initialized=True but centroids "
+                "are all zero — checkpoint was likely taken mid-FAISS-fit. "
+                "Re-run on_train_end to produce a valid checkpoint."
+            )
 
     @torch.no_grad()
     def predict(self, batch: torch.Tensor) -> torch.Tensor:
