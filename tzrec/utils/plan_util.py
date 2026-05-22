@@ -232,34 +232,51 @@ _DP_AXIS_BIN_CAP = 1024
 
 
 class DynamicProgrammingProposer(Proposer):
-    r"""Proposes sharding plans via 2D (HBM × DDR) dynamic programming.
+    r"""Proposes sharding plans in 2D (HBM × DDR) dynamic programming fashion.
 
-    Given :math:`M` tables each with up to :math:`N` ShardingOptions, pick one
-    option per table to minimize total perf while respecting both per-rank
-    HBM and per-machine DDR budgets from the topology. (HBM is GPU-local, so
-    each device gets its own quota; DDR is host-shared across ranks
-    co-located on the same machine, so the prune threshold is the sum over
-    a ``local_world_size``-sized window.)
+        The problem of the Embedding Sharding Plan can be framed as follows: Given
+    :math:`M` tables and their corresponding :math:`N` Sharding Options, we need to
+    select one sharding option for each table such that the total performance is
+    minimized, while keeping both an HBM constraint :math:`K_h` and a host DDR
+    constraint :math:`K_d` in check. This can be abstracted into the following
+    mathematical formulation:
 
-    Each axis (HBM, DDR) is discretized into bins; ``dp[table][h][d]`` holds
-    the minimum perf over the first ``table`` tables using ``≈ h`` HBM bins
-    and ``≈ d`` DDR bins. The transition is:
+    Given matrices :math:`A^h`, :math:`A^d`, and :math:`B` of dimensions
+    :math:`(M, N)`, let :math:`a^h_{i,j}` and :math:`a^d_{i,j}` be the per-option
+    HBM and DDR storage costs, and :math:`b_{i,j}` the perf cost. We aim to find a
+    set of column indices :math:`\{ j_0, j_1, \ldots, j_{M-1} \}` such that the
+    following conditions are satisfied:
+
+    1. :math:`\sum_{i=0}^{M-1} a^h_{i,j_i} \leq K_h`.
+    2. :math:`\sum_{i=0}^{M-1} a^d_{i,j_i} \leq K_d`.
+    3. :math:`\sum_{i=0}^{M-1} b_{i,j_i}` is minimized.
+
+    This problem can be tackled using 2D dynamic programming. First, discretize
+    :math:`K_h` and :math:`K_d` into bins, and denote the discretization functions
+    as :math:`f_h` and :math:`f_d`.
+
+    Define the state :math:`dp[i][f_h(k_h)][f_d(k_d)]` to represent the minimum
+    value of :math:`B` when considering the first :math:`i` rows and the totals of
+    :math:`A^h` and :math:`A^d` equal the discretized values :math:`k_h` and
+    :math:`k_d` respectively.
+
+    The state transition can then be represented as:
 
     .. math::
-        dp[i][h][d] = \min_{j} dp[i-1][h - A_h[i][j]][d - A_d[i][j]]
-                              + B[i][j]
+        dp[i][f_h(k_h)][f_d(k_d)] = \min_{j=0}^{N-1} \left(
+            dp[i-1][f_h(k_h - a^h_{i,j})][f_d(k_d - a^d_{i,j})] + b_{i,j} \right)
 
-    Backtracking emits one proposal per HBM bin -- the perf-best plan
-    across all DDR bins at that HBM level -- in decreasing HBM order.
-    Plans at the same HBM bin with worse perf are strictly dominated
-    (same HBM cost, higher perf), so they are skipped. The host axis is
-    load-bearing for dynamicemb CACHING mode (where DDR = full table) vs
-    HYBRID (DDR = ``(1 - load_factor) · table``).
+    Since :math:`K_h` and :math:`K_d` are sums allocated across all memory, simply
+    satisfying that the totals in the plan equal them does not guarantee that the
+    allocation will fit on all cards / hosts. Therefore, it is essential to
+    maintain all the states of the last layer of :math:`dp`. For each HBM bin we
+    emit one proposal -- the lowest-:math:`B` plan across all DDR bins at that
+    HBM level -- in decreasing HBM order; plans at the same HBM bin with worse
+    perf are strictly dominated and skipped.
 
     Args:
-        hbm_bins_per_device: HBM discretization bins per device. Default 100.
-        ddr_bins_per_device: DDR discretization bins per device. Default 50 —
-            DDR budgets dominate embedding demand, so a coarser axis suffices.
+        hbm_bins_per_device (int): per-device HBM bins for DP precision.
+        ddr_bins_per_device (int): per-device DDR bins for DP precision.
     """
 
     def __init__(
