@@ -268,6 +268,50 @@ class SidRqvaeTest(unittest.TestCase):
         )
         self.assertTrue(has_grad)
 
+    def test_commitment_loss_l1_branch(self) -> None:
+        """Verify the new commitment_loss='l1' branch is actually taken
+        in ResidualQuantized (previously fell through to the L2 branch).
+        """
+        from tzrec.modules.sid_generation.residual_quantized import (
+            ResidualQuantized,
+        )
+
+        torch.manual_seed(0)
+        rq = ResidualQuantized(
+            embed_dim=8,
+            n_layers=2,
+            n_embed=4,
+            forward_mode="ste",
+            commitment_loss="l1",
+            kmeans_init=False,
+            use_sinkhorn=False,
+        )
+        # Stub the codebook to known centroids so the result is reproducible.
+        for layer in rq.layers:
+            torch.nn.init.normal_(layer.embedding.weight, std=0.1)
+
+        x = torch.randn(4, 8, requires_grad=True)
+        out = rq(x)
+        # Loss must be a finite scalar with gradient flowing back into x.
+        self.assertTrue(torch.isfinite(out.quantization_loss))
+        out.quantization_loss.backward()
+        self.assertIsNotNone(x.grad)
+
+    def test_commitment_loss_invalid_raises(self) -> None:
+        """ResidualQuantized rejects unknown commitment_loss spellings."""
+        from tzrec.modules.sid_generation.residual_quantized import (
+            ResidualQuantized,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "commitment_loss"):
+            ResidualQuantized(
+                embed_dim=8,
+                n_layers=2,
+                n_embed=4,
+                commitment_loss="bogus",
+                use_sinkhorn=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

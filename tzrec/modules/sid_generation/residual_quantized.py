@@ -50,7 +50,7 @@ class ResidualQuantized(nn.Module):
             quantization layer. Default: False.
         distance_type (str|List[str]): distance metric per layer,
             'l2' or 'cosine'. Supports per-layer list. Default: 'l2'.
-        commitment_loss (str): commitment loss type, 'l2' or 'cos'.
+        commitment_loss (str): commitment loss type, 'l2', 'l1' or 'cos'.
             Default: 'l2'.
         latent_weight (List[float]): commitment loss weights [w1, w2].
             w1: x toward quant (encoder side).
@@ -87,6 +87,9 @@ class ResidualQuantized(nn.Module):
         sinkhorn_epsilon: float = 10.0,
     ) -> None:
         super().__init__()
+        assert commitment_loss in ("l2", "l1", "cos"), (
+            f"commitment_loss must be 'l2', 'l1' or 'cos', got {commitment_loss!r}"
+        )
         self.embed_dim = embed_dim
         self.n_layers = n_layers
         self.normalize_residuals = normalize_residuals
@@ -198,6 +201,7 @@ class ResidualQuantized(nn.Module):
 
           - cos: (1 - cosine_similarity) * weight
           - l2:  (x - quant)^2.mean() * weight
+          - l1:  |x - quant|.mean() * weight
 
         Both directions are always summed:
             loss1 = encoder-toward-quant (gradient flows into encoder)
@@ -218,6 +222,11 @@ class ResidualQuantized(nn.Module):
             loss2 = (
                 1 - F.cosine_similarity(x.detach(), quant, dim=-1)
             ).mean() * self.commitment_w2
+        elif self.commitment_loss_type == "l1":
+            # Mirrors the l2 branch with elementwise abs; same reduction
+            # so the two w1/w2 knobs scale identically across loss types.
+            loss1 = (x - quant.detach()).abs().mean() * self.commitment_w1
+            loss2 = (x.detach() - quant).abs().mean() * self.commitment_w2
         else:  # 'l2'
             loss1 = (x - quant.detach()).pow(2.0).mean() * self.commitment_w1
             loss2 = (x.detach() - quant).pow(2.0).mean() * self.commitment_w2
