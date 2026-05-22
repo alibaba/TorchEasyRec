@@ -1,9 +1,9 @@
 name: Unit Test PPU CI
 
 on:
-  # TEMP: pull_request trigger added to shake out the lane; remove once stable.
   pull_request:
     types: [opened, reopened, synchronize]
+    branches: ['release/**']
   workflow_dispatch:
 
 concurrency:
