@@ -133,9 +133,11 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         model.on_train_end()  # should not raise
 
     def test_is_initialized_not_in_state_dict(self) -> None:
-        """``_is_initialized`` must be ``persistent=False`` so a
-        mid-training checkpoint can't ship ``True`` next to still-zero
-        centroids.
+        """``_is_initialized`` must be ``persistent=False``.
+
+        Otherwise a mid-training checkpoint would ship ``True`` next to
+        still-zero centroids, and a resume-then-infer would silently
+        return dummy zero codes.
         """
         model = self._create_model()
         sd_keys = list(model.state_dict().keys())

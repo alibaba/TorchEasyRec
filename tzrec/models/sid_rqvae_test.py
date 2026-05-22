@@ -279,11 +279,11 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertTrue(has_grad)
 
     def test_clip_mask_uses_flag_not_equality(self) -> None:
-        """The is_clip_pair flag (not bit-exact embedding equality) drives
-        routing. Build a batch where ``image_emb == item_emb`` numerically
-        but ``is_clip_pair=1``: row must route to the CLIP branch (under
-        the old bit-exact logic it would have been silently relabeled as
-        recon).
+        """The is_clip_pair flag, not bit-exact equality, drives routing.
+
+        Build a batch where ``image_emb == item_emb`` numerically but
+        ``is_clip_pair=1``: row must route to the CLIP branch (under the
+        old bit-exact logic it would have been silently relabeled recon).
         """
         B, input_dim = 4, 32
         model = self._create_model(input_dim=input_dim, use_clip=True)
@@ -311,8 +311,9 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertGreater(predictions["clip_loss"].item(), 0.0)
 
     def test_commitment_loss_l1_branch(self) -> None:
-        """Verify the new commitment_loss='l1' branch is actually taken
-        in ResidualQuantized (previously fell through to the L2 branch).
+        """Verify the new commitment_loss='l1' branch runs end-to-end.
+
+        Previously ``"l1"`` silently fell through to the L2 branch.
         """
         from tzrec.modules.sid_generation.residual_quantized import (
             ResidualQuantized,
@@ -340,9 +341,10 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertIsNotNone(x.grad)
 
     def test_sinkhorn_config_enabled_false(self) -> None:
-        """``sinkhorn_config { enabled: false }`` must turn Sinkhorn off
-        (previously hard-coded ``True`` and the proto block ignored except
-        for iters/epsilon).
+        """``sinkhorn_config { enabled: false }`` must turn Sinkhorn off.
+
+        Previously ``use_sinkhorn`` was hard-coded ``True`` and the proto
+        block was honored only for iters/epsilon.
         """
         n_embed_str = ",".join(["16"] * 2)
         sid_rqvae_cfg = sid_model_pb2.SidRqvae(
@@ -375,8 +377,9 @@ class SidRqvaeTest(unittest.TestCase):
             self.assertFalse(layer.use_sinkhorn)
 
     def test_sinkhorn_config_default_enabled(self) -> None:
-        """Omitting ``sinkhorn_config`` preserves the pre-existing
-        on-by-default behavior (back-compat for legacy configs).
+        """Omitting ``sinkhorn_config`` preserves on-by-default behavior.
+
+        Back-compat for legacy configs that never set the sub-config.
         """
         model = self._create_model()  # no sinkhorn_config set
         for layer in model._rqvae.quantizer.layers:

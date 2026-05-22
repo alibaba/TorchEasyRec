@@ -229,9 +229,7 @@ class KMeansLayer(nn.Module):
         # later resume-then-infer would silently return dummy zero codes
         # instead of raising. Each load must re-run ``load_centroids_``
         # (or the FAISS fit) to set the flag.
-        self.register_buffer(
-            "_is_initialized", torch.tensor(False), persistent=False
-        )
+        self.register_buffer("_is_initialized", torch.tensor(False), persistent=False)
 
     @property
     def is_initialized(self) -> bool:

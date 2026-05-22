@@ -171,9 +171,7 @@ class SidRqvae(BaseModel):
         # Read the explicit per-sample flag emitted by the FG layer.
         # Shape: (B, 1) raw_feature → squeeze to (B,). Any non-zero value
         # marks a clip pair.
-        is_clip_pair_raw = self._extract_feature(
-            batch, self._is_clip_pair_feature_name
-        )
+        is_clip_pair_raw = self._extract_feature(batch, self._is_clip_pair_feature_name)
         clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
 
         result = self._rqvae.forward_mixed(embedding, fea2, clip_mask)
