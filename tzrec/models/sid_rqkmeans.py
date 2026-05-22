@@ -237,16 +237,44 @@ class SidRqkmeans(BaseModel):
             - other ranks: ship local buffer via gather_object(dst=0)
               and wait for the broadcast.
         """
-        if not self._offline_buffer:
-            logger.warning(
-                "[SidRqkmeans.on_train_end] offline buffer is empty; "
-                "skip FAISS fit. Did the train_eval loop run?"
-            )
-            return
-
         is_ddp = (
             dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         )
+
+        # The bare ``if not self._offline_buffer: return`` is a LOCAL
+        # decision and deadlocks under DDP: a rank whose loader shipped
+        # zero samples would return immediately, while peers fall through
+        # into ``dist.gather_object(...)`` and block forever waiting for
+        # the absentee. Vote collectively with an OR (``ReduceOp.MAX`` on
+        # a bool tensor) and have every rank bail together if ANY rank's
+        # buffer is empty. Strict-but-safe: an empty rank in this
+        # end-of-training path is almost always a misconfig (skewed
+        # loader, dataset smaller than world_size) — better to surface it
+        # via the warning than to silently fit on a truncated corpus.
+        local_empty = len(self._offline_buffer) == 0
+        if is_ddp:
+            # Use int32 on the model's device (NCCL is finicky about bool
+            # dtype across versions; same reasoning as the comment on
+            # `_is_initialized` broadcast below).
+            flag = torch.tensor(
+                int(local_empty),
+                dtype=torch.int32,
+                device=self._dummy_param.device,
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            any_empty = bool(flag.item())
+        else:
+            any_empty = local_empty
+
+        if any_empty:
+            if (not is_ddp) or dist.get_rank() == 0:
+                logger.warning(
+                    "[SidRqkmeans.on_train_end] at least one rank has an "
+                    "empty offline buffer; skipping FAISS fit on all ranks. "
+                    "Did the train_eval loop run, and is the per-rank shard "
+                    "non-empty?"
+                )
+            return
 
         if is_ddp:
             # DDP path: every rank ships its local buffer to rank 0 via
