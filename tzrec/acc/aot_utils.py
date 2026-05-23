@@ -14,6 +14,7 @@ import os
 from typing import Any, Dict, Optional, Set, Union
 
 import torch
+import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
 from torch import nn
 
 from tzrec.acc.utils import is_unified_aot_predict
