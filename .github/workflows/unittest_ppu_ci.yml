@@ -33,6 +33,7 @@ jobs:
             -e GITHUB_ACTIONS=true \
             -e CI=true \
             -e CI_HYPOTHESIS=true \
+            -e TZREC_TEST_TIMEOUT_SCALE=4 \
             -e TORCHINDUCTOR_CACHE_DIR=/github/home/.torchinductor \
             -v "$WORK_ROOT":/__w \
             -v "$EXTERNALS_ROOT":/__e:ro \
