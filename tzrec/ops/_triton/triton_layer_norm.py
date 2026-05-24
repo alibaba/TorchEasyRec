@@ -258,13 +258,9 @@ def _weighted_layer_norm_bwd_dx(
 
 
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
-    # PPU Triton mis-compiles num_warps=32 for this reduction kernel.
-    from tzrec.ops import is_ppu_arch
-
-    skip_32_warps = torch.ops.hip or is_ppu_arch()
     configs = []
     for BLOCK_N in [32, 64, 128, 256]:
-        for num_warps in [8, 16] + ([] if skip_32_warps else [32]):
+        for num_warps in [8, 16] + ([] if torch.ops.hip else [32]):
             configs.append(
                 triton.Config(
                     {"BLOCK_N": BLOCK_N},
