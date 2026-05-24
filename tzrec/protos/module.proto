@@ -195,12 +195,21 @@ message GRContextualInterleavePreprocessor {
     required GRContextualizedMLP content_mlp = 7;
 }
 
+message GRUIHPreprocessor {
+    // action encoder config (optional - for models with action info)
+    optional GRActionEncoder action_encoder = 1;
+    // action embedding mlp config (required if action_encoder is set)
+    optional GRContextualizedMLP action_mlp = 2;
+}
+
 message GRInputPreprocessor {
     oneof input_preprocessor {
         // input preprocessor with contextual features
         GRContextualPreprocessor contextual_preprocessor = 20;
         // input preprocessor with interleave targets
         GRContextualInterleavePreprocessor contextual_interleave_preprocessor = 21;
+        // input preprocessor for sequence-only models (no candidate concat)
+        GRUIHPreprocessor uih_preprocessor = 22;
     }
 }
 

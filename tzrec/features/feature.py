@@ -469,10 +469,7 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def name(self) -> str:
         """Feature name."""
-        if self._is_grouped_seq:
-            return f"{self.sequence_name}{self._underline}{self.config.feature_name}"
-        else:
-            return self.config.feature_name
+        return f"{self.grouped_sequence_prefix}{self.config.feature_name}"
 
     @property
     def is_neg(self) -> bool:
@@ -567,6 +564,11 @@ class BaseFeature(object, metaclass=_meta_cls):
     def is_grouped_sequence(self) -> bool:
         """Feature is grouped sequence or not."""
         return self._is_grouped_seq
+
+    @property
+    def grouped_sequence_prefix(self) -> str:
+        """Flatten prefix ``<sequence_name><_underline>``; empty if not grouped."""
+        return f"{self.sequence_name}{self._underline}" if self._is_grouped_seq else ""
 
     @property
     def is_weighted(self) -> bool:
@@ -733,20 +735,34 @@ class BaseFeature(object, metaclass=_meta_cls):
                 self._inputs = [v for _, v in self.side_inputs]
         return self._inputs
 
+    def _is_sequence_input(self, side: str, name: str) -> bool:
+        """Whether an input is sequence-typed at the FG handler interface.
+
+        Rule: explicit ``sequence_fields`` wins; else single-input class
+        auto-marks (with ``side != 'feature'``); else multi-input
+        item-side default.
+
+        ``name`` may be either the raw input name or its grouped-sequence
+        prefixed form; the prefix is stripped internally.
+        """
+        if not self.is_sequence:
+            return False
+        if self._is_grouped_seq and self.sequence_name:
+            prefix = self.grouped_sequence_prefix
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+        if (
+            hasattr(self.config, "sequence_fields")
+            and len(self.config.sequence_fields) > 0
+        ):
+            return name in self.config.sequence_fields
+        if self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
+            return side != "feature"
+        return side == "item"
+
     def _need_seq_prefix(self, side: str, name: str) -> bool:
         """Check input fields should add prefix of group sequence or not."""
-        if self._is_grouped_seq:
-            if (
-                hasattr(self.config, "sequence_fields")
-                and len(self.config.sequence_fields) > 0
-            ):
-                return name in self.config.sequence_fields
-            elif self.__class__.__name__ in SINGLE_INPUT_FEATURE_CLASSES:
-                return side != "feature"
-            else:
-                return side == "item"
-        else:
-            return False
+        return self._is_grouped_seq and self._is_sequence_input(side, name)
 
     @property
     def side_inputs(self) -> List[Tuple[str, str]]:
@@ -770,12 +786,31 @@ class BaseFeature(object, metaclass=_meta_cls):
                     )
                 side, name = x[0], x[1]
                 seq_prefix = (
-                    f"{self.sequence_name}{self._underline}"
+                    self.grouped_sequence_prefix
                     if self._need_seq_prefix(side, name)
                     else ""
                 )
                 self._side_inputs.append((side, f"{seq_prefix}{name}"))
         return self._side_inputs
+
+    @property
+    def sequence_input_names(self) -> List[str]:
+        """A subset of ``self.inputs`` that are sequence inputs at the FG handler.
+
+        Returns ``[self.name]`` for ``FG_NONE`` / ``FG_BUCKETIZE``; the
+        grouped-sequence-prefixed names that satisfy
+        ``_is_sequence_input`` for ``FG_DAG`` / ``FG_NORMAL``. Empty for
+        non-sequence features.
+        """
+        if not self.is_sequence:
+            return []
+        if self.fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+            return [self.name]
+        return [
+            full_name
+            for side, full_name in self.side_inputs
+            if self._is_sequence_input(side, full_name)
+        ]
 
     @property
     def stub_type(self) -> bool:
@@ -1193,6 +1228,43 @@ def create_features(
             feature.is_user_feat = feature.name in user_feats
 
     return features
+
+
+def project_grouped_sequence_feature_to_scalar(
+    feature: BaseFeature,
+) -> feature_pb2.FeatureConfig:
+    """Return a scalar export FeatureConfig for a grouped sequence sub-feature.
+
+    Rewraps the inner ``SeqFeatureConfig`` as a top-level ``FeatureConfig``
+    and materializes the source's effective ``default_value`` / ``value_dim``
+    so the exported scalar feature matches the training sub-feature
+    (otherwise scalar mode defaults differ from sequence mode).
+
+    Args:
+        feature: a grouped sequence sub-feature.
+
+    Returns:
+        a fresh FeatureConfig for ``create_features()`` to build as scalar.
+    """
+    if not feature.is_grouped_sequence:
+        raise ValueError(
+            "project_grouped_sequence_feature_to_scalar only accepts grouped "
+            f"sequence sub-features; got {feature.name} "
+            "(is_grouped_sequence=False)"
+        )
+    src_cfg = feature.feature_config  # SeqFeatureConfig
+    feat_type = src_cfg.WhichOneof("feature")
+    src_msg = getattr(src_cfg, feat_type)
+
+    scalar_cfg = feature_pb2.FeatureConfig()
+    dst_msg = getattr(scalar_cfg, feat_type)
+    dst_msg.CopyFrom(src_msg)
+
+    if hasattr(dst_msg, "default_value") and not dst_msg.default_value:
+        dst_msg.default_value = feature.default_value
+    if hasattr(dst_msg, "value_dim") and not dst_msg.HasField("value_dim"):
+        dst_msg.value_dim = feature.value_dim
+    return scalar_cfg
 
 
 def _copy_assets(

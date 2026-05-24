@@ -229,7 +229,7 @@ def create_output_postprocessor(
 ) -> OutputPostprocessor:
     """Create OutputPostprocessor."""
     if isinstance(postprocessor_cfg, module_pb2.GROutputPostprocessor):
-        postprocessor_type = postprocessor_cfg.WhichOneof("input_preprocessor")
+        postprocessor_type = postprocessor_cfg.WhichOneof("output_postprocessor")
         config_dict = config_to_kwargs(getattr(postprocessor_cfg, postprocessor_type))
     else:
         assert len(postprocessor_cfg) == 1, (

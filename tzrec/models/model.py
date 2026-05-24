@@ -60,6 +60,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         self._base_model_config = model_config
         self._model_type = model_config.WhichOneof("model")
         self._features = features
+        self._feature_groups = list(model_config.feature_groups)
         self._labels = labels
         self._model_config = (
             getattr(model_config, self._model_type) if self._model_type else None
@@ -71,6 +72,16 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             self._sample_weights = sample_weights
 
         self._train_metric_modules = nn.ModuleDict()
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Model's features (default property forwarding to ``self._features``)."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """Model's feature_groups (default forward to ``self._feature_groups``)."""
+        return self._feature_groups
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -335,13 +346,22 @@ class ScriptWrapper(BaseModule):
     def __init__(self, module: nn.Module) -> None:
         super().__init__()
         self.model = module
-        self._features = self.model._features
         self._data_parser = DataParser(
-            self._features,
+            self.model.features,
             sampler_type=str(module.sampler_type)
             if hasattr(module, "sampler_type")
             else None,
         )
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Live read of the wrapped module's features (no snapshot)."""
+        return self.model.features
+
+    @property
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """Live read of the wrapped module's feature_groups."""
+        return self.model.feature_groups
 
     def get_batch(
         self,

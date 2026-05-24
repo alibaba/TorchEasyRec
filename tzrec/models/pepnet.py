@@ -185,9 +185,9 @@ class PEPNet(MultiTaskRank):
                 tower_loss_name, domain_index = tower_domain_loss_predict_name.rsplit(
                     "_", 1
                 )
-                new_predictions[tower_loss_name] = [
-                    (domain_index, tower_domain_loss_predict_value)
-                ]
+                new_predictions[tower_loss_name].append(
+                    (int(domain_index), tower_domain_loss_predict_value)
+                )
             domain_index = batch.labels[self._domain_input_name]
             for tower_loss_name, tower_loss_predict_values in new_predictions.items():
                 tower_loss_domain_predict = torch.stack(

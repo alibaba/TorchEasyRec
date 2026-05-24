@@ -11,7 +11,7 @@
 
 
 import os
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from torch import nn
@@ -23,6 +23,7 @@ from tzrec.models.model import (
     UnifiedAOTIModelWrapper,
 )
 from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
+from tzrec.protos import model_pb2
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
@@ -41,6 +42,59 @@ def _aoti_compile_cfg() -> Dict[str, Any]:
     if is_autotune_with_sample_inputs():
         cfg["triton.autotune_with_sample_inputs"] = True
     return cfg
+
+
+def _backport_pt178147_int_array_dedup() -> None:
+    """Backport pytorch/pytorch#178147 onto torch < the release that includes it.
+
+    Upstream ``CppWrapperCpu.codegen_int_array_var`` (cpp_wrapper_cpu.py) keys
+    its int_array dedup cache on ``id(writeline)``. ``writeline`` is
+    ``<IndentedBuffer>.writeline``, a fresh bound-method object materialized on
+    every attribute access; CPython's small-object allocator recycles those
+    addresses, so two distinct destination IndentedBuffers can present the
+    same id() across calls. A false cache hit then returns an int_array name
+    whose declaration was queued at a *later* position in the assembled
+    wrapper.cpp, producing intermittently::
+
+        error: 'int_array_NN' was not declared in this scope
+
+    Upstream fix (pytorch/pytorch#178147, merged 2026-05-10): key on
+    ``id(writeline.__self__)`` -- the underlying IndentedBuffer, stable for
+    the whole compile -- with a fallback to ``id(writeline)`` for free
+    functions. Not present in torch 2.11.0; will be in the next release.
+
+    REMOVE THIS PATCH when tzrec's torch pin advances to a release that
+    includes pytorch/pytorch#178147.
+    """
+    from torch._inductor.codegen import cpp_wrapper_cpu as _cwc
+
+    cls = _cwc.CppWrapperCpu
+
+    if getattr(cls.codegen_int_array_var, "_tzrec_pt178147_backport", False):
+        return
+
+    def codegen_int_array_var(
+        self,
+        int_array,
+        writeline,
+        known_statically=False,
+        graph=None,
+    ):
+        wl_key = id(getattr(writeline, "__self__", writeline))
+        cache_key = (
+            int_array,
+            wl_key,
+            known_statically,
+            id(graph) if graph else None,
+        )
+        if cache_key not in self.codegen_int_array_var_cache:
+            self.codegen_int_array_var_cache[cache_key] = (
+                self._codegen_int_array_var_impl(int_array, writeline, known_statically)
+            )
+        return self.codegen_int_array_var_cache[cache_key]
+
+    codegen_int_array_var._tzrec_pt178147_backport = True  # type: ignore[attr-defined]
+    cls.codegen_int_array_var = codegen_int_array_var
 
 
 def load_model_aot(
@@ -167,6 +221,7 @@ def export_model_aot(
             args=(sparse_output,),
             dynamic_shapes=(dynamic_shapes,),
         )
+    _backport_pt178147_int_array_dedup()
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
@@ -231,11 +286,11 @@ def _pad_empty_sparse_values(
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
-    model_config: Any,
+    feature_groups: List[model_pb2.FeatureGroupConfig],
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
-    Uses structural knowledge from feature configs and model config:
+    Uses structural knowledge from feature configs and feature groups:
     - .lengths → batch dim (always)
     - .values for non-sequence single-value sparse features → batch dim
     - .values for sequence features → data-dependent Dim, shared by features
@@ -248,8 +303,8 @@ def _build_dynamic_shapes(
 
     Args:
         data: input tensor dict from Batch.to_dict().
-        features: list of BaseFeature from model._features.
-        model_config: ModelConfig proto with feature_groups.
+        features: list of BaseFeature from model.features.
+        feature_groups: list of FeatureGroupConfig from model.feature_groups.
 
     Returns:
         dynamic_shapes dict for torch.export.export().
@@ -287,8 +342,8 @@ def _build_dynamic_shapes(
         return getattr(feat, "value_dim", 1) == 1
 
     # Step 2: For standalone sequence features not yet grouped, fall back to
-    # model_config.feature_groups structure.
-    for fg in model_config.feature_groups:
+    # feature_groups structure.
+    for fg in feature_groups:
         if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
             # In JAGGED_SEQUENCE groups, single-valued features share nnz.
             # Multi-valued features have independent nnz and are NOT grouped.
@@ -412,14 +467,14 @@ def export_unified_model_aot(
 
     # Pad any 0-size non-sequence sparse .values tensors so torch.export
     # doesn't specialize on the empty size (which conflicts with dynamic Dims).
-    seq_feat_names = {f.name for f in model._features if f.is_sequence}
+    seq_feat_names = {f.name for f in model.features if f.is_sequence}
     data = _pad_empty_sparse_values(data, seq_feat_names)
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
         data,
-        features=model._features,
-        model_config=model.model._base_model_config,
+        features=model.features,
+        feature_groups=model.feature_groups,
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 

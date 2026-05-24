@@ -644,6 +644,184 @@ class FeatureTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
         self.assertEqual(repr(feature_cfgs), repr(again_feature_cfgs))
 
+    @parameterized.expand(
+        [
+            [FgMode.FG_NORMAL],
+            [FgMode.FG_DAG],
+            [FgMode.FG_NONE],
+            [FgMode.FG_BUCKETIZE],
+        ]
+    )
+    def test_sequence_input_names(self, fg_mode):
+        """Sequence-input detection across feature types and fg_modes.
+
+        One full config covers each ``_is_sequence_input`` branch:
+        non-sequence feature, top-level ``sequence_id_feature``, grouped
+        single-input sub, grouped multi-input sub with explicit
+        ``sequence_fields`` excluding the non-sequence ``map`` input.
+
+        FG_NORMAL / FG_DAG return prefixed side-input names;
+        FG_NONE / FG_BUCKETIZE return ``[self.name]``.
+        """
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a",
+                    expression="item:cat_a",
+                    num_buckets=100,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.IdFeature(
+                    feature_name="seq_a",
+                    expression="item:seq_a",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    num_buckets=100,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_seq",
+                    sequence_length=10,
+                    sequence_delim=";",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="cat_b",
+                                expression="item:cat_b",
+                                num_buckets=100,
+                            )
+                        ),
+                        feature_pb2.SeqFeatureConfig(
+                            lookup_feature=feature_pb2.LookupFeature(
+                                feature_name="lookup_c",
+                                map="item:cat_map",
+                                key="item:cat_key",
+                                sequence_fields=["cat_key"],
+                                num_buckets=10,
+                                embedding_dim=8,
+                            )
+                        ),
+                    ],
+                )
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs, fg_mode=fg_mode)
+        by_name = {f.name: f for f in features}
+        self.assertEqual(
+            set(by_name),
+            {"cat_a", "seq_a", "click_seq__cat_b", "click_seq__lookup_c"},
+        )
+
+        # Non-sequence: always empty regardless of fg_mode.
+        self.assertEqual(by_name["cat_a"].sequence_input_names, [])
+
+        if fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
+            # Pre-encoded mode: the entire self.name column is the sequence.
+            self.assertEqual(by_name["seq_a"].sequence_input_names, ["seq_a"])
+            self.assertEqual(
+                by_name["click_seq__cat_b"].sequence_input_names,
+                ["click_seq__cat_b"],
+            )
+            self.assertEqual(
+                by_name["click_seq__lookup_c"].sequence_input_names,
+                ["click_seq__lookup_c"],
+            )
+        else:
+            # FG_DAG / FG_NORMAL: prefix applied to true sequence inputs only.
+            # top-level single-input -> [raw_name] (no group prefix).
+            self.assertEqual(by_name["seq_a"].sequence_input_names, ["seq_a"])
+            # grouped single-input item-side -> ["click_seq__cat_b"].
+            self.assertEqual(
+                by_name["click_seq__cat_b"].sequence_input_names,
+                ["click_seq__cat_b"],
+            )
+            # grouped multi-input with explicit sequence_fields=["cat_key"]:
+            # cat_map is item-side but excluded; cat_key is the only sequence
+            # input and gets the group prefix.
+            self.assertEqual(
+                by_name["click_seq__lookup_c"].inputs,
+                ["cat_map", "click_seq__cat_key"],
+            )
+            self.assertEqual(
+                by_name["click_seq__lookup_c"].sequence_input_names,
+                ["click_seq__cat_key"],
+            )
+
+
+class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
+    def _build_grouped(self, seq_sub_cfg):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="cand_seq",
+                    sequence_delim="|",
+                    sequence_length=100,
+                    features=[seq_sub_cfg],
+                )
+            ),
+        ]
+        return feature_lib.create_features(feature_cfgs)
+
+    def test_projection_materializes_defaults_and_passes_through_create_features(self):
+        # id_feature: default_value / value_dim materialization + create_features.
+        id_sub_cfg = feature_pb2.SeqFeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="video_id",
+                expression="item:video_id",
+                embedding_dim=32,
+                num_buckets=10000000,
+            )
+        )
+        features = self._build_grouped(id_sub_cfg)
+        self.assertEqual(len(features), 1)
+        sub_feature = features[0]
+        self.assertTrue(sub_feature.is_grouped_sequence)
+        # Sequence-effective defaults on the source.
+        self.assertEqual(sub_feature.default_value, "0")
+        self.assertEqual(sub_feature.value_dim, 1)
+
+        scalar_cfg = feature_lib.project_grouped_sequence_feature_to_scalar(sub_feature)
+        self.assertEqual(scalar_cfg.WhichOneof("feature"), "id_feature")
+        # Materialized onto the scalar proto.
+        self.assertEqual(scalar_cfg.id_feature.default_value, "0")
+        self.assertTrue(scalar_cfg.id_feature.HasField("value_dim"))
+        self.assertEqual(scalar_cfg.id_feature.value_dim, 1)
+        # Source proto not mutated.
+        self.assertEqual(sub_feature.feature_config.id_feature.default_value, "")
+        self.assertFalse(sub_feature.feature_config.id_feature.HasField("value_dim"))
+
+        # create_features rebuilds it as a top-level scalar feature.
+        scalar_features = feature_lib.create_features([scalar_cfg])
+        self.assertEqual(len(scalar_features), 1)
+        scalar = scalar_features[0]
+        self.assertEqual(scalar.name, "video_id")
+        self.assertFalse(scalar.is_grouped_sequence)
+        self.assertEqual(scalar.value_dim, 1)
+
+        # raw_feature: confirms the helper isn't hard-coded to id_feature.
+        raw_sub_cfg = feature_pb2.SeqFeatureConfig(
+            raw_feature=feature_pb2.RawFeature(
+                feature_name="watch_time", expression="user:watch_time"
+            )
+        )
+        raw_features = self._build_grouped(raw_sub_cfg)
+        raw_scalar_cfg = feature_lib.project_grouped_sequence_feature_to_scalar(
+            raw_features[0]
+        )
+        self.assertEqual(raw_scalar_cfg.WhichOneof("feature"), "raw_feature")
+
+    def test_projection_rejects_non_grouped_feature(self):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="user_id")
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs)
+        with self.assertRaisesRegex(ValueError, "is_grouped_sequence=False"):
+            feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -210,7 +210,7 @@ class MINDItemTower(MatchTower):
 
     def __init__(
         self,
-        tower_config: tower_pb2.MINDItemTower,
+        tower_config: tower_pb2.Tower,
         output_dim: int,
         similarity: simi_pb2.Similarity,
         item_feature_group: model_pb2.FeatureGroupConfig,

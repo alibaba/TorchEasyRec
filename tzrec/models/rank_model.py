@@ -84,7 +84,7 @@ class RankModel(BaseModel):
         """Build embedding group and group variational dropout."""
         self.embedding_group = EmbeddingGroup(
             self._features,
-            list(self._base_model_config.feature_groups),
+            self._feature_groups,
             wide_embedding_dim=int(self.wide_embedding_dim)
             if hasattr(self, "wide_embedding_dim")
             else None,
@@ -99,7 +99,7 @@ class RankModel(BaseModel):
             variational_dropout_config_dict = config_to_kwargs(
                 variational_dropout_config
             )
-            for feature_group in list(self._base_model_config.feature_groups):
+            for feature_group in self._feature_groups:
                 group_name = feature_group.group_name
                 if feature_group.group_type != model_pb2.SEQUENCE:
                     feature_dim = self.embedding_group.group_feature_dims(group_name)
