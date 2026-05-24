@@ -594,7 +594,6 @@ def _weighted_rms_norm_bwd_dx(
     eps,
     GROUP_N,
     BLOCK_D: tl.constexpr,
-    SKIP_LOCK: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_D)
@@ -622,25 +621,22 @@ def _weighted_rms_norm_bwd_dx(
 
     # Offset locks and weights/biases gradient pointer for parallel reduction
     lock_id = row % GROUP_N
+    Lock += lock_id
+    Count = Lock + GROUP_N
     DW = DW + lock_id * D + cols
+    # Accumulate partial sums for dw/db
     partial_dw = dy * xhat
-    if SKIP_LOCK:
-        # No contention: lock_id is unique per row, write the per-row partial directly.
-        tl.store(DW, partial_dw, mask=mask)
+    while tl.atomic_cas(Lock, 0, 1) == 1:
+        pass
+    count = tl.load(Count)
+    # First store doesn't accumulate
+    if count == 0:
+        tl.atomic_xchg(Count, 1)
     else:
-        Lock += lock_id
-        Count = Lock + GROUP_N
-        while tl.atomic_cas(Lock, 0, 1) == 1:
-            pass
-        count = tl.load(Count)
-        # First store doesn't accumulate
-        if count == 0:
-            tl.atomic_xchg(Count, 1)
-        else:
-            partial_dw += tl.load(DW, mask=mask)
-        tl.store(DW, partial_dw, mask=mask)
-        # Release the lock
-        tl.atomic_xchg(Lock, 0)
+        partial_dw += tl.load(DW, mask=mask)
+    tl.store(DW, partial_dw, mask=mask)
+    # Release the lock
+    tl.atomic_xchg(Lock, 0)
 
 
 @triton_autotune(
@@ -765,7 +761,6 @@ class RMSNormFunction(torch.autograd.Function):
             ctx.eps,
             GROUP_N=GROUP_N,
             BLOCK_D=ctx.BLOCK_D,
-            SKIP_LOCK=(GROUP_N == N),
             num_warps=ctx.num_warps,
         )
 
