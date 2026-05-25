@@ -16,6 +16,7 @@ from collections import OrderedDict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
+import numpy as np
 import psutil
 import torch
 from torch import distributed as dist
@@ -85,10 +86,6 @@ from tzrec.protos import feature_pb2
 from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
-
-
-def _bytes_to_float_bin(num_bytes: Union[float, int], bin_size: float) -> float:
-    return float(num_bytes) / bin_size
 
 
 def create_planner(
@@ -190,7 +187,18 @@ def create_planner(
             global_constraints=global_constraints,
         ),
         storage_reservation=storage_reservation,
-        proposer=[DynamicProgrammingProposer(), UniformProposer()],
+        # DP bin counts are env-tunable; defaults match the proposer signature.
+        proposer=[
+            DynamicProgrammingProposer(
+                hbm_bins_per_device=int(
+                    os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "100")
+                ),
+                ddr_bins_per_device=int(
+                    os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25")
+                ),
+            ),
+            UniformProposer(),
+        ],
         debug=True,
     )
     return planner
@@ -225,10 +233,113 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
 
 
 _INF = float("inf")
-# Cap per-axis bin count for the 2D DP. Without this, `bins_per_device *
-# num_devices` blows up on multi-host worlds (e.g. 16 GPUs at 100 hbm
-# bins/dev = 1600 bins, * 800 ddr bins = 1.28M cells per table).
-_DP_AXIS_BIN_CAP = 1024
+
+
+def _firsts(sorted_keys: np.ndarray) -> np.ndarray:
+    """Boolean first-occurrence mask in a sorted 1-D key array."""
+    out = np.empty(sorted_keys.shape, dtype=bool)
+    if sorted_keys.size == 0:
+        return out
+    out[0] = True
+    out[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    return out
+
+
+def _sparse_dp_proposor_numpy(
+    table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    hbm_bins: int,
+    ddr_bins: int,
+) -> List[List[int]]:
+    """Sparse-K NumPy 2D DP over (hbm_bin, ddr_bin) reachable cells.
+
+    Per table, broadcasts (K_prev, N) candidates and uses lexsort + a
+    first-occurrence mask for groupby-argmin on the destination cell. Reachable
+    cells K_t saturate at the actual reachable count, not hbm_bins * ddr_bins.
+    Backtracking walks T x K_t int32 arrays in O(T) Python steps.
+
+    table_opts entries are (opt_h, opt_d, opt_perf, opt_global_idx) per table,
+    all 1-D NumPy arrays (the float ones in bin-units; the index one in opt-id
+    space, used to reconstruct proposals).
+
+    Returns a list of proposals; each proposal is a list of opt-id integers,
+    one per table, emitted in decreasing-HBM order with at most one entry per
+    HBM bin (the perf-best plan across all DDR bins at that HBM level).
+    """
+    T = len(table_opts)
+    if T == 0:
+        return []
+
+    h0, d0, p0, g0 = table_opts[0]
+    val = (h0 < hbm_bins) & (d0 < ddr_bins)
+    if not val.any():
+        return []
+    h0, d0, p0, g0 = h0[val], d0[val], p0[val], g0[val]
+    h_idx = h0.astype(np.int32)
+    d_idx = d0.astype(np.int32)
+    flat = h_idx.astype(np.int64) * ddr_bins + d_idx
+    order = np.lexsort((p0, flat))
+    win = order[_firsts(flat[order])]
+
+    dp_perf = p0[win]
+    dp_h_act = h0[win]
+    dp_d_act = d0[win]
+    dp_h_idx = h_idx[win]
+    back_opt: List[np.ndarray] = [g0[win]]
+    back_src: List[np.ndarray] = [np.full(win.size, -1, dtype=np.int32)]
+
+    for t in range(1, T):
+        if dp_perf.size == 0:
+            break
+        h_t, d_t, p_t, g_t = table_opts[t]
+        if p_t.size == 0:
+            dp_perf = np.zeros(0)
+            break
+
+        new_h = dp_h_act[:, None] + h_t[None, :]
+        new_d = dp_d_act[:, None] + d_t[None, :]
+        new_p = dp_perf[:, None] + p_t[None, :]
+        val = (new_h < hbm_bins) & (new_d < ddr_bins)
+        if not val.any():
+            dp_perf = np.zeros(0)
+            break
+
+        h_idx = new_h.astype(np.int32)
+        d_idx = new_d.astype(np.int32)
+        flat = h_idx.astype(np.int64) * ddr_bins + d_idx
+
+        flat_v = flat[val]
+        new_p_v = new_p[val]
+        new_h_v = new_h[val]
+        new_d_v = new_d[val]
+        h_idx_v = h_idx[val]
+        src_K, src_j = np.where(val)
+
+        order = np.lexsort((new_p_v, flat_v))
+        win = order[_firsts(flat_v[order])]
+
+        dp_perf = new_p_v[win]
+        dp_h_act = new_h_v[win]
+        dp_d_act = new_d_v[win]
+        dp_h_idx = h_idx_v[win]
+        back_opt.append(g_t[src_j[win]])
+        back_src.append(src_K[win].astype(np.int32))
+
+    if dp_perf.size == 0:
+        return []
+
+    # Per-HBM-bin best, decreasing HBM order.
+    order = np.lexsort((dp_perf, dp_h_idx))
+    chosen = order[_firsts(dp_h_idx[order])][::-1]
+
+    proposals: List[List[int]] = []
+    for k0 in chosen:
+        ids = [-1] * T
+        cur_K = int(k0)
+        for t in range(T - 1, -1, -1):
+            ids[t] = int(back_opt[t][cur_K])
+            cur_K = int(back_src[t][cur_K])
+        proposals.append(ids)
+    return proposals
 
 
 class DynamicProgrammingProposer(Proposer):
@@ -282,7 +393,7 @@ class DynamicProgrammingProposer(Proposer):
     def __init__(
         self,
         hbm_bins_per_device: int = 100,
-        ddr_bins_per_device: int = 50,
+        ddr_bins_per_device: int = 25,
     ) -> None:
         self._inited: bool = False
         self._hbm_bins_per_device: int = max(hbm_bins_per_device, 1)
@@ -350,10 +461,8 @@ class DynamicProgrammingProposer(Proposer):
 
         self._inited = True
         assert storage_constraint is not None
-        table_count = len(self._sharding_options_by_fqn)
-        if table_count == 0:
+        if not self._sharding_options_by_fqn:
             return
-        option_count = max(len(x) for x in self._sharding_options_by_fqn.values())
 
         num_devices = len(storage_constraint.devices)
         max_device_hbm = 0
@@ -377,12 +486,8 @@ class DynamicProgrammingProposer(Proposer):
             )
             max_machine_ddr = max(max_machine_ddr, machine_ddr)
 
-        hbm_bins = max(
-            min(self._hbm_bins_per_device * num_devices, _DP_AXIS_BIN_CAP), 1
-        )
-        ddr_bins = max(
-            min(self._ddr_bins_per_device * num_devices, _DP_AXIS_BIN_CAP), 1
-        )
+        hbm_bins = max(self._hbm_bins_per_device * num_devices, 1)
+        ddr_bins = max(self._ddr_bins_per_device * num_devices, 1)
         # Collapse a degenerate axis to a single bin so we don't waste states
         # on (e.g.) CPU-only topologies that have hbm == 0 everywhere.
         if hbm_total == 0:
@@ -392,13 +497,13 @@ class DynamicProgrammingProposer(Proposer):
         hbm_bin_size = float(hbm_total) / hbm_bins if hbm_bins > 0 else 1.0
         ddr_bin_size = float(ddr_total) / ddr_bins if ddr_bins > 0 else 1.0
 
-        hbm_by_fqn = [[_INF] * option_count for _ in range(table_count)]
-        ddr_by_fqn = [[_INF] * option_count for _ in range(table_count)]
-        perf_by_fqn = [[_INF] * option_count for _ in range(table_count)]
-
-        for table_id, sharding_options in enumerate(
-            self._sharding_options_by_fqn.values()
-        ):
+        # Per-table option arrays in bin-units, with infeasible options pruned.
+        table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for sharding_options in self._sharding_options_by_fqn.values():
+            h_list: List[float] = []
+            d_list: List[float] = []
+            p_list: List[float] = []
+            g_list: List[int] = []
             for opt_id, sharding_option in enumerate(sharding_options):
                 max_shard_hbm = max(
                     (shard.storage.hbm or 0) for shard in sharding_option.shards
@@ -411,101 +516,28 @@ class DynamicProgrammingProposer(Proposer):
                     continue
                 if ddr_total > 0 and max_shard_ddr > max_machine_ddr:
                     continue
-                hbm_by_fqn[table_id][opt_id] = (
-                    _bytes_to_float_bin(
-                        sharding_option.total_storage.hbm or 0, hbm_bin_size
-                    )
+                h_list.append(
+                    (sharding_option.total_storage.hbm or 0) / hbm_bin_size
                     if hbm_total > 0
                     else 0.0
                 )
-                ddr_by_fqn[table_id][opt_id] = (
-                    _bytes_to_float_bin(
-                        sharding_option.total_storage.ddr or 0, ddr_bin_size
-                    )
+                d_list.append(
+                    (sharding_option.total_storage.ddr or 0) / ddr_bin_size
                     if ddr_total > 0
                     else 0.0
                 )
-                perf_by_fqn[table_id][opt_id] = sharding_option.total_perf
+                p_list.append(sharding_option.total_perf)
+                g_list.append(opt_id)
+            table_opts.append(
+                (
+                    np.asarray(h_list, dtype=np.float32),
+                    np.asarray(d_list, dtype=np.float32),
+                    np.asarray(p_list, dtype=np.float32),
+                    np.asarray(g_list, dtype=np.int32),
+                )
+            )
 
-        # dp[table][hbm_bin][ddr_bin] = (perf, hbm_actual, ddr_actual)
-        # backtrack[table][hbm_bin][ddr_bin] = (opt_id, prev_hbm_bin, prev_ddr_bin)
-        empty_state = (_INF, _INF, _INF)
-        empty_back = (-1, -1, -1)
-        dp = [
-            [[empty_state] * ddr_bins for _ in range(hbm_bins)]
-            for _ in range(table_count)
-        ]
-        backtrack = [
-            [[empty_back] * ddr_bins for _ in range(hbm_bins)]
-            for _ in range(table_count)
-        ]
-
-        # Seed the first table.
-        for opt_j in range(option_count):
-            h = hbm_by_fqn[0][opt_j]
-            d = ddr_by_fqn[0][opt_j]
-            if h >= hbm_bins or d >= ddr_bins:
-                continue
-            h_i = int(h)
-            d_i = int(d)
-            if dp[0][h_i][d_i][0] > perf_by_fqn[0][opt_j]:
-                dp[0][h_i][d_i] = (perf_by_fqn[0][opt_j], h, d)
-                backtrack[0][h_i][d_i] = (opt_j, -1, -1)
-
-        for table_i in range(1, table_count):
-            prev_dp = dp[table_i - 1]
-            cur_dp = dp[table_i]
-            cur_back = backtrack[table_i]
-            hbm_t = hbm_by_fqn[table_i]
-            ddr_t = ddr_by_fqn[table_i]
-            perf_t = perf_by_fqn[table_i]
-            for h in range(hbm_bins):
-                prev_dp_h = prev_dp[h]
-                for d in range(ddr_bins):
-                    prev_state = prev_dp_h[d]
-                    prev_perf = prev_state[0]
-                    if prev_perf == _INF:
-                        continue
-                    prev_h_val = prev_state[1]
-                    prev_d_val = prev_state[2]
-                    for opt_j in range(option_count):
-                        delta_perf = perf_t[opt_j]
-                        if delta_perf == _INF:
-                            continue
-                        new_h = prev_h_val + hbm_t[opt_j]
-                        new_d = prev_d_val + ddr_t[opt_j]
-                        if new_h >= hbm_bins or new_d >= ddr_bins:
-                            continue
-                        new_h_i = int(new_h)
-                        new_d_i = int(new_d)
-                        new_perf = prev_perf + delta_perf
-                        if cur_dp[new_h_i][new_d_i][0] > new_perf:
-                            cur_dp[new_h_i][new_d_i] = (new_perf, new_h, new_d)
-                            cur_back[new_h_i][new_d_i] = (opt_j, h, d)
-
-        # For each HBM bin, emit only the lowest-perf DDR cell. Any other
-        # (h, d') at the same h has the same HBM cost and worse-or-equal
-        # perf -- strictly dominated, no point proposing. Caps the proposal
-        # count at hbm_bins (<= _DP_AXIS_BIN_CAP), down from
-        # hbm_bins x ddr_bins.
-        self._proposal_list = []
-        last_dp = dp[table_count - 1]
-        last_back = backtrack[table_count - 1]
-        for h in range(hbm_bins - 1, -1, -1):  # high HBM first
-            best_perf = _INF
-            best_d = -1
-            for d in range(ddr_bins):
-                if last_back[h][d][0] >= 0 and last_dp[h][d][0] < best_perf:
-                    best_perf = last_dp[h][d][0]
-                    best_d = d
-            if best_d < 0:
-                continue
-            cur_opt_idx, prev_h, prev_d = last_back[h][best_d]
-            proposal_indices = [-1] * table_count
-            proposal_indices[table_count - 1] = cur_opt_idx
-            for i in range(table_count - 2, -1, -1):
-                proposal_indices[i], prev_h, prev_d = backtrack[i][prev_h][prev_d]
-            self._proposal_list.append(proposal_indices)
+        self._proposal_list = _sparse_dp_proposor_numpy(table_opts, hbm_bins, ddr_bins)
         if self._proposal_list:
             self._current_proposal = 0
 

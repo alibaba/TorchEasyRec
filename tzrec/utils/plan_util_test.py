@@ -9,10 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 import unittest
 from types import SimpleNamespace
+from typing import List, Tuple
 
+import numpy as np
 import torch
+from parameterized import parameterized
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
@@ -20,11 +24,11 @@ from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
 from torchrec.distributed.planner.types import PlannerError, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import CacheParams, ShardingType
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.plan_util import DynamicProgrammingProposer, _emit_dynamicemb_variants
+from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposor_numpy
 
 
 class PlanUtilTest(unittest.TestCase):
@@ -140,64 +144,6 @@ class PlanUtilTest(unittest.TestCase):
         )
 
 
-class EmitDynamicEmbVariantsTest(unittest.TestCase):
-    """``_emit_dynamicemb_variants`` produces { HYBRID, CACHING } × factors."""
-
-    def _make_base(self, cache_params=None):
-        # _emit_dynamicemb_variants only touches cache_params and
-        # dynamicemb_options on the option, so a SimpleNamespace stand-in is
-        # sufficient and avoids the heavy ShardingOption constructor surface.
-        return SimpleNamespace(
-            cache_params=cache_params,
-            dynamicemb_options=SimpleNamespace(caching=False, bucket_capacity=128),
-        )
-
-    def test_unfixed_factor_emits_twenty_variants(self):
-        variants = _emit_dynamicemb_variants(self._make_base(cache_params=None))
-        self.assertEqual(len(variants), 20)
-        cache_modes = sorted({v.dynamicemb_options.caching for v in variants})
-        self.assertEqual(cache_modes, [False, True])
-        for caching_mode in (False, True):
-            factors = sorted(
-                v.cache_params.load_factor
-                for v in variants
-                if v.dynamicemb_options.caching is caching_mode
-            )
-            self.assertEqual(factors, [round((i + 1) / 10, 4) for i in range(10)])
-
-    def test_fixed_factor_emits_two_variants(self):
-        variants = _emit_dynamicemb_variants(
-            self._make_base(cache_params=CacheParams(load_factor=0.3))
-        )
-        self.assertEqual(len(variants), 2)
-        cache_modes = sorted(v.dynamicemb_options.caching for v in variants)
-        self.assertEqual(cache_modes, [False, True])
-        for v in variants:
-            self.assertEqual(v.cache_params.load_factor, 0.3)
-
-    def test_variants_own_dynamicemb_options(self):
-        # Per-variant mutation of caching must not bleed across variants.
-        base = self._make_base()
-        original_opts = base.dynamicemb_options
-        variants = _emit_dynamicemb_variants(base)
-        for v in variants:
-            self.assertIsNot(v.dynamicemb_options, original_opts)
-
-    def test_stats_preserved_on_clone(self):
-        class _Stats:
-            expected_lookups = 100.0
-
-            def expected_miss_rate(self, ratio):
-                return 0.1
-
-        stats = _Stats()
-        variants = _emit_dynamicemb_variants(
-            self._make_base(cache_params=CacheParams(load_factor=0.2, stats=stats))
-        )
-        for v in variants:
-            self.assertIs(v.cache_params.stats, stats)
-
-
 class _FakeStorage:
     def __init__(self, hbm, ddr):
         self.hbm = hbm
@@ -230,6 +176,97 @@ def _make_topology(num_devices, hbm_per_device, ddr_per_device, local_world_size
         ],
         local_world_size=local_world_size or num_devices,
     )
+
+
+def _dense_dp_proposor_python_reference(
+    table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    hbm_bins: int,
+    ddr_bins: int,
+) -> List[List[int]]:
+    """Dense T x H x D Python DP -- the oracle for sparse-K NumPy equivalence.
+
+    Same input shape as plan_util._sparse_dp_proposor_numpy: per table, a tuple of
+    (opt_h, opt_d, opt_perf, opt_global_idx) in bin-units. Algorithmically
+    identical to the in-tree DP that the NumPy version replaced (dense state +
+    full backtrack), tightened with a 2-row dp ring buffer so it stays
+    tractable on small property-test problem sizes.
+    """
+    T = len(table_opts)
+    if T == 0:
+        return []
+    INF = float("inf")
+    empty = (INF, INF, INF)
+    prev_dp = [[empty] * ddr_bins for _ in range(hbm_bins)]
+    backtrack = [[[(-1, -1, -1)] * ddr_bins for _ in range(hbm_bins)] for _ in range(T)]
+
+    # Seed table 0.
+    h0, d0, p0, g0 = table_opts[0]
+    for j in range(len(p0)):
+        h, d, p = float(h0[j]), float(d0[j]), float(p0[j])
+        if h >= hbm_bins or d >= ddr_bins:
+            continue
+        hi, di = int(h), int(d)
+        if prev_dp[hi][di][0] > p:
+            prev_dp[hi][di] = (p, h, d)
+            backtrack[0][hi][di] = (int(g0[j]), -1, -1)
+
+    # Transitions.
+    for t in range(1, T):
+        h_t, d_t, p_t, g_t = table_opts[t]
+        cur_dp = [[empty] * ddr_bins for _ in range(hbm_bins)]
+        for h in range(hbm_bins):
+            for d in range(ddr_bins):
+                pp, ph, pd = prev_dp[h][d]
+                if pp == INF:
+                    continue
+                for j in range(len(p_t)):
+                    new_h = ph + float(h_t[j])
+                    new_d = pd + float(d_t[j])
+                    if new_h >= hbm_bins or new_d >= ddr_bins:
+                        continue
+                    nhi, ndi = int(new_h), int(new_d)
+                    new_p = pp + float(p_t[j])
+                    if cur_dp[nhi][ndi][0] > new_p:
+                        cur_dp[nhi][ndi] = (new_p, new_h, new_d)
+                        backtrack[t][nhi][ndi] = (int(g_t[j]), h, d)
+        prev_dp = cur_dp
+
+    # Per-HBM-bin best, decreasing HBM order.
+    proposals: List[List[int]] = []
+    last_back = backtrack[T - 1]
+    for h in range(hbm_bins - 1, -1, -1):
+        best_p, best_d = INF, -1
+        for d in range(ddr_bins):
+            if last_back[h][d][0] >= 0 and prev_dp[h][d][0] < best_p:
+                best_p, best_d = prev_dp[h][d][0], d
+        if best_d < 0:
+            continue
+        opt, ph, pd = last_back[h][best_d]
+        ids = [-1] * T
+        ids[T - 1] = opt
+        for t in range(T - 2, -1, -1):
+            ids[t], ph, pd = backtrack[t][ph][pd]
+        proposals.append(ids)
+    return proposals
+
+
+def _make_random_table_opts(
+    seed: int, T: int = 5, N: int = 4, H: int = 8, D: int = 8
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Seeded random per-table option arrays for property testing.
+
+    Per-option bin contributions stay in [0, axis/2) so combined plans can fit
+    several tables without saturating either axis.
+    """
+    rng = random.Random(seed)
+    table_opts = []
+    for _ in range(T):
+        h = np.asarray([rng.uniform(0, H / 2) for _ in range(N)], dtype=np.float32)
+        d = np.asarray([rng.uniform(0, D / 2) for _ in range(N)], dtype=np.float32)
+        p = np.asarray([rng.uniform(1, 100) for _ in range(N)], dtype=np.float32)
+        g = np.arange(N, dtype=np.int32)
+        table_opts.append((h, d, p, g))
+    return table_opts
 
 
 class DynamicProgrammingProposerTest(unittest.TestCase):
@@ -348,6 +385,20 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
             [_FakeShardingOption("t", hbm=100, ddr=900, perf=10.0)], topology
         )
         self.assertGreater(len(proposals_fit), 0)
+
+    @parameterized.expand([(seed,) for seed in [0, 1, 7, 42, 1337]])
+    def test_sparse_numpy_matches_dense_reference(self, seed):
+        # Property test: sparse-K NumPy DP must produce the same proposal set
+        # as the dense T x H x D Python reference oracle for any random input.
+        table_opts = _make_random_table_opts(seed, T=5, N=4, H=8, D=8)
+        np_proposals = _sparse_dp_proposor_numpy(table_opts, hbm_bins=8, ddr_bins=8)
+        ref_proposals = _dense_dp_proposor_python_reference(
+            table_opts, hbm_bins=8, ddr_bins=8
+        )
+        self.assertEqual(
+            {tuple(p) for p in np_proposals},
+            {tuple(p) for p in ref_proposals},
+        )
 
     def test_empty_search_space_returns_empty_proposal(self):
         proposer = DynamicProgrammingProposer()
