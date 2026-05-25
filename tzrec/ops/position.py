@@ -104,6 +104,7 @@ def add_timestamp_positional_embeddings(
     time_bucket_fn: str = "sqrt",
     time_bucket_increments: float = 60.0,
     kernel: Kernel = Kernel.PYTORCH,
+    query_time: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert time_bucket_fn in ["sqrt", "log"]
     if kernel == Kernel.CUTLASS:
@@ -127,6 +128,7 @@ def add_timestamp_positional_embeddings(
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
             time_bucket_increments=time_bucket_increments,
+            query_time=query_time,
         )
     else:
         return pytorch_add_timestamp_positional_embeddings(
@@ -142,4 +144,5 @@ def add_timestamp_positional_embeddings(
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
             time_bucket_increments=time_bucket_increments,
+            query_time=query_time,
         )
