@@ -14,7 +14,7 @@ import unittest
 import torch
 from hypothesis import Verbosity, assume, given, settings
 from hypothesis import strategies as st
-from torchrec import JaggedTensor, KeyedJaggedTensor
+from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, CAND_POS_LENGTHS, Batch
 from tzrec.features.feature import create_features
@@ -35,7 +35,7 @@ from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
 
 
-def _build_model(device: torch.device) -> HSTUMatch:
+def _build_model(device: torch.device, with_query_time: bool = False) -> HSTUMatch:
     """Build an HSTUMatch model with standard test configuration.
 
     Mirrors the production grouped-sequence pattern: `uih_seq` and
@@ -43,6 +43,10 @@ def _build_model(device: torch.device) -> HSTUMatch:
     dim / `embedding_name` so the two flattened features share one
     embedding table. `uih_seq` also carries the `historical_ts` raw
     sub-feature for the timestamp dense path.
+
+    When ``with_query_time`` is set, the user tower turns on time encoding
+    and a scalar ``request_time`` raw feature is exposed through a
+    ``query_time`` DEEP group — the per-row time-bias anchor.
     """
     feature_cfgs = [
         feature_pb2.FeatureConfig(
@@ -84,6 +88,12 @@ def _build_model(device: torch.device) -> HSTUMatch:
             )
         ),
     ]
+    if with_query_time:
+        feature_cfgs.append(
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="request_time")
+            )
+        )
     features = create_features(feature_cfgs)
     feature_groups = [
         model_pb2.FeatureGroupConfig(
@@ -102,6 +112,14 @@ def _build_model(device: torch.device) -> HSTUMatch:
             group_type=model_pb2.FeatureGroupType.JAGGED_SEQUENCE,
         ),
     ]
+    if with_query_time:
+        feature_groups.append(
+            model_pb2.FeatureGroupConfig(
+                group_name="query_time",
+                feature_names=["request_time"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            )
+        )
     model_config = model_pb2.ModelConfig(
         feature_groups=feature_groups,
         hstu_match=match_model_pb2.HSTUMatch(
@@ -120,6 +138,8 @@ def _build_model(device: torch.device) -> HSTUMatch:
                     attn_num_layers=2,
                     positional_encoder=module_pb2.GRPositionalEncoder(
                         num_position_buckets=512,
+                        num_time_buckets=512,
+                        use_time_encoding=with_query_time,
                     ),
                     input_preprocessor=module_pb2.GRInputPreprocessor(
                         uih_preprocessor=module_pb2.GRUIHPreprocessor(),
@@ -153,13 +173,16 @@ def _build_model(device: torch.device) -> HSTUMatch:
     return hstu
 
 
-def _build_batch(device: torch.device) -> Batch:
+def _build_batch(device: torch.device, with_query_time: bool = False) -> Batch:
     """Build a test Batch with the row-(B-1) suffix candidate layout.
 
     UIH: user1 has 3 items, user2 has 4 items.
     Candidates: row 0 = [pos_0]; row 1 (last) = [pos_1, simple_neg_0,
     simple_neg_1] -- the shared simple-neg pool sits in the last row's suffix.
     pos_lengths = [1, 1].
+
+    When ``with_query_time`` is set, a per-row ``request_time`` dense scalar
+    (strictly after each user's last UIH event at ts 3 / 7) is included.
     """
     sparse_feature = KeyedJaggedTensor.from_lengths_sync(
         keys=["uih_seq__video_id", "cand_seq__video_id"],
@@ -172,7 +195,14 @@ def _build_batch(device: torch.device) -> Batch:
             lengths=torch.tensor([3, 4]),
         ),
     }
+    dense_features = {}
+    if with_query_time:
+        dense_features[BASE_DATA_GROUP] = KeyedTensor.from_tensor_list(
+            keys=["request_time"],
+            tensors=[torch.tensor([[100.0], [100.0]])],
+        )
     return Batch(
+        dense_features=dense_features,
         sparse_features={BASE_DATA_GROUP: sparse_feature},
         sequence_dense_features=sequence_dense_features,
         jagged_labels={
@@ -244,6 +274,34 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertFalse(scalar_features[0].is_grouped_sequence)
         self.assertEqual(scalar_feature_groups[0].feature_names, ["video_id"])
         self.assertEqual(scalar_feature_groups[0].group_name, "candidate")
+
+    @given(
+        graph_type=st.sampled_from([TestGraphType.NORMAL, TestGraphType.FX_TRACE]),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
+    def test_hstu_match_query_time(self, graph_type) -> None:
+        """The optional `query_time` DEEP group is the time-bias anchor.
+
+        Detected and threaded into the user tower so it reads a per-row
+        request time instead of deriving it from the last UIH event.
+        """
+        device = torch.device("cpu")
+        # No query_time group -> encoder falls back to the last UIH timestamp.
+        self.assertEqual(
+            _build_model(device).user_tower._hstu_encoder._query_time_key, ""
+        )
+        # With the group -> encoder reads it as the explicit per-row anchor.
+        hstu = _build_model(device, with_query_time=True)
+        self.assertEqual(hstu.user_tower._hstu_encoder._query_time_key, "query_time")
+        hstu.set_kernel(Kernel.PYTORCH)
+        batch = _build_batch(device, with_query_time=True)
+
+        if graph_type == TestGraphType.FX_TRACE:
+            predictions = create_test_model(hstu, graph_type)(batch)
+        else:
+            wrapped = TrainWrapper(hstu, device=device).to(device)
+            _, (_, predictions, _) = wrapped(batch)
+        self.assertEqual(predictions["similarity"].size(0), 2)
 
 
 if __name__ == "__main__":
