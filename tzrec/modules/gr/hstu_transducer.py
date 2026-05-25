@@ -71,8 +71,13 @@ class _HSTUPipelineBase(BaseModule):
         attn_truncation_split_layer: int = 0,
         attn_truncation_tail_len: int = 0,
         name: str = "",
+        query_time_key: str = "",
     ) -> None:
         super().__init__(is_inference=is_inference)
+        # Grouped-feature key of the per-row request time used as the time-bias
+        # anchor. Empty -> anchor on the last in-sequence timestamp (canonical
+        # HSTU / DLRM-HSTU, which concatenates the candidate request time).
+        self._query_time_key: str = query_time_key
         self._input_preprocessor: InputPreprocessor = create_input_preprocessor(
             input_preprocessor,
             uih_embedding_dim=uih_embedding_dim,
@@ -129,6 +134,13 @@ class _HSTUPipelineBase(BaseModule):
                 output_num_targets,
             ) = self._input_preprocessor(grouped_features)
 
+        # Per-row request time anchor (HSTUMatch). Read from grouped_features
+        # rather than the preprocessor tuple so the shared ranking path is
+        # untouched. `[B, 1]` raw values -> the op reshapes to `[B]`.
+        query_time: Optional[torch.Tensor] = None
+        if self._query_time_key != "":
+            query_time = grouped_features[self._query_time_key]
+
         with record_function("hstu_positional_encoder"):
             if self._positional_encoder is not None:
                 output_seq_embeddings = self._positional_encoder(
@@ -138,6 +150,7 @@ class _HSTUPipelineBase(BaseModule):
                     seq_timestamps=output_seq_timestamps,
                     seq_embeddings=output_seq_embeddings,
                     num_targets=output_num_targets,
+                    query_time=query_time,
                 )
 
         output_seq_embeddings = torch.nn.functional.dropout(
@@ -468,6 +481,10 @@ class HSTUMatchEncoder(_HSTUPipelineBase):
         is_inference (bool): whether to run in inference mode.
         attn_truncation_split_layer (int): see `HSTUTransducer`.
         attn_truncation_tail_len (int): see `HSTUTransducer`.
+        query_time_key (str): grouped-feature key of the per-row request time
+            used as the time-bias anchor. Empty (default) anchors on the last
+            UIH timestamp; pass a scalar request-time group to anchor on the
+            actual request time (decoupled from UIH staleness).
     """
 
     def __init__(
@@ -487,6 +504,7 @@ class HSTUMatchEncoder(_HSTUPipelineBase):
         attn_truncation_split_layer: int = 0,
         attn_truncation_tail_len: int = 0,
         name: str = "",
+        query_time_key: str = "",
     ) -> None:
         super().__init__(
             uih_embedding_dim=uih_embedding_dim,
@@ -504,6 +522,7 @@ class HSTUMatchEncoder(_HSTUPipelineBase):
             attn_truncation_split_layer=attn_truncation_split_layer,
             attn_truncation_tail_len=attn_truncation_tail_len,
             name=name,
+            query_time_key=query_time_key,
         )
         self._output_postprocessor: OutputPostprocessor = create_output_postprocessor(
             output_postprocessor, embedding_dim=stu["embedding_dim"]
