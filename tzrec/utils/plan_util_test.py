@@ -185,73 +185,89 @@ def _dense_dp_proposor_python_reference(
 ) -> List[List[int]]:
     """Dense T x H x D Python DP -- the oracle for sparse-K NumPy equivalence.
 
-    Same input shape as plan_util._sparse_dp_proposor_numpy: per table, a tuple of
-    (opt_h, opt_d, opt_perf, opt_global_idx) in bin-units. Algorithmically
-    identical to the in-tree DP that the NumPy version replaced (dense state +
-    full backtrack), tightened with a 2-row dp ring buffer so it stays
-    tractable on small property-test problem sizes.
+    Same input shape as plan_util._sparse_dp_proposor_numpy: per table, a tuple
+    of ``(opt_hbm, opt_ddr, opt_perf, opt_global_id)`` in bin-units.
+    Algorithmically identical to the in-tree DP that the NumPy version
+    replaced (dense state + full backtrack), tightened with a 2-row dp ring
+    buffer so it stays tractable on small property-test problem sizes.
     """
-    T = len(table_opts)
-    if T == 0:
+    table_count = len(table_opts)
+    if table_count == 0:
         return []
     INF = float("inf")
-    empty = (INF, INF, INF)
-    prev_dp = [[empty] * ddr_bins for _ in range(hbm_bins)]
-    backtrack = [[[(-1, -1, -1)] * ddr_bins for _ in range(hbm_bins)] for _ in range(T)]
+    empty_state = (INF, INF, INF)
+    prev_dp = [[empty_state] * ddr_bins for _ in range(hbm_bins)]
+    backtrack = [
+        [[(-1, -1, -1)] * ddr_bins for _ in range(hbm_bins)] for _ in range(table_count)
+    ]
 
     # Seed table 0.
-    h0, d0, p0, g0 = table_opts[0]
-    for j in range(len(p0)):
-        h, d, p = float(h0[j]), float(d0[j]), float(p0[j])
-        if h >= hbm_bins or d >= ddr_bins:
+    seed_hbm, seed_ddr, seed_perf, seed_opt_id = table_opts[0]
+    for opt_j in range(len(seed_perf)):
+        hbm = float(seed_hbm[opt_j])
+        ddr = float(seed_ddr[opt_j])
+        perf = float(seed_perf[opt_j])
+        if hbm >= hbm_bins or ddr >= ddr_bins:
             continue
-        hi, di = int(h), int(d)
-        if prev_dp[hi][di][0] > p:
-            prev_dp[hi][di] = (p, h, d)
-            backtrack[0][hi][di] = (int(g0[j]), -1, -1)
+        hbm_i, ddr_i = int(hbm), int(ddr)
+        if prev_dp[hbm_i][ddr_i][0] > perf:
+            prev_dp[hbm_i][ddr_i] = (perf, hbm, ddr)
+            backtrack[0][hbm_i][ddr_i] = (int(seed_opt_id[opt_j]), -1, -1)
 
     # Transitions.
-    for t in range(1, T):
-        h_t, d_t, p_t, g_t = table_opts[t]
-        cur_dp = [[empty] * ddr_bins for _ in range(hbm_bins)]
-        for h in range(hbm_bins):
-            for d in range(ddr_bins):
-                pp, ph, pd = prev_dp[h][d]
-                if pp == INF:
+    for table_i in range(1, table_count):
+        cur_table_hbm, cur_table_ddr, cur_table_perf, cur_table_opt_id = table_opts[
+            table_i
+        ]
+        cur_dp = [[empty_state] * ddr_bins for _ in range(hbm_bins)]
+        for hbm_i in range(hbm_bins):
+            for ddr_i in range(ddr_bins):
+                prev_perf, prev_hbm, prev_ddr = prev_dp[hbm_i][ddr_i]
+                if prev_perf == INF:
                     continue
-                for j in range(len(p_t)):
-                    new_h = ph + float(h_t[j])
-                    new_d = pd + float(d_t[j])
-                    if new_h >= hbm_bins or new_d >= ddr_bins:
+                for opt_j in range(len(cur_table_perf)):
+                    new_hbm = prev_hbm + float(cur_table_hbm[opt_j])
+                    new_ddr = prev_ddr + float(cur_table_ddr[opt_j])
+                    if new_hbm >= hbm_bins or new_ddr >= ddr_bins:
                         continue
-                    nhi, ndi = int(new_h), int(new_d)
-                    new_p = pp + float(p_t[j])
-                    if cur_dp[nhi][ndi][0] > new_p:
-                        cur_dp[nhi][ndi] = (new_p, new_h, new_d)
-                        backtrack[t][nhi][ndi] = (int(g_t[j]), h, d)
+                    new_hbm_i, new_ddr_i = int(new_hbm), int(new_ddr)
+                    new_perf = prev_perf + float(cur_table_perf[opt_j])
+                    if cur_dp[new_hbm_i][new_ddr_i][0] > new_perf:
+                        cur_dp[new_hbm_i][new_ddr_i] = (new_perf, new_hbm, new_ddr)
+                        backtrack[table_i][new_hbm_i][new_ddr_i] = (
+                            int(cur_table_opt_id[opt_j]),
+                            hbm_i,
+                            ddr_i,
+                        )
         prev_dp = cur_dp
 
     # Per-HBM-bin best, decreasing HBM order.
     proposals: List[List[int]] = []
-    last_back = backtrack[T - 1]
-    for h in range(hbm_bins - 1, -1, -1):
-        best_p, best_d = INF, -1
-        for d in range(ddr_bins):
-            if last_back[h][d][0] >= 0 and prev_dp[h][d][0] < best_p:
-                best_p, best_d = prev_dp[h][d][0], d
-        if best_d < 0:
+    last_back = backtrack[table_count - 1]
+    for hbm_i in range(hbm_bins - 1, -1, -1):
+        best_perf, best_ddr_i = INF, -1
+        for ddr_i in range(ddr_bins):
+            if last_back[hbm_i][ddr_i][0] >= 0 and prev_dp[hbm_i][ddr_i][0] < best_perf:
+                best_perf, best_ddr_i = prev_dp[hbm_i][ddr_i][0], ddr_i
+        if best_ddr_i < 0:
             continue
-        opt, ph, pd = last_back[h][best_d]
-        ids = [-1] * T
-        ids[T - 1] = opt
-        for t in range(T - 2, -1, -1):
-            ids[t], ph, pd = backtrack[t][ph][pd]
-        proposals.append(ids)
+        cur_opt_j, prev_hbm_i, prev_ddr_i = last_back[hbm_i][best_ddr_i]
+        proposal_indices = [-1] * table_count
+        proposal_indices[table_count - 1] = cur_opt_j
+        for table_i in range(table_count - 2, -1, -1):
+            proposal_indices[table_i], prev_hbm_i, prev_ddr_i = backtrack[table_i][
+                prev_hbm_i
+            ][prev_ddr_i]
+        proposals.append(proposal_indices)
     return proposals
 
 
 def _make_random_table_opts(
-    seed: int, T: int = 5, N: int = 4, H: int = 8, D: int = 8
+    seed: int,
+    table_count: int = 5,
+    option_count: int = 4,
+    hbm_bins: int = 8,
+    ddr_bins: int = 8,
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Seeded random per-table option arrays for property testing.
 
@@ -260,12 +276,20 @@ def _make_random_table_opts(
     """
     rng = random.Random(seed)
     table_opts = []
-    for _ in range(T):
-        h = np.asarray([rng.uniform(0, H / 2) for _ in range(N)], dtype=np.float32)
-        d = np.asarray([rng.uniform(0, D / 2) for _ in range(N)], dtype=np.float32)
-        p = np.asarray([rng.uniform(1, 100) for _ in range(N)], dtype=np.float32)
-        g = np.arange(N, dtype=np.int32)
-        table_opts.append((h, d, p, g))
+    for _ in range(table_count):
+        hbm = np.asarray(
+            [rng.uniform(0, hbm_bins / 2) for _ in range(option_count)],
+            dtype=np.float32,
+        )
+        ddr = np.asarray(
+            [rng.uniform(0, ddr_bins / 2) for _ in range(option_count)],
+            dtype=np.float32,
+        )
+        perf = np.asarray(
+            [rng.uniform(1, 100) for _ in range(option_count)], dtype=np.float32
+        )
+        opt_id = np.arange(option_count, dtype=np.int32)
+        table_opts.append((hbm, ddr, perf, opt_id))
     return table_opts
 
 
@@ -390,14 +414,16 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
     def test_sparse_numpy_matches_dense_reference(self, seed):
         # Property test: sparse-K NumPy DP must produce the same proposal set
         # as the dense T x H x D Python reference oracle for any random input.
-        table_opts = _make_random_table_opts(seed, T=5, N=4, H=8, D=8)
-        np_proposals = _sparse_dp_proposor_numpy(table_opts, hbm_bins=8, ddr_bins=8)
-        ref_proposals = _dense_dp_proposor_python_reference(
+        table_opts = _make_random_table_opts(
+            seed, table_count=5, option_count=4, hbm_bins=8, ddr_bins=8
+        )
+        actual_proposals = _sparse_dp_proposor_numpy(table_opts, hbm_bins=8, ddr_bins=8)
+        expected_proposals = _dense_dp_proposor_python_reference(
             table_opts, hbm_bins=8, ddr_bins=8
         )
         self.assertEqual(
-            {tuple(p) for p in np_proposals},
-            {tuple(p) for p in ref_proposals},
+            {tuple(p) for p in actual_proposals},
+            {tuple(p) for p in expected_proposals},
         )
 
     def test_empty_search_space_returns_empty_proposal(self):

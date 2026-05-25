@@ -235,14 +235,21 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
 _INF = float("inf")
 
 
-def _firsts(sorted_keys: np.ndarray) -> np.ndarray:
-    """Boolean first-occurrence mask in a sorted 1-D key array."""
-    out = np.empty(sorted_keys.shape, dtype=bool)
-    if sorted_keys.size == 0:
-        return out
-    out[0] = True
-    out[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    return out
+def _argmin_per_group(group_keys: np.ndarray, perf_keys: np.ndarray) -> np.ndarray:
+    """Index of the min-``perf_keys`` entry per distinct ``group_keys`` value.
+
+    Both inputs must be 1-D and the same length. Ties on ``perf_keys`` are
+    broken by input order. Output indexes into the original (pre-sort)
+    arrays, ordered by ascending ``group_keys``.
+    """
+    if group_keys.size == 0:
+        return np.empty(0, dtype=np.int64)
+    lexsort_order = np.lexsort((perf_keys, group_keys))
+    sorted_groups = group_keys[lexsort_order]
+    is_first_of_run = np.empty(sorted_groups.shape, dtype=bool)
+    is_first_of_run[0] = True
+    is_first_of_run[1:] = sorted_groups[1:] != sorted_groups[:-1]
+    return lexsort_order[is_first_of_run]
 
 
 def _sparse_dp_proposor_numpy(
@@ -252,93 +259,98 @@ def _sparse_dp_proposor_numpy(
 ) -> List[List[int]]:
     """Sparse-K NumPy 2D DP over (hbm_bin, ddr_bin) reachable cells.
 
-    Per table, broadcasts (K_prev, N) candidates and uses lexsort + a
-    first-occurrence mask for groupby-argmin on the destination cell. Reachable
-    cells K_t saturate at the actual reachable count, not hbm_bins * ddr_bins.
-    Backtracking walks T x K_t int32 arrays in O(T) Python steps.
+    Per table, broadcasts (K_prev, N) candidates and uses :func:`_argmin_per_group`
+    (lexsort + first-of-run) for groupby-argmin on the destination cell.
+    Reachable cells K_t saturate at the actual reachable count, not
+    ``hbm_bins * ddr_bins``. Backtracking walks T x K_t int32 arrays in
+    O(T) Python steps.
 
-    table_opts entries are (opt_h, opt_d, opt_perf, opt_global_idx) per table,
-    all 1-D NumPy arrays (the float ones in bin-units; the index one in opt-id
-    space, used to reconstruct proposals).
+    ``table_opts`` entries are ``(opt_hbm, opt_ddr, opt_perf, opt_global_id)``
+    per table, all 1-D NumPy arrays (the float ones in bin-units; the index
+    one in opt-id space, used to reconstruct proposals).
 
     Returns a list of proposals; each proposal is a list of opt-id integers,
     one per table, emitted in decreasing-HBM order with at most one entry per
     HBM bin (the perf-best plan across all DDR bins at that HBM level).
     """
-    T = len(table_opts)
-    if T == 0:
+    table_count = len(table_opts)
+    if table_count == 0:
         return []
 
-    h0, d0, p0, g0 = table_opts[0]
-    val = (h0 < hbm_bins) & (d0 < ddr_bins)
-    if not val.any():
+    seed_hbm, seed_ddr, seed_perf, seed_opt_id = table_opts[0]
+    valid_mask = (seed_hbm < hbm_bins) & (seed_ddr < ddr_bins)
+    if not valid_mask.any():
         return []
-    h0, d0, p0, g0 = h0[val], d0[val], p0[val], g0[val]
-    h_idx = h0.astype(np.int32)
-    d_idx = d0.astype(np.int32)
-    flat = h_idx.astype(np.int64) * ddr_bins + d_idx
-    order = np.lexsort((p0, flat))
-    win = order[_firsts(flat[order])]
+    seed_hbm = seed_hbm[valid_mask]
+    seed_ddr = seed_ddr[valid_mask]
+    seed_perf = seed_perf[valid_mask]
+    seed_opt_id = seed_opt_id[valid_mask]
+    seed_hbm_i = seed_hbm.astype(np.int32)
+    seed_ddr_i = seed_ddr.astype(np.int32)
+    flat_cell_i = seed_hbm_i.astype(np.int64) * ddr_bins + seed_ddr_i
+    winners = _argmin_per_group(group_keys=flat_cell_i, perf_keys=seed_perf)
 
-    dp_perf = p0[win]
-    dp_h_act = h0[win]
-    dp_d_act = d0[win]
-    dp_h_idx = h_idx[win]
-    back_opt: List[np.ndarray] = [g0[win]]
-    back_src: List[np.ndarray] = [np.full(win.size, -1, dtype=np.int32)]
+    dp_perf = seed_perf[winners]
+    dp_hbm = seed_hbm[winners]
+    dp_ddr = seed_ddr[winners]
+    dp_hbm_i = seed_hbm_i[winners]
+    back_opt_j: List[np.ndarray] = [seed_opt_id[winners]]
+    back_prev_cell_i: List[np.ndarray] = [np.full(winners.size, -1, dtype=np.int32)]
 
-    for t in range(1, T):
+    for table_i in range(1, table_count):
         if dp_perf.size == 0:
             break
-        h_t, d_t, p_t, g_t = table_opts[t]
-        if p_t.size == 0:
+        cur_table_hbm, cur_table_ddr, cur_table_perf, cur_table_opt_id = table_opts[
+            table_i
+        ]
+        if cur_table_perf.size == 0:
             dp_perf = np.zeros(0)
             break
 
-        new_h = dp_h_act[:, None] + h_t[None, :]
-        new_d = dp_d_act[:, None] + d_t[None, :]
-        new_p = dp_perf[:, None] + p_t[None, :]
-        val = (new_h < hbm_bins) & (new_d < ddr_bins)
-        if not val.any():
+        new_hbm = dp_hbm[:, None] + cur_table_hbm[None, :]
+        new_ddr = dp_ddr[:, None] + cur_table_ddr[None, :]
+        new_perf = dp_perf[:, None] + cur_table_perf[None, :]
+        valid_mask = (new_hbm < hbm_bins) & (new_ddr < ddr_bins)
+        if not valid_mask.any():
             dp_perf = np.zeros(0)
             break
 
-        h_idx = new_h.astype(np.int32)
-        d_idx = new_d.astype(np.int32)
-        flat = h_idx.astype(np.int64) * ddr_bins + d_idx
+        new_hbm_i = new_hbm.astype(np.int32)
+        new_ddr_i = new_ddr.astype(np.int32)
+        flat_cell_i = new_hbm_i.astype(np.int64) * ddr_bins + new_ddr_i
 
-        flat_v = flat[val]
-        new_p_v = new_p[val]
-        new_h_v = new_h[val]
-        new_d_v = new_d[val]
-        h_idx_v = h_idx[val]
-        src_K, src_j = np.where(val)
+        valid_flat_cell_i = flat_cell_i[valid_mask]
+        valid_new_perf = new_perf[valid_mask]
+        valid_new_hbm = new_hbm[valid_mask]
+        valid_new_ddr = new_ddr[valid_mask]
+        valid_new_hbm_i = new_hbm_i[valid_mask]
+        valid_prev_cell_i, valid_opt_j = np.where(valid_mask)
 
-        order = np.lexsort((new_p_v, flat_v))
-        win = order[_firsts(flat_v[order])]
+        winners = _argmin_per_group(
+            group_keys=valid_flat_cell_i, perf_keys=valid_new_perf
+        )
 
-        dp_perf = new_p_v[win]
-        dp_h_act = new_h_v[win]
-        dp_d_act = new_d_v[win]
-        dp_h_idx = h_idx_v[win]
-        back_opt.append(g_t[src_j[win]])
-        back_src.append(src_K[win].astype(np.int32))
+        dp_perf = valid_new_perf[winners]
+        dp_hbm = valid_new_hbm[winners]
+        dp_ddr = valid_new_ddr[winners]
+        dp_hbm_i = valid_new_hbm_i[winners]
+        back_opt_j.append(cur_table_opt_id[valid_opt_j[winners]])
+        back_prev_cell_i.append(valid_prev_cell_i[winners].astype(np.int32))
 
     if dp_perf.size == 0:
         return []
 
     # Per-HBM-bin best, decreasing HBM order.
-    order = np.lexsort((dp_perf, dp_h_idx))
-    chosen = order[_firsts(dp_h_idx[order])][::-1]
+    chosen_cell_i = _argmin_per_group(group_keys=dp_hbm_i, perf_keys=dp_perf)[::-1]
 
     proposals: List[List[int]] = []
-    for k0 in chosen:
-        ids = [-1] * T
-        cur_K = int(k0)
-        for t in range(T - 1, -1, -1):
-            ids[t] = int(back_opt[t][cur_K])
-            cur_K = int(back_src[t][cur_K])
-        proposals.append(ids)
+    for last_cell_i in chosen_cell_i:
+        proposal_indices = [-1] * table_count
+        cur_cell_i = int(last_cell_i)
+        for table_i in range(table_count - 1, -1, -1):
+            proposal_indices[table_i] = int(back_opt_j[table_i][cur_cell_i])
+            cur_cell_i = int(back_prev_cell_i[table_i][cur_cell_i])
+        proposals.append(proposal_indices)
     return proposals
 
 
@@ -500,10 +512,10 @@ class DynamicProgrammingProposer(Proposer):
         # Per-table option arrays in bin-units, with infeasible options pruned.
         table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         for sharding_options in self._sharding_options_by_fqn.values():
-            h_list: List[float] = []
-            d_list: List[float] = []
-            p_list: List[float] = []
-            g_list: List[int] = []
+            hbm_list: List[float] = []
+            ddr_list: List[float] = []
+            perf_list: List[float] = []
+            opt_id_list: List[int] = []
             for opt_id, sharding_option in enumerate(sharding_options):
                 max_shard_hbm = max(
                     (shard.storage.hbm or 0) for shard in sharding_option.shards
@@ -516,24 +528,24 @@ class DynamicProgrammingProposer(Proposer):
                     continue
                 if ddr_total > 0 and max_shard_ddr > max_machine_ddr:
                     continue
-                h_list.append(
+                hbm_list.append(
                     (sharding_option.total_storage.hbm or 0) / hbm_bin_size
                     if hbm_total > 0
                     else 0.0
                 )
-                d_list.append(
+                ddr_list.append(
                     (sharding_option.total_storage.ddr or 0) / ddr_bin_size
                     if ddr_total > 0
                     else 0.0
                 )
-                p_list.append(sharding_option.total_perf)
-                g_list.append(opt_id)
+                perf_list.append(sharding_option.total_perf)
+                opt_id_list.append(opt_id)
             table_opts.append(
                 (
-                    np.asarray(h_list, dtype=np.float32),
-                    np.asarray(d_list, dtype=np.float32),
-                    np.asarray(p_list, dtype=np.float32),
-                    np.asarray(g_list, dtype=np.int32),
+                    np.asarray(hbm_list, dtype=np.float32),
+                    np.asarray(ddr_list, dtype=np.float32),
+                    np.asarray(perf_list, dtype=np.float32),
+                    np.asarray(opt_id_list, dtype=np.int32),
                 )
             )
 
