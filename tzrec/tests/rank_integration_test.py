@@ -24,7 +24,12 @@ from tzrec.datasets.dataset import create_dataloader
 from tzrec.main import _create_features
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
-from tzrec.utils.test_util import dfs_are_close, gpu_unavailable
+from tzrec.utils.test_util import (
+    cutlass_hstu_unavailable,
+    dfs_are_close,
+    gpu_unavailable,
+    torch_fx_tool_unavailable,
+)
 
 
 class RankIntegrationTest(unittest.TestCase):
@@ -1036,6 +1041,7 @@ class RankIntegrationTest(unittest.TestCase):
             acc_cfg = json.load(f)
             self.assertEqual(acc_cfg.get("UNIFIED_AOT"), "1")
 
+    @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_cutlass_train_eval_export(self):
         self.success = utils.test_train_eval(
@@ -1064,6 +1070,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
+    @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_ultra_hstu_cutlass_train_eval_export(self):
         self.success = utils.test_train_eval(
@@ -1132,6 +1139,11 @@ class RankIntegrationTest(unittest.TestCase):
             predict_columns=["user_id", "item_id", "clk", "probs"],
         )
 
+    @unittest.skipIf(*torch_fx_tool_unavailable)
+    @unittest.skipIf(
+        not dynamicemb_util.has_dynamicemb,
+        "dynamicemb not available (config sets `dynamicemb { }` on features).",
+    )
     @unittest.skipIf(*gpu_unavailable)
     def test_multi_tower_din_rtp_train_export(self):
         # set USE_RTP env here for gen correct rtp style train/eval data
@@ -1164,6 +1176,7 @@ class RankIntegrationTest(unittest.TestCase):
             in weight_json
         )
 
+    @unittest.skipIf(*torch_fx_tool_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_rtp_train_export(self):
         self.success = utils.test_train_eval(

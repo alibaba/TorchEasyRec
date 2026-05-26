@@ -384,6 +384,10 @@ class JaggedTensorsTest(unittest.TestCase):
         from tzrec.ops.jagged_tensors import (
             jagged_dense_bmm_broadcast_add,
         )
+        from tzrec.utils.test_util import get_compare_tolerance
+
+        if atol is None and rtol is None:
+            atol, rtol = get_compare_tolerance(dtype)
 
         if sparsity > 0.0:
             lengths = generate_sparse_seq_len(
