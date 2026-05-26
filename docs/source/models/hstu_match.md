@@ -104,6 +104,12 @@ feature_configs {
         }
     }
 }
+feature_configs {
+    raw_feature {
+        feature_name: "request_time"
+        expression: "user:request_time"
+    }
+}
 model_config {
     feature_groups {
         group_name: "contextual"
@@ -139,6 +145,11 @@ model_config {
         group_name: "uih_timestamp"
         feature_names: "uih_seq__action_timestamp"
         group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "query_time"
+        feature_names: "request_time"
+        group_type: DEEP
     }
     hstu_match {
         user_tower {
@@ -221,7 +232,7 @@ model_config {
   - uih_action: 用户历史交互的行为事件序列，注: 该行为事件按位存储，如 expr, click, add, buy 三个行为，则一般 expr=0, click=1, add=2, buy=4；类型为 JAGGED_SEQUENCE，当 `uih_preprocessor.action_encoder` 配置时必填
   - uih_watchtime: 用户历史交互的行为时长序列；类型为 JAGGED_SEQUENCE，当 action encoder 需要 watchtime 时必填
   - uih_timestamp: 用户历史交互的行为时间戳序列；类型为 JAGGED_SEQUENCE，当 `positional_encoder.use_time_encoding=true` 时必填
-  - query_time: 每行一个标量的**请求时间** raw 特征；类型为 DEEP，可选。配置后，时间编码的相对时间差以请求时间为基准 (`ts_gap = query_time - 行为时间戳`)，而非默认的最后一个 UIH 行为时间。这样 user embedding 能反映行为序列相对于 (在线服务) 请求时刻的新鲜度；不配置时回退到以最后一个 UIH 行为时间为基准。请求时间需与 uih_timestamp 使用相同单位，在线服务时传入当前请求时刻
+  - query_time: 每行一个标量的请求时间 raw 特征 (需与 uih_timestamp 同单位)；类型为 DEEP，可选。配置后时间编码以请求时间为基准 (`ts_gap = query_time - 行为时间戳`)，否则回退到最后一个 UIH 行为时间
 
   **group_name 不能变**，user_tower/item_tower 通过 group_name 索引对应的 feature_group
 
