@@ -47,5 +47,5 @@ jobs:
       - name: StopDockerContainer
         if: always()
         run: |
-          docker stop --time=30 "ppu-ci-${{ github.run_id }}" 2>/dev/null || true
+          docker stop --timeout=30 "ppu-ci-${{ github.run_id }}" 2>/dev/null || true
           docker rm -f "ppu-ci-${{ github.run_id }}" 2>/dev/null || true
