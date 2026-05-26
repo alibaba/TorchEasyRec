@@ -96,6 +96,17 @@ class HSTUUserTower(MatchTowerWoEG):
             contextual_feature_dim = contextual_dims[0]
             max_contextual_seq_len = len(contextual_dims)
 
+        # Optional `query_time` DEEP group: per-row request-time anchor for the
+        # HSTU time bias (absent -> anchor on the last UIH timestamp).
+        query_time_key = next(
+            (
+                feature_group.group_name
+                for feature_group in feature_groups
+                if feature_group.group_name == "query_time"
+            ),
+            "",
+        )
+
         self._hstu_encoder: HSTUMatchEncoder = HSTUMatchEncoder(
             uih_embedding_dim=embedding_group.group_total_dim(
                 f"{tower_config.input}.sequence"
@@ -105,6 +116,7 @@ class HSTUUserTower(MatchTowerWoEG):
             contextual_group_name=contextual_group_name,
             scaling_seqlen=tower_config.max_seq_len,
             is_inference=False,
+            query_time_key=query_time_key,
             **config_to_kwargs(tower_config.hstu),
         )
         if self._output_dim > 0:
@@ -266,6 +278,9 @@ class HSTUMatch(MatchModel):
           UIHPreprocessor's action_encoder and the HSTU positional
           encoder's time bias. Required when `uih_preprocessor.action_encoder`
           is configured.
+        - "query_time" (optional, DEEP): a single per-row scalar request-time
+          raw feature used as the HSTU time-bias anchor; absent, the anchor
+          falls back to the last UIH timestamp.
 
     User tower returns the last-position UIH embedding per user; it is compared
     against candidate embeddings via the configured similarity at both train and

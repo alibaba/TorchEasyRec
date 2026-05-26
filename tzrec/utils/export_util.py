@@ -34,12 +34,16 @@ from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
     EmbeddingBagCollectionInterface,
     EmbeddingCollection,
     EmbeddingCollectionInterface,
 )
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
+)
+from torchrec.quant.embedding_modules import (
+    quant_prep_enable_cache_features_order,
 )
 from torchrec.sparse import jagged_tensor
 
@@ -213,9 +217,16 @@ def export_model_normal(
             logger.info("quantize embeddings...")
             additional_qconfig_spec_keys = []
             additional_mapping = {}
+            cache_order_types = [EmbeddingBagCollection]
             if acc_utils.is_ec_quant():
                 additional_qconfig_spec_keys.append(EmbeddingCollection)
                 additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
+                cache_order_types.append(EmbeddingCollection)
+            # Cache the feature-permute order as an on-device buffer instead of
+            # rebuilding `torch.tensor(order, device=cuda)` (a blocking H2D copy)
+            # on every forward. Must run before quantize_embeddings so the quant
+            # modules pick it up via `from_float`.
+            quant_prep_enable_cache_features_order(model, cache_order_types)
             quantize_embeddings(
                 model,
                 dtype=acc_utils.quant_dtype(),

@@ -93,6 +93,7 @@ def pytorch_add_timestamp_positional_embeddings(
     interleave_targets: bool,
     time_bucket_fn: str,
     time_bucket_increments: float,
+    query_time: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     max_pos_ind = pos_embeddings.size(0)
     # position encoding
@@ -115,11 +116,19 @@ def pytorch_add_timestamp_positional_embeddings(
         max_lengths=[max_seq_len],
         padding_value=0.0,
     ).squeeze(-1)
-    query_time = torch.gather(
-        timestamps,
-        dim=1,
-        index=(seq_lengths - 1).unsqueeze(1).clamp(min=0).to(torch.int64),
-    )
+    if query_time is None:
+        # No explicit anchor: use the last in-sequence timestamp. For
+        # DLRM-HSTU the candidate is concatenated last, so this is the
+        # request time; for any UIH-only sequence it is the most-recent event.
+        query_time = torch.gather(
+            timestamps,
+            dim=1,
+            index=(seq_lengths - 1).unsqueeze(1).clamp(min=0).to(torch.int64),
+        )
+    else:
+        # Explicit per-row request time (HSTUMatch two-tower: no candidate is
+        # concatenated, so the anchor cannot be derived from the sequence).
+        query_time = query_time.view(-1, 1).to(timestamps.dtype)
     ts = query_time - timestamps
     ts = ts + time_delta
     ts = ts.clamp(min=1e-6) / time_bucket_increments

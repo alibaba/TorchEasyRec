@@ -388,6 +388,76 @@ class PositionEmbeddingsTest(unittest.TestCase):
                 rtol=2e-2 if dtype != torch.float32 else None,
             )
 
+    @unittest.skipIf(*gpu_unavailable)
+    def test_add_timestamp_positional_embeddings_explicit_query_time(self) -> None:
+        """Explicit per-row query_time anchors ts_gap.
+
+        Contract checked here:
+          * passing the last in-sequence timestamp as ``query_time`` reproduces
+            the ``query_time=None`` (gather-last) path exactly, on both kernels;
+          * the pytorch and triton explicit paths agree;
+          * a later ``query_time`` (a request after the last event) shifts the
+            gaps and changes the output -- the bug this fixes: a UIH-only tower
+            could never represent staleness relative to the request time.
+        """
+        from tzrec.ops.position import add_timestamp_positional_embeddings
+
+        device = torch.device("cuda")
+        torch.manual_seed(0)
+        batch_size, d, max_seq_len, num_time_buckets = 4, 16, 48, 1000
+
+        seq_lengths = torch.randint(1, max_seq_len + 1, (batch_size,), device=device)
+        seq_offsets = torch.zeros(batch_size + 1, dtype=torch.int64, device=device)
+        seq_offsets[1:] = torch.cumsum(seq_lengths, dim=0)
+        total = int(seq_offsets[-1].item())
+
+        pos_w = torch.empty(max_seq_len, d, device=device).uniform_(-1.0, 1.0)
+        ts_w = torch.empty(num_time_buckets + 1, d, device=device).uniform_(-1.0, 1.0)
+        seq_emb = torch.empty(total, d, device=device).uniform_(-0.1, 0.1)
+        # strictly increasing per-row timestamps
+        timestamps = torch.cat(
+            [
+                torch.cumsum(
+                    torch.randint(1, 100, (int(n.item()),), device=device), dim=0
+                )
+                for n in seq_lengths
+            ]
+        ).to(torch.float32)
+        last_ts = timestamps[seq_offsets[1:] - 1]  # [B], per-row last event
+        # HSTUMatch's UIH-only path passes a zeros num_targets (not None).
+        num_targets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+
+        def run(kernel: Kernel, query_time: object) -> torch.Tensor:
+            return add_timestamp_positional_embeddings(
+                alpha=1.0,
+                max_seq_len=max_seq_len,
+                max_contextual_seq_len=0,
+                position_embeddings_weight=pos_w,
+                timestamp_embeddings_weight=ts_w,
+                seq_offsets=seq_offsets,
+                seq_lengths=seq_lengths,
+                seq_embeddings=seq_emb,
+                timestamps=timestamps,
+                num_targets=num_targets,
+                interleave_targets=False,
+                time_bucket_fn="sqrt",
+                time_bucket_increments=60.0,
+                kernel=kernel,
+                query_time=query_time,  # pyre-ignore[6]
+            )
+
+        for kernel in (Kernel.PYTORCH, Kernel.TRITON):
+            torch.testing.assert_close(run(kernel, None), run(kernel, last_ts))
+        # explicit path agrees across kernels
+        torch.testing.assert_close(
+            run(Kernel.PYTORCH, last_ts), run(Kernel.TRITON, last_ts)
+        )
+        # a request strictly after every event shifts the gaps -> output changes
+        future = last_ts + 100000.0
+        self.assertFalse(
+            torch.allclose(run(Kernel.TRITON, None), run(Kernel.TRITON, future))
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
