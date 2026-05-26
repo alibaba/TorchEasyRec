@@ -25,16 +25,12 @@ jobs:
         run: |
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
-          # Pre-cleanup: kill any leftover ppu-ci-* containers from previously
-          # cancelled runs. The GH runner SIGKILLs the step's bash so our EXIT
-          # trap doesn't fire on cancel, leaving the container orphaned and
-          # holding alixpu contexts on devices 0/1.
+          # Pre-cleanup: nuke any leftover ppu-ci-* containers from runs that
+          # died without cleanup (runner crash, host reboot). Cancel-in-progress
+          # cleanup is handled by the StopDockerContainer post-step below.
           docker ps --format '{{.Names}}' | grep '^ppu-ci-' \
             | xargs -r docker kill 2>/dev/null || true
-          CNAME="ppu-ci-${{ github.run_id }}"
-          cleanup() { docker stop --time=30 "$CNAME" 2>/dev/null || true; }
-          trap cleanup EXIT INT TERM
-          docker run --rm --name "$CNAME" \
+          docker run --rm --name "ppu-ci-${{ github.run_id }}" \
             --workdir /__w/TorchEasyRec/TorchEasyRec \
             --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu --device=/dev/alixpu_ctl \
             --shm-size=256g --ulimit memlock=-1 \
@@ -53,3 +49,8 @@ jobs:
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.1-ppu \
             bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --time=30 "ppu-ci-${{ github.run_id }}" 2>/dev/null || true
+          docker rm -f "ppu-ci-${{ github.run_id }}" 2>/dev/null || true
