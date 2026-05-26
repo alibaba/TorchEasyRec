@@ -25,11 +25,6 @@ jobs:
         run: |
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
-          # Pre-cleanup: nuke any leftover ppu-ci-* containers from runs that
-          # died without cleanup (runner crash, host reboot). Cancel-in-progress
-          # cleanup is handled by the StopDockerContainer post-step below.
-          docker ps --format '{{.Names}}' | grep '^ppu-ci-' \
-            | xargs -r docker kill 2>/dev/null || true
           docker run --rm --name "ppu-ci-${{ github.run_id }}" \
             --workdir /__w/TorchEasyRec/TorchEasyRec \
             --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu --device=/dev/alixpu_ctl \
