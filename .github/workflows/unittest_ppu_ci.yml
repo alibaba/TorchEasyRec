@@ -25,9 +25,12 @@ jobs:
         run: |
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
-          # Tie container lifecycle to this bash so cancel-in-progress
-          # actually stops the container (instead of leaving it orphaned
-          # holding alixpu contexts on devices 0/1).
+          # Pre-cleanup: kill any leftover ppu-ci-* containers from previously
+          # cancelled runs. The GH runner SIGKILLs the step's bash so our EXIT
+          # trap doesn't fire on cancel, leaving the container orphaned and
+          # holding alixpu contexts on devices 0/1.
+          docker ps --format '{{.Names}}' | grep '^ppu-ci-' \
+            | xargs -r docker kill 2>/dev/null || true
           CNAME="ppu-ci-${{ github.run_id }}"
           cleanup() { docker stop --time=30 "$CNAME" 2>/dev/null || true; }
           trap cleanup EXIT INT TERM
