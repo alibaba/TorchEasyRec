@@ -39,6 +39,44 @@ gpu_unavailable: Tuple[bool, str] = (
     "CUDA/HIP is not available or no GPUs detected",
 )
 
+# CUTLASS HSTU is backed by the fbgemm_gpu_hstu wheel, resolved as
+# ``hstu_attn_varlen_func`` (None when the wheel is missing).
+try:
+    from tzrec.ops._cuda.cutlass_hstu_attention import hstu_attn_varlen_func
+
+    _has_cutlass_hstu = hstu_attn_varlen_func is not None
+except ImportError:
+    _has_cutlass_hstu = False
+
+cutlass_hstu_unavailable: Tuple[bool, str] = (
+    not _has_cutlass_hstu,
+    "fbgemm_gpu_hstu wheel is not installed",
+)
+
+try:
+    import torch_fx_tool  # noqa: F401
+
+    _has_torch_fx_tool = True
+except ImportError:
+    _has_torch_fx_tool = False
+
+torch_fx_tool_unavailable: Tuple[bool, str] = (
+    not _has_torch_fx_tool,
+    "torch_fx_tool wheel is not installed (required for RTP export)",
+)
+
+
+def get_compare_tolerance(
+    dtype: torch.dtype,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return (atol, rtol) for Triton-vs-PyTorch comparisons; widen fp32 on PPU."""
+    from tzrec.ops import is_ppu_arch
+
+    if is_ppu_arch() and dtype == torch.float32:
+        return (3e-5, 2e-5)
+    return (None, None)
+
+
 _settings.register_profile(
     "default", _settings(_settings.get_profile("default"), print_blob=True)
 )

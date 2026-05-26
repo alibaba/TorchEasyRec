@@ -1,0 +1,51 @@
+name: Unit Test PPU CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: ['release/**']
+  workflow_dispatch:
+
+concurrency:
+  group: unittest-ppu-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci-test:
+    # `container:` would inject -v /var/run/docker.sock which DSW authZ blocks here.
+    runs-on: tzrec-ppu-runner
+    timeout-minutes: 1440
+    steps:
+      - name: FetchCommit
+        uses: actions/checkout@v4
+        with:
+          path: run_${{ github.run_id }}
+      - name: RunUnitTestPPUCI
+        id: run_unittest_ppu_ci
+        run: |
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
+          docker run --rm --name "ppu-ci-${{ github.run_id }}" \
+            --workdir /__w/TorchEasyRec/TorchEasyRec \
+            --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu --device=/dev/alixpu_ctl \
+            --shm-size=256g --ulimit memlock=-1 \
+            -e HOME=/github/home \
+            -e GITHUB_ACTIONS=true \
+            -e CI=true \
+            -e CI_HYPOTHESIS=true \
+            -e TZREC_TEST_TIMEOUT_SCALE=4 \
+            -e TORCHINDUCTOR_CACHE_DIR=/github/home/.torchinductor \
+            -v "$WORK_ROOT":/__w \
+            -v "$EXTERNALS_ROOT":/__e:ro \
+            -v "$WORK_ROOT/_temp":/__w/_temp \
+            -v "$WORK_ROOT/_actions":/__w/_actions \
+            -v "$WORK_ROOT/_tool":/__w/_tool \
+            -v "$WORK_ROOT/_temp/_github_home":/github/home \
+            -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.1-ppu \
+            bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --timeout=30 "ppu-ci-${{ github.run_id }}" 2>/dev/null || true
+          docker rm -f "ppu-ci-${{ github.run_id }}" 2>/dev/null || true

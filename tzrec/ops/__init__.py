@@ -10,6 +10,9 @@
 # limitations under the License.
 
 from enum import Enum, unique
+from typing import Optional
+
+import torch
 
 
 @unique
@@ -19,3 +22,20 @@ class Kernel(Enum):
     TRITON = "TRITON"
     PYTORCH = "PYTORCH"
     CUTLASS = "CUTLASS"
+
+
+_is_ppu_arch_cached: Optional[bool] = None
+
+
+def is_ppu_arch() -> bool:
+    """Return True if a CUDA device is an Alibaba PPU (alixpu) accelerator."""
+    global _is_ppu_arch_cached
+    if _is_ppu_arch_cached is None:
+        try:
+            _is_ppu_arch_cached = torch.cuda.is_available() and any(
+                "PPU" in torch.cuda.get_device_name(i)
+                for i in range(torch.cuda.device_count())
+            )
+        except Exception:
+            _is_ppu_arch_cached = False
+    return _is_ppu_arch_cached
