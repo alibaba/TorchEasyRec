@@ -70,5 +70,7 @@ message TrainConfig {
     optional uint32 gradient_accumulation_steps = 18;
     // dense gradient clipping config
     optional GradClipping grad_clipping = 19;
+    // maximum number of recent checkpoints to keep; 0 keeps all.
+    optional uint32 keep_checkpoint_max = 20 [default = 0];
     // TBD: qcomm config
 }
