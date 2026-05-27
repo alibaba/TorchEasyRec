@@ -71,7 +71,7 @@ model_config {
 
 ## 示例Config
 
-[deepfm_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/deepfm_criteo.config)
+[deepfm_criteo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/deepfm_criteo.config)
 
 ## 参考论文
 

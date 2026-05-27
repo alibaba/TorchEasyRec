@@ -68,7 +68,7 @@ model_config {
 
 ## 示例Config
 
-[rocket_launching_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/rocket_launching_criteo.config)
+[rocket_launching_criteo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/rocket_launching_criteo.config)
 
 ## 参考论文
 

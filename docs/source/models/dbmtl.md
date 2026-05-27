@@ -152,7 +152,7 @@ DBMTL模型每个塔的指标为：指标名+ "\_" + tower_name
 
 ## 示例配置
 
-[dbmtl_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dbmtl_taobao.config)
+[dbmtl_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/dbmtl_taobao.config)
 
 ## 参考论文
 

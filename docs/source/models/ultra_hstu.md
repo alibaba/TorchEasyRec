@@ -150,7 +150,7 @@ model_config {
 
 ## 示例Config
 
-[ultra_hstu_kuairand.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/ultra_hstu_kuairand.config)
+[ultra_hstu_kuairand.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/ultra_hstu_kuairand.config)
 
 ## 参考论文
 

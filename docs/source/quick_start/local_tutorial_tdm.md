@@ -8,21 +8,21 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 
 输入数据以parquet格式为例
 
-- 训练样本数据: [taobao_data_recall_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz)
-- 评估样本数据: [taobao_data_recall_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz)
-- 物品池特征数据: [taobao_ad_feature](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz)
+- 训练样本数据: [taobao_data_recall_train](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz)
+- 评估样本数据: [taobao_data_recall_eval](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz)
+- 物品池特征数据: [taobao_ad_feature](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz)
 
 ### 配置文件
 
-[tdm_taobao_local.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/tdm_taobao_local.config)
+[tdm_taobao_local.config](https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/tdm_taobao_local.config)
 
 ```bash
 # 下载并解压
 mkdir -p data
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/tdm_taobao_local.config
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/tdm_taobao_local.config
 tar xf taobao_data_recall_train.tar.gz -C data
 tar xf taobao_data_recall_eval.tar.gz -C data
 tar xf taobao_ad_feature.tar.gz -C data

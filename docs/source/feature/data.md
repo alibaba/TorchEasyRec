@@ -122,7 +122,7 @@ TorchEasyRec 提供了 Flink UDTF 用于将 Flink 流数据序列化为 Arrow IP
 
 #### 下载 UDF JAR
 
-- JAR 下载地址: `https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/flink/flink-arrow-batch-udf-0.1.jar`
+- JAR 下载地址: `https://tzrec.oss-accelerate.aliyuncs.com/third_party/flink/flink-arrow-batch-udf-0.1.jar`
 
 #### 在阿里云 Flink VVP 中使用
 
@@ -253,7 +253,7 @@ pipeline.global-job-parameters: |
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/pyfg104-1.0.4-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
+    /home/tops/bin/pip3 install http://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg104-1.0.4-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```

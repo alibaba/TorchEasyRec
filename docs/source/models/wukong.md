@@ -104,7 +104,7 @@ model_config {
 
 ### 示例Config
 
-[wukong_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/wukong.config)
+[wukong_demo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/wukong.config)
 
 ### 参考论文
 

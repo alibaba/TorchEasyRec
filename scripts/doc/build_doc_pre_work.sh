@@ -9,7 +9,7 @@ sed 's#(docs/source/#(#g;s#(docs/images/#(../images/#g;s#"docs/images/#"../image
 sed -i '1i\# 简介' docs/source/intro.md
 
 # replace wheel and docker version
-LATEST_WHEEL_VERSION=$(pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com | awk 'NR==1{print $2}' | sed 's/[()]//g')
+LATEST_WHEEL_VERSION=$(pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com | awk 'NR==1{print $2}' | sed 's/[()]//g')
 LATEST_DOCKER_VERSION=$(grep DOCKER_TAG= scripts/build_docker.sh | awk -F= '{print $2}')
 for f in docs/source/quick_start/*.md; do
     cp $f $f.bak
