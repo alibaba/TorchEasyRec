@@ -34,6 +34,13 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 _DISABLE_V3_CACHE_SUFFIX = "_disable_v3"
 
+# FP8 HSTU attention only runs on SM90 (Hopper); skip elsewhere (e.g. the
+# local A10/sm86 dev box) so the test is a no-op until it reaches an H20 box.
+_fp8_unavailable = (
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    "FP8 HSTU attention requires an SM90 (Hopper) GPU",
+)
+
 
 @contextlib.contextmanager
 def _force_mma_v2():  # pyre-ignore[3]
@@ -99,6 +106,7 @@ def test_attn(
     rtol: Optional[float] = None,
     enable_tma: bool = False,
     scaling_seqlen: int = -1,
+    fp8_quant_mode: int = -1,
 ) -> None:
     # has_max_attn_len=True and enable_tma=True will result in TritonGPUCoalesce error
     # include/llvm/llvm/ADT/SmallVector.h:296: const_reference llvm::SmallVectorTemplateCommon<long>::operator[](size_type) const [T = long]: Assertion `idx < size()' failed.    # NOQA
@@ -198,6 +206,7 @@ def test_attn(
         kernel=real_kernel,
         enable_tma=enable_tma,
         scaling_seqlen=scaling_seqlen,
+        fp8_quant_mode=fp8_quant_mode,
     )
 
     torch.testing.assert_close(
@@ -576,6 +585,51 @@ class HSTUAttentionTest(unittest.TestCase):
             real_kernel=Kernel.CUTLASS,
         )
 
+    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(*_fp8_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(4, 8),
+        heads=st.integers(1, 4),
+        max_uih_len=st.sampled_from([20, 100, 128]),
+        max_targets=st.sampled_from([20, 512]),
+        attn_dim=st.sampled_from([64, 128]),
+        causal=st.sampled_from([True]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
+        has_max_attn_len=st.sampled_from([False]),
+        contextual_seq_len=st.sampled_from([0, 10]),
+        scaling_seqlen=st.sampled_from([-1, 2048]),
+        # 0 = per-tensor (coarsest), 3 = per-head. Per-block (2) is skipped
+        # to avoid the wheel's cu12 per-block special-case.
+        fp8_quant_mode=st.sampled_from([0, 3]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=10,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_attn_fp8_cutlass(self, *args, **kwargs) -> None:
+        # CUTLASS FP8 attention (SM90 only). The wheel quantizes q/k/v
+        # internally, so we feed bf16 and compare against the bf16 PyTorch
+        # reference with relaxed tolerances (FP8 e4m3 is lossy). The backward
+        # re-quantizes q/k/v/dout to FP8, so grads carry larger error; the
+        # atol/rtol below are starting points to tune against observed error
+        # on the H20 box.
+        hidden_dim = kwargs.pop("attn_dim")
+        test_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            test_backward=True,
+            ref_kernel=Kernel.PYTORCH,
+            real_kernel=Kernel.CUTLASS,
+            atol=1e-1,
+            rtol=1e-1,
+        )
+
     # NOTE: no ``test_delta_attn_cutlass`` — ``delta_hstu_mha`` has no
     # CUTLASS implementation and falls back to Triton internally. The
     # delta/cached path is already covered by ``test_delta_attn_triton``.
@@ -594,7 +648,7 @@ class HSTUAttentionTest(unittest.TestCase):
         sla_k2=st.sampled_from([0, 4, 8]),
         has_multiple_targets=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 4]),
-        # Sample both bf16 and fp16 -- fp8 is deferred to ultra-hstu-fp8.
+        # Sample both bf16 and fp16; FP8 is covered by test_attn_fp8_cutlass.
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
