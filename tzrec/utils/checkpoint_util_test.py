@@ -15,10 +15,12 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import torch.distributed as dist
 import torchrec
+from parameterized import parameterized
 from torch import nn
 from torchrec import EmbeddingBagCollection
 from torchrec.distributed.model_parallel import (
@@ -215,6 +217,115 @@ class CheckpointUtilTest(unittest.TestCase):
         )
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "custom"))
         self.assertEqual(step, 0)
+
+    def _remaining_ckpt_steps(self):
+        return sorted(
+            int(p.rsplit("-", 1)[1])
+            for p in os.listdir(self.test_dir)
+            if p.startswith("model.ckpt-")
+        )
+
+    @parameterized.expand(
+        [
+            # name, keep_checkpoint_max, protect_best, expected remaining steps
+            ("keep_all", 0, False, [0, 10, 20, 30]),
+            ("recent_2", 2, False, [20, 30]),
+            ("protect_best", 2, True, [10, 20, 30]),
+            ("keep_ge_count", 10, False, [0, 10, 20, 30]),
+        ]
+    )
+    def test_checkpoint_manager_prune(
+        self, _name, keep_checkpoint_max, protect_best, expected_steps
+    ):
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        export_config = None
+        if protect_best:
+            with open(
+                os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w"
+            ) as f:
+                f.write('{"global_step":0, "auc":0.50}\n')
+                f.write('{"global_step":10, "auc":0.99}\n')  # best, outside recent-2
+                f.write('{"global_step":20, "auc":0.60}\n')
+                f.write('{"global_step":30, "auc":0.70}\n')
+            export_config = ExportConfig(
+                exporter_type="best",
+                best_exporter_metric="auc",
+                metric_larger_is_better=True,
+            )
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir,
+            keep_checkpoint_max=keep_checkpoint_max,
+            export_config=export_config,
+        )
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()  # drains the async worker -> deterministic
+        self.assertEqual(self._remaining_ckpt_steps(), expected_steps)
+
+    def test_checkpoint_manager_prune_non_rank_zero(self):
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, keep_checkpoint_max=2
+        )
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [0, 10, 20, 30])
+
+    def test_checkpoint_manager_prune_idempotent(self):
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, keep_checkpoint_max=2
+        )
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.prune()  # coalesced; must not double-delete or error
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [20, 30])
+
+    def test_checkpoint_manager_finalizer_drains(self):
+        # Simulate the exception path: prune() runs but close() is never reached.
+        # The weakref.finalize safety net must drain the worker at interpreter exit.
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, keep_checkpoint_max=2
+        )
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+        self.assertTrue(manager._finalizer.alive)
+        manager._finalizer()  # invoke directly to simulate at-exit
+        self.assertEqual(self._remaining_ckpt_steps(), [20, 30])
+        self.assertFalse(manager._prune_worker.is_alive())
+        self.assertFalse(manager._finalizer.alive)
+
+    def test_checkpoint_manager_discovery(self):
+        for step in [0, 10, 20]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w") as f:
+            f.write('{"global_step":0, "auc":0.6}\n')
+            f.write('{"global_step":10, "auc":0.7}\n')  # best
+            f.write('{"global_step":20, "auc":0.5}\n')
+        export_config = ExportConfig(
+            exporter_type="best",
+            best_exporter_metric="auc",
+            metric_larger_is_better=True,
+        )
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, export_config=export_config
+        )
+        self.assertEqual(
+            manager.latest_checkpoint(),
+            checkpoint_util.latest_checkpoint(self.test_dir),
+        )
+        self.assertEqual(
+            manager.best_checkpoint(),
+            checkpoint_util.best_checkpoint(self.test_dir, export_config),
+        )
+        self.assertEqual(manager.best_checkpoint()[1], 10)
 
     def test_dist_save_restore_model(self):
         port = misc_util.get_free_port()
