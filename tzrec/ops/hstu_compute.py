@@ -323,6 +323,7 @@ def hstu_preprocess_and_attention(
     enable_tma: bool = False,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    fp8_quant_mode: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -349,6 +350,12 @@ def hstu_preprocess_and_attention(
                 "kernel=Kernel.CUTLASS or kernel=Kernel.PYTORCH, or "
                 "split the call into separate preprocess and hstu_mha "
                 "(prefill=True)."
+            )
+        if fp8_quant_mode >= 0:
+            raise ValueError(
+                f"fp8_quant_mode={fp8_quant_mode} (FP8) is not supported on "
+                "the fused Triton preprocess+attention path; FP8 attention "
+                "requires kernel=Kernel.CUTLASS."
             )
         from tzrec.ops._triton.triton_hstu_preprocess_and_attention import (
             triton_hstu_preprocess_and_attention,
@@ -417,5 +424,6 @@ def hstu_preprocess_and_attention(
             kernel=kernel,
             attn_func=attn_func,
             scaling_seqlen=scaling_seqlen,
+            fp8_quant_mode=fp8_quant_mode,
         ).view(-1, hidden_dim * num_heads)
     return u, attn_output, k, v

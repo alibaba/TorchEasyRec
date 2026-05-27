@@ -12,6 +12,7 @@
 from typing import Optional
 
 import torch
+from torch.fx._symbolic_trace import is_fx_tracing
 
 from tzrec.utils.logging_util import logger
 
@@ -26,6 +27,23 @@ except ImportError as e:
     hstu_attn_varlen_func = None  # type: ignore[assignment]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+# Highest fp8_quant_mode the wheel accepts (0..5 are FP8 modes; -1 = off).
+_MAX_FP8_QUANT_MODE = 5
+
+
+def _assert_fp8_capable() -> None:
+    """Raise unless the current device is SM90 (Hopper), where FP8 is supported."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "FP8 HSTU attention (fp8_quant_mode >= 0) requires a CUDA SM90 "
+            "(Hopper) GPU; no CUDA device is available."
+        )
+    major = torch.cuda.get_device_capability()[0]
+    if major != 9:
+        raise RuntimeError(
+            "FP8 HSTU attention (fp8_quant_mode >= 0) is only supported on "
+            f"SM90 (Hopper); got device capability major version {major}."
+        )
 
 
 @torch.fx.wrap
@@ -42,6 +60,7 @@ def cutlass_hstu_mha(
     contextual_seq_len: int = 0,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    fp8_quant_mode: int = -1,
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
@@ -82,10 +101,22 @@ def cutlass_hstu_mha(
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
+        fp8_quant_mode: FP8 quantization mode forwarded to the wheel.
+            ``-1`` (default) keeps q/k/v in bf16/fp16 (no FP8). ``0..5``
+            select an FP8 mode (0 per-tensor, 1 two-direction, 2 per-block,
+            3 per-head, 4 per-batch, 5 global); the wheel quantizes q/k/v
+            internally. FP8 requires an SM90 (Hopper) GPU.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
     """
+    if fp8_quant_mode < -1 or fp8_quant_mode > _MAX_FP8_QUANT_MODE:
+        raise ValueError(
+            f"fp8_quant_mode must be in [-1, {_MAX_FP8_QUANT_MODE}]; "
+            f"got {fp8_quant_mode}."
+        )
+    if fp8_quant_mode >= 0 and not is_fx_tracing():
+        _assert_fp8_capable()
     if hstu_attn_varlen_func is None:
         raise RuntimeError(
             "fbgemm_gpu_hstu wheel is not installed; cannot run CUTLASS "
@@ -186,4 +217,5 @@ def cutlass_hstu_mha(
         rab=None,
         has_drab=False,
         func=attn_func,
+        quant_mode=fp8_quant_mode,
     )

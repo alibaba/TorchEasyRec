@@ -250,6 +250,10 @@ class STULayer(STU):
             ``max_seq_len`` (legacy behavior). When set to a fixed value
             (typically the model's config ``max_seq_len``), attention output
             is invariant to batch-level seq-length.
+        fp8_quant_mode (int): FP8 attention quant mode (``-1`` = off,
+            ``0..5`` select an FP8 mode). Only honored on the training/eval
+            forward with ``Kernel.CUTLASS`` on an SM90 (Hopper) GPU; the
+            cached/delta serving path always runs in bf16/fp16.
         is_inference (bool): whether to run in inference mode.
     """
 
@@ -278,6 +282,7 @@ class STULayer(STU):
         sla_k1: int = 0,
         sla_k2: int = 0,
         scaling_seqlen: int = -1,
+        fp8_quant_mode: int = -1,
         is_inference: bool = False,
     ) -> None:
         super().__init__(
@@ -302,6 +307,7 @@ class STULayer(STU):
         self._sla_k1: int = sla_k1
         self._sla_k2: int = sla_k2
         self._scaling_seqlen: int = scaling_seqlen
+        self._fp8_quant_mode: int = fp8_quant_mode
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -530,6 +536,7 @@ class STULayer(STU):
                 enable_tma=self._enable_tma,
                 attn_func=local_attn_func,
                 scaling_seqlen=self._scaling_seqlen,
+                fp8_quant_mode=self._fp8_quant_mode,
             )
 
         self.update_kv_cache(
@@ -578,6 +585,11 @@ class STULayer(STU):
 
         Returns:
             torch.Tensor: output sequence embedding tensor.
+
+        Note:
+            This path runs in bf16/fp16 regardless of ``fp8_quant_mode``;
+            FP8 attention applies only to the full training/eval ``forward``
+            (``delta_hstu_mha`` has no FP8 kernel).
         """
         with record_function("## stu_compute_uqvk ##"):
             delta_u, delta_q, delta_k, delta_v = hstu_compute_uqvk(
