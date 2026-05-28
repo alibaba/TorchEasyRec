@@ -12,7 +12,11 @@
 import glob
 import json
 import os
+import queue
 import re
+import shutil
+import threading
+import weakref
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +41,9 @@ from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
+
+# queue token meaning "run a prune pass"; ``None`` means "stop the worker".
+_PRUNE_REQUEST = object()
 
 
 class PartialLoadPlanner(DefaultLoadPlanner):
@@ -254,6 +261,183 @@ def best_checkpoint(
     else:
         logger.info(f"not find {eval_result_filename}, will search latest checkpoint")
         return latest_checkpoint(model_dir)
+
+
+class CheckpointManager:
+    """Saves training checkpoints and prunes old ones asynchronously.
+
+    ``prune`` never deletes on the calling thread: it enqueues a coalesced
+    request to a single daemon worker that does all filesystem work (listing,
+    best-checkpoint lookup, deletion), so the training loop never blocks on
+    ``model_dir`` I/O. ``glob`` of ``model_dir`` is the source of truth on every
+    pass, so the manager holds no checkpoint registry. Load/discovery methods
+    delegate to the module-level free functions.
+
+    Args:
+        model_dir: directory holding ``model.ckpt-<step>`` checkpoints.
+        keep_checkpoint_max: max number of recent checkpoints to keep; 0 keeps all.
+        export_config: when ``exporter_type == "best"``, the current best checkpoint
+            (by eval metric) is always retained even if older than the kept window.
+        eval_result_filename: eval result file (relative to ``model_dir``) used to
+            locate the best checkpoint.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        keep_checkpoint_max: int = 0,
+        export_config: Optional[export_pb2.ExportConfig] = None,
+        eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+    ) -> None:
+        self._model_dir = model_dir
+        self._keep_checkpoint_max = keep_checkpoint_max
+        self._export_config = export_config
+        self._eval_result_filename = eval_result_filename
+        self._prune_queue: "queue.Queue[object]" = queue.Queue()
+        self._prune_pending = False
+        self._lock = threading.Lock()
+        self._prune_worker: Optional[threading.Thread] = None
+        self._finalizer: Optional[weakref.finalize] = None
+
+    def save(
+        self,
+        step: int,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+        dataloader_state: Optional[Dict[str, int]] = None,
+    ) -> str:
+        """Save a checkpoint at the given step, then request an async prune."""
+        ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
+        save_model(ckpt_dir, model, optimizer)
+        if dataloader_state is not None:
+            save_dataloader_state(ckpt_dir, dataloader_state)
+        self.prune()
+        return ckpt_dir
+
+    def prune(self) -> None:
+        """Request an async prune pass (keep recent N + best). Rank 0 only.
+
+        Cheap and non-blocking: only flips a flag and enqueues one coalesced
+        request. The flag drops the request when a pass is already queued or
+        in-flight, so the queue stays bounded. All filesystem work happens on
+        the worker thread.
+        """
+        if self._keep_checkpoint_max <= 0:
+            return
+        if int(os.environ.get("RANK", 0)) != 0:
+            return
+        with self._lock:
+            if self._prune_pending:
+                return
+            self._prune_pending = True
+        self._ensure_prune_worker()
+        self._prune_queue.put(_PRUNE_REQUEST)
+
+    def close(self) -> None:
+        """Drain queued prune passes and stop the worker (idempotent).
+
+        Called at the end of training for a deterministic flush. A weakref.finalize
+        safety net (registered when the worker starts) runs the same drain at
+        interpreter exit if close() is skipped (e.g. training raised), so the worker
+        is never leaked and pending deletions still complete.
+        """
+        if self._prune_worker is None:
+            return
+        self._finalizer.detach()
+        self._drain(self._prune_queue, self._prune_worker)
+        self._prune_worker = None
+
+    # --- load / discovery (delegate to the module-level free functions) ---
+
+    def latest_checkpoint(self) -> Tuple[Optional[str], int]:
+        """Latest checkpoint under this manager's model_dir."""
+        return latest_checkpoint(self._model_dir)
+
+    def best_checkpoint(self) -> Tuple[Optional[str], int]:
+        """Best checkpoint under model_dir per the configured export metric."""
+        return best_checkpoint(
+            self._model_dir, self._export_config, self._eval_result_filename
+        )
+
+    def restore(
+        self,
+        ckpt_path: str,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+        ckpt_param_map_path: Optional[str] = None,
+    ) -> None:
+        """Restore model/optimizer state from a checkpoint dir."""
+        restore_model(ckpt_path, model, optimizer, ckpt_param_map_path)
+
+    def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, int]]:
+        """Restore dataloader state saved alongside a checkpoint."""
+        return restore_dataloader_state(ckpt_path)
+
+    @staticmethod
+    def _drain(prune_queue: "queue.Queue[object]", worker: threading.Thread) -> None:
+        """Stop the prune worker and wait for it to finish (no ``self`` ref).
+
+        Used by both ``close()`` and the weakref.finalize safety net. FIFO ensures
+        any pending prune request runs before the stop sentinel.
+        """
+        prune_queue.put(None)  # stop sentinel
+        worker.join()
+
+    def _ensure_prune_worker(self) -> None:
+        if self._prune_worker is None:
+            self._prune_worker = threading.Thread(
+                target=self._prune_worker_loop, name="ckpt-prune", daemon=True
+            )
+            self._prune_worker.start()
+            # Safety net: if close() is never reached (e.g. training raised), drain
+            # the worker at interpreter exit so it is not leaked. The callback must
+            # not reference self, or it would pin the manager.
+            self._finalizer = weakref.finalize(
+                self, self._drain, self._prune_queue, self._prune_worker
+            )
+
+    def _prune_worker_loop(self) -> None:
+        while True:
+            item = self._prune_queue.get()
+            try:
+                if item is None:  # stop sentinel
+                    return
+                # allow a fresh request to be enqueued while this pass runs.
+                with self._lock:
+                    self._prune_pending = False
+                try:
+                    self._run_prune()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Checkpoint prune pass failed: {e}")
+            finally:
+                self._prune_queue.task_done()
+
+    def _run_prune(self) -> None:
+        """All filesystem work for one prune pass -- runs only on the worker."""
+        ckpt_metas = glob.glob(
+            os.path.join(self._model_dir, "model.ckpt-*" + os.path.sep)
+        )
+        ckpt_metas = [x.rstrip(os.path.sep) for x in ckpt_metas]
+        if len(ckpt_metas) <= self._keep_checkpoint_max:
+            return
+        ckpt_metas.sort(key=_get_checkpoint_step)
+        protected = set(ckpt_metas[-self._keep_checkpoint_max :])
+        if (
+            self._export_config is not None
+            and self._export_config.exporter_type == "best"
+        ):
+            best_ckpt_path, _ = best_checkpoint(
+                self._model_dir, self._export_config, self._eval_result_filename
+            )
+            if best_ckpt_path is not None:
+                protected.add(best_ckpt_path.rstrip(os.path.sep))
+        for ckpt_path in ckpt_metas:
+            if ckpt_path not in protected:
+                logger.info(f"Removing old checkpoint {ckpt_path}...")
+                try:
+                    shutil.rmtree(ckpt_path)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Failed to remove checkpoint {ckpt_path}: {e}")
 
 
 _DISTCP_RANK_RE = re.compile(r"__(\d+)_\d+\.distcp$")

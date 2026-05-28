@@ -27,6 +27,7 @@ _original_remove = os.remove
 _original_isdir = os.path.isdir
 _original_exists = os.path.exists
 _original_copy = shutil.copy
+_original_rmtree = shutil.rmtree
 _original_glob = glob_module.glob
 _original_getsize = os.path.getsize
 
@@ -109,6 +110,18 @@ def _patched_copy(src, dst, *args, **kwargs):
         return _original_copy(src, dst, *args, **kwargs)
 
 
+def _patched_rmtree(path, ignore_errors=False, *args, **kwargs):
+    fs, _ = url_to_fs(path)
+    if fs is not None:
+        try:
+            return fs.rm(path, recursive=True)
+        except Exception:
+            if not ignore_errors:
+                raise
+    else:
+        return _original_rmtree(path, ignore_errors, *args, **kwargs)
+
+
 def _patched_glob(pattern, *args, **kwargs):
     fs, _ = url_to_fs(pattern)
     if fs is not None:
@@ -134,6 +147,7 @@ def apply_monkeypatch():
     os.remove = _patched_remove
     os.path.exists = _patched_exists
     shutil.copy = _patched_copy
+    shutil.rmtree = _patched_rmtree
     glob_module.glob = _patched_glob
     os.path.getsize = _patch_get_size
 
@@ -147,6 +161,7 @@ def remove_monkeypatch():
     os.remove = _original_remove
     os.path.exists = _original_exists
     shutil.copy = _original_copy
+    shutil.rmtree = _original_rmtree
     glob_module.glob = _original_glob
     os.path.getsize = _original_getsize
 

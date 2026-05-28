@@ -25,6 +25,7 @@ from tzrec.main import _create_features
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
 from tzrec.utils.test_util import (
+    cutlass_hstu_unavailable,
     dfs_are_close,
     gpu_unavailable,
     mark_ci_scope,
@@ -1064,6 +1065,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.assertEqual(acc_cfg.get("MAX_EXPORT_BATCH_SIZE"), "2")
 
     @mark_ci_scope("h20")
+    @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_cutlass_train_eval_export(self):
         self.success = utils.test_train_eval(
@@ -1093,6 +1095,7 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(self.success)
 
     @mark_ci_scope("h20")
+    @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_ultra_hstu_cutlass_train_eval_export(self):
         self.success = utils.test_train_eval(
