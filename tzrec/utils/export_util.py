@@ -1240,7 +1240,7 @@ def export_distributed_embedding(
 
     # make dataparser to get user feats before create model
     data_config = pipeline_config.data_config
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
     dataloader = create_dataloader(
         data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
