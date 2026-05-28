@@ -39,20 +39,6 @@ gpu_unavailable: Tuple[bool, str] = (
     "CUDA/HIP is not available or no GPUs detected",
 )
 
-# CUTLASS HSTU is backed by the fbgemm_gpu_hstu wheel, resolved as
-# ``hstu_attn_varlen_func`` (None when the wheel is missing).
-try:
-    from tzrec.ops._cuda.cutlass_hstu_attention import hstu_attn_varlen_func
-
-    _has_cutlass_hstu = hstu_attn_varlen_func is not None
-except ImportError:
-    _has_cutlass_hstu = False
-
-cutlass_hstu_unavailable: Tuple[bool, str] = (
-    not _has_cutlass_hstu,
-    "fbgemm_gpu_hstu wheel is not installed",
-)
-
 try:
     import torch_fx_tool  # noqa: F401
 
