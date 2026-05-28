@@ -491,6 +491,7 @@ def export_unified_model_aot(
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
+    _backport_pt178147_int_array_dedup()
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)

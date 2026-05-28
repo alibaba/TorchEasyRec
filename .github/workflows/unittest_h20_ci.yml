@@ -24,7 +24,7 @@ jobs:
         run: |
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
-          docker run --rm \
+          docker run --rm --name "h20-ci-${{ github.run_id }}" \
             --workdir /__w/TorchEasyRec/TorchEasyRec \
             --gpus all --shm-size=512g --ulimit memlock=-1 \
             -e HOME=/github/home \
@@ -42,3 +42,8 @@ jobs:
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.2 \
             bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test.sh --scope h20'
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --timeout=30 "h20-ci-${{ github.run_id }}" 2>/dev/null || true
+          docker rm -f "h20-ci-${{ github.run_id }}" 2>/dev/null || true
