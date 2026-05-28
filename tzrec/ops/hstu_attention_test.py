@@ -566,15 +566,21 @@ class HSTUAttentionTest(unittest.TestCase):
     # pyre-ignore[2]
     def test_attn_cutlass(self, *args, **kwargs) -> None:
         hidden_dim = kwargs.pop("attn_dim")
-        test_attn(
-            *args,
-            **kwargs,
-            attn_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            test_backward=True,
-            ref_kernel=Kernel.PYTORCH,
-            real_kernel=Kernel.CUTLASS,
-        )
+        # CUTLASS silently falls back to Triton when max_attn_len>0 combines
+        # with target/contextual masking (hstu_attention.py
+        # _warn_cutlass_fallback_local_target); _force_mma_v2 sidesteps the
+        # Triton 3.6 sm_90 WGMMA bwd race (FAQ Q15) on those fallback shapes.
+        # No-op for the pure-CUTLASS path (env var only affects Triton).
+        with _force_mma_v2():
+            test_attn(
+                *args,
+                **kwargs,
+                attn_dim=hidden_dim,
+                hidden_dim=hidden_dim,
+                test_backward=True,
+                ref_kernel=Kernel.PYTORCH,
+                real_kernel=Kernel.CUTLASS,
+            )
 
     # NOTE: no ``test_delta_attn_cutlass`` — ``delta_hstu_mha`` has no
     # CUTLASS implementation and falls back to Triton internally. The
@@ -615,15 +621,18 @@ class HSTUAttentionTest(unittest.TestCase):
         if sla_k1 == 0 and sla_k2 == 0:
             return
         hidden_dim = kwargs.pop("attn_dim")
-        test_sla_attn(
-            *args,
-            **kwargs,
-            attn_dim=hidden_dim,
-            sla_k1=sla_k1,
-            sla_k2=sla_k2,
-            test_backward=True,
-            real_kernel=Kernel.CUTLASS,
-        )
+        # Same WGMMA-bwd workaround as test_attn_cutlass; harmless on the
+        # pure-CUTLASS NFUNC path (no Triton kernel runs).
+        with _force_mma_v2():
+            test_sla_attn(
+                *args,
+                **kwargs,
+                attn_dim=hidden_dim,
+                sla_k1=sla_k1,
+                sla_k2=sla_k2,
+                test_backward=True,
+                real_kernel=Kernel.CUTLASS,
+            )
 
     def test_sla_matches_fixed_causal_when_k1_spans_full_window(self) -> None:
         """CPU coverage of ``pytorch_hstu_mha(attn_func=...)``.
