@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -37,6 +38,18 @@ amd_gpu_unavailable: Tuple[bool, str] = (
 gpu_unavailable: Tuple[bool, str] = (
     nv_gpu_unavailable[0] and amd_gpu_unavailable[0],
     "CUDA/HIP is not available or no GPUs detected",
+)
+
+# Optional-wheel probes via find_spec so importing test_util does NOT
+# eagerly load the wheel (or its CUDA/inductor/dynamo side effects) into
+# every test process.
+cutlass_hstu_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("hstu") is None,
+    "fbgemm_gpu_hstu wheel is not installed",
+)
+torch_fx_tool_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("torch_fx_tool") is None,
+    "torch_fx_tool wheel is not installed (required for RTP export)",
 )
 
 _settings.register_profile(

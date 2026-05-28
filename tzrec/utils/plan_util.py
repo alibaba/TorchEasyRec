@@ -16,6 +16,7 @@ from collections import OrderedDict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
+import numpy as np
 import psutil
 import torch
 from torch import distributed as dist
@@ -85,10 +86,6 @@ from tzrec.protos import feature_pb2
 from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
-
-
-def _bytes_to_float_bin(num_bytes: Union[float, int], bin_size: float) -> float:
-    return float(num_bytes) / bin_size
 
 
 def create_planner(
@@ -190,7 +187,18 @@ def create_planner(
             global_constraints=global_constraints,
         ),
         storage_reservation=storage_reservation,
-        proposer=[DynamicProgrammingProposer(), UniformProposer()],
+        # DP bin counts are env-tunable; defaults match the proposer signature.
+        proposer=[
+            DynamicProgrammingProposer(
+                hbm_bins_per_device=int(
+                    os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "100")
+                ),
+                ddr_bins_per_device=int(
+                    os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25")
+                ),
+            ),
+            UniformProposer(),
+        ],
         debug=True,
     )
     return planner
@@ -224,70 +232,202 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
         return sharders
 
 
+_INF = float("inf")
+
+
+def _argmin_per_group(group_keys: np.ndarray, perf_keys: np.ndarray) -> np.ndarray:
+    """Index of the min-``perf_keys`` entry per distinct ``group_keys`` value.
+
+    Both inputs must be 1-D and the same length. Ties on ``perf_keys`` are
+    broken by input order. Output indexes into the original (pre-sort)
+    arrays, ordered by ascending ``group_keys``.
+    """
+    if group_keys.size == 0:
+        return np.empty(0, dtype=np.int64)
+    lexsort_order = np.lexsort((perf_keys, group_keys))
+    sorted_groups = group_keys[lexsort_order]
+    is_first_of_run = np.empty(sorted_groups.shape, dtype=bool)
+    is_first_of_run[0] = True
+    is_first_of_run[1:] = sorted_groups[1:] != sorted_groups[:-1]
+    return lexsort_order[is_first_of_run]
+
+
+def _sparse_dp_proposor_numpy(
+    table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    hbm_bins: int,
+    ddr_bins: int,
+) -> List[List[int]]:
+    """Sparse-K NumPy 2D DP over (hbm_bin, ddr_bin) reachable cells.
+
+    Per table, broadcasts (K_prev, N) candidates and uses :func:`_argmin_per_group`
+    (lexsort + first-of-run) for groupby-argmin on the destination cell.
+    Reachable cells K_t saturate at the actual reachable count, not
+    ``hbm_bins * ddr_bins``. Backtracking walks T x K_t int32 arrays in
+    O(T) Python steps.
+
+    ``table_opts`` entries are ``(opt_hbm, opt_ddr, opt_perf, opt_global_id)``
+    per table, all 1-D NumPy arrays (the float ones in bin-units; the index
+    one in opt-id space, used to reconstruct proposals).
+
+    Returns a list of proposals; each proposal is a list of opt-id integers,
+    one per table, emitted in decreasing-HBM order with at most one entry per
+    HBM bin (the perf-best plan across all DDR bins at that HBM level).
+    """
+    table_count = len(table_opts)
+    if table_count == 0:
+        return []
+
+    seed_hbm, seed_ddr, seed_perf, seed_opt_id = table_opts[0]
+    valid_mask = (seed_hbm < hbm_bins) & (seed_ddr < ddr_bins)
+    if not valid_mask.any():
+        return []
+    seed_hbm = seed_hbm[valid_mask]
+    seed_ddr = seed_ddr[valid_mask]
+    seed_perf = seed_perf[valid_mask]
+    seed_opt_id = seed_opt_id[valid_mask]
+    seed_hbm_i = seed_hbm.astype(np.int32)
+    seed_ddr_i = seed_ddr.astype(np.int32)
+    flat_cell_i = seed_hbm_i.astype(np.int64) * ddr_bins + seed_ddr_i
+    winners = _argmin_per_group(group_keys=flat_cell_i, perf_keys=seed_perf)
+
+    dp_perf = seed_perf[winners]
+    dp_hbm = seed_hbm[winners]
+    dp_ddr = seed_ddr[winners]
+    dp_hbm_i = seed_hbm_i[winners]
+    back_opt_j: List[np.ndarray] = [seed_opt_id[winners]]
+    back_prev_cell_i: List[np.ndarray] = [np.full(winners.size, -1, dtype=np.int32)]
+
+    for table_i in range(1, table_count):
+        if dp_perf.size == 0:
+            break
+        cur_table_hbm, cur_table_ddr, cur_table_perf, cur_table_opt_id = table_opts[
+            table_i
+        ]
+        if cur_table_perf.size == 0:
+            dp_perf = np.zeros(0)
+            break
+
+        new_hbm = dp_hbm[:, None] + cur_table_hbm[None, :]
+        new_ddr = dp_ddr[:, None] + cur_table_ddr[None, :]
+        new_perf = dp_perf[:, None] + cur_table_perf[None, :]
+        valid_mask = (new_hbm < hbm_bins) & (new_ddr < ddr_bins)
+        if not valid_mask.any():
+            dp_perf = np.zeros(0)
+            break
+
+        new_hbm_i = new_hbm.astype(np.int32)
+        new_ddr_i = new_ddr.astype(np.int32)
+        flat_cell_i = new_hbm_i.astype(np.int64) * ddr_bins + new_ddr_i
+
+        valid_flat_cell_i = flat_cell_i[valid_mask]
+        valid_new_perf = new_perf[valid_mask]
+        valid_new_hbm = new_hbm[valid_mask]
+        valid_new_ddr = new_ddr[valid_mask]
+        valid_new_hbm_i = new_hbm_i[valid_mask]
+        valid_prev_cell_i, valid_opt_j = np.where(valid_mask)
+
+        winners = _argmin_per_group(
+            group_keys=valid_flat_cell_i, perf_keys=valid_new_perf
+        )
+
+        dp_perf = valid_new_perf[winners]
+        dp_hbm = valid_new_hbm[winners]
+        dp_ddr = valid_new_ddr[winners]
+        dp_hbm_i = valid_new_hbm_i[winners]
+        back_opt_j.append(cur_table_opt_id[valid_opt_j[winners]])
+        back_prev_cell_i.append(valid_prev_cell_i[winners].astype(np.int32))
+
+    if dp_perf.size == 0:
+        return []
+
+    # Per-HBM-bin best, decreasing HBM order.
+    chosen_cell_i = _argmin_per_group(group_keys=dp_hbm_i, perf_keys=dp_perf)[::-1]
+
+    proposals: List[List[int]] = []
+    for last_cell_i in chosen_cell_i:
+        proposal_indices = [-1] * table_count
+        cur_cell_i = int(last_cell_i)
+        for table_i in range(table_count - 1, -1, -1):
+            proposal_indices[table_i] = int(back_opt_j[table_i][cur_cell_i])
+            cur_cell_i = int(back_prev_cell_i[table_i][cur_cell_i])
+        proposals.append(proposal_indices)
+    return proposals
+
+
 class DynamicProgrammingProposer(Proposer):
-    r"""Proposes sharding plans in dynamic programming fashion.
+    r"""Proposes sharding plans in 2D (HBM × DDR) dynamic programming fashion.
 
         The problem of the Embedding Sharding Plan can be framed as follows: Given
     :math:`M` tables and their corresponding :math:`N` Sharding Options, we need to
     select one sharding option for each table such that the total performance is
-    minimized, while keeping the overall memory constraint :math:`K` in check. This can
-    be abstracted into the following mathematical formulation:
+    minimized, while keeping both an HBM constraint :math:`K_h` and a host DDR
+    constraint :math:`K_d` in check. This can be abstracted into the following
+    mathematical formulation:
 
-    Given a matrix :math:`A` of dimensions :math:`(M, N)` and another matrix :math:`B`
-    of the same dimensions, let the elements of matrix :math:`A` be denoted as
-    :math:`a_{i,j}` and the elements of matrix :math:`B` as :math:`b_{i,j}`. We aim
-    to find a set of column indices :math:`\{ j_0, j_1, \ldots, j_{M-1} \}` such that
-    the following conditions are satisfied:
+    Given matrices :math:`A^h`, :math:`A^d`, and :math:`B` of dimensions
+    :math:`(M, N)`, let :math:`a^h_{i,j}` and :math:`a^d_{i,j}` be the per-option
+    HBM and DDR storage costs, and :math:`b_{i,j}` the perf cost. We aim to find a
+    set of column indices :math:`\{ j_0, j_1, \ldots, j_{M-1} \}` such that the
+    following conditions are satisfied:
 
-    1. :math:`\sum_{i=0}^{M-1} a_{i,j_i} \leq K`, where :math:`K` is a float.
-    2. :math:`\sum_{i=0}^{M-1} b_{i,j_i}` is minimized.
+    1. :math:`\sum_{i=0}^{M-1} a^h_{i,j_i} \leq K_h`.
+    2. :math:`\sum_{i=0}^{M-1} a^d_{i,j_i} \leq K_d`.
+    3. :math:`\sum_{i=0}^{M-1} b_{i,j_i}` is minimized.
 
-    This problem can be tackled using dynamic programming. First, discretize :math:`K`
-    into :math:`K_i`, and denote the discretization function as :math:`f`.
+    This problem can be tackled using 2D dynamic programming. First, discretize
+    :math:`K_h` and :math:`K_d` into bins, and denote the discretization functions
+    as :math:`f_h` and :math:`f_d`.
 
-    Define the state :math:`dp[i][f(k)]` to represent the minimum value of :math:`B`
-    when considering the first :math:`i` rows and the total sum of :math:`A` is equal to
-    the discretized value :math:`k`.
+    Define the state :math:`dp[i][f_h(k_h)][f_d(k_d)]` to represent the minimum
+    value of :math:`B` when considering the first :math:`i` rows and the totals of
+    :math:`A^h` and :math:`A^d` equal the discretized values :math:`k_h` and
+    :math:`k_d` respectively.
 
     The state transition can then be represented as:
 
     .. math::
-        dp[i][f(k)] = \min_{j=0}^{N-1} \left( dp[i-1][f(k - A[i][j])] + B[i][j] \right)
+        dp[i][f_h(k_h)][f_d(k_d)] = \min_{j=0}^{N-1} \left(
+            dp[i-1][f_h(k_h - a^h_{i,j})][f_d(k_d - a^d_{i,j})] + b_{i,j} \right)
 
-    Since :math:`K` is the sum allocated across all memory, simply satisfying that the
-    total memory in the plan equals :math:`K` does not guarantee that the allocation
-    will fit on all cards. Therefore, it is essential to maintain all the states of the
-    last layer of :math:`dp`. This allows us to propose different plans under varying
-    total memory constraints.
+    Since :math:`K_h` and :math:`K_d` are sums allocated across all memory, simply
+    satisfying that the totals in the plan equal them does not guarantee that the
+    allocation will fit on all cards / hosts. Therefore, it is essential to
+    maintain all the states of the last layer of :math:`dp`. For each HBM bin we
+    emit one proposal -- the lowest-:math:`B` plan across all DDR bins at that
+    HBM level -- in decreasing HBM order; plans at the same HBM bin with worse
+    perf are strictly dominated and skipped.
 
     Args:
-        mem_bins_per_device (int): memory bins for dynamic programming precision.
+        hbm_bins_per_device (int): per-device HBM bins for DP precision.
+        ddr_bins_per_device (int): per-device DDR bins for DP precision.
     """
 
-    def __init__(self, mem_bins_per_device: int = 100) -> None:
+    def __init__(
+        self,
+        hbm_bins_per_device: int = 100,
+        ddr_bins_per_device: int = 25,
+    ) -> None:
         self._inited: bool = False
-        self._mem_bins_per_device: int = max(mem_bins_per_device, 1)
+        self._hbm_bins_per_device: int = max(hbm_bins_per_device, 1)
+        self._ddr_bins_per_device: int = max(ddr_bins_per_device, 1)
         self._sharding_options_by_fqn: OrderedDict[str, List[ShardingOption]] = (
             OrderedDict()
         )
-        # list of proposals with different total_mem, a proposal is a list of
-        # indices of sharding_options
+        # list of proposals with different total_mem; each proposal is a list
+        # of indices into self._sharding_options_by_fqn[fqn].
         self._proposal_list: List[List[int]] = []
         self._current_proposal: int = -1
-        self._storage_type = "hbm"
-        if not torch.cuda.is_available():
-            self._storage_type = "ddr"
 
     def load(
         self,
         search_space: List[ShardingOption],
         enumerator: Optional[Enumerator] = None,
     ) -> None:
-        """Load search space."""
+        """Load search space, sorted by total (hbm + ddr) ascending."""
         self._reset()
-        # order the sharding_option by total_storage.hbm from low to high
         for sharding_option in sorted(
-            search_space, key=lambda x: getattr(x.total_storage, self._storage_type)
+            search_space,
+            key=lambda x: (x.total_storage.hbm or 0) + (x.total_storage.ddr or 0),
         ):
             fqn = sharding_option.fqn
             if fqn not in self._sharding_options_by_fqn:
@@ -324,105 +464,94 @@ class DynamicProgrammingProposer(Proposer):
         perf_rating: Optional[float] = None,
         storage_constraint: Optional[Topology] = None,
     ) -> None:
-        """Feedback last proposed plan."""
-        if not self._inited:
-            self._inited = True
-            table_count = len(self._sharding_options_by_fqn)
-            option_count = max([len(x) for x in self._sharding_options_by_fqn.values()])
-
-            assert storage_constraint is not None
-            # are we assuming the table will be evenly sharded on all devices?
-            max_device_mem = 0
-            mem_total = 0
-            for x in storage_constraint.devices:
-                cur_device_mem = getattr(x.storage, self._storage_type)
-                max_device_mem = max(max_device_mem, cur_device_mem)
-                mem_total += cur_device_mem
-
-            bin_count = self._mem_bins_per_device * len(storage_constraint.devices)
-            bin_size = float(mem_total) / bin_count
-
-            dp = [
-                [(float("inf"), float("inf"))] * bin_count for _ in range(table_count)
-            ]  # [table_id][mem_bin][perf, mem]
-
-            backtrack = [
-                [(-1, -1)] * bin_count for _ in range(table_count)
-            ]  # [table_id][mem_bin][opt_id, prev_mem_bin]
-
-            mem_by_fqn = [
-                [float("inf") for _ in range(option_count)] for _ in range(table_count)
-            ]  # memory constraint lookup table: [table_id][sharding_option_id]
-            perf_by_fqn = [
-                [float("inf") for _ in range(option_count)] for _ in range(table_count)
-            ]  # performance metrics lookup table: [table_id][sharding_option_id]
-
-            # populate mem and perf for each sharding option and table:
-            # A[table_id][sharding_option_id]
-            for table_id, sharding_options in enumerate(
-                self._sharding_options_by_fqn.values()
-            ):
-                for opt_id, sharding_option in enumerate(sharding_options):
-                    # prune mem of one shard > mem of one device
-                    if (
-                        max(
-                            [
-                                getattr(shard.storage, self._storage_type)
-                                for shard in sharding_option.shards
-                            ]
-                        )
-                        > max_device_mem
-                    ):
-                        continue
-                    mem_by_fqn[table_id][opt_id] = _bytes_to_float_bin(
-                        getattr(sharding_option.total_storage, self._storage_type),
-                        bin_size,
-                    )
-                    perf_by_fqn[table_id][opt_id] = sharding_option.total_perf
-
-            table_0 = 0
-            for opt_j in range(option_count):
-                if mem_by_fqn[0][opt_j] < bin_count:
-                    mem_i = int(mem_by_fqn[0][opt_j])
-                    # options are ordered in increasing order of mem, we only want to
-                    # consider a sharding option that has higher mem and better perf
-                    # (the smaller the better)
-                    if dp[table_0][mem_i][0] > perf_by_fqn[table_0][opt_j]:
-                        dp[table_0][mem_i] = (
-                            perf_by_fqn[table_0][opt_j],
-                            mem_by_fqn[table_0][opt_j],
-                        )
-                        backtrack[table_0][mem_i] = (opt_j, -1)
-
-            # dp: table_count x option_count x bin_count
-            for table_i in range(1, table_count):
-                for opt_j in range(option_count):
-                    for mem in range(bin_count):
-                        prev_perf, perv_mem = dp[table_i - 1][mem]
-                        if prev_perf < float("inf"):
-                            new_mem = perv_mem + mem_by_fqn[table_i][opt_j]
-                            if new_mem < bin_count:
-                                new_mem_i = int(new_mem)
-                                new_perf = prev_perf + perf_by_fqn[table_i][opt_j]
-                                if dp[table_i][new_mem_i][0] > new_perf:
-                                    dp[table_i][new_mem_i] = (new_perf, new_mem)
-                                    backtrack[table_i][new_mem_i] = (opt_j, mem)
-            self._proposal_list = []
-            # fill in all the proposals, starting from highest mem to lowest mem
-            for c in range(bin_count - 1, -1, -1):
-                cur_opt_idx, cur_mem_idx = backtrack[table_count - 1][c]
-                if cur_opt_idx >= 0:
-                    proposal_indices = [-1] * table_count
-                    proposal_indices[table_count - 1] = cur_opt_idx
-                    for i in range(table_count - 2, -1, -1):
-                        proposal_indices[i], cur_mem_idx = backtrack[i][cur_mem_idx]
-                    self._proposal_list.append(proposal_indices)
-            if len(self._proposal_list) > 0:
-                self._current_proposal = 0
-        else:
+        """Run 2D DP on first feedback; otherwise advance the proposal cursor."""
+        if self._inited:
             self._current_proposal += 1
             if self._current_proposal >= len(self._proposal_list):
                 self._current_proposal = -1
+            return
+
+        self._inited = True
+        assert storage_constraint is not None
+        if not self._sharding_options_by_fqn:
+            return
+
+        num_devices = len(storage_constraint.devices)
+        max_device_hbm = 0
+        hbm_total = 0
+        ddr_total = 0
+        for device in storage_constraint.devices:
+            max_device_hbm = max(max_device_hbm, device.storage.hbm or 0)
+            hbm_total += device.storage.hbm or 0
+            ddr_total += device.storage.ddr or 0
+        # DDR is host-shared across ranks co-located on one machine, so the
+        # per-option fit check compares against the largest machine's DDR pool
+        # -- not per-device. HBM is GPU-local, so its prune stays per-device.
+        per_host = getattr(storage_constraint, "local_world_size", None) or num_devices
+        per_host = max(per_host, 1)
+        max_machine_ddr = 0
+        for host_start in range(0, num_devices, per_host):
+            host_end = min(host_start + per_host, num_devices)
+            machine_ddr = sum(
+                (storage_constraint.devices[i].storage.ddr or 0)
+                for i in range(host_start, host_end)
+            )
+            max_machine_ddr = max(max_machine_ddr, machine_ddr)
+
+        hbm_bins = max(self._hbm_bins_per_device * num_devices, 1)
+        ddr_bins = max(self._ddr_bins_per_device * num_devices, 1)
+        # Collapse a degenerate axis to a single bin so we don't waste states
+        # on (e.g.) CPU-only topologies that have hbm == 0 everywhere.
+        if hbm_total == 0:
+            hbm_bins = 1
+        if ddr_total == 0:
+            ddr_bins = 1
+        hbm_bin_size = float(hbm_total) / hbm_bins if hbm_bins > 0 else 1.0
+        ddr_bin_size = float(ddr_total) / ddr_bins if ddr_bins > 0 else 1.0
+
+        # Per-table option arrays in bin-units, with infeasible options pruned.
+        table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for sharding_options in self._sharding_options_by_fqn.values():
+            hbm_list: List[float] = []
+            ddr_list: List[float] = []
+            perf_list: List[float] = []
+            opt_id_list: List[int] = []
+            for opt_id, sharding_option in enumerate(sharding_options):
+                max_shard_hbm = max(
+                    (shard.storage.hbm or 0) for shard in sharding_option.shards
+                )
+                max_shard_ddr = max(
+                    (shard.storage.ddr or 0) for shard in sharding_option.shards
+                )
+                # HBM is per-device, DDR is per-machine: see comment above.
+                if hbm_total > 0 and max_shard_hbm > max_device_hbm:
+                    continue
+                if ddr_total > 0 and max_shard_ddr > max_machine_ddr:
+                    continue
+                hbm_list.append(
+                    (sharding_option.total_storage.hbm or 0) / hbm_bin_size
+                    if hbm_total > 0
+                    else 0.0
+                )
+                ddr_list.append(
+                    (sharding_option.total_storage.ddr or 0) / ddr_bin_size
+                    if ddr_total > 0
+                    else 0.0
+                )
+                perf_list.append(sharding_option.total_perf)
+                opt_id_list.append(opt_id)
+            table_opts.append(
+                (
+                    np.asarray(hbm_list, dtype=np.float32),
+                    np.asarray(ddr_list, dtype=np.float32),
+                    np.asarray(perf_list, dtype=np.float32),
+                    np.asarray(opt_id_list, dtype=np.int32),
+                )
+            )
+
+        self._proposal_list = _sparse_dp_proposor_numpy(table_opts, hbm_bins, ddr_bins)
+        if self._proposal_list:
+            self._current_proposal = 0
 
 
 def _extract_constraints_for_param(
@@ -755,6 +884,38 @@ def calculate_shard_storages(
         )
 
 
+def _emit_dynamicemb_variants(
+    base_option: ShardingOption,
+) -> List[ShardingOption]:
+    """Expand a dynamicemb ShardingOption into HYBRID + CACHING variants.
+
+    Sweeps both placement modes (``caching=False`` and ``caching=True``) and,
+    when ``base_option.cache_params`` is unset, ten cache_load_factor values
+    (0.1, 0.2, ..., 1.0). The downstream 2D DP proposer picks per table the
+    best (mode, ratio) that fits both HBM and host topology budgets.
+
+    ``base_option.dynamicemb_options`` must already be attached by the
+    caller; each returned ShardingOption owns a freshly deep-copied
+    ``dynamicemb_options`` instance so per-option ``caching`` mutations do
+    not bleed across variants.
+    """
+    if base_option.cache_params is None:
+        load_factors = [(i + 1) / 10 for i in range(10)]
+        stats = None
+    else:
+        load_factors = [base_option.cache_params.load_factor]
+        stats = base_option.cache_params.stats
+    variants: List[ShardingOption] = []
+    for caching_mode in (False, True):
+        for load_factor in load_factors:
+            opt = copy.deepcopy(base_option)
+            opt.cache_params = CacheParams(load_factor=load_factor, stats=stats)
+            # deepcopy(base_option) already produced a fresh dynamicemb_options.
+            opt.dynamicemb_options.caching = caching_mode  # pyre-ignore [16]
+            variants.append(opt)
+    return variants
+
+
 class EmbeddingEnumerator(_EmbeddingEnumerator):
     """Generates embedding sharding options for given `nn.Module` with constraints.
 
@@ -934,20 +1095,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_option.use_dynamicemb = use_dynamicemb
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
-                            if sharding_option.cache_params is None:
-                                # add cache_load_factor automatic search space
-                                for load_factor_step in range(10):
-                                    sharding_option_copy = copy.deepcopy(
-                                        sharding_option
-                                    )
-                                    sharding_option_copy.cache_params = CacheParams(
-                                        load_factor=(load_factor_step + 1) / 10
-                                    )
-                                    sharding_options_per_table.append(
-                                        sharding_option_copy
-                                    )
-                            else:
-                                sharding_options_per_table.append(sharding_option)
+                            sharding_options_per_table.extend(
+                                _emit_dynamicemb_variants(sharding_option)
+                            )
                         else:
                             sharding_options_per_table.append(sharding_option)
 

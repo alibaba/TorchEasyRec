@@ -76,6 +76,7 @@ class HSTUPositionalEncoder(BaseModule):
         seq_timestamps: torch.Tensor,
         seq_embeddings: torch.Tensor,
         num_targets: Optional[torch.Tensor],
+        query_time: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward the module.
 
@@ -86,6 +87,9 @@ class HSTUPositionalEncoder(BaseModule):
             seq_timestamps (torch.Tensor): input sequence timestamps.
             seq_embeddings (torch.Tensor): input sequence embeddings.
             num_targets (int): number of targets.
+            query_time (torch.Tensor, optional): per-row request time used as
+                the time-bias anchor (``ts_gap = query_time - timestamp``).
+                When ``None``, the last in-sequence timestamp is used.
 
         Returns:
             torch.Tensor: output sequence embedding with position embedding.
@@ -106,6 +110,7 @@ class HSTUPositionalEncoder(BaseModule):
                 time_bucket_fn=self._time_bucket_fn,
                 time_bucket_increments=self._time_bucket_increments,
                 kernel=self.kernel(),
+                query_time=query_time,
             )
         else:
             seq_embeddings = add_positional_embeddings(

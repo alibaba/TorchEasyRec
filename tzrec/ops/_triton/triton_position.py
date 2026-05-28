@@ -287,6 +287,7 @@ def _add_timestamp_position_embeddings_kernel(
     TsEmb,
     Out,
     TS,
+    QueryTime,
     PosInds,
     TsInds,
     NumTargets,
@@ -306,6 +307,7 @@ def _add_timestamp_position_embeddings_kernel(
     HAS_MULTIPLE_TARGETS: tl.constexpr,
     INTERLEAVE_TARGETS: tl.constexpr,
     TIME_BUCKET_FN: tl.constexpr,
+    HAS_QUERY_TIME: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -348,7 +350,12 @@ def _add_timestamp_position_embeddings_kernel(
     pos_emb_offsets = pos_inds[:, None] * stride_pn + offs_d[None, :]
     # timestamp encoding
     ts = tl.load(TS + seq_start + offs_n, mask=mask_n)
-    query_time = tl.load(TS + seq_end - 1)
+    if HAS_QUERY_TIME:
+        # Explicit per-row request time (HSTUMatch two-tower).
+        query_time = tl.load(QueryTime + off_b)
+    else:
+        # Last in-sequence timestamp (canonical / DLRM-HSTU request anchor).
+        query_time = tl.load(TS + seq_end - 1)
     ts = query_time - ts + time_delta
     ts = tl.where(ts > 1e-6, ts, 1e-6) / time_bucket_increments
     if TIME_BUCKET_FN == "log":
@@ -468,6 +475,7 @@ def triton_add_timestamp_positional_embeddings_fwd(
     interleave_targets: bool,
     time_bucket_fn: str,
     time_bucket_increments: float,
+    query_time: Optional[torch.Tensor],
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int
 ]:
@@ -489,6 +497,10 @@ def triton_add_timestamp_positional_embeddings_fwd(
     out = torch.empty_like(seq_embeddings)
 
     timestamps = switch_to_contiguous_if_needed(timestamps)
+    if query_time is not None:
+        query_time = switch_to_contiguous_if_needed(
+            query_time.view(-1).to(timestamps.dtype)
+        )
     ts_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
     pos_inds = torch.empty_like(seq_embeddings[:, 0], dtype=torch.int32)
     ts_emb_size = ts_embeddings.shape[0]
@@ -506,6 +518,7 @@ def triton_add_timestamp_positional_embeddings_fwd(
         TsEmb=ts_embeddings,
         Out=out,
         TS=timestamps,
+        QueryTime=query_time,
         PosInds=pos_inds,
         TsInds=ts_inds,
         NumTargets=num_targets,
@@ -525,6 +538,7 @@ def triton_add_timestamp_positional_embeddings_fwd(
         HAS_MULTIPLE_TARGETS=num_targets is not None,
         INTERLEAVE_TARGETS=interleave_targets,
         TIME_BUCKET_FN=time_bucket_fn,
+        HAS_QUERY_TIME=query_time is not None,
         BLOCK_D=BLOCK_D,
     )
     sorted_ts_key_inds, sorted_ts_value_inds = torch.sort(ts_inds)
@@ -557,6 +571,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         interleave_targets: bool,
         time_bucket_fn: str,
         time_bucket_increments: float,
+        query_time: Optional[torch.Tensor] = None,
     ):
         (
             out,
@@ -579,6 +594,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
             time_bucket_increments=time_bucket_increments,
+            query_time=query_time,
         )
         ctx.save_for_backward(
             sorted_pos_key_inds,
@@ -604,6 +620,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         None,
         torch.Tensor,
         torch.Tensor,
+        None,
         None,
         None,
         None,
@@ -666,6 +683,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -697,6 +715,7 @@ def triton_add_timestamp_positional_embeddings(
     interleave_targets: bool,
     time_bucket_fn: str,
     time_bucket_increments: float,
+    query_time: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return _AddTimestampPositionEmbeddingsFunction.apply(
         seq_embeddings,
@@ -711,4 +730,5 @@ def triton_add_timestamp_positional_embeddings(
         interleave_targets,
         time_bucket_fn,
         time_bucket_increments,
+        query_time,
     )
