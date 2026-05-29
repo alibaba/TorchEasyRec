@@ -252,8 +252,9 @@ class STULayer(STU):
             is invariant to batch-level seq-length.
         fp8_quant_mode (int): FP8 attention quant mode (``-1`` = off,
             ``0..5`` select an FP8 mode). Only honored on the training/eval
-            forward with ``Kernel.CUTLASS`` on an SM90+ (Hopper/Blackwell)
-            GPU; the cached/delta serving path always runs in bf16/fp16.
+            forward with ``Kernel.CUTLASS`` on SM90 (Hopper) or SM120
+            (Blackwell RTX, ``quant_mode=2`` only); the cached/delta
+            serving path always runs in bf16/fp16.
         is_inference (bool): whether to run in inference mode.
     """
 

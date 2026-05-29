@@ -272,11 +272,11 @@ message STU {
     // attention output scaling divisor (denominator of the SiLU(QK)/N term).
     // Sentinel: < 0 (default) = use runtime max_seq_len.
     optional int32 scaling_seqlen = 16 [default = -1];
-    // FP8 attention quant mode for the CUTLASS kernel (SM90+, Hopper/Blackwell).
+    // FP8 attention quant mode for the CUTLASS kernel.
     // -1 (default) = off (bf16/fp16); 0..5 select FP8 modes (0 per-tensor,
     // 1 two-direction, 2 per-block, 3 per-head, 4 per-batch, 5 global).
-    // Requires model.kernel = CUTLASS; the wheel routes to the per-arch FP8
-    // kernel (sm120/Blackwell RTX supports only quant_mode=2 forward).
+    // Requires model.kernel = CUTLASS on SM90 (Hopper, all modes, fwd+bwd)
+    // or SM120 (Blackwell RTX, quant_mode=2 only, forward-only).
     optional int32 fp8_quant_mode = 17 [default = -1];
 }
 

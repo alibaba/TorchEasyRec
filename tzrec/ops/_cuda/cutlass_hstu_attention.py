@@ -31,19 +31,36 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _MAX_FP8_QUANT_MODE = 5
 
 
-def _assert_fp8_capable() -> None:
-    """Raise unless the current device is SM90+ (Hopper or Blackwell)."""
+def _assert_fp8_capable(fp8_quant_mode: int) -> None:
+    """Raise unless the (arch, quant_mode) pair has an FP8 kernel in the wheel.
+
+    The wheel's dispatcher (``cuda_hstu_attention.HstuAttnVarlenFunc.forward``)
+    only routes to an FP8 kernel for SM90 (Hopper, modes 0..5) and SM120
+    (Blackwell RTX, mode 2 only -- forward-only). SM80 (Ampere) and SM100
+    (Blackwell datacenter) have no FP8 kernel; on SM120 with quant_mode != 2
+    the dispatcher silently falls through to the SM80 bf16/fp16 path, so we
+    must reject that here.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FP8 HSTU attention (fp8_quant_mode >= 0) requires a CUDA SM90+ "
-            "(Hopper / Blackwell) GPU; no CUDA device is available."
+            "FP8 HSTU attention (fp8_quant_mode >= 0) requires a CUDA SM90 "
+            "(Hopper) or SM120 (Blackwell RTX) GPU; no CUDA device is available."
         )
     major = torch.cuda.get_device_capability()[0]
-    if major < 9:
-        raise RuntimeError(
-            "FP8 HSTU attention (fp8_quant_mode >= 0) requires SM90+ "
-            f"(Hopper / Blackwell); got device capability major version {major}."
-        )
+    if major == 9:
+        return  # Hopper: all modes 0..5 supported (fwd + bwd).
+    if major == 12:
+        if fp8_quant_mode != 2:
+            raise RuntimeError(
+                "FP8 HSTU attention on SM120 (Blackwell RTX) only supports "
+                f"fp8_quant_mode=2 (per-block, forward-only); got "
+                f"fp8_quant_mode={fp8_quant_mode}."
+            )
+        return
+    raise RuntimeError(
+        "FP8 HSTU attention requires SM90 (Hopper) or SM120 (Blackwell RTX); "
+        f"got device capability major version {major}."
+    )
 
 
 @torch.fx.wrap
@@ -105,9 +122,8 @@ def cutlass_hstu_mha(
             ``-1`` (default) keeps q/k/v in bf16/fp16 (no FP8). ``0..5``
             select an FP8 mode (0 per-tensor, 1 two-direction, 2 per-block,
             3 per-head, 4 per-batch, 5 global); the wheel quantizes q/k/v
-            internally. FP8 requires SM90+ (Hopper or Blackwell); the
-            wheel routes to the per-arch FP8 kernel (sm120/Blackwell RTX
-            supports only ``quant_mode=2`` forward).
+            internally. FP8 requires SM90 (Hopper, all modes, fwd+bwd) or
+            SM120 (Blackwell RTX, ``quant_mode=2`` only, forward-only).
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -118,7 +134,7 @@ def cutlass_hstu_mha(
             f"got {fp8_quant_mode}."
         )
     if fp8_quant_mode >= 0 and not is_fx_tracing():
-        _assert_fp8_capable()
+        _assert_fp8_capable(fp8_quant_mode)
     if hstu_attn_varlen_func is None:
         raise RuntimeError(
             "fbgemm_gpu_hstu wheel is not installed; cannot run CUTLASS "
