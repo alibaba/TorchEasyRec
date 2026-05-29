@@ -32,17 +32,17 @@ _MAX_FP8_QUANT_MODE = 5
 
 
 def _assert_fp8_capable() -> None:
-    """Raise unless the current device is SM90 (Hopper), where FP8 is supported."""
+    """Raise unless the current device is SM90+ (Hopper or Blackwell)."""
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FP8 HSTU attention (fp8_quant_mode >= 0) requires a CUDA SM90 "
-            "(Hopper) GPU; no CUDA device is available."
+            "FP8 HSTU attention (fp8_quant_mode >= 0) requires a CUDA SM90+ "
+            "(Hopper / Blackwell) GPU; no CUDA device is available."
         )
     major = torch.cuda.get_device_capability()[0]
-    if major != 9:
+    if major < 9:
         raise RuntimeError(
-            "FP8 HSTU attention (fp8_quant_mode >= 0) is only supported on "
-            f"SM90 (Hopper); got device capability major version {major}."
+            "FP8 HSTU attention (fp8_quant_mode >= 0) requires SM90+ "
+            f"(Hopper / Blackwell); got device capability major version {major}."
         )
 
 
@@ -105,7 +105,9 @@ def cutlass_hstu_mha(
             ``-1`` (default) keeps q/k/v in bf16/fp16 (no FP8). ``0..5``
             select an FP8 mode (0 per-tensor, 1 two-direction, 2 per-block,
             3 per-head, 4 per-batch, 5 global); the wheel quantizes q/k/v
-            internally. FP8 requires an SM90 (Hopper) GPU.
+            internally. FP8 requires SM90+ (Hopper or Blackwell); the
+            wheel routes to the per-arch FP8 kernel (sm120/Blackwell RTX
+            supports only ``quant_mode=2`` forward).
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).

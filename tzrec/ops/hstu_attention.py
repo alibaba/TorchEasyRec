@@ -88,8 +88,9 @@ def hstu_mha(
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
         fp8_quant_mode: FP8 quantization mode (``-1`` = off, ``0..5`` select
-            an FP8 mode). Only supported on ``Kernel.CUTLASS`` (SM90); a
-            value ``>= 0`` with any other kernel raises.
+            an FP8 mode). Only supported on ``Kernel.CUTLASS`` (SM90+,
+            Hopper / Blackwell); a value ``>= 0`` with any other kernel
+            raises.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
