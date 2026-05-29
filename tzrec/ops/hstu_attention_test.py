@@ -35,11 +35,12 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 _DISABLE_V3_CACHE_SUFFIX = "_disable_v3"
 
-# FP8 HSTU attention only runs on SM90 (Hopper); skip elsewhere (e.g. the
-# local A10/sm86 dev box) so the test is a no-op until it reaches an H20 box.
+# test_attn_fp8_cutlass samples every FP8 quant_mode; only SM90 (Hopper)
+# supports all of them. SM120 (Blackwell RTX) is mode=2 forward-only and
+# would fail the other modes; SM80/SM100 have no FP8.
 _fp8_unavailable = (
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
-    "FP8 HSTU attention requires an SM90 (Hopper) GPU",
+    "all-FP8-mode test requires SM90 (Hopper)",
 )
 
 
