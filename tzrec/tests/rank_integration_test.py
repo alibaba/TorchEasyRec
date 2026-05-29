@@ -1098,15 +1098,22 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_ultra_hstu_cutlass_train_eval_export(self):
-        # Enable per-block FP8 attention (quant_mode=2) for the H20 run --
+        # Enable per-tensor FP8 attention (quant_mode=0) for the H20 run --
         # exercises train + eval + AOTI export + predict end-to-end on the
-        # CUTLASS FP8 path. Mode 2 is the choice the wheel supports across
-        # both SM90 (Hopper) and SM120 (Blackwell RTX).
+        # CUTLASS FP8 path. Modes 1..5 each rely on wheel-side Python
+        # quant helpers whose data-dependent loops either fail
+        # torch.export's GuardOnDataDependentSymNode (mode 2/3/4/5) or
+        # AOTI's runtime tensor reinterpret on unbacked SymInts even when
+        # the quant helper is wrapped as a torch.library.custom_op
+        # (verified: a quantize_for_block_scale custom_op wrap unblocks
+        # export but predict still fails on aoti_torch__reinterpret_tensor).
+        # Mode 0 is just q.to(fp8_e4m3fn) + dummy 1.0 descales -- no
+        # Python data-dep -- so it survives export + AOTI + predict.
         pc = config_util.load_pipeline_config(
             "tzrec/tests/configs/ultra_hstu_cutlass_kuairand_1k.config"
         )
         for hstu in pc.model_config.ultra_hstu.hstu:
-            hstu.stu.fp8_quant_mode = 2
+            hstu.stu.fp8_quant_mode = 0
         fp8_config = os.path.join(self.test_dir, "ultra_hstu_cutlass_fp8.config")
         config_util.save_message(pc, fp8_config)
         self.success = utils.test_train_eval(fp8_config, self.test_dir)
