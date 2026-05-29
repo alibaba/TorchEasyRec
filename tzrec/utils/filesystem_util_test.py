@@ -33,6 +33,21 @@ class FileSystemUtilTest(unittest.TestCase):
             if os.path.exists(self.test_dir):
                 shutil.rmtree(self.test_dir)
 
+    def test_rmtree_local_and_fsspec(self):
+        # local path -> delegates to the original rmtree
+        local_sub = os.path.join(self.test_dir, "local_sub")
+        os.makedirs(os.path.join(local_sub, "nested"))
+        shutil.rmtree(local_sub)
+        self.assertFalse(os.path.exists(local_sub))
+        # file:// path -> fsspec branch (recursive fs.rm)
+        fsspec_sub = os.path.join(self.test_dir, "fsspec_sub")
+        os.makedirs(os.path.join(fsspec_sub, "nested"))
+        shutil.rmtree(f"file://{fsspec_sub}")
+        self.assertFalse(os.path.exists(fsspec_sub))
+        # ignore_errors swallows a missing path on the fsspec branch
+        shutil.rmtree(f"file://{fsspec_sub}", ignore_errors=True)
+        self.success = True
+
     def test_local_fsspec_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config",
