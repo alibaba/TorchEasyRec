@@ -543,11 +543,12 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "train/eval_result.txt"))
         )
 
-        # set tf32 config for consistent TRT comparison
+        # disable tf32 so baseline and TRT engine both run strict fp32; export_config
+        # is the export/predict authority in allow_tf32_for_export
         test_config_path = os.path.join(self.test_dir, "pipeline.config")
         pipeline_config = config_util.load_pipeline_config(test_config_path)
-        pipeline_config.train_config.cudnn_allow_tf32 = True
-        pipeline_config.train_config.cuda_matmul_allow_tf32 = True
+        pipeline_config.export_config.cudnn_allow_tf32 = False
+        pipeline_config.export_config.cuda_matmul_allow_tf32 = False
         config_util.save_message(pipeline_config, test_config_path)
 
         trt_dir = os.path.join(self.test_dir, "trt")
