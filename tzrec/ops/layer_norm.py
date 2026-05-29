@@ -17,7 +17,7 @@
 import torch
 from torch.fx._symbolic_trace import is_fx_tracing
 
-from tzrec.ops import Kernel
+from tzrec.ops import Kernel, is_ppu_arch
 from tzrec.ops._pytorch.pt_layer_norm import (
     pytorch_layer_norm,
     pytorch_rms_norm,
@@ -64,6 +64,11 @@ def rms_norm(
 ) -> torch.Tensor:
     if kernel == Kernel.CUTLASS:
         kernel = Kernel.TRITON
+    # PPU Triton has an atomic_cas/atomic_xchg memory-ordering bug in
+    # _weighted_rms_norm_bwd_dx that produces wrong dw when GROUP_N<N (large
+    # batches). Force PyTorch on PPU until the vendor lands a fix.
+    if kernel == Kernel.TRITON and is_ppu_arch():
+        kernel = Kernel.PYTORCH
     if kernel == Kernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must not be cpu tensor")
