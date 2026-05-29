@@ -52,6 +52,18 @@ torch_fx_tool_unavailable: Tuple[bool, str] = (
     "torch_fx_tool wheel is not installed (required for RTP export)",
 )
 
+
+def get_compare_tolerance(
+    dtype: torch.dtype,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return (atol, rtol) for Triton-vs-PyTorch comparisons; widen fp32 on PPU."""
+    from tzrec.ops import is_ppu_arch
+
+    if is_ppu_arch() and dtype == torch.float32:
+        return (3e-5, 2e-5)
+    return (None, None)
+
+
 _settings.register_profile(
     "default", _settings(_settings.get_profile("default"), print_blob=True)
 )

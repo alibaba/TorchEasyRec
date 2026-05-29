@@ -75,6 +75,10 @@ class MMlTest(unittest.TestCase):
         rtol: Optional[float] = None,
     ) -> None:
         from tzrec.ops.mm import addmm
+        from tzrec.utils.test_util import get_compare_tolerance
+
+        if atol is None and rtol is None:
+            atol, rtol = get_compare_tolerance(dtype)
 
         # to enable more deterministic results.
         torch.manual_seed(0)
