@@ -35,14 +35,6 @@ from tzrec.utils.test_util import hypothesis_settings as settings
 
 _DISABLE_V3_CACHE_SUFFIX = "_disable_v3"
 
-# test_attn_fp8_cutlass samples every FP8 quant_mode; only SM90 (Hopper)
-# supports all of them. SM120 (Blackwell RTX) is mode=2 forward-only and
-# would fail the other modes; SM80/SM100 have no FP8.
-_fp8_unavailable = (
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
-    "all-FP8-mode test requires SM90 (Hopper)",
-)
-
 
 @contextlib.contextmanager
 def _force_mma_v2():  # pyre-ignore[3]
@@ -594,9 +586,14 @@ class HSTUAttentionTest(unittest.TestCase):
                 real_kernel=Kernel.CUTLASS,
             )
 
+    # Samples every FP8 quant_mode; only SM90 (Hopper) supports all of them.
+    # SM120 (Blackwell RTX) is mode=2 fwd-only; SM80/SM100 have no FP8.
     @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
-    @unittest.skipIf(*_fp8_unavailable)
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+        "all-FP8-mode test requires SM90 (Hopper)",
+    )
     # pyre-ignore
     @given(
         batch_size=st.integers(4, 8),
