@@ -1098,10 +1098,18 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_ultra_hstu_cutlass_train_eval_export(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/ultra_hstu_cutlass_kuairand_1k.config",
-            self.test_dir,
+        # Enable per-block FP8 attention (quant_mode=2) for the H20 run --
+        # exercises train + eval + AOTI export + predict end-to-end on the
+        # CUTLASS FP8 path. Mode 2 is the choice the wheel supports across
+        # both SM90 (Hopper) and SM120 (Blackwell RTX).
+        pc = config_util.load_pipeline_config(
+            "tzrec/tests/configs/ultra_hstu_cutlass_kuairand_1k.config"
         )
+        for hstu in pc.model_config.ultra_hstu.hstu:
+            hstu.stu.fp8_quant_mode = 2
+        fp8_config = os.path.join(self.test_dir, "ultra_hstu_cutlass_fp8.config")
+        config_util.save_message(pc, fp8_config)
+        self.success = utils.test_train_eval(fp8_config, self.test_dir)
         if self.success:
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
