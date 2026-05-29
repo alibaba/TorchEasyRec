@@ -593,6 +593,7 @@ class HSTUAttentionTest(unittest.TestCase):
                 real_kernel=Kernel.CUTLASS,
             )
 
+    @mark_ci_scope("h20")
     @unittest.skipIf(*gpu_unavailable)
     @unittest.skipIf(*_fp8_unavailable)
     # pyre-ignore
@@ -608,23 +609,16 @@ class HSTUAttentionTest(unittest.TestCase):
         has_max_attn_len=st.sampled_from([False]),
         contextual_seq_len=st.sampled_from([0, 10]),
         scaling_seqlen=st.sampled_from([-1, 2048]),
-        # 0 = per-tensor (coarsest), 3 = per-head. Per-block (2) is skipped
-        # to avoid the wheel's cu12 per-block special-case.
-        fp8_quant_mode=st.sampled_from([0, 3]),
+        fp8_quant_mode=st.sampled_from([0, 1, 2, 3, 4, 5]),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=10,
+        max_examples=20,
         deadline=None,
     )
     # pyre-ignore[2]
     def test_attn_fp8_cutlass(self, *args, **kwargs) -> None:
-        # CUTLASS FP8 attention (SM90 only). The wheel quantizes q/k/v
-        # internally, so we feed bf16 and compare against the bf16 PyTorch
-        # reference with relaxed tolerances (FP8 e4m3 is lossy). The backward
-        # re-quantizes q/k/v/dout to FP8, so grads carry larger error; the
-        # atol/rtol below are starting points to tune against observed error
-        # on the H20 box.
+        # FP8 e4m3 vs bf16 ref; tolerances relaxed for quantization loss.
         hidden_dim = kwargs.pop("attn_dim")
         test_attn(
             *args,
