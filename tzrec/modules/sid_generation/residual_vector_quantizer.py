@@ -18,7 +18,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.kmeans import _residual_kmeans
+from tzrec.modules.sid_generation.kmeans import faiss_residual_kmeans
 from tzrec.modules.sid_generation.residual_quantizer import ResidualQuantizer
 from tzrec.modules.sid_generation.types import (
     QuantizeForwardMode,
@@ -155,10 +155,15 @@ class ResidualVectorQuantizer(ResidualQuantizer):
     @torch.jit.ignore
     @torch.no_grad()
     def init_embed_(self, data: torch.Tensor) -> None:
-        """Initialize codebook weights via residual K-Means.
+        """Initialize codebook weights via FAISS residual K-Means.
 
         Only executed once when kmeans_init=True and not yet initialized.
-        Uses the first batch of training data as initialization pool.
+        Uses the first batch of training data as the initialization pool.
+
+        Under DDP the codebook is fit on rank 0 only and broadcast, so every
+        rank starts from the SAME codebook. (Averaging per-rank centroids —
+        the previous behavior — mixes permutation-misaligned clusters across
+        ranks and yields a near-random warm start.)
 
         Args:
             data (Tensor): input data, shape (B, D).
@@ -166,14 +171,21 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if self.initted:
             return
 
-        centers = _residual_kmeans(data, self.n_embed_list)
-
-        # Average per-layer centroids across DDP ranks so every rank
-        # starts from the same codebook.
-        if dist.is_initialized() and dist.get_world_size() > 1:
+        is_ddp = dist.is_initialized() and dist.get_world_size() > 1
+        if (not is_ddp) or dist.get_rank() == 0:
+            centers = faiss_residual_kmeans(
+                data,
+                self.n_embed_list,
+                {"niter": 10, "seed": 123, "verbose": False},
+            )
+        else:
+            centers = [
+                torch.empty(k, self.embed_dim, dtype=torch.float32, device=data.device)
+                for k in self.n_embed_list
+            ]
+        if is_ddp:
             for c in centers:
-                dist.all_reduce(c, op=dist.ReduceOp.SUM)
-                c /= dist.get_world_size()
+                dist.broadcast(c, src=0)
 
         for i, layer in enumerate(self.layers):
             layer.embedding.weight.data.copy_(centers[i])

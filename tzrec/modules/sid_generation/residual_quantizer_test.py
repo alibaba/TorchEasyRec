@@ -88,6 +88,24 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         codes = self.rvq.get_codes(torch.randn(4, 8))
         self.assertEqual(codes.shape, (4, 3))
 
+    def test_faiss_kmeans_init_seeds_codebook(self) -> None:
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        torch.manual_seed(0)
+        rvq = ResidualVectorQuantizer(
+            embed_dim=8, n_layers=2, n_embed=16, kmeans_init=True
+        )
+        self.assertFalse(bool(rvq.initted.item()))
+        rvq.train()
+        # First training forward triggers the FAISS warm-start.
+        rvq(torch.randn(512, 8))
+        self.assertTrue(bool(rvq.initted.item()))
+        for layer in rvq.layers:
+            self.assertTrue(torch.isfinite(layer.embedding.weight).all())
+            self.assertGreater(layer.embedding.weight.abs().sum().item(), 0.0)
+
 
 class ResidualKMeansQuantizerTest(unittest.TestCase):
     def test_is_subclass(self) -> None:

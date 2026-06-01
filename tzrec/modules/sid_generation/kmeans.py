@@ -18,14 +18,12 @@ SID models:
   :class:`ResidualKMeansQuantizer`. Centroids are injected
   by the FAISS backend via ``load_centroids_``; the only forward path
   is ``predict``.
-* :func:`_kmeans` / :func:`_residual_kmeans` — pure-torch Lloyd's
-  K-Means + residual variant, used by :class:`ResidualVectorQuantizer` to
-  warm-start the RQ-VAE codebook on the first training batch. They run
-  once on a single batch of encoder outputs (typically ~2k × 64), so
-  pulling in FAISS here would be all overhead and no benefit.
+* :func:`faiss_residual_kmeans` — FAISS residual K-Means used by
+  :class:`ResidualVectorQuantizer` to warm-start the RQ-VAE codebook on the
+  first training batch (same FAISS backend as the offline RQ-KMeans fit).
 """
 
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -92,109 +90,53 @@ def _squared_euclidean_distance(
 
 
 @torch.no_grad()
-def _kmeans_plus_plus(
-    data: torch.Tensor,
-    n_clusters: int,
-) -> torch.Tensor:
-    """KMeans++ initialization (Arthur & Vassilvitskii 2007).
-
-    Selects initial centroids via distance-weighted probability sampling
-    to ensure well-spread starting points. Used by the RQ-VAE codebook
-    init path (``ResidualVectorQuantizer.kmeans_init``); the K-Means backend itself no
-    longer needs it.
-
-    Args:
-        data (Tensor): data points, shape (N, D).
-        n_clusters (int): number of clusters K.
-
-    Returns:
-        Tensor: initial centroids, shape (K, D).
-    """
-    N, D = data.shape
-    centroids = torch.zeros(n_clusters, D, device=data.device, dtype=data.dtype)
-
-    idx = torch.randint(0, N, (1,), device=data.device)
-    centroids[0] = data[idx]
-
-    for i in range(1, n_clusters):
-        dists = _squared_euclidean_distance(data, centroids[:i])  # (N, i)
-        min_dists = dists.min(dim=1)[0]  # (N,)
-        if min_dists.sum() == 0:
-            centroids[i:] = data[
-                torch.randint(0, N, (n_clusters - i,), device=data.device)
-            ]
-            break
-        next_idx = torch.multinomial(min_dists, num_samples=1)
-        centroids[i] = data[next_idx]
-
-    return centroids
-
-
-@torch.no_grad()
-def _kmeans(
-    samples: torch.Tensor,
-    n_clusters: int,
-    n_iters: int = 100,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Lloyd's K-Means with KMeans++ initialization.
-
-    Used by :class:`ResidualVectorQuantizer.init_embed_` to warm-start the
-    RQ-VAE codebook on the first training batch.
-
-    Args:
-        samples (Tensor): data points, shape (N, D).
-        n_clusters (int): number of clusters K.
-        n_iters (int): number of Lloyd iterations. Default: 100.
-
-    Returns:
-        centroids (Tensor): cluster centers, shape (K, D).
-        assignments (Tensor): cluster indices, shape (N,).
-    """
-    N, D = samples.shape
-    centroids = _kmeans_plus_plus(samples, n_clusters)
-
-    for _ in range(n_iters):
-        dists = _squared_euclidean_distance(samples, centroids)  # (N, K)
-        assignments = dists.argmin(dim=-1)  # (N,)
-
-        bins = torch.bincount(assignments, minlength=n_clusters)
-        zero_mask = bins == 0
-        bins_clamped = bins.masked_fill(zero_mask, 1)
-
-        new_centroids = torch.zeros_like(centroids)
-        new_centroids.scatter_add_(0, assignments.unsqueeze(1).expand(-1, D), samples)
-        new_centroids = new_centroids / bins_clamped.unsqueeze(1)
-
-        # Keep old centroids for empty clusters
-        centroids = torch.where(zero_mask.unsqueeze(1), centroids, new_centroids)
-
-    return centroids, assignments
-
-
-@torch.no_grad()
-def _residual_kmeans(
+def faiss_residual_kmeans(
     samples: torch.Tensor,
     n_clusters_list: List[int],
-    n_iters: int = 100,
+    faiss_kmeans_kwargs: Optional[Dict] = None,
 ) -> List[torch.Tensor]:
-    """Residual K-Means: per-layer cluster then subtract centroids.
+    """Residual K-Means warm-start via FAISS, one pass per layer.
 
-    Used by :class:`ResidualVectorQuantizer.init_embed_` to seed every RQ
-    codebook layer in one pass over the first training batch.
+    Clusters ``samples`` with FAISS K-Means, subtracts each point's assigned
+    centroid, and repeats on the residual for every layer. Used by
+    :meth:`ResidualVectorQuantizer.init_embed_` to seed the RQ-VAE codebook
+    from the first training batch — the same FAISS backend the offline
+    RQ-KMeans model uses, instead of a separate torch-native Lloyd's loop.
 
     Args:
         samples (Tensor): data points, shape (N, D).
         n_clusters_list (List[int]): per-layer cluster counts.
-        n_iters (int): K-Means iterations per layer. Default: 100.
+        faiss_kmeans_kwargs (Dict|None): extra kwargs for ``faiss.Kmeans``
+            (e.g. ``{'niter': 10, 'seed': 123}``).
 
     Returns:
-        List[Tensor]: per-layer centroids ``[(K0, D), (K1, D), ...]``.
+        List[Tensor]: per-layer centroids ``[(K0, D), ...]`` on samples.device.
+
+    Raises:
+        ImportError: if ``faiss`` is not installed.
     """
-    res_centers = []
+    try:
+        import faiss
+    except ImportError as e:
+        raise ImportError(
+            "faiss is required for RQ-VAE kmeans_init. Install via "
+            "`pip install faiss-cpu` or `pip install faiss-gpu`."
+        ) from e
+
+    kwargs = dict(faiss_kmeans_kwargs or {})
+    device = samples.device
+    _, D = samples.shape
+    # Own a contiguous fp32 numpy copy we mutate in place to form residuals.
+    x = samples.detach().cpu().float().numpy().copy()
+
+    res_centers: List[torch.Tensor] = []
     for n_clusters in n_clusters_list:
-        centroids, assignments = _kmeans(samples, n_clusters, n_iters)
-        res_centers.append(centroids)
-        samples = samples - centroids[assignments]
+        kmeans = faiss.Kmeans(D, n_clusters, **kwargs)
+        kmeans.train(x)
+        centroids = kmeans.centroids.copy()  # (K, D)
+        res_centers.append(torch.from_numpy(centroids).to(device))
+        _, idx = kmeans.index.search(x, 1)
+        x -= centroids[idx.ravel()]  # residual, in place
     return res_centers
 
 
