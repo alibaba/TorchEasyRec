@@ -87,9 +87,10 @@ class SidRqvae(BaseSidModel):
             cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
         )
 
-        input_dim = self._input_dim  # shared field parsed by BaseSidModel
         embed_dim = cfg.embed_dim
-        hidden_dims = list(cfg.hidden_dims) if cfg.hidden_dims else [input_dim // 2]
+        hidden_dims = (
+            list(cfg.hidden_dims) if cfg.hidden_dims else [self._input_dim // 2]
+        )
         # latent_weight defaults to (1.0, 0.5) when the user leaves the
         # repeated field empty.
         latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
@@ -102,9 +103,11 @@ class SidRqvae(BaseSidModel):
             sinkhorn_iters = cfg.sinkhorn_config.iters
             sinkhorn_epsilon = cfg.sinkhorn_config.epsilon
 
-        self._encoder = self._build_mlp([input_dim, *hidden_dims, embed_dim])
+        self._encoder = self._build_mlp([self._input_dim, *hidden_dims, embed_dim])
         # Decoder is the symmetric reverse of the encoder.
-        self._decoder = self._build_mlp([embed_dim, *reversed(hidden_dims), input_dim])
+        self._decoder = self._build_mlp(
+            [embed_dim, *reversed(hidden_dims), self._input_dim]
+        )
 
         self._quantizer = ResidualVectorQuantizer(
             embed_dim=embed_dim,
@@ -132,7 +135,7 @@ class SidRqvae(BaseSidModel):
         logger.info(
             "SidRqvae init: input_dim=%d, embed_dim=%d, hidden_dims=%s, "
             "n_layers=%d, n_embed=%s, loss_type=%s, use_clip=%s",
-            input_dim,
+            self._input_dim,
             embed_dim,
             hidden_dims,
             self._n_layers,
