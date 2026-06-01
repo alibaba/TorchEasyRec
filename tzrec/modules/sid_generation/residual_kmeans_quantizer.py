@@ -45,9 +45,9 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         embed_dim (int): feature dimension.
         n_layers (int): number of residual quantization layers.
         n_embed (int|List[int]): number of clusters per layer. Default: 256.
-            All layers must share the same ``K`` — a single FAISS ``Kmeans``
-            object is reused across layers (matches the OneRec reference).
-            Non-uniform codebooks are not supported.
+            May differ per layer (non-uniform codebooks such as
+            ``[256, 512, 1024]`` are supported) — ``train_offline`` builds a
+            separate ``faiss.Kmeans`` per layer.
         normalize_residuals (bool): whether to L2-normalize residuals
             before each layer. Default: False.
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
@@ -65,14 +65,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
     ) -> None:
         super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
         self.faiss_kmeans_kwargs = dict(faiss_kmeans_kwargs or {})
-
-        # ``train_offline`` reuses a single ``faiss.Kmeans`` instance across
-        # layers, so non-uniform codebooks would silently train layers 1+
-        # with ``K=n_embed_list[0]``. Fail fast instead.
-        assert len(set(self.n_embed_list)) == 1, (
-            "ResidualKMeansQuantizer requires a uniform codebook size "
-            f"across layers; got {self.n_embed_list}."
-        )
 
         self.layers = nn.ModuleList(
             [
@@ -206,11 +198,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         N, D = x.shape
         out = np.zeros((N, D), dtype=np.float32)
 
-        # Reuse one Kmeans instance across all layers (matches OneRec impl):
-        # rebuilding the FAISS object per layer doubles index-init cost.
-        n_embed = self.n_embed_list[0]
-        kmeans = faiss.Kmeans(self.embed_dim, n_embed, **self.faiss_kmeans_kwargs)
-
         # Chunk size for index.search to limit peak memory.
         # 500K × 512 × 4B ≈ 1 GB per chunk.
         SEARCH_CHUNK = 500_000
@@ -221,6 +208,14 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 np.maximum(norms, 1e-8, out=norms)
                 x /= norms  # in-place
 
+            # Fresh Kmeans per layer so each layer can use its own K
+            # (non-uniform codebooks supported). Index construction is a cheap
+            # O(K*D) allocation next to train(), so this is effectively free.
+            kmeans = faiss.Kmeans(
+                self.embed_dim,
+                self.n_embed_list[layer_idx],
+                **self.faiss_kmeans_kwargs,
+            )
             kmeans.train(x)
 
             for start in range(0, N, SEARCH_CHUNK):

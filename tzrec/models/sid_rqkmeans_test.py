@@ -36,11 +36,11 @@ def _make_batch(batch_size: int, input_dim: int) -> Batch:
 class SidRqkmeansOfflineTest(unittest.TestCase):
     """Tests for SidRqkmeans (FAISS-only)."""
 
-    def _create_model(self, input_dim=32, n_layers=2, niter=5):
+    def _create_model(self, input_dim=32, n_layers=2, niter=5, codebook=None):
         """Create a SidRqkmeans configured for offline FAISS fit."""
         from google.protobuf.struct_pb2 import Struct
 
-        n_embed_list = [16] * n_layers
+        n_embed_list = codebook if codebook is not None else [16] * n_layers
 
         faiss_kwargs = Struct()
         faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
@@ -136,6 +136,37 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         codes = preds["codes"]
         self.assertEqual(codes.shape, (B, 2))
         self.assertTrue((codes >= 0).all() and (codes < 16).all())
+
+    def test_non_uniform_codebook_end_to_end(self) -> None:
+        """Non-uniform codebook [8, 4, 16]: fit then emit per-layer codes."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+        B, input_dim = 64, 32
+        codebook = [8, 4, 16]
+        model = self._create_model(input_dim=input_dim, codebook=codebook)
+        # Reservoir cap derives from the LARGEST K (16), not the first (8).
+        self.assertEqual(
+            model._sample_cap,
+            16 * int(model._faiss_kwargs.get("max_points_per_centroid", 256)),
+        )
+
+        model.train()
+        for _ in range(8):
+            model.predict(_make_batch(B, input_dim))
+        model.on_train_end()
+
+        for k, layer in zip(codebook, model._quantizer.layers):
+            self.assertTrue(bool(layer._is_initialized.item()))
+            self.assertEqual(layer.centroids.shape[0], k)
+
+        model.eval()
+        codes = model.predict(_make_batch(B, input_dim))["codes"]
+        self.assertEqual(codes.shape, (B, 3))
+        for i, k in enumerate(codebook):
+            self.assertTrue((codes[:, i] >= 0).all() and (codes[:, i] < k).all())
 
     def test_on_train_end_noop_on_empty_buffer(self) -> None:
         """on_train_end on an empty buffer is a warned no-op."""

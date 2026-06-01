@@ -100,7 +100,9 @@ class SidRqkmeans(BaseSidModel):
         # buffering the full corpus is wasted memory. We reservoir-sample to
         # that target instead, split across ranks so the gathered set on
         # rank0 is ~train_sample_size and FAISS does no further subsampling.
-        k = self._n_embed_list[0]
+        # Use the LARGEST per-layer K so non-uniform codebooks (e.g.
+        # [256, 512, 1024]) still feed their biggest layer enough points.
+        k = max(self._n_embed_list)
         max_ppc = int(self._faiss_kwargs.get("max_points_per_centroid", 256))
         global_target = (
             cfg.train_sample_size if cfg.train_sample_size > 0 else k * max_ppc

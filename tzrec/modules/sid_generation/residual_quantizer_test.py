@@ -112,9 +112,12 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
         self.assertIsInstance(rkq, ResidualQuantizer)
 
-    def test_non_uniform_codebook_rejected(self) -> None:
-        with self.assertRaises(AssertionError):
-            ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=[8, 4])
+    def test_non_uniform_codebook_supported(self) -> None:
+        rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=3, n_embed=[8, 4, 16])
+        self.assertEqual(rkq.n_embed_list, [8, 4, 16])
+        self.assertEqual(
+            [layer.centroids.shape[0] for layer in rkq.layers], [8, 4, 16]
+        )
 
     def test_forward_returns_zeros_before_fit(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
@@ -122,6 +125,24 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         codes, quantized = rkq(torch.randn(5, 4))
         self.assertEqual(codes.shape, (5, 2))
         self.assertEqual(quantized.shape, (5, 4))
+
+    def test_train_offline_non_uniform(self) -> None:
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        torch.manual_seed(0)
+        n_embed = [8, 4, 16]
+        rkq = ResidualKMeansQuantizer(
+            embed_dim=4, n_layers=3, n_embed=n_embed, faiss_kmeans_kwargs={"niter": 5}
+        )
+        rkq.train_offline(torch.randn(512, 4), verbose=False)
+        self.assertTrue(rkq.all_initialized)
+        # Each layer fit its own K centroids; codes stay in per-layer range.
+        codes, _ = rkq(torch.randn(7, 4))
+        self.assertEqual(codes.shape, (7, 3))
+        for i, k in enumerate(n_embed):
+            self.assertTrue((codes[:, i] >= 0).all() and (codes[:, i] < k).all())
 
     def test_train_offline_then_decode(self) -> None:
         try:

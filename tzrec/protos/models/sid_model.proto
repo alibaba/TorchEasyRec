@@ -78,10 +78,10 @@ message SidRqkmeans {
     // no encoder).
     optional uint32 input_dim = 1 [default = 512];
     // Per-layer cluster counts, e.g. [256, 256, 256].
-    // List length is the number of residual quantization layers. All
-    // entries must be equal — the FAISS backend reuses a single
-    // ``faiss.Kmeans`` object across layers, so non-uniform codebooks
-    // are not supported (a uniformity assert fires at construction).
+    // List length is the number of residual quantization layers. Entries
+    // may differ per layer (non-uniform codebooks such as [256, 512, 1024]
+    // are supported — the FAISS backend fits a separate ``faiss.Kmeans``
+    // per layer).
     repeated uint32 codebook = 3;
     // L2-normalize residuals before each layer.
     optional bool normalize_residuals = 4 [default = true];
