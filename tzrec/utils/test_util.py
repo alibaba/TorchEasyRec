@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -38,6 +39,30 @@ gpu_unavailable: Tuple[bool, str] = (
     nv_gpu_unavailable[0] and amd_gpu_unavailable[0],
     "CUDA/HIP is not available or no GPUs detected",
 )
+
+# Optional-wheel probes via find_spec so importing test_util does NOT
+# eagerly load the wheel (or its CUDA/inductor/dynamo side effects) into
+# every test process.
+cutlass_hstu_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("hstu") is None,
+    "fbgemm_gpu_hstu wheel is not installed",
+)
+torch_fx_tool_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("torch_fx_tool") is None,
+    "torch_fx_tool wheel is not installed (required for RTP export)",
+)
+
+
+def get_compare_tolerance(
+    dtype: torch.dtype,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return (atol, rtol) for Triton-vs-PyTorch comparisons; widen fp32 on PPU."""
+    from tzrec.ops import is_ppu_arch
+
+    if is_ppu_arch() and dtype == torch.float32:
+        return (3e-5, 2e-5)
+    return (None, None)
+
 
 _settings.register_profile(
     "default", _settings(_settings.get_profile("default"), print_blob=True)

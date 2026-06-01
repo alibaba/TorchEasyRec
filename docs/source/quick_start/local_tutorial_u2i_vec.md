@@ -8,10 +8,10 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 
 输入数据以parquet格式为例
 
-- 训练样本数据: [taobao_data_recall_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz)
-- 评估样本数据: [taobao_data_recall_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz)
-- 物品池特征数据: [taobao_ad_feature](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz)
-- 负采样物品数据: [taobao_ad_feature_gl](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature_gl)
+- 训练样本数据: [taobao_data_recall_train](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz)
+- 评估样本数据: [taobao_data_recall_eval](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz)
+- 物品池特征数据: [taobao_ad_feature](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz)
+- 负采样物品数据: [taobao_ad_feature_gl](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_ad_feature_gl)
   - 当物品池很大上百万甚至是上亿的时候，U2I双塔召回模型常常需要在物品池中针对每个正样本采样一千甚至一万的负样本才能跟在线向量检索推理的分布一致，达到比较好的召回效果。因此需要将物品池组织成GraphLearn格式的负采样表，在训练时动态采样负样本。
   - Local模式下，GraphLearn格式的加权随机负采样包含3列，以"\\t"分割
     - 第一行固定为 "id:int64\\tweight:float\\tattrs:string"
@@ -19,16 +19,16 @@ TorchEasyRec环境准备参考[Local Tutorial](./local_tutorial.md)
 
 ### 配置文件
 
-配置文件以DSSM为例 [dssm_taobao_local.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/dssm_taobao_local.config)
+配置文件以DSSM为例 [dssm_taobao_local.config](https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/dssm_taobao_local.config)
 
 ```bash
 # 下载并解压
 mkdir -p data
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_ad_feature_gl -O data/taobao_ad_feature_gl
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/dssm_taobao_local.config
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_train.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_recall_eval.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_ad_feature.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_ad_feature_gl -O data/taobao_ad_feature_gl
+wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/dssm_taobao_local.config
 tar xf taobao_data_recall_train.tar.gz -C data
 tar xf taobao_data_recall_eval.tar.gz -C data
 tar xf taobao_ad_feature.tar.gz -C data

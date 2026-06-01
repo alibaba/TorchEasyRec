@@ -9,3 +9,4 @@
    quick_start/local_tutorial_tdm.md
    quick_start/dlc_tutorial.md
    quick_start/dlc_odps_dataset_tutorial.md
+   quick_start/ppu_odps_dataset_tutorial.md

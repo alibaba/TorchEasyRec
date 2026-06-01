@@ -1,6 +1,8 @@
-# DLC Tutorial (MaxCompute Table）
+# DLC Tutorial (PPU + MaxCompute Table）
 
-此文档提供在阿里云的PAI-DLC（分布式训练容器）中使用TorchEasyRec读取MaxCompute（MC）表进行模型训练的步骤和配置示例。
+此文档提供在阿里云的PAI-DLC（分布式训练容器）中使用PPU加速卡，配合TorchEasyRec读取MaxCompute（MC）表进行模型训练的步骤和配置示例。
+
+PPU是阿里云自研的AI加速卡，兼容CUDA生态，可低成本迁移现有训练代码，详见[PPU简介](https://help.aliyun.com/zh/document_detail/2864586.html)。TorchEasyRec在PPU上的使用方式与GPU基本一致，仅需更换节点镜像与对应的tzrec安装包。
 
 ## 环境准备
 
@@ -34,11 +36,11 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:1.2.0-pytorch2.11.0-gpu-py311-cu129-ubuntu22.04`
+**节点镜像** 选择官方镜像`torcheasyrec:1.1.0-pytorch2.10.0-ppu-py312-cu130-ubuntu24.04`
 
 **数据集配置** 选择刚新建的NAS数据集
 
-**资源配置** 选择框架为PyTorch，任务资源我们以选择单机8卡V100为例（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型），**驱动设置选择535+**
+**资源配置** 选择框架为PyTorch，任务资源选择PPU规格的机型（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型）
 
 **角色信息** 选择**PAI默认角色**
 
@@ -52,7 +54,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 cd /mnt/data
 wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config
 # 安装tzrec并启动训练
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec==${TZREC_PPU_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -78,7 +80,7 @@ nproc-per-node: 如果是cpu训练，则设置为固定值1
 完成模型训练后，进行模型评估：
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec==${TZREC_PPU_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -96,7 +98,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 导出训练好的模型：
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec==${TZREC_PPU_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -114,7 +116,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 使用导出的模型进行预测：
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec==${TZREC_PPU_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -135,3 +137,4 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 
 1. 确保在MaxCompute控制台中已为相关用户授予必要的权限以访问数据表。
 1. 在训练命令中，`ODPS_ENDPOINT`环境变量需设置为对应的MaxCompute服务地址。
+1. PPU镜像内置了适配PPU的PyTorch等依赖，安装tzrec时请勿覆盖升级这些底层依赖。

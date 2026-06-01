@@ -80,7 +80,7 @@ model_config {
 
 ## 示例Config
 
-[xdeepfm_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/xdeepfm_criteo.config)
+[xdeepfm_criteo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/xdeepfm_criteo.config)
 
 ## 参考论文
 

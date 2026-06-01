@@ -51,7 +51,7 @@ model_config {
 
 ## 示例Config
 
-[wide_and_deep_criteo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/wide_and_deep_criteo.config)
+[wide_and_deep_criteo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/wide_and_deep_criteo.config)
 
 ## 参考论文
 

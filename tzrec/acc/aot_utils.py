@@ -14,6 +14,7 @@ import os
 from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
+import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
 from torch import nn
 
 from tzrec.acc.utils import is_autotune_with_sample_inputs, is_unified_aot_predict
@@ -491,6 +492,7 @@ def export_unified_model_aot(
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
+    _backport_pt178147_int_array_dedup()
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
