@@ -881,29 +881,25 @@ class EmbeddingGroupImpl(nn.Module):
         # do user-side embedding input-tile
         if self.has_sparse_user:
             keyed_tensor_user = self.ebc_user(sparse_feature_user)
-            fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", keyed_tensor_user)
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
             kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            # fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", kt)
+            fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", kt)
             kts.append(kt)
 
         # do user-side mc embedding input-tile
         if self.has_mc_sparse_user:
             keyed_tensor_user = self.mc_ebc_user(sparse_feature_user)[0]
-            fx_mark_keyed_tensor(
-                self._all_group_str + "__mc_ebc_user", keyed_tensor_user
-            )
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
             kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            # fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc_user", kt)
+            fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc_user", kt)
             kts.append(kt)
 
         if self.has_dense:
