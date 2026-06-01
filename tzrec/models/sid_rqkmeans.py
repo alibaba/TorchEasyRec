@@ -26,9 +26,9 @@ import torchmetrics
 from google.protobuf.json_format import MessageToDict
 from torch import nn
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.model import BaseModel
+from tzrec.models.sid_model import BaseSidModel
 from tzrec.modules.sid_generation import RQKMeans
 from tzrec.modules.sid_generation.kmeans import recon_diagnostics
 from tzrec.protos.model_pb2 import ModelConfig
@@ -52,7 +52,7 @@ def _coerce_proto_numbers(d: Dict) -> Dict:
     return out
 
 
-class SidRqkmeans(BaseModel):
+class SidRqkmeans(BaseSidModel):
     """SID generation model using residual K-Means (FAISS-only).
 
     No gradient-based training. The codebook is built once at the end
@@ -77,11 +77,6 @@ class SidRqkmeans(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         cfg = self._model_config  # SidRqkmeans proto message
-        self._embedding_feature_name = cfg.embedding_feature_name
-
-        assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
-        n_embed_list = list(cfg.codebook)
-        n_layers = len(n_embed_list)
 
         self._faiss_kwargs = (
             _coerce_proto_numbers(MessageToDict(cfg.faiss_kmeans_kwargs))
@@ -91,8 +86,8 @@ class SidRqkmeans(BaseModel):
 
         self._rqkmeans = RQKMeans(
             embed_dim=cfg.input_dim,
-            n_layers=n_layers,
-            n_embed=n_embed_list,
+            n_layers=self._n_layers,
+            n_embed=self._n_embed_list,
             normalize_residuals=cfg.normalize_residuals,
             faiss_kmeans_kwargs=self._faiss_kwargs,
         )
@@ -104,11 +99,6 @@ class SidRqkmeans(BaseModel):
         # KMeans has no learnable parameters (centroids use register_buffer).
         # Add dummy param to keep optimizer/DDP happy.
         self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=True)
-
-    def _extract_embedding(self, batch: Batch) -> torch.Tensor:
-        """Extract item embedding from Batch.dense_features."""
-        kt = batch.dense_features[BASE_DATA_GROUP]
-        return kt[self._embedding_feature_name]
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -122,7 +112,7 @@ class SidRqkmeans(BaseModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        embedding = self._extract_embedding(batch)
+        embedding = self._extract_feature(batch)
 
         # Training: buffer for the end-of-loop FAISS fit and return dummy
         # codes — the codebook does not exist yet.
@@ -135,10 +125,9 @@ class SidRqkmeans(BaseModel):
         if self.is_train:
             self._offline_buffer.append(embedding.detach().cpu())
             B = embedding.shape[0]
-            n_layers = self._rqkmeans.quantizer.n_layers
             return {
                 "codes": torch.zeros(
-                    B, n_layers, dtype=torch.long, device=embedding.device
+                    B, self._n_layers, dtype=torch.long, device=embedding.device
                 )
             }
 
@@ -153,14 +142,6 @@ class SidRqkmeans(BaseModel):
             predictions["input_embedding"] = embedding
 
         return predictions
-
-    def init_loss(self) -> None:
-        """Initialize loss modules.
-
-        KMeans has no gradient loss; the codebook is built in
-        ``on_train_end`` at end of training.
-        """
-        pass
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
@@ -181,25 +162,17 @@ class SidRqkmeans(BaseModel):
         return {"dummy_loss": self._dummy_param.sum() * 0.0}
 
     def init_metric(self) -> None:
-        """Initialize metric modules.
+        """Initialize metric modules (shared eval metrics + rel_loss).
 
         Only eval metrics are registered. During training ``predict``
         returns dummy zero codes (the codebook does not exist yet), so
-        any train-time metric would be either NaN or trivially constant.
-        ``compute_train_metric`` therefore returns an empty dict, which
-        the framework already tolerates.
+        any train-time metric would be either NaN or trivially constant;
+        the inherited no-op ``update_train_metric`` keeps the train path
+        empty (``compute_train_metric`` then returns an empty dict, which
+        the framework already tolerates).
         """
-        self._metric_modules["mse"] = torchmetrics.MeanMetric()
+        super().init_metric()
         self._metric_modules["rel_loss"] = torchmetrics.MeanMetric()
-        self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
-
-    def update_train_metric(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        batch: Batch,
-    ) -> None:
-        """No-op — see :meth:`init_metric`."""
-        return
 
     def update_metric(
         self,
@@ -214,9 +187,6 @@ class SidRqkmeans(BaseModel):
             batch (Batch): input batch data.
             losses (dict, optional): a dict of loss.
         """
-        codes = predictions["codes"]
-        B = codes.shape[0]
-
         if "input_embedding" in predictions:
             mse, rel = recon_diagnostics(
                 predictions["input_embedding"],
@@ -225,8 +195,7 @@ class SidRqkmeans(BaseModel):
             self._metric_modules["mse"].update(mse)
             self._metric_modules["rel_loss"].update(rel)
 
-        unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._metric_modules["unique_sid_ratio"].update(unique_sids / B)
+        self._update_unique_sid_ratio(predictions["codes"])
 
     @torch.no_grad()
     def on_train_end(self) -> None:

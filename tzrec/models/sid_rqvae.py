@@ -21,14 +21,14 @@ import torch
 import torch.nn.functional as F
 import torchmetrics
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.model import BaseModel
+from tzrec.models.sid_model import BaseSidModel
 from tzrec.modules.sid_generation import RQVAE
 from tzrec.protos.model_pb2 import ModelConfig
 
 
-class SidRqvae(BaseModel):
+class SidRqvae(BaseSidModel):
     """SID generation model using RQ-VAE (Encoder + VQ + Decoder).
 
     End-to-end differentiable training with reconstruction loss
@@ -52,7 +52,6 @@ class SidRqvae(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         cfg = self._model_config  # SidRqvae proto message
-        self._embedding_feature_name = cfg.embedding_feature_name
         self._loss_type = cfg.loss_type
         self._use_clip = cfg.HasField("clip_config")
         self._clip_feature_name = (
@@ -70,10 +69,6 @@ class SidRqvae(BaseModel):
         if cfg.latent_weight:
             rqvae_extra["latent_weight"] = list(cfg.latent_weight)
 
-        assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
-        n_embed_list = list(cfg.codebook)
-        n_layers = len(n_embed_list)
-
         use_sinkhorn = True
         sinkhorn_iters = 5
         sinkhorn_epsilon = 10.0
@@ -86,8 +81,8 @@ class SidRqvae(BaseModel):
             input_dim=cfg.input_dim,
             embed_dim=cfg.embed_dim,
             hidden_dims=hidden_dims,
-            n_layers=n_layers,
-            n_embed=n_embed_list,
+            n_layers=self._n_layers,
+            n_embed=self._n_embed_list,
             forward_mode=cfg.forward_mode,
             normalize_residuals=cfg.normalize_residuals,
             distance_type=cfg.distance_type,
@@ -101,21 +96,6 @@ class SidRqvae(BaseModel):
             use_clip=self._use_clip,
             **rqvae_extra,
         )
-
-    def _extract_feature(
-        self, batch: Batch, feature_name: Optional[str] = None
-    ) -> torch.Tensor:
-        """Extract a named feature from Batch.dense_features.
-
-        Args:
-            batch (Batch): input batch data.
-            feature_name (str, optional): feature name to extract.
-                Defaults to self._embedding_feature_name.
-        """
-        if feature_name is None:
-            feature_name = self._embedding_feature_name
-        kt = batch.dense_features[BASE_DATA_GROUP]
-        return kt[feature_name]
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -176,14 +156,6 @@ class SidRqvae(BaseModel):
         }
         return predictions
 
-    def init_loss(self) -> None:
-        """Initialize loss modules.
-
-        Reconstruction loss and commitment loss are computed internally
-        by RQVAE and passed through predictions. No external loss module needed.
-        """
-        pass
-
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
@@ -207,9 +179,8 @@ class SidRqvae(BaseModel):
         return losses
 
     def init_metric(self) -> None:
-        """Initialize metric modules."""
-        self._metric_modules["mse"] = torchmetrics.MeanMetric()
-        self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
+        """Initialize metric modules (shared eval metrics + train-path mse)."""
+        super().init_metric()
 
         # Loss values are already logged by the framework via loss(); only
         # quantization quality needs the train-path metric. unique_sid_ratio
@@ -247,13 +218,9 @@ class SidRqvae(BaseModel):
             batch (Batch): input batch data.
             losses (dict, optional): a dict of loss.
         """
-        codes = predictions["codes"]
-        B = codes.shape[0]
-
         if "x_hat" in predictions:
             embedding = self._extract_feature(batch)
             mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
             self._metric_modules["mse"].update(mse)
 
-        unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._metric_modules["unique_sid_ratio"].update(unique_sids / B)
+        self._update_unique_sid_ratio(predictions["codes"])
