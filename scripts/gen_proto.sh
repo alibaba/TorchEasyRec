@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 VERSION="1.5.1"
-ROOT_URL="http://tzrec.oss-cn-beijing.aliyuncs.com/third_party/"
+ROOT_URL="http://tzrec.oss-accelerate.aliyuncs.com/third_party/"
 if [ "$(uname)" == "Darwin" ]; then
     OS='darwin'
 elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then

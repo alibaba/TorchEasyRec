@@ -121,7 +121,7 @@ model_config {
 
 ## 示例Config
 
-[tdm_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/tdm_taobao_local.config)
+[tdm_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/tdm_taobao_local.config)
 
 ## 参考论文
 

@@ -16,9 +16,9 @@ pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nig
 conda create -n tzrec python=3.11
 conda activate tzrec
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu129
-pip install fbgemm-gpu==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html
+pip install fbgemm-gpu==1.6.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html
 pip install torchmetrics==1.0.3 tensordict
-pip install torchrec==1.6.0 -f https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/torchrec/repo.html
+pip install torchrec==1.6.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
@@ -57,19 +57,19 @@ CPU版本 镜像地址:
 
 输入数据以parquet格式为例
 
-- 训练数据: [taobao_data_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz)
-- 评估数据: [taobao_data_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz)
+- 训练数据: [taobao_data_train](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz)
+- 评估数据: [taobao_data_eval](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz)
 
 ### 配置文件
 
-配置文件以DIN为例 [multi_tower_din_taobao_local.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_local.config)
+配置文件以DIN为例 [multi_tower_din_taobao_local.config](https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_local.config)
 
 ```bash
 # 下载并解压
 mkdir -p data
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_local.config
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_local.config
 tar xf taobao_data_train.tar.gz -C data
 tar xf taobao_data_eval.tar.gz -C data
 ```

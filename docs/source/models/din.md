@@ -81,7 +81,7 @@ model_config {
 
 ## 示例config
 
-[multi_tower_din_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/multi_tower_din_taobao.config)
+[multi_tower_din_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/multi_tower_din_taobao.config)
 
 ## 参考论文
 
