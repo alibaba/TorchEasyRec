@@ -121,6 +121,11 @@ class SidRqkmeans(BaseSidModel):
 
         # Training: buffer for the end-of-loop FAISS fit and return dummy
         # codes — the codebook does not exist yet.
+        # We move to host (.cpu()) deliberately: the whole corpus is
+        # accumulated before the single FAISS pass, so keeping every step's
+        # batch resident in GPU memory would OOM, and the common faiss-cpu
+        # build cannot consume CUDA tensors anyway. (A faiss-gpu fit could
+        # take a GPU tensor, but that is the exception, not the default.)
         # TODO(perf): .cpu() is a synchronous D2H per step and the buffer
         # grows unbounded with steps. Rework to either (a) GPU-resident
         # buffer + bulk D2H in on_train_end with size cap, or (b) replace

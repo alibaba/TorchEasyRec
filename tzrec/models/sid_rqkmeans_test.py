@@ -52,15 +52,10 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             faiss_kmeans_kwargs=faiss_kwargs,
             embedding_feature_name="item_emb",
         )
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["item_emb"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-        ]
+        # SID models read the item-embedding dense feature directly from the
+        # batch; they do not consume feature_groups, so none is set (which
+        # keeps the config consistent with the empty ``features`` list).
         model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups,
             sid_rqkmeans=sid_rqkmeans_cfg,
         )
         model = SidRqkmeans(model_config=model_config, features=[], labels=[])

@@ -65,15 +65,10 @@ class SidRqvaeTest(unittest.TestCase):
                 )
             )
 
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["item_emb"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-        ]
+        # SID models read the item-embedding dense feature directly from the
+        # batch; they do not consume feature_groups, so none is set (which
+        # keeps the config consistent with the empty ``features`` list).
         model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups,
             sid_rqvae=sid_rqvae_cfg,
         )
         model = SidRqvae(model_config=model_config, features=[], labels=[])
@@ -359,15 +354,7 @@ class SidRqvaeTest(unittest.TestCase):
         sid_rqvae_cfg.sinkhorn_config.CopyFrom(
             sid_model_pb2.SinkhornConfig(enabled=False)
         )
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                feature_names=["item_emb"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-        ]
         model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups,
             sid_rqvae=sid_rqvae_cfg,
         )
         model = SidRqvae(model_config=model_config, features=[], labels=[])

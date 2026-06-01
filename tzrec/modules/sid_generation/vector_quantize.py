@@ -201,8 +201,8 @@ class VectorQuantize(nn.Module):
 
         if self.training and self.use_sinkhorn:
             # Sinkhorn requires non-negative cost; z-score then shift.
-            var, mean = torch.var_mean(distances, unbiased=False)
-            distances = (distances - mean) * var.add(1e-12).rsqrt()
+            std, mean = torch.std_mean(distances, unbiased=False)
+            distances = (distances - mean) / std.add(1e-12)
             distances = distances - distances.min()
 
             # Sinkhorn optimal-transport assignment
