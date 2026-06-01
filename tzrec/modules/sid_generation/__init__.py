@@ -17,7 +17,6 @@ from tzrec.modules.sid_generation.kmeans import (
 )
 from tzrec.modules.sid_generation.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
-    RQKMeans,
 )
 from tzrec.modules.sid_generation.residual_quantizer import (
     ResidualQuantizer,
@@ -48,5 +47,4 @@ __all__ = [
     "RQVAE",
     "KMeansLayer",
     "ResidualKMeansQuantizer",
-    "RQKMeans",
 ]

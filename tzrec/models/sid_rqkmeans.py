@@ -29,7 +29,7 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid_generation import RQKMeans
+from tzrec.modules.sid_generation import ResidualKMeansQuantizer
 from tzrec.modules.sid_generation.kmeans import recon_diagnostics
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.logging_util import logger
@@ -78,13 +78,18 @@ class SidRqkmeans(BaseSidModel):
 
         cfg = self._model_config  # SidRqkmeans proto message
 
+        # NOTE: the project helper ``config_util.config_to_kwargs`` would be
+        # the idiomatic choice here, but it passes ``MessageToDict(...,
+        # including_default_value_fields=True)`` which protobuf 5.x removed,
+        # so it raises framework-wide under the installed protobuf. Use a
+        # direct (version-safe) MessageToDict until that helper is fixed.
         self._faiss_kwargs = (
             _coerce_proto_numbers(MessageToDict(cfg.faiss_kmeans_kwargs))
             if cfg.HasField("faiss_kmeans_kwargs")
             else {}
         )
 
-        self._rqkmeans = RQKMeans(
+        self._quantizer = ResidualKMeansQuantizer(
             embed_dim=cfg.input_dim,
             n_layers=self._n_layers,
             n_embed=self._n_embed_list,
@@ -131,14 +136,14 @@ class SidRqkmeans(BaseSidModel):
                 )
             }
 
-        result = self._rqkmeans(embedding)
+        codes, quantized = self._quantizer(embedding)
 
         predictions: Dict[str, torch.Tensor] = {
-            "codes": result["codes"],
+            "codes": codes,
         }
 
         if self.is_eval:
-            predictions["quantized"] = result["quantized"]
+            predictions["quantized"] = quantized
             predictions["input_embedding"] = embedding
 
         return predictions
@@ -265,14 +270,14 @@ class SidRqkmeans(BaseSidModel):
                     "[SidRqkmeans.on_train_end] rank0 fitting FAISS "
                     "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
                 )
-                self._rqkmeans.train_offline(full, verbose=True)
+                self._quantizer.train_offline(full, verbose=True)
                 del full
             # Broadcast centroids and set the init flag locally on every
             # rank. ``_is_initialized`` is a bool buffer and NCCL's bool
             # dtype support is inconsistent across versions, so we avoid
             # a separate broadcast for it — all ranks enter this block in
             # lockstep, so a local fill_() keeps state consistent.
-            for layer in self._rqkmeans.quantizer.layers:
+            for layer in self._quantizer.layers:
                 dist.broadcast(layer.centroids, src=0)
                 layer._is_initialized.fill_(True)
             dist.barrier()
@@ -305,5 +310,5 @@ class SidRqkmeans(BaseSidModel):
 
             # train_offline takes ownership of ``full_np`` (in-place
             # residual updates); drop our reference after the call.
-            self._rqkmeans.train_offline(full_np, verbose=True)
+            self._quantizer.train_offline(full_np, verbose=True)
             del full_np

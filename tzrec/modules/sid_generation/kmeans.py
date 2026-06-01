@@ -15,7 +15,7 @@ This module is the single home for torch-native K-Means code used by
 SID models:
 
 * :class:`KMeansLayer` — per-layer centroid container used by
-  :class:`ResidualKMeansQuantizer` / :class:`RQKMeans`. Centroids are injected
+  :class:`ResidualKMeansQuantizer`. Centroids are injected
   by the FAISS backend via ``load_centroids_``; the only forward path
   is ``predict``.
 * :func:`_kmeans` / :func:`_residual_kmeans` — pure-torch Lloyd's
@@ -100,7 +100,7 @@ def _kmeans_plus_plus(
 
     Selects initial centroids via distance-weighted probability sampling
     to ensure well-spread starting points. Used by the RQ-VAE codebook
-    init path (``ResidualVectorQuantizer.kmeans_init``); RQKMeans itself no
+    init path (``ResidualVectorQuantizer.kmeans_init``); the K-Means backend itself no
     longer needs it.
 
     Args:

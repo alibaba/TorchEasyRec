@@ -91,7 +91,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         total = sum(t.shape[0] for t in model._offline_buffer)
         self.assertEqual(total, 4 * B)
         # FAISS not yet triggered: layers should be uninitialized
-        for layer in model._rqkmeans.quantizer.layers:
+        for layer in model._quantizer.layers:
             self.assertFalse(layer.is_initialized)
 
     def test_on_train_end_runs_faiss(self) -> None:
@@ -116,7 +116,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         # Buffer should be cleared
         self.assertEqual(model._offline_buffer, [])
         # All layers should be initialized + centroids non-zero
-        for layer in model._rqkmeans.quantizer.layers:
+        for layer in model._quantizer.layers:
             self.assertTrue(bool(layer._is_initialized.item()))
             self.assertGreater(layer.centroids.abs().sum().item(), 0.0)
 

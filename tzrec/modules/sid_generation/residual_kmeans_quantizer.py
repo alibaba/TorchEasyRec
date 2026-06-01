@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-layer residual K-Means: ResidualKMeansQuantizer and RQKMeans wrapper.
+"""Multi-layer residual K-Means: ResidualKMeansQuantizer.
 
 Training is FAISS-only: the codebook is built once via ``train_offline``
 over the full embedding matrix; ``forward`` is read-only (predict + lookup).
@@ -70,8 +70,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # layers, so non-uniform codebooks would silently train layers 1+
         # with ``K=n_embed_list[0]``. Fail fast instead.
         assert len(set(self.n_embed_list)) == 1, (
-            "ResidualKMeansQuantizer / RQKMeans require a uniform codebook "
-            f"size across layers; got {self.n_embed_list}."
+            "ResidualKMeansQuantizer requires a uniform codebook size "
+            f"across layers; got {self.n_embed_list}."
         )
 
         self.layers = nn.ModuleList(
@@ -182,7 +182,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             import faiss
         except ImportError as e:
             raise ImportError(
-                "faiss is required for RQKMeans training. Install via "
+                "faiss is required for ResidualKMeansQuantizer training. Install via "
                 "`pip install faiss-cpu` or `pip install faiss-gpu`."
             ) from e
 
@@ -256,86 +256,3 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         """Reconstruction loss diagnostics (MSE + relative L1)."""
         loss, rel_loss = recon_diagnostics(x, out, epsilon=epsilon)
         return {"loss": float(loss.item()), "rel_loss": float(rel_loss.item())}
-
-
-class RQKMeans(nn.Module):
-    """RQ-KMeans: multi-layer residual K-Means trained offline via FAISS.
-
-    No Encoder/Decoder — directly clusters input vectors via residual
-    K-Means. Codebook is built once by :meth:`train_offline`; ``forward``
-    is read-only (assign + lookup).
-
-    Args:
-        embed_dim (int): feature dimension. Default: 64.
-        n_layers (int): number of residual quantization layers. Default: 3.
-        n_embed (int|List[int]): number of clusters per layer. Default: 256.
-        normalize_residuals (bool): L2-normalize residuals before each
-            layer. Default: False.
-        faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
-            ``faiss.Kmeans(...)``.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int = 64,
-        n_layers: int = 3,
-        n_embed: Union[int, List[int]] = 256,
-        normalize_residuals: bool = False,
-        faiss_kmeans_kwargs: Optional[Dict] = None,
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.quantizer = ResidualKMeansQuantizer(
-            embed_dim=embed_dim,
-            n_layers=n_layers,
-            n_embed=n_embed,
-            normalize_residuals=normalize_residuals,
-            faiss_kmeans_kwargs=faiss_kmeans_kwargs,
-        )
-
-    def train_offline(
-        self,
-        inputs: Union[torch.Tensor, "np.ndarray"],
-        verbose: bool = True,
-    ) -> None:
-        """Build codebook offline via FAISS.
-
-        Args:
-            inputs: full embedding matrix, shape (N, embed_dim). Either
-                a ``torch.Tensor`` or an ``np.ndarray`` (ownership
-                transferred — array is mutated in-place).
-            verbose (bool): print per-layer reconstruction loss.
-        """
-        self.quantizer.train_offline(inputs, verbose=verbose)
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Forward: residual K-Means assignment (no training).
-
-        Args:
-            x: (B, embed_dim) input features.
-
-        Returns:
-            dict with keys:
-                'codes':     (B, n_layers)  semantic IDs.
-                'quantized': (B, embed_dim) quantized vector (sum of centroids).
-        """
-        codes, quantized = self.quantizer(x)
-        return {
-            "codes": codes,
-            "quantized": quantized,
-        }
-
-    @torch.no_grad()
-    def get_codes(self, x: torch.Tensor) -> torch.Tensor:
-        """Inference: get semantic IDs."""
-        return self.quantizer.get_codes(x)
-
-    @torch.no_grad()
-    def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Reconstruct vectors from semantic IDs (centroid lookup + sum)."""
-        return self.quantizer.decode_codes(codes)
-
-    @torch.no_grad()
-    def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:
-        """Get centroid weights for a specific layer."""
-        return self.quantizer.get_codebook_embeddings(layer_idx)
