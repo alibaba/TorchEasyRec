@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tzrec.modules.sid_generation.clip_loss import (
+from tzrec.loss.clip_loss import (
     MaskedCLIPLoss,
     _all_gather_with_grad,
 )

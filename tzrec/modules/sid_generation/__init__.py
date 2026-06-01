@@ -9,9 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tzrec.modules.sid_generation.clip_loss import (
-    MaskedCLIPLoss,
-)
 from tzrec.modules.sid_generation.kmeans import (
     KMeansLayer,
 )
@@ -38,7 +35,6 @@ __all__ = [
     "QuantizeOutput",
     "ResidualQuantizerOutput",
     "VectorQuantize",
-    "MaskedCLIPLoss",
     "ResidualQuantizer",
     "ResidualVectorQuantizer",
     "KMeansLayer",
