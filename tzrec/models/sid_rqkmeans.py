@@ -212,44 +212,22 @@ class SidRqkmeans(BaseSidModel):
         """Trigger one-shot FAISS fit after the train_eval loop ends.
 
         Overrides :meth:`BaseModel.on_train_end`. Called unconditionally
-        by ``tzrec.main.train_and_evaluate`` after the training loop
-        exits. No-op when the buffer is empty.
+        by ``tzrec.main.train_and_evaluate`` after the training loop exits.
 
         DDP behavior:
             - rank0: receive local buffers via gather_object, concat,
               run FAISS fit, then broadcast centroids to other ranks.
             - other ranks: ship local buffer via gather_object(dst=0)
               and wait for the broadcast.
+
+        No cross-rank empty-buffer handshake is needed: the dataset layer
+        enforces ``num_files >= world_size`` (``tzrec.datasets.dataset``
+        raises otherwise), so in synchronized training every rank receives
+        at least one shard and reaches the gather with a non-empty buffer.
         """
         is_ddp = (
             dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         )
-
-        # A local-only empty check would deadlock: the empty rank returns
-        # while peers block in gather_object below. OR the flag across
-        # ranks and bail together if any rank is empty.
-        local_empty = len(self._offline_buffer) == 0
-        if is_ddp:
-            # int32, not bool — NCCL bool support is version-dependent.
-            flag = torch.tensor(
-                int(local_empty),
-                dtype=torch.int32,
-                device=self._dummy_param.device,
-            )
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-            any_empty = bool(flag.item())
-        else:
-            any_empty = local_empty
-
-        if any_empty:
-            if (not is_ddp) or dist.get_rank() == 0:
-                logger.warning(
-                    "[SidRqkmeans.on_train_end] at least one rank has an "
-                    "empty offline buffer; skipping FAISS fit on all ranks. "
-                    "Did the train_eval loop run, and is the per-rank shard "
-                    "non-empty?"
-                )
-            return
 
         if is_ddp:
             # DDP path: every rank ships its local buffer to rank 0 via
@@ -286,34 +264,43 @@ class SidRqkmeans(BaseSidModel):
                 dist.broadcast(layer.centroids, src=0)
                 layer._is_initialized.fill_(True)
             dist.barrier()
-        else:
-            # Single-process path: build the full numpy matrix directly
-            # from the buffer list, popping each chunk after copy so the
-            # transient memory high-water mark stays ~= final matrix size
-            # (instead of 2× when going through torch.cat).
-            N = sum(t.shape[0] for t in self._offline_buffer)
-            D = self._offline_buffer[0].shape[1]
-            logger.info(
-                "[SidRqkmeans.on_train_end] fitting FAISS on "
-                "%d samples (D=%d)." % (N, D)
-            )
-            full_np = np.empty((N, D), dtype=np.float32)
-            offset = 0
-            # Pop from the front; each popped tensor is released before
-            # the next copy so cumulative torch memory shrinks monotonically.
-            while self._offline_buffer:
-                t = self._offline_buffer.pop(0)
-                n = t.shape[0]
-                # .float().numpy() returns a view sharing storage with
-                # the fp32 tensor; the subsequent assignment copies into
-                # full_np, after which ``t`` can be freed.
-                full_np[offset : offset + n] = t.float().numpy()
-                offset += n
-                del t
-            del self._offline_buffer
-            self._offline_buffer = []
+            return
 
-            # train_offline takes ownership of ``full_np`` (in-place
-            # residual updates); drop our reference after the call.
-            self._quantizer.train_offline(full_np, verbose=True)
-            del full_np
+        # Single-process path. Guard an empty buffer with a plain local
+        # check (no collective): on_train_end may be invoked without a
+        # training pass having run.
+        if len(self._offline_buffer) == 0:
+            logger.warning(
+                "[SidRqkmeans.on_train_end] empty offline buffer; skipping "
+                "FAISS fit. Did the train_eval loop run?"
+            )
+            return
+
+        # Build the full numpy matrix directly from the buffer list, popping
+        # each chunk after copy so the transient memory high-water mark stays
+        # ~= final matrix size (instead of 2× when going through torch.cat).
+        N = sum(t.shape[0] for t in self._offline_buffer)
+        D = self._offline_buffer[0].shape[1]
+        logger.info(
+            "[SidRqkmeans.on_train_end] fitting FAISS on %d samples (D=%d)." % (N, D)
+        )
+        full_np = np.empty((N, D), dtype=np.float32)
+        offset = 0
+        # Pop from the front; each popped tensor is released before the next
+        # copy so cumulative torch memory shrinks monotonically.
+        while self._offline_buffer:
+            t = self._offline_buffer.pop(0)
+            n = t.shape[0]
+            # .float().numpy() returns a view sharing storage with the fp32
+            # tensor; the subsequent assignment copies into full_np, after
+            # which ``t`` can be freed.
+            full_np[offset : offset + n] = t.float().numpy()
+            offset += n
+            del t
+        del self._offline_buffer
+        self._offline_buffer = []
+
+        # train_offline takes ownership of ``full_np`` (in-place residual
+        # updates); drop our reference after the call.
+        self._quantizer.train_offline(full_np, verbose=True)
+        del full_np
