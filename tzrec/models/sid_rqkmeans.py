@@ -23,7 +23,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torchmetrics
-from google.protobuf.json_format import MessageToDict
 from torch import nn
 
 from tzrec.datasets.utils import Batch
@@ -32,6 +31,7 @@ from tzrec.models.sid_model import BaseSidModel
 from tzrec.modules.sid_generation import ResidualKMeansQuantizer
 from tzrec.modules.sid_generation.kmeans import recon_diagnostics
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
 
 
@@ -78,13 +78,11 @@ class SidRqkmeans(BaseSidModel):
 
         cfg = self._model_config  # SidRqkmeans proto message
 
-        # NOTE: the project helper ``config_util.config_to_kwargs`` would be
-        # the idiomatic choice here, but it passes ``MessageToDict(...,
-        # including_default_value_fields=True)`` which protobuf 5.x removed,
-        # so it raises framework-wide under the installed protobuf. Use a
-        # direct (version-safe) MessageToDict until that helper is fixed.
+        # config_to_kwargs returns Struct numbers as floats (it is
+        # MessageToDict under the hood), so _coerce_proto_numbers restores
+        # the ints faiss.Kmeans expects (niter, seed, nredo, ...).
         self._faiss_kwargs = (
-            _coerce_proto_numbers(MessageToDict(cfg.faiss_kmeans_kwargs))
+            _coerce_proto_numbers(config_util.config_to_kwargs(cfg.faiss_kmeans_kwargs))
             if cfg.HasField("faiss_kmeans_kwargs")
             else {}
         )
