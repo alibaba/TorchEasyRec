@@ -47,11 +47,11 @@ class SidRqvaeTest(unittest.TestCase):
 
     def _create_model(self, use_clip=False, input_dim=32, embed_dim=8, n_layers=2):
         """Helper to create a SidRqvae model with minimal config."""
-        n_embed_str = ",".join(["16"] * n_layers)
+        n_embed_list = [16] * n_layers
         sid_rqvae_cfg = sid_model_pb2.SidRqvae(
             input_dim=input_dim,
             embed_dim=embed_dim,
-            codebook=n_embed_str,
+            codebook=n_embed_list,
             forward_mode="ste",
             loss_type="mse",
             kmeans_init=False,
@@ -346,11 +346,11 @@ class SidRqvaeTest(unittest.TestCase):
         Previously ``use_sinkhorn`` was hard-coded ``True`` and the proto
         block was honored only for iters/epsilon.
         """
-        n_embed_str = ",".join(["16"] * 2)
+        n_embed_list = [16] * 2
         sid_rqvae_cfg = sid_model_pb2.SidRqvae(
             input_dim=32,
             embed_dim=8,
-            codebook=n_embed_str,
+            codebook=n_embed_list,
             forward_mode="ste",
             loss_type="mse",
             kmeans_init=False,

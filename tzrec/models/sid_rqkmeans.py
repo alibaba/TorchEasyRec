@@ -28,7 +28,6 @@ from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models._sid_helpers import parse_int_list
 from tzrec.models.model import BaseModel
 from tzrec.modules.sid_generation import RQKMeans
 from tzrec.modules.sid_generation.kmeans import recon_diagnostics
@@ -80,8 +79,8 @@ class SidRqkmeans(BaseModel):
         cfg = self._model_config  # SidRqkmeans proto message
         self._embedding_feature_name = cfg.embedding_feature_name
 
-        assert cfg.codebook, "codebook must be set, e.g. '256,256,256'"
-        n_embed_list = parse_int_list(cfg.codebook)
+        assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
+        n_embed_list = list(cfg.codebook)
         n_layers = len(n_embed_list)
 
         self._faiss_kwargs = (

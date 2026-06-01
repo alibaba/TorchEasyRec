@@ -33,13 +33,13 @@ message SidRqvae {
     optional uint32 input_dim = 1 [default = 512];
     // Quantization latent dimension (encoder output / codebook dim).
     optional uint32 embed_dim = 2 [default = 64];
-    // Encoder hidden layer sizes, comma-separated, e.g. "256,128".
+    // Encoder hidden layer sizes, e.g. [256, 128].
     // Defaults to [input_dim // 2] when unset.
-    optional string hidden_dims = 3;
-    // Per-layer codebook size, comma-separated, e.g. "256,256,256".
+    repeated uint32 hidden_dims = 3;
+    // Per-layer codebook size, e.g. [256, 256, 256].
     // List length is the number of residual quantization layers;
-    // non-uniform codebooks such as "512,256,128" are supported.
-    optional string codebook = 5;
+    // non-uniform codebooks such as [512, 256, 128] are supported.
+    repeated uint32 codebook = 5;
 
     // === Quantization strategy ===
     // VQ forward mode: "ste" or "gumbel_softmax".
@@ -50,8 +50,9 @@ message SidRqvae {
     optional string distance_type = 9 [default = "l2"];
     // Commitment loss type: "l2", "l1" or "cos".
     optional string commitment_loss = 10 [default = "l2"];
-    // Commitment loss weights [w1, w2], comma-separated.
-    optional string latent_weight = 11 [default = "1.0,0.5"];
+    // Commitment loss weights [w1, w2]. Defaults to [1.0, 0.5] when unset
+    // (applied by RQVAE / ResidualVectorQuantizer).
+    repeated float latent_weight = 11;
     // STE rotation trick.
     optional bool rotation_trick = 12 [default = false];
     // KMeans codebook initialization on first training forward.
@@ -76,12 +77,12 @@ message SidRqkmeans {
     // Input embedding dimension (K-Means runs directly on raw embeddings,
     // no encoder).
     optional uint32 input_dim = 1 [default = 512];
-    // Per-layer cluster counts, comma-separated, e.g. "256,256,256".
+    // Per-layer cluster counts, e.g. [256, 256, 256].
     // List length is the number of residual quantization layers. All
     // entries must be equal — the FAISS backend reuses a single
     // ``faiss.Kmeans`` object across layers, so non-uniform codebooks
     // are not supported (a uniformity assert fires at construction).
-    optional string codebook = 3;
+    repeated uint32 codebook = 3;
     // L2-normalize residuals before each layer.
     optional bool normalize_residuals = 4 [default = true];
     // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a

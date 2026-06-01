@@ -40,14 +40,14 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         """Create a SidRqkmeans configured for offline FAISS fit."""
         from google.protobuf.struct_pb2 import Struct
 
-        n_embed_str = ",".join(["16"] * n_layers)
+        n_embed_list = [16] * n_layers
 
         faiss_kwargs = Struct()
         faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
 
         sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
             input_dim=input_dim,
-            codebook=n_embed_str,
+            codebook=n_embed_list,
             normalize_residuals=False,
             faiss_kmeans_kwargs=faiss_kwargs,
             embedding_feature_name="item_emb",

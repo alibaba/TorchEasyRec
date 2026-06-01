@@ -23,7 +23,6 @@ import torchmetrics
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models._sid_helpers import parse_float_list, parse_int_list
 from tzrec.models.model import BaseModel
 from tzrec.modules.sid_generation import RQVAE
 from tzrec.protos.model_pb2 import ModelConfig
@@ -63,15 +62,16 @@ class SidRqvae(BaseModel):
             cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
         )
 
-        hidden_dims = parse_int_list(cfg.hidden_dims) if cfg.hidden_dims else None
-        # Only forward latent_weight when proto sets it; otherwise let
-        # RQVAE / ResidualQuantized apply their signature default (1.0, 0.5).
+        hidden_dims = list(cfg.hidden_dims) if cfg.hidden_dims else None
+        # Only forward latent_weight when the user set it (repeated field is
+        # empty when unset); otherwise let RQVAE / ResidualVectorQuantizer
+        # apply their signature default (1.0, 0.5).
         rqvae_extra: Dict[str, Any] = {}
         if cfg.latent_weight:
-            rqvae_extra["latent_weight"] = parse_float_list(cfg.latent_weight)
+            rqvae_extra["latent_weight"] = list(cfg.latent_weight)
 
-        assert cfg.codebook, "codebook must be set, e.g. '256,256,256'"
-        n_embed_list = parse_int_list(cfg.codebook)
+        assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
+        n_embed_list = list(cfg.codebook)
         n_layers = len(n_embed_list)
 
         use_sinkhorn = True
