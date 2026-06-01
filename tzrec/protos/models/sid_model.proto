@@ -1,0 +1,94 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "google/protobuf/struct.proto";
+
+message SinkhornConfig {
+    // Number of Sinkhorn iterations.
+    optional uint32 iters = 1 [default = 5];
+    // Sinkhorn sharpness parameter (epsilon).
+    optional float epsilon = 2 [default = 10.0];
+    // Whether Sinkhorn uniform assignment is enabled. Default: true.
+    // Set ``enabled: false`` to turn Sinkhorn off while still providing
+    // the sub-config (e.g. to override iters/epsilon for an A/B comparison).
+    optional bool enabled = 3 [default = true];
+}
+
+message ClipConfig {
+    // Name of the second feature (paired with embedding_feature_name
+    // to form a contrastive pair).
+    required string clip_feature_name = 1;
+    // Name of the per-sample boolean feature (0/1, value_dim=1) that
+    // flags whether the row is a CLIP pair (1) or a reconstruction-only
+    // row (0). Required for mixed recon+clip batches: the model uses
+    // this column directly as the ``clip_mask``. Replaces the prior
+    // bit-exact ``embedding == fea2`` discrimination, which silently
+    // mislabeled rows on any upstream float cast / normalization.
+    required string is_clip_pair_feature_name = 2;
+}
+
+message SidRqvae {
+    // === Network structure ===
+    // Input embedding dimension.
+    optional uint32 input_dim = 1 [default = 512];
+    // Quantization latent dimension (encoder output / codebook dim).
+    optional uint32 embed_dim = 2 [default = 64];
+    // Encoder hidden layer sizes, comma-separated, e.g. "256,128".
+    // Defaults to [input_dim // 2] when unset.
+    optional string hidden_dims = 3;
+    // Per-layer codebook size, comma-separated, e.g. "256,256,256".
+    // List length is the number of residual quantization layers;
+    // non-uniform codebooks such as "512,256,128" are supported.
+    optional string codebook = 5;
+
+    // === Quantization strategy ===
+    // VQ forward mode: "ste" or "gumbel_softmax".
+    optional string forward_mode = 6 [default = "ste"];
+    // L2-normalize residuals before each quantization layer.
+    optional bool normalize_residuals = 7 [default = false];
+    // Distance metric: "l2" or "cosine".
+    optional string distance_type = 9 [default = "l2"];
+    // Commitment loss type: "l2", "l1" or "cos".
+    optional string commitment_loss = 10 [default = "l2"];
+    // Commitment loss weights [w1, w2], comma-separated.
+    optional string latent_weight = 11 [default = "1.0,0.5"];
+    // STE rotation trick.
+    optional bool rotation_trick = 12 [default = false];
+    // KMeans codebook initialization on first training forward.
+    optional bool kmeans_init = 13 [default = true];
+
+    // === Optional sub-module configs ===
+    // Sinkhorn uniform assignment. Default behavior when this block is
+    // omitted: enabled with iters=5, epsilon=10.0. Include the sub-config
+    // to override params; set ``enabled: false`` inside it to disable.
+    optional SinkhornConfig sinkhorn_config = 15;
+    // CLIP contrastive learning (disabled when unset).
+    optional ClipConfig clip_config = 16;
+
+    // Reconstruction loss type: "mse", "l1", or "cosine".
+    optional string loss_type = 20 [default = "mse"];
+
+    // Name of the item embedding feature inside the input Batch.
+    optional string embedding_feature_name = 40 [default = "item_emb"];
+}
+
+message SidRqkmeans {
+    // Input embedding dimension (K-Means runs directly on raw embeddings,
+    // no encoder).
+    optional uint32 input_dim = 1 [default = 512];
+    // Per-layer cluster counts, comma-separated, e.g. "256,256,256".
+    // List length is the number of residual quantization layers. All
+    // entries must be equal — the FAISS backend reuses a single
+    // ``faiss.Kmeans`` object across layers, so non-uniform codebooks
+    // are not supported (a uniformity assert fires at construction).
+    optional string codebook = 3;
+    // L2-normalize residuals before each layer.
+    optional bool normalize_residuals = 4 [default = true];
+    // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a
+    // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
+    // spherical: false, seed: 1234}.
+    optional google.protobuf.Struct faiss_kmeans_kwargs = 5;
+
+    // Name of the item embedding feature inside the input Batch.
+    optional string embedding_feature_name = 40 [default = "item_emb"];
+}
