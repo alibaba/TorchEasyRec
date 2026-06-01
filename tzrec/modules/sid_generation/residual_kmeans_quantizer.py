@@ -158,12 +158,17 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
     ) -> None:
         """Train the multi-layer codebook via offline FAISS K-Means.
 
+        FAISS consumes torch tensors directly (via ``faiss.contrib.
+        torch_utils``) — no numpy round-trips. The residual matrix stays a
+        host (CPU) tensor; when a faiss-gpu build is present, ``gpu=<dev>``
+        moves only FAISS's internal, subsampled working set to the GPU, so we
+        never hold (N, D) in VRAM. On a faiss-cpu build it runs on CPU
+        unchanged. Either way the code path is identical.
+
         Args:
-            inputs: full embedding matrix, shape (N, D). Either a
-                ``torch.Tensor`` (will be copied to numpy) or a
-                ``np.ndarray`` (ownership transferred; caller MUST
-                release any outside reference — the array is mutated
-                in-place to compute residuals layer by layer).
+            inputs: full embedding matrix, shape (N, D), ``torch.Tensor`` or
+                ``np.ndarray``. Copied once to an owned CPU float32 tensor;
+                the caller's input is not mutated.
             verbose (bool): whether to print per-layer reconstruction
                 loss. Default: True.
 
@@ -172,31 +177,38 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         """
         try:
             import faiss
+            import faiss.contrib.torch_utils  # noqa: F401  (torch tensor I/O)
         except ImportError as e:
             raise ImportError(
                 "faiss is required for ResidualKMeansQuantizer training. Install via "
                 "`pip install faiss-cpu` or `pip install faiss-gpu`."
             ) from e
 
-        # Materialise to a float32 contiguous numpy array that we own
-        # (so in-place residual updates are safe).
+        # Own a contiguous CPU float32 tensor we can update in place for
+        # residuals, without mutating the caller's input.
         if isinstance(inputs, torch.Tensor):
             assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
                 f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
             )
-            # Tensor path still requires a copy; caller will hold a
-            # reference until we return, so we must not alias it.
-            x = inputs.detach().cpu().float().numpy().copy()
+            x = inputs.detach().to("cpu", torch.float32).contiguous().clone()
         else:
             assert inputs.ndim == 2 and inputs.shape[1] == self.embed_dim, (
                 f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
             )
-            # Numpy path: take ownership — no extra copy. Caller promises
-            # the array is no longer used outside. Only ensure dtype
-            # + contiguity (zero-copy when already satisfied).
-            x = np.ascontiguousarray(inputs, dtype=np.float32)
-        N, D = x.shape
-        out = np.zeros((N, D), dtype=np.float32)
+            x = torch.from_numpy(np.ascontiguousarray(inputs, dtype=np.float32)).clone()
+        N = x.shape[0]
+        out = torch.zeros_like(x)
+
+        # Use FAISS GPU compute when a GPU build is available (data stays on
+        # host; FAISS streams only its subsampled training set to the device).
+        # An explicit ``gpu`` in faiss_kmeans_kwargs always wins.
+        kwargs = dict(self.faiss_kmeans_kwargs)
+        if "gpu" not in kwargs:
+            kwargs["gpu"] = (
+                torch.cuda.current_device()
+                if faiss.get_num_gpus() > 0 and torch.cuda.is_available()
+                else False
+            )
 
         # Chunk size for index.search to limit peak memory.
         # 500K × 512 × 4B ≈ 1 GB per chunk.
@@ -204,40 +216,34 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
 
         for layer_idx in range(self.n_layers):
             if self.normalize_residuals:
-                norms = np.linalg.norm(x, axis=1, keepdims=True)
-                np.maximum(norms, 1e-8, out=norms)
-                x /= norms  # in-place
+                x = F.normalize(x, dim=-1)
 
             # Fresh Kmeans per layer so each layer can use its own K
             # (non-uniform codebooks supported). Index construction is a cheap
             # O(K*D) allocation next to train(), so this is effectively free.
             kmeans = faiss.Kmeans(
-                self.embed_dim,
-                self.n_embed_list[layer_idx],
-                **self.faiss_kmeans_kwargs,
+                self.embed_dim, self.n_embed_list[layer_idx], **kwargs
             )
             kmeans.train(x)
+            centroids = torch.as_tensor(kmeans.centroids, dtype=torch.float32).cpu()
 
             for start in range(0, N, SEARCH_CHUNK):
                 end = min(start + SEARCH_CHUNK, N)
                 _, idx = kmeans.index.search(x[start:end], 1)
-                q = kmeans.centroids[idx.ravel()]  # (chunk, D)
+                idx = torch.as_tensor(idx, device="cpu").reshape(-1).long()
+                q = centroids[idx]  # (chunk, D)
                 out[start:end] += q
                 x[start:end] -= q  # residual
                 del idx, q
 
             if verbose:
-                out_t = torch.from_numpy(out)
-                ref_t = torch.from_numpy(out + x)  # x_in = out + residual
                 logger.info(
                     "[ResidualKMeansQuantizer][offline_faiss][layer %d] %s",
                     layer_idx,
-                    self._calc_loss(ref_t, out_t),
+                    self._calc_loss(out + x, out),  # x_in = out + residual
                 )
-                del out_t, ref_t
 
-            centroids_t = torch.from_numpy(kmeans.centroids.copy())
-            self.layers[layer_idx].load_centroids_(centroids_t)
+            self.layers[layer_idx].load_centroids_(centroids)
             if verbose:
                 logger.info(
                     "[ResidualKMeansQuantizer][offline_faiss] layer %d finished",
