@@ -28,8 +28,11 @@ class BaseSidModel(BaseModel):
     Factors the structure common to :class:`SidRqvae` (RQ-VAE) and
     :class:`SidRqkmeans` (residual K-Means):
 
+    - the shared config fields every SID proto carries —
+      ``embedding_feature_name`` (``_embedding_feature_name``), ``input_dim``
+      (``_input_dim``), ``normalize_residuals`` (``_normalize_residuals``),
+      and the per-layer ``codebook`` (``_n_embed_list`` / ``_n_layers``),
     - reading the item-embedding feature out of ``Batch.dense_features``,
-    - parsing the per-layer ``codebook`` into ``n_embed_list`` / ``n_layers``,
     - the eval metrics every SID model reports — reconstruction ``mse`` and
       ``unique_sid_ratio`` (codebook coverage).
 
@@ -56,7 +59,12 @@ class BaseSidModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         cfg = self._model_config
+        # Config fields shared by every SID model (present on each SID proto
+        # message): the item-embedding feature, the input dimension, the
+        # residual-normalization toggle, and the per-layer codebook.
         self._embedding_feature_name = cfg.embedding_feature_name
+        self._input_dim = cfg.input_dim
+        self._normalize_residuals = cfg.normalize_residuals
 
         assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
         self._n_embed_list = list(cfg.codebook)

@@ -86,12 +86,11 @@ class SidRqkmeans(BaseSidModel):
             else {}
         )
 
-        self._input_dim = cfg.input_dim
         self._quantizer = ResidualKMeansQuantizer(
-            embed_dim=cfg.input_dim,
+            embed_dim=self._input_dim,
             n_layers=self._n_layers,
             n_embed=self._n_embed_list,
-            normalize_residuals=cfg.normalize_residuals,
+            normalize_residuals=self._normalize_residuals,
             faiss_kmeans_kwargs=self._faiss_kwargs,
         )
 

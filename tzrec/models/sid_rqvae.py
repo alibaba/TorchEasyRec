@@ -87,7 +87,7 @@ class SidRqvae(BaseSidModel):
             cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
         )
 
-        input_dim = cfg.input_dim
+        input_dim = self._input_dim  # shared field parsed by BaseSidModel
         embed_dim = cfg.embed_dim
         hidden_dims = list(cfg.hidden_dims) if cfg.hidden_dims else [input_dim // 2]
         # latent_weight defaults to (1.0, 0.5) when the user leaves the
@@ -111,7 +111,7 @@ class SidRqvae(BaseSidModel):
             n_layers=self._n_layers,
             n_embed=self._n_embed_list,
             forward_mode=cfg.forward_mode,
-            normalize_residuals=cfg.normalize_residuals,
+            normalize_residuals=self._normalize_residuals,
             distance_type=cfg.distance_type,
             commitment_loss=cfg.commitment_loss,
             latent_weight=latent_weight,
