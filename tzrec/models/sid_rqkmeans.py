@@ -19,7 +19,6 @@ loop ends, via the :meth:`BaseModel.on_train_end` lifecycle hook
 
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torchmetrics
@@ -87,6 +86,7 @@ class SidRqkmeans(BaseSidModel):
             else {}
         )
 
+        self._input_dim = cfg.input_dim
         self._quantizer = ResidualKMeansQuantizer(
             embed_dim=cfg.input_dim,
             n_layers=self._n_layers,
@@ -95,13 +95,80 @@ class SidRqkmeans(BaseSidModel):
             faiss_kmeans_kwargs=self._faiss_kwargs,
         )
 
-        # CPU buffer for embeddings collected during training; FAISS
-        # consumes it in on_train_end() at end-of-loop.
-        self._offline_buffer: List[torch.Tensor] = []
+        # Per-rank reservoir cap. FAISS K-Means only ever consumes
+        # K * max_points_per_centroid points (it subsamples internally), so
+        # buffering the full corpus is wasted memory. We reservoir-sample to
+        # that target instead, split across ranks so the gathered set on
+        # rank0 is ~train_sample_size and FAISS does no further subsampling.
+        k = self._n_embed_list[0]
+        max_ppc = int(self._faiss_kwargs.get("max_points_per_centroid", 256))
+        global_target = (
+            cfg.train_sample_size if cfg.train_sample_size > 0 else k * max_ppc
+        )
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self._sample_cap = max(1, -(-global_target // world_size))  # ceil div
+
+        # Bounded host-resident reservoir (allocated lazily on first batch,
+        # once the embedding dim/device is known). ``_n_filled`` slots hold
+        # data; ``_n_seen`` is the running count for the sampling probability.
+        self._reservoir: Optional[torch.Tensor] = None
+        self._n_filled = 0
+        self._n_seen = 0
 
         # KMeans has no learnable parameters (centroids use register_buffer).
         # Add dummy param to keep optimizer/DDP happy.
         self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=True)
+
+    @torch.no_grad()
+    def _reservoir_add(self, x: torch.Tensor) -> None:
+        """Add a batch to the bounded reservoir (Vitter's Algorithm R).
+
+        Keeps a uniform random ``self._sample_cap`` subset of every embedding
+        seen so far in O(cap) host memory, in a single streaming pass.
+
+        Args:
+            x (Tensor): a batch of embeddings, shape (B, D); copied to host.
+        """
+        x = x.detach().to("cpu", dtype=torch.float32)
+        cap = self._sample_cap
+        if self._reservoir is None:
+            self._reservoir = torch.empty(cap, x.shape[1], dtype=torch.float32)
+
+        # Phase 1: fill empty slots first.
+        if self._n_filled < cap:
+            take = min(x.shape[0], cap - self._n_filled)
+            self._reservoir[self._n_filled : self._n_filled + take] = x[:take]
+            self._n_filled += take
+            self._n_seen += take
+            x = x[take:]
+            if x.shape[0] == 0:
+                return
+
+        # Phase 2: replacement. Row j (0-indexed in x) is the
+        # (n_seen + j)-th item seen; it enters the reservoir with prob
+        # cap / (n_seen + j + 1), displacing a uniformly-random slot.
+        r = x.shape[0]
+        pos = self._n_seen + torch.arange(r)
+        accept = torch.rand(r) < (cap / (pos + 1).to(torch.float64))
+        idx = accept.nonzero(as_tuple=True)[0]
+        if idx.numel() > 0:
+            slots = torch.randint(0, cap, (idx.numel(),))
+            # Intra-batch slot collisions resolve last-write-wins; the bias is
+            # O(B/cap) per step and negligible for codebook fitting.
+            self._reservoir[slots] = x[idx]
+        self._n_seen += r
+
+    def _reservoir_sample(self) -> torch.Tensor:
+        """Return the filled portion of the reservoir, shape (n_filled, D)."""
+        if self._reservoir is None or self._n_filled == 0:
+            return torch.empty(0, self._input_dim, dtype=torch.float32)
+        return self._reservoir[: self._n_filled]
+
+    def _reset_reservoir(self) -> None:
+        """Drop the reservoir after the FAISS fit to free host memory."""
+        self._reservoir = None
+        self._n_filled = 0
+        self._n_seen = 0
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -117,21 +184,12 @@ class SidRqkmeans(BaseSidModel):
         """
         embedding = self._extract_feature(batch)
 
-        # Training: buffer for the end-of-loop FAISS fit and return dummy
-        # codes — the codebook does not exist yet.
-        # We move to host (.cpu()) deliberately: the whole corpus is
-        # accumulated before the single FAISS pass, so keeping every step's
-        # batch resident in GPU memory would OOM, and the common faiss-cpu
-        # build cannot consume CUDA tensors anyway. (A faiss-gpu fit could
-        # take a GPU tensor, but that is the exception, not the default.)
-        # TODO(perf): .cpu() is a synchronous D2H per step and the buffer
-        # grows unbounded with steps. Rework to either (a) GPU-resident
-        # buffer + bulk D2H in on_train_end with size cap, or (b) replace
-        # the train pass with an inference_mode corpus walk launched from
-        # on_train_end. Skipped here to avoid OOM-vs-refactor tradeoffs;
-        # tracked separately.
+        # Training: reservoir-sample into a bounded host buffer for the
+        # end-of-loop FAISS fit, and return dummy codes — the codebook does
+        # not exist yet. The reservoir caps memory at _sample_cap rows
+        # regardless of corpus size (FAISS only consumes a subset anyway).
         if self.is_train:
-            self._offline_buffer.append(embedding.detach().cpu())
+            self._reservoir_add(embedding)
             B = embedding.shape[0]
             return {
                 "codes": torch.zeros(
@@ -213,30 +271,28 @@ class SidRqkmeans(BaseSidModel):
         by ``tzrec.main.train_and_evaluate`` after the training loop exits.
 
         DDP behavior:
-            - rank0: receive local buffers via gather_object, concat,
-              run FAISS fit, then broadcast centroids to other ranks.
-            - other ranks: ship local buffer via gather_object(dst=0)
-              and wait for the broadcast.
+            - rank0: receive each rank's reservoir sample via gather_object,
+              concat, run FAISS fit, then broadcast centroids to all ranks.
+            - other ranks: ship their reservoir sample via gather_object
+              (dst=0) and wait for the broadcast.
 
         No cross-rank empty-buffer handshake is needed: the dataset layer
         enforces ``num_files >= world_size`` (``tzrec.datasets.dataset``
         raises otherwise), so in synchronized training every rank receives
-        at least one shard and reaches the gather with a non-empty buffer.
+        at least one shard and reaches the gather with a non-empty sample.
         """
         is_ddp = (
             dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         )
 
-        if is_ddp:
-            # DDP path: every rank ships its local buffer to rank 0 via
-            # gather_object (variable-length pickle — fine for this one-
-            # shot, CPU-resident gather). Only rank 0 holds the corpus,
-            # so peak memory is O(world_size) on rank 0 and O(1) elsewhere
-            # (vs O(world_size²) for all_gather_object).
-            local = torch.cat(self._offline_buffer, dim=0)
-            del self._offline_buffer
-            self._offline_buffer = []
+        local = self._reservoir_sample()
+        self._reset_reservoir()
 
+        if is_ddp:
+            # DDP path: every rank ships its reservoir sample to rank 0 via
+            # gather_object. Each sample is bounded by _sample_cap, so the
+            # gathered set on rank0 is ~train_sample_size and FAISS does no
+            # further subsampling.
             rank = dist.get_rank()
             gathered: Optional[List[Optional[torch.Tensor]]] = (
                 [None] * dist.get_world_size() if rank == 0 else None
@@ -264,41 +320,17 @@ class SidRqkmeans(BaseSidModel):
             dist.barrier()
             return
 
-        # Single-process path. Guard an empty buffer with a plain local
-        # check (no collective): on_train_end may be invoked without a
-        # training pass having run.
-        if len(self._offline_buffer) == 0:
+        # Single-process path. Guard an empty sample with a plain local check
+        # (no collective): on_train_end may be invoked without a training pass.
+        if local.shape[0] == 0:
             logger.warning(
-                "[SidRqkmeans.on_train_end] empty offline buffer; skipping "
-                "FAISS fit. Did the train_eval loop run?"
+                "[SidRqkmeans.on_train_end] empty reservoir; skipping FAISS "
+                "fit. Did the train_eval loop run?"
             )
             return
 
-        # Build the full numpy matrix directly from the buffer list, popping
-        # each chunk after copy so the transient memory high-water mark stays
-        # ~= final matrix size (instead of 2× when going through torch.cat).
-        N = sum(t.shape[0] for t in self._offline_buffer)
-        D = self._offline_buffer[0].shape[1]
         logger.info(
-            "[SidRqkmeans.on_train_end] fitting FAISS on %d samples (D=%d)." % (N, D)
+            "[SidRqkmeans.on_train_end] fitting FAISS on %d samples (D=%d)."
+            % (local.shape[0], local.shape[1])
         )
-        full_np = np.empty((N, D), dtype=np.float32)
-        offset = 0
-        # Pop from the front; each popped tensor is released before the next
-        # copy so cumulative torch memory shrinks monotonically.
-        while self._offline_buffer:
-            t = self._offline_buffer.pop(0)
-            n = t.shape[0]
-            # .float().numpy() returns a view sharing storage with the fp32
-            # tensor; the subsequent assignment copies into full_np, after
-            # which ``t`` can be freed.
-            full_np[offset : offset + n] = t.float().numpy()
-            offset += n
-            del t
-        del self._offline_buffer
-        self._offline_buffer = []
-
-        # train_offline takes ownership of ``full_np`` (in-place residual
-        # updates); drop our reference after the call.
-        self._quantizer.train_offline(full_np, verbose=True)
-        del full_np
+        self._quantizer.train_offline(local, verbose=True)

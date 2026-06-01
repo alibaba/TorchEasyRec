@@ -86,7 +86,7 @@ def _on_train_end_worker(rank: int, world_size: int, port: int) -> None:
     torch.manual_seed(100 + rank)
     for _ in range(6):
         model.predict(_make_batch(32, input_dim, device))
-    assert len(model._offline_buffer) == 6, f"rank{rank}: buffer not filled"
+    assert model._n_seen == 6 * 32, f"rank{rank}: reservoir not filled"
 
     # The collective sequence under test: empty-flag all_reduce ->
     # gather_object -> rank0 FAISS fit -> broadcast centroids + fill flag.

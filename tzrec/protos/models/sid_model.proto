@@ -89,6 +89,12 @@ message SidRqkmeans {
     // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
     // spherical: false, seed: 1234}.
     optional google.protobuf.Struct faiss_kmeans_kwargs = 5;
+    // Target number of embeddings to reservoir-sample for the FAISS fit
+    // (global, across all ranks). Bounds host memory regardless of corpus
+    // size. 0 (the default) auto-derives it as K * max_points_per_centroid
+    // — exactly what FAISS subsamples to internally (default 256), so no
+    // training points are wasted.
+    optional uint32 train_sample_size = 6 [default = 0];
 
     // Name of the item embedding feature inside the input Batch.
     optional string embedding_feature_name = 40 [default = "item_emb"];

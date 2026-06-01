@@ -68,10 +68,11 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertEqual(model._faiss_kwargs.get("niter"), 5)
         self.assertEqual(model._faiss_kwargs.get("seed"), 1234)
         self.assertFalse(model._faiss_kwargs.get("verbose"))
-        self.assertEqual(model._offline_buffer, [])
+        self.assertEqual(model._n_seen, 0)
+        self.assertIsNone(model._reservoir)
 
     def test_predict_collects_buffer(self) -> None:
-        """In train mode, predict should append to buffer; never fit."""
+        """In train mode, predict reservoir-samples; never fits."""
         B, input_dim = 8, 32
         model = self._create_model(input_dim=input_dim)
         model.train()
@@ -81,13 +82,26 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             preds = model.predict(batch)
             self.assertIn("codes", preds)
 
-        # Buffer accumulates 4 batches of B samples each
-        self.assertEqual(len(model._offline_buffer), 4)
-        total = sum(t.shape[0] for t in model._offline_buffer)
-        self.assertEqual(total, 4 * B)
+        # Reservoir holds all 4*B samples (well under the cap) and tracks
+        # the running count.
+        self.assertEqual(model._n_seen, 4 * B)
+        self.assertEqual(model._n_filled, 4 * B)
         # FAISS not yet triggered: layers should be uninitialized
         for layer in model._quantizer.layers:
             self.assertFalse(layer.is_initialized)
+
+    def test_reservoir_caps_memory(self) -> None:
+        """Reservoir bounds the buffer at _sample_cap regardless of corpus."""
+        B, input_dim = 16, 8
+        model = self._create_model(input_dim=input_dim)
+        model._sample_cap = 10  # force a tiny cap
+        model._reset_reservoir()
+        model.train()
+        for _ in range(20):  # 320 rows >> cap
+            model.predict(_make_batch(B, input_dim))
+        self.assertEqual(model._n_seen, 20 * B)
+        self.assertEqual(model._n_filled, 10)
+        self.assertEqual(model._reservoir.shape, (10, input_dim))
 
     def test_on_train_end_runs_faiss(self) -> None:
         """on_train_end triggers FAISS fit and clears buffer."""
@@ -103,13 +117,14 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         # Accumulate enough samples (FAISS K-Means needs at least K points)
         for _ in range(8):
             model.predict(_make_batch(B, input_dim))
-        self.assertGreater(len(model._offline_buffer), 0)
+        self.assertGreater(model._n_seen, 0)
 
         # Trigger one-shot FAISS fit
         model.on_train_end()
 
-        # Buffer should be cleared
-        self.assertEqual(model._offline_buffer, [])
+        # Reservoir should be released after the fit
+        self.assertEqual(model._n_seen, 0)
+        self.assertIsNone(model._reservoir)
         # All layers should be initialized + centroids non-zero
         for layer in model._quantizer.layers:
             self.assertTrue(bool(layer._is_initialized.item()))
