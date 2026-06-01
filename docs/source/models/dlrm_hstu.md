@@ -304,11 +304,11 @@ model_config {
 
 ### 数据
 
-[kuairand-27k.tar.gz](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/kuairand-27k.tar.gz)
+[kuairand-27k.tar.gz](https://tzrec.oss-accelerate.aliyuncs.com/data/models/kuairand-27k.tar.gz)
 
 ### 配置文件
 
-[dlrm_hstu_kuairand.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_hstu_kuairand.config)
+[dlrm_hstu_kuairand.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/dlrm_hstu_kuairand.config)
 注: 如遇到训练不稳定问题，可优先考虑调整混合精度相关的配置: 去除train_config中的mixed_precision，去除feature_configs中的data_type，设置train_config.cuda_matmul_allow_tf32=true
 
 ### 模型导出

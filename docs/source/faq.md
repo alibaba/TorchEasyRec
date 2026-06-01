@@ -24,7 +24,7 @@ libidn.so.11: cannot open shared object file: No such file or directory
 
 **原因：** 系统中缺少libidn.so库文件。
 
-**解决方法：** Centos运行yum install libidn来安装所需的库；Ubuntu可以下载https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/libidn11_1.33-2.2ubuntu2_amd64.deb，apt-get install ./libidn11_1.33-2.2ubuntu2_amd64.deb来安装。
+**解决方法：** Centos运行yum install libidn来安装所需的库；Ubuntu可以下载https://tzrec.oss-accelerate.aliyuncs.com/third_party/libidn11_1.33-2.2ubuntu2_amd64.deb，apt-get install ./libidn11_1.33-2.2ubuntu2_amd64.deb来安装。
 
 ______________________________________________________________________
 
@@ -303,7 +303,7 @@ torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 **解决方法：** 安装修复后的Triton wheel：
 
 ```bash
-pip install --force-reinstall --no-deps "https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
+pip install --force-reinstall --no-deps "https://tzrec.oss-accelerate.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
 ```
 
 ______________________________________________________________________

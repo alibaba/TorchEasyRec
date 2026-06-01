@@ -9,7 +9,7 @@ sed 's#(docs/source/#(#g;s#(docs/images/#(../images/#g;s#"docs/images/#"../image
 sed -i '1i\# 简介' docs/source/intro.md
 
 # replace wheel and docker version
-ALL_WHEEL_VERSIONS=$(pip index versions tzrec -f http://tzrec.oss-cn-beijing.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-cn-beijing.aliyuncs.com)
+ALL_WHEEL_VERSIONS=$(pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com)
 LATEST_WHEEL_VERSION=$(echo "${ALL_WHEEL_VERSIONS}" | awk 'NR==1{print $2}' | sed 's/[()]//g')
 # PPU runs on the 1.1.x line; pick the latest 1.1.x from the available versions list
 LATEST_PPU_WHEEL_VERSION=$(echo "${ALL_WHEEL_VERSIONS}" | grep -i 'available versions' | tr ',' '\n' | tr -d ' ' | grep '^1\.1\.' | head -1)

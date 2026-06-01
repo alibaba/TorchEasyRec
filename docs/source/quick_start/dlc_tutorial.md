@@ -22,12 +22,12 @@ pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/ni
 
 输入数据以parquet格式为例
 
-- 训练数据: [taobao_data_train](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz)
-- 评估数据: [taobao_data_eval](https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz)
+- 训练数据: [taobao_data_train](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz)
+- 评估数据: [taobao_data_eval](https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz)
 
 #### 配置文件
 
-配置文件以DIN为例 [multi_tower_din_taobao_dlc.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc.config)
+配置文件以DIN为例 [multi_tower_din_taobao_dlc.config](https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc.config)
 
 ### 配置任务
 
@@ -46,9 +46,9 @@ pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/ni
 ```bash
 # 下载数据和配置文件并解压到nas/oss上，如果数据已存在，则不需要上述下载和解压命令
 cd /mnt/data
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc.config
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_train.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/taobao_data_eval.tar.gz
+wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc.config
 tar xf taobao_data_train.tar.gz
 tar xf taobao_data_eval.tar.gz
 cd -

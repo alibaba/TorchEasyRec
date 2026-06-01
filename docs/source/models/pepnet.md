@@ -121,7 +121,7 @@ model_config {
 
 ## 示例Config
 
-[pepnet_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/pepnet_taobao.config)
+[pepnet_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/pepnet_taobao.config)
 
 ## 参考论文
 

@@ -93,7 +93,7 @@ model_config {
 
 ## 示例Config
 
-[DLRM_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dlrm_criteo.config)
+[DLRM_demo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/dlrm_criteo.config)
 
 ## 参考论文
 

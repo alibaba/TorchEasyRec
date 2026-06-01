@@ -145,7 +145,7 @@ model_config {
 
 ## 示例Config
 
-[dssm_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dssm_taobao.config)
+[dssm_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/dssm_taobao.config)
 
 ## 参考论文
 

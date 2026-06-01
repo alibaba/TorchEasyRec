@@ -43,7 +43,7 @@ def _get_easyrec(pkg_path=None):
     local_cache_dir = tempfile.mkdtemp(prefix="tzrec_tmp")
     if pkg_path is None:
         pkg_path = (
-            f"https://easyrec.oss-cn-beijing.aliyuncs.com/release/whls/"
+            f"https://easyrec.oss-accelerate.aliyuncs.com/release/whls/"
             f"easy_rec-{EASYREC_VERSION}-py2.py3-none-any.whl"
         )
     if pkg_path.startswith("http"):
