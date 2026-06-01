@@ -26,10 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tzrec.loss.clip_loss import (
-    MaskedCLIPLoss,
-    _all_gather_with_grad,
-)
+from tzrec.loss.clip_loss import MaskedCLIPLoss
 from tzrec.utils import misc_util
 
 WORLD_SIZE = 2
@@ -53,7 +50,7 @@ def _all_gather_worker(rank: int, world_size: int, port: int) -> None:
     device = _init(rank, world_size, port)
     # Each rank holds a distinct, rank-identifying tensor.
     x = torch.full((2, 3), float(rank + 1), device=device, requires_grad=True)
-    gathered = _all_gather_with_grad([x])[0]
+    gathered = MaskedCLIPLoss._all_gather_with_grad([x])[0]
 
     # Forward: gathered is (world_size*2, 3); rank r contributes rows
     # [2r : 2r+2] all equal to (r+1).

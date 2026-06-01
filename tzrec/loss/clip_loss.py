@@ -16,38 +16,11 @@ from typing import Dict, List, Optional
 import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
-from torch import nn
 from torch.nn import functional as F
+from torch.nn.modules.loss import _Loss
 
 
-def _all_gather_with_grad(
-    tensors: List[torch.Tensor],
-) -> List[torch.Tensor]:
-    """All-gather tensors across distributed workers with gradient support.
-
-    In single-process mode, returns input tensors unchanged. In
-    multi-process mode, uses ``torch.distributed.nn.functional.all_gather``
-    — the built-in differentiable collective (its backward sum-reduces the
-    per-rank grads and returns this rank's slice), so no custom
-    ``autograd.Function`` is needed.
-
-    Args:
-        tensors (List[Tensor]): list of tensors to gather.
-
-    Returns:
-        List[Tensor]: gathered tensors, each (world_size * B, ...).
-    """
-    if not dist.is_initialized() or dist.get_world_size() == 1:
-        return tensors
-
-    gathered: List[torch.Tensor] = []
-    for tensor in tensors:
-        tensor_all = dist_nn.all_gather(tensor)  # differentiable, one per rank
-        gathered.append(torch.cat(tensor_all, dim=0))
-    return gathered
-
-
-class MaskedCLIPLoss(nn.Module):
+class MaskedCLIPLoss(_Loss):
     """Masked CLIP loss for mixed recon+clip batches.
 
     In a mixed batch, recon rows (clip_mask=False) should not
@@ -78,6 +51,30 @@ class MaskedCLIPLoss(nn.Module):
         self.labels: Optional[torch.Tensor] = None
         self.last_local_batch_size: Optional[int] = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+
+    @staticmethod
+    def _all_gather_with_grad(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+        """All-gather tensors across workers with gradient support.
+
+        In single-process mode, returns the input tensors unchanged. In
+        multi-process mode, uses ``torch.distributed.nn.functional
+        .all_gather`` — the built-in differentiable collective (its backward
+        sum-reduces the per-rank grads and returns this rank's slice), so no
+        custom ``autograd.Function`` is needed.
+
+        Args:
+            tensors (List[Tensor]): list of tensors to gather.
+
+        Returns:
+            List[Tensor]: gathered tensors, each (world_size * B, ...).
+        """
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return tensors
+        gathered: List[torch.Tensor] = []
+        for tensor in tensors:
+            tensor_all = dist_nn.all_gather(tensor)  # differentiable, per rank
+            gathered.append(torch.cat(tensor_all, dim=0))
+        return gathered
 
     @staticmethod
     def _gather_bool_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -145,10 +142,10 @@ class MaskedCLIPLoss(nn.Module):
         text_embed = F.normalize(text_embed, dim=-1, p=2)
 
         # All-gather across GPUs (with gradient support)
-        image_embed_all, text_embed_all = _all_gather_with_grad(
+        image_embed_all, text_embed_all = self._all_gather_with_grad(
             [image_embed, text_embed]
         )
-        image_embed_all_ori, text_embed_all_ori = _all_gather_with_grad(
+        image_embed_all_ori, text_embed_all_ori = self._all_gather_with_grad(
             [image_embed_ori, text_embed_ori]
         )
 

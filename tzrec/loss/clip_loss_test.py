@@ -14,16 +14,13 @@ import unittest
 import numpy as np
 import torch
 
-from tzrec.loss.clip_loss import (
-    MaskedCLIPLoss,
-    _all_gather_with_grad,
-)
+from tzrec.loss.clip_loss import MaskedCLIPLoss
 
 
 class AllGatherWithGradTest(unittest.TestCase):
     def test_single_process_identity(self) -> None:
         a, b = torch.randn(3, 4), torch.randn(3, 4)
-        out = _all_gather_with_grad([a, b])
+        out = MaskedCLIPLoss._all_gather_with_grad([a, b])
         self.assertIs(out[0], a)
         self.assertIs(out[1], b)
 
