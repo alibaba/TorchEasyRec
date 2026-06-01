@@ -110,7 +110,7 @@ class VectorQuantize(nn.Module):
     Maps continuous input vectors to the nearest codebook entry and returns
     the quantized embeddings + codebook indices. The commitment loss is
     computed at the residual-aggregator level by
-    :meth:`ResidualQuantized._single_commitment_loss` over the cumulative
+    :meth:`ResidualVectorQuantizer._single_commitment_loss` over the cumulative
     quants (matching al_sid's ``RQBottleneck.compute_commitment_loss``);
     this layer is intentionally loss-free.
 
@@ -232,7 +232,7 @@ class VectorQuantize(nn.Module):
             3. compute differentiable embedding (STE or Gumbel-Softmax)
 
         Commitment loss is computed by the caller
-        (:meth:`ResidualQuantized._single_commitment_loss`).
+        (:meth:`ResidualVectorQuantizer._single_commitment_loss`).
 
         Args:
             x (Tensor): input vectors, shape (B, D).

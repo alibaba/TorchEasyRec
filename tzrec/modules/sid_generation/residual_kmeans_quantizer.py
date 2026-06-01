@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-layer residual K-Means: ResidualKMeans and RQKMeans wrapper.
+"""Multi-layer residual K-Means: ResidualKMeansQuantizer and RQKMeans wrapper.
 
 Training is FAISS-only: the codebook is built once via ``train_offline``
 over the full embedding matrix; ``forward`` is read-only (predict + lookup).
@@ -23,10 +23,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from tzrec.modules.sid_generation.kmeans import KMeansLayer, recon_diagnostics
+from tzrec.modules.sid_generation.residual_quantizer import ResidualQuantizer
 from tzrec.utils.logging_util import logger
 
 
-class ResidualKMeans(nn.Module):
+class ResidualKMeansQuantizer(ResidualQuantizer):
     """Multi-layer residual K-Means with offline FAISS training.
 
     Each layer quantizes the residual from the previous layer:
@@ -62,33 +63,21 @@ class ResidualKMeans(nn.Module):
         normalize_residuals: bool = False,
         faiss_kmeans_kwargs: Optional[Dict] = None,
     ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.n_layers = n_layers
-        self.normalize_residuals = normalize_residuals
+        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
         self.faiss_kmeans_kwargs = dict(faiss_kmeans_kwargs or {})
 
-        if isinstance(n_embed, int):
-            n_embed_list = [n_embed] * n_layers
-        else:
-            assert len(n_embed) == n_layers, (
-                "length of n_embed and n_layers must be same, "
-                f"but got {len(n_embed)} vs {n_layers}"
-            )
-            n_embed_list = list(n_embed)
         # ``train_offline`` reuses a single ``faiss.Kmeans`` instance across
         # layers, so non-uniform codebooks would silently train layers 1+
         # with ``K=n_embed_list[0]``. Fail fast instead.
-        assert len(set(n_embed_list)) == 1, (
-            "ResidualKMeans / RQKMeans require a uniform codebook size "
-            f"across layers; got {n_embed_list}."
+        assert len(set(self.n_embed_list)) == 1, (
+            "ResidualKMeansQuantizer / RQKMeans require a uniform codebook "
+            f"size across layers; got {self.n_embed_list}."
         )
-        self.n_embed_list = n_embed_list
 
         self.layers = nn.ModuleList(
             [
                 KMeansLayer(
-                    n_clusters=n_embed_list[i],
+                    n_clusters=self.n_embed_list[i],
                     n_features=embed_dim,
                 )
                 for i in range(n_layers)
@@ -99,10 +88,6 @@ class ResidualKMeans(nn.Module):
     def all_initialized(self) -> bool:
         """Whether all layers have been initialized via offline FAISS."""
         return all(layer.is_initialized for layer in self.layers)
-
-    def output_dim(self) -> int:
-        """Output dimension of the module."""
-        return self.embed_dim
 
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assign codes per layer and sum the centroids.
@@ -169,26 +154,9 @@ class ResidualKMeans(nn.Module):
         """
         return self.layers[layer_idx].centroids
 
-    @torch.no_grad()
-    def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Reconstruct embeddings from semantic ID codes.
-
-        Args:
-            codes (Tensor): cluster ids, shape (B, n_layers).
-
-        Returns:
-            Tensor: reconstructed embeddings, shape (B, D).
-        """
-        quantized_sum = torch.zeros(
-            codes.shape[0],
-            self.embed_dim,
-            device=codes.device,
-            dtype=torch.float,
-        )
-        for i, layer in enumerate(self.layers):
-            emb = layer.centroids[codes[:, i]]
-            quantized_sum = quantized_sum + emb
-        return quantized_sum
+    def _lookup_code(self, layer_idx: int, code_idx: torch.Tensor) -> torch.Tensor:
+        """Look up codebook vectors via the layer's centroid table."""
+        return self.layers[layer_idx].centroids[code_idx]
 
     @torch.no_grad()
     def train_offline(
@@ -267,7 +235,7 @@ class ResidualKMeans(nn.Module):
                 out_t = torch.from_numpy(out)
                 ref_t = torch.from_numpy(out + x)  # x_in = out + residual
                 logger.info(
-                    "[ResidualKMeans][offline_faiss][layer %d] %s",
+                    "[ResidualKMeansQuantizer][offline_faiss][layer %d] %s",
                     layer_idx,
                     self._calc_loss(ref_t, out_t),
                 )
@@ -277,7 +245,7 @@ class ResidualKMeans(nn.Module):
             self.layers[layer_idx].load_centroids_(centroids_t)
             if verbose:
                 logger.info(
-                    "[ResidualKMeans][offline_faiss] layer %d finished",
+                    "[ResidualKMeansQuantizer][offline_faiss] layer %d finished",
                     layer_idx,
                 )
 
@@ -317,7 +285,7 @@ class RQKMeans(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.quantizer = ResidualKMeans(
+        self.quantizer = ResidualKMeansQuantizer(
             embed_dim=embed_dim,
             n_layers=n_layers,
             n_embed=n_embed,

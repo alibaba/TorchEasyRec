@@ -15,11 +15,11 @@ This module is the single home for torch-native K-Means code used by
 SID models:
 
 * :class:`KMeansLayer` — per-layer centroid container used by
-  :class:`ResidualKMeans` / :class:`RQKMeans`. Centroids are injected
+  :class:`ResidualKMeansQuantizer` / :class:`RQKMeans`. Centroids are injected
   by the FAISS backend via ``load_centroids_``; the only forward path
   is ``predict``.
 * :func:`_kmeans` / :func:`_residual_kmeans` — pure-torch Lloyd's
-  K-Means + residual variant, used by :class:`ResidualQuantized` to
+  K-Means + residual variant, used by :class:`ResidualVectorQuantizer` to
   warm-start the RQ-VAE codebook on the first training batch. They run
   once on a single batch of encoder outputs (typically ~2k × 64), so
   pulling in FAISS here would be all overhead and no benefit.
@@ -39,7 +39,7 @@ def recon_diagnostics(
     """MSE + relative-L1 reconstruction diagnostics.
 
     Shared by :meth:`SidRqkmeans.update_metric` (which wants tensors for
-    ``torchmetrics.MeanMetric``) and :meth:`ResidualKMeans.train_offline`'s
+    ``torchmetrics.MeanMetric``) and :meth:`ResidualKMeansQuantizer.train_offline`'s
     per-layer log line (which converts to Python floats via ``.item()``).
 
     Args:
@@ -100,7 +100,7 @@ def _kmeans_plus_plus(
 
     Selects initial centroids via distance-weighted probability sampling
     to ensure well-spread starting points. Used by the RQ-VAE codebook
-    init path (``ResidualQuantized.kmeans_init``); RQKMeans itself no
+    init path (``ResidualVectorQuantizer.kmeans_init``); RQKMeans itself no
     longer needs it.
 
     Args:
@@ -138,7 +138,7 @@ def _kmeans(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Lloyd's K-Means with KMeans++ initialization.
 
-    Used by :class:`ResidualQuantized.init_embed_` to warm-start the
+    Used by :class:`ResidualVectorQuantizer.init_embed_` to warm-start the
     RQ-VAE codebook on the first training batch.
 
     Args:
@@ -179,7 +179,7 @@ def _residual_kmeans(
 ) -> List[torch.Tensor]:
     """Residual K-Means: per-layer cluster then subtract centroids.
 
-    Used by :class:`ResidualQuantized.init_embed_` to seed every RQ
+    Used by :class:`ResidualVectorQuantizer.init_embed_` to seed every RQ
     codebook layer in one pass over the first training batch.
 
     Args:
@@ -202,7 +202,7 @@ class KMeansLayer(nn.Module):
     """Single layer of a residual K-Means stack.
 
     Centroids are populated externally by ``load_centroids_`` (called per
-    layer by the FAISS backend in :class:`ResidualKMeans`); ``predict``
+    layer by the FAISS backend in :class:`ResidualKMeansQuantizer`); ``predict``
     is the only forward path. PyTorch state-dict keys are scoped by
     attribute path (``layers.<i>.centroids``), so renaming the class
     does not break existing checkpoints.

@@ -315,12 +315,12 @@ class SidRqvaeTest(unittest.TestCase):
 
         Previously ``"l1"`` silently fell through to the L2 branch.
         """
-        from tzrec.modules.sid_generation.residual_quantized import (
-            ResidualQuantized,
+        from tzrec.modules.sid_generation.residual_vector_quantizer import (
+            ResidualVectorQuantizer,
         )
 
         torch.manual_seed(0)
-        rq = ResidualQuantized(
+        rq = ResidualVectorQuantizer(
             embed_dim=8,
             n_layers=2,
             n_embed=4,
@@ -386,13 +386,13 @@ class SidRqvaeTest(unittest.TestCase):
             self.assertTrue(layer.use_sinkhorn)
 
     def test_commitment_loss_invalid_raises(self) -> None:
-        """ResidualQuantized rejects unknown commitment_loss spellings."""
-        from tzrec.modules.sid_generation.residual_quantized import (
-            ResidualQuantized,
+        """ResidualVectorQuantizer rejects unknown commitment_loss spellings."""
+        from tzrec.modules.sid_generation.residual_vector_quantizer import (
+            ResidualVectorQuantizer,
         )
 
         with self.assertRaisesRegex(AssertionError, "commitment_loss"):
-            ResidualQuantized(
+            ResidualVectorQuantizer(
                 embed_dim=8,
                 n_layers=2,
                 n_embed=4,

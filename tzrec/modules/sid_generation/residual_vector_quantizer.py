@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ResidualQuantized: multi-layer residual vector quantization with VQ layers."""
+"""ResidualVectorQuantizer: multi-layer residual VQ with gradient training."""
 
 from typing import List, Sequence, Union
 
@@ -19,15 +19,16 @@ from torch import nn
 from torch.nn import functional as F
 
 from tzrec.modules.sid_generation.kmeans import _residual_kmeans
+from tzrec.modules.sid_generation.residual_quantizer import ResidualQuantizer
 from tzrec.modules.sid_generation.types import (
     QuantizeForwardMode,
-    ResidualQuantizedOutput,
+    ResidualQuantizerOutput,
 )
 from tzrec.modules.sid_generation.vector_quantize import VectorQuantize
 from tzrec.utils.logging_util import logger
 
 
-class ResidualQuantized(nn.Module):
+class ResidualVectorQuantizer(ResidualQuantizer):
     """Multi-layer residual vector quantization.
 
     Each layer quantizes the residual from the previous layer:
@@ -86,13 +87,10 @@ class ResidualQuantized(nn.Module):
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
     ) -> None:
-        super().__init__()
+        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
         assert commitment_loss in ("l2", "l1", "cos"), (
             f"commitment_loss must be 'l2', 'l1' or 'cos', got {commitment_loss!r}"
         )
-        self.embed_dim = embed_dim
-        self.n_layers = n_layers
-        self.normalize_residuals = normalize_residuals
         self.commitment_loss_type = commitment_loss
         self.rotation_trick = rotation_trick
 
@@ -109,16 +107,6 @@ class ResidualQuantized(nn.Module):
             )
         mode_enum = self._FORWARD_MODE_MAP[forward_mode]
 
-        if isinstance(n_embed, int):
-            n_embed_list = [n_embed] * n_layers
-        else:
-            assert len(n_embed) == n_layers, (
-                "length of n_embed and n_layers must be same, "
-                f"but got {len(n_embed)} vs {n_layers}"
-            )
-            n_embed_list = list(n_embed)
-        self.n_embed_list = n_embed_list
-
         if isinstance(distance_type, str):
             distance_types = [distance_type] * n_layers
         else:
@@ -132,7 +120,7 @@ class ResidualQuantized(nn.Module):
             [
                 VectorQuantize(
                     embed_dim=embed_dim,
-                    n_embed=n_embed_list[i],
+                    n_embed=self.n_embed_list[i],
                     forward_mode=mode_enum,
                     distance_type=distance_types[i],
                     use_sinkhorn=use_sinkhorn,
@@ -144,7 +132,7 @@ class ResidualQuantized(nn.Module):
         )
 
         logger.info(
-            "ResidualQuantized init: embed_dim=%d, n_layers=%d, "
+            "ResidualVectorQuantizer init: embed_dim=%d, n_layers=%d, "
             "n_embed=%s, forward_mode=%s, normalize_residuals=%s, "
             "distance_type=%s, commitment_loss=%s, latent_weight=%s, "
             "rotation_trick=%s, kmeans_init=%s, use_sinkhorn=%s, "
@@ -276,15 +264,11 @@ class ResidualQuantized(nn.Module):
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
 
-    def output_dim(self) -> int:
-        """Output dimension of the module."""
-        return self.embed_dim
-
     def forward(
         self,
         input: torch.Tensor,
         temperature: float = 1.0,
-    ) -> ResidualQuantizedOutput:
+    ) -> ResidualQuantizerOutput:
         """Forward the multi-layer residual quantization.
 
         Training flow:
@@ -300,7 +284,7 @@ class ResidualQuantized(nn.Module):
             temperature (float): temperature for Gumbel-Softmax.
 
         Returns:
-            ResidualQuantizedOutput: (cluster_ids, quantized_embeddings,
+            ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
                 quantization_loss).
         """
         # Step 1: KMeans initialization (first training forward only)
@@ -346,7 +330,7 @@ class ResidualQuantized(nn.Module):
             else:
                 quants_trunc = input + (quants_trunc - input).detach()
 
-        return ResidualQuantizedOutput(
+        return ResidualQuantizerOutput(
             cluster_ids=cluster_ids,
             quantized_embeddings=quants_trunc,
             quantization_loss=commitment_loss,
@@ -377,23 +361,6 @@ class ResidualQuantized(nn.Module):
         """
         return self.layers[layer_idx].embedding.weight.data
 
-    @torch.no_grad()
-    def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Reconstruct embeddings from semantic ID codes.
-
-        Args:
-            codes (Tensor): cluster ids, shape (B, n_layers).
-
-        Returns:
-            Tensor: reconstructed embeddings, shape (B, D).
-        """
-        quantized_sum = torch.zeros(
-            codes.shape[0],
-            self.embed_dim,
-            device=codes.device,
-            dtype=torch.float,
-        )
-        for i, layer in enumerate(self.layers):
-            emb = layer.embedding(codes[:, i])
-            quantized_sum = quantized_sum + emb
-        return quantized_sum
+    def _lookup_code(self, layer_idx: int, code_idx: torch.Tensor) -> torch.Tensor:
+        """Look up codebook vectors via the layer's embedding table."""
+        return self.layers[layer_idx].embedding(code_idx)

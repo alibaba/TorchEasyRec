@@ -15,12 +15,15 @@ from tzrec.modules.sid_generation.clip_loss import (
 from tzrec.modules.sid_generation.kmeans import (
     KMeansLayer,
 )
-from tzrec.modules.sid_generation.residual_kmeans import (
-    ResidualKMeans,
+from tzrec.modules.sid_generation.residual_kmeans_quantizer import (
+    ResidualKMeansQuantizer,
     RQKMeans,
 )
-from tzrec.modules.sid_generation.residual_quantized import (
-    ResidualQuantized,
+from tzrec.modules.sid_generation.residual_quantizer import (
+    ResidualQuantizer,
+)
+from tzrec.modules.sid_generation.residual_vector_quantizer import (
+    ResidualVectorQuantizer,
 )
 from tzrec.modules.sid_generation.rqvae import (
     RQVAE,
@@ -28,7 +31,7 @@ from tzrec.modules.sid_generation.rqvae import (
 from tzrec.modules.sid_generation.types import (
     QuantizeForwardMode,
     QuantizeOutput,
-    ResidualQuantizedOutput,
+    ResidualQuantizerOutput,
 )
 from tzrec.modules.sid_generation.vector_quantize import (
     VectorQuantize,
@@ -37,12 +40,13 @@ from tzrec.modules.sid_generation.vector_quantize import (
 __all__ = [
     "QuantizeForwardMode",
     "QuantizeOutput",
-    "ResidualQuantizedOutput",
+    "ResidualQuantizerOutput",
     "VectorQuantize",
     "GatherLayer",
-    "ResidualQuantized",
+    "ResidualQuantizer",
+    "ResidualVectorQuantizer",
     "RQVAE",
     "KMeansLayer",
-    "ResidualKMeans",
+    "ResidualKMeansQuantizer",
     "RQKMeans",
 ]

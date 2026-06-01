@@ -41,7 +41,7 @@ class QuantizeOutput(NamedTuple):
     ids: torch.Tensor
 
 
-class ResidualQuantizedOutput(NamedTuple):
+class ResidualQuantizerOutput(NamedTuple):
     """Output of the residual quantization module.
 
     Attributes:

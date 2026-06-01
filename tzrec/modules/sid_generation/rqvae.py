@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RQVAE: Encoder + ResidualQuantized + Decoder top-level wrapper."""
+"""RQVAE: Encoder + ResidualVectorQuantizer + Decoder top-level wrapper."""
 
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -19,12 +19,14 @@ from torch import nn
 from torch.nn import functional as F
 
 from tzrec.modules.sid_generation.clip_loss import MaskedCLIPLoss
-from tzrec.modules.sid_generation.residual_quantized import ResidualQuantized
+from tzrec.modules.sid_generation.residual_vector_quantizer import (
+    ResidualVectorQuantizer,
+)
 from tzrec.utils.logging_util import logger
 
 
 class RQVAE(nn.Module):
-    """RQ-VAE: Encoder + ResidualQuantized + Decoder.
+    """RQ-VAE: Encoder + ResidualVectorQuantizer + Decoder.
 
     Supports optional CLIP contrastive learning. When use_clip=True,
     forward accepts paired inputs (fea1, fea2) and computes CLIP loss
@@ -120,7 +122,7 @@ class RQVAE(nn.Module):
         dec_dims = [embed_dim] + list(reversed(hidden_dims)) + [input_dim]
         self.decoder = self._build_mlp(dec_dims)
 
-        self.quantizer = ResidualQuantized(
+        self.quantizer = ResidualVectorQuantizer(
             embed_dim=embed_dim,
             n_layers=n_layers,
             n_embed=n_embed,
