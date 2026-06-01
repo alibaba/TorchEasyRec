@@ -11,28 +11,41 @@
 
 """SidRqvae: SID generation model using RQ-VAE (Encoder + VQ + Decoder).
 
-End-to-end differentiable training with reconstruction loss
-and commitment loss. Optionally supports CLIP contrastive learning.
+End-to-end differentiable training with reconstruction loss and commitment
+loss. Optionally supports CLIP contrastive learning. The encoder/decoder,
+residual vector quantizer, and CLIP head all live directly on the model —
+there is no intermediate ``RQVAE`` module wrapper.
 """
 
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchmetrics
+from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid_generation import RQVAE
+from tzrec.modules.sid_generation.clip_loss import MaskedCLIPLoss
+from tzrec.modules.sid_generation.residual_vector_quantizer import (
+    ResidualVectorQuantizer,
+)
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.logging_util import logger
 
 
 class SidRqvae(BaseSidModel):
     """SID generation model using RQ-VAE (Encoder + VQ + Decoder).
 
-    End-to-end differentiable training with reconstruction loss
-    and commitment loss. Optionally supports CLIP contrastive learning.
+    Encoder/Decoder are configurable-depth MLPs built from ``hidden_dims``:
+        Encoder: input_dim -> hidden_dims[0] -> ... -> embed_dim
+        Decoder: embed_dim -> ... -> hidden_dims[0] -> input_dim
+    (ReLU between hidden layers; the decoder mirrors the encoder.)
+
+    When ``clip_config`` is set, ``predict`` runs a dual path and a masked
+    CLIP contrastive loss is added for the CLIP-pair rows.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -40,6 +53,16 @@ class SidRqvae(BaseSidModel):
         labels (list): list of label names.
         sample_weights (list): sample weight names.
     """
+
+    @staticmethod
+    def _build_mlp(dims: List[int]) -> nn.Sequential:
+        """Build MLP: dims[0] -> ... -> dims[-1], ReLU between hidden layers."""
+        layers: List[nn.Module] = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:  # no activation after the last layer
+                layers.append(nn.ReLU())
+        return nn.Sequential(*layers)
 
     def __init__(
         self,
@@ -53,6 +76,9 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
         self._loss_type = cfg.loss_type
+        assert self._loss_type in ("mse", "l1", "cosine"), (
+            f"loss_type must be 'mse', 'l1' or 'cosine', got '{self._loss_type}'"
+        )
         self._use_clip = cfg.HasField("clip_config")
         self._clip_feature_name = (
             cfg.clip_config.clip_feature_name if self._use_clip else None
@@ -61,13 +87,12 @@ class SidRqvae(BaseSidModel):
             cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
         )
 
-        hidden_dims = list(cfg.hidden_dims) if cfg.hidden_dims else None
-        # Only forward latent_weight when the user set it (repeated field is
-        # empty when unset); otherwise let RQVAE / ResidualVectorQuantizer
-        # apply their signature default (1.0, 0.5).
-        rqvae_extra: Dict[str, Any] = {}
-        if cfg.latent_weight:
-            rqvae_extra["latent_weight"] = list(cfg.latent_weight)
+        input_dim = cfg.input_dim
+        embed_dim = cfg.embed_dim
+        hidden_dims = list(cfg.hidden_dims) if cfg.hidden_dims else [input_dim // 2]
+        # latent_weight defaults to (1.0, 0.5) when the user leaves the
+        # repeated field empty.
+        latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
 
         use_sinkhorn = True
         sinkhorn_iters = 5
@@ -77,25 +102,140 @@ class SidRqvae(BaseSidModel):
             sinkhorn_iters = cfg.sinkhorn_config.iters
             sinkhorn_epsilon = cfg.sinkhorn_config.epsilon
 
-        self._rqvae = RQVAE(
-            input_dim=cfg.input_dim,
-            embed_dim=cfg.embed_dim,
-            hidden_dims=hidden_dims,
+        self._encoder = self._build_mlp([input_dim, *hidden_dims, embed_dim])
+        # Decoder is the symmetric reverse of the encoder.
+        self._decoder = self._build_mlp([embed_dim, *reversed(hidden_dims), input_dim])
+
+        self._quantizer = ResidualVectorQuantizer(
+            embed_dim=embed_dim,
             n_layers=self._n_layers,
             n_embed=self._n_embed_list,
             forward_mode=cfg.forward_mode,
             normalize_residuals=cfg.normalize_residuals,
             distance_type=cfg.distance_type,
             commitment_loss=cfg.commitment_loss,
+            latent_weight=latent_weight,
             rotation_trick=cfg.rotation_trick,
             kmeans_init=cfg.kmeans_init,
             use_sinkhorn=use_sinkhorn,
             sinkhorn_iters=sinkhorn_iters,
             sinkhorn_epsilon=sinkhorn_epsilon,
-            loss_type=cfg.loss_type,
-            use_clip=self._use_clip,
-            **rqvae_extra,
         )
+
+        # CLIP contrastive head (optional).
+        if self._use_clip:
+            self._logit_scale_self = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale_cl = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._masked_clip_loss_fn = MaskedCLIPLoss()
+
+        logger.info(
+            "SidRqvae init: input_dim=%d, embed_dim=%d, hidden_dims=%s, "
+            "n_layers=%d, n_embed=%s, loss_type=%s, use_clip=%s",
+            input_dim,
+            embed_dim,
+            hidden_dims,
+            self._n_layers,
+            self._n_embed_list,
+            self._loss_type,
+            self._use_clip,
+        )
+
+    # ----- encode / decode / loss helpers (formerly RQVAE) -----
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode. (B, input_dim) -> (B, embed_dim)."""
+        return self._encoder(x)
+
+    def _decode(self, z_q: torch.Tensor) -> torch.Tensor:
+        """Decode. (B, embed_dim) -> (B, input_dim)."""
+        return self._decoder(z_q)
+
+    def _recon_loss(self, x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Mean reconstruction loss for the configured ``loss_type``."""
+        if self._loss_type == "mse":
+            return F.mse_loss(x_hat, x, reduction="mean")
+        elif self._loss_type == "l1":
+            return F.l1_loss(x_hat, x, reduction="mean")
+        else:  # 'cosine'
+            return (1 - F.cosine_similarity(x_hat, x, dim=1)).mean()
+
+    def _forward_rqvae(
+        self, x: torch.Tensor, temperature: float = 1.0
+    ) -> Dict[str, torch.Tensor]:
+        """Standard RQ-VAE forward: encode -> quantize -> decode -> loss."""
+        z_e = self._encode(x)
+        quant = self._quantizer(z_e, temperature=temperature)
+        x_hat = self._decode(quant.quantized_embeddings)
+
+        recon_loss = self._recon_loss(x_hat, x)
+        quant_loss = quant.quantization_loss
+        return {
+            "x_hat": x_hat,
+            "codes": quant.cluster_ids,
+            "quantized": quant.quantized_embeddings,
+            "reconstruction_loss": recon_loss,
+            "quantization_loss": quant_loss,
+            "loss": recon_loss + quant_loss,
+        }
+
+    def _masked_recon_loss(
+        self,
+        x_hat: torch.Tensor,
+        x: torch.Tensor,
+        recon_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample recon loss masked to recon rows (no data-dependent branch)."""
+        if self._loss_type == "mse":
+            per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
+        elif self._loss_type == "l1":
+            per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
+        else:  # 'cosine'
+            per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
+        n_recon = recon_mask.float().sum().clamp(min=1)
+        return (per_sample * recon_mask.float()).sum() / n_recon
+
+    def _forward_mixed(
+        self,
+        fea1: torch.Tensor,
+        fea2: torch.Tensor,
+        clip_mask: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Mixed recon + CLIP forward (all rows dual-pathed; mask splits loss)."""
+        z_e1 = self._encode(fea1)
+        quant1 = self._quantizer(z_e1, temperature=temperature)
+        x_hat1 = self._decode(quant1.quantized_embeddings)
+
+        z_e2 = self._encode(fea2)
+        quant2 = self._quantizer(z_e2, temperature=temperature)
+        x_hat2 = self._decode(quant2.quantized_embeddings)
+
+        recon_mask = ~clip_mask
+        recon_loss = self._masked_recon_loss(x_hat1, fea1, recon_mask)
+
+        features = {
+            "image_embed": x_hat1,
+            "text_embed": x_hat2,
+            "image_embed_ori": fea1,
+            "text_embed_ori": fea2,
+            "logit_scale_self": self._logit_scale_self.exp(),
+            "logit_scale_cl": self._logit_scale_cl.exp(),
+            "logit_scale": self._logit_scale.exp(),
+        }
+        clip_result = self._masked_clip_loss_fn(features, clip_mask)
+
+        commitment = (quant1.quantization_loss + quant2.quantization_loss) / 2
+        return {
+            "codes": quant1.cluster_ids,
+            "quantized": quant1.quantized_embeddings,
+            "x_hat": x_hat1,
+            "recon_loss": recon_loss,
+            "clip_loss": clip_result["clip_loss"],
+            "commitment_loss": commitment,
+        }
+
+    # ----- BaseModel interface -----
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -115,7 +255,7 @@ class SidRqvae(BaseSidModel):
 
     def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Standard RQ-VAE: encode -> quantize -> decode -> loss."""
-        result = self._rqvae.forward_rqvae(embedding)
+        result = self._forward_rqvae(embedding)
 
         predictions: Dict[str, torch.Tensor] = {
             "codes": result["codes"],
@@ -132,11 +272,11 @@ class SidRqvae(BaseSidModel):
     def _predict_mixed(
         self, embedding: torch.Tensor, batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Mixed recon + CLIP: extract fea2 and clip_mask, call forward_mixed."""
+        """Mixed recon + CLIP: extract fea2 and clip_mask, run the dual path."""
         # Inference skips the dual path: fea2 / clip_mask aren't needed
         # when we only emit codes.
         if self._is_inference:
-            result = self._rqvae.forward_rqvae(embedding)
+            result = self._forward_rqvae(embedding)
             return {"codes": result["codes"]}
 
         fea2 = self._extract_feature(batch, self._clip_feature_name)
@@ -144,7 +284,7 @@ class SidRqvae(BaseSidModel):
         is_clip_pair_raw = self._extract_feature(batch, self._is_clip_pair_feature_name)
         clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
 
-        result = self._rqvae.forward_mixed(embedding, fea2, clip_mask)
+        result = self._forward_mixed(embedding, fea2, clip_mask)
 
         predictions: Dict[str, torch.Tensor] = {
             "codes": result["codes"],

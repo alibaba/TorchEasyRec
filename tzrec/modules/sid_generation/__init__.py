@@ -24,9 +24,6 @@ from tzrec.modules.sid_generation.residual_quantizer import (
 from tzrec.modules.sid_generation.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
-from tzrec.modules.sid_generation.rqvae import (
-    RQVAE,
-)
 from tzrec.modules.sid_generation.types import (
     QuantizeForwardMode,
     QuantizeOutput,
@@ -44,7 +41,6 @@ __all__ = [
     "GatherLayer",
     "ResidualQuantizer",
     "ResidualVectorQuantizer",
-    "RQVAE",
     "KMeansLayer",
     "ResidualKMeansQuantizer",
 ]

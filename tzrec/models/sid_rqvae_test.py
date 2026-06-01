@@ -373,7 +373,7 @@ class SidRqvaeTest(unittest.TestCase):
         model = SidRqvae(model_config=model_config, features=[], labels=[])
         init_parameters(model, device=torch.device("cpu"))
 
-        for layer in model._rqvae.quantizer.layers:
+        for layer in model._quantizer.layers:
             self.assertFalse(layer.use_sinkhorn)
 
     def test_sinkhorn_config_default_enabled(self) -> None:
@@ -382,7 +382,7 @@ class SidRqvaeTest(unittest.TestCase):
         Back-compat for legacy configs that never set the sub-config.
         """
         model = self._create_model()  # no sinkhorn_config set
-        for layer in model._rqvae.quantizer.layers:
+        for layer in model._quantizer.layers:
             self.assertTrue(layer.use_sinkhorn)
 
     def test_commitment_loss_invalid_raises(self) -> None:
