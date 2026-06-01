@@ -11,40 +11,13 @@
 
 """CLIP contrastive learning loss with distributed all-gather support."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn as dist_nn
 from torch import nn
 from torch.nn import functional as F
-
-
-class GatherLayer(torch.autograd.Function):
-    """Gather tensors from all workers with gradient support.
-
-    Standard ``dist.all_gather`` detaches gradients; this custom
-    ``autograd.Function`` keeps the computation graph connected so
-    that contrastive losses can backpropagate through gathered tensors.
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """All-gather ``x`` across ranks, returning one tensor per rank."""
-        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-        dist.all_gather(output, x)
-        return tuple(output)
-
-    @staticmethod
-    def backward(ctx, *grads: torch.Tensor) -> torch.Tensor:
-        """Sum-reduce the per-rank grads and return this rank's slice.
-
-        ``all_reduce`` is sum, so reducing only this rank's slice gives
-        the same result as stacking + reducing + slicing, but avoids
-        materialising the full ``(world_size, B, D)`` buffer.
-        """
-        grad_local = grads[dist.get_rank()].contiguous()
-        dist.all_reduce(grad_local)
-        return grad_local
 
 
 def _all_gather_with_grad(
@@ -52,9 +25,11 @@ def _all_gather_with_grad(
 ) -> List[torch.Tensor]:
     """All-gather tensors across distributed workers with gradient support.
 
-    In single-process mode, returns input tensors unchanged.
-    In multi-process mode, uses GatherLayer for backward-compatible
-    all_gather.
+    In single-process mode, returns input tensors unchanged. In
+    multi-process mode, uses ``torch.distributed.nn.functional.all_gather``
+    — the built-in differentiable collective (its backward sum-reduces the
+    per-rank grads and returns this rank's slice), so no custom
+    ``autograd.Function`` is needed.
 
     Args:
         tensors (List[Tensor]): list of tensors to gather.
@@ -67,7 +42,7 @@ def _all_gather_with_grad(
 
     gathered: List[torch.Tensor] = []
     for tensor in tensors:
-        tensor_all = GatherLayer.apply(tensor)
+        tensor_all = dist_nn.all_gather(tensor)  # differentiable, one per rank
         gathered.append(torch.cat(tensor_all, dim=0))
     return gathered
 
