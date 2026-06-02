@@ -168,19 +168,19 @@ class SidRqvaeTest(unittest.TestCase):
 
         predictions = model.predict(batch)
 
-        # Mixed mode should return recon_loss, clip_loss, commitment_loss
+        # Mixed mode returns reconstruction_loss, clip_loss, quantization_loss
         self.assertIn("codes", predictions)
-        self.assertIn("recon_loss", predictions)
+        self.assertIn("reconstruction_loss", predictions)
         self.assertIn("clip_loss", predictions)
-        self.assertIn("commitment_loss", predictions)
+        self.assertIn("quantization_loss", predictions)
         self.assertIn("x_hat", predictions)
         self.assertEqual(predictions["codes"].shape[0], B)
 
         # Loss should return all three
         losses = model.loss(predictions, batch)
-        self.assertIn("recon_loss", losses)
+        self.assertIn("reconstruction_loss", losses)
         self.assertIn("clip_loss", losses)
-        self.assertIn("commitment_loss", losses)
+        self.assertIn("quantization_loss", losses)
 
         total_loss = sum(losses.values())
         self.assertTrue(total_loss.requires_grad)
@@ -220,8 +220,8 @@ class SidRqvaeTest(unittest.TestCase):
 
         # clip_loss should be 0 (no clip rows)
         self.assertEqual(predictions["clip_loss"].item(), 0.0)
-        # recon_loss should be > 0
-        self.assertGreater(predictions["recon_loss"].item(), 0.0)
+        # reconstruction_loss should be > 0
+        self.assertGreater(predictions["reconstruction_loss"].item(), 0.0)
 
     def test_rqvae_clip_all_clip(self) -> None:
         """Test mixed mode with all-clip batch (edge case)."""
@@ -249,8 +249,8 @@ class SidRqvaeTest(unittest.TestCase):
         predictions = model.predict(batch)
         model.loss(predictions, batch)
 
-        # recon_loss should be 0 (no recon rows)
-        self.assertEqual(predictions["recon_loss"].item(), 0.0)
+        # reconstruction_loss should be 0 (no recon rows)
+        self.assertEqual(predictions["reconstruction_loss"].item(), 0.0)
         # clip_loss should be > 0
         self.assertGreater(predictions["clip_loss"].item(), 0.0)
 
@@ -301,8 +301,8 @@ class SidRqvaeTest(unittest.TestCase):
         )
 
         predictions = model.predict(batch)
-        # All rows flagged as clip -> recon_loss should be 0, clip_loss > 0
-        self.assertEqual(predictions["recon_loss"].item(), 0.0)
+        # All rows flagged as clip -> reconstruction_loss should be 0, clip_loss > 0
+        self.assertEqual(predictions["reconstruction_loss"].item(), 0.0)
         self.assertGreater(predictions["clip_loss"].item(), 0.0)
 
     def test_commitment_loss_l1_branch(self) -> None:

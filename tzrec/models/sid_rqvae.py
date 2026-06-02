@@ -235,9 +235,9 @@ class SidRqvae(BaseSidModel):
             "codes": quant1.cluster_ids,
             "quantized": quant1.quantized_embeddings,
             "x_hat": x_hat1,
-            "recon_loss": recon_loss,
+            "reconstruction_loss": recon_loss,
             "clip_loss": clip_result["clip_loss"],
-            "commitment_loss": commitment,
+            "quantization_loss": commitment,
         }
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -293,9 +293,9 @@ class SidRqvae(BaseSidModel):
             "codes": result["codes"],
             "quantized": result["quantized"],
             "x_hat": result["x_hat"],
-            "recon_loss": result["recon_loss"],
+            "reconstruction_loss": result["reconstruction_loss"],
             "clip_loss": result["clip_loss"],
-            "commitment_loss": result["commitment_loss"],
+            "quantization_loss": result["quantization_loss"],
         }
         return predictions
 
@@ -312,13 +312,10 @@ class SidRqvae(BaseSidModel):
             losses (dict): a dict of loss tensor.
         """
         losses: Dict[str, torch.Tensor] = {}
+        losses["reconstruction_loss"] = predictions["reconstruction_loss"]
+        losses["quantization_loss"] = predictions["quantization_loss"]
         if self._use_clip:
-            losses["recon_loss"] = predictions["recon_loss"]
             losses["clip_loss"] = predictions["clip_loss"]
-            losses["commitment_loss"] = predictions["commitment_loss"]
-        else:
-            losses["reconstruction_loss"] = predictions["reconstruction_loss"]
-            losses["quantization_loss"] = predictions["quantization_loss"]
         return losses
 
     def init_metric(self) -> None:
