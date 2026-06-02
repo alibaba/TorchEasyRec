@@ -362,6 +362,26 @@ def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
     return list(leaf_module_names)
 
 
+def _get_dense_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Get dense-embedding modules to keep as FX leaf modules during export.
+
+    ``AutoDisEmbedding`` / ``MLPEmbedding`` override ``state_dict`` /
+    ``_load_from_state_dict`` with split per-feature names. Tracing them as
+    leaves keeps the class so ``reset_parameters`` and the custom restore run
+    after the graph is flattened; otherwise their params stay uninitialized.
+    """
+    from tzrec.modules.dense_embedding_collection import (
+        AutoDisEmbedding,
+        MLPEmbedding,
+    )
+
+    names = []
+    for path, module in model.named_modules():
+        if isinstance(module, (AutoDisEmbedding, MLPEmbedding)):
+            names.append(path)
+    return names
+
+
 def _get_rtp_feature_to_embedding_info(
     model: nn.Module,
 ) -> Dict[str, BaseEmbeddingConfig]:
@@ -802,7 +822,10 @@ def export_rtp_model(
 
     # Trace Sharded Model
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
+    tracer = Tracer(
+        leaf_modules=_get_sharded_leaf_module_names(unwrap_model)
+        + _get_dense_embedding_leaf_module_names(unwrap_model)
+    )
     full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
