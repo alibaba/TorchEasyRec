@@ -76,11 +76,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ]
         )
 
-    @property
-    def all_initialized(self) -> bool:
-        """Whether all layers have been initialized via offline FAISS."""
-        return all(layer.is_initialized for layer in self.layers)
-
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assign codes per layer and sum the centroids.
 

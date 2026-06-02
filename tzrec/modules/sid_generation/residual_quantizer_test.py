@@ -121,7 +121,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
 
     def test_forward_returns_zeros_before_fit(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
-        self.assertFalse(rkq.all_initialized)
+        self.assertFalse(all(layer.is_initialized for layer in rkq.layers))
         codes, quantized = rkq(torch.randn(5, 4))
         self.assertEqual(codes.shape, (5, 2))
         self.assertEqual(quantized.shape, (5, 4))
@@ -137,7 +137,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
             embed_dim=4, n_layers=3, n_embed=n_embed, faiss_kmeans_kwargs={"niter": 5}
         )
         rkq.train_offline(torch.randn(512, 4), verbose=False)
-        self.assertTrue(rkq.all_initialized)
+        self.assertTrue(all(layer.is_initialized for layer in rkq.layers))
         # Each layer fit its own K centroids; codes stay in per-layer range.
         codes, _ = rkq(torch.randn(7, 4))
         self.assertEqual(codes.shape, (7, 3))
@@ -154,7 +154,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
             embed_dim=4, n_layers=2, n_embed=8, faiss_kmeans_kwargs={"niter": 5}
         )
         rkq.train_offline(torch.randn(256, 4), verbose=False)
-        self.assertTrue(rkq.all_initialized)
+        self.assertTrue(all(layer.is_initialized for layer in rkq.layers))
 
         codes, _ = rkq(torch.randn(5, 4))
         self.assertTrue((codes >= 0).all() and (codes < 8).all())
