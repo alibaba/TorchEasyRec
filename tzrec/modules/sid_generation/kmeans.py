@@ -57,36 +57,26 @@ def recon_diagnostics(
 
 
 @torch.no_grad()
-def _squared_euclidean_distance(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    chunk_size: int = 50000,
-) -> torch.Tensor:
-    """Squared L2 distance with chunked computation for memory efficiency.
-
-    Chunks the rows of ``x`` so peak memory is bounded by
-    ``chunk_size * K * 4 bytes`` (fp32) regardless of ``N``.
+def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Squared L2 distance between rows of ``x`` and ``y``.
 
     Args:
         x (Tensor): data points, shape (N, D).
         y (Tensor): centroids, shape (K, D).
-        chunk_size (int): max rows of x per chunk. Default: 50000.
 
     Returns:
         Tensor: squared distances, shape (N, K).
+
+    Called per-batch from :meth:`KMeansLayer.predict`, so ``N`` is the batch
+    size and the full (N, K) product is small. Kept branch-free (no
+    data-dependent chunking on ``N``) so the predict forward stays
+    FX-traceable: torchrec's inference pipeline symbolically traces the
+    model, and a ``if N <= chunk_size`` on the traced batch dim raises a
+    ``torch.fx`` TraceError.
     """
     x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
     y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
-    N = x.shape[0]
-    if N <= chunk_size:
-        return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
-    out = x.new_empty(N, y.shape[0])
-    for start in range(0, N, chunk_size):
-        end = min(start + chunk_size, N)
-        out[start:end] = (x_sq[start:end] + y_sq - 2.0 * x[start:end] @ y.t()).clamp_(
-            min=0.0
-        )
-    return out
+    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
 
 
 @torch.no_grad()

@@ -38,13 +38,6 @@ class KmeansHelpersTest(unittest.TestCase):
         # row0: dist to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
         torch.testing.assert_close(d, torch.tensor([[0.0, 1.0], [1.0, 2.0]]))
 
-    def test_squared_euclidean_distance_chunked_matches(self) -> None:
-        x = torch.randn(120, 5)
-        y = torch.randn(7, 5)
-        full = _squared_euclidean_distance(x, y, chunk_size=1000)
-        chunked = _squared_euclidean_distance(x, y, chunk_size=16)
-        torch.testing.assert_close(full, chunked)
-
     def test_faiss_residual_kmeans_per_layer_centers(self) -> None:
         try:
             import faiss  # noqa: F401

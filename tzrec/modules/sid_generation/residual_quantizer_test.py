@@ -126,6 +126,25 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertEqual(codes.shape, (5, 2))
         self.assertEqual(quantized.shape, (5, 4))
 
+    def test_forward_is_fx_traceable(self) -> None:
+        """Predict forward must FX-trace.
+
+        torchrec's inference pipeline symbolically traces the model, so the
+        per-batch distance path must be free of data-dependent control flow.
+        """
+        import torch.fx as fx
+
+        torch.manual_seed(0)
+        rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
+        for layer in rkq.layers:  # populate centroids -> is_initialized=True
+            layer.load_centroids_(torch.randn(8, 4))
+        traced = fx.symbolic_trace(rkq)
+        x = torch.randn(5, 4)
+        c_eager, q_eager = rkq(x)
+        c_traced, q_traced = traced(x)
+        torch.testing.assert_close(c_traced, c_eager)
+        torch.testing.assert_close(q_traced, q_eager)
+
     def test_train_offline_non_uniform(self) -> None:
         try:
             import faiss  # noqa: F401
