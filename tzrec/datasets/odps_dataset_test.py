@@ -14,14 +14,18 @@ import multiprocessing as mp
 import os
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
+import requests
 from odps import ODPS
 from parameterized import parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
+from tzrec.datasets import odps_dataset
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
@@ -687,6 +691,54 @@ class OdpsWriterTest(unittest.TestCase):
             partition = None
         with t.open_reader(partition=partition) as reader:
             self.assertEqual(reader.count, 1280)
+
+
+class _FailingStorageClient:
+    """Stub storage-api client whose calls raise a connection-reset error."""
+
+    _table = "test_project.test_table"
+    _quota_name = "test_quota"
+    _rest_endpoint = "http://service.odps.test"
+
+    def _raise(self):
+        raise requests.exceptions.ConnectionError(
+            "Connection aborted.",
+            ConnectionResetError(104, "Connection reset by peer"),
+        )
+
+    def read_rows_arrow(self, read_req):
+        self._raise()
+
+    def get_read_session(self, sess_req):
+        self._raise()
+
+
+class OdpsStorageErrorLogTest(unittest.TestCase):
+    def test_read_rows_arrow_logs_session_and_reraises(self):
+        client = _FailingStorageClient()
+        read_req = SimpleNamespace(
+            session_id="sess-read-123",
+            row_index=0,
+            row_count=10,
+            max_batch_rows=100,
+        )
+        with mock.patch.object(odps_dataset, "logger") as m_logger:
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                odps_dataset._read_rows_arrow_with_retry(client, read_req)
+        m_logger.error.assert_called_once()
+        logged = m_logger.error.call_args[0][0]
+        self.assertIn("sess-read-123", logged)
+        self.assertIn("test_project.test_table", logged)
+
+    def test_get_read_session_logs_session_and_reraises(self):
+        client = _FailingStorageClient()
+        sess_req = SimpleNamespace(session_id="sess-scan-456")
+        with mock.patch.object(odps_dataset, "logger") as m_logger:
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                odps_dataset._get_session_record_count(client, sess_req)
+        m_logger.error.assert_called_once()
+        logged = m_logger.error.call_args[0][0]
+        self.assertIn("sess-scan-456", logged)
 
 
 if __name__ == "__main__":
