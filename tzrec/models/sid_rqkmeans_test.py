@@ -9,22 +9,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.models.sid_rqkmeans import SidRqkmeans
 from tzrec.protos import model_pb2
 from tzrec.protos.models import sid_model_pb2
+from tzrec.utils import misc_util
 from tzrec.utils.state_dict_util import init_parameters
 
+WORLD_SIZE = 2
 
-def _make_batch(batch_size: int, input_dim: int) -> Batch:
+
+def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
     """Create a minimal Batch with dense embedding features."""
     dense_feature = KeyedTensor.from_tensor_list(
-        keys=["item_emb"], tensors=[torch.randn(batch_size, input_dim)]
+        keys=["item_emb"],
+        tensors=[torch.randn(batch_size, input_dim, device=device)],
     )
     return Batch(
         dense_features={BASE_DATA_GROUP: dense_feature},
@@ -33,32 +40,39 @@ def _make_batch(batch_size: int, input_dim: int) -> Batch:
     )
 
 
+def _build_model(input_dim=32, n_layers=2, niter=5, codebook=None) -> SidRqkmeans:
+    """Build a SidRqkmeans configured for offline FAISS fit.
+
+    Module-level (not a method) so the spawned DDP workers below can build
+    the same model; callers move it to a device / init params as needed.
+    SID models read the item-embedding dense feature directly from the batch
+    and do not consume feature_groups, so none is set.
+    """
+    from google.protobuf.struct_pb2 import Struct
+
+    n_embed_list = codebook if codebook is not None else [16] * n_layers
+    faiss_kwargs = Struct()
+    faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
+    cfg = sid_model_pb2.SidRqkmeans(
+        input_dim=input_dim,
+        codebook=n_embed_list,
+        normalize_residuals=False,
+        faiss_kmeans_kwargs=faiss_kwargs,
+        embedding_feature_name="item_emb",
+    )
+    return SidRqkmeans(
+        model_config=model_pb2.ModelConfig(sid_rqkmeans=cfg),
+        features=[],
+        labels=[],
+    )
+
+
 class SidRqkmeansOfflineTest(unittest.TestCase):
-    """Tests for SidRqkmeans (FAISS-only)."""
+    """Single-process tests for SidRqkmeans (FAISS-only)."""
 
     def _create_model(self, input_dim=32, n_layers=2, niter=5, codebook=None):
-        """Create a SidRqkmeans configured for offline FAISS fit."""
-        from google.protobuf.struct_pb2 import Struct
-
-        n_embed_list = codebook if codebook is not None else [16] * n_layers
-
-        faiss_kwargs = Struct()
-        faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
-
-        sid_rqkmeans_cfg = sid_model_pb2.SidRqkmeans(
-            input_dim=input_dim,
-            codebook=n_embed_list,
-            normalize_residuals=False,
-            faiss_kmeans_kwargs=faiss_kwargs,
-            embedding_feature_name="item_emb",
-        )
-        # SID models read the item-embedding dense feature directly from the
-        # batch; they do not consume feature_groups, so none is set (which
-        # keeps the config consistent with the empty ``features`` list).
-        model_config = model_pb2.ModelConfig(
-            sid_rqkmeans=sid_rqkmeans_cfg,
-        )
-        model = SidRqkmeans(model_config=model_config, features=[], labels=[])
+        """Create a SidRqkmeans on CPU with params initialized."""
+        model = _build_model(input_dim, n_layers, niter, codebook)
         init_parameters(model, device=torch.device("cpu"))
         return model
 
@@ -219,6 +233,73 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         fresh = self._create_model()
         with self.assertRaisesRegex(RuntimeError, "mid-FAISS-fit"):
             fresh.load_state_dict(sd)
+
+
+# --------------------------------------------------------------------------
+# Distributed (multi-process) test for the DDP on_train_end path: the
+# cross-rank gather_object -> FAISS fit -> broadcast sequence the in-process
+# tests above cannot reach. NCCL on GPU when >=2 devices, else gloo/CPU.
+# --------------------------------------------------------------------------
+def _init_dist(rank: int, world_size: int, port: int) -> torch.device:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    use_cuda = torch.cuda.is_available() and torch.cuda.device_count() >= world_size
+    if use_cuda:
+        torch.cuda.set_device(rank)
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        return torch.device(f"cuda:{rank}")
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    return torch.device("cpu")
+
+
+def _on_train_end_worker(rank: int, world_size: int, port: int) -> None:
+    device = _init_dist(rank, world_size, port)
+    input_dim, n_layers, k = 16, 2, 16
+    model = _build_model(input_dim, n_layers, codebook=[k] * n_layers).to(device)
+    model.train()
+
+    torch.manual_seed(100 + rank)
+    for _ in range(6):
+        model.predict(_make_batch(32, input_dim, device))
+    assert model._n_seen == 6 * 32, f"rank{rank}: reservoir not filled"
+
+    # gather_object -> rank0 FAISS fit -> broadcast centroids + fill flag.
+    model.on_train_end()
+
+    for layer in model._quantizer.layers:
+        assert bool(layer._is_initialized.item()), f"rank{rank}: layer uninit"
+        assert layer.centroids.abs().sum().item() > 0.0, f"rank{rank}: zero centroids"
+    # Centroids were broadcast from rank0 -> must be bit-identical across ranks.
+    for layer in model._quantizer.layers:
+        cmin, cmax = layer.centroids.clone(), layer.centroids.clone()
+        dist.all_reduce(cmin, op=dist.ReduceOp.MIN)
+        dist.all_reduce(cmax, op=dist.ReduceOp.MAX)
+        assert torch.allclose(cmin, cmax), f"rank{rank}: centroids differ across ranks"
+
+    model.eval()
+    codes = model.predict(_make_batch(8, input_dim, device))["codes"]
+    assert codes.shape == (8, n_layers), f"rank{rank}: bad codes shape {codes.shape}"
+    assert (codes >= 0).all() and (codes < k).all(), f"rank{rank}: codes out of range"
+    dist.destroy_process_group()
+
+
+class SidRqkmeansDistTest(unittest.TestCase):
+    """2-rank test for SidRqkmeans.on_train_end (gather -> fit -> broadcast)."""
+
+    def test_on_train_end_ddp(self) -> None:
+        port = misc_util.get_free_port()
+        ctx = mp.get_context("spawn")
+        procs = []
+        for rank in range(WORLD_SIZE):
+            p = ctx.Process(target=_on_train_end_worker, args=(rank, WORLD_SIZE, port))
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
 
 
 if __name__ == "__main__":
