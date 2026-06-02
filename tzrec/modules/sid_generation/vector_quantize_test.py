@@ -26,7 +26,8 @@ class VectorQuantizeTest(unittest.TestCase):
             ("ste_l2", QuantizeForwardMode.STE, "l2", True),
             ("ste_cosine", QuantizeForwardMode.STE, "cosine", True),
             ("ste_no_sinkhorn", QuantizeForwardMode.STE, "l2", False),
-            ("gumbel_l2", QuantizeForwardMode.GUMBEL_SOFTMAX, "l2", True),
+            # Gumbel must run without Sinkhorn (the combo is asserted against).
+            ("gumbel_l2", QuantizeForwardMode.GUMBEL_SOFTMAX, "l2", False),
         ]
     )
     def test_train_forward(self, _name, mode, distance_type, use_sinkhorn) -> None:
@@ -45,6 +46,16 @@ class VectorQuantizeTest(unittest.TestCase):
         self.assertEqual(out.ids.shape, (5,))
         self.assertTrue((out.ids >= 0).all() and (out.ids < 16).all())
         self.assertTrue(torch.isfinite(out.embeddings).all())
+
+    def test_sinkhorn_gumbel_combo_rejected(self) -> None:
+        """Sinkhorn + Gumbel would desync `ids` and `emb`; constructor rejects it."""
+        with self.assertRaisesRegex(AssertionError, "GUMBEL_SOFTMAX"):
+            VectorQuantize(
+                embed_dim=8,
+                n_embed=16,
+                forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
+                use_sinkhorn=True,
+            )
 
     def test_train_forward_backward_reaches_input(self) -> None:
         torch.manual_seed(0)

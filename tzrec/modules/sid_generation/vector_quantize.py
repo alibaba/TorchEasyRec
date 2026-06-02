@@ -142,6 +142,19 @@ class VectorQuantize(nn.Module):
         sinkhorn_epsilon: float = 10.0,
     ) -> None:
         super().__init__()
+        # Sinkhorn + Gumbel-Softmax pick the code by two different rules:
+        # `ids` come from the Sinkhorn balanced-assignment argmax, while the
+        # Gumbel branch builds `emb` from argmax(-distances + noise) (nearest
+        # code). The two indices generally disagree, so the saved SID would not
+        # match the codebook vector actually reconstructed/trained. STE avoids
+        # this by looking up embedding(ids) directly. Force a consistent combo.
+        _is_gumbel = forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
+        assert not (use_sinkhorn and _is_gumbel), (
+            "use_sinkhorn=True is incompatible with forward_mode=GUMBEL_SOFTMAX: "
+            "Sinkhorn drives `ids` (balanced assignment) while Gumbel drives "
+            "`emb` (nearest code), so the returned id and embedding diverge. "
+            "Use STE with Sinkhorn, or Gumbel-Softmax without Sinkhorn."
+        )
         self.embed_dim = embed_dim
         self.n_embed = n_embed
         self.forward_mode = forward_mode
