@@ -144,8 +144,6 @@ class SidRqvae(BaseSidModel):
             self._use_clip,
         )
 
-    # ----- encode / decode / loss helpers (formerly RQVAE) -----
-
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode. (B, input_dim) -> (B, embed_dim)."""
         return self._encoder(x)
@@ -154,14 +152,34 @@ class SidRqvae(BaseSidModel):
         """Decode. (B, embed_dim) -> (B, input_dim)."""
         return self._decoder(z_q)
 
-    def _recon_loss(self, x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """Mean reconstruction loss for the configured ``loss_type``."""
+    def _recon_loss(
+        self,
+        x_hat: torch.Tensor,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Reconstruction loss for the configured ``loss_type``.
+
+        Returns the mean over all rows, or — when ``mask`` (a per-row bool)
+        is given — the mean over only the masked-in rows (the mixed
+        recon+CLIP path applies recon loss to recon rows only). No
+        data-dependent branching, so it stays ``torch.compile``-friendly.
+
+        Args:
+            x_hat (Tensor): reconstructed output, shape (B, D).
+            x (Tensor): original input, shape (B, D).
+            mask (Tensor, optional): per-row bool; rows to include.
+        """
         if self._loss_type == "mse":
-            return F.mse_loss(x_hat, x, reduction="mean")
+            per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
         elif self._loss_type == "l1":
-            return F.l1_loss(x_hat, x, reduction="mean")
+            per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
         else:  # 'cosine'
-            return (1 - F.cosine_similarity(x_hat, x, dim=1)).mean()
+            per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
+        if mask is None:
+            return per_sample.mean()
+        mask = mask.float()
+        return (per_sample * mask).sum() / mask.sum().clamp(min=1)
 
     def _forward_rqvae(
         self, x: torch.Tensor, temperature: float = 1.0
@@ -182,22 +200,6 @@ class SidRqvae(BaseSidModel):
             "loss": recon_loss + quant_loss,
         }
 
-    def _masked_recon_loss(
-        self,
-        x_hat: torch.Tensor,
-        x: torch.Tensor,
-        recon_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Per-sample recon loss masked to recon rows (no data-dependent branch)."""
-        if self._loss_type == "mse":
-            per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
-        elif self._loss_type == "l1":
-            per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
-        else:  # 'cosine'
-            per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
-        n_recon = recon_mask.float().sum().clamp(min=1)
-        return (per_sample * recon_mask.float()).sum() / n_recon
-
     def _forward_mixed(
         self,
         fea1: torch.Tensor,
@@ -215,7 +217,7 @@ class SidRqvae(BaseSidModel):
         x_hat2 = self._decode(quant2.quantized_embeddings)
 
         recon_mask = ~clip_mask
-        recon_loss = self._masked_recon_loss(x_hat1, fea1, recon_mask)
+        recon_loss = self._recon_loss(x_hat1, fea1, recon_mask)
 
         features = {
             "image_embed": x_hat1,
@@ -237,8 +239,6 @@ class SidRqvae(BaseSidModel):
             "clip_loss": clip_result["clip_loss"],
             "commitment_loss": commitment,
         }
-
-    # ----- BaseModel interface -----
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
