@@ -11,7 +11,7 @@
 
 """BaseSidModel: shared base for semantic-ID generation models."""
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torchmetrics
@@ -105,7 +105,7 @@ class BaseSidModel(BaseModel):
 
     def update_train_metric(
         self,
-        predictions: dict,
+        predictions: Dict[str, torch.Tensor],
         batch: Batch,
     ) -> None:
         """Update train-path metric state.

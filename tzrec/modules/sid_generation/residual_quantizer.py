@@ -78,6 +78,7 @@ class ResidualQuantizer(nn.Module):
         normalize_residuals: bool = False,
     ) -> None:
         super().__init__()
+        assert n_layers >= 1, f"n_layers must be >= 1, got {n_layers}"
         self.embed_dim = embed_dim
         self.n_layers = n_layers
         self.normalize_residuals = normalize_residuals

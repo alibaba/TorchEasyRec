@@ -119,14 +119,21 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         self.assertIsNotNone(fq.books[0].grad)
         self.assertIsNone(x.grad)
 
-    def test_normalize_residuals_branch(self) -> None:
-        torch.manual_seed(0)
-        fq = _FakeQuantizer(
-            embed_dim=4, n_layers=2, n_embed=5, normalize_residuals=True
+    def test_normalize_residuals_changes_assignment(self) -> None:
+        # Same input and same codebook (re-seeded before each build), so the
+        # only difference is the normalize_residuals branch — it must change
+        # the residual a later layer sees and hence the codes it assigns.
+        x = torch.randn(8, 4)
+        torch.manual_seed(1)
+        fq_off = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=6)
+        torch.manual_seed(1)
+        fq_on = _FakeQuantizer(
+            embed_dim=4, n_layers=2, n_embed=6, normalize_residuals=True
         )
-        ids, agg, _ = fq._residual_pass(torch.randn(5, 4))
-        self.assertEqual(ids.shape, (5, 2))
-        self.assertEqual(agg.shape, (5, 4))
+        ids_off, _, _ = fq_off._residual_pass(x)
+        ids_on, _, _ = fq_on._residual_pass(x)
+        self.assertEqual(ids_on.shape, (8, 2))
+        self.assertFalse(torch.equal(ids_off, ids_on))
 
     def test_decode_codes_sum_and_dtype(self) -> None:
         torch.manual_seed(0)
