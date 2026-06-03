@@ -27,8 +27,10 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid_generation import ResidualKMeansQuantizer
 from tzrec.modules.sid_generation.kmeans import recon_diagnostics
+from tzrec.modules.sid_generation.residual_kmeans_quantizer import (
+    ResidualKMeansQuantizer,
+)
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
@@ -255,14 +257,18 @@ class SidRqkmeans(BaseSidModel):
             losses (dict, optional): a dict of loss.
         """
         if "input_embedding" in predictions:
-            mse, rel = recon_diagnostics(
+            _, rel = recon_diagnostics(
                 predictions["input_embedding"],
                 predictions["quantized"],
             )
-            self._metric_modules["mse"].update(mse)
+            # MeanSquaredError aggregates (preds, target) itself; rel_loss has
+            # no torchmetrics equivalent so it stays a MeanMetric.
+            self._metric_modules["mse"].update(
+                predictions["quantized"], predictions["input_embedding"]
+            )
             self._metric_modules["rel_loss"].update(rel)
 
-        self._update_unique_sid_ratio(predictions["codes"])
+        self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
 
     @torch.no_grad()
     def on_train_end(self) -> None:

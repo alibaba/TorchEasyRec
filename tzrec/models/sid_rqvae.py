@@ -327,7 +327,7 @@ class SidRqvae(BaseSidModel):
         # is intentionally eval-only: torch.unique(codes, dim=0).shape[0]
         # forces a GPU->host sync every step, and codebook coverage is a
         # diagnostic, not a training signal.
-        self._train_metric_modules["mse"] = torchmetrics.MeanMetric()
+        self._train_metric_modules["mse"] = torchmetrics.MeanSquaredError()
 
     def update_train_metric(
         self,
@@ -342,8 +342,7 @@ class SidRqvae(BaseSidModel):
         """
         if "x_hat" in predictions:
             embedding = self._extract_feature(batch)
-            mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
-            self._train_metric_modules["mse"].update(mse)
+            self._train_metric_modules["mse"].update(predictions["x_hat"], embedding)
 
     def update_metric(
         self,
@@ -360,7 +359,6 @@ class SidRqvae(BaseSidModel):
         """
         if "x_hat" in predictions:
             embedding = self._extract_feature(batch)
-            mse = F.mse_loss(predictions["x_hat"], embedding, reduction="mean")
-            self._metric_modules["mse"].update(mse)
+            self._metric_modules["mse"].update(predictions["x_hat"], embedding)
 
-        self._update_unique_sid_ratio(predictions["codes"])
+        self._metric_modules["unique_sid_ratio"].update(predictions["codes"])

@@ -18,6 +18,7 @@ import torchmetrics
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
 from tzrec.protos.model_pb2 import ModelConfig
 
@@ -100,8 +101,8 @@ class BaseSidModel(BaseModel):
         ``unique_sid_ratio``: codebook coverage = unique SIDs / batch size.
         Subclasses call ``super().init_metric()`` then add their extras.
         """
-        self._metric_modules["mse"] = torchmetrics.MeanMetric()
-        self._metric_modules["unique_sid_ratio"] = torchmetrics.MeanMetric()
+        self._metric_modules["mse"] = torchmetrics.MeanSquaredError()
+        self._metric_modules["unique_sid_ratio"] = UniqueRatio()
 
     def update_train_metric(
         self,
@@ -114,15 +115,3 @@ class BaseSidModel(BaseModel):
         with a meaningful train signal (RQ-VAE) override this.
         """
         return
-
-    def _update_unique_sid_ratio(self, codes: torch.Tensor) -> None:
-        """Update the codebook-coverage metric (unique SIDs / batch size).
-
-        Args:
-            codes (Tensor): semantic-ID codes, shape (B, n_layers).
-        """
-        B = codes.shape[0]
-        if B == 0:  # empty final shard under DDP/TorchRec
-            return
-        unique_sids = torch.unique(codes, dim=0).shape[0]
-        self._metric_modules["unique_sid_ratio"].update(unique_sids / B)
