@@ -122,5 +122,7 @@ class BaseSidModel(BaseModel):
             codes (Tensor): semantic-ID codes, shape (B, n_layers).
         """
         B = codes.shape[0]
+        if B == 0:  # empty final shard under DDP/TorchRec
+            return
         unique_sids = torch.unique(codes, dim=0).shape[0]
         self._metric_modules["unique_sid_ratio"].update(unique_sids / B)

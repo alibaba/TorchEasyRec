@@ -203,12 +203,10 @@ class ResidualQuantizer(nn.Module):
         Returns:
             Tensor: reconstructed embeddings, shape (B, embed_dim).
         """
-        quantized_sum = torch.zeros(
-            codes.shape[0],
-            self.embed_dim,
-            device=codes.device,
-            dtype=torch.float,
-        )
-        for i in range(self.n_layers):
+        # Seed from the first lookup so device and dtype follow the codebook
+        # (avoids pinning the sum to fp32 under mixed precision). n_layers >= 1
+        # is guaranteed by the codebook config.
+        quantized_sum = self._lookup_code(0, codes[:, 0])
+        for i in range(1, self.n_layers):
             quantized_sum = quantized_sum + self._lookup_code(i, codes[:, i])
         return quantized_sum

@@ -12,6 +12,7 @@
 import unittest
 
 import torch
+from torch import nn
 
 from tzrec.modules.sid_generation.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
@@ -59,6 +60,86 @@ class ResidualQuantizerBaseTest(unittest.TestCase):
         # decode_codes is concrete but delegates to the abstract _lookup_code.
         with self.assertRaises(NotImplementedError):
             rq.decode_codes(torch.zeros(3, 2, dtype=torch.long))
+
+
+class _FakeQuantizer(ResidualQuantizer):
+    """Minimal concrete subclass to exercise the base residual walk.
+
+    Implements only the two per-layer primitives over a learnable codebook,
+    so the base's _residual_pass / get_codes / decode_codes can be tested
+    without pulling in the K-Means or VQ backends.
+    """
+
+    def __init__(self, embed_dim, n_layers, n_embed=5, normalize_residuals=False):
+        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
+        self.books = nn.ParameterList(
+            [
+                nn.Parameter(torch.randn(self.n_embed_list[i], embed_dim))
+                for i in range(n_layers)
+            ]
+        )
+
+    def _quantize_layer(self, layer_idx, residual, temperature=1.0):
+        codes = (residual.detach() @ self.books[layer_idx].t()).argmax(dim=-1)
+        return codes, self.books[layer_idx][codes]
+
+    def _lookup_code(self, layer_idx, code_idx):
+        return self.books[layer_idx][code_idx]
+
+    def forward(self, input):
+        return self._residual_pass(input)
+
+    def get_codebook_embeddings(self, layer_idx):
+        return self.books[layer_idx]
+
+
+class ResidualQuantizerWalkTest(unittest.TestCase):
+    """Exercise the concrete residual walk the base owns (via a fake backend)."""
+
+    def test_residual_pass_shapes_and_aggregate(self) -> None:
+        torch.manual_seed(0)
+        fq = _FakeQuantizer(embed_dim=4, n_layers=3, n_embed=5)
+        x = torch.randn(6, 4)
+        ids, agg, cum = fq._residual_pass(x)
+        self.assertEqual(ids.shape, (6, 3))
+        self.assertEqual(fq.get_codes(x).shape, (6, 3))
+        manual = sum(fq._lookup_code(i, ids[:, i]) for i in range(3))
+        torch.testing.assert_close(agg, manual)  # aggregated == Σ quantized_i
+        self.assertTrue(torch.equal(cum[-1], agg))
+
+    def test_detach_invariant(self) -> None:
+        torch.manual_seed(0)
+        fq = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=5)
+        x = torch.randn(5, 4, requires_grad=True)
+        _, agg, _ = fq._residual_pass(x)
+        # Codebook grad flows, but the residual chain is detached, so the
+        # input receives no gradient.
+        self.assertTrue(agg.requires_grad)
+        agg.sum().backward()
+        self.assertIsNotNone(fq.books[0].grad)
+        self.assertIsNone(x.grad)
+
+    def test_normalize_residuals_branch(self) -> None:
+        torch.manual_seed(0)
+        fq = _FakeQuantizer(
+            embed_dim=4, n_layers=2, n_embed=5, normalize_residuals=True
+        )
+        ids, agg, _ = fq._residual_pass(torch.randn(5, 4))
+        self.assertEqual(ids.shape, (5, 2))
+        self.assertEqual(agg.shape, (5, 4))
+
+    def test_decode_codes_sum_and_dtype(self) -> None:
+        torch.manual_seed(0)
+        fq = _FakeQuantizer(embed_dim=4, n_layers=3, n_embed=5)
+        codes = torch.randint(0, 5, (6, 3))
+        recon = fq.decode_codes(codes)
+        self.assertEqual(recon.shape, (6, 4))
+        manual = sum(fq.books[i][codes[:, i]] for i in range(3))
+        torch.testing.assert_close(recon, manual)
+        # device/dtype follow the codebook (regression for the fp32-pin fix).
+        fq16 = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=5).to(torch.bfloat16)
+        recon16 = fq16.decode_codes(torch.randint(0, 5, (3, 2)))
+        self.assertEqual(recon16.dtype, torch.bfloat16)
 
 
 class ResidualVectorQuantizerTest(unittest.TestCase):
