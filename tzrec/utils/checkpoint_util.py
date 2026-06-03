@@ -14,8 +14,8 @@ import json
 import os
 import queue
 import re
-import tempfile
 import shutil
+import tempfile
 import threading
 import weakref
 from dataclasses import replace
