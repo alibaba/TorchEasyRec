@@ -35,12 +35,14 @@ class BaseSidModel(BaseModel):
       and the per-layer ``codebook`` (``_n_embed_list`` / ``_n_layers``),
     - reading the item-embedding feature out of ``Batch.dense_features``,
     - the eval metrics every SID model reports — reconstruction ``mse`` and
-      ``unique_sid_ratio`` (codebook coverage).
+      ``unique_sid_ratio`` (mean per-batch unique-SID ratio, a diversity
+      proxy).
 
     Subclasses build their quantizer in ``__init__`` (after calling
     ``super().__init__``) and implement :meth:`predict` and :meth:`loss`.
-    They extend :meth:`init_metric` / :meth:`update_metric` with any
-    backend-specific metrics.
+    They extend :meth:`init_metric` (via ``super()``) and implement
+    :meth:`update_metric` to populate the registered metrics
+    (:meth:`update_train_metric` defaults to a no-op).
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -98,8 +100,9 @@ class BaseSidModel(BaseModel):
         """Initialize the eval metrics shared by all SID models.
 
         ``mse``: reconstruction error (input vs. quantized / decoded).
-        ``unique_sid_ratio``: codebook coverage = unique SIDs / batch size.
-        Subclasses call ``super().init_metric()`` then add their extras.
+        ``unique_sid_ratio``: mean per-batch unique-SID ratio (distinct rows /
+        batch size; a batch-size-sensitive diversity proxy, not global
+        coverage). Subclasses call ``super().init_metric()`` then add extras.
         """
         self._metric_modules["mse"] = torchmetrics.MeanSquaredError()
         self._metric_modules["unique_sid_ratio"] = UniqueRatio()

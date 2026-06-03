@@ -14,12 +14,14 @@ from torchmetrics import Metric
 
 
 class UniqueRatio(Metric):
-    """Codebook-coverage metric: mean of per-batch (unique rows / batch size).
+    """Mean per-batch unique-SID ratio (distinct rows / batch size).
 
-    Each ``update`` counts the unique rows of a ``(B, n_layers)`` semantic-ID
-    code tensor and accumulates the per-batch ratio; ``compute`` returns the
-    running mean. Empty batches (``B == 0``, e.g. an empty final DDP/TorchRec
-    shard) are skipped. States reduce by ``sum`` across ranks.
+    Averages, over batches, the fraction of distinct semantic-ID rows in each
+    batch. It is a cheap (two-scalar state) **diversity proxy**, NOT global
+    codebook coverage: a SID repeated across different batches counts as
+    distinct in each, and smaller batches bias the value toward 1.0. Empty
+    batches are skipped; the per-rank sums reduce by ``sum`` (a count-weighted
+    mean).
     """
 
     higher_is_better = True
@@ -31,7 +33,7 @@ class UniqueRatio(Metric):
         self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
     def update(self, codes: torch.Tensor) -> None:
-        """Accumulate the unique-ratio of one batch of codes.
+        """Accumulate one batch's distinct-row ratio.
 
         Args:
             codes (Tensor): semantic-ID codes, shape (B, n_layers).

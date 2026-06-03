@@ -17,10 +17,17 @@ from tzrec.metrics.unique_ratio import UniqueRatio
 
 
 class UniqueRatioTest(unittest.TestCase):
-    def test_known_duplicates(self) -> None:
+    def test_single_batch_ratio(self) -> None:
         metric = UniqueRatio()
-        # 3 unique rows out of 4 -> 0.75.
+        # 3 distinct rows out of 4 -> 0.75.
         metric.update(torch.tensor([[1, 2], [1, 2], [3, 4], [5, 6]]))
+        self.assertAlmostEqual(metric.compute().item(), 0.75, places=6)
+
+    def test_mean_over_batches(self) -> None:
+        metric = UniqueRatio()
+        metric.update(torch.tensor([[1, 1], [1, 1]]))  # 1/2 = 0.5
+        metric.update(torch.tensor([[1, 1], [2, 2]]))  # 2/2 = 1.0
+        # Per-batch mean = 0.75 (a global distinct/total would give 0.5).
         self.assertAlmostEqual(metric.compute().item(), 0.75, places=6)
 
     def test_empty_batch_skipped(self) -> None:
@@ -28,12 +35,6 @@ class UniqueRatioTest(unittest.TestCase):
         metric.update(torch.empty(0, 3, dtype=torch.long))
         self.assertEqual(metric.count.item(), 0.0)
         self.assertTrue(torch.isnan(metric.compute()))
-
-    def test_mean_over_batches(self) -> None:
-        metric = UniqueRatio()
-        metric.update(torch.tensor([[1, 1], [1, 1]]))  # 1/2 = 0.5
-        metric.update(torch.tensor([[1, 1], [2, 2]]))  # 2/2 = 1.0
-        self.assertAlmostEqual(metric.compute().item(), 0.75, places=6)  # mean
 
 
 if __name__ == "__main__":
