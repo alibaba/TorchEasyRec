@@ -88,6 +88,15 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         codes = self.rvq.get_codes(torch.randn(4, 8))
         self.assertEqual(codes.shape, (4, 3))
 
+    def test_forward_get_codes_consistent_eval(self) -> None:
+        """get_codes (shared base walk) matches forward's ids in eval."""
+        self.rvq.eval()
+        x = torch.randn(6, 8)
+        fwd_ids = self.rvq(x).cluster_ids
+        gc_ids = self.rvq.get_codes(x)
+        self.assertFalse(gc_ids.requires_grad)
+        torch.testing.assert_close(gc_ids, fwd_ids)
+
     def test_faiss_kmeans_init_seeds_codebook(self) -> None:
         try:
             import faiss  # noqa: F401
@@ -179,6 +188,23 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertTrue((codes >= 0).all() and (codes < 8).all())
         recon = rkq.decode_codes(codes)  # inherited from the base
         self.assertEqual(recon.shape, (5, 4))
+
+    def test_forward_get_codes_consistent(self) -> None:
+        """Forward ids and get_codes both route through the shared walk."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        torch.manual_seed(0)
+        rkq = ResidualKMeansQuantizer(
+            embed_dim=4, n_layers=3, n_embed=8, faiss_kmeans_kwargs={"niter": 5}
+        )
+        rkq.train_offline(torch.randn(256, 4), verbose=False)
+        x = torch.randn(9, 4)
+        fwd_ids, fwd_quant = rkq(x)
+        torch.testing.assert_close(rkq.get_codes(x), fwd_ids)
+        # forward's residual-sum equals the centroid-sum reconstruction.
+        torch.testing.assert_close(fwd_quant, rkq.decode_codes(fwd_ids))
 
 
 if __name__ == "__main__":

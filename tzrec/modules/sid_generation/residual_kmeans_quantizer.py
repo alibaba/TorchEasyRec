@@ -76,12 +76,42 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ]
         )
 
+    def _quantize_layer(
+        self,
+        layer_idx: int,
+        residual: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Nearest-centroid assignment for one layer.
+
+        Uninitialized layers (before ``train_offline``) return zeros, so the
+        residual walk is a no-op and the model stays callable. ``temperature``
+        is unused (no soft assignment).
+
+        Args:
+            layer_idx (int): quantization layer index.
+            residual (Tensor): current residual, shape (B, D).
+            temperature (float): unused.
+
+        Returns:
+            codes (Tensor): cluster indices, shape (B,).
+            quantized (Tensor): selected centroids, shape (B, D).
+        """
+        layer = self.layers[layer_idx]
+        if not layer.is_initialized:
+            codes = torch.zeros(
+                residual.shape[0], dtype=torch.long, device=residual.device
+            )
+            return codes, torch.zeros_like(residual)
+        codes = layer.predict(residual)
+        return codes, layer.centroids[codes]
+
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assign codes per layer and sum the centroids.
 
         Codebook is read-only here; training happens in ``train_offline``.
-        Uninitialized layers return dummy zeros so the model is callable
-        before the one-shot FAISS fit completes.
+        Uninitialized layers contribute zeros (see :meth:`_quantize_layer`) so
+        the model is callable before the one-shot FAISS fit completes.
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
@@ -90,44 +120,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             codes (Tensor): cluster indices per layer, shape (B, n_layers).
             quantized (Tensor): sum of quantized embeddings, shape (B, D).
         """
-        residual = input
-        all_codes: List[torch.Tensor] = []
-        quantized_sum = torch.zeros_like(input)
-
-        for layer in self.layers:
-            if self.normalize_residuals:
-                residual = F.normalize(residual, dim=-1)
-
-            if layer.is_initialized:
-                codes = layer.predict(residual)
-                quantized = layer.centroids[codes]
-                residual = residual - quantized
-                quantized_sum = quantized_sum + quantized
-            else:
-                codes = torch.zeros(
-                    input.shape[0], dtype=torch.long, device=input.device
-                )
-            all_codes.append(codes)
-
-        cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
+        cluster_ids, quantized_sum, _ = self._residual_pass(input)
         return cluster_ids, quantized_sum
-
-    @torch.no_grad()
-    def get_codes(self, input: torch.Tensor) -> torch.Tensor:
-        """Assign semantic IDs without updating centroids."""
-        residual = input
-        all_codes: List[torch.Tensor] = []
-
-        for layer in self.layers:
-            if self.normalize_residuals:
-                residual = F.normalize(residual, dim=-1)
-
-            codes = layer.predict(residual)
-            all_codes.append(codes)
-            quantized = layer.centroids[codes]
-            residual = residual - quantized
-
-        return torch.stack(all_codes, dim=-1)
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:

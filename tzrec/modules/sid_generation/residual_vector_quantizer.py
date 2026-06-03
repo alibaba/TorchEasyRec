@@ -11,7 +11,7 @@
 
 """ResidualVectorQuantizer: multi-layer residual VQ with gradient training."""
 
-from typing import List, Sequence, Union
+from typing import List, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -276,6 +276,30 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
 
+    def _quantize_layer(
+        self,
+        layer_idx: int,
+        residual: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize one layer's residual via its ``VectorQuantize`` layer.
+
+        Returns the raw (un-STE'd) codebook vector so gradient still flows into
+        the codebook; STE is applied once on the aggregate in :meth:`forward`.
+
+        Args:
+            layer_idx (int): quantization layer index.
+            residual (Tensor): current residual, shape (B, D).
+            temperature (float): Gumbel-Softmax temperature.
+
+        Returns:
+            ids (Tensor): per-layer cluster ids, shape (B,).
+            raw_emb (Tensor): raw codebook vectors (with grad), shape (B, D).
+        """
+        layer = self.layers[layer_idx]
+        out = layer(residual, temperature=temperature)
+        return out.ids, layer.embedding(out.ids)
+
     def forward(
         self,
         input: torch.Tensor,
@@ -285,11 +309,11 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Training flow:
             1. If kmeans_init and not initialized -> init_embed_(input)
-            2. For each layer: quantize detached residual, accumulate
-               into aggregated_quants and compute per-layer commitment loss
-               in-place (avoids storing a quant_list of clones).
-            3. Mean of per-layer commitment losses (cos/l2 with latent_weight)
-            4. STE gradient pass-through (or rotation trick)
+            2. Shared residual walk (:meth:`_residual_pass`) over the detached
+               input: per-layer assign + grad-carrying accumulation.
+            3. Mean of per-layer commitment losses over the cumulative quants
+               (cos/l2 with latent_weight).
+            4. STE gradient pass-through (or rotation trick).
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
@@ -303,36 +327,17 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if self.training:
             self.init_embed_(input)
 
-        # Detach residual for VQ assignment (gradient flows via STE only).
-        residual = input.detach()
-        all_ids: List[torch.Tensor] = []
-        commitment_loss_list: List[torch.Tensor] = []
-        aggregated_quants = torch.zeros_like(input)
-
-        # Step 2: per-layer residual quantization
-        for layer in self.layers:
-            if self.normalize_residuals:
-                residual = F.normalize(residual, dim=-1)
-
-            quantized = layer(residual, temperature=temperature)
-            all_ids.append(quantized.ids)
-
-            # Separate raw lookup: ``quantized.embeddings`` already applies
-            # STE (gradient -> encoder), but the commitment loss + residual
-            # update need the un-STE'd codebook vector with gradient still
-            # flowing into ``layer.embedding.weight``.
-            raw_emb = layer.embedding(quantized.ids)
-            residual = residual - raw_emb.detach()
-            aggregated_quants = aggregated_quants + raw_emb
-
-            commitment_loss_list.append(
-                self._single_commitment_loss(input, aggregated_quants)
-            )
-
-        cluster_ids = torch.stack(all_ids, dim=-1)  # (B, n_layers)
+        # Step 2: shared residual walk on the detached input (encoder grad
+        # flows only via the STE in step 4; the accumulated quants keep grad
+        # so the codebook still trains). cumulative[i] = sum after layer i.
+        cluster_ids, aggregated_quants, cumulative = self._residual_pass(
+            input.detach(), temperature
+        )
 
         # Step 3: aggregate per-layer commitment loss
-        commitment_loss = torch.mean(torch.stack(commitment_loss_list))
+        commitment_loss = torch.mean(
+            torch.stack([self._single_commitment_loss(input, c) for c in cumulative])
+        )
 
         # Step 4: STE or rotation trick (quants_trunc = final accumulated)
         quants_trunc = aggregated_quants
@@ -347,19 +352,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             quantized_embeddings=quants_trunc,
             quantization_loss=commitment_loss,
         )
-
-    @torch.no_grad()
-    def get_codes(self, input: torch.Tensor) -> torch.Tensor:
-        """Assign semantic IDs without gradient computation.
-
-        Args:
-            input (Tensor): input embeddings, shape (B, D).
-
-        Returns:
-            Tensor: cluster ids, shape (B, n_layers).
-        """
-        output = self.forward(input)
-        return output.cluster_ids
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:

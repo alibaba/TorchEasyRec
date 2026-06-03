@@ -11,10 +11,11 @@
 
 """ResidualQuantizer: abstract base for multi-layer residual quantizers."""
 
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def normalize_n_embed(n_embed: Union[int, List[int]], n_layers: int) -> List[int]:
@@ -54,10 +55,12 @@ class ResidualQuantizer(nn.Module):
     Semantic ID = (code_0, code_1, ..., code_{n_layers-1}).
 
     This base owns the structural invariants (``embed_dim``, ``n_layers``,
-    per-layer codebook sizes, residual normalization toggle) and the
-    backend-agnostic :meth:`decode_codes` / :meth:`output_dim`. Subclasses
-    build ``self.layers`` and implement :meth:`forward`, :meth:`get_codes`,
-    :meth:`get_codebook_embeddings`, and :meth:`_lookup_code`.
+    per-layer codebook sizes, residual normalization toggle) and the shared
+    residual walk (:meth:`_residual_pass`, :meth:`get_codes`,
+    :meth:`decode_codes`, :meth:`output_dim`). Subclasses build ``self.layers``
+    and implement the per-layer primitives :meth:`_quantize_layer` (encode) and
+    :meth:`_lookup_code` (decode), plus :meth:`forward` and
+    :meth:`get_codebook_embeddings`.
 
     Args:
         embed_dim (int): feature / codebook dimension.
@@ -90,9 +93,69 @@ class ResidualQuantizer(nn.Module):
         """Assign codes per layer and accumulate the quantized output."""
         raise NotImplementedError
 
+    def _quantize_layer(
+        self,
+        layer_idx: int,
+        residual: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Assign one layer's codes and look up its quantized vector.
+
+        Backend primitive behind the residual walk (encode-direction mirror of
+        :meth:`_lookup_code`). ``temperature`` is used only by the VQ backend.
+
+        Args:
+            layer_idx (int): quantization layer index.
+            residual (Tensor): current residual, shape (B, D).
+            temperature (float): Gumbel-Softmax temperature (VQ only).
+
+        Returns:
+            codes (Tensor): per-layer cluster ids, shape (B,).
+            quantized (Tensor): the layer's quantized vector, shape (B, D).
+        """
+        raise NotImplementedError
+
+    def _residual_pass(
+        self,
+        input: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Shared residual walk: per-layer assign, subtract, accumulate.
+
+        The quantized vector is subtracted detached (keeps the residual chain
+        gradient-free) and accumulated (keeps gradient when the backend
+        supplies it, e.g. VQ).
+
+        Args:
+            input (Tensor): input embeddings, shape (B, D).
+            temperature (float): forwarded to :meth:`_quantize_layer`.
+
+        Returns:
+            cluster_ids (Tensor): stacked codes, shape (B, n_layers).
+            aggregated (Tensor): sum of quantized vectors, shape (B, D).
+            cumulative (List[Tensor]): running sum after each layer
+                (``cumulative[-1] is aggregated``).
+        """
+        residual = input
+        all_codes: List[torch.Tensor] = []
+        cumulative: List[torch.Tensor] = []
+        aggregated = torch.zeros_like(input)
+        for i in range(self.n_layers):
+            if self.normalize_residuals:
+                residual = F.normalize(residual, dim=-1)
+            codes, quantized = self._quantize_layer(i, residual, temperature)
+            all_codes.append(codes)
+            aggregated = aggregated + quantized
+            cumulative.append(aggregated)
+            residual = residual - quantized.detach()
+        cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
+        return cluster_ids, aggregated, cumulative
+
     @torch.no_grad()
     def get_codes(self, input: torch.Tensor) -> torch.Tensor:
         """Assign semantic IDs without updating the codebook.
+
+        Shared encode-direction mirror of :meth:`decode_codes`.
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
@@ -100,7 +163,8 @@ class ResidualQuantizer(nn.Module):
         Returns:
             Tensor: cluster ids, shape (B, n_layers).
         """
-        raise NotImplementedError
+        cluster_ids, _, _ = self._residual_pass(input)
+        return cluster_ids
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:
