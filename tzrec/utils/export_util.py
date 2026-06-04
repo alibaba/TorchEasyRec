@@ -54,6 +54,7 @@ from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
+from tzrec.datasets.data_parser import _tile_size
 from tzrec.features.feature import (
     BaseFeature,
     create_feature_configs,
@@ -94,6 +95,11 @@ def ensure_input_tile_for_distributed_embedding() -> None:
             f"got INPUT_TILE={current_input_tile}. Overriding to 3."
         )
         os.environ["INPUT_TILE"] = "3"
+
+
+def _is_input_tile_user_keyed_tensor(name: str) -> bool:
+    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
+    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
 
 
 def export_model(
@@ -1340,7 +1346,17 @@ def export_distributed_embedding(
                 continue
             node_kt = node.args[1]
             with graph.inserting_after(node_kt):
-                outputs[name] = graph.call_method("values", args=(node_kt,))
+                kt_values = node_kt.kwargs.get("values")
+                if (
+                    _is_input_tile_user_keyed_tensor(name)
+                    and getattr(kt_values, "op", None) == "call_method"
+                    and kt_values.target == "tile"
+                ):
+                    # Serving supplies raw user-side embedding values with batch=1.
+                    # Keep sparse output raw as well; the dense model owns tiling.
+                    outputs[name] = kt_values.args[0]
+                else:
+                    outputs[name] = graph.call_method("values", args=(node_kt,))
                 output_attrs[name + "__length_per_key"] = graph.call_method(
                     "length_per_key", args=(node_kt,)
                 )
@@ -1450,12 +1466,23 @@ def export_distributed_embedding(
                 getitem_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
+                values_node = getitem_node
+                if _is_input_tile_user_keyed_tensor(name):
+                    batch_size_node = graph.call_function(
+                        operator.getitem, args=(input_node, "batch_size")
+                    )
+                    tile_size_node = graph.call_function(
+                        _tile_size, args=(batch_size_node,)
+                    )
+                    values_node = graph.call_method(
+                        "tile", args=(getitem_node, tile_size_node, 1)
+                    )
                 new_node = graph.call_function(
                     KeyedTensor,
                     kwargs={
                         "keys": sparse_attrs[name + "__keys"],
                         "length_per_key": sparse_attrs[name + "__length_per_key"],
-                        "values": getitem_node,
+                        "values": values_node,
                     },
                 )
                 dense_graph_config[name] = [
