@@ -14,7 +14,7 @@ import unittest
 import torch
 from torch import nn
 
-from tzrec.modules.sid_generation.residual_quantizer import (
+from tzrec.modules.sid.residual_quantizer import (
     ResidualQuantizer,
     normalize_n_embed,
 )
