@@ -14,8 +14,8 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.sid_generation.types import QuantizeForwardMode
-from tzrec.modules.sid_generation.vector_quantize import VectorQuantize
+from tzrec.modules.sid.types import QuantizeForwardMode
+from tzrec.modules.sid.vector_quantize import VectorQuantize
 
 
 class VectorQuantizeTest(unittest.TestCase):

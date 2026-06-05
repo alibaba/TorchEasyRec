@@ -18,8 +18,8 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.kmeans import _squared_euclidean_distance
-from tzrec.modules.sid_generation.types import (
+from tzrec.modules.sid.kmeans import _squared_euclidean_distance
+from tzrec.modules.sid.types import (
     QuantizeForwardMode,
     QuantizeOutput,
 )

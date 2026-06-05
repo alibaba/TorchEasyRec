@@ -14,17 +14,17 @@ import unittest
 import torch
 from torch import nn
 
-from tzrec.modules.sid_generation.residual_kmeans_quantizer import (
+from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
-from tzrec.modules.sid_generation.residual_quantizer import (
+from tzrec.modules.sid.residual_quantizer import (
     ResidualQuantizer,
     normalize_n_embed,
 )
-from tzrec.modules.sid_generation.residual_vector_quantizer import (
+from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
-from tzrec.modules.sid_generation.types import ResidualQuantizerOutput
+from tzrec.modules.sid.types import ResidualQuantizerOutput
 
 
 class NormalizeNEmbedTest(unittest.TestCase):

@@ -13,7 +13,7 @@ import unittest
 
 import torch
 
-from tzrec.modules.sid_generation.kmeans import (
+from tzrec.modules.sid.kmeans import (
     KMeansLayer,
     _squared_euclidean_distance,
     faiss_residual_kmeans,

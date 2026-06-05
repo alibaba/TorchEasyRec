@@ -22,8 +22,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.kmeans import KMeansLayer, recon_diagnostics
-from tzrec.modules.sid_generation.residual_quantizer import ResidualQuantizer
+from tzrec.modules.sid.kmeans import KMeansLayer, recon_diagnostics
+from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.utils.logging_util import logger
 
 

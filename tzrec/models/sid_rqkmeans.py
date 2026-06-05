@@ -27,8 +27,8 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid_generation.kmeans import recon_diagnostics
-from tzrec.modules.sid_generation.residual_kmeans_quantizer import (
+from tzrec.modules.sid.kmeans import recon_diagnostics
+from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
 from tzrec.protos.model_pb2 import ModelConfig

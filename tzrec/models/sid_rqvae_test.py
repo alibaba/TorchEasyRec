@@ -310,7 +310,7 @@ class SidRqvaeTest(unittest.TestCase):
 
         Previously ``"l1"`` silently fell through to the L2 branch.
         """
-        from tzrec.modules.sid_generation.residual_vector_quantizer import (
+        from tzrec.modules.sid.residual_vector_quantizer import (
             ResidualVectorQuantizer,
         )
 
@@ -374,7 +374,7 @@ class SidRqvaeTest(unittest.TestCase):
 
     def test_commitment_loss_invalid_raises(self) -> None:
         """ResidualVectorQuantizer rejects unknown commitment_loss spellings."""
-        from tzrec.modules.sid_generation.residual_vector_quantizer import (
+        from tzrec.modules.sid.residual_vector_quantizer import (
             ResidualVectorQuantizer,
         )
 

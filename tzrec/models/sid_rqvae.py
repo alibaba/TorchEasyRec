@@ -29,7 +29,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.clip_loss import MaskedCLIPLoss
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid_generation.residual_vector_quantizer import (
+from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
 from tzrec.protos.model_pb2 import ModelConfig

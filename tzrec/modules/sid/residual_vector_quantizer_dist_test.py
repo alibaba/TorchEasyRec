@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tzrec.modules.sid_generation.residual_vector_quantizer import (
+from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
 from tzrec.utils import misc_util

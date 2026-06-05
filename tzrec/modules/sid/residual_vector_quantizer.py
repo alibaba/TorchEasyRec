@@ -18,13 +18,13 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid_generation.kmeans import faiss_residual_kmeans
-from tzrec.modules.sid_generation.residual_quantizer import ResidualQuantizer
-from tzrec.modules.sid_generation.types import (
+from tzrec.modules.sid.kmeans import faiss_residual_kmeans
+from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
+from tzrec.modules.sid.types import (
     QuantizeForwardMode,
     ResidualQuantizerOutput,
 )
-from tzrec.modules.sid_generation.vector_quantize import VectorQuantize
+from tzrec.modules.sid.vector_quantize import VectorQuantize
 from tzrec.utils.logging_util import logger
 
 
