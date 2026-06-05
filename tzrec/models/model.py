@@ -150,6 +150,15 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric_results[metric_name] = metric.compute()
         return metric_results
 
+    def on_train_end(self) -> None:
+        """Hook fired once after the train_eval loop exits.
+
+        Default: no-op. Override in models that need one-shot end-of-loop
+        work — e.g. :class:`SidRqkmeans` uses this hook to fit the FAISS
+        codebook from the embedding sample it collected during training.
+        """
+        pass
+
     def sparse_parameters(
         self,
     ) -> Tuple[Iterable[nn.Parameter], Iterable[nn.Parameter]]:

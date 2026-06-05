@@ -1,0 +1,31 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "google/protobuf/struct.proto";
+
+message SidRqkmeans {
+    // Input embedding dimension (K-Means runs directly on raw embeddings,
+    // no encoder).
+    optional uint32 input_dim = 1 [default = 512];
+    // Per-layer cluster counts, e.g. [256, 256, 256].
+    // List length is the number of residual quantization layers. Entries
+    // may differ per layer (non-uniform codebooks such as [256, 512, 1024]
+    // are supported — the FAISS backend fits a separate ``faiss.Kmeans``
+    // per layer).
+    repeated uint32 codebook = 3;
+    // L2-normalize residuals before each layer.
+    optional bool normalize_residuals = 4 [default = true];
+    // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a
+    // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
+    // spherical: false, seed: 1234}.
+    optional google.protobuf.Struct faiss_kmeans_kwargs = 5;
+    // Target number of embeddings to reservoir-sample for the FAISS fit
+    // (global, across all ranks). Bounds host memory regardless of corpus
+    // size. 0 (the default) auto-derives it as K * max_points_per_centroid
+    // — exactly what FAISS subsamples to internally (default 256), so no
+    // training points are wasted.
+    optional uint32 train_sample_size = 6 [default = 0];
+
+    // Name of the item embedding feature inside the input Batch.
+    optional string embedding_feature_name = 40 [default = "item_emb"];
+}

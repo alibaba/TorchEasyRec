@@ -5,6 +5,7 @@ import "tzrec/protos/models/rank_model.proto";
 import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
 import "tzrec/protos/models/general_rank_model.proto";
+import "tzrec/protos/models/sid_model.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
@@ -76,6 +77,10 @@ message ModelConfig {
         TDM tdm = 400;
 
         RocketLaunching rocket_launching = 500;
+
+        // SID generation models
+        // (600 is reserved for SidRqvae, arriving in the follow-up PR)
+        SidRqkmeans sid_rqkmeans = 601;
     }
 
     optional uint32 num_class = 2 [default = 1];
