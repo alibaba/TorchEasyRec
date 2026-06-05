@@ -80,7 +80,7 @@ MMoE模型每个塔的指标为：指标名+ "\_" + tower_name
 
 ## 示例Config
 
-[mmoe_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/mmoe_taobao.config)
+[mmoe_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/mmoe_taobao.config)
 
 ## 参考论文
 

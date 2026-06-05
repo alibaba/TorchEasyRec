@@ -15,7 +15,7 @@
 1. 获取并执行脚本来创建数据表并上传数据至MaxCompute
 
 ```bash
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/data/quick_start/upload_data.sh
+wget https://tzrec.oss-accelerate.aliyuncs.com/data/quick_start/upload_data.sh
 bash upload_data.sh ${ODPS_PROJECT_NAME}
 ```
 
@@ -28,7 +28,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 ### 配置文件
 
-配置文件以DIN为例 [multi_tower_din_taobao_dlc_mc.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config)
+配置文件以DIN为例 [multi_tower_din_taobao_dlc_mc.config](https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config)
 
 ### 配置任务
 
@@ -50,7 +50,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 ```bash
 cd /mnt/data
-wget https://tzrec.oss-cn-beijing.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config
+wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config
 # 安装tzrec并启动训练
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \

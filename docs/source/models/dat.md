@@ -78,7 +78,7 @@ model_config {
 
 ## 示例Config
 
-[dat_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dat_taobao.config)
+[dat_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/dat_taobao.config)
 
 ## 参考论文
 

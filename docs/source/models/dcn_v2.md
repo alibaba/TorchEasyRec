@@ -74,7 +74,7 @@ model_config {
 
 ### 示例Config
 
-[dcn_v2_demo.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/dcn_v2_criteo.config)
+[dcn_v2_demo.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/dcn_v2_criteo.config)
 
 ### 参考论文
 

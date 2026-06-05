@@ -542,7 +542,7 @@ feature_configs {
 
 - **text_normalizer**: 可选，是否对文本进行归一化
 
-  - **stop_char_file**: 停用词表路径，默认为系统内置，详见[stop_char](https://tzrec.oss-cn-beijing.aliyuncs.com/third_party/stop_char)
+  - **stop_char_file**: 停用词表路径，默认为系统内置，详见[stop_char](https://tzrec.oss-accelerate.aliyuncs.com/third_party/stop_char)
   - **norm_options**: 归一化选项，默认为TEXT_LOWER2UPPER, TEXT_SBC2DBC, TEXT_CHT2CHS, TEXT_FILTER
 
   | 方式              | 描述                   |

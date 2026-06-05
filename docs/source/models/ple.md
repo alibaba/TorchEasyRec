@@ -110,7 +110,7 @@ model_config {
 
 ## 示例Config
 
-[ple_taobao.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/ple_taobao.config)
+[ple_taobao.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/ple_taobao.config)
 
 ## 参考论文
 
