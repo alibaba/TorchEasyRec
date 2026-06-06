@@ -12,6 +12,7 @@
 from typing import Optional
 
 import torch
+from torch.fx._symbolic_trace import is_fx_tracing
 
 from tzrec.utils.logging_util import logger
 
@@ -26,6 +27,117 @@ except ImportError as e:
     hstu_attn_varlen_func = None  # type: ignore[assignment]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+# Highest fp8_quant_mode the wheel accepts (0..5 are FP8 modes; -1 = off).
+_MAX_FP8_QUANT_MODE = 5
+
+
+def _assert_fp8_capable(fp8_quant_mode: int) -> None:
+    """Raise unless the (arch, quant_mode) pair has an FP8 kernel in the wheel.
+
+    The wheel's dispatcher (``cuda_hstu_attention.HstuAttnVarlenFunc.forward``)
+    only routes to an FP8 kernel for SM90 (Hopper, modes 0..5) and SM120
+    (Blackwell RTX, mode 2 only -- forward-only). SM80 (Ampere) and SM100
+    (Blackwell datacenter) have no FP8 kernel; on SM120 with quant_mode != 2
+    the dispatcher silently falls through to the SM80 bf16/fp16 path, so we
+    must reject that here.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "FP8 HSTU attention (fp8_quant_mode >= 0) requires a CUDA SM90 "
+            "(Hopper) or SM120 (Blackwell RTX) GPU; no CUDA device is available."
+        )
+    major = torch.cuda.get_device_capability()[0]
+    if major == 9:
+        return  # Hopper: all modes 0..5 supported (fwd + bwd).
+    if major == 12:
+        if fp8_quant_mode != 2:
+            raise RuntimeError(
+                "FP8 HSTU attention on SM120 (Blackwell RTX) only supports "
+                f"fp8_quant_mode=2 (per-block, forward-only); got "
+                f"fp8_quant_mode={fp8_quant_mode}."
+            )
+        return
+    raise RuntimeError(
+        "FP8 HSTU attention requires SM90 (Hopper) or SM120 (Blackwell RTX); "
+        f"got device capability major version {major}."
+    )
+
+
+@torch.library.custom_op("tzrec::cutlass_hstu_fp8_fwd", mutates_args=())
+def cutlass_hstu_fp8_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    max_seq_len: int,
+    scaling_seqlen: int,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+    fp8_quant_mode: int,
+    attn_func: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Opaque FP8 HSTU forward for torch.export / AOTInductor.
+
+    The wheel's ``hstu_attn_varlen_func`` quantizes q/k/v in Python before
+    dispatching to the registered ``fbgemm::hstu_varlen_fwd_90`` op. For
+    block/head/batch/tensor FP8 modes that quantization iterates over
+    per-sample lengths derived from ``cu_seqlens`` and produces descale
+    tensors whose block-count dim is data-dependent. Tracing through it
+    raises ``GuardOnDataDependentSymNode`` (export) or, once the quantizer
+    is itself wrapped, leaves unbacked-SymInt-shaped descales in the graph
+    that AOTI mis-sizes at runtime. Wrapping the whole forward as one custom
+    op keeps all quantization + descales internal: the exported graph sees
+    only this op returning a tensor of ``v``'s shape, and the real Python
+    quantization runs unchanged inside the op at predict time.
+
+    Only used on the export path (see ``cutlass_hstu_mha``); eager training
+    keeps calling ``hstu_attn_varlen_func`` directly so autograd is intact.
+    """
+    return hstu_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=max_seq_len,
+        max_seqlen_k=max_seq_len,
+        scaling_seqlen=scaling_seqlen,
+        num_contexts=num_contexts,
+        num_targets=num_targets,
+        target_group_size=1,
+        window_size=(window_size_left, window_size_right),
+        alpha=alpha,
+        rab=None,
+        has_drab=False,
+        func=attn_func,
+        quant_mode=fp8_quant_mode,
+    )
+
+
+@cutlass_hstu_fp8_fwd.register_fake
+def _cutlass_hstu_fp8_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    max_seq_len: int,
+    scaling_seqlen: int,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+    fp8_quant_mode: int,
+    attn_func: Optional[torch.Tensor],
+) -> torch.Tensor:
+    # FP8 attention returns a bf16/fp16 output of v's shape (the kernel
+    # dequantizes internally). No data-dependent dims escape this op.
+    return v.new_empty(v.shape, dtype=v.dtype)
 
 
 @torch.fx.wrap
@@ -42,6 +154,7 @@ def cutlass_hstu_mha(
     contextual_seq_len: int = 0,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    fp8_quant_mode: int = -1,
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
@@ -82,10 +195,23 @@ def cutlass_hstu_mha(
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
+        fp8_quant_mode: FP8 quantization mode forwarded to the wheel.
+            ``-1`` (default) keeps q/k/v in bf16/fp16 (no FP8). ``0..5``
+            select an FP8 mode (0 per-tensor, 1 two-direction, 2 per-block,
+            3 per-head, 4 per-batch, 5 global); the wheel quantizes q/k/v
+            internally. FP8 requires SM90 (Hopper, all modes, fwd+bwd) or
+            SM120 (Blackwell RTX, ``quant_mode=2`` only, forward-only).
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
     """
+    if fp8_quant_mode < -1 or fp8_quant_mode > _MAX_FP8_QUANT_MODE:
+        raise ValueError(
+            f"fp8_quant_mode must be in [-1, {_MAX_FP8_QUANT_MODE}]; "
+            f"got {fp8_quant_mode}."
+        )
+    if fp8_quant_mode >= 0 and not is_fx_tracing():
+        _assert_fp8_capable(fp8_quant_mode)
     if hstu_attn_varlen_func is None:
         raise RuntimeError(
             "fbgemm_gpu_hstu wheel is not installed; cannot run CUTLASS "
@@ -167,6 +293,27 @@ def cutlass_hstu_mha(
     if scaling_seqlen == -1:
         scaling_seqlen = max_seq_len
 
+    if fp8_quant_mode >= 0 and torch.compiler.is_exporting():
+        # Route FP8 through the opaque custom op so torch.export / AOTI never
+        # trace the wheel's Python quantizer (whose data-dependent descales
+        # otherwise break export tracing / AOTI runtime). Eager train/eval
+        # falls through to hstu_attn_varlen_func below (autograd intact).
+        return torch.ops.tzrec.cutlass_hstu_fp8_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            num_contexts_tensor,
+            num_targets_int32,
+            max_seq_len,
+            scaling_seqlen,
+            window_size_left,
+            window_size_right,
+            alpha,
+            fp8_quant_mode,
+            attn_func,
+        )
+
     return hstu_attn_varlen_func(
         q,
         k,
@@ -186,4 +333,5 @@ def cutlass_hstu_mha(
         rab=None,
         has_drab=False,
         func=attn_func,
+        quant_mode=fp8_quant_mode,
     )

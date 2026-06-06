@@ -100,6 +100,7 @@ def test_attn(
     rtol: Optional[float] = None,
     enable_tma: bool = False,
     scaling_seqlen: int = -1,
+    fp8_quant_mode: int = -1,
 ) -> None:
     # has_max_attn_len=True and enable_tma=True will result in TritonGPUCoalesce error
     # include/llvm/llvm/ADT/SmallVector.h:296: const_reference llvm::SmallVectorTemplateCommon<long>::operator[](size_type) const [T = long]: Assertion `idx < size()' failed.    # NOQA
@@ -199,6 +200,7 @@ def test_attn(
         kernel=real_kernel,
         enable_tma=enable_tma,
         scaling_seqlen=scaling_seqlen,
+        fp8_quant_mode=fp8_quant_mode,
     )
 
     torch.testing.assert_close(
@@ -584,6 +586,53 @@ class HSTUAttentionTest(unittest.TestCase):
                 real_kernel=Kernel.CUTLASS,
             )
 
+    # Samples every FP8 quant_mode; only SM90 (Hopper) supports all of them.
+    # SM120 (Blackwell RTX) is mode=2 fwd-only; SM80/SM100 have no FP8.
+    @mark_ci_scope("h20")
+    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+        "all-FP8-mode test requires SM90 (Hopper)",
+    )
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(4, 8),
+        heads=st.integers(1, 4),
+        max_uih_len=st.sampled_from([20, 100, 128]),
+        max_targets=st.sampled_from([20, 512]),
+        attn_dim=st.sampled_from([64, 128]),
+        causal=st.sampled_from([True]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        dtype=st.sampled_from(get_test_dtypes([torch.bfloat16])),
+        has_max_attn_len=st.sampled_from([False]),
+        contextual_seq_len=st.sampled_from([0, 10]),
+        scaling_seqlen=st.sampled_from([-1, 2048]),
+        # mode=1 (two-direction) excluded: the wheel's vt TMA descriptor
+        # init fails for some shapes (e.g. batch=6, heads=4, max_uih=100,
+        # attn_dim=128). Revisit once the wheel is fixed upstream.
+        fp8_quant_mode=st.sampled_from([0, 2, 3, 4, 5]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_attn_fp8_cutlass(self, *args, **kwargs) -> None:
+        # FP8 e4m3 vs bf16 ref; tolerances relaxed for quantization loss.
+        hidden_dim = kwargs.pop("attn_dim")
+        test_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            test_backward=True,
+            ref_kernel=Kernel.PYTORCH,
+            real_kernel=Kernel.CUTLASS,
+            atol=1e-1,
+            rtol=1e-1,
+        )
+
     # NOTE: no ``test_delta_attn_cutlass`` — ``delta_hstu_mha`` has no
     # CUTLASS implementation and falls back to Triton internally. The
     # delta/cached path is already covered by ``test_delta_attn_triton``.
@@ -603,7 +652,7 @@ class HSTUAttentionTest(unittest.TestCase):
         sla_k2=st.sampled_from([0, 4, 8]),
         has_multiple_targets=st.sampled_from([True, False]),
         contextual_seq_len=st.sampled_from([0, 4]),
-        # Sample both bf16 and fp16 -- fp8 is deferred to ultra-hstu-fp8.
+        # Sample both bf16 and fp16; FP8 is covered by test_attn_fp8_cutlass.
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(

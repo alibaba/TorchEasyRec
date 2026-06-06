@@ -59,6 +59,7 @@ def hstu_mha(
     enable_tma: bool = False,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    fp8_quant_mode: int = -1,
 ) -> torch.Tensor:
     """HSTU multi-head attention with kernel backend dispatch.
 
@@ -86,6 +87,10 @@ def hstu_mha(
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
+        fp8_quant_mode: FP8 quantization mode (``-1`` = off, ``0..5`` select
+            an FP8 mode). Only supported on ``Kernel.CUTLASS`` running on
+            SM90 (Hopper) or SM120 (Blackwell RTX, ``quant_mode=2`` only);
+            a value ``>= 0`` with any other kernel raises.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -105,6 +110,13 @@ def hstu_mha(
             "attn_func (arbitrary-mask NFUNC path) is not supported on "
             "Kernel.TRITON. Use Kernel.CUTLASS for production training or "
             "Kernel.PYTORCH for the reference implementation."
+        )
+
+    if fp8_quant_mode >= 0 and kernel != Kernel.CUTLASS:
+        raise ValueError(
+            f"fp8_quant_mode={fp8_quant_mode} (FP8) is only supported on "
+            f"Kernel.CUTLASS; got kernel={kernel}. FP8 attention requires "
+            "the CUTLASS SM90 kernel."
         )
 
     if kernel == Kernel.CUTLASS and attn_func is None:
@@ -141,6 +153,7 @@ def hstu_mha(
             contextual_seq_len=contextual_seq_len,
             attn_func=attn_func,
             scaling_seqlen=scaling_seqlen,
+            fp8_quant_mode=fp8_quant_mode,
         )
 
     if kernel == Kernel.TRITON:
