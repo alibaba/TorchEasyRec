@@ -307,6 +307,12 @@ class KafkaDatasetTest(unittest.TestCase):
             self.assertIsInstance(value, int)
             self.assertGreaterEqual(value, 0)
 
+        # Event-time should be surfaced from the kafka message timestamps (the
+        # producer stamps create-time), as a positive epoch-ms integer.
+        self.assertIsNotNone(batch.data_timestamp)
+        self.assertIsInstance(batch.data_timestamp, int)
+        self.assertGreater(batch.data_timestamp, 0)
+
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )

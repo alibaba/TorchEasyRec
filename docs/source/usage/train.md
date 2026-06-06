@@ -63,6 +63,9 @@ LR策略可以支持按epoch更新或者按step更新
 - num_epochs: 训练的epoch数
 - save_checkpoints_steps: 保存模型的步数间隔，保存模型后会做一次评估
 - save_checkpoints_epochs: 保存模型的Epoch数间隔，保存模型后会做一次评估，与save_checkpoints_steps不能同时设置
+- save_checkpoints_timestamp_interval: 按数据时间（如Kafka消息的timestamp）保存模型的间隔秒数，每当已消费数据的事件时间跨过一个按epoch对齐的间隔边界时保存一次，默认0表示关闭。仅对带timestamp的数据源（如KafkaDataset）生效
+- save_checkpoints_timestamps: 按数据时间保存模型的绝对时间点列表（单位为秒的epoch时间戳），已消费数据的事件时间每跨过一个时间点保存一次，默认为空表示关闭
+- checkpoint_timestamp_reduce: 分布式训练下各rank消费的分区不同，事件时间也不同，在触发基于时间的checkpoint前如何对各rank的事件时间做归约，可选"min"（最慢rank越过边界后才保存，默认）或"max"（任一rank越过边界即保存）
 - keep_checkpoint_max: 最多保留的最近checkpoint数量，超出后会异步删除最旧的checkpoint，默认0表示全部保留；当exporter_type为best时，会额外保留指标最优的checkpoint
 - fine_tune_checkpoint: 增量训练的checkpoint路径，也可以设置checkpoint目录，将会使用目录下最新的checkpoint
 - fine_tune_ckpt_var_map: 需要restore的参数列表文件路径，文件的每一行是{variable_name in current model}\\t{variable name in old model ckpt}

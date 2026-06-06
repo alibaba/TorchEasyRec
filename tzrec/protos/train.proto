@@ -72,5 +72,16 @@ message TrainConfig {
     optional GradClipping grad_clipping = 19;
     // maximum number of recent checkpoints to keep; 0 keeps all.
     optional uint32 keep_checkpoint_max = 20 [default = 0];
+    // event-time interval (seconds) for saving checkpoint, based on the consumed
+    // data timestamp (e.g. kafka message timestamp). saves once per epoch-aligned
+    // interval boundary that the consumed event-time crosses. 0 disables.
+    optional uint32 save_checkpoints_timestamp_interval = 21 [default = 0];
+    // absolute event-time targets (seconds since epoch); a checkpoint is saved once
+    // when the consumed data timestamp crosses each target. empty disables.
+    repeated uint64 save_checkpoints_timestamps = 22;
+    // how to reconcile per-rank consumed event-time before deciding to save a
+    // timestamp-triggered checkpoint: "min" (slowest rank passed the boundary) or
+    // "max" (latest event-time seen on any rank).
+    optional string checkpoint_timestamp_reduce = 23 [default = "min"];
     // TBD: qcomm config
 }

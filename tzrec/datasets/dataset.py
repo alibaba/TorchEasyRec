@@ -30,6 +30,7 @@ from tzrec.datasets.utils import (
     CAND_POS_LENGTHS,
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    DATA_TIMESTAMP,
     HARD_NEG_INDICES,
     Batch,
     RecordBatchTensor,
@@ -333,6 +334,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 )
             )
 
+        # Extract transient event-time (kafka message timestamp, ms) if present.
+        # Pop unconditionally so it is never parsed as a feature; the max valid
+        # (>= 0) timestamp in the batch is surfaced on Batch.data_timestamp.
+        data_timestamp = None
+        ts_col = input_data.pop(DATA_TIMESTAMP, None)
+        if ts_col is not None and len(ts_col) > 0:
+            max_ts = pc.max(ts_col).as_py()
+            if max_ts is not None and max_ts >= 0:
+                data_timestamp = max_ts
+
         use_sample_mask = self._mode == Mode.TRAIN and (
             self._data_config.negative_sample_mask_prob > 0
             or self._data_config.sample_mask_prob > 0
@@ -372,6 +383,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
+        batch.data_timestamp = data_timestamp
         return batch
 
     def _apply_negative_sampler(

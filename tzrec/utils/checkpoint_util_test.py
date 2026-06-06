@@ -481,6 +481,87 @@ class DataloaderCheckpointTest(unittest.TestCase):
 
         self.assertEqual(checkpoint_state, {"path:0": 100, "path:500": 200})
 
+    def test_should_save_on_timestamp_first_batch(self):
+        """No reference yet -> only initialize, never save."""
+        self.assertFalse(
+            checkpoint_util.should_save_on_timestamp(
+                1000, None, interval_s=600, target_ts_list=[500]
+            )
+        )
+
+    def test_should_save_on_timestamp_interval_crossed(self):
+        """Crossing an epoch-aligned interval boundary fires."""
+        # floor(3600/3600)=1 > floor(3599/3600)=0
+        self.assertTrue(
+            checkpoint_util.should_save_on_timestamp(
+                3600, 3599, interval_s=3600, target_ts_list=[]
+            )
+        )
+
+    def test_should_save_on_timestamp_interval_not_crossed(self):
+        """Same interval bucket does not fire."""
+        # floor(3500/3600) == floor(3000/3600) == 0
+        self.assertFalse(
+            checkpoint_util.should_save_on_timestamp(
+                3500, 3000, interval_s=3600, target_ts_list=[]
+            )
+        )
+
+    def test_should_save_on_timestamp_interval_disabled(self):
+        """interval_s=0 disables the interval trigger."""
+        self.assertFalse(
+            checkpoint_util.should_save_on_timestamp(
+                10000, 0, interval_s=0, target_ts_list=[]
+            )
+        )
+
+    def test_should_save_on_timestamp_target_crossed(self):
+        """Crossing an absolute target fires (boundary inclusive on the right)."""
+        self.assertTrue(
+            checkpoint_util.should_save_on_timestamp(
+                1500, 1000, interval_s=0, target_ts_list=[1500]
+            )
+        )
+        self.assertTrue(
+            checkpoint_util.should_save_on_timestamp(
+                1600, 1000, interval_s=0, target_ts_list=[1500]
+            )
+        )
+
+    def test_should_save_on_timestamp_target_not_reached(self):
+        """Target ahead of consumed event-time does not fire."""
+        self.assertFalse(
+            checkpoint_util.should_save_on_timestamp(
+                1400, 1000, interval_s=0, target_ts_list=[1500]
+            )
+        )
+
+    def test_should_save_on_timestamp_target_no_refire(self):
+        """A target already behind the reference does not refire."""
+        self.assertFalse(
+            checkpoint_util.should_save_on_timestamp(
+                2000, 1500, interval_s=0, target_ts_list=[1500]
+            )
+        )
+
+    def test_should_save_on_timestamp_multiple_targets(self):
+        """Any one crossed target in the window fires."""
+        self.assertTrue(
+            checkpoint_util.should_save_on_timestamp(
+                1600, 1000, interval_s=0, target_ts_list=[900, 1500, 5000]
+            )
+        )
+
+    def test_should_save_on_timestamp_interval_and_targets(self):
+        """Targets fire even when the interval boundary is not crossed."""
+        # same interval bucket (floor(1600/3600)==floor(1000/3600)==0) but a target
+        # at 1500 is crossed.
+        self.assertTrue(
+            checkpoint_util.should_save_on_timestamp(
+                1600, 1000, interval_s=3600, target_ts_list=[1500]
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

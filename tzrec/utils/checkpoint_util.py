@@ -854,6 +854,51 @@ def update_dataloder_state(
             dataloader_state[key] = value
 
 
+def should_save_on_timestamp(
+    data_ts_s: float,
+    last_ckpt_ts_s: Optional[float],
+    interval_s: int,
+    target_ts_list: List[int],
+) -> bool:
+    """Decide whether to save a checkpoint based on consumed event-time.
+
+    Drives event-time checkpointing from the data timestamp (e.g. the kafka
+    message timestamp surfaced on ``Batch.data_timestamp``). Two triggers:
+
+    * interval: an epoch-aligned boundary (``floor(ts / interval_s)``) has been
+      crossed since the last timestamp-triggered save.
+    * targets: the consumed event-time has crossed an absolute target.
+
+    Args:
+        data_ts_s: current consumed event-time (seconds since epoch), already
+            reconciled across ranks.
+        last_ckpt_ts_s: event-time at the last timestamp-triggered save, or None
+            when no reference has been established yet (first batch / just
+            restored). When None this returns False so the caller only
+            initializes the reference instead of saving.
+        interval_s: epoch-aligned event-time interval in seconds; 0 disables the
+            interval trigger.
+        target_ts_list: absolute event-time targets (seconds since epoch); a save
+            fires once when the consumed event-time crosses each target.
+
+    Returns:
+        True if a checkpoint should be saved for this event-time.
+    """
+    # No reference yet: only initialize, never save on the first observed batch.
+    if last_ckpt_ts_s is None:
+        return False
+    # Epoch-aligned interval boundary crossed since the last save.
+    if interval_s > 0 and int(data_ts_s // interval_s) > int(
+        last_ckpt_ts_s // interval_s
+    ):
+        return True
+    # Any absolute target crossed within (last_ckpt_ts_s, data_ts_s].
+    for target in target_ts_list:
+        if last_ckpt_ts_s < target <= data_ts_s:
+            return True
+    return False
+
+
 def list_distcp_param(checkpoint_dir: str) -> List[str]:
     """List distributed checkpoint parameter names."""
     meta_paths = []

@@ -24,6 +24,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    DATA_TIMESTAMP,
     FIELD_TYPE_TO_PA,
     get_input_fields_proto,
 )
@@ -376,6 +377,8 @@ class KafkaReader(BaseReader):
                 # Track checkpoint metadata for each message
                 source_ids = []
                 row_indices = []
+                # Track event-time (kafka message timestamp, ms) for each message
+                timestamps = []
 
                 for msg in messages:
                     msg_error = msg.error()
@@ -410,6 +413,10 @@ class KafkaReader(BaseReader):
                     source_ids.extend([source_id] * batch_len)
                     # Use offset as the row index (each message has one offset)
                     row_indices.extend([offset] * batch_len)
+                    # msg.timestamp() -> (timestamp_type, timestamp_ms); the value is
+                    # -1 when the topic has no timestamps (TIMESTAMP_NOT_AVAILABLE).
+                    ts_ms = msg.timestamp()[1]
+                    timestamps.extend([ts_ms] * batch_len)
 
                 if not record_batchs:
                     continue
@@ -436,6 +443,11 @@ class KafkaReader(BaseReader):
                 )
                 t = t.append_column(
                     CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
+                )
+                # Add transient event-time column (consumed downstream in _build_batch
+                # to set Batch.data_timestamp; not part of the checkpoint state).
+                t = t.append_column(
+                    DATA_TIMESTAMP, pa.array(timestamps, type=pa.int64())
                 )
 
                 for batch in t.to_batches():
