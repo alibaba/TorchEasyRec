@@ -1355,14 +1355,18 @@ def export_distributed_embedding(
                     # Serving supplies raw user-side embedding values with batch=1.
                     # Keep sparse output raw as well; the dense model owns tiling.
                     outputs[name] = kt_values.args[0]
+                    output_attrs[name + "__length_per_key"] = node_kt.kwargs[
+                        "length_per_key"
+                    ]
+                    output_attrs[name + "__keys"] = node_kt.kwargs["keys"]
                 else:
                     outputs[name] = graph.call_method("values", args=(node_kt,))
-                output_attrs[name + "__length_per_key"] = graph.call_method(
-                    "length_per_key", args=(node_kt,)
-                )
-                output_attrs[name + "__keys"] = graph.call_method(
-                    "keys", args=(node_kt,)
-                )
+                    output_attrs[name + "__length_per_key"] = graph.call_method(
+                        "length_per_key", args=(node_kt,)
+                    )
+                    output_attrs[name + "__keys"] = graph.call_method(
+                        "keys", args=(node_kt,)
+                    )
         elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
             name = node.args[0]
             node_jt = node.args[1]
@@ -1384,14 +1388,12 @@ def export_distributed_embedding(
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
 
-    sparse_model = DistributedModelParallel(
-        module=sparse_gm,
-        sharders=sharders,
-        device=device,
-        plan=plan,
-    )
+    # `unwrap_model` has already been wrapped by DistributedModelParallel and
+    # restored above. `sparse_gm` shares those sharded embedding modules; wrapping
+    # the extracted sparse graph a second time can leave TorchRec's per-table
+    # feature split state inconsistent for INPUT_TILE user towers.
+    sparse_model = sparse_gm
     sparse_model.eval()
-    checkpoint_util.restore_model(checkpoint_path, sparse_model)
     sparse_output, sparse_attrs = sparse_model(data, device=device)
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")
@@ -1598,14 +1600,22 @@ def _merge_sharded_embedding_json(
                     # Dynamic npz entry names are uniform across ranks
                     # (e.g. always "user_id_emb.keys"). Serving iterates all
                     # sparse_dynamic_embedding-*.npz files with the same entry
-                    # names, so keep the single key_name/value_name pair.
-                    for field in ("key_name", "value_name"):
+                    # names, so keep the single key/value/score entry names.
+                    for field in ("key_name", "value_name", "score_name"):
                         if merged_json[emb_name].get(field) != info.get(field):
                             raise ValueError(
                                 f"dynamic embedding {emb_name} has inconsistent "
                                 f"{field}: {merged_json[emb_name].get(field)} vs "
                                 f"{info.get(field)}"
                             )
+                    if merged_json[emb_name].get("score_dtype") != info.get(
+                        "score_dtype"
+                    ):
+                        raise ValueError(
+                            f"dynamic embedding {emb_name} has inconsistent "
+                            f"score_dtype: {merged_json[emb_name].get('score_dtype')} "
+                            f"vs {info.get('score_dtype')}"
+                        )
 
     return merged_json
 
@@ -1655,7 +1665,7 @@ def _get_sparse_embedding_tensor(
 
     Returns:
         out: regular sparse embedding tensors keyed by emb_name.
-        dynamic_out: dynamicemb keys/values keyed by composite names. Empty if
+        dynamic_out: dynamicemb keys/values/scores keyed by composite names. Empty if
             no dynamic embedding tables exist.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
         feat_meta: feature -> embedding_name / pooling mapping.
@@ -1713,6 +1723,7 @@ def _get_sparse_embedding_tensor(
     # per-emb_name npz entry names for dynamic tables on this rank.
     dynamic_key_names = defaultdict(list)
     dynamic_value_names = defaultdict(list)
+    dynamic_score_names = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
@@ -1798,16 +1809,44 @@ def _get_sparse_embedding_tensor(
                     values = torch.tensor(
                         np.fromfile(f, dtype=np.float32), dtype=torch.float32
                     )
+                score_file = os.path.join(
+                    os.path.dirname(key_file),
+                    f"{emb_name}_emb_scores.rank_{idx}.world_size_{num_shards}",
+                )
+                if not os.path.exists(score_file):
+                    raise FileNotFoundError(
+                        f"dynamic embedding {emb_name} score file not found: "
+                        f"{score_file}"
+                    )
+                with open(score_file, "rb") as f:
+                    scores = torch.tensor(
+                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
+                    )
+                if keys.numel() != scores.numel():
+                    raise ValueError(
+                        f"dynamic embedding {emb_name} key/score row mismatch: "
+                        f"keys={keys.numel()}, scores={scores.numel()}, "
+                        f"key_file={key_file}, score_file={score_file}"
+                    )
+                if values.numel() != keys.numel() * emb_dim:
+                    raise ValueError(
+                        f"dynamic embedding {emb_name} value row mismatch: "
+                        f"keys={keys.numel()}, value_elements={values.numel()}, "
+                        f"embedding_dim={emb_dim}"
+                    )
                 key_name = f"{emb_name}.keys"
                 value_name = f"{emb_name}.values"
+                score_name = f"{emb_name}.scores"
                 values_2d = values.view([-1, emb_dim])
                 dynamic_out[key_name] = keys
                 dynamic_out[value_name] = values_2d
+                dynamic_out[score_name] = scores
                 emb_name_to_meta_tensor[emb_name] = values_2d
                 value_name_to_key[value_name] = key_name
                 dynamic_emb_names.add(emb_name)
                 dynamic_key_names[emb_name].append(key_name)
                 dynamic_value_names[emb_name].append(value_name)
+                dynamic_score_names[emb_name].append(score_name)
 
     # TODO(hongsheng.jhs): support mczch
 
@@ -1835,18 +1874,22 @@ def _get_sparse_embedding_tensor(
         }
         if is_dynamic:
             # Entry names inside sparse_dynamic_embedding-*.npz. The serving
-            # processor expects one key/value entry pair and applies it to all
-            # dynamic npz shards.
+            # processor expects one key/value/score entry triplet and applies it
+            # to all dynamic npz shards.
             t_meta["key_dtype"] = "int64"
+            t_meta["score_dtype"] = "int64"
             key_names = list(dict.fromkeys(dynamic_key_names[emb_name]))
             value_names = list(dict.fromkeys(dynamic_value_names[emb_name]))
-            if len(key_names) != 1 or len(value_names) != 1:
+            score_names = list(dict.fromkeys(dynamic_score_names[emb_name]))
+            if len(key_names) != 1 or len(value_names) != 1 or len(score_names) != 1:
                 raise ValueError(
-                    f"dynamic embedding {emb_name} expects one key/value npz "
-                    f"entry pair, got {key_names} / {value_names}"
+                    f"dynamic embedding {emb_name} expects one key/value/score "
+                    f"npz entry triplet, got {key_names} / {value_names} / "
+                    f"{score_names}"
                 )
             t_meta["key_name"] = key_names[0]
             t_meta["value_name"] = value_names[0]
+            t_meta["score_name"] = score_names[0]
         emb_meta[emb_name] = t_meta
 
     feat_meta = {}
