@@ -334,15 +334,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 )
             )
 
-        # Extract transient event-time (Unix-epoch seconds) if present. Pop it
-        # unconditionally so it is never parsed as a feature; surface the max valid
-        # (>= 0) value on Batch.data_timestamp, else keep the -1.0 "unavailable"
-        # sentinel. The producer (e.g. KafkaReader) owns the unit; stays unit-agnostic.
+        # Pop the transient event-time column (Unix-epoch seconds) so it is never
+        # parsed as a feature, and surface its max on Batch.data_timestamp. The
+        # -1.0 "unavailable" sentinel sorts below any real time, so max yields the
+        # right value (a real time, or -1.0 when none). Producer owns the unit.
         data_timestamp = -1.0
         ts_col = input_data.pop(DATA_TIMESTAMP, None)
         if ts_col is not None and len(ts_col) > 0:
             max_ts = pc.max(ts_col).as_py()
-            if max_ts is not None and max_ts >= 0:
+            if max_ts is not None:
                 data_timestamp = max_ts
 
         use_sample_mask = self._mode == Mode.TRAIN and (

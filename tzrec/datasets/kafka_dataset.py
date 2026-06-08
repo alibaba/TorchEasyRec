@@ -413,11 +413,9 @@ class KafkaReader(BaseReader):
                     source_ids.extend([source_id] * batch_len)
                     # Use offset as the row index (each message has one offset)
                     row_indices.extend([offset] * batch_len)
-                    # msg.timestamp() -> (timestamp_type, timestamp_ms); the value
-                    # is -1 when the topic has no timestamps
-                    # (TIMESTAMP_NOT_AVAILABLE). Normalize ms -> Unix-epoch seconds
-                    # here (the unit used by Batch.data_timestamp / config / the
-                    # save triggers); keep -1 as the "unavailable" sentinel.
+                    # msg.timestamp() -> (type, ms); ms is -1 when unavailable.
+                    # Normalize to Unix-epoch seconds (the unit used downstream),
+                    # keeping -1 as the "unavailable" sentinel.
                     ts_ms = msg.timestamp()[1]
                     ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
                     timestamps.extend([ts_s] * batch_len)
@@ -448,8 +446,7 @@ class KafkaReader(BaseReader):
                 t = t.append_column(
                     CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
                 )
-                # Add transient event-time column in seconds (consumed in
-                # _build_batch to set Batch.data_timestamp; not checkpoint state).
+                # transient event-time column (seconds), read in _build_batch
                 t = t.append_column(
                     DATA_TIMESTAMP, pa.array(timestamps, type=pa.float64())
                 )

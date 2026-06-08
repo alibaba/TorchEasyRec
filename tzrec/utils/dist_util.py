@@ -88,6 +88,27 @@ def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.Proces
     return pg
 
 
+def gather_float_scalar(
+    value: float, device: Optional[torch.device] = None
+) -> List[float]:
+    """All-gather a float scalar from every rank into one list.
+
+    Args:
+        value: this rank's scalar.
+        device: device for the gather tensors.
+
+    Returns:
+        Each rank's value, in rank order (just ``[value]`` when not distributed).
+    """
+    if not dist.is_initialized():
+        return [value]
+    world_size = dist.get_world_size()
+    local = torch.tensor([value], dtype=torch.float64, device=device)
+    gathered = torch.empty(world_size, dtype=torch.float64, device=device)
+    dist.all_gather_into_tensor(gathered, local)
+    return gathered.tolist()
+
+
 # fix missing create_mean_pooling_callback of mc-ebc input_dist
 def _mc_ebc_input_dist(
     # pyre-ignore [2]

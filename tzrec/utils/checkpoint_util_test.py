@@ -610,6 +610,21 @@ class DataloaderCheckpointTest(unittest.TestCase):
                 quorum=0.5,
                 expected=101.0,
             ),
+            # -1.0 (worker without a timestamp) sorts low, counts as "not past":
+            # 2 of 3 have a real time, quorum 0.5 met -> 100.0
+            param(
+                "sentinel_quorum_met",
+                ts_list=[100.0, 101.0, -1.0],
+                quorum=0.5,
+                expected=100.0,
+            ),
+            # only 1 of 3 has a real time, quorum 0.5 not met -> negative result
+            param(
+                "sentinel_quorum_unmet",
+                ts_list=[100.0, -1.0, -1.0],
+                quorum=0.5,
+                expected=-1.0,
+            ),
         ]
     )
     def test_quorum_event_time(self, _name, ts_list, quorum, expected):
@@ -671,6 +686,16 @@ class DataloaderCheckpointTest(unittest.TestCase):
         self.assertFalse(mgr.maybe_save(2, model=None, worker_ts_list=[3700.0, 3500.0]))
         # both crossed -> save
         self.assertTrue(mgr.maybe_save(3, model=None, worker_ts_list=[3700.0, 3601.0]))
+
+    def test_maybe_save_timestamp_sentinel(self):
+        # -1.0 sentinels (workers without a timestamp) never establish/advance the
+        # reference nor trigger a save; a real time later initializes cleanly
+        mgr = self._policy_manager(ts_interval_s=3600)
+        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[-1.0, -1.0]))
+        self.assertIsNone(mgr._last_data_ts)  # not initialized to -1.0
+        self.assertFalse(mgr.maybe_save(2, model=None, worker_ts_list=[3599.0, 3599.0]))
+        self.assertEqual(mgr._last_data_ts, 3599.0)  # real time initializes
+        self.assertTrue(mgr.maybe_save(3, model=None, worker_ts_list=[3600.0, 3600.0]))
 
     def test_maybe_save_stamps_watermark(self):
         mgr = self._policy_manager(ts_interval_s=3600)

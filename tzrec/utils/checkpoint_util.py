@@ -335,9 +335,15 @@ class CheckpointManager:
     ) -> None:
         """Configure when ``maybe_save`` fires (train path only).
 
-        Sets cadence config only; never resets ``_last_ckpt_step`` /
-        ``_last_data_ts`` so a watermark seeded by ``restore_dataloader_state``
-        on resume survives.
+        Sets cadence config only (never the ``_last_*`` state), so a watermark
+        seeded on resume survives.
+
+        Args:
+            save_steps: step interval; 0 disables the step trigger.
+            save_epochs: epoch interval; 0 disables the epoch trigger.
+            ts_interval_s: event-time interval in seconds; 0 disables.
+            ts_targets: absolute event-time targets (Unix-epoch seconds).
+            ts_quorum: fraction of workers (0, 1] past a boundary to trigger a save.
         """
         if (ts_interval_s > 0 or len(ts_targets) > 0) and not (0.0 < ts_quorum <= 1.0):
             raise ValueError(
@@ -350,7 +356,7 @@ class CheckpointManager:
         self._ts_quorum = ts_quorum
 
     def needs_worker_timestamps(self) -> bool:
-        """Whether the configured policy needs per-worker event-times."""
+        """Return whether the policy needs per-worker event-times gathered."""
         return self._ts_interval > 0 or len(self._ts_targets) > 0
 
     def maybe_save(
@@ -367,20 +373,33 @@ class CheckpointManager:
         """Save a checkpoint if a configured trigger fires; return whether it did.
 
         Centralizes the step / epoch / event-time decisions and the single
-        per-step dedupe, so no call site can re-save a step another already
-        saved. ``worker_ts_list`` is the per-rank consumed event-times the caller
-        gathered (``all_gather``); reconciliation (quorum), the event-time
-        watermark advance/persist, and the save all happen here.
+        per-step dedupe so no call site can re-save a step another already saved.
+        The decision is deterministic and identical across ranks, so the
+        collective ``save`` is entered in lockstep and nothing collective runs
+        when not saving.
 
-        The decision is deterministic and identical across ranks (same gathered
-        list -> same quorum -> same config), so the collective ``save`` is
-        entered in lockstep; nothing collective runs when not saving.
+        Args:
+            step: current global step.
+            model: model to save.
+            optimizer: optimizer to save, if any.
+            dataloader_state: dataloader resume state; the event-time watermark is
+                stamped into it on save.
+            epoch: current epoch; enables the epoch trigger when not None.
+            worker_ts_list: per-rank consumed event-times (seconds) gathered by the
+                caller; reconciled here via the worker quorum.
+            final: force a save (still subject to the dedupe), e.g. at train end.
+
+        Returns:
+            True if a checkpoint was saved.
         """
         data_ts = (
             quorum_event_time(worker_ts_list, self._ts_quorum)
             if worker_ts_list
             else None
         )
+        # a -1.0-dominated quorum (too few workers with a timestamp) -> no event-time
+        if data_ts is not None and data_ts < 0:
+            data_ts = None
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -394,7 +413,7 @@ class CheckpointManager:
             want = True
         if data_ts is not None:
             if self._last_data_ts is None:
-                # first observed event-time: initialize the reference, do not save
+                # first event-time seen: set the reference, do not save
                 self._last_data_ts = data_ts
             elif should_save_on_timestamp(
                 data_ts, self._last_data_ts, self._ts_interval, self._ts_targets
@@ -406,8 +425,7 @@ class CheckpointManager:
 
         self._last_ckpt_step = step
         if data_ts is not None:
-            # advance + persist the watermark on ANY save (step/epoch/timestamp/
-            # final) so resume re-fires no already-saved boundary and misses none
+            # advance + persist the watermark on every save so resume is exact
             self._last_data_ts = data_ts
             if dataloader_state is not None:
                 dataloader_state[DATA_TS_WATERMARK] = data_ts
@@ -473,8 +491,7 @@ class CheckpointManager:
         """Restore dataloader state saved alongside a checkpoint.
 
         Also seeds the event-time watermark so ``maybe_save`` resumes the
-        timestamp trigger from where it left off (re-firing no already-saved
-        boundary and missing none); absent/None -> initialize from first batch.
+        timestamp trigger; absent -> initialize from the first batch.
         """
         state = restore_dataloader_state(ckpt_path)
         if state is not None:
@@ -1021,9 +1038,13 @@ def quorum_event_time(local_ts_list: List[float], quorum: float) -> Optional[flo
     0 -> max (any one worker). Using a quantile makes the default (0.5) robust to
     a single outlier/garbage timestamp.
 
+    A worker without a timestamp carries the -1.0 sentinel, which sorts low and so
+    counts as "not past" -- the quorum is over all workers; the result is negative
+    when too few have a real timestamp.
+
     Args:
-        local_ts_list: per-worker event-times (seconds); invalid/missing entries
-            should already be filtered out by the caller.
+        local_ts_list: per-worker event-times (seconds), -1.0 for workers without
+            one.
         quorum: fraction of workers in (0, 1].
 
     Returns:

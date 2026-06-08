@@ -38,9 +38,8 @@ CAND_POS_LENGTHS = "cand_pos_lengths"
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
 CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
-# Transient per-row event-time column in Unix-epoch seconds (-1 when unavailable),
-# produced by the source reader (e.g. KafkaReader normalizes its ms timestamp).
-# Surfaced as the per-batch max on Batch.data_timestamp; not persisted.
+# Transient event-time column (Unix-epoch seconds, -1 when unavailable) set by the
+# source reader; surfaced as the per-batch max on Batch.data_timestamp, not persisted.
 DATA_TIMESTAMP = "__data_timestamp__"  # float64 column, event-time (seconds)
 
 
@@ -339,9 +338,8 @@ class Batch(Pipelineable):
     dummy: bool = field(default=False)
     # checkpoint info: {source_key: max_abs_row}
     checkpoint_info: Optional[Dict[str, int]] = field(default=None)
-    # max event-time (Unix-epoch seconds) consumed in this batch, or -1.0 when the
-    # source has no timestamps (e.g. non-kafka datasets). normalized from the raw
-    # kafka message timestamp (ms) in BaseDataset._build_batch.
+    # max event-time (Unix-epoch seconds) consumed in this batch, -1.0 when the
+    # source has no timestamps (e.g. non-kafka datasets)
     data_timestamp: float = field(default=-1.0)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":

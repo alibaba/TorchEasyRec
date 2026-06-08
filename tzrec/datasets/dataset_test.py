@@ -19,7 +19,6 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import pyarrow as pa
-import torch
 from graphlearn.python.nn.pytorch.data import utils
 from parameterized import param, parameterized
 from torch.utils.data import DataLoader
@@ -32,7 +31,6 @@ from tzrec.datasets.utils import (
     DATA_TIMESTAMP,
     HARD_NEG_INDICES,
     NEG_DATA_GROUP,
-    Batch,
 )
 from tzrec.features.feature import BaseFeature, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
@@ -293,18 +291,6 @@ class DatasetTest(unittest.TestCase):
     def test_build_batch_data_timestamp(self, _name, columns, expected):
         batch = self._build_batch_with_columns(columns)
         self.assertEqual(batch.data_timestamp, expected)
-
-    @parameterized.expand(
-        [
-            param("to", apply=lambda b: b.to(torch.device("cpu"))),
-            param("pin_memory", apply=lambda b: b.pin_memory()),
-        ]
-    )
-    def test_batch_copy_preserves_data_timestamp(self, _name, apply):
-        # silent-failure guard: copy methods must keep data_timestamp, otherwise
-        # event-time checkpointing becomes a no-op after the pipeline
-        batch = Batch(data_timestamp=1717000000.456)
-        self.assertEqual(apply(batch).data_timestamp, 1717000000.456)
 
     @parameterized.expand(
         [

@@ -74,8 +74,8 @@ message TrainConfig {
     optional uint32 keep_checkpoint_max = 20 [default = 0];
     // event-time interval (seconds) for saving checkpoint, based on the consumed
     // data timestamp (e.g. kafka message timestamp). saves once per interval
-    // boundary (aligned to the Unix epoch / wall-clock, NOT training epochs) that
-    // the consumed event-time crosses. 0 disables.
+    // boundary crossed, aligned to the Unix epoch (wall-clock), not training
+    // epochs. 0 disables.
     optional uint32 save_checkpoints_timestamp_interval = 21 [default = 0];
     // absolute event-time targets (Unix-epoch seconds); a checkpoint is saved once
     // when the consumed data timestamp crosses each target. empty disables.

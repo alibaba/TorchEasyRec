@@ -82,6 +82,7 @@ from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
     create_train_pipeline,
+    gather_float_scalar,
     init_process_group,
 )
 from tzrec.utils.export_util import export_model
@@ -314,23 +315,6 @@ def _log_train(
                 summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
-def _gather_worker_event_times(
-    data_timestamp_s: float, device: Optional[torch.device]
-) -> List[float]:
-    """All-gather each rank's consumed event-time (seconds) for the save quorum.
-
-    Ranks without a timestamp this step carry the -1.0 sentinel, which is filtered
-    out so the returned list holds only the valid per-worker event-times.
-    """
-    if dist.is_initialized():
-        world_size = dist.get_world_size()
-        local_t = torch.tensor([data_timestamp_s], dtype=torch.float64, device=device)
-        gathered = torch.empty(world_size, dtype=torch.float64, device=device)
-        dist.all_gather_into_tensor(gathered, local_t)
-        return [v for v in gathered.tolist() if v >= 0]
-    return [data_timestamp_s] if data_timestamp_s >= 0 else []
-
-
 def _train_and_evaluate(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -373,8 +357,7 @@ def _train_and_evaluate(
     else:
         save_checkpoints_steps = train_config.save_checkpoints_steps
 
-    # Centralize the save cadence (step / epoch / consumed-event-time) in the
-    # CheckpointManager. It owns the dedupe and the event-time watermark; the loop
+    # The CheckpointManager owns the save cadence + dedupe + watermark; the loop
     # only gathers per-worker event-times and runs eval after a save.
     ckpt_manager.set_save_policy(
         save_checkpoints_steps,
@@ -504,13 +487,11 @@ def _train_and_evaluate(
                 i_step -= 1
                 break
 
-            # Gather each rank's consumed event-time for the timestamp trigger.
-            # Done in lockstep across ranks under the same equal-step-count
-            # invariant the model's own gradient collectives already require: a
-            # rank that drains first hangs at the gradient all-reduce inside
-            # pipeline.progress before ever reaching here.
+            # Gather each rank's consumed event-time for the timestamp trigger,
+            # in lockstep (same equal-step-count invariant the model's gradient
+            # collectives already require).
             worker_ts = (
-                _gather_worker_event_times(batch.data_timestamp, ts_device)
+                gather_float_scalar(batch.data_timestamp, ts_device)
                 if need_ts
                 else None
             )
