@@ -276,9 +276,9 @@ class DatasetTest(unittest.TestCase):
                 },
                 expected=1717000002.0,
             ),
-            # no __data_timestamp__ column (e.g. non-kafka source) -> None
-            param("absent", columns={}, expected=None),
-            # all -1 (topic without timestamps) -> None
+            # no __data_timestamp__ column (e.g. non-kafka source) -> -1.0 sentinel
+            param("absent", columns={}, expected=-1.0),
+            # all -1 (topic without timestamps) -> -1.0 sentinel
             param(
                 "all_invalid",
                 columns={
@@ -286,7 +286,7 @@ class DatasetTest(unittest.TestCase):
                         [-1.0, -1.0, -1.0, -1.0], type=pa.float64()
                     )
                 },
-                expected=None,
+                expected=-1.0,
             ),
         ]
     )

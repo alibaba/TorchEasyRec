@@ -339,10 +339,10 @@ class Batch(Pipelineable):
     dummy: bool = field(default=False)
     # checkpoint info: {source_key: max_abs_row}
     checkpoint_info: Optional[Dict[str, int]] = field(default=None)
-    # max event-time (Unix-epoch seconds) consumed in this batch, or None when the
+    # max event-time (Unix-epoch seconds) consumed in this batch, or -1.0 when the
     # source has no timestamps (e.g. non-kafka datasets). normalized from the raw
     # kafka message timestamp (ms) in BaseDataset._build_batch.
-    data_timestamp: Optional[float] = field(default=None)
+    data_timestamp: float = field(default=-1.0)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""

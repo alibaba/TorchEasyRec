@@ -12,7 +12,6 @@
 import copy
 import itertools
 import json
-import math
 import os
 from collections import OrderedDict
 from queue import Queue
@@ -316,22 +315,20 @@ def _log_train(
 
 
 def _gather_worker_event_times(
-    data_timestamp_s: Optional[float], device: Optional[torch.device]
+    data_timestamp_s: float, device: Optional[torch.device]
 ) -> List[float]:
     """All-gather each rank's consumed event-time (seconds) for the save quorum.
 
-    Ranks without a timestamp this step contribute a NaN that is filtered out, so
-    the returned list holds only the valid per-worker event-times. all_gather
-    (not all_reduce) is used so a NaN never poisons the others.
+    Ranks without a timestamp this step carry the -1.0 sentinel, which is filtered
+    out so the returned list holds only the valid per-worker event-times.
     """
-    local = data_timestamp_s if data_timestamp_s is not None else float("nan")
     if dist.is_initialized():
         world_size = dist.get_world_size()
-        local_t = torch.tensor([local], dtype=torch.float64, device=device)
+        local_t = torch.tensor([data_timestamp_s], dtype=torch.float64, device=device)
         gathered = torch.empty(world_size, dtype=torch.float64, device=device)
         dist.all_gather_into_tensor(gathered, local_t)
-        return [v for v in gathered.tolist() if not math.isnan(v)]
-    return [] if math.isnan(local) else [local]
+        return [v for v in gathered.tolist() if v >= 0]
+    return [data_timestamp_s] if data_timestamp_s >= 0 else []
 
 
 def _train_and_evaluate(
