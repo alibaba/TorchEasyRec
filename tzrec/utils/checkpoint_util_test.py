@@ -20,7 +20,7 @@ from unittest import mock
 import torch
 import torch.distributed as dist
 import torchrec
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch import nn
 from torchrec import EmbeddingBagCollection
 from torchrec.distributed.model_parallel import (
@@ -481,125 +481,139 @@ class DataloaderCheckpointTest(unittest.TestCase):
 
         self.assertEqual(checkpoint_state, {"path:0": 100, "path:500": 200})
 
-    def test_should_save_on_timestamp_first_batch(self):
-        """No reference yet -> only initialize, never save."""
-        self.assertFalse(
-            checkpoint_util.should_save_on_timestamp(
-                1000, None, interval_s=600, target_ts_list=[500]
-            )
-        )
-
-    def test_should_save_on_timestamp_interval_crossed(self):
-        """Crossing an epoch-aligned interval boundary fires."""
-        # floor(3600/3600)=1 > floor(3599/3600)=0
-        self.assertTrue(
-            checkpoint_util.should_save_on_timestamp(
-                3600, 3599, interval_s=3600, target_ts_list=[]
-            )
-        )
-
-    def test_should_save_on_timestamp_interval_not_crossed(self):
-        """Same interval bucket does not fire."""
-        # floor(3500/3600) == floor(3000/3600) == 0
-        self.assertFalse(
-            checkpoint_util.should_save_on_timestamp(
-                3500, 3000, interval_s=3600, target_ts_list=[]
-            )
-        )
-
-    def test_should_save_on_timestamp_interval_disabled(self):
-        """interval_s=0 disables the interval trigger."""
-        self.assertFalse(
-            checkpoint_util.should_save_on_timestamp(
-                10000, 0, interval_s=0, target_ts_list=[]
-            )
-        )
-
-    def test_should_save_on_timestamp_target_crossed(self):
-        """Crossing an absolute target fires (boundary inclusive on the right)."""
-        self.assertTrue(
-            checkpoint_util.should_save_on_timestamp(
-                1500, 1000, interval_s=0, target_ts_list=[1500]
-            )
-        )
-        self.assertTrue(
-            checkpoint_util.should_save_on_timestamp(
-                1600, 1000, interval_s=0, target_ts_list=[1500]
-            )
-        )
-
-    def test_should_save_on_timestamp_target_not_reached(self):
-        """Target ahead of consumed event-time does not fire."""
-        self.assertFalse(
-            checkpoint_util.should_save_on_timestamp(
-                1400, 1000, interval_s=0, target_ts_list=[1500]
-            )
-        )
-
-    def test_should_save_on_timestamp_target_no_refire(self):
-        """A target already behind the reference does not refire."""
-        self.assertFalse(
-            checkpoint_util.should_save_on_timestamp(
-                2000, 1500, interval_s=0, target_ts_list=[1500]
-            )
-        )
-
-    def test_should_save_on_timestamp_multiple_targets(self):
-        """Any one crossed target in the window fires."""
-        self.assertTrue(
-            checkpoint_util.should_save_on_timestamp(
-                1600, 1000, interval_s=0, target_ts_list=[900, 1500, 5000]
-            )
-        )
-
-    def test_should_save_on_timestamp_interval_and_targets(self):
-        """Targets fire even when the interval boundary is not crossed."""
-        # same interval bucket (floor(1600/3600)==floor(1000/3600)==0) but a target
-        # at 1500 is crossed.
-        self.assertTrue(
-            checkpoint_util.should_save_on_timestamp(
-                1600, 1000, interval_s=3600, target_ts_list=[1500]
-            )
-        )
-
-    def test_quorum_event_time_empty(self):
-        self.assertIsNone(checkpoint_util.quorum_event_time([], 0.5))
-
-    def test_quorum_event_time_single(self):
-        self.assertEqual(checkpoint_util.quorum_event_time([42.0], 0.5), 42.0)
-
-    def test_quorum_event_time_all_equal(self):
-        self.assertEqual(checkpoint_util.quorum_event_time([5.0, 5.0, 5.0], 0.5), 5.0)
-
-    def test_quorum_event_time_full_quorum_is_min(self):
-        # quorum=1.0 -> all workers must be past T -> min
+    @parameterized.expand(
+        [
+            # no reference yet -> only initialize, never save
+            param(
+                "first_batch",
+                data_ts=1000,
+                last=None,
+                interval=600,
+                targets=[500],
+                expected=False,
+            ),
+            # floor(3600/3600)=1 > floor(3599/3600)=0
+            param(
+                "interval_crossed",
+                data_ts=3600,
+                last=3599,
+                interval=3600,
+                targets=[],
+                expected=True,
+            ),
+            # floor(3500/3600) == floor(3000/3600) == 0
+            param(
+                "interval_not_crossed",
+                data_ts=3500,
+                last=3000,
+                interval=3600,
+                targets=[],
+                expected=False,
+            ),
+            param(
+                "interval_disabled",
+                data_ts=10000,
+                last=0,
+                interval=0,
+                targets=[],
+                expected=False,
+            ),
+            # target boundary is inclusive on the right
+            param(
+                "target_crossed_exact",
+                data_ts=1500,
+                last=1000,
+                interval=0,
+                targets=[1500],
+                expected=True,
+            ),
+            param(
+                "target_crossed_past",
+                data_ts=1600,
+                last=1000,
+                interval=0,
+                targets=[1500],
+                expected=True,
+            ),
+            param(
+                "target_not_reached",
+                data_ts=1400,
+                last=1000,
+                interval=0,
+                targets=[1500],
+                expected=False,
+            ),
+            param(
+                "target_no_refire",
+                data_ts=2000,
+                last=1500,
+                interval=0,
+                targets=[1500],
+                expected=False,
+            ),
+            param(
+                "multiple_targets",
+                data_ts=1600,
+                last=1000,
+                interval=0,
+                targets=[900, 1500, 5000],
+                expected=True,
+            ),
+            # same interval bucket, but a target at 1500 is crossed
+            param(
+                "interval_and_targets",
+                data_ts=1600,
+                last=1000,
+                interval=3600,
+                targets=[1500],
+                expected=True,
+            ),
+        ]
+    )
+    def test_should_save_on_timestamp(
+        self, _name, data_ts, last, interval, targets, expected
+    ):
         self.assertEqual(
-            checkpoint_util.quorum_event_time([10.0, 20.0, 30.0, 40.0], 1.0), 10.0
+            checkpoint_util.should_save_on_timestamp(data_ts, last, interval, targets),
+            expected,
         )
 
-    def test_quorum_event_time_tiny_quorum_is_max(self):
-        # quorum near 0 -> any one worker -> max
-        self.assertEqual(
-            checkpoint_util.quorum_event_time([10.0, 20.0, 30.0, 40.0], 0.01), 40.0
-        )
-
-    def test_quorum_event_time_half_even(self):
-        # m=4, k=ceil(0.5*4)=2 -> vals[4-2]=vals[2] = 2nd largest, half are >= it
-        self.assertEqual(
-            checkpoint_util.quorum_event_time([10.0, 20.0, 30.0, 40.0], 0.5), 30.0
-        )
-
-    def test_quorum_event_time_half_odd(self):
-        # m=3, k=ceil(0.5*3)=ceil(1.5)=2 -> vals[3-2]=vals[1] = median
-        self.assertEqual(
-            checkpoint_util.quorum_event_time([10.0, 30.0, 20.0], 0.5), 20.0
-        )
-
-    def test_quorum_event_time_robust_to_outlier(self):
-        # a single far-future garbage value does not move the median (quorum 0.5)
-        self.assertEqual(
-            checkpoint_util.quorum_event_time([100.0, 101.0, 1e18], 0.5), 101.0
-        )
+    @parameterized.expand(
+        [
+            param("empty", ts_list=[], quorum=0.5, expected=None),
+            param("single", ts_list=[42.0], quorum=0.5, expected=42.0),
+            param("all_equal", ts_list=[5.0, 5.0, 5.0], quorum=0.5, expected=5.0),
+            # quorum=1.0 -> all workers must be past T -> min
+            param(
+                "full_quorum_is_min",
+                ts_list=[10.0, 20.0, 30.0, 40.0],
+                quorum=1.0,
+                expected=10.0,
+            ),
+            # quorum near 0 -> any one worker -> max
+            param(
+                "tiny_quorum_is_max",
+                ts_list=[10.0, 20.0, 30.0, 40.0],
+                quorum=0.01,
+                expected=40.0,
+            ),
+            # m=4, k=ceil(0.5*4)=2 -> 2nd largest, half are >= it
+            param(
+                "half_even", ts_list=[10.0, 20.0, 30.0, 40.0], quorum=0.5, expected=30.0
+            ),
+            # m=3, k=ceil(1.5)=2 -> median
+            param("half_odd", ts_list=[10.0, 30.0, 20.0], quorum=0.5, expected=20.0),
+            # a single far-future garbage value does not move the median
+            param(
+                "robust_to_outlier",
+                ts_list=[100.0, 101.0, 1e18],
+                quorum=0.5,
+                expected=101.0,
+            ),
+        ]
+    )
+    def test_quorum_event_time(self, _name, ts_list, quorum, expected):
+        self.assertEqual(checkpoint_util.quorum_event_time(ts_list, quorum), expected)
 
     def _policy_manager(self, **policy):
         """A CheckpointManager with save() mocked and a save policy applied."""

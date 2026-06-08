@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 from graphlearn.python.nn.pytorch.data import utils
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
@@ -262,37 +262,49 @@ class DatasetTest(unittest.TestCase):
         input_data.update(extra_columns)
         return dataset._build_batch(input_data)
 
-    def test_build_batch_data_timestamp(self):
-        # column is event-time in seconds (the reader normalizes); surface the max
-        # valid (>= 0) value, ignoring the -1 "no timestamp" sentinel.
-        batch = self._build_batch_with_columns(
-            {
-                DATA_TIMESTAMP: pa.array(
-                    [1717000000.0, 1717000002.0, -1.0, 1717000001.0],
-                    type=pa.float64(),
-                )
-            }
-        )
-        self.assertEqual(batch.data_timestamp, 1717000002.0)
+    @parameterized.expand(
+        [
+            # column is event-time in seconds (the reader normalizes); surface the
+            # max valid (>= 0) value, ignoring the -1 "no timestamp" sentinel
+            param(
+                "max_valid",
+                columns={
+                    DATA_TIMESTAMP: pa.array(
+                        [1717000000.0, 1717000002.0, -1.0, 1717000001.0],
+                        type=pa.float64(),
+                    )
+                },
+                expected=1717000002.0,
+            ),
+            # no __data_timestamp__ column (e.g. non-kafka source) -> None
+            param("absent", columns={}, expected=None),
+            # all -1 (topic without timestamps) -> None
+            param(
+                "all_invalid",
+                columns={
+                    DATA_TIMESTAMP: pa.array(
+                        [-1.0, -1.0, -1.0, -1.0], type=pa.float64()
+                    )
+                },
+                expected=None,
+            ),
+        ]
+    )
+    def test_build_batch_data_timestamp(self, _name, columns, expected):
+        batch = self._build_batch_with_columns(columns)
+        self.assertEqual(batch.data_timestamp, expected)
 
-    def test_build_batch_data_timestamp_absent(self):
-        # no __data_timestamp__ column (e.g. non-kafka source) -> None
-        batch = self._build_batch_with_columns({})
-        self.assertIsNone(batch.data_timestamp)
-
-    def test_build_batch_data_timestamp_all_invalid(self):
-        # all -1 (topic without timestamps) -> None
-        batch = self._build_batch_with_columns(
-            {DATA_TIMESTAMP: pa.array([-1.0, -1.0, -1.0, -1.0], type=pa.float64())}
-        )
-        self.assertIsNone(batch.data_timestamp)
-
-    def test_batch_to_and_pin_memory_preserve_data_timestamp(self):
-        # silent-failure guard: .to()/.pin_memory() must keep data_timestamp,
-        # otherwise event-time checkpointing becomes a no-op after the pipeline
+    @parameterized.expand(
+        [
+            param("to", apply=lambda b: b.to(torch.device("cpu"))),
+            param("pin_memory", apply=lambda b: b.pin_memory()),
+        ]
+    )
+    def test_batch_copy_preserves_data_timestamp(self, _name, apply):
+        # silent-failure guard: copy methods must keep data_timestamp, otherwise
+        # event-time checkpointing becomes a no-op after the pipeline
         batch = Batch(data_timestamp=1717000000.456)
-        self.assertEqual(batch.to(torch.device("cpu")).data_timestamp, 1717000000.456)
-        self.assertEqual(batch.pin_memory().data_timestamp, 1717000000.456)
+        self.assertEqual(apply(batch).data_timestamp, 1717000000.456)
 
     @parameterized.expand(
         [
