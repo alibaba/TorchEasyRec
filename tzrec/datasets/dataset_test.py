@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import pyarrow as pa
+import torch
 from graphlearn.python.nn.pytorch.data import utils
 from parameterized import parameterized
 from torch.utils.data import DataLoader
@@ -28,8 +29,10 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
     CAND_POS_LENGTHS,
+    DATA_TIMESTAMP,
     HARD_NEG_INDICES,
     NEG_DATA_GROUP,
+    Batch,
 )
 from tzrec.features.feature import BaseFeature, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
@@ -222,6 +225,68 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].values().size(), (8,))
         self.assertEqual(batch.sparse_features[BASE_DATA_GROUP].lengths().size(), (8,))
         self.assertEqual(batch.labels["label"].size(), (4,))
+
+    def _build_batch_with_columns(self, extra_columns):
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="label", type=pa.int32()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+        ]
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+                label_fields=["label"],
+            ),
+            features=create_features(feature_cfgs),
+            input_path="",
+            input_fields=input_fields,
+            mode=Mode.TRAIN,
+        )
+        input_data = OrderedDict(
+            [
+                ("int_a", pa.array([1, 2, 3, 4], type=pa.int64())),
+                ("float_b", pa.array([1.0, 2.0, 3.0, 4.0], type=pa.float64())),
+                ("label", pa.array([0, 1, 0, 1], type=pa.int32())),
+            ]
+        )
+        input_data.update(extra_columns)
+        return dataset._build_batch(input_data)
+
+    def test_build_batch_data_timestamp(self):
+        # max of the valid (>= 0) event-times; the -1 "no timestamp" is ignored
+        batch = self._build_batch_with_columns(
+            {DATA_TIMESTAMP: pa.array([100, 200, -1, 150], type=pa.int64())}
+        )
+        self.assertEqual(batch.data_timestamp, 200)
+
+    def test_build_batch_data_timestamp_absent(self):
+        # no __data_timestamp__ column (e.g. non-kafka source) -> None
+        batch = self._build_batch_with_columns({})
+        self.assertIsNone(batch.data_timestamp)
+
+    def test_build_batch_data_timestamp_all_invalid(self):
+        # all -1 (topic without timestamps) -> None
+        batch = self._build_batch_with_columns(
+            {DATA_TIMESTAMP: pa.array([-1, -1, -1, -1], type=pa.int64())}
+        )
+        self.assertIsNone(batch.data_timestamp)
+
+    def test_batch_to_and_pin_memory_preserve_data_timestamp(self):
+        # silent-failure guard: .to()/.pin_memory() must keep data_timestamp,
+        # otherwise event-time checkpointing becomes a no-op after the pipeline
+        batch = Batch(data_timestamp=1717000000456)
+        self.assertEqual(batch.to(torch.device("cpu")).data_timestamp, 1717000000456)
+        self.assertEqual(batch.pin_memory().data_timestamp, 1717000000456)
 
     @parameterized.expand(
         [

@@ -562,6 +562,131 @@ class DataloaderCheckpointTest(unittest.TestCase):
             )
         )
 
+    def test_quorum_event_time_empty(self):
+        self.assertIsNone(checkpoint_util.quorum_event_time([], 0.5))
+
+    def test_quorum_event_time_single(self):
+        self.assertEqual(checkpoint_util.quorum_event_time([42.0], 0.5), 42.0)
+
+    def test_quorum_event_time_all_equal(self):
+        self.assertEqual(checkpoint_util.quorum_event_time([5.0, 5.0, 5.0], 0.5), 5.0)
+
+    def test_quorum_event_time_full_quorum_is_min(self):
+        # quorum=1.0 -> all workers must be past T -> min
+        self.assertEqual(
+            checkpoint_util.quorum_event_time([10.0, 20.0, 30.0, 40.0], 1.0), 10.0
+        )
+
+    def test_quorum_event_time_tiny_quorum_is_max(self):
+        # quorum near 0 -> any one worker -> max
+        self.assertEqual(
+            checkpoint_util.quorum_event_time([10.0, 20.0, 30.0, 40.0], 0.01), 40.0
+        )
+
+    def test_quorum_event_time_half_even(self):
+        # m=4, k=ceil(0.5*4)=2 -> vals[4-2]=vals[2] = 2nd largest, half are >= it
+        self.assertEqual(
+            checkpoint_util.quorum_event_time([10.0, 20.0, 30.0, 40.0], 0.5), 30.0
+        )
+
+    def test_quorum_event_time_half_odd(self):
+        # m=3, k=ceil(0.5*3)=ceil(1.5)=2 -> vals[3-2]=vals[1] = median
+        self.assertEqual(
+            checkpoint_util.quorum_event_time([10.0, 30.0, 20.0], 0.5), 20.0
+        )
+
+    def test_quorum_event_time_robust_to_outlier(self):
+        # a single far-future garbage value does not move the median (quorum 0.5)
+        self.assertEqual(
+            checkpoint_util.quorum_event_time([100.0, 101.0, 1e18], 0.5), 101.0
+        )
+
+    def _policy_manager(self, **policy):
+        """A CheckpointManager with save() mocked and a save policy applied."""
+        tmp_dir = tempfile.mkdtemp(dir="./")
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        mgr = checkpoint_util.CheckpointManager(tmp_dir)
+        defaults = dict(
+            save_steps=0,
+            save_epochs=0,
+            ts_interval_s=0,
+            ts_targets=[],
+            ts_quorum=0.5,
+        )
+        defaults.update(policy)
+        mgr.set_save_policy(**defaults)
+        mgr.save = mock.MagicMock(return_value="ckpt")
+        return mgr
+
+    def test_maybe_save_step_interval(self):
+        mgr = self._policy_manager(save_steps=10)
+        self.assertFalse(mgr.maybe_save(5, model=None))
+        self.assertTrue(mgr.maybe_save(10, model=None))
+        self.assertEqual(mgr.save.call_count, 1)
+
+    def test_maybe_save_epoch_interval(self):
+        mgr = self._policy_manager(save_epochs=2)
+        self.assertFalse(mgr.maybe_save(100, model=None, epoch=0))
+        self.assertTrue(mgr.maybe_save(100, model=None, epoch=1))
+
+    def test_maybe_save_dedupe_epoch_after_same_step(self):
+        # regression: an epoch save right after a same-step save must not re-save
+        mgr = self._policy_manager(save_steps=10, save_epochs=1)
+        self.assertTrue(mgr.maybe_save(10, model=None))  # step trigger
+        self.assertFalse(mgr.maybe_save(10, model=None, epoch=0))  # same step -> no-op
+        self.assertEqual(mgr.save.call_count, 1)
+
+    def test_maybe_save_final_dedupe(self):
+        mgr = self._policy_manager(save_steps=10)
+        self.assertTrue(mgr.maybe_save(10, model=None))
+        self.assertFalse(mgr.maybe_save(10, model=None, final=True))  # already saved
+        self.assertTrue(mgr.maybe_save(11, model=None, final=True))  # new step
+
+    def test_maybe_save_timestamp_init_then_fire(self):
+        mgr = self._policy_manager(ts_interval_s=3600)
+        # first observed event-time only initializes the reference, no save
+        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[3599.0]))
+        # crossing the next Unix-epoch-aligned boundary fires
+        self.assertTrue(mgr.maybe_save(2, model=None, worker_ts_list=[3600.0]))
+
+    def test_maybe_save_timestamp_quorum(self):
+        # quorum=1.0: only fires once the slowest worker crosses
+        mgr = self._policy_manager(ts_interval_s=3600, ts_quorum=1.0)
+        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[3000.0, 3000.0]))
+        # one worker crossed, the other not -> min still in old bucket -> no save
+        self.assertFalse(mgr.maybe_save(2, model=None, worker_ts_list=[3700.0, 3500.0]))
+        # both crossed -> save
+        self.assertTrue(mgr.maybe_save(3, model=None, worker_ts_list=[3700.0, 3601.0]))
+
+    def test_maybe_save_stamps_watermark(self):
+        mgr = self._policy_manager(ts_interval_s=3600)
+        state = {}
+        self.assertFalse(
+            mgr.maybe_save(
+                1, model=None, dataloader_state=state, worker_ts_list=[3599.0]
+            )
+        )
+        self.assertTrue(
+            mgr.maybe_save(
+                2, model=None, dataloader_state=state, worker_ts_list=[3600.0]
+            )
+        )
+        self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+
+    def test_restore_seeds_watermark(self):
+        mgr = self._policy_manager(ts_interval_s=3600)
+        tmp_dir = tempfile.mkdtemp(dir="./")
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        checkpoint_util.save_dataloader_state(
+            tmp_dir, {"topic:0": 5, checkpoint_util.DATA_TS_WATERMARK: 7200.0}
+        )
+        state = mgr.restore_dataloader_state(tmp_dir)
+        self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 7200.0)
+        # seeded reference: a value in the same bucket does not re-fire
+        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[7201.0]))
+        # crossing the next boundary fires
+        self.assertTrue(mgr.maybe_save(2, model=None, worker_ts_list=[10800.0]))
+
 
 if __name__ == "__main__":
     unittest.main()

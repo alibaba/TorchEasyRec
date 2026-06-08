@@ -12,6 +12,7 @@
 import copy
 import itertools
 import json
+import math
 import os
 from collections import OrderedDict
 from queue import Queue
@@ -314,6 +315,27 @@ def _log_train(
                 summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
+def _gather_worker_event_times(
+    data_timestamp_ms: Optional[int], device: Optional[torch.device]
+) -> List[float]:
+    """All-gather each rank's consumed event-time (seconds) for the save quorum.
+
+    Ranks without a timestamp this step contribute a NaN that is filtered out, so
+    the returned list holds only the valid per-worker event-times. all_gather
+    (not all_reduce) is used so a NaN never poisons the others.
+    """
+    local = (
+        data_timestamp_ms / 1000.0 if data_timestamp_ms is not None else float("nan")
+    )
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        local_t = torch.tensor([local], dtype=torch.float64, device=device)
+        gathered = torch.empty(world_size, dtype=torch.float64, device=device)
+        dist.all_gather_into_tensor(gathered, local_t)
+        return [v for v in gathered.tolist() if not math.isnan(v)]
+    return [] if math.isnan(local) else [local]
+
+
 def _train_and_evaluate(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -356,18 +378,18 @@ def _train_and_evaluate(
     else:
         save_checkpoints_steps = train_config.save_checkpoints_steps
 
-    # Event-time (consumed data timestamp, e.g. kafka message timestamp) driven
-    # checkpointing. ts_trigger_active is config-derived so it is identical on all
-    # ranks, keeping the per-step cross-rank all-reduce below collective-safe.
-    ts_interval_s = train_config.save_checkpoints_timestamp_interval
-    ts_targets = list(train_config.save_checkpoints_timestamps)
-    ts_reduce = train_config.checkpoint_timestamp_reduce or "min"
-    if ts_reduce not in ("min", "max"):
-        raise ValueError(
-            "train_config.checkpoint_timestamp_reduce must be 'min' or 'max', "
-            f"got {ts_reduce!r}."
-        )
-    ts_trigger_active = ts_interval_s > 0 or len(ts_targets) > 0
+    # Centralize the save cadence (step / epoch / consumed-event-time) in the
+    # CheckpointManager. It owns the dedupe and the event-time watermark; the loop
+    # only gathers per-worker event-times and runs eval after a save.
+    ckpt_manager.set_save_policy(
+        save_checkpoints_steps,
+        save_checkpoints_epochs,
+        train_config.save_checkpoints_timestamp_interval,
+        list(train_config.save_checkpoints_timestamps),
+        train_config.save_checkpoints_timestamp_quorum,
+    )
+    need_ts = ckpt_manager.needs_worker_timestamps()
+    ts_device = next(model.parameters()).device if need_ts else None
 
     plogger = None
     summary_writer = None
@@ -408,22 +430,12 @@ def _train_and_evaluate(
         )
         prof.start()
 
-    last_ckpt_step = -1
-    # event-time at the last timestamp-triggered save (seconds since epoch); None
-    # until the first batch with a valid timestamp establishes the reference.
-    last_ckpt_data_ts_s: Optional[float] = None
-    ts_device = None
-    if ts_trigger_active:
-        ts_device = next(model.parameters()).device
     i_step = 0
     i_epoch = 0
     losses = {}
 
-    def do_checkpoint(step: int) -> None:
-        """Save a checkpoint (and run eval, if configured) at the given step."""
-        nonlocal last_ckpt_step
-        last_ckpt_step = step
-        ckpt_manager.save(step, model, optimizer, dataloader_state)
+    def run_eval(step: int, epoch: int) -> None:
+        """Run eval after a checkpoint save, if an eval dataloader is configured."""
         if eval_dataloader is not None:
             _evaluate(
                 model,
@@ -432,11 +444,13 @@ def _train_and_evaluate(
                 eval_result_filename=eval_result_filename,
                 global_step=step,
                 eval_summary_writer=eval_summary_writer,
-                global_epoch=i_epoch,
+                global_epoch=epoch,
                 check_all_workers_data_status=check_all_workers_data_status,
             )
             model.train()
 
+    # last gathered per-worker event-times, reused by the epoch / final saves
+    worker_ts: Optional[List[float]] = None
     for i_epoch in epoch_iter:
         pipeline = create_train_pipeline(
             model,
@@ -495,65 +509,33 @@ def _train_and_evaluate(
                 i_step -= 1
                 break
 
-            if save_checkpoints_steps > 0 and i_step > 0:
-                if i_step % save_checkpoints_steps == 0:
-                    do_checkpoint(i_step)
-
-            if ts_trigger_active:
-                # Reconcile each rank's consumed event-time before deciding to save
-                # (the save below is collective). Ranks without a timestamp this step
-                # contribute a neutral sentinel so they neither skew nor skip the
-                # collective. The all-reduce is gated only by the config-derived
-                # ts_trigger_active, so every rank participates.
-                if ts_reduce == "min":
-                    reduce_op = dist.ReduceOp.MIN
-                    local_ts_s = (
-                        batch.data_timestamp / 1000.0
-                        if batch.data_timestamp is not None
-                        else float("inf")
-                    )
-                else:
-                    reduce_op = dist.ReduceOp.MAX
-                    local_ts_s = (
-                        batch.data_timestamp / 1000.0
-                        if batch.data_timestamp is not None
-                        else float("-inf")
-                    )
-                if dist.is_initialized():
-                    ts_tensor = torch.tensor(
-                        [local_ts_s], dtype=torch.float64, device=ts_device
-                    )
-                    dist.all_reduce(ts_tensor, op=reduce_op)
-                    global_ts_s = ts_tensor.item()
-                else:
-                    global_ts_s = local_ts_s
-                # global_ts_s stays at the sentinel only when no rank had a valid
-                # timestamp this step; skip those steps.
-                if global_ts_s not in (float("inf"), float("-inf")):
-                    if last_ckpt_data_ts_s is None:
-                        # First observed event-time: set the reference, do not save.
-                        last_ckpt_data_ts_s = global_ts_s
-                    elif checkpoint_util.should_save_on_timestamp(
-                        global_ts_s,
-                        last_ckpt_data_ts_s,
-                        ts_interval_s,
-                        ts_targets,
-                    ):
-                        last_ckpt_data_ts_s = global_ts_s
-                        # Avoid double-saving when a step trigger already fired here.
-                        if i_step != last_ckpt_step:
-                            logger.info(
-                                f"saving checkpoint at step {i_step}, triggered by "
-                                f"consumed event-time {global_ts_s:.0f}s "
-                                f"(reduce={ts_reduce})"
-                            )
-                            do_checkpoint(i_step)
+            # Gather each rank's consumed event-time for the timestamp trigger.
+            # Done in lockstep across ranks under the same equal-step-count
+            # invariant the model's own gradient collectives already require: a
+            # rank that drains first hangs at the gradient all-reduce inside
+            # pipeline.progress before ever reaching here.
+            worker_ts = (
+                _gather_worker_event_times(batch.data_timestamp, ts_device)
+                if need_ts
+                else None
+            )
+            # Single entry point for step / epoch / event-time saves + dedupe.
+            if ckpt_manager.maybe_save(
+                i_step, model, optimizer, dataloader_state, worker_ts_list=worker_ts
+            ):
+                run_eval(i_step, i_epoch)
             if train_config.is_profiling:
                 prof.step()
 
-        if save_checkpoints_epochs > 0 and i_step > 0:
-            if (i_epoch + 1) % save_checkpoints_epochs == 0:
-                do_checkpoint(i_step)
+        if ckpt_manager.maybe_save(
+            i_step,
+            model,
+            optimizer,
+            dataloader_state,
+            epoch=i_epoch,
+            worker_ts_list=worker_ts,
+        ):
+            run_eval(i_step, i_epoch)
 
         if use_step and i_step >= train_config.num_steps - 1:
             break
@@ -575,8 +557,10 @@ def _train_and_evaluate(
         summary_writer.close()
     if train_config.is_profiling:
         prof.stop()
-    if last_ckpt_step != i_step:
-        do_checkpoint(i_step)
+    if ckpt_manager.maybe_save(
+        i_step, model, optimizer, dataloader_state, worker_ts_list=worker_ts, final=True
+    ):
+        run_eval(i_step, i_epoch)
     ckpt_manager.close()
 
 
