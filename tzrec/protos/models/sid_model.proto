@@ -14,7 +14,7 @@ message SidRqkmeans {
     // per layer).
     repeated uint32 codebook = 3;
     // L2-normalize residuals before each layer.
-    optional bool normalize_residuals = 4 [default = true];
+    optional bool normalize_residuals = 4 [default = false];
     // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a
     // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
     // spherical: false, seed: 1234}.

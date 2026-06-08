@@ -49,8 +49,9 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ``[256, 512, 1024]`` are supported) — ``train_offline`` builds a
             separate ``faiss.Kmeans`` per layer.
         normalize_residuals (bool): whether to L2-normalize residuals
-            before each layer. Default: True, matching the ``SidRqkmeans``
-            proto default so direct instantiation agrees with the config path.
+            before each layer. Default: False, matching the ``SidRqkmeans``
+            proto default (and OpenOneRec's residual k-means, which fits raw
+            residuals with no per-layer normalization).
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
             ``faiss.Kmeans(D, K, **kwargs)`` (e.g. {'niter': 20,
             'gpu': True, 'verbose': True, 'spherical': False}).
@@ -61,7 +62,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         embed_dim: int,
         n_layers: int,
         n_embed: Union[int, List[int]] = 256,
-        normalize_residuals: bool = True,
+        normalize_residuals: bool = False,
         faiss_kmeans_kwargs: Optional[Dict] = None,
     ) -> None:
         super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
