@@ -502,12 +502,8 @@ def _train_and_evaluate(
 
     # One-shot end-of-loop hook (default no-op). Some models do real work
     # here — e.g. SidRqkmeans fits its FAISS codebook from the embeddings
-    # collected during training. Since that mutates model state, force the
-    # tail-save below to fire so the post-hook state is persisted even when
-    # the last in-loop checkpoint coincided with the final step.
+    # collected during training.
     _model.on_train_end()
-    if last_ckpt_step == i_step:
-        last_ckpt_step = -1
 
     _log_train(
         i_step,
