@@ -150,14 +150,20 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric_results[metric_name] = metric.compute()
         return metric_results
 
-    def on_train_end(self) -> None:
+    def on_train_end(self) -> bool:
         """Hook fired once after the train_eval loop exits.
 
         Default: no-op. Override in models that need one-shot end-of-loop
         work — e.g. :class:`SidRqkmeans` uses this hook to fit the FAISS
         codebook from the embedding sample it collected during training.
+
+        Returns:
+            is_ckpt_after_train (bool): whether the hook mutated model state
+            that must be persisted, so the train loop should force a final
+            checkpoint even when one was already saved at the last step.
+            Default ``False`` (no-op hooks change nothing).
         """
-        pass
+        return False
 
     def sparse_parameters(
         self,

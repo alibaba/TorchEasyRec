@@ -44,13 +44,10 @@ def _coerce_proto_numbers(d: Dict) -> Dict:
     Python ``int``. This helper converts any float that is an exact
     integer to ``int`` for downstream consumption.
     """
-    out: Dict = {}
-    for k, v in d.items():
-        if isinstance(v, float) and v.is_integer():
-            out[k] = int(v)
-        else:
-            out[k] = v
-    return out
+    return {
+        k: int(v) if isinstance(v, float) and v.is_integer() else v
+        for k, v in d.items()
+    }
 
 
 class SidRqkmeans(BaseSidModel):
@@ -132,15 +129,17 @@ class SidRqkmeans(BaseSidModel):
         Args:
             x (Tensor): a batch of embeddings, shape (B, D); copied to host.
         """
-        x = x.detach().to("cpu", dtype=torch.float32)
+        x = x.detach()
         cap = self._sample_cap
         if self._reservoir is None:
             self._reservoir = torch.empty(cap, x.shape[1], dtype=torch.float32)
 
-        # Phase 1: fill empty slots first.
+        # Phase 1: fill empty slots first. Copy only the rows we keep to host.
         if self._n_filled < cap:
             take = min(x.shape[0], cap - self._n_filled)
-            self._reservoir[self._n_filled : self._n_filled + take] = x[:take]
+            self._reservoir[self._n_filled : self._n_filled + take] = x[:take].to(
+                "cpu", dtype=torch.float32
+            )
             self._n_filled += take
             self._n_seen += take
             x = x[take:]
@@ -149,7 +148,12 @@ class SidRqkmeans(BaseSidModel):
 
         # Phase 2: replacement. Row j (0-indexed in x) is the
         # (n_seen + j)-th item seen; it enters the reservoir with prob
-        # cap / (n_seen + j + 1), displacing a uniformly-random slot.
+        # cap / (n_seen + j + 1), displacing a uniformly-random slot. The
+        # accept decision needs only counts (not embedding values), so we
+        # compute it on small host index tensors and copy ONLY the accepted
+        # rows to host — in steady state (reservoir full, n_seen >> cap)
+        # almost none are accepted, so the whole-batch GPU->CPU copy is
+        # avoided. float64 keeps (n_seen + j + 1) exact past 2**24.
         r = x.shape[0]
         pos = self._n_seen + torch.arange(r)
         accept = torch.rand(r) < (cap / (pos + 1).to(torch.float64))
@@ -158,7 +162,7 @@ class SidRqkmeans(BaseSidModel):
             slots = torch.randint(0, cap, (idx.numel(),))
             # Intra-batch slot collisions resolve last-write-wins; the bias is
             # O(B/cap) per step and negligible for codebook fitting.
-            self._reservoir[slots] = x[idx]
+            self._reservoir[slots] = x[idx.to(x.device)].to("cpu", dtype=torch.float32)
         self._n_seen += r
 
     def _reservoir_sample(self) -> torch.Tensor:
@@ -271,7 +275,7 @@ class SidRqkmeans(BaseSidModel):
         self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
 
     @torch.no_grad()
-    def on_train_end(self) -> None:
+    def on_train_end(self) -> bool:
         """Trigger one-shot FAISS fit after the train_eval loop ends.
 
         Overrides :meth:`BaseModel.on_train_end`. Called unconditionally
@@ -283,10 +287,19 @@ class SidRqkmeans(BaseSidModel):
             - other ranks: ship their reservoir sample via gather_object
               (dst=0) and wait for the broadcast.
 
-        No cross-rank empty-buffer handshake is needed: the dataset layer
-        enforces ``num_files >= world_size`` (``tzrec.datasets.dataset``
-        raises otherwise), so in synchronized training every rank receives
-        at least one shard and reaches the gather with a non-empty sample.
+        Empty-reservoir handling: for any real-scale dataset every rank gets
+        a non-empty reservoir — the default ParquetDataset (``rebalance=True``)
+        splits rows across ``num_workers * world_size`` workers, so a rank only
+        ends up empty for a pathologically tiny corpus (``total_rows`` smaller
+        than that worker count). That degenerate case does not hang: rank0's
+        FAISS fit raises on too-few points and the fit-status broadcast below
+        makes every rank raise a coordinated ``RuntimeError`` instead.
+
+        Returns:
+            is_ckpt_after_train (bool): ``True`` once the codebook has been
+            fitted here (the centroid buffers changed and must be persisted,
+            so the train loop forces a final checkpoint); ``False`` when the
+            fit was skipped (empty reservoir — nothing to persist).
         """
         is_ddp = (
             dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
@@ -306,16 +319,39 @@ class SidRqkmeans(BaseSidModel):
             )
             dist.gather_object(local, gathered, dst=0)
             del local
+            fit_ok = True
             if rank == 0:
                 assert gathered is not None
-                full = torch.cat([g for g in gathered if g is not None], dim=0)
-                del gathered
-                logger.info(
-                    "[SidRqkmeans.on_train_end] rank0 fitting FAISS "
-                    "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
+                try:
+                    full = torch.cat([g for g in gathered if g is not None], dim=0)
+                    del gathered
+                    logger.info(
+                        "[SidRqkmeans.on_train_end] rank0 fitting FAISS "
+                        "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
+                    )
+                    self._quantizer.train_offline(full, verbose=True)
+                    del full
+                except Exception as e:  # noqa: BLE001
+                    # Swallow on rank0 only long enough to tell the peers — if
+                    # we let it propagate here, ranks 1..N-1 would block forever
+                    # on the centroid broadcast below with no sender.
+                    fit_ok = False
+                    logger.error(
+                        "[SidRqkmeans.on_train_end] rank0 FAISS fit failed: %s", e
+                    )
+            # Sync rank0's status to every rank (int flag, not bool — see the
+            # NCCL note below) so a rank0-only failure makes all ranks raise
+            # together instead of deadlocking on the centroid broadcast.
+            status = torch.tensor(
+                [1 if fit_ok else 0],
+                device=self._quantizer.layers[0].centroids.device,
+            )
+            dist.broadcast(status, src=0)
+            if int(status.item()) == 0:
+                raise RuntimeError(
+                    "[SidRqkmeans.on_train_end] FAISS fit failed on rank0; "
+                    "see rank0 logs for the underlying error."
                 )
-                self._quantizer.train_offline(full, verbose=True)
-                del full
             # Broadcast centroids and set the init flag locally on every
             # rank. ``_is_initialized`` is a bool buffer and NCCL's bool
             # dtype support is inconsistent across versions, so we avoid
@@ -324,8 +360,9 @@ class SidRqkmeans(BaseSidModel):
             for layer in self._quantizer.layers:
                 dist.broadcast(layer.centroids, src=0)
                 layer._is_initialized.fill_(True)
+                layer._initialized = True
             dist.barrier()
-            return
+            return True
 
         # Single-process path. Guard an empty sample with a plain local check
         # (no collective): on_train_end may be invoked without a training pass.
@@ -334,10 +371,11 @@ class SidRqkmeans(BaseSidModel):
                 "[SidRqkmeans.on_train_end] empty reservoir; skipping FAISS "
                 "fit. Did the train_eval loop run?"
             )
-            return
+            return False
 
         logger.info(
             "[SidRqkmeans.on_train_end] fitting FAISS on %d samples (D=%d)."
             % (local.shape[0], local.shape[1])
         )
         self._quantizer.train_offline(local, verbose=True)
+        return True

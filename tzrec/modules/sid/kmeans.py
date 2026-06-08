@@ -18,12 +18,9 @@ SID models:
   :class:`ResidualKMeansQuantizer`. Centroids are injected
   by the FAISS backend via ``load_centroids_``; the only forward path
   is ``predict``.
-* :func:`faiss_residual_kmeans` — FAISS residual K-Means used by
-  :class:`ResidualVectorQuantizer` to warm-start the RQ-VAE codebook on the
-  first training batch (same FAISS backend as the offline RQ-KMeans fit).
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch import nn
@@ -79,57 +76,6 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
 
 
-@torch.no_grad()
-def faiss_residual_kmeans(
-    samples: torch.Tensor,
-    n_clusters_list: List[int],
-    faiss_kmeans_kwargs: Optional[Dict] = None,
-) -> List[torch.Tensor]:
-    """Residual K-Means warm-start via FAISS, one pass per layer.
-
-    Clusters ``samples`` with FAISS K-Means, subtracts each point's assigned
-    centroid, and repeats on the residual for every layer. Used by
-    :meth:`ResidualVectorQuantizer.init_embed_` to seed the RQ-VAE codebook
-    from the first training batch — the same FAISS backend the offline
-    RQ-KMeans model uses, instead of a separate torch-native Lloyd's loop.
-
-    Args:
-        samples (Tensor): data points, shape (N, D).
-        n_clusters_list (List[int]): per-layer cluster counts.
-        faiss_kmeans_kwargs (Dict|None): extra kwargs for ``faiss.Kmeans``
-            (e.g. ``{'niter': 10, 'seed': 123}``).
-
-    Returns:
-        List[Tensor]: per-layer centroids ``[(K0, D), ...]`` on samples.device.
-
-    Raises:
-        ImportError: if ``faiss`` is not installed.
-    """
-    try:
-        import faiss
-    except ImportError as e:
-        raise ImportError(
-            "faiss is required for RQ-VAE kmeans_init. Install via "
-            "`pip install faiss-cpu` or `pip install faiss-gpu`."
-        ) from e
-
-    kwargs = dict(faiss_kmeans_kwargs or {})
-    device = samples.device
-    _, D = samples.shape
-    # Own a contiguous fp32 numpy copy we mutate in place to form residuals.
-    x = samples.detach().cpu().float().numpy().copy()
-
-    res_centers: List[torch.Tensor] = []
-    for n_clusters in n_clusters_list:
-        kmeans = faiss.Kmeans(D, n_clusters, **kwargs)
-        kmeans.train(x)
-        centroids = kmeans.centroids.copy()  # (K, D)
-        res_centers.append(torch.from_numpy(centroids).to(device))
-        _, idx = kmeans.index.search(x, 1)
-        x -= centroids[idx.ravel()]  # residual, in place
-    return res_centers
-
-
 class KMeansLayer(nn.Module):
     """Single layer of a residual K-Means stack.
 
@@ -158,11 +104,17 @@ class KMeansLayer(nn.Module):
         # so a normal post-fit checkpoint round-trips; mid-fit poisoning
         # (True flag + still-zero centroids) is caught in _load_from_state_dict.
         self.register_buffer("_is_initialized", torch.tensor(False))
+        # Plain-Python mirror of ``_is_initialized``, read on the per-batch
+        # forward path (``_quantize_layer``) so the hot path never pays a
+        # ``.item()`` GPU->CPU sync. Kept in lockstep with the buffer wherever
+        # the buffer changes: ``load_centroids_``, ``_load_from_state_dict``,
+        # and the DDP broadcast in ``SidRqkmeans.on_train_end``.
+        self._initialized: bool = False
 
     @property
     def is_initialized(self) -> bool:
         """Whether centroids have been injected via ``load_centroids_``."""
-        return self._is_initialized.item()
+        return self._initialized
 
     @torch.no_grad()
     def load_centroids_(self, centroids: torch.Tensor) -> None:
@@ -180,6 +132,7 @@ class KMeansLayer(nn.Module):
             centroids.to(dtype=self.centroids.dtype, device=self.centroids.device)
         )
         self._is_initialized.fill_(True)
+        self._initialized = True
 
     def _load_from_state_dict(
         self,
@@ -201,7 +154,10 @@ class KMeansLayer(nn.Module):
             unexpected_keys,
             error_msgs,
         )
-        if bool(self._is_initialized.item()) and self.centroids.abs().sum() == 0:
+        # Mirror the restored buffer into the cached Python flag (one sync at
+        # load time, off the hot path).
+        self._initialized = bool(self._is_initialized.item())
+        if self._initialized and self.centroids.abs().sum() == 0:
             error_msgs.append(
                 f"KMeansLayer at '{prefix}': _is_initialized=True but centroids "
                 "are all zero — checkpoint was likely taken mid-FAISS-fit. "

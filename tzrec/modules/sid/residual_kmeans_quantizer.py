@@ -49,7 +49,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ``[256, 512, 1024]`` are supported) — ``train_offline`` builds a
             separate ``faiss.Kmeans`` per layer.
         normalize_residuals (bool): whether to L2-normalize residuals
-            before each layer. Default: False.
+            before each layer. Default: True, matching the ``SidRqkmeans``
+            proto default so direct instantiation agrees with the config path.
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
             ``faiss.Kmeans(D, K, **kwargs)`` (e.g. {'niter': 20,
             'gpu': True, 'verbose': True, 'spherical': False}).
@@ -60,7 +61,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         embed_dim: int,
         n_layers: int,
         n_embed: Union[int, List[int]] = 256,
-        normalize_residuals: bool = False,
+        normalize_residuals: bool = True,
         faiss_kmeans_kwargs: Optional[Dict] = None,
     ) -> None:
         super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
@@ -187,6 +188,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             x = torch.from_numpy(np.ascontiguousarray(inputs, dtype=np.float32)).clone()
         N = x.shape[0]
         out = torch.zeros_like(x)
+        # Keep the original input only when we log: the per-layer diagnostic
+        # is the cumulative reconstruction error of the *original* input by
+        # the centroid sum so far (the same quantity update_metric reports).
+        # ``out + x`` would equal it only when normalize_residuals is off; with
+        # normalization the residual is rescaled each layer, so track x0.
+        x0 = x.clone() if verbose else None
 
         # Use FAISS GPU compute when a GPU build is available (data stays on
         # host; FAISS streams only its subsampled training set to the device).
@@ -229,7 +236,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 logger.info(
                     "[ResidualKMeansQuantizer][offline_faiss][layer %d] %s",
                     layer_idx,
-                    self._calc_loss(out + x, out),  # x_in = out + residual
+                    self._calc_loss(x0, out),  # cumulative recon of original input
                 )
 
             self.layers[layer_idx].load_centroids_(centroids)

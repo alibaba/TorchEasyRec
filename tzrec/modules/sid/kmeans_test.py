@@ -16,7 +16,6 @@ import torch
 from tzrec.modules.sid.kmeans import (
     KMeansLayer,
     _squared_euclidean_distance,
-    faiss_residual_kmeans,
     recon_diagnostics,
 )
 
@@ -37,22 +36,6 @@ class KmeansHelpersTest(unittest.TestCase):
         self.assertEqual(d.shape, (2, 2))
         # row0: dist to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
         torch.testing.assert_close(d, torch.tensor([[0.0, 1.0], [1.0, 2.0]]))
-
-    def test_faiss_residual_kmeans_per_layer_centers(self) -> None:
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-        torch.manual_seed(0)
-        samples = torch.randn(512, 6)
-        centers = faiss_residual_kmeans(
-            samples, [8, 4], {"niter": 5, "verbose": False, "seed": 1}
-        )
-        self.assertEqual(len(centers), 2)
-        self.assertEqual(centers[0].shape, (8, 6))
-        self.assertEqual(centers[1].shape, (4, 6))
-        self.assertTrue(torch.isfinite(centers[0]).all())
-        self.assertEqual(centers[0].device, samples.device)
 
 
 class KMeansLayerTest(unittest.TestCase):

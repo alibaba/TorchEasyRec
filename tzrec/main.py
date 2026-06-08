@@ -502,8 +502,10 @@ def _train_and_evaluate(
 
     # One-shot end-of-loop hook (default no-op). Some models do real work
     # here — e.g. SidRqkmeans fits its FAISS codebook from the embeddings
-    # collected during training.
-    _model.on_train_end()
+    # collected during training. When the hook mutated state that must be
+    # persisted, it returns True so the tail save below fires even if the
+    # last in-loop checkpoint already landed on the final step.
+    is_ckpt_after_train = _model.on_train_end()
 
     _log_train(
         i_step,
@@ -518,7 +520,7 @@ def _train_and_evaluate(
         summary_writer.close()
     if train_config.is_profiling:
         prof.stop()
-    if last_ckpt_step != i_step:
+    if last_ckpt_step != i_step or is_ckpt_after_train:
         ckpt_manager.save(i_step, model, optimizer, dataloader_state)
         if eval_dataloader is not None:
             _evaluate(

@@ -133,8 +133,8 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             model.predict(_make_batch(B, input_dim))
         self.assertGreater(model._n_seen, 0)
 
-        # Trigger one-shot FAISS fit
-        model.on_train_end()
+        # Trigger one-shot FAISS fit; a real fit must request a tail checkpoint
+        self.assertTrue(model.on_train_end())
 
         # Reservoir should be released after the fit
         self.assertEqual(model._n_seen, 0)
@@ -185,7 +185,8 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
     def test_on_train_end_noop_on_empty_buffer(self) -> None:
         """on_train_end on an empty buffer is a warned no-op."""
         model = self._create_model()
-        model.on_train_end()  # should not raise
+        # No fit happened, so no tail checkpoint is requested.
+        self.assertFalse(model.on_train_end())  # should not raise
 
     def test_post_fit_checkpoint_round_trips(self) -> None:
         """Fit → save state_dict → load into fresh instance → predict.
@@ -266,7 +267,8 @@ def _on_train_end_worker(rank: int, world_size: int, port: int) -> None:
     assert model._n_seen == 6 * 32, f"rank{rank}: reservoir not filled"
 
     # gather_object -> rank0 FAISS fit -> broadcast centroids + fill flag.
-    model.on_train_end()
+    # Every rank fitted/received the codebook, so each requests a tail ckpt.
+    assert model.on_train_end(), f"rank{rank}: on_train_end should request ckpt"
 
     for layer in model._quantizer.layers:
         assert bool(layer._is_initialized.item()), f"rank{rank}: layer uninit"
