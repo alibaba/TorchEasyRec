@@ -302,12 +302,14 @@ class SidRqkmeans(BaseSidModel):
                     )
                     self._quantizer.train_offline(full, verbose=True)
                     del full
-                except Exception as e:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
                     # Don't raise yet — peers would hang on the broadcast below.
                     # Signal failure via the status flag so all ranks raise.
+                    # logger.exception keeps the traceback so the rank0-only
+                    # failure is diagnosable from the log.
                     fit_ok = False
-                    logger.error(
-                        "[SidRqkmeans.on_train_end] rank0 FAISS fit failed: %s", e
+                    logger.exception(
+                        "[SidRqkmeans.on_train_end] rank0 FAISS fit failed"
                     )
             # Broadcast rank0's status (int, not bool — see NCCL note below) so
             # a rank0-only failure makes all ranks raise instead of deadlocking.
