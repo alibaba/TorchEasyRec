@@ -308,9 +308,9 @@ class KafkaDatasetTest(unittest.TestCase):
             self.assertGreaterEqual(value, 0)
 
         # Event-time should be surfaced from the kafka message timestamps (the
-        # producer stamps create-time), as a positive epoch-ms integer.
+        # producer stamps create-time), as positive Unix-epoch seconds (float).
         self.assertIsNotNone(batch.data_timestamp)
-        self.assertIsInstance(batch.data_timestamp, int)
+        self.assertIsInstance(batch.data_timestamp, float)
         self.assertGreater(batch.data_timestamp, 0)
 
     @unittest.skipIf(

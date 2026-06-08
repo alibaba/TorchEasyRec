@@ -38,10 +38,10 @@ CAND_POS_LENGTHS = "cand_pos_lengths"
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
 CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
-# Transient per-row event-time (kafka message timestamp, ms since epoch); -1 when
-# unavailable. Not persisted into the checkpoint state, only surfaced on
-# Batch.data_timestamp.
-DATA_TIMESTAMP = "__data_timestamp__"  # int64 column for event-time (ms)
+# Transient per-row event-time column carrying the RAW kafka message timestamp in
+# ms (-1 when unavailable). Normalized to Unix-epoch seconds on Batch.data_timestamp
+# in _build_batch; not persisted into the checkpoint state.
+DATA_TIMESTAMP = "__data_timestamp__"  # int64 column, raw event-time (ms)
 
 
 def inject_checkpoint_metadata(
@@ -339,9 +339,10 @@ class Batch(Pipelineable):
     dummy: bool = field(default=False)
     # checkpoint info: {source_key: max_abs_row}
     checkpoint_info: Optional[Dict[str, int]] = field(default=None)
-    # max event-time (kafka message timestamp, ms since epoch) consumed in this batch,
-    # or None when the source has no timestamps (e.g. non-kafka datasets)
-    data_timestamp: Optional[int] = field(default=None)
+    # max event-time (Unix-epoch seconds) consumed in this batch, or None when the
+    # source has no timestamps (e.g. non-kafka datasets). normalized from the raw
+    # kafka message timestamp (ms) in BaseDataset._build_batch.
+    data_timestamp: Optional[float] = field(default=None)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""

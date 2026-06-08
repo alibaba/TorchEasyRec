@@ -263,11 +263,17 @@ class DatasetTest(unittest.TestCase):
         return dataset._build_batch(input_data)
 
     def test_build_batch_data_timestamp(self):
-        # max of the valid (>= 0) event-times; the -1 "no timestamp" is ignored
+        # max of the valid (>= 0) raw-ms event-times, normalized to seconds; the
+        # -1 "no timestamp" is ignored. 1717000002000 ms -> 1717000002.0 s
         batch = self._build_batch_with_columns(
-            {DATA_TIMESTAMP: pa.array([100, 200, -1, 150], type=pa.int64())}
+            {
+                DATA_TIMESTAMP: pa.array(
+                    [1717000000000, 1717000002000, -1, 1717000001000],
+                    type=pa.int64(),
+                )
+            }
         )
-        self.assertEqual(batch.data_timestamp, 200)
+        self.assertAlmostEqual(batch.data_timestamp, 1717000002.0, places=3)
 
     def test_build_batch_data_timestamp_absent(self):
         # no __data_timestamp__ column (e.g. non-kafka source) -> None
@@ -284,9 +290,9 @@ class DatasetTest(unittest.TestCase):
     def test_batch_to_and_pin_memory_preserve_data_timestamp(self):
         # silent-failure guard: .to()/.pin_memory() must keep data_timestamp,
         # otherwise event-time checkpointing becomes a no-op after the pipeline
-        batch = Batch(data_timestamp=1717000000456)
-        self.assertEqual(batch.to(torch.device("cpu")).data_timestamp, 1717000000456)
-        self.assertEqual(batch.pin_memory().data_timestamp, 1717000000456)
+        batch = Batch(data_timestamp=1717000000.456)
+        self.assertEqual(batch.to(torch.device("cpu")).data_timestamp, 1717000000.456)
+        self.assertEqual(batch.pin_memory().data_timestamp, 1717000000.456)
 
     @parameterized.expand(
         [

@@ -334,15 +334,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 )
             )
 
-        # Extract transient event-time (kafka message timestamp, ms) if present.
+        # Extract transient event-time (raw kafka message timestamp, ms) if present.
         # Pop unconditionally so it is never parsed as a feature; the max valid
-        # (>= 0) timestamp in the batch is surfaced on Batch.data_timestamp.
+        # (>= 0) timestamp is normalized to Unix-epoch seconds and surfaced on
+        # Batch.data_timestamp (the unit used by config, watermark and triggers).
         data_timestamp = None
         ts_col = input_data.pop(DATA_TIMESTAMP, None)
         if ts_col is not None and len(ts_col) > 0:
             max_ts = pc.max(ts_col).as_py()
             if max_ts is not None and max_ts >= 0:
-                data_timestamp = max_ts
+                data_timestamp = max_ts / 1000.0
 
         use_sample_mask = self._mode == Mode.TRAIN and (
             self._data_config.negative_sample_mask_prob > 0

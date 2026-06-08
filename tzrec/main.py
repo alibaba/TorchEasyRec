@@ -316,7 +316,7 @@ def _log_train(
 
 
 def _gather_worker_event_times(
-    data_timestamp_ms: Optional[int], device: Optional[torch.device]
+    data_timestamp_s: Optional[float], device: Optional[torch.device]
 ) -> List[float]:
     """All-gather each rank's consumed event-time (seconds) for the save quorum.
 
@@ -324,9 +324,7 @@ def _gather_worker_event_times(
     the returned list holds only the valid per-worker event-times. all_gather
     (not all_reduce) is used so a NaN never poisons the others.
     """
-    local = (
-        data_timestamp_ms / 1000.0 if data_timestamp_ms is not None else float("nan")
-    )
+    local = data_timestamp_s if data_timestamp_s is not None else float("nan")
     if dist.is_initialized():
         world_size = dist.get_world_size()
         local_t = torch.tensor([local], dtype=torch.float64, device=device)
