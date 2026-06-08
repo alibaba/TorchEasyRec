@@ -97,15 +97,14 @@ class SidRqkmeans(BaseSidModel):
     def _init_reservoir(self) -> None:
         """Set up the bounded host reservoir for the end-of-loop FAISS fit.
 
-        Per-rank cap: FAISS subsamples to K*max_points_per_centroid internally,
-        so reservoir-sample to that target (split across ranks) rather than
-        buffer the whole corpus. Use the largest per-layer K so non-uniform
-        codebooks still feed their biggest layer enough points.
+        Per-rank cap: target the points the FAISS fit will subsample to
+        (``ResidualKMeansQuantizer.default_fit_sample_size``), split across
+        ranks, rather than buffer the whole corpus.
         """
-        k = max(self._n_embed_list)
-        max_ppc = int(self._faiss_kwargs.get("max_points_per_centroid", 256))
         target = self._model_config.train_sample_size
-        global_target = target if target > 0 else k * max_ppc
+        global_target = (
+            target if target > 0 else self._quantizer.default_fit_sample_size()
+        )
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         self._sample_cap = max(1, -(-global_target // world_size))  # ceil div
 

@@ -142,6 +142,16 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         """Look up codebook vectors via the layer's centroid table."""
         return self.layers[layer_idx].centroids[code_idx]
 
+    def default_fit_sample_size(self) -> int:
+        """Points the FAISS fit subsamples to: max(K) * max_points_per_centroid.
+
+        ``faiss.Kmeans`` caps each layer's training set at
+        ``K * max_points_per_centroid`` (default 256), so fitting on more is
+        wasted. Callers use this to size their training-sample reservoir.
+        """
+        max_ppc = int(self.faiss_kmeans_kwargs.get("max_points_per_centroid", 256))
+        return max(self.n_embed_list) * max_ppc
+
     @torch.no_grad()
     def train_offline(
         self,
