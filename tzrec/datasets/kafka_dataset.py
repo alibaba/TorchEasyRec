@@ -377,7 +377,7 @@ class KafkaReader(BaseReader):
                 # Track checkpoint metadata for each message
                 source_ids = []
                 row_indices = []
-                # Track event-time (kafka message timestamp, ms) for each message
+                # Track event-time (Unix-epoch seconds) for each message
                 timestamps = []
 
                 for msg in messages:
@@ -413,10 +413,14 @@ class KafkaReader(BaseReader):
                     source_ids.extend([source_id] * batch_len)
                     # Use offset as the row index (each message has one offset)
                     row_indices.extend([offset] * batch_len)
-                    # msg.timestamp() -> (timestamp_type, timestamp_ms); the value is
-                    # -1 when the topic has no timestamps (TIMESTAMP_NOT_AVAILABLE).
+                    # msg.timestamp() -> (timestamp_type, timestamp_ms); the value
+                    # is -1 when the topic has no timestamps
+                    # (TIMESTAMP_NOT_AVAILABLE). Normalize ms -> Unix-epoch seconds
+                    # here (the unit used by Batch.data_timestamp / config / the
+                    # save triggers); keep -1 as the "unavailable" sentinel.
                     ts_ms = msg.timestamp()[1]
-                    timestamps.extend([ts_ms] * batch_len)
+                    ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
+                    timestamps.extend([ts_s] * batch_len)
 
                 if not record_batchs:
                     continue
@@ -444,10 +448,10 @@ class KafkaReader(BaseReader):
                 t = t.append_column(
                     CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
                 )
-                # Add transient event-time column (consumed downstream in _build_batch
-                # to set Batch.data_timestamp; not part of the checkpoint state).
+                # Add transient event-time column in seconds (consumed in
+                # _build_batch to set Batch.data_timestamp; not checkpoint state).
                 t = t.append_column(
-                    DATA_TIMESTAMP, pa.array(timestamps, type=pa.int64())
+                    DATA_TIMESTAMP, pa.array(timestamps, type=pa.float64())
                 )
 
                 for batch in t.to_batches():

@@ -263,17 +263,17 @@ class DatasetTest(unittest.TestCase):
         return dataset._build_batch(input_data)
 
     def test_build_batch_data_timestamp(self):
-        # max of the valid (>= 0) raw-ms event-times, normalized to seconds; the
-        # -1 "no timestamp" is ignored. 1717000002000 ms -> 1717000002.0 s
+        # column is event-time in seconds (the reader normalizes); surface the max
+        # valid (>= 0) value, ignoring the -1 "no timestamp" sentinel.
         batch = self._build_batch_with_columns(
             {
                 DATA_TIMESTAMP: pa.array(
-                    [1717000000000, 1717000002000, -1, 1717000001000],
-                    type=pa.int64(),
+                    [1717000000.0, 1717000002.0, -1.0, 1717000001.0],
+                    type=pa.float64(),
                 )
             }
         )
-        self.assertAlmostEqual(batch.data_timestamp, 1717000002.0, places=3)
+        self.assertEqual(batch.data_timestamp, 1717000002.0)
 
     def test_build_batch_data_timestamp_absent(self):
         # no __data_timestamp__ column (e.g. non-kafka source) -> None
@@ -283,7 +283,7 @@ class DatasetTest(unittest.TestCase):
     def test_build_batch_data_timestamp_all_invalid(self):
         # all -1 (topic without timestamps) -> None
         batch = self._build_batch_with_columns(
-            {DATA_TIMESTAMP: pa.array([-1, -1, -1, -1], type=pa.int64())}
+            {DATA_TIMESTAMP: pa.array([-1.0, -1.0, -1.0, -1.0], type=pa.float64())}
         )
         self.assertIsNone(batch.data_timestamp)
 

@@ -38,10 +38,10 @@ CAND_POS_LENGTHS = "cand_pos_lengths"
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
 CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
-# Transient per-row event-time column carrying the RAW kafka message timestamp in
-# ms (-1 when unavailable). Normalized to Unix-epoch seconds on Batch.data_timestamp
-# in _build_batch; not persisted into the checkpoint state.
-DATA_TIMESTAMP = "__data_timestamp__"  # int64 column, raw event-time (ms)
+# Transient per-row event-time column in Unix-epoch seconds (-1 when unavailable),
+# produced by the source reader (e.g. KafkaReader normalizes its ms timestamp).
+# Surfaced as the per-batch max on Batch.data_timestamp; not persisted.
+DATA_TIMESTAMP = "__data_timestamp__"  # float64 column, event-time (seconds)
 
 
 def inject_checkpoint_metadata(
