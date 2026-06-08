@@ -51,10 +51,10 @@ from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
+from tzrec.datasets.data_parser import _tile_size
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
-from tzrec.datasets.data_parser import _tile_size
 from tzrec.features.feature import (
     BaseFeature,
     create_feature_configs,
@@ -1735,7 +1735,6 @@ def _get_sparse_embedding_tensor(
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
     dynamic_out = {}
     # shard_offsets = {}
-    value_name_to_key = {}
     # per-table representative tensor used only for meta (shape/dtype/memory).
     # dynamicemb tables are stored in `dynamic_out` under composite keys, so we
     # track a separate mapping keyed by emb_name here.
@@ -1761,7 +1760,7 @@ def _get_sparse_embedding_tensor(
         elif isinstance(values, ShardedTensor):
             _len_local_shards = len(values.local_shards())
             assert _len_local_shards in [0, 1], "other cases are not considered."
-            num_shards = len(values.metadata().shards_metadata)
+
             if _len_local_shards == 1:
                 for _idx, shards_meta in enumerate(values.metadata().shards_metadata):
                     placement = shards_meta.placement
@@ -1773,13 +1772,12 @@ def _get_sparse_embedding_tensor(
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
                             out[emb_name] = local_tensor
                             emb_name_to_meta_tensor[emb_name] = local_tensor
-                            value_name_to_key[feat_name_impl] = None
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
-            out[emb_name] = values
-            emb_name_to_meta_tensor[emb_name] = values
-            value_name_to_key[feat_name_impl] = None
+            local_tensor = values.detach().cpu().numpy()
+            out[emb_name] = local_tensor
+            emb_name_to_meta_tensor[emb_name] = local_tensor
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
@@ -1809,32 +1807,49 @@ def _get_sparse_embedding_tensor(
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
-        for i in range(rank, len(key_files), world_size):
-            key_file = key_files[i]
+        key_files_by_emb = defaultdict(list)
+        for key_file in key_files:
             path_parts = key_file.split(os.path.sep)
             match = key_pattern.match(path_parts[-1])
-            if match:
-                emb_name = match.group("emb_name")
-                emb_dim = emb_name_to_emb_dim[emb_name]
-                idx = match.group("idx")
-                num_shards = match.group("num_shards")
+            if not match:
+                continue
+            emb_name = match.group("emb_name")
+            ckpt_rank = int(match.group("idx"))
+            ckpt_world_size = int(match.group("num_shards"))
+            key_files_by_emb[emb_name].append((ckpt_rank, ckpt_world_size, key_file))
+
+        for emb_name, emb_key_files in key_files_by_emb.items():
+            emb_dim = emb_name_to_emb_dim[emb_name]
+            key_name = f"{emb_name}.keys"
+            value_name = f"{emb_name}.values"
+            score_name = f"{emb_name}.scores"
+            keys_list = []
+            values_list = []
+            scores_list = []
+            ckpt_world_sizes = {x[1] for x in emb_key_files}
+            if len(ckpt_world_sizes) > 1:
+                raise ValueError(
+                    f"dynamic embedding {emb_name} has inconsistent checkpoint "
+                    f"world_size values: {sorted(ckpt_world_sizes)}"
+                )
+            for ckpt_rank, ckpt_world_size, key_file in sorted(emb_key_files):
+                if ckpt_rank % world_size != rank:
+                    continue
                 with open(key_file, "rb") as f:
                     keys = torch.tensor(
                         np.fromfile(f, dtype=np.int64), dtype=torch.int64
                     )
-                with open(
-                    os.path.join(
-                        os.path.dirname(key_file),
-                        f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
-                    ),
-                    "rb",
-                ) as f:
+                value_file = os.path.join(
+                    os.path.dirname(key_file),
+                    f"{emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                )
+                with open(value_file, "rb") as f:
                     values = torch.tensor(
                         np.fromfile(f, dtype=np.float32), dtype=torch.float32
                     )
                 score_file = os.path.join(
                     os.path.dirname(key_file),
-                    f"{emb_name}_emb_scores.rank_{idx}.world_size_{num_shards}",
+                    f"{emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
                 )
                 if not os.path.exists(score_file):
                     raise FileNotFoundError(
@@ -1857,19 +1872,23 @@ def _get_sparse_embedding_tensor(
                         f"keys={keys.numel()}, value_elements={values.numel()}, "
                         f"embedding_dim={emb_dim}"
                     )
-                key_name = f"{emb_name}.keys"
-                value_name = f"{emb_name}.values"
-                score_name = f"{emb_name}.scores"
-                values_2d = values.view([-1, emb_dim])
-                dynamic_out[key_name] = keys
-                dynamic_out[value_name] = values_2d
-                dynamic_out[score_name] = scores
-                emb_name_to_meta_tensor[emb_name] = values_2d
-                value_name_to_key[value_name] = key_name
-                dynamic_emb_names.add(emb_name)
-                dynamic_key_names[emb_name].append(key_name)
-                dynamic_value_names[emb_name].append(value_name)
-                dynamic_score_names[emb_name].append(score_name)
+                keys_list.append(keys)
+                values_list.append(values.view([-1, emb_dim]))
+                scores_list.append(scores)
+
+            if not keys_list:
+                continue
+            keys = torch.cat(keys_list)
+            values_2d = torch.cat(values_list, dim=0)
+            scores = torch.cat(scores_list)
+            dynamic_out[key_name] = keys
+            dynamic_out[value_name] = values_2d
+            dynamic_out[score_name] = scores
+            emb_name_to_meta_tensor[emb_name] = values_2d
+            dynamic_emb_names.add(emb_name)
+            dynamic_key_names[emb_name].append(key_name)
+            dynamic_value_names[emb_name].append(value_name)
+            dynamic_score_names[emb_name].append(score_name)
 
     # TODO(hongsheng.jhs): support mczch
 

@@ -10,8 +10,13 @@
 # limitations under the License.
 
 
+import os
+import shutil
+import tempfile
 import unittest
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torchrec.distributed.train_pipeline.utils import Tracer
 
@@ -22,11 +27,105 @@ from tzrec.modules.dense_embedding_collection import (
 )
 from tzrec.utils.export_util import (
     _get_dense_embedding_leaf_module_names,
+    _get_sparse_embedding_tensor,
     _prune_unused_param_and_buffer,
 )
 
 
 class ExportUtilTest(unittest.TestCase):
+    def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
+        """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")
+        old_rank = os.environ.get("RANK")
+        old_world_size = os.environ.get("WORLD_SIZE")
+        try:
+            ckpt_dir = os.path.join(tmp, "model.ckpt-1")
+            dy_dir = os.path.join(
+                ckpt_dir,
+                "dynamicemb",
+                "model.model.embedding_group.emb_impls.__BASE__.ebc",
+            )
+            os.makedirs(dy_dir)
+
+            def write_shard(rank: int, keys: np.ndarray, values: np.ndarray) -> None:
+                keys.astype(np.int64).tofile(
+                    os.path.join(
+                        dy_dir, f"user_id_emb_emb_keys.rank_{rank}.world_size_2"
+                    )
+                )
+                values.astype(np.float32).tofile(
+                    os.path.join(
+                        dy_dir, f"user_id_emb_emb_values.rank_{rank}.world_size_2"
+                    )
+                )
+                (keys + 100).astype(np.int64).tofile(
+                    os.path.join(
+                        dy_dir, f"user_id_emb_emb_scores.rank_{rank}.world_size_2"
+                    )
+                )
+
+            write_shard(
+                0,
+                np.array([0, 2]),
+                np.array([[0.0, 0.1], [2.0, 2.1]], dtype=np.float32),
+            )
+            write_shard(
+                1,
+                np.array([1, 3]),
+                np.array([[1.0, 1.1], [3.0, 3.1]], dtype=np.float32),
+            )
+
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            embedding_bag_info = [
+                SimpleNamespace(
+                    name="user_id_emb",
+                    embedding_dim=2,
+                    feature_names=["user_id"],
+                    pooling="SUM",
+                )
+            ]
+
+            _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                torch.nn.Module(),
+                ckpt_dir,
+                [],
+                embedding_bag_info,
+            )
+
+            torch.testing.assert_close(
+                dynamic_out["user_id_emb.keys"], torch.tensor([0, 2, 1, 3])
+            )
+            torch.testing.assert_close(
+                dynamic_out["user_id_emb.scores"], torch.tensor([100, 102, 101, 103])
+            )
+            torch.testing.assert_close(
+                dynamic_out["user_id_emb.values"],
+                torch.tensor([[0.0, 0.1], [2.0, 2.1], [1.0, 1.1], [3.0, 3.1]]),
+            )
+            self.assertEqual(emb_meta["user_id_emb"]["shape"], [4, 2])
+            self.assertEqual(emb_meta["user_id_emb"]["key_name"], "user_id_emb.keys")
+            self.assertEqual(
+                emb_meta["user_id_emb"]["value_name"], "user_id_emb.values"
+            )
+            self.assertEqual(
+                emb_meta["user_id_emb"]["score_name"], "user_id_emb.scores"
+            )
+            self.assertEqual(
+                feat_meta["user_id__ebc"],
+                {"embedding_name": "user_id_emb", "pooling": "SUM"},
+            )
+        finally:
+            if old_rank is None:
+                os.environ.pop("RANK", None)
+            else:
+                os.environ["RANK"] = old_rank
+            if old_world_size is None:
+                os.environ.pop("WORLD_SIZE", None)
+            else:
+                os.environ["WORLD_SIZE"] = old_world_size
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_dense_embedding_restore_survives_fx_flatten(self) -> None:
         """AutoDis/MLP params must restore after the RTP FX flatten.
 
