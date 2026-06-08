@@ -500,11 +500,9 @@ def _train_and_evaluate(
             if lr.by_epoch:
                 lr.step()
 
-    # One-shot end-of-loop hook (default no-op). Some models do real work
-    # here — e.g. SidRqkmeans fits its FAISS codebook from the embeddings
-    # collected during training. When the hook mutated state that must be
-    # persisted, it returns True so the tail save below fires even if the
-    # last in-loop checkpoint already landed on the final step.
+    # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
+    # codebook here). Returns True if it mutated persistable state, forcing the
+    # tail save below even when the last in-loop checkpoint hit the final step.
     is_ckpt_after_train = _model.on_train_end()
 
     _log_train(

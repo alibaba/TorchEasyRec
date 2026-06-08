@@ -33,9 +33,8 @@ def recon_diagnostics(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """MSE + relative-L1 reconstruction diagnostics.
 
-    Shared by :meth:`SidRqkmeans.update_metric` (which wants tensors for
-    ``torchmetrics.MeanMetric``) and :meth:`ResidualKMeansQuantizer.train_offline`'s
-    per-layer log line (which converts to Python floats via ``.item()``).
+    Shared by :meth:`SidRqkmeans.update_metric` and
+    :meth:`ResidualKMeansQuantizer.train_offline`'s per-layer log.
 
     Args:
         x: ground-truth embedding, shape (B, D).
@@ -64,12 +63,8 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     Returns:
         Tensor: squared distances, shape (N, K).
 
-    Called per-batch from :meth:`KMeansLayer.predict`, so ``N`` is the batch
-    size and the full (N, K) product is small. Kept branch-free (no
-    data-dependent chunking on ``N``) so the predict forward stays
-    FX-traceable: torchrec's inference pipeline symbolically traces the
-    model, and a ``if N <= chunk_size`` on the traced batch dim raises a
-    ``torch.fx`` TraceError.
+    Kept branch-free (no data-dependent control flow on ``N``) so the
+    per-batch predict forward stays FX-traceable for torchrec inference.
     """
     x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
     y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
@@ -79,11 +74,9 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
 class KMeansLayer(nn.Module):
     """Single layer of a residual K-Means stack.
 
-    Centroids are populated externally by ``load_centroids_`` (called per
-    layer by the FAISS backend in :class:`ResidualKMeansQuantizer`); ``predict``
-    is the only forward path. PyTorch state-dict keys are scoped by
-    attribute path (``layers.<i>.centroids``), so renaming the class
-    does not break existing checkpoints.
+    Centroids are populated externally by ``load_centroids_`` (the FAISS
+    backend in :class:`ResidualKMeansQuantizer`); ``predict`` is the only
+    forward path.
 
     Args:
         n_clusters (int): number of clusters (codebook size).
@@ -100,21 +93,27 @@ class KMeansLayer(nn.Module):
         self.n_features = n_features
 
         self.register_buffer("centroids", torch.zeros(n_clusters, n_features))
-        # Flipped by ``load_centroids_`` after the FAISS fit. Persistent
-        # so a normal post-fit checkpoint round-trips; mid-fit poisoning
-        # (True flag + still-zero centroids) is caught in _load_from_state_dict.
+        # Persistent so a post-fit checkpoint round-trips; a mid-fit poison
+        # (True flag + zero centroids) is caught in _load_from_state_dict.
         self.register_buffer("_is_initialized", torch.tensor(False))
-        # Plain-Python mirror of ``_is_initialized``, read on the per-batch
-        # forward path (``_quantize_layer``) so the hot path never pays a
-        # ``.item()`` GPU->CPU sync. Kept in lockstep with the buffer wherever
-        # the buffer changes: ``load_centroids_``, ``_load_from_state_dict``,
-        # and the DDP broadcast in ``SidRqkmeans.on_train_end``.
+        # Plain-Python mirror of the buffer, read on the per-batch forward
+        # path to avoid a .item() GPU->CPU sync. Synced only via
+        # mark_initialized_ and _load_from_state_dict.
         self._initialized: bool = False
 
     @property
     def is_initialized(self) -> bool:
         """Whether centroids have been injected via ``load_centroids_``."""
         return self._initialized
+
+    def mark_initialized_(self) -> None:
+        """Flag centroids populated, syncing buffer + cached mirror.
+
+        For callers that fill ``centroids`` in place (e.g. the DDP broadcast
+        in :meth:`SidRqkmeans.on_train_end`) rather than via ``load_centroids_``.
+        """
+        self._is_initialized.fill_(True)
+        self._initialized = True
 
     @torch.no_grad()
     def load_centroids_(self, centroids: torch.Tensor) -> None:
@@ -131,8 +130,7 @@ class KMeansLayer(nn.Module):
         self.centroids.copy_(
             centroids.to(dtype=self.centroids.dtype, device=self.centroids.device)
         )
-        self._is_initialized.fill_(True)
-        self._initialized = True
+        self.mark_initialized_()
 
     def _load_from_state_dict(
         self,
@@ -154,8 +152,7 @@ class KMeansLayer(nn.Module):
             unexpected_keys,
             error_msgs,
         )
-        # Mirror the restored buffer into the cached Python flag (one sync at
-        # load time, off the hot path).
+        # Mirror the restored buffer into the cached flag (one load-time sync).
         self._initialized = bool(self._is_initialized.item())
         if self._initialized and self.centroids.abs().sum() == 0:
             error_msgs.append(
