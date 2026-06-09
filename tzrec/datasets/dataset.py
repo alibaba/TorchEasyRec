@@ -334,10 +334,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 )
             )
 
-        # Pop the transient event-time column (Unix-epoch seconds) so it is never
-        # parsed as a feature, and surface its max on Batch.data_timestamp. The
-        # -1.0 "unavailable" sentinel sorts below any real time, so max yields the
-        # right value (a real time, or -1.0 when none). Producer owns the unit.
+        # Pop the event-time column (so it's not parsed as a feature) and surface
+        # its max; the -1.0 sentinel sorts below real times, so max is correct.
         data_timestamp = -1.0
         ts_col = input_data.pop(DATA_TIMESTAMP, None)
         if ts_col is not None and len(ts_col) > 0:

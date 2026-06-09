@@ -413,9 +413,8 @@ class KafkaReader(BaseReader):
                     source_ids.extend([source_id] * batch_len)
                     # Use offset as the row index (each message has one offset)
                     row_indices.extend([offset] * batch_len)
-                    # msg.timestamp() -> (type, ms); ms is -1 when unavailable.
-                    # Normalize to Unix-epoch seconds (the unit used downstream),
-                    # keeping -1 as the "unavailable" sentinel.
+                    # msg.timestamp() -> (type, ms), -1 when unavailable; use
+                    # Unix-epoch seconds and keep -1 as the sentinel.
                     ts_ms = msg.timestamp()[1]
                     ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
                     timestamps.extend([ts_s] * batch_len)

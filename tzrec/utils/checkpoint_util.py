@@ -914,8 +914,8 @@ def save_model(
 
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
-# reserved key in dataloader_state holding the event-time watermark (Unix-epoch
-# seconds) of the last checkpoint; no ":" so per-source consumers skip it.
+# reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
+# no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
 
 
