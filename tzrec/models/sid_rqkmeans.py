@@ -106,7 +106,8 @@ class SidRqkmeans(BaseSidModel):
             target if target > 0 else self._quantizer.default_fit_sample_size()
         )
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self._sample_cap = max(1, -(-global_target // world_size))  # ceil div
+        # ceil div: round up so the per-rank caps together cover global_target.
+        self._sample_cap = max(1, -(-global_target // world_size))
 
         # Allocated lazily on the first batch. _n_filled = used slots;
         # _n_seen = running count for the accept prob.
