@@ -88,6 +88,8 @@ def fx_mark_keyed_tensor(name: str, x: KeyedTensor, is_dense: bool = False) -> N
 
     Used in EmbeddingGroup for split sparse part model when export.
     KeyedTensor.values() will be sparse part output and dense part input.
+    If ``is_dense`` is true, split exporters keep the node in the dense graph
+    instead of treating it as sparse-model output.
     """
     return
 
