@@ -1294,7 +1294,7 @@ def export_distributed_embedding(
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
     **kwargs: Any,
-) -> List[nn.Module]:
+) -> None:
     """Export for online serving under distributed embedding mode."""
     if not _prepare_single_rank_distributed_embedding_export():
         return
