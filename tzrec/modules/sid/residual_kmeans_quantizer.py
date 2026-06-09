@@ -192,6 +192,15 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # faiss_kmeans_kwargs (e.g. ``True`` for all GPUs) to opt into GPU.
         kwargs = dict(self.faiss_kmeans_kwargs)
         kwargs.setdefault("gpu", False)
+        if verbose:
+            logger.info(
+                "[ResidualKMeansQuantizer] fitting %d-layer codebook on %s "
+                "(N=%d, D=%d); set faiss_kmeans_kwargs.gpu to change.",
+                self.n_layers,
+                "GPU" if kwargs["gpu"] else "CPU",
+                N,
+                self.embed_dim,
+            )
 
         # Chunk index.search to cap peak memory (~1 GB at 500K × 512 × 4B).
         SEARCH_CHUNK = 500_000
