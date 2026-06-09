@@ -117,8 +117,8 @@ class SidRqkmeans(BaseSidModel):
         world_size guard in ``__init__``), so no per-rank split.
         """
         target = self._model_config.train_sample_size
-        self._sample_cap = max(
-            1, target if target > 0 else self._quantizer.default_fit_sample_size()
+        self._sample_cap = (
+            target if target > 0 else self._quantizer.default_fit_sample_size()
         )
 
         # Allocated lazily on the first batch. _n_filled = used slots;

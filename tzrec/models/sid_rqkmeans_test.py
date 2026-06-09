@@ -37,39 +37,6 @@ def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
     return _batch_from_rows(torch.randn(batch_size, input_dim, device=device))
 
 
-def _build_model(
-    input_dim=32,
-    n_layers=2,
-    niter=5,
-    codebook=None,
-    normalize_residuals=False,
-    train_sample_size=0,
-) -> SidRqkmeans:
-    """Build a SidRqkmeans configured for offline FAISS fit.
-
-    SID models read the item-embedding dense feature directly from the batch
-    and do not consume feature_groups, so none is set.
-    """
-    from google.protobuf.struct_pb2 import Struct
-
-    n_embed_list = codebook if codebook is not None else [16] * n_layers
-    faiss_kwargs = Struct()
-    faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
-    cfg = sid_model_pb2.SidRqkmeans(
-        input_dim=input_dim,
-        codebook=n_embed_list,
-        normalize_residuals=normalize_residuals,
-        faiss_kmeans_kwargs=faiss_kwargs,
-        embedding_feature_name="item_emb",
-        train_sample_size=train_sample_size,
-    )
-    return SidRqkmeans(
-        model_config=model_pb2.ModelConfig(sid_rqkmeans=cfg),
-        features=[],
-        labels=[],
-    )
-
-
 class SidRqkmeansOfflineTest(unittest.TestCase):
     """Single-process tests for SidRqkmeans (FAISS-only)."""
 
@@ -82,14 +49,28 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         normalize_residuals=False,
         train_sample_size=0,
     ):
-        """Create a SidRqkmeans on CPU with params initialized."""
-        model = _build_model(
-            input_dim,
-            n_layers,
-            niter,
-            codebook,
-            normalize_residuals,
-            train_sample_size,
+        """Build a SidRqkmeans on CPU with params initialized.
+
+        SID models read the item-embedding dense feature directly from the
+        batch and do not consume feature_groups, so none is set.
+        """
+        from google.protobuf.struct_pb2 import Struct
+
+        n_embed_list = codebook if codebook is not None else [16] * n_layers
+        faiss_kwargs = Struct()
+        faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
+        cfg = sid_model_pb2.SidRqkmeans(
+            input_dim=input_dim,
+            codebook=n_embed_list,
+            normalize_residuals=normalize_residuals,
+            faiss_kmeans_kwargs=faiss_kwargs,
+            embedding_feature_name="item_emb",
+            train_sample_size=train_sample_size,
+        )
+        model = SidRqkmeans(
+            model_config=model_pb2.ModelConfig(sid_rqkmeans=cfg),
+            features=[],
+            labels=[],
         )
         init_parameters(model, device=torch.device("cpu"))
         return model
