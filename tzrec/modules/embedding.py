@@ -1033,14 +1033,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 feature = name_to_feature[name]
 
                 if feature.is_sparse:
-                    if shared_feature_flag[name]:
-                        shared_name = shared_name + "@" + emb_config.name
                     output_dim = feature.output_dim
                     emb_config = feature.emb_config
                     mc_module = feature.mc_module(device)
                     assert emb_config is not None
                     # we may/could modify ec name at feat_to_group_to_emb_name
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
+                    if shared_feature_flag[name]:
+                        shared_name = shared_name + "@" + emb_config.name
                     embedding_dim = emb_config.embedding_dim
                     const = feature.parameter_constraints(emb_config)
 
