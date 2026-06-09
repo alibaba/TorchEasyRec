@@ -11,6 +11,7 @@
 
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -18,7 +19,7 @@ import shutil
 import threading
 import weakref
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -298,13 +299,25 @@ class CheckpointManager:
         self._lock = threading.Lock()
         self._prune_worker: Optional[threading.Thread] = None
         self._finalizer: Optional[weakref.finalize] = None
+        # save-cadence policy (set via set_save_policy on the train path only;
+        # defaults disable all triggers so eval/predict/export paths are unaffected)
+        self._save_steps = 0
+        self._save_epochs = 0
+        self._ts_interval = 0
+        self._ts_targets: List[int] = []
+        self._ts_quorum = 0.5
+        # CPU (gloo) group for the event-time gather; created in set_save_policy
+        self._ts_group: Optional[dist.ProcessGroup] = None
+        # cadence state owned here so dedupe is centralized across all save sites
+        self._last_ckpt_step = -1
+        self._last_data_ts: Optional[float] = None
 
     def save(
         self,
         step: int,
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
-        dataloader_state: Optional[Dict[str, int]] = None,
+        dataloader_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
@@ -313,6 +326,138 @@ class CheckpointManager:
             save_dataloader_state(ckpt_dir, dataloader_state)
         self.prune()
         return ckpt_dir
+
+    def set_save_policy(
+        self,
+        save_steps: int,
+        save_epochs: int,
+        ts_interval_s: int,
+        ts_targets: List[int],
+        ts_quorum: float,
+    ) -> None:
+        """Configure when ``maybe_save`` fires (train path only).
+
+        Sets cadence config only (never the ``_last_*`` state), so a watermark
+        seeded on resume survives. When timestamp triggers are active under a
+        distributed run, also creates the dedicated CPU (gloo) group used for the
+        per-step event-time gather -- a collective, so all ranks must call this.
+
+        Args:
+            save_steps: step interval; 0 disables the step trigger.
+            save_epochs: epoch interval; 0 disables the epoch trigger.
+            ts_interval_s: event-time interval in seconds; 0 disables.
+            ts_targets: absolute event-time targets (Unix-epoch seconds).
+            ts_quorum: fraction of workers (0, 1] past a boundary to trigger a save.
+        """
+        if (ts_interval_s > 0 or len(ts_targets) > 0) and not (0.0 < ts_quorum <= 1.0):
+            raise ValueError(
+                f"save_checkpoints_timestamp_quorum must be in (0, 1], got {ts_quorum}."
+            )
+        self._save_steps = save_steps
+        self._save_epochs = save_epochs
+        self._ts_interval = ts_interval_s
+        self._ts_targets = ts_targets
+        self._ts_quorum = ts_quorum
+        if self.needs_worker_timestamps() and dist.is_initialized():
+            self._ts_group = dist.new_group(backend="gloo")
+
+    def needs_worker_timestamps(self) -> bool:
+        """Return whether the policy needs per-worker event-times gathered."""
+        return self._ts_interval > 0 or len(self._ts_targets) > 0
+
+    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
+        """Quorum-reconcile this rank's event-time across workers.
+
+        Gathers over the CPU group from ``set_save_policy``. Each worker without a
+        timestamp contributes the -1.0 sentinel (sorts low, so it counts as "not
+        past"). Returns None when timestamp triggers are off or too few workers
+        have a real timestamp.
+
+        Args:
+            data_timestamp: this rank's consumed event-time (seconds), -1.0 if none.
+
+        Returns:
+            The quorum event-time (seconds), or None.
+        """
+        if not self.needs_worker_timestamps():
+            return None
+        if dist.is_initialized():
+            worker_ts: List[float] = [0.0] * dist.get_world_size(self._ts_group)
+            dist.all_gather_object(worker_ts, data_timestamp, group=self._ts_group)
+        else:
+            worker_ts = [data_timestamp]
+        data_ts = quorum_event_time(worker_ts, self._ts_quorum)
+        return data_ts if data_ts is not None and data_ts >= 0 else None
+
+    def maybe_save(
+        self,
+        step: int,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+        dataloader_state: Optional[Dict[str, Any]] = None,
+        *,
+        epoch: Optional[int] = None,
+        data_timestamp: float = -1.0,
+        final: bool = False,
+        force: bool = False,
+    ) -> bool:
+        """Save a checkpoint if a configured trigger fires; return whether it did.
+
+        Centralizes the step / epoch / event-time decisions and the single
+        per-step dedupe so no call site can re-save a step another already saved.
+        The decision is deterministic and identical across ranks, so the
+        collective ``save`` is entered in lockstep and nothing collective runs
+        when not saving.
+
+        Args:
+            step: current global step.
+            model: model to save.
+            optimizer: optimizer to save, if any.
+            dataloader_state: dataloader resume state; the event-time watermark is
+                stamped into it on save.
+            epoch: current epoch; enables the epoch trigger when not None.
+            data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
+                reconciled across workers (quorum) for the event-time trigger.
+            final: force a save (still subject to the dedupe), e.g. at train end.
+            force: save even if this step was already saved (bypasses the
+                per-step dedupe), e.g. when end-of-train work mutated the model
+                state at the final step (see ``on_train_end``).
+
+        Returns:
+            True if a checkpoint was saved.
+        """
+        data_ts = self._reconcile_event_time(data_timestamp)
+
+        want = final or force
+        if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
+            want = True
+        if (
+            epoch is not None
+            and self._save_epochs > 0
+            and step > 0
+            and (epoch + 1) % self._save_epochs == 0
+        ):
+            want = True
+        if data_ts is not None:
+            if self._last_data_ts is None:
+                # first event-time seen: set the reference, do not save
+                self._last_data_ts = data_ts
+            elif should_save_on_timestamp(
+                data_ts, self._last_data_ts, self._ts_interval, self._ts_targets
+            ):
+                want = True
+
+        if not want or (step == self._last_ckpt_step and not force):
+            return False
+
+        self._last_ckpt_step = step
+        if data_ts is not None:
+            # advance + persist the watermark on every save so resume is exact
+            self._last_data_ts = data_ts
+            if dataloader_state is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
+        self.save(step, model, optimizer, dataloader_state)
+        return True
 
     def prune(self) -> None:
         """Request an async prune pass (keep recent N + best). Rank 0 only.
@@ -369,9 +514,16 @@ class CheckpointManager:
         """Restore model/optimizer state from a checkpoint dir."""
         restore_model(ckpt_path, model, optimizer, ckpt_param_map_path)
 
-    def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, int]]:
-        """Restore dataloader state saved alongside a checkpoint."""
-        return restore_dataloader_state(ckpt_path)
+    def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, Any]]:
+        """Restore dataloader state saved alongside a checkpoint.
+
+        Also seeds the event-time watermark so ``maybe_save`` resumes the
+        timestamp trigger; absent -> initialize from the first batch.
+        """
+        state = restore_dataloader_state(ckpt_path)
+        if state is not None:
+            self._last_data_ts = state.get(DATA_TS_WATERMARK)
+        return state
 
     @staticmethod
     def _drain(prune_queue: "queue.Queue[object]", worker: threading.Thread) -> None:
@@ -766,11 +918,14 @@ def save_model(
 
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
+# reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
+# no ":" so per-source consumers skip it.
+DATA_TS_WATERMARK = "__data_ts_watermark__"
 
 
 def save_dataloader_state(
     checkpoint_dir: str,
-    dataloader_state: Dict[str, int],
+    dataloader_state: Dict[str, Any],
 ) -> None:
     """Save dataloader state, aggregating from all ranks first.
 
@@ -789,7 +944,7 @@ def save_dataloader_state(
         dist.all_gather_object(all_states, dataloader_state)
 
         # Merge by taking max for each key
-        merged_state: Dict[str, int] = {}
+        merged_state: Dict[str, Any] = {}
         for state in all_states:
             if state:
                 for key, value in state.items():
@@ -809,7 +964,9 @@ def save_dataloader_state(
         logger.info(f"Saved dataloader state to {ckpt_path}")
 
 
-def restore_dataloader_state(checkpoint_dir: str) -> Optional[Dict[str, int]]:
+def restore_dataloader_state(
+    checkpoint_dir: str,
+) -> Optional[Dict[str, Any]]:
     """Restore dataloader checkpoint state from file.
 
     Args:
@@ -833,7 +990,7 @@ def restore_dataloader_state(checkpoint_dir: str) -> Optional[Dict[str, int]]:
 
 
 def update_dataloder_state(
-    dataloader_state: Dict[str, int],
+    dataloader_state: Dict[str, Any],
     checkpoint_info: Optional[Dict[str, int]],
 ) -> None:
     """Merge batch's checkpoint_info into dataloader_state by taking max per key.
@@ -852,6 +1009,83 @@ def update_dataloder_state(
             dataloader_state[key] = max(dataloader_state[key], value)
         else:
             dataloader_state[key] = value
+
+
+def should_save_on_timestamp(
+    data_ts_s: float,
+    last_ckpt_ts_s: Optional[float],
+    interval_s: int,
+    target_ts_list: List[int],
+) -> bool:
+    """Decide whether to save a checkpoint based on consumed event-time.
+
+    Drives event-time checkpointing from the data timestamp (e.g. the kafka
+    message timestamp surfaced on ``Batch.data_timestamp``). Two triggers:
+
+    * interval: a boundary ``floor(ts / interval_s)`` -- aligned to the Unix
+      epoch (wall-clock), NOT to training epochs -- has been crossed since the
+      last save.
+    * targets: the consumed event-time has crossed an absolute target.
+
+    Args:
+        data_ts_s: current consumed event-time (Unix-epoch seconds), already
+            reconciled across ranks.
+        last_ckpt_ts_s: event-time at the last save, or None when no reference
+            has been established yet (first batch / just restored). When None
+            this returns False so the caller only initializes the reference
+            instead of saving.
+        interval_s: event-time interval in seconds, boundaries aligned to the
+            Unix epoch; 0 disables the interval trigger.
+        target_ts_list: absolute event-time targets (Unix-epoch seconds); a save
+            fires once when the consumed event-time crosses each target.
+
+    Returns:
+        True if a checkpoint should be saved for this event-time.
+    """
+    # No reference yet: only initialize, never save on the first observed batch.
+    if last_ckpt_ts_s is None:
+        return False
+    # Unix-epoch-aligned interval boundary crossed since the last save.
+    if interval_s > 0 and int(data_ts_s // interval_s) > int(
+        last_ckpt_ts_s // interval_s
+    ):
+        return True
+    # Any absolute target crossed within (last_ckpt_ts_s, data_ts_s].
+    for target in target_ts_list:
+        if last_ckpt_ts_s < target <= data_ts_s:
+            return True
+    return False
+
+
+def quorum_event_time(local_ts_list: List[float], quorum: float) -> Optional[float]:
+    """Reconcile per-worker consumed event-times into one global event-time.
+
+    Returns the event-time that at least ``quorum`` fraction of the workers have
+    reached -- i.e. the ``(1 - quorum)`` upper quantile of the per-worker values:
+    the largest ``T`` such that at least ``ceil(quorum * m)`` of the ``m`` values
+    are ``>= T``. ``quorum=1.0`` -> min (all workers past ``T``); ``quorum`` near
+    0 -> max (any one worker). Using a quantile makes the default (0.5) robust to
+    a single outlier/garbage timestamp.
+
+    A worker without a timestamp carries the -1.0 sentinel, which sorts low and so
+    counts as "not past" -- the quorum is over all workers; the result is negative
+    when too few have a real timestamp.
+
+    Args:
+        local_ts_list: per-worker event-times (seconds), -1.0 for workers without
+            one.
+        quorum: fraction of workers in (0, 1].
+
+    Returns:
+        The reconciled event-time, or None when ``local_ts_list`` is empty.
+    """
+    vals = sorted(local_ts_list)
+    m = len(vals)
+    if m == 0:
+        return None
+    # epsilon guards float overshoot (e.g. 0.1 * 10 -> 1.0000000001 -> ceil 2)
+    k = max(1, min(m, math.ceil(quorum * m - 1e-9)))
+    return vals[m - k]
 
 
 def list_distcp_param(checkpoint_dir: str) -> List[str]:
