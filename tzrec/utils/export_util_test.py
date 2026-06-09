@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -28,11 +29,61 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.utils.export_util import (
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
+    _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
+    export_distributed_embedding,
 )
 
 
 class ExportUtilTest(unittest.TestCase):
+    def test_distributed_embedding_export_forces_rank_zero_single_process(self) -> None:
+        """Rank 0 export should be normalized to a single logical GPU."""
+        old_env = {
+            key: os.environ.get(key)
+            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+        }
+        try:
+            os.environ["RANK"] = "0"
+            os.environ["LOCAL_RANK"] = "2"
+            os.environ["WORLD_SIZE"] = "4"
+            os.environ["LOCAL_WORLD_SIZE"] = "4"
+
+            self.assertTrue(_prepare_single_rank_distributed_embedding_export())
+            self.assertEqual(os.environ["RANK"], "0")
+            self.assertEqual(os.environ["LOCAL_RANK"], "0")
+            self.assertEqual(os.environ["WORLD_SIZE"], "1")
+            self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "1")
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_distributed_embedding_export_skips_nonzero_rank_before_pg_init(
+        self,
+    ) -> None:
+        """Non-zero ranks should exit before creating a process group."""
+        old_env = {
+            key: os.environ.get(key)
+            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+        }
+        try:
+            os.environ["RANK"] = "1"
+            os.environ["LOCAL_RANK"] = "1"
+            os.environ["WORLD_SIZE"] = "2"
+            os.environ["LOCAL_WORLD_SIZE"] = "2"
+
+            with mock.patch("tzrec.utils.export_util.init_process_group") as init_pg:
+                export_distributed_embedding(None, None, None, "/tmp/unused_export")
+                init_pg.assert_not_called()
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")

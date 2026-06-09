@@ -348,6 +348,36 @@ def export_model_normal(
                 shutil.copy(asset, save_dir)
 
 
+def _prepare_single_rank_distributed_embedding_export() -> bool:
+    """Force distributed-embedding export to run as a single rank."""
+    rank = int(os.environ.get("RANK", 0))
+    if rank != 0:
+        logger.warning(
+            "Only first rank will be used for distributed embedding export now."
+        )
+        return False
+
+    forced_env = {
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_WORLD_SIZE": "1",
+    }
+    changed = [
+        f"{key}={value}"
+        for key, value in forced_env.items()
+        if os.environ.get(key) != value
+    ]
+    if changed:
+        logger.warning(
+            "distributed embedding export only supports single-rank export now, "
+            "we set %s.",
+            ", ".join(changed),
+        )
+    os.environ.update(forced_env)
+    return True
+
+
 def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
     """Get ShardedModule as leaf modules."""
 
@@ -1266,9 +1296,11 @@ def export_distributed_embedding(
     **kwargs: Any,
 ) -> List[nn.Module]:
     """Export for online serving under distributed embedding mode."""
+    if not _prepare_single_rank_distributed_embedding_export():
+        return
+
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
-    # local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_rank_zero = rank == 0
     graph_dir = os.path.join(save_dir, "graph")
