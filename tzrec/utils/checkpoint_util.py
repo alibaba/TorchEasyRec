@@ -306,6 +306,8 @@ class CheckpointManager:
         self._ts_interval = 0
         self._ts_targets: List[int] = []
         self._ts_quorum = 0.5
+        # CPU (gloo) group for the event-time gather; created in set_save_policy
+        self._ts_group: Optional[dist.ProcessGroup] = None
         # cadence state owned here so dedupe is centralized across all save sites
         self._last_ckpt_step = -1
         self._last_data_ts: Optional[float] = None
@@ -336,7 +338,9 @@ class CheckpointManager:
         """Configure when ``maybe_save`` fires (train path only).
 
         Sets cadence config only (never the ``_last_*`` state), so a watermark
-        seeded on resume survives.
+        seeded on resume survives. When timestamp triggers are active under a
+        distributed run, also creates the dedicated CPU (gloo) group used for the
+        per-step event-time gather -- a collective, so all ranks must call this.
 
         Args:
             save_steps: step interval; 0 disables the step trigger.
@@ -354,10 +358,36 @@ class CheckpointManager:
         self._ts_interval = ts_interval_s
         self._ts_targets = ts_targets
         self._ts_quorum = ts_quorum
+        if self.needs_worker_timestamps() and dist.is_initialized():
+            self._ts_group = dist.new_group(backend="gloo")
 
     def needs_worker_timestamps(self) -> bool:
         """Return whether the policy needs per-worker event-times gathered."""
         return self._ts_interval > 0 or len(self._ts_targets) > 0
+
+    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
+        """Quorum-reconcile this rank's event-time across workers.
+
+        Gathers over the CPU group from ``set_save_policy``. Each worker without a
+        timestamp contributes the -1.0 sentinel (sorts low, so it counts as "not
+        past"). Returns None when timestamp triggers are off or too few workers
+        have a real timestamp.
+
+        Args:
+            data_timestamp: this rank's consumed event-time (seconds), -1.0 if none.
+
+        Returns:
+            The quorum event-time (seconds), or None.
+        """
+        if not self.needs_worker_timestamps():
+            return None
+        if dist.is_initialized():
+            worker_ts: List[float] = [0.0] * dist.get_world_size(self._ts_group)
+            dist.all_gather_object(worker_ts, data_timestamp, group=self._ts_group)
+        else:
+            worker_ts = [data_timestamp]
+        data_ts = quorum_event_time(worker_ts, self._ts_quorum)
+        return data_ts if data_ts is not None and data_ts >= 0 else None
 
     def maybe_save(
         self,
@@ -367,7 +397,7 @@ class CheckpointManager:
         dataloader_state: Optional[Dict[str, Any]] = None,
         *,
         epoch: Optional[int] = None,
-        worker_ts_list: Optional[List[float]] = None,
+        data_timestamp: float = -1.0,
         final: bool = False,
     ) -> bool:
         """Save a checkpoint if a configured trigger fires; return whether it did.
@@ -385,21 +415,14 @@ class CheckpointManager:
             dataloader_state: dataloader resume state; the event-time watermark is
                 stamped into it on save.
             epoch: current epoch; enables the epoch trigger when not None.
-            worker_ts_list: per-rank consumed event-times (seconds) gathered by the
-                caller; reconciled here via the worker quorum.
+            data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
+                reconciled across workers (quorum) for the event-time trigger.
             final: force a save (still subject to the dedupe), e.g. at train end.
 
         Returns:
             True if a checkpoint was saved.
         """
-        data_ts = (
-            quorum_event_time(worker_ts_list, self._ts_quorum)
-            if worker_ts_list
-            else None
-        )
-        # a -1.0-dominated quorum (too few workers with a timestamp) -> no event-time
-        if data_ts is not None and data_ts < 0:
-            data_ts = None
+        data_ts = self._reconcile_event_time(data_timestamp)
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:

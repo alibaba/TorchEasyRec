@@ -674,43 +674,39 @@ class DataloaderCheckpointTest(unittest.TestCase):
     def test_maybe_save_timestamp_init_then_fire(self):
         mgr = self._policy_manager(ts_interval_s=3600)
         # first observed event-time only initializes the reference, no save
-        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[3599.0]))
+        self.assertFalse(mgr.maybe_save(1, model=None, data_timestamp=3599.0))
         # crossing the next Unix-epoch-aligned boundary fires
-        self.assertTrue(mgr.maybe_save(2, model=None, worker_ts_list=[3600.0]))
-
-    def test_maybe_save_timestamp_quorum(self):
-        # quorum=1.0: only fires once the slowest worker crosses
-        mgr = self._policy_manager(ts_interval_s=3600, ts_quorum=1.0)
-        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[3000.0, 3000.0]))
-        # one worker crossed, the other not -> min still in old bucket -> no save
-        self.assertFalse(mgr.maybe_save(2, model=None, worker_ts_list=[3700.0, 3500.0]))
-        # both crossed -> save
-        self.assertTrue(mgr.maybe_save(3, model=None, worker_ts_list=[3700.0, 3601.0]))
+        self.assertTrue(mgr.maybe_save(2, model=None, data_timestamp=3600.0))
 
     def test_maybe_save_timestamp_sentinel(self):
-        # -1.0 sentinels (workers without a timestamp) never establish/advance the
-        # reference nor trigger a save; a real time later initializes cleanly
+        # -1.0 (no timestamp this step) never establishes/advances the reference
+        # nor triggers a save; a real time later initializes cleanly
         mgr = self._policy_manager(ts_interval_s=3600)
-        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[-1.0, -1.0]))
+        self.assertFalse(mgr.maybe_save(1, model=None, data_timestamp=-1.0))
         self.assertIsNone(mgr._last_data_ts)  # not initialized to -1.0
-        self.assertFalse(mgr.maybe_save(2, model=None, worker_ts_list=[3599.0, 3599.0]))
+        self.assertFalse(mgr.maybe_save(2, model=None, data_timestamp=3599.0))
         self.assertEqual(mgr._last_data_ts, 3599.0)  # real time initializes
-        self.assertTrue(mgr.maybe_save(3, model=None, worker_ts_list=[3600.0, 3600.0]))
+        self.assertTrue(mgr.maybe_save(3, model=None, data_timestamp=3600.0))
 
     def test_maybe_save_stamps_watermark(self):
         mgr = self._policy_manager(ts_interval_s=3600)
         state = {}
         self.assertFalse(
-            mgr.maybe_save(
-                1, model=None, dataloader_state=state, worker_ts_list=[3599.0]
-            )
+            mgr.maybe_save(1, model=None, dataloader_state=state, data_timestamp=3599.0)
         )
         self.assertTrue(
-            mgr.maybe_save(
-                2, model=None, dataloader_state=state, worker_ts_list=[3600.0]
-            )
+            mgr.maybe_save(2, model=None, dataloader_state=state, data_timestamp=3600.0)
         )
         self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+
+    def test_reconcile_event_time_single_process(self):
+        # not distributed: this rank's value passes through (quorum of one); -1.0
+        # (no timestamp) -> None; disabled policy -> None
+        mgr = self._policy_manager(ts_interval_s=3600)
+        self.assertEqual(mgr._reconcile_event_time(1717000000.0), 1717000000.0)
+        self.assertIsNone(mgr._reconcile_event_time(-1.0))
+        mgr_off = self._policy_manager()
+        self.assertIsNone(mgr_off._reconcile_event_time(1717000000.0))
 
     def test_restore_seeds_watermark(self):
         mgr = self._policy_manager(ts_interval_s=3600)
@@ -722,9 +718,9 @@ class DataloaderCheckpointTest(unittest.TestCase):
         state = mgr.restore_dataloader_state(tmp_dir)
         self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 7200.0)
         # seeded reference: a value in the same bucket does not re-fire
-        self.assertFalse(mgr.maybe_save(1, model=None, worker_ts_list=[7201.0]))
+        self.assertFalse(mgr.maybe_save(1, model=None, data_timestamp=7201.0))
         # crossing the next boundary fires
-        self.assertTrue(mgr.maybe_save(2, model=None, worker_ts_list=[10800.0]))
+        self.assertTrue(mgr.maybe_save(2, model=None, data_timestamp=10800.0))
 
 
 if __name__ == "__main__":

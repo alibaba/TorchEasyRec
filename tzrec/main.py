@@ -82,7 +82,6 @@ from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
     create_train_pipeline,
-    gather_float_scalar,
     init_process_group,
 )
 from tzrec.utils.export_util import export_model
@@ -366,12 +365,6 @@ def _train_and_evaluate(
         list(train_config.save_checkpoints_timestamps),
         train_config.save_checkpoints_timestamp_quorum,
     )
-    need_ts = ckpt_manager.needs_worker_timestamps()
-    # dedicated CPU (gloo) group so the per-step event-time gather stays off the
-    # GPU and never forces a device sync that would stall the prefetch pipeline.
-    ts_pg = (
-        dist.new_group(backend="gloo") if need_ts and dist.is_initialized() else None
-    )
 
     plogger = None
     summary_writer = None
@@ -431,8 +424,8 @@ def _train_and_evaluate(
             )
             model.train()
 
-    # last gathered per-worker event-times, reused by the epoch / final saves
-    worker_ts: Optional[List[float]] = None
+    # this rank's last consumed event-time, reused by the epoch / final saves
+    data_timestamp = -1.0
     for i_epoch in epoch_iter:
         pipeline = create_train_pipeline(
             model,
@@ -491,15 +484,15 @@ def _train_and_evaluate(
                 i_step -= 1
                 break
 
-            # Gather each rank's consumed event-time for the timestamp trigger,
-            # in lockstep (same equal-step-count invariant the model's gradient
-            # collectives already require).
-            worker_ts = (
-                gather_float_scalar(batch.data_timestamp, ts_pg) if need_ts else None
-            )
-            # Single entry point for step / epoch / event-time saves + dedupe.
+            # Single entry point for step / epoch / event-time saves + dedupe;
+            # maybe_save reconciles this rank's event-time across ranks in lockstep.
+            data_timestamp = batch.data_timestamp
             if ckpt_manager.maybe_save(
-                i_step, model, optimizer, dataloader_state, worker_ts_list=worker_ts
+                i_step,
+                model,
+                optimizer,
+                dataloader_state,
+                data_timestamp=data_timestamp,
             ):
                 run_eval(i_step, i_epoch)
             if train_config.is_profiling:
@@ -511,7 +504,7 @@ def _train_and_evaluate(
             optimizer,
             dataloader_state,
             epoch=i_epoch,
-            worker_ts_list=worker_ts,
+            data_timestamp=data_timestamp,
         ):
             run_eval(i_step, i_epoch)
 
@@ -536,7 +529,12 @@ def _train_and_evaluate(
     if train_config.is_profiling:
         prof.stop()
     if ckpt_manager.maybe_save(
-        i_step, model, optimizer, dataloader_state, worker_ts_list=worker_ts, final=True
+        i_step,
+        model,
+        optimizer,
+        dataloader_state,
+        data_timestamp=data_timestamp,
+        final=True,
     ):
         run_eval(i_step, i_epoch)
     ckpt_manager.close()
