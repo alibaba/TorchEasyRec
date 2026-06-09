@@ -27,12 +27,9 @@ from tzrec.utils.state_dict_util import init_parameters
 WORLD_SIZE = 2
 
 
-def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
-    """Create a minimal Batch with dense embedding features."""
-    dense_feature = KeyedTensor.from_tensor_list(
-        keys=["item_emb"],
-        tensors=[torch.randn(batch_size, input_dim, device=device)],
-    )
+def _batch_from_rows(rows: torch.Tensor) -> Batch:
+    """Wrap explicit ``item_emb`` rows in a minimal Batch."""
+    dense_feature = KeyedTensor.from_tensor_list(keys=["item_emb"], tensors=[rows])
     return Batch(
         dense_features={BASE_DATA_GROUP: dense_feature},
         sparse_features={},
@@ -40,7 +37,14 @@ def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
     )
 
 
-def _build_model(input_dim=32, n_layers=2, niter=5, codebook=None) -> SidRqkmeans:
+def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
+    """Create a minimal Batch with random dense embedding features."""
+    return _batch_from_rows(torch.randn(batch_size, input_dim, device=device))
+
+
+def _build_model(
+    input_dim=32, n_layers=2, niter=5, codebook=None, normalize_residuals=False
+) -> SidRqkmeans:
     """Build a SidRqkmeans configured for offline FAISS fit.
 
     Module-level (not a method) so the spawned DDP workers below can build
@@ -56,7 +60,7 @@ def _build_model(input_dim=32, n_layers=2, niter=5, codebook=None) -> SidRqkmean
     cfg = sid_model_pb2.SidRqkmeans(
         input_dim=input_dim,
         codebook=n_embed_list,
-        normalize_residuals=False,
+        normalize_residuals=normalize_residuals,
         faiss_kmeans_kwargs=faiss_kwargs,
         embedding_feature_name="item_emb",
     )
@@ -70,9 +74,16 @@ def _build_model(input_dim=32, n_layers=2, niter=5, codebook=None) -> SidRqkmean
 class SidRqkmeansOfflineTest(unittest.TestCase):
     """Single-process tests for SidRqkmeans (FAISS-only)."""
 
-    def _create_model(self, input_dim=32, n_layers=2, niter=5, codebook=None):
+    def _create_model(
+        self,
+        input_dim=32,
+        n_layers=2,
+        niter=5,
+        codebook=None,
+        normalize_residuals=False,
+    ):
         """Create a SidRqkmeans on CPU with params initialized."""
-        model = _build_model(input_dim, n_layers, niter, codebook)
+        model = _build_model(input_dim, n_layers, niter, codebook, normalize_residuals)
         init_parameters(model, device=torch.device("cpu"))
         return model
 
@@ -116,6 +127,51 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertEqual(model._n_seen, 20 * B)
         self.assertEqual(model._n_filled, 10)
         self.assertEqual(model._reservoir.shape, (10, input_dim))
+
+    def test_reservoir_phase2_replacement(self) -> None:
+        """Phase-2 replacement keeps a valid reservoir of real, in-range rows.
+
+        Feeds identifiable rows (each row's value == its global stream index),
+        then asserts every reservoir slot still holds an intact fed row, all
+        indices are in range, and replacement past the initial fill actually
+        happened — exercising the accept-prob / slot-write logic that the
+        count/shape-only ``test_reservoir_caps_memory`` cannot.
+        """
+        torch.manual_seed(0)
+        input_dim, cap, B, n_batches = 4, 8, 4, 50
+        model = self._create_model(input_dim=input_dim)
+        model._sample_cap = cap
+        model._reset_reservoir()
+        model.train()
+
+        gidx = 0
+        for _ in range(n_batches):
+            rows = (
+                torch.arange(gidx, gidx + B, dtype=torch.float32)
+                .unsqueeze(1)
+                .expand(B, input_dim)
+                .contiguous()
+            )
+            gidx += B
+            model.predict(_batch_from_rows(rows))
+
+        total = B * n_batches
+        self.assertEqual(model._n_seen, total)
+        self.assertEqual(model._n_filled, cap)
+
+        res = model._reservoir
+        idx = res[:, 0].round().long()
+        # Each stored row is an intact fed row (all columns equal its index),
+        # never zeros/garbage.
+        self.assertTrue(
+            torch.equal(res, idx.unsqueeze(1).float().expand_as(res)),
+            "reservoir holds corrupted (non-fed) rows",
+        )
+        # All indices are valid stream positions.
+        self.assertTrue((idx >= 0).all() and (idx < total).all())
+        # Phase-2 replacement happened: at least one slot holds a row added
+        # after the reservoir filled (index >= cap).
+        self.assertTrue((idx >= cap).any(), "no Phase-2 replacement occurred")
 
     def test_on_train_end_runs_faiss(self) -> None:
         """on_train_end triggers FAISS fit and clears buffer."""
@@ -182,6 +238,83 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         for i, k in enumerate(codebook):
             self.assertTrue((codes[:, i] >= 0).all() and (codes[:, i] < k).all())
 
+    def test_normalize_residuals_end_to_end(self) -> None:
+        """train_offline with normalize_residuals=True fits + predicts.
+
+        Exercises the ``F.normalize`` site inside ``train_offline`` (a second
+        normalize independent of ``_residual_pass``), which the other tests —
+        all built with normalize_residuals=False — never reach.
+        """
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+        B, input_dim = 64, 32
+        model = self._create_model(input_dim=input_dim, normalize_residuals=True)
+        self.assertTrue(model._quantizer.normalize_residuals)
+
+        model.train()
+        for _ in range(8):
+            model.predict(_make_batch(B, input_dim))
+        self.assertTrue(model.on_train_end())
+
+        for layer in model._quantizer.layers:
+            self.assertTrue(layer.is_initialized)
+
+        model.eval()
+        codes = model.predict(_make_batch(B, input_dim))["codes"]
+        self.assertEqual(codes.shape, (B, 2))
+        self.assertTrue((codes >= 0).all() and (codes < 16).all())
+
+    def test_eval_and_inference_predict_contract(self) -> None:
+        """Eval exposes quantized/input_embedding; inference is codes-only."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+        B, input_dim = 64, 32
+        model = self._create_model(input_dim=input_dim)
+        model.train()
+        for _ in range(8):
+            model.predict(_make_batch(B, input_dim))
+        model.on_train_end()
+
+        # Eval mode: reconstruction outputs are present for update_metric.
+        model.eval()
+        eval_preds = model.predict(_make_batch(B, input_dim))
+        self.assertIn("quantized", eval_preds)
+        self.assertIn("input_embedding", eval_preds)
+
+        # Inference (serving) mode: codes-only contract.
+        model.set_is_inference(True)
+        inf_preds = model.predict(_make_batch(B, input_dim))
+        self.assertEqual(set(inf_preds.keys()), {"codes"})
+
+    def test_eval_metric_path(self) -> None:
+        """init_metric/update_metric report finite mse + rel_loss in eval."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+        B, input_dim = 64, 32
+        model = self._create_model(input_dim=input_dim)
+        model.train()
+        for _ in range(8):
+            model.predict(_make_batch(B, input_dim))
+        model.on_train_end()
+
+        model.init_metric()
+        model.eval()
+        preds = model.predict(_make_batch(B, input_dim))
+        model.update_metric(preds, _make_batch(B, input_dim))
+        metrics = model.compute_metric()
+        for key in ("mse", "rel_loss", "unique_sid_ratio"):
+            self.assertIn(key, metrics)
+            self.assertTrue(torch.isfinite(torch.as_tensor(metrics[key])).all())
+
     def test_on_train_end_noop_on_empty_buffer(self) -> None:
         """on_train_end on an empty buffer is a warned no-op."""
         model = self._create_model()
@@ -191,9 +324,9 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
     def test_post_fit_checkpoint_round_trips(self) -> None:
         """Fit → save state_dict → load into fresh instance → predict.
 
-        After loading, ``predict`` must return real (non-zero) codes —
-        the centroids and the ``_is_initialized`` flag both need to come
-        through the state_dict.
+        The reloaded model must produce the *same* codes as the source on the
+        same batch — verifying the centroids round-trip exactly, not merely
+        that they came through as non-zero.
         """
         try:
             import faiss  # noqa: F401
@@ -210,13 +343,19 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
 
         dst = self._create_model(input_dim=input_dim)
         dst.load_state_dict(sd)
+
+        # Same batch through both → identical codes (exact round-trip).
+        batch = _make_batch(B, input_dim)
+        src.eval()
         dst.eval()
-        codes = dst.predict(_make_batch(B, input_dim))["codes"]
+        src_codes = src.predict(batch)["codes"]
+        dst_codes = dst.predict(batch)["codes"]
         self.assertGreater(
-            codes.abs().sum().item(),
+            dst_codes.abs().sum().item(),
             0,
             "post-fit checkpoint resume produced all-zero codes",
         )
+        torch.testing.assert_close(dst_codes, src_codes)
 
     def test_mid_fit_checkpoint_rejected_on_load(self) -> None:
         """Tampered state (_is_initialized=True + zero centroids) raises."""

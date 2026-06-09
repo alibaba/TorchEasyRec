@@ -21,9 +21,10 @@ message SidRqkmeans {
     optional google.protobuf.Struct faiss_kmeans_kwargs = 5;
     // Target number of embeddings to reservoir-sample for the FAISS fit
     // (global, across all ranks). Bounds host memory regardless of corpus
-    // size. 0 (the default) auto-derives it as K * max_points_per_centroid
-    // — exactly what FAISS subsamples to internally (default 256), so no
-    // training points are wasted.
+    // size. 0 (the default) auto-derives it as max(K) * max_points_per_centroid
+    // (the largest per-layer codebook, for non-uniform codebooks) — exactly
+    // what FAISS subsamples to internally (default 256), so no training points
+    // are wasted.
     optional uint32 train_sample_size = 6 [default = 0];
 
     // Name of the item embedding feature inside the input Batch.

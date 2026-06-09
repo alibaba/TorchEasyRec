@@ -160,9 +160,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
     ) -> None:
         """Train the multi-layer codebook via offline FAISS K-Means.
 
-        The residual matrix stays a host (CPU) tensor; with a faiss-gpu build,
-        ``gpu=<dev>`` moves only FAISS's subsampled working set to the GPU, so
-        we never hold (N, D) in VRAM. faiss-cpu runs the same path on CPU.
+        The residual matrix stays a host (CPU) tensor. With a faiss-gpu build,
+        ``faiss.Kmeans`` runs the K-Means training (over its internally
+        subsampled set) on the GPU; the post-fit ``index.search`` assignment
+        still streams all N rows through in ``SEARCH_CHUNK``-sized chunks, so we
+        never hold the full (N, D) on the device. faiss-cpu runs the same path
+        on CPU.
 
         Args:
             inputs (Tensor): embedding matrix (N, D). Copied once to an owned
@@ -182,13 +185,13 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         x0 = x.clone() if verbose else None
 
         # Use FAISS GPU compute when a faiss-gpu build is present; an explicit
-        # ``gpu`` in faiss_kmeans_kwargs always wins.
+        # ``gpu`` in faiss_kmeans_kwargs always wins. NB faiss reads ``gpu`` as a
+        # GPU *count* (1 = one GPU = the current/rank0 device), not a device
+        # index — passing an index of 0 is falsy and silently falls back to CPU.
         kwargs = dict(self.faiss_kmeans_kwargs)
         if "gpu" not in kwargs:
             kwargs["gpu"] = (
-                torch.cuda.current_device()
-                if faiss.get_num_gpus() > 0 and torch.cuda.is_available()
-                else False
+                1 if (faiss.get_num_gpus() > 0 and torch.cuda.is_available()) else False
             )
 
         # Chunk index.search to cap peak memory (~1 GB at 500K × 512 × 4B).

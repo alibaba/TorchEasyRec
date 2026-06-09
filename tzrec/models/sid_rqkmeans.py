@@ -273,8 +273,11 @@ class SidRqkmeans(BaseSidModel):
 
         Returns:
             is_ckpt_after_train (bool): ``True`` if the codebook was fitted
-            (centroids changed → force a final checkpoint), ``False`` if the
-            fit was skipped (empty reservoir).
+            (centroids changed → force a final checkpoint). Only the
+            single-process path can return ``False`` (empty reservoir, fit
+            skipped); the DDP path either returns ``True`` or raises (an empty
+            gather makes rank0's fit fail, which the status broadcast turns
+            into a coordinated ``RuntimeError``).
         """
         is_ddp = (
             dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
