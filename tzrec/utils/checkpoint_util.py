@@ -419,16 +419,17 @@ class CheckpointManager:
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
             final: force a save (still subject to the dedupe), e.g. at train end.
-            force: save even if this step was already saved (bypasses the
-                per-step dedupe), e.g. when end-of-train work mutated the model
-                state at the final step (see ``on_train_end``).
+            force: when a save is already requested (e.g. ``final``), bypass the
+                per-step dedupe so it fires even if this step was already saved
+                — e.g. when end-of-train work mutated the model state at the
+                final step (see ``on_train_end``). No effect on its own.
 
         Returns:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
 
-        want = final or force
+        want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
             want = True
         if (
