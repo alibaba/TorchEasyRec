@@ -24,6 +24,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.dlrm_hstu import DlrmHSTU
 from tzrec.models.model import TrainWrapper
+from tzrec.models.rank_model import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.ops import Kernel
 from tzrec.protos import (
     feature_pb2,
@@ -444,6 +445,34 @@ class DlrmHSTUTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_like"].size(), (6,))
         self.assertEqual(predictions["logits_is_comment"].size(), (6,))
         self.assertEqual(predictions["probs_is_comment"].size(), (6,))
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dlrm_hstu_predict_num_targets_order(self) -> None:
+        """num_targets split key must stay in input order.
+
+        ``_write_predictions`` regroups predictions per request via
+        ``cumsum(predictions[TARGET_REPEAT_INTERLEAVE_KEY])``. With
+        ``sequence_timestamp_is_ascending=False``, ``predict()`` flips features
+        (reversing request order) and flips predictions back, so the key must
+        also be un-flipped; reading it from the still-flipped
+        ``candidate.sequence_length`` returns [4, 2] for the [2, 4] test batch,
+        misassigning whole-request blocks. ``size()`` (== 6) can't catch it.
+        """
+        device = torch.device("cuda")
+        # candidate (cand_seq) counts in _build_batch, in input order.
+        expected_num_targets = [2, 4]
+        for ascending in (True, False):
+            model = _build_model(
+                device=device, sequence_timestamp_is_ascending=ascending
+            )
+            batch = _build_batch(device=device)
+            with torch.no_grad():
+                predictions = model.predict(batch)
+            self.assertEqual(
+                predictions[TARGET_REPEAT_INTERLEAVE_KEY].cpu().tolist(),
+                expected_num_targets,
+                msg=f"num_targets order wrong for ascending={ascending}",
+            )
 
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_task_weight(self) -> None:
