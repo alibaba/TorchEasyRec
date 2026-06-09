@@ -178,6 +178,13 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         )
         x = inputs.detach().to("cpu", torch.float32).contiguous().clone()
         N = x.shape[0]
+        # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
+        # errors) when N < K and returns a degenerate codebook, which the
+        # all-zero poison guard in KMeansLayer would not catch.
+        max_k = max(self.n_embed_list)
+        assert N >= max_k, (
+            f"need >= {max_k} points to fit the codebook (largest layer K), got N={N}"
+        )
         out = torch.zeros_like(x)
         # Original input, kept only for the log: the per-layer diagnostic is the
         # cumulative recon error of x0 by the centroid sum (what update_metric

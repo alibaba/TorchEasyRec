@@ -241,6 +241,13 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         """Update metric state.
 
+        Note: ``mse``/``rel_loss`` compare ``input_embedding`` against the
+        centroid-sum reconstruction. They are meaningful reconstruction
+        metrics only with ``normalize_residuals=False`` (the default); with
+        normalization the centroids live on the rescaled-residual scale, so
+        the two quantities don't share a scale (same caveat the train_offline
+        per-layer log carries).
+
         Args:
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.

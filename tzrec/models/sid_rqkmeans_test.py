@@ -43,7 +43,12 @@ def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
 
 
 def _build_model(
-    input_dim=32, n_layers=2, niter=5, codebook=None, normalize_residuals=False
+    input_dim=32,
+    n_layers=2,
+    niter=5,
+    codebook=None,
+    normalize_residuals=False,
+    train_sample_size=0,
 ) -> SidRqkmeans:
     """Build a SidRqkmeans configured for offline FAISS fit.
 
@@ -63,6 +68,7 @@ def _build_model(
         normalize_residuals=normalize_residuals,
         faiss_kmeans_kwargs=faiss_kwargs,
         embedding_feature_name="item_emb",
+        train_sample_size=train_sample_size,
     )
     return SidRqkmeans(
         model_config=model_pb2.ModelConfig(sid_rqkmeans=cfg),
@@ -81,9 +87,17 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         niter=5,
         codebook=None,
         normalize_residuals=False,
+        train_sample_size=0,
     ):
         """Create a SidRqkmeans on CPU with params initialized."""
-        model = _build_model(input_dim, n_layers, niter, codebook, normalize_residuals)
+        model = _build_model(
+            input_dim,
+            n_layers,
+            niter,
+            codebook,
+            normalize_residuals,
+            train_sample_size,
+        )
         init_parameters(model, device=torch.device("cpu"))
         return model
 
@@ -95,6 +109,23 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertFalse(model._faiss_kwargs.get("verbose"))
         self.assertEqual(model._n_seen, 0)
         self.assertIsNone(model._reservoir)
+
+    def test_sample_cap_from_train_sample_size(self) -> None:
+        """Explicit train_sample_size drives the per-rank cap (ceil-div)."""
+        from unittest import mock
+
+        # Single process (world_size=1): cap == train_sample_size.
+        model = self._create_model(train_sample_size=900)
+        self.assertEqual(model._sample_cap, 900)
+
+        # Per-rank ceil-div across world_size (patch dist + recompute the cap).
+        for world_size, expected in [(4, 225), (7, 129), (1000, 1)]:
+            with (
+                mock.patch.object(dist, "is_initialized", return_value=True),
+                mock.patch.object(dist, "get_world_size", return_value=world_size),
+            ):
+                model._init_reservoir()
+            self.assertEqual(model._sample_cap, expected)
 
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""
@@ -461,50 +492,43 @@ def _on_train_end_fail_worker(rank: int, world_size: int, port: int) -> None:
     )
 
 
+def _run_dist_workers(worker, world_size: int, timeout: int = 120) -> None:
+    """Spawn ``world_size`` procs running ``worker(rank, world_size, port)``.
+
+    Joins with a timeout so a deadlock (e.g. a dropped barrier / reordered
+    broadcast) fails the test instead of hanging CI, and raises on a hung or
+    nonzero-exit worker.
+    """
+    port = misc_util.get_free_port()
+    ctx = mp.get_context("spawn")
+    procs = []
+    for rank in range(world_size):
+        p = ctx.Process(target=worker, args=(rank, world_size, port))
+        p.start()
+        procs.append(p)
+    for i, p in enumerate(procs):
+        p.join(timeout=timeout)
+        if p.is_alive():
+            p.terminate()
+            raise RuntimeError(f"worker-{i} deadlocked (timed out after {timeout}s).")
+        if p.exitcode != 0:
+            raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
+
+
 class SidRqkmeansDistTest(unittest.TestCase):
     """2-rank test for SidRqkmeans.on_train_end (gather -> fit -> broadcast)."""
 
     def test_on_train_end_ddp(self) -> None:
-        port = misc_util.get_free_port()
-        ctx = mp.get_context("spawn")
-        procs = []
-        for rank in range(WORLD_SIZE):
-            p = ctx.Process(target=_on_train_end_worker, args=(rank, WORLD_SIZE, port))
-            p.start()
-            procs.append(p)
-        for i, p in enumerate(procs):
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
+        _run_dist_workers(_on_train_end_worker, WORLD_SIZE)
 
     def test_on_train_end_ddp_rank0_failure(self) -> None:
         """A rank0-only fit failure raises on every rank — never deadlocks.
 
         Guards the status-flag-before-centroid-broadcast ordering: a regression
-        that reordered/dropped it would hang here. ``join(timeout=...)`` turns a
-        reintroduced deadlock into a CI failure instead of a hung job.
+        that reordered/dropped it would hang, which the join timeout turns into
+        a CI failure instead of a hung job.
         """
-        port = misc_util.get_free_port()
-        ctx = mp.get_context("spawn")
-        procs = []
-        for rank in range(WORLD_SIZE):
-            p = ctx.Process(
-                target=_on_train_end_fail_worker, args=(rank, WORLD_SIZE, port)
-            )
-            p.start()
-            procs.append(p)
-        for i, p in enumerate(procs):
-            p.join(timeout=120)
-            if p.is_alive():
-                p.terminate()
-                raise RuntimeError(
-                    f"worker-{i} deadlocked on a rank0 fit failure (timed out)."
-                )
-            if p.exitcode != 0:
-                raise RuntimeError(
-                    f"worker-{i} did not raise the coordinated error "
-                    f"(exitcode={p.exitcode})."
-                )
+        _run_dist_workers(_on_train_end_fail_worker, WORLD_SIZE)
 
 
 if __name__ == "__main__":
