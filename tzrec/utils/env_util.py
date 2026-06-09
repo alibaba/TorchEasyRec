@@ -34,7 +34,7 @@ def use_rtp() -> bool:
 
 def use_distributed_embedding() -> bool:
     """Export model for distributed embedding mode of EAS processor."""
-    return os.environ.get("use_distributed_embedding", "0") == "1"
+    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
 
 
 def enable_tma() -> bool:

@@ -91,7 +91,7 @@ def ensure_input_tile_for_distributed_embedding() -> None:
         os.environ["INPUT_TILE"] = "3"
     elif current_input_tile != "3":
         logger.warning(
-            "use_distributed_embedding=1 requires INPUT_TILE=3, "
+            "USE_DISTRIBUTED_EMBEDDING=1 requires INPUT_TILE=3, "
             f"got INPUT_TILE={current_input_tile}. Overriding to 3."
         )
         os.environ["INPUT_TILE"] = "3"
