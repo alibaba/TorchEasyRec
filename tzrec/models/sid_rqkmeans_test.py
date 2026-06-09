@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -39,6 +40,14 @@ def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
 
 class SidRqkmeansOfflineTest(unittest.TestCase):
     """Single-process tests for SidRqkmeans (FAISS-only)."""
+
+    def setUp(self) -> None:
+        # SidRqkmeans is CPU-only and refuses to init when CUDA is visible. The
+        # GPU CI runners have CUDA, so simulate a CPU-only host for every
+        # construction-based test. (test_init_raises_on_gpu overrides this.)
+        patcher = mock.patch.object(torch.cuda, "is_available", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _create_model(
         self,
@@ -321,13 +330,19 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
 
     def test_init_raises_under_ddp(self) -> None:
         """SidRqkmeans is single-process only: world_size>1 fails fast in init."""
-        from unittest import mock
-
         with (
             mock.patch.object(dist, "is_available", return_value=True),
             mock.patch.object(dist, "is_initialized", return_value=True),
             mock.patch.object(dist, "get_world_size", return_value=2),
             self.assertRaisesRegex(RuntimeError, "single-process"),
+        ):
+            self._create_model()
+
+    def test_init_raises_on_gpu(self) -> None:
+        """SidRqkmeans is CPU-only: a visible CUDA device fails fast in init."""
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "CPU-only"),
         ):
             self._create_model()
 

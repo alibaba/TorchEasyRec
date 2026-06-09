@@ -55,7 +55,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             residuals with no per-layer normalization).
         faiss_kmeans_kwargs (Dict|None): extra kwargs forwarded to
             ``faiss.Kmeans(D, K, **kwargs)`` (e.g. {'niter': 20,
-            'gpu': True, 'verbose': True, 'spherical': False}).
+            'verbose': True, 'spherical': False}). A ``gpu`` key is ignored —
+            the fit is CPU-only.
     """
 
     def __init__(
@@ -160,23 +161,21 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
     ) -> None:
         """Train the multi-layer codebook via offline FAISS K-Means.
 
-        The residual matrix stays a host (CPU) tensor. With a faiss-gpu build,
-        ``faiss.Kmeans`` runs the K-Means training (over its internally
-        subsampled set) on the GPU; the post-fit ``index.search`` assignment
-        still streams all N rows through in ``SEARCH_CHUNK``-sized chunks, so we
-        never hold the full (N, D) on the device. faiss-cpu runs the same path
-        on CPU.
+        CPU-only: ``inputs`` is already a host tensor (SidRqkmeans refuses to
+        run when CUDA is visible) and the FAISS fit runs on CPU. The post-fit
+        ``index.search`` assignment streams all N rows through in
+        ``SEARCH_CHUNK``-sized chunks to cap peak memory.
 
         Args:
-            inputs (Tensor): embedding matrix (N, D). Copied once to an owned
-                CPU float32 tensor; not mutated.
+            inputs (Tensor): embedding matrix (N, D) on CPU. Copied once to an
+                owned float32 tensor; not mutated.
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # Own a contiguous CPU float32 copy to update in place as the residual.
+        # Own a contiguous float32 copy to update in place as the residual.
         assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
             f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
         )
-        x = inputs.detach().to("cpu", torch.float32).contiguous().clone()
+        x = inputs.detach().to(torch.float32).contiguous().clone()
         N = x.shape[0]
         # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
         # errors) when N < K and returns a degenerate codebook, which the
@@ -191,20 +190,16 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # reports). ``out + x`` would equal it only without normalization.
         x0 = x.clone() if verbose else None
 
-        # Default to a CPU fit. faiss reads ``gpu`` as a GPU *count*, not a
-        # device index (and ``1 == True`` collapses to all GPUs), so it cannot
-        # pin this rank0-only fit to a single device without sharding faiss
-        # memory onto the other ranks' GPUs. The fit is a bounded one-shot over
-        # the reservoir subsample, so CPU is cheap; set ``gpu`` explicitly in
-        # faiss_kmeans_kwargs (e.g. ``True`` for all GPUs) to opt into GPU.
+        # CPU-only fit: SidRqkmeans refuses to initialize when CUDA is visible,
+        # so the codebook is always built on CPU. Drop any stale ``gpu`` request
+        # from the config so a faiss-gpu build can't try to use an absent GPU.
         kwargs = dict(self.faiss_kmeans_kwargs)
-        kwargs.setdefault("gpu", False)
+        kwargs.pop("gpu", None)
         if verbose:
             logger.info(
-                "[ResidualKMeansQuantizer] fitting %d-layer codebook on %s "
-                "(N=%d, D=%d); set faiss_kmeans_kwargs.gpu to change.",
+                "[ResidualKMeansQuantizer] fitting %d-layer codebook on CPU "
+                "(N=%d, D=%d).",
                 self.n_layers,
-                "GPU" if kwargs["gpu"] else "CPU",
                 N,
                 self.embed_dim,
             )
@@ -222,12 +217,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 self.embed_dim, self.n_embed_list[layer_idx], **kwargs
             )
             kmeans.train(x)
-            centroids = torch.as_tensor(kmeans.centroids, dtype=torch.float32).cpu()
+            centroids = torch.as_tensor(kmeans.centroids, dtype=torch.float32)
 
             for start in range(0, N, SEARCH_CHUNK):
                 end = min(start + SEARCH_CHUNK, N)
                 _, idx = kmeans.index.search(x[start:end], 1)
-                idx = torch.as_tensor(idx, device="cpu").reshape(-1).long()
+                idx = torch.as_tensor(idx).reshape(-1).long()
                 q = centroids[idx]  # (chunk, D)
                 out[start:end] += q
                 x[start:end] -= q  # residual

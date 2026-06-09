@@ -72,6 +72,16 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
+        # CPU-only: everything (embeddings, reservoir, FAISS fit) stays on the
+        # host, so there are no device copies on the train path. Refuse to run
+        # when CUDA is visible rather than silently shuttling tensors to/from a
+        # GPU; launch with CUDA_VISIBLE_DEVICES="" (or on a CPU-only host).
+        if torch.cuda.is_available():
+            raise RuntimeError(
+                "SidRqkmeans is CPU-only, but a CUDA device is visible. "
+                'Run with CUDA_VISIBLE_DEVICES="" (or on a CPU-only host).'
+            )
+
         # Single-process only: the FAISS fit runs on one process over its local
         # reservoir, with no cross-rank gather/broadcast. Fail fast here rather
         # than after a full (wasted) training pass.
@@ -138,11 +148,12 @@ class SidRqkmeans(BaseSidModel):
         if self._reservoir is None:
             self._reservoir = torch.empty(cap, x.shape[1], dtype=torch.float32)
 
-        # Phase 1: fill empty slots first. Copy only the rows we keep to host.
+        # Phase 1: fill empty slots first. x is already on the host (CPU-only
+        # model), so this is a dtype cast into the reservoir, not a device copy.
         if self._n_filled < cap:
             take = min(x.shape[0], cap - self._n_filled)
             self._reservoir[self._n_filled : self._n_filled + take] = x[:take].to(
-                "cpu", dtype=torch.float32
+                torch.float32
             )
             self._n_filled += take
             self._n_seen += take
@@ -151,9 +162,7 @@ class SidRqkmeans(BaseSidModel):
                 return
 
         # Phase 2: row j enters with prob cap/(n_seen+j+1), displacing a random
-        # slot. The accept decision needs only counts, so compute it on host and
-        # copy ONLY accepted rows (in steady state, almost none) — avoiding the
-        # whole-batch GPU->CPU copy. float64 keeps n_seen+j+1 exact past 2**24.
+        # slot. float64 keeps n_seen+j+1 exact past 2**24.
         r = x.shape[0]
         pos = self._n_seen + torch.arange(r)
         accept = torch.rand(r) < (cap / (pos + 1).to(torch.float64))
@@ -161,7 +170,7 @@ class SidRqkmeans(BaseSidModel):
         if idx.numel() > 0:
             slots = torch.randint(0, cap, (idx.numel(),))
             # Slot collisions are last-write-wins; O(B/cap) bias, negligible here.
-            self._reservoir[slots] = x[idx.to(x.device)].to("cpu", dtype=torch.float32)
+            self._reservoir[slots] = x[idx].to(torch.float32)
         self._n_seen += r
 
     def _reservoir_sample(self) -> torch.Tensor:
