@@ -330,7 +330,7 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
-    dataloader_state: Optional[Dict[str, int]] = None,
+    dataloader_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -367,7 +367,11 @@ def _train_and_evaluate(
         train_config.save_checkpoints_timestamp_quorum,
     )
     need_ts = ckpt_manager.needs_worker_timestamps()
-    ts_device = next(model.parameters()).device if need_ts else None
+    # dedicated CPU (gloo) group so the per-step event-time gather stays off the
+    # GPU and never forces a device sync that would stall the prefetch pipeline.
+    ts_pg = (
+        dist.new_group(backend="gloo") if need_ts and dist.is_initialized() else None
+    )
 
     plogger = None
     summary_writer = None
@@ -491,9 +495,7 @@ def _train_and_evaluate(
             # in lockstep (same equal-step-count invariant the model's gradient
             # collectives already require).
             worker_ts = (
-                gather_float_scalar(batch.data_timestamp, ts_device)
-                if need_ts
-                else None
+                gather_float_scalar(batch.data_timestamp, ts_pg) if need_ts else None
             )
             # Single entry point for step / epoch / event-time saves + dedupe.
             if ckpt_manager.maybe_save(
@@ -638,7 +640,7 @@ def train_and_evaluate(
                 )
 
     # Restore dataloader checkpoint state
-    dataloader_state: Optional[Dict[str, int]] = None
+    dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
         if dataloader_state:

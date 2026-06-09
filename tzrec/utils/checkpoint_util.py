@@ -19,7 +19,7 @@ import shutil
 import threading
 import weakref
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -315,7 +315,7 @@ class CheckpointManager:
         step: int,
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
-        dataloader_state: Optional[Dict[str, int]] = None,
+        dataloader_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
@@ -364,7 +364,7 @@ class CheckpointManager:
         step: int,
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
-        dataloader_state: Optional[Dict[str, int]] = None,
+        dataloader_state: Optional[Dict[str, Any]] = None,
         *,
         epoch: Optional[int] = None,
         worker_ts_list: Optional[List[float]] = None,
@@ -487,7 +487,7 @@ class CheckpointManager:
         """Restore model/optimizer state from a checkpoint dir."""
         restore_model(ckpt_path, model, optimizer, ckpt_param_map_path)
 
-    def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, int]]:
+    def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, Any]]:
         """Restore dataloader state saved alongside a checkpoint.
 
         Also seeds the event-time watermark so ``maybe_save`` resumes the
@@ -898,7 +898,7 @@ DATA_TS_WATERMARK = "__data_ts_watermark__"
 
 def save_dataloader_state(
     checkpoint_dir: str,
-    dataloader_state: Dict[str, int],
+    dataloader_state: Dict[str, Any],
 ) -> None:
     """Save dataloader state, aggregating from all ranks first.
 
@@ -917,7 +917,7 @@ def save_dataloader_state(
         dist.all_gather_object(all_states, dataloader_state)
 
         # Merge by taking max for each key
-        merged_state: Dict[str, int] = {}
+        merged_state: Dict[str, Any] = {}
         for state in all_states:
             if state:
                 for key, value in state.items():
@@ -937,7 +937,9 @@ def save_dataloader_state(
         logger.info(f"Saved dataloader state to {ckpt_path}")
 
 
-def restore_dataloader_state(checkpoint_dir: str) -> Optional[Dict[str, int]]:
+def restore_dataloader_state(
+    checkpoint_dir: str,
+) -> Optional[Dict[str, Any]]:
     """Restore dataloader checkpoint state from file.
 
     Args:
@@ -961,7 +963,7 @@ def restore_dataloader_state(checkpoint_dir: str) -> Optional[Dict[str, int]]:
 
 
 def update_dataloder_state(
-    dataloader_state: Dict[str, int],
+    dataloader_state: Dict[str, Any],
     checkpoint_info: Optional[Dict[str, int]],
 ) -> None:
     """Merge batch's checkpoint_info into dataloader_state by taking max per key.
