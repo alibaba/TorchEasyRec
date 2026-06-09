@@ -9,22 +9,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import unittest
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.models.sid_rqkmeans import SidRqkmeans
 from tzrec.protos import model_pb2
 from tzrec.protos.models import sid_model_pb2
-from tzrec.utils import misc_util
 from tzrec.utils.state_dict_util import init_parameters
-
-WORLD_SIZE = 2
 
 
 def _batch_from_rows(rows: torch.Tensor) -> Batch:
@@ -52,8 +47,6 @@ def _build_model(
 ) -> SidRqkmeans:
     """Build a SidRqkmeans configured for offline FAISS fit.
 
-    Module-level (not a method) so the spawned DDP workers below can build
-    the same model; callers move it to a device / init params as needed.
     SID models read the item-embedding dense feature directly from the batch
     and do not consume feature_groups, so none is set.
     """
@@ -111,21 +104,14 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertIsNone(model._reservoir)
 
     def test_sample_cap_from_train_sample_size(self) -> None:
-        """Explicit train_sample_size drives the per-rank cap (ceil-div)."""
-        from unittest import mock
-
-        # Single process (world_size=1): cap == train_sample_size.
+        """train_sample_size (when set) drives the reservoir cap directly."""
+        # Explicit train_sample_size: cap == train_sample_size.
         model = self._create_model(train_sample_size=900)
         self.assertEqual(model._sample_cap, 900)
 
-        # Per-rank ceil-div across world_size (patch dist + recompute the cap).
-        for world_size, expected in [(4, 225), (7, 129), (1000, 1)]:
-            with (
-                mock.patch.object(dist, "is_initialized", return_value=True),
-                mock.patch.object(dist, "get_world_size", return_value=world_size),
-            ):
-                model._init_reservoir()
-            self.assertEqual(model._sample_cap, expected)
+        # Default (train_sample_size=0): cap == the FAISS fit's subsample size.
+        model = self._create_model()
+        self.assertEqual(model._sample_cap, model._quantizer.default_fit_sample_size())
 
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""
@@ -352,6 +338,19 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         # No fit happened, so no tail checkpoint is requested.
         self.assertFalse(model.on_train_end())  # should not raise
 
+    def test_on_train_end_raises_under_ddp(self) -> None:
+        """SidRqkmeans is single-process only: world_size>1 must raise."""
+        from unittest import mock
+
+        model = self._create_model()
+        with (
+            mock.patch.object(dist, "is_available", return_value=True),
+            mock.patch.object(dist, "is_initialized", return_value=True),
+            mock.patch.object(dist, "get_world_size", return_value=2),
+            self.assertRaisesRegex(RuntimeError, "single-process"),
+        ):
+            model.on_train_end()
+
     def test_post_fit_checkpoint_round_trips(self) -> None:
         """Fit → save state_dict → load into fresh instance → predict.
 
@@ -404,131 +403,6 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         fresh = self._create_model()
         with self.assertRaisesRegex(RuntimeError, "mid-FAISS-fit"):
             fresh.load_state_dict(sd)
-
-
-# --------------------------------------------------------------------------
-# Distributed (multi-process) test for the DDP on_train_end path: the
-# cross-rank gather_object -> FAISS fit -> broadcast sequence the in-process
-# tests above cannot reach. NCCL on GPU when >=2 devices, else gloo/CPU.
-# --------------------------------------------------------------------------
-def _init_dist(rank: int, world_size: int, port: int) -> torch.device:
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    use_cuda = torch.cuda.is_available() and torch.cuda.device_count() >= world_size
-    if use_cuda:
-        torch.cuda.set_device(rank)
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-        return torch.device(f"cuda:{rank}")
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    return torch.device("cpu")
-
-
-def _on_train_end_worker(rank: int, world_size: int, port: int) -> None:
-    device = _init_dist(rank, world_size, port)
-    input_dim, n_layers, k = 16, 2, 16
-    model = _build_model(input_dim, n_layers, codebook=[k] * n_layers).to(device)
-    model.train()
-
-    torch.manual_seed(100 + rank)
-    for _ in range(6):
-        model.predict(_make_batch(32, input_dim, device))
-    assert model._n_seen == 6 * 32, f"rank{rank}: reservoir not filled"
-
-    # gather_object -> rank0 FAISS fit -> broadcast centroids + fill flag.
-    # Every rank fitted/received the codebook, so each requests a tail ckpt.
-    assert model.on_train_end(), f"rank{rank}: on_train_end should request ckpt"
-
-    for layer in model._quantizer.layers:
-        assert bool(layer._is_initialized.item()), f"rank{rank}: layer uninit"
-        assert layer.centroids.abs().sum().item() > 0.0, f"rank{rank}: zero centroids"
-    # Centroids were broadcast from rank0 -> must be bit-identical across ranks.
-    for layer in model._quantizer.layers:
-        cmin, cmax = layer.centroids.clone(), layer.centroids.clone()
-        dist.all_reduce(cmin, op=dist.ReduceOp.MIN)
-        dist.all_reduce(cmax, op=dist.ReduceOp.MAX)
-        assert torch.allclose(cmin, cmax), f"rank{rank}: centroids differ across ranks"
-
-    model.eval()
-    codes = model.predict(_make_batch(8, input_dim, device))["codes"]
-    assert codes.shape == (8, n_layers), f"rank{rank}: bad codes shape {codes.shape}"
-    assert (codes >= 0).all() and (codes < k).all(), f"rank{rank}: codes out of range"
-    dist.destroy_process_group()
-
-
-def _on_train_end_fail_worker(rank: int, world_size: int, port: int) -> None:
-    """Worker that forces rank0's FAISS fit to fail.
-
-    Every rank must then raise the coordinated ``RuntimeError`` (driven by the
-    fit-status broadcast) instead of deadlocking on the centroid broadcast. A
-    worker returns 0 only if it caught that expected error.
-    """
-    device = _init_dist(rank, world_size, port)
-    input_dim, n_layers, k = 16, 2, 16
-    model = _build_model(input_dim, n_layers, codebook=[k] * n_layers).to(device)
-    model.train()
-    for _ in range(6):
-        model.predict(_make_batch(32, input_dim, device))
-
-    # Force the rank0-only fit to raise (no faiss needed: only rank0 fits, and
-    # we replace its fit). The status flag must turn this into an all-ranks
-    # raise, not a hang.
-    if rank == 0:
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("forced rank0 fit failure")
-
-        model._quantizer.train_offline = _boom
-
-    try:
-        model.on_train_end()
-    except RuntimeError:
-        dist.destroy_process_group()
-        return  # expected: coordinated failure reached this rank
-    dist.destroy_process_group()
-    raise AssertionError(
-        f"rank{rank}: on_train_end did not raise on a rank0 fit failure"
-    )
-
-
-def _run_dist_workers(worker, world_size: int, timeout: int = 120) -> None:
-    """Spawn ``world_size`` procs running ``worker(rank, world_size, port)``.
-
-    Joins with a timeout so a deadlock (e.g. a dropped barrier / reordered
-    broadcast) fails the test instead of hanging CI, and raises on a hung or
-    nonzero-exit worker.
-    """
-    port = misc_util.get_free_port()
-    ctx = mp.get_context("spawn")
-    procs = []
-    for rank in range(world_size):
-        p = ctx.Process(target=worker, args=(rank, world_size, port))
-        p.start()
-        procs.append(p)
-    for i, p in enumerate(procs):
-        p.join(timeout=timeout)
-        if p.is_alive():
-            p.terminate()
-            raise RuntimeError(f"worker-{i} deadlocked (timed out after {timeout}s).")
-        if p.exitcode != 0:
-            raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
-
-
-class SidRqkmeansDistTest(unittest.TestCase):
-    """2-rank test for SidRqkmeans.on_train_end (gather -> fit -> broadcast)."""
-
-    def test_on_train_end_ddp(self) -> None:
-        _run_dist_workers(_on_train_end_worker, WORLD_SIZE)
-
-    def test_on_train_end_ddp_rank0_failure(self) -> None:
-        """A rank0-only fit failure raises on every rank — never deadlocks.
-
-        Guards the status-flag-before-centroid-broadcast ordering: a regression
-        that reordered/dropped it would hang, which the join timeout turns into
-        a CI failure instead of a hung job.
-        """
-        _run_dist_workers(_on_train_end_fail_worker, WORLD_SIZE)
 
 
 if __name__ == "__main__":

@@ -97,18 +97,15 @@ class SidRqkmeans(BaseSidModel):
     def _init_reservoir(self) -> None:
         """Set up the bounded host reservoir for the end-of-loop FAISS fit.
 
-        Per-rank cap: target ``train_sample_size`` when set (>0), else the
-        points the FAISS fit subsamples to
-        (``ResidualKMeansQuantizer.default_fit_sample_size``), split across
-        ranks — rather than buffer the whole corpus.
+        Caps at ``train_sample_size`` when set (>0), else the points the FAISS
+        fit subsamples to (``ResidualKMeansQuantizer.default_fit_sample_size``)
+        — rather than buffer the whole corpus. Single-process only (see the
+        world_size guard in :meth:`on_train_end`), so no per-rank split.
         """
         target = self._model_config.train_sample_size
-        global_target = (
-            target if target > 0 else self._quantizer.default_fit_sample_size()
+        self._sample_cap = max(
+            1, target if target > 0 else self._quantizer.default_fit_sample_size()
         )
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # ceil div: round up so the per-rank caps together cover global_target.
-        self._sample_cap = max(1, -(-global_target // world_size))
 
         # Allocated lazily on the first batch. _n_filled = used slots;
         # _n_seen = running count for the accept prob.
@@ -272,79 +269,35 @@ class SidRqkmeans(BaseSidModel):
         """Fit the FAISS codebook once, after the train_eval loop exits.
 
         Overrides :meth:`BaseModel.on_train_end` (called unconditionally by
-        ``tzrec.main``). DDP: every rank gather_objects its reservoir to rank0,
-        which fits and broadcasts the centroids back.
+        ``tzrec.main``). Single-process only: the fit runs on one process over
+        its local reservoir, with no cross-rank gather/broadcast.
 
-        An empty reservoir only happens for a pathologically tiny corpus
-        (rebalance splits rows across ``num_workers * world_size``); it then
-        fails fast via the fit-status broadcast rather than hanging.
+        An empty reservoir only happens for a pathologically tiny corpus; the
+        fit is then skipped and ``False`` returned.
 
         Returns:
             is_ckpt_after_train (bool): ``True`` if the codebook was fitted
-            (centroids changed → force a final checkpoint). Only the
-            single-process path can return ``False`` (empty reservoir, fit
-            skipped); the DDP path either returns ``True`` or raises (an empty
-            gather makes rank0's fit fail, which the status broadcast turns
-            into a coordinated ``RuntimeError``).
+            (centroids changed → force a final checkpoint), ``False`` if the
+            fit was skipped (empty reservoir).
+
+        Raises:
+            RuntimeError: if launched under distributed training
+            (``world_size > 1``). SidRqkmeans is single-process only.
         """
-        is_ddp = (
-            dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-        )
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        ):
+            raise RuntimeError(
+                "SidRqkmeans supports single-process training only "
+                f"(world_size=1); got world_size={dist.get_world_size()}. "
+                "Launch with --nproc-per-node=1."
+            )
 
         local = self._reservoir_sample()
         self._reset_reservoir()
 
-        if is_ddp:
-            # Each rank ships its (capped) reservoir to rank0, which fits.
-            rank = dist.get_rank()
-            gathered: Optional[List[Optional[torch.Tensor]]] = (
-                [None] * dist.get_world_size() if rank == 0 else None
-            )
-            dist.gather_object(local, gathered, dst=0)
-            del local
-            fit_ok = True
-            if rank == 0:
-                assert gathered is not None
-                try:
-                    full = torch.cat([g for g in gathered if g is not None], dim=0)
-                    del gathered
-                    logger.info(
-                        "[SidRqkmeans.on_train_end] rank0 fitting FAISS "
-                        "on %d samples (D=%d)." % (full.shape[0], full.shape[1])
-                    )
-                    self._quantizer.train_offline(full, verbose=True)
-                    del full
-                except Exception:  # noqa: BLE001
-                    # Don't raise yet — peers would hang on the broadcast below.
-                    # Signal failure via the status flag so all ranks raise.
-                    # logger.exception keeps the traceback so the rank0-only
-                    # failure is diagnosable from the log.
-                    fit_ok = False
-                    logger.exception(
-                        "[SidRqkmeans.on_train_end] rank0 FAISS fit failed"
-                    )
-            # Broadcast rank0's status (int, not bool — see NCCL note below) so
-            # a rank0-only failure makes all ranks raise instead of deadlocking.
-            status = torch.tensor(
-                [1 if fit_ok else 0],
-                device=self._quantizer.layers[0].centroids.device,
-            )
-            dist.broadcast(status, src=0)
-            if int(status.item()) == 0:
-                raise RuntimeError(
-                    "[SidRqkmeans.on_train_end] FAISS fit failed on rank0; "
-                    "see rank0 logs for the underlying error."
-                )
-            # Broadcast centroids; set the init flag locally (avoids
-            # broadcasting a bool buffer — NCCL bool support is inconsistent).
-            # All ranks are in lockstep, so a local mark_initialized_() agrees.
-            for layer in self._quantizer.layers:
-                dist.broadcast(layer.centroids, src=0)
-                layer.mark_initialized_()
-            dist.barrier()
-            return True
-
-        # Single-process: guard an empty reservoir with a plain local check.
         if local.shape[0] == 0:
             logger.warning(
                 "[SidRqkmeans.on_train_end] empty reservoir; skipping FAISS "
