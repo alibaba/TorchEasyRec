@@ -171,11 +171,15 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 owned float32 tensor; not mutated.
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # Own a contiguous float32 copy to update in place as the residual.
+        # CPU-only: SidRqkmeans refuses to init when CUDA is visible, but this
+        # quantizer is a standalone module — assert the host-tensor contract it
+        # relies on so misuse fails here, not deep inside faiss.
+        assert not inputs.is_cuda, "train_offline is CPU-only; got a CUDA tensor"
         assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
             f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
         )
-        x = inputs.detach().to(torch.float32).contiguous().clone()
+        # Own one contiguous float32 copy to update in place as the residual.
+        x = inputs.detach().to(dtype=torch.float32, copy=True).contiguous()
         N = x.shape[0]
         # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
         # errors) when N < K and returns a degenerate codebook, which the
