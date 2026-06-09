@@ -184,15 +184,14 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # reports). ``out + x`` would equal it only without normalization.
         x0 = x.clone() if verbose else None
 
-        # Use FAISS GPU compute when a faiss-gpu build is present; an explicit
-        # ``gpu`` in faiss_kmeans_kwargs always wins. NB faiss reads ``gpu`` as a
-        # GPU *count* (1 = one GPU = the current/rank0 device), not a device
-        # index — passing an index of 0 is falsy and silently falls back to CPU.
+        # Default to a CPU fit. faiss reads ``gpu`` as a GPU *count*, not a
+        # device index (and ``1 == True`` collapses to all GPUs), so it cannot
+        # pin this rank0-only fit to a single device without sharding faiss
+        # memory onto the other ranks' GPUs. The fit is a bounded one-shot over
+        # the reservoir subsample, so CPU is cheap; set ``gpu`` explicitly in
+        # faiss_kmeans_kwargs (e.g. ``True`` for all GPUs) to opt into GPU.
         kwargs = dict(self.faiss_kmeans_kwargs)
-        if "gpu" not in kwargs:
-            kwargs["gpu"] = (
-                1 if (faiss.get_num_gpus() > 0 and torch.cuda.is_available()) else False
-            )
+        kwargs.setdefault("gpu", False)
 
         # Chunk index.search to cap peak memory (~1 GB at 500K × 512 × 4B).
         SEARCH_CHUNK = 500_000

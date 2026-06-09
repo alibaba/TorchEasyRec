@@ -426,6 +426,41 @@ def _on_train_end_worker(rank: int, world_size: int, port: int) -> None:
     dist.destroy_process_group()
 
 
+def _on_train_end_fail_worker(rank: int, world_size: int, port: int) -> None:
+    """Worker that forces rank0's FAISS fit to fail.
+
+    Every rank must then raise the coordinated ``RuntimeError`` (driven by the
+    fit-status broadcast) instead of deadlocking on the centroid broadcast. A
+    worker returns 0 only if it caught that expected error.
+    """
+    device = _init_dist(rank, world_size, port)
+    input_dim, n_layers, k = 16, 2, 16
+    model = _build_model(input_dim, n_layers, codebook=[k] * n_layers).to(device)
+    model.train()
+    for _ in range(6):
+        model.predict(_make_batch(32, input_dim, device))
+
+    # Force the rank0-only fit to raise (no faiss needed: only rank0 fits, and
+    # we replace its fit). The status flag must turn this into an all-ranks
+    # raise, not a hang.
+    if rank == 0:
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("forced rank0 fit failure")
+
+        model._quantizer.train_offline = _boom
+
+    try:
+        model.on_train_end()
+    except RuntimeError:
+        dist.destroy_process_group()
+        return  # expected: coordinated failure reached this rank
+    dist.destroy_process_group()
+    raise AssertionError(
+        f"rank{rank}: on_train_end did not raise on a rank0 fit failure"
+    )
+
+
 class SidRqkmeansDistTest(unittest.TestCase):
     """2-rank test for SidRqkmeans.on_train_end (gather -> fit -> broadcast)."""
 
@@ -441,6 +476,35 @@ class SidRqkmeansDistTest(unittest.TestCase):
             p.join()
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
+
+    def test_on_train_end_ddp_rank0_failure(self) -> None:
+        """A rank0-only fit failure raises on every rank — never deadlocks.
+
+        Guards the status-flag-before-centroid-broadcast ordering: a regression
+        that reordered/dropped it would hang here. ``join(timeout=...)`` turns a
+        reintroduced deadlock into a CI failure instead of a hung job.
+        """
+        port = misc_util.get_free_port()
+        ctx = mp.get_context("spawn")
+        procs = []
+        for rank in range(WORLD_SIZE):
+            p = ctx.Process(
+                target=_on_train_end_fail_worker, args=(rank, WORLD_SIZE, port)
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join(timeout=120)
+            if p.is_alive():
+                p.terminate()
+                raise RuntimeError(
+                    f"worker-{i} deadlocked on a rank0 fit failure (timed out)."
+                )
+            if p.exitcode != 0:
+                raise RuntimeError(
+                    f"worker-{i} did not raise the coordinated error "
+                    f"(exitcode={p.exitcode})."
+                )
 
 
 if __name__ == "__main__":

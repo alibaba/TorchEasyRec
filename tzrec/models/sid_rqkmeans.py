@@ -97,9 +97,10 @@ class SidRqkmeans(BaseSidModel):
     def _init_reservoir(self) -> None:
         """Set up the bounded host reservoir for the end-of-loop FAISS fit.
 
-        Per-rank cap: target the points the FAISS fit will subsample to
+        Per-rank cap: target ``train_sample_size`` when set (>0), else the
+        points the FAISS fit subsamples to
         (``ResidualKMeansQuantizer.default_fit_sample_size``), split across
-        ranks, rather than buffer the whole corpus.
+        ranks — rather than buffer the whole corpus.
         """
         target = self._model_config.train_sample_size
         global_target = (
