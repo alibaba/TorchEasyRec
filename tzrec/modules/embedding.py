@@ -1016,6 +1016,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             else:
                 shared_feature_flag[feature_name] = False
 
+        emb_name_to_feature_to_shared_name = defaultdict(dict)
         for feature_group in feature_groups:
             query_dim = 0
             sequence_dim = 0
@@ -1041,6 +1042,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_config.name
+                    emb_name_to_feature_to_shared_name[emb_config.name][
+                        name
+                    ] = shared_name
                     embedding_dim = emb_config.embedding_dim
                     const = feature.parameter_constraints(emb_config)
 
@@ -1152,7 +1156,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             feat_list = []
             for emb_config in ec._embedding_configs:
                 for feature_name in emb_config.feature_names:
-                    feat_list.append(feature_name)
+                    shared_name = emb_name_to_feature_to_shared_name[
+                        emb_config.name
+                    ].get(feature_name, feature_name)
+                    feat_list.append((feature_name, shared_name))
             self.ec_dict_features[k] = feat_list
 
         self.mc_ec_dict = nn.ModuleDict()
@@ -1175,7 +1182,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 feat_list = []
                 for emb_config in ec._embedding_configs:
                     for feature_name in emb_config.feature_names:
-                        feat_list.append(feature_name)
+                        shared_name = emb_name_to_feature_to_shared_name[
+                            emb_config.name
+                        ].get(feature_name, feature_name)
+                        feat_list.append((feature_name, shared_name))
                 self.ec_dict_features_user[k] = feat_list
 
             self.mc_ec_dict_user = nn.ModuleDict()
@@ -1242,11 +1252,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             ):
                 d_jt = ec(sparse_feature)
                 new_d_jt = {}
-                for k in feature_keys:
-                    if k in self.seq_sparse_keys or k in self.query_sparse_keys:
-                        val = d_jt[k]
-                        fx_mark_seq_ec_jt(f"{k}", val)
-                        new_d_jt[k] = val
+                for raw_key, shared_key in feature_keys:
+                    if (
+                        shared_key in self.seq_sparse_keys
+                        or shared_key in self.query_sparse_keys
+                    ):
+                        val = d_jt[raw_key]
+                        fx_mark_seq_ec_jt(f"{shared_key}", val)
+                        new_d_jt[shared_key] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse:
@@ -1262,14 +1275,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             ):
                 d_jt = ec(sparse_feature_user)
                 new_d_jt = {}
-                for k in feature_keys:
+                for raw_key, shared_key in feature_keys:
                     if (
-                        k in self.seq_sparse_keys_user
-                        or k in self.query_sparse_keys_user
+                        shared_key in self.seq_sparse_keys_user
+                        or shared_key in self.query_sparse_keys_user
                     ):
-                        val = d_jt[k]
-                        fx_mark_seq_ec_jt(f"{k}", val)
-                        new_d_jt[k] = val
+                        val = d_jt[raw_key]
+                        fx_mark_seq_ec_jt(f"{shared_key}", val)
+                        new_d_jt[shared_key] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse_user:
