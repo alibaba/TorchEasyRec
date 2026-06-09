@@ -338,18 +338,17 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         # No fit happened, so no tail checkpoint is requested.
         self.assertFalse(model.on_train_end())  # should not raise
 
-    def test_on_train_end_raises_under_ddp(self) -> None:
-        """SidRqkmeans is single-process only: world_size>1 must raise."""
+    def test_init_raises_under_ddp(self) -> None:
+        """SidRqkmeans is single-process only: world_size>1 fails fast in init."""
         from unittest import mock
 
-        model = self._create_model()
         with (
             mock.patch.object(dist, "is_available", return_value=True),
             mock.patch.object(dist, "is_initialized", return_value=True),
             mock.patch.object(dist, "get_world_size", return_value=2),
             self.assertRaisesRegex(RuntimeError, "single-process"),
         ):
-            model.on_train_end()
+            self._create_model()
 
     def test_post_fit_checkpoint_round_trips(self) -> None:
         """Fit → save state_dict → load into fresh instance → predict.

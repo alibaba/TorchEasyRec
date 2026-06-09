@@ -72,6 +72,20 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
+        # Single-process only: the FAISS fit runs on one process over its local
+        # reservoir, with no cross-rank gather/broadcast. Fail fast here rather
+        # than after a full (wasted) training pass.
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        ):
+            raise RuntimeError(
+                "SidRqkmeans supports single-process training only "
+                f"(world_size=1); got world_size={dist.get_world_size()}. "
+                "Launch with --nproc-per-node=1."
+            )
+
         cfg = self._model_config  # SidRqkmeans proto message
 
         # config_to_kwargs yields Struct numbers as floats; coerce back to int.
@@ -100,7 +114,7 @@ class SidRqkmeans(BaseSidModel):
         Caps at ``train_sample_size`` when set (>0), else the points the FAISS
         fit subsamples to (``ResidualKMeansQuantizer.default_fit_sample_size``)
         — rather than buffer the whole corpus. Single-process only (see the
-        world_size guard in :meth:`on_train_end`), so no per-rank split.
+        world_size guard in ``__init__``), so no per-rank split.
         """
         target = self._model_config.train_sample_size
         self._sample_cap = max(
@@ -269,8 +283,9 @@ class SidRqkmeans(BaseSidModel):
         """Fit the FAISS codebook once, after the train_eval loop exits.
 
         Overrides :meth:`BaseModel.on_train_end` (called unconditionally by
-        ``tzrec.main``). Single-process only: the fit runs on one process over
-        its local reservoir, with no cross-rank gather/broadcast.
+        ``tzrec.main``). Single-process only (enforced by the world_size guard
+        in ``__init__``): the fit runs on one process over its local reservoir,
+        with no cross-rank gather/broadcast.
 
         An empty reservoir only happens for a pathologically tiny corpus; the
         fit is then skipped and ``False`` returned.
@@ -279,22 +294,7 @@ class SidRqkmeans(BaseSidModel):
             is_ckpt_after_train (bool): ``True`` if the codebook was fitted
             (centroids changed → force a final checkpoint), ``False`` if the
             fit was skipped (empty reservoir).
-
-        Raises:
-            RuntimeError: if launched under distributed training
-            (``world_size > 1``). SidRqkmeans is single-process only.
         """
-        if (
-            dist.is_available()
-            and dist.is_initialized()
-            and dist.get_world_size() > 1
-        ):
-            raise RuntimeError(
-                "SidRqkmeans supports single-process training only "
-                f"(world_size=1); got world_size={dist.get_world_size()}. "
-                "Launch with --nproc-per-node=1."
-            )
-
         local = self._reservoir_sample()
         self._reset_reservoir()
 
