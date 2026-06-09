@@ -75,11 +75,7 @@ class SidRqkmeans(BaseSidModel):
         # Single-process only: the FAISS fit runs on one process over its local
         # reservoir, with no cross-rank gather/broadcast. Fail fast here rather
         # than after a full (wasted) training pass.
-        if (
-            dist.is_available()
-            and dist.is_initialized()
-            and dist.get_world_size() > 1
-        ):
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             raise RuntimeError(
                 "SidRqkmeans supports single-process training only "
                 f"(world_size=1); got world_size={dist.get_world_size()}. "
