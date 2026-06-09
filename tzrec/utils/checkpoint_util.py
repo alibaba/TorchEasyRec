@@ -418,11 +418,15 @@ class CheckpointManager:
             epoch: current epoch; enables the epoch trigger when not None.
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
-            final: force a save (still subject to the dedupe), e.g. at train end.
-            force: when a save is already requested (e.g. ``final``), bypass the
-                per-step dedupe so it fires even if this step was already saved
-                — e.g. when end-of-train work mutated the model state at the
-                final step (see ``on_train_end``). No effect on its own.
+            final: request a save unconditionally (still subject to the dedupe),
+                e.g. at train end. This sets ``want``; it does not bypass the
+                per-step dedupe — that is what ``force`` is for.
+            force: bypass the per-step dedupe so a wanted save fires even if this
+                step was already saved — e.g. when end-of-train work mutated the
+                model state at the already-saved final step (see ``on_train_end``).
+                Orthogonal to ``final``: ``force`` only relaxes the dedupe and has
+                no effect on its own (it still needs ``want``, which ``final`` or a
+                cadence trigger supplies).
 
         Returns:
             True if a checkpoint was saved.
