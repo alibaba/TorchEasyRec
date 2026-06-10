@@ -218,7 +218,6 @@ class SidRqkmeans(BaseSidModel):
 
         if self.is_eval:
             predictions["quantized"] = quantized
-            predictions["input_embedding"] = embedding
 
         return predictions
 
@@ -257,28 +256,28 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         """Update metric state.
 
-        Note: ``mse``/``rel_loss`` compare ``input_embedding`` against the
-        centroid-sum reconstruction. They are meaningful reconstruction
-        metrics only with ``normalize_residuals=False`` (the default); with
-        normalization the centroids live on the rescaled-residual scale, so
-        the two quantities don't share a scale (same caveat the train_offline
-        per-layer log carries).
+        The reconstruction target (the input embedding) is re-extracted from
+        ``batch`` rather than threaded through ``predictions`` — it is an input,
+        not a model output (mirrors ``SidRqvae.update_metric``). ``quantized`` is
+        present only in eval (see ``predict``), so this runs eval-only.
+
+        Note: ``mse``/``rel_loss`` compare that embedding against the centroid-sum
+        reconstruction. They are meaningful reconstruction metrics only with
+        ``normalize_residuals=False`` (the default); with normalization the
+        centroids live on the rescaled-residual scale, so the two quantities
+        don't share a scale (same caveat the train_offline per-layer log carries).
 
         Args:
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
             losses (dict, optional): a dict of loss.
         """
-        if "input_embedding" in predictions:
-            _, rel = recon_diagnostics(
-                predictions["input_embedding"],
-                predictions["quantized"],
-            )
+        if "quantized" in predictions:
+            embedding = self._extract_feature(batch)
+            _, rel = recon_diagnostics(embedding, predictions["quantized"])
             # mse aggregates (preds, target) itself; rel_loss has no
             # torchmetrics equivalent, so it stays a MeanMetric.
-            self._metric_modules["mse"].update(
-                predictions["quantized"], predictions["input_embedding"]
-            )
+            self._metric_modules["mse"].update(predictions["quantized"], embedding)
             self._metric_modules["rel_loss"].update(rel)
 
         self._metric_modules["unique_sid_ratio"].update(predictions["codes"])

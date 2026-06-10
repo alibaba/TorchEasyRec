@@ -275,7 +275,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertTrue((codes >= 0).all() and (codes < 16).all())
 
     def test_eval_and_inference_predict_contract(self) -> None:
-        """Eval exposes quantized/input_embedding; inference is codes-only."""
+        """Eval exposes codes + quantized only; inference is codes-only."""
         try:
             import faiss  # noqa: F401
         except ImportError:
@@ -288,11 +288,12 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             model.predict(_make_batch(B, input_dim))
         model.on_train_end()
 
-        # Eval mode: reconstruction outputs are present for update_metric.
+        # Eval mode: the centroid-sum reconstruction is exposed for
+        # update_metric; the input embedding is NOT threaded through
+        # predictions (it is re-extracted from the batch in update_metric).
         model.eval()
         eval_preds = model.predict(_make_batch(B, input_dim))
-        self.assertIn("quantized", eval_preds)
-        self.assertIn("input_embedding", eval_preds)
+        self.assertEqual(set(eval_preds.keys()), {"codes", "quantized"})
 
         # Inference (serving) mode: codes-only contract.
         model.set_is_inference(True)
@@ -315,8 +316,11 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
 
         model.init_metric()
         model.eval()
-        preds = model.predict(_make_batch(B, input_dim))
-        model.update_metric(preds, _make_batch(B, input_dim))
+        # Same batch through predict + update_metric: the reconstruction target
+        # is re-extracted from this batch, so it must match the predicted one.
+        batch = _make_batch(B, input_dim)
+        preds = model.predict(batch)
+        model.update_metric(preds, batch)
         metrics = model.compute_metric()
         for key in ("mse", "rel_loss", "unique_sid_ratio"):
             self.assertIn(key, metrics)
