@@ -196,21 +196,18 @@ class SidRqkmeans(BaseSidModel):
         return predictions.get("quantized")
 
     @torch.no_grad()
-    def on_train_end(self) -> bool:
+    def on_train_end(self) -> None:
         """Fit the FAISS codebook once, after the train_eval loop exits.
 
         Overrides :meth:`BaseModel.on_train_end` (called unconditionally by
         ``tzrec.main``). Single-process only (enforced by the world_size guard
         in ``__init__``): the fit runs on one process over its local reservoir,
-        with no cross-rank gather/broadcast.
+        with no cross-rank gather/broadcast. The tail ``final=True`` checkpoint
+        then persists the fitted codebook (SID runs with periodic checkpointing
+        disabled, so that save is never deduped away).
 
         An empty reservoir only happens for a pathologically tiny corpus; the
-        fit is then skipped and ``False`` returned.
-
-        Returns:
-            is_ckpt_after_train (bool): ``True`` if the codebook was fitted
-            (centroids changed → force a final checkpoint), ``False`` if the
-            fit was skipped (empty reservoir).
+        fit is then skipped.
         """
         local = self._reservoir.sample()
         self._reservoir.reset()
@@ -220,11 +217,10 @@ class SidRqkmeans(BaseSidModel):
                 "[SidRqkmeans.on_train_end] empty reservoir; skipping FAISS "
                 "fit. Did the train_eval loop run?"
             )
-            return False
+            return
 
         logger.info(
             "[SidRqkmeans.on_train_end] fitting FAISS on %d samples (D=%d)."
             % (local.shape[0], local.shape[1])
         )
         self._quantizer.train_offline(local, verbose=True)
-        return True

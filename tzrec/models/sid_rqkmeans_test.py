@@ -145,8 +145,8 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             model.predict(_make_batch(B, input_dim))
         self.assertGreater(model._reservoir.n_seen, 0)
 
-        # Trigger one-shot FAISS fit; a real fit must request a tail checkpoint
-        self.assertTrue(model.on_train_end())
+        # Trigger one-shot FAISS fit.
+        model.on_train_end()
 
         # Reservoir should be released after the fit
         self.assertEqual(model._reservoir.n_seen, 0)
@@ -213,7 +213,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         model.train()
         for _ in range(8):
             model.predict(_make_batch(B, input_dim))
-        self.assertTrue(model.on_train_end())
+        model.on_train_end()
 
         for layer in model._quantizer.layers:
             self.assertTrue(layer.is_initialized)
@@ -289,8 +289,8 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
     def test_on_train_end_noop_on_empty_buffer(self) -> None:
         """on_train_end on an empty buffer is a warned no-op."""
         model = self._create_model()
-        # No fit happened, so no tail checkpoint is requested.
-        self.assertFalse(model.on_train_end())  # should not raise
+        model.on_train_end()  # warns and returns without fitting; must not raise
+        self.assertFalse(model._quantizer.is_fitted)
 
     def test_init_raises_under_ddp(self) -> None:
         """SidRqkmeans is single-process only: world_size>1 fails fast in init."""

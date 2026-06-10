@@ -516,9 +516,10 @@ def _train_and_evaluate(
                 lr.step()
 
     # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
-    # codebook here). Returns True if it mutated persistable state, forcing the
-    # tail save below even when the last in-loop checkpoint hit the final step.
-    is_ckpt_after_train = _model.on_train_end()
+    # codebook here). SID models run with periodic checkpointing disabled
+    # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
+    # the only checkpoint and persists whatever on_train_end produced.
+    _model.on_train_end()
 
     _log_train(
         i_step,
@@ -533,9 +534,6 @@ def _train_and_evaluate(
         summary_writer.close()
     if train_config.is_profiling:
         prof.stop()
-    # ``force`` re-fires the save past maybe_save's per-step dedupe when
-    # on_train_end mutated persistable state (e.g. SidRqkmeans fit its codebook)
-    # after the last in-loop save landed on the final step.
     if ckpt_manager.maybe_save(
         i_step,
         model,
@@ -543,7 +541,6 @@ def _train_and_evaluate(
         dataloader_state,
         data_timestamp=data_timestamp,
         final=True,
-        force=is_ckpt_after_train,
     ):
         run_eval(i_step, i_epoch)
     ckpt_manager.close()
