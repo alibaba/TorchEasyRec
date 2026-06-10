@@ -18,6 +18,7 @@ import torchmetrics
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
 from tzrec.protos.model_pb2 import ModelConfig
@@ -39,10 +40,10 @@ class BaseSidModel(BaseModel):
       proxy).
 
     Subclasses build their quantizer in ``__init__`` (after calling
-    ``super().__init__``) and implement :meth:`predict` and :meth:`loss`.
-    They extend :meth:`init_metric` (via ``super()``) and implement
-    :meth:`update_metric` to populate the registered metrics
-    (:meth:`update_train_metric` defaults to a no-op).
+    ``super().__init__``) and implement :meth:`predict`, :meth:`loss`, and
+    :meth:`_reconstruction` (which exposes the model's reconstruction of the
+    input embedding for the shared :meth:`update_metric`).
+    (:meth:`update_train_metric` defaults to a no-op.)
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -99,13 +100,61 @@ class BaseSidModel(BaseModel):
     def init_metric(self) -> None:
         """Initialize the eval metrics shared by all SID models.
 
-        ``mse``: reconstruction error (input vs. quantized / decoded).
-        ``unique_sid_ratio``: mean per-batch unique-SID ratio (distinct rows /
-        batch size; a batch-size-sensitive diversity proxy, not global
-        coverage). Subclasses call ``super().init_metric()`` then add extras.
+        - ``mse``: reconstruction error (input vs. quantized / decoded).
+        - ``rel_loss``: symmetric relative-L1 reconstruction error
+          (:class:`~tzrec.metrics.relative_l1.RelativeL1`); meaningful only with
+          ``normalize_residuals=False`` (else the reconstruction and the input
+          live on different scales).
+        - ``unique_sid_ratio``: mean per-batch unique-SID ratio (distinct rows /
+          batch size; a batch-size-sensitive diversity proxy, not global
+          coverage).
+
+        Subclasses that add extras call ``super().init_metric()`` first.
         """
         self._metric_modules["mse"] = torchmetrics.MeanSquaredError()
+        self._metric_modules["rel_loss"] = RelativeL1()
         self._metric_modules["unique_sid_ratio"] = UniqueRatio()
+
+    def _reconstruction(
+        self, predictions: Dict[str, torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """The model's reconstruction of the input embedding, or None.
+
+        Returns the (B, D) tensor that ``mse``/``rel_loss`` compare against the
+        input embedding — e.g. ``predictions["quantized"]`` (RQ-KMeans) or
+        ``predictions["x_hat"]`` (RQ-VAE). Returns None when it is unavailable or
+        not yet meaningful this step (e.g. before a K-Means fit), in which case
+        :meth:`update_metric` skips the eval metrics entirely.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+        """
+        raise NotImplementedError
+
+    def update_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        losses: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """Update eval metrics from a reconstruction + the re-extracted input.
+
+        The target embedding is re-extracted from ``batch`` (it is an input, not
+        a model output). All three metrics are gated on a non-None
+        :meth:`_reconstruction` so a not-yet-fitted model does not log garbage.
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+            losses (dict, optional): a dict of loss.
+        """
+        recon = self._reconstruction(predictions)
+        if recon is None:
+            return
+        embedding = self._extract_feature(batch)
+        self._metric_modules["mse"].update(recon, embedding)
+        self._metric_modules["rel_loss"].update(recon, embedding)
+        self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
 
     def update_train_metric(
         self,

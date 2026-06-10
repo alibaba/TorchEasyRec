@@ -21,13 +21,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-import torchmetrics
 from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid.kmeans import ReservoirSampler, relative_l1
+from tzrec.modules.sid.kmeans import ReservoirSampler
 from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
@@ -177,54 +176,24 @@ class SidRqkmeans(BaseSidModel):
         """
         return {"dummy_loss": self._dummy_param.sum() * 0.0}
 
-    def init_metric(self) -> None:
-        """Register eval metrics (shared ``mse`` + ``rel_loss``).
+    def _reconstruction(
+        self, predictions: Dict[str, torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Centroid-sum reconstruction, or None until the codebook is fit.
 
-        Train-time metrics are intentionally absent: ``predict`` returns dummy
-        codes pre-fit, so the inherited no-op ``update_train_metric`` keeps the
-        train path empty.
-        """
-        super().init_metric()
-        self._metric_modules["rel_loss"] = torchmetrics.MeanMetric()
-
-    def update_metric(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        batch: Batch,
-        losses: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> None:
-        """Update metric state.
-
-        The reconstruction target (the input embedding) is re-extracted from
-        ``batch`` — it is an input, not a model output. ``quantized`` is present
-        only in eval (see ``predict``), so this runs eval-only.
-
-        Note: ``mse``/``rel_loss`` compare that embedding against the centroid-sum
-        reconstruction. They are meaningful reconstruction metrics only with
-        ``normalize_residuals=False`` (the default); with normalization the
-        centroids live on the rescaled-residual scale, so the two quantities
-        don't share a scale (same caveat the train_offline per-layer log carries).
+        ``quantized`` is present only in eval and is all-zeros before the
+        end-of-train FAISS fit, so gate on the fit — the shared
+        :meth:`BaseSidModel.update_metric` then skips the eval metrics until the
+        reconstruction is meaningful. (Meaningful only with
+        ``normalize_residuals=False``; with normalization the centroids live on
+        the rescaled-residual scale, so the two quantities don't share a scale.)
 
         Args:
             predictions (dict): a dict of predicted result.
-            batch (Batch): input batch data.
-            losses (dict, optional): a dict of loss.
         """
-        # In-loop eval can run before the end-of-train FAISS fit; the codebook
-        # is all-zeros then, so codes/reconstruction are meaningless. Skip until
-        # fitted so those bogus values don't pollute the eval metrics.
         if not self._quantizer.is_fitted:
-            return
-
-        if "quantized" in predictions:
-            embedding = self._extract_feature(batch)
-            # rel_loss has no torchmetrics equivalent, so compute it directly.
-            self._metric_modules["mse"].update(predictions["quantized"], embedding)
-            self._metric_modules["rel_loss"].update(
-                relative_l1(embedding, predictions["quantized"])
-            )
-
-        self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
+            return None
+        return predictions.get("quantized")
 
     @torch.no_grad()
     def on_train_end(self) -> bool:
