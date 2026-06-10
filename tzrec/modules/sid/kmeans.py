@@ -14,20 +14,23 @@
 This module is the single home for torch-native K-Means code used by
 SID models:
 
-* :class:`KMeansLayer` — per-layer centroid container used by
-  :class:`ResidualKMeansQuantizer`. Centroids are injected
-  by the FAISS backend via ``load_centroids_``; the only forward path
-  is ``predict``.
+* :class:`QuantizeLayer` — the per-layer quantizer interface
+  (``quantize`` / ``lookup`` / ``get_codebook_embeddings``) shared with the
+  RQ-VAE backend's vector-quantize layer.
+* :class:`KMeansQuantizeLayer` — the K-Means implementation: a centroid
+  container populated by the FAISS backend via ``load_centroids_``.
 * :class:`ReservoirSampler` — bounded uniform stream sample (Vitter
   Algorithm R) that :class:`~tzrec.models.sid_rqkmeans.SidRqkmeans`
   fills during training to feed the one-shot FAISS fit.
 """
 
+from abc import abstractmethod
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
 
+from tzrec.modules.sid.types import QuantizeOutput
 from tzrec.utils.logging_util import logger
 
 
@@ -162,11 +165,35 @@ class ReservoirSampler:
         self._n_seen = 0
 
 
-class KMeansLayer(nn.Module):
+class QuantizeLayer(nn.Module):
+    """One quantize layer: assign inputs to a codebook and look codes up.
+
+    Shared interface for the K-Means backend (:class:`KMeansQuantizeLayer`)
+    and the RQ-VAE backend's vector-quantize layer, so the residual quantizer
+    can drive either uniformly.
+    """
+
+    @abstractmethod
+    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+        """Assign ``x`` (B, D) to the codebook, returning codes + embeddings."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def lookup(self, ids: torch.Tensor) -> torch.Tensor:
+        """Gather codebook embeddings for ``ids``."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_codebook_embeddings(self) -> torch.Tensor:
+        """Return the full codebook, shape (n_clusters, D)."""
+        raise NotImplementedError
+
+
+class KMeansQuantizeLayer(QuantizeLayer):
     """Single layer of a residual K-Means stack.
 
     Centroids are populated externally by ``load_centroids_`` (the FAISS
-    backend in :class:`ResidualKMeansQuantizer`); ``predict`` is the only
+    backend in :class:`ResidualKMeansQuantizer`); ``quantize`` is the only
     forward path.
 
     Args:
@@ -198,11 +225,7 @@ class KMeansLayer(nn.Module):
         return self._initialized
 
     def mark_initialized_(self) -> None:
-        """Flag centroids populated, syncing buffer + cached mirror.
-
-        For callers that fill ``centroids`` in place (e.g. the DDP broadcast
-        in :meth:`SidRqkmeans.on_train_end`) rather than via ``load_centroids_``.
-        """
+        """Flag centroids populated, syncing buffer + cached mirror."""
         self._is_initialized.fill_(True)
         self._initialized = True
 
@@ -247,23 +270,39 @@ class KMeansLayer(nn.Module):
         self._initialized = bool(self._is_initialized.item())
         if self._initialized and self.centroids.abs().sum() == 0:
             error_msgs.append(
-                f"KMeansLayer at '{prefix}': _is_initialized=True but centroids "
-                "are all zero — checkpoint was likely taken mid-FAISS-fit. "
-                "Re-run on_train_end to produce a valid checkpoint."
+                f"KMeansQuantizeLayer at '{prefix}': _is_initialized=True but "
+                "centroids are all zero — checkpoint was likely taken "
+                "mid-FAISS-fit. Re-run on_train_end to produce a valid checkpoint."
             )
 
     @torch.no_grad()
-    def predict(self, batch: torch.Tensor) -> torch.Tensor:
-        """Assign points to nearest centroid.
+    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+        """Assign points to the nearest centroid and gather them.
 
         Uses ``torch.cdist`` (L2); argmin is invariant to the monotonic sqrt,
         so assignments match squared-L2 except at exact equidistant ties
         (measure zero for real embeddings), where either centroid is valid.
+        Before the FAISS fit (uninitialized) this returns all-zero codes +
+        embeddings so the residual walk stays a no-op and the model is callable.
+        ``temperature`` is unused (no soft assignment).
 
         Args:
-            batch (Tensor): data points, shape (B, D).
+            x (Tensor): data points, shape (B, D).
+            temperature (float): unused.
 
         Returns:
-            Tensor: cluster indices, shape (B,).
+            QuantizeOutput: ``ids`` (B,) and ``embeddings`` (B, D).
         """
-        return torch.cdist(batch, self.centroids).argmin(dim=-1)
+        if not self.is_initialized:
+            ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
+        ids = torch.cdist(x, self.centroids).argmin(dim=-1)
+        return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
+
+    def lookup(self, ids: torch.Tensor) -> torch.Tensor:
+        """Gather centroids for ``ids``, shape (..., D)."""
+        return self.centroids[ids]
+
+    def get_codebook_embeddings(self) -> torch.Tensor:
+        """Return the centroid table, shape (n_clusters, n_features)."""
+        return self.centroids

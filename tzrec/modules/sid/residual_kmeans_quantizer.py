@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.kmeans import KMeansLayer, recon_diagnostics
+from tzrec.modules.sid.kmeans import KMeansQuantizeLayer, recon_diagnostics
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.utils.logging_util import logger
 
@@ -35,8 +35,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         residual_0 = input
         for each layer i:
             (optionally) residual_i = L2_normalize(residual_i)
-            code_i = layer_i.predict(residual_i)
-            quantized_i = layer_i.centroids[code_i]
+            code_i, quantized_i = layer_i.quantize(residual_i)
             residual_{i+1} = residual_i - quantized_i
         output = sum of all quantized_i
 
@@ -72,7 +71,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
 
         self.layers = nn.ModuleList(
             [
-                KMeansLayer(
+                KMeansQuantizeLayer(
                     n_clusters=self.n_embed_list[i],
                     n_features=embed_dim,
                 )
@@ -86,29 +85,22 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         residual: torch.Tensor,
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Nearest-centroid assignment for one layer.
+        """Nearest-centroid assignment for one layer (delegates to the layer).
 
         Uninitialized layers (before ``train_offline``) return zeros, so the
-        residual walk is a no-op and the model stays callable. ``temperature``
-        is unused (no soft assignment).
+        residual walk is a no-op and the model stays callable.
 
         Args:
             layer_idx (int): quantization layer index.
             residual (Tensor): current residual, shape (B, D).
-            temperature (float): unused.
+            temperature (float): unused (no soft assignment).
 
         Returns:
             codes (Tensor): cluster indices, shape (B,).
             quantized (Tensor): selected centroids, shape (B, D).
         """
-        layer = self.layers[layer_idx]
-        if not layer.is_initialized:
-            codes = torch.zeros(
-                residual.shape[0], dtype=torch.long, device=residual.device
-            )
-            return codes, torch.zeros_like(residual)
-        codes = layer.predict(residual)
-        return codes, layer.centroids[codes]
+        out = self.layers[layer_idx].quantize(residual, temperature)
+        return out.ids, out.embeddings
 
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assign codes per layer and sum the centroids.
@@ -146,11 +138,11 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         Returns:
             Tensor: centroids, shape (n_embed, embed_dim).
         """
-        return self.layers[layer_idx].centroids
+        return self.layers[layer_idx].get_codebook_embeddings()
 
     def _lookup_code(self, layer_idx: int, code_idx: torch.Tensor) -> torch.Tensor:
         """Look up codebook vectors via the layer's centroid table."""
-        return self.layers[layer_idx].centroids[code_idx]
+        return self.layers[layer_idx].lookup(code_idx)
 
     def default_fit_sample_size(self) -> int:
         """Points the FAISS fit subsamples to: max(K) * max_points_per_centroid.
@@ -195,7 +187,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         N = x.shape[0]
         # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
         # errors) when N < K and returns a degenerate codebook, which the
-        # all-zero poison guard in KMeansLayer would not catch.
+        # all-zero poison guard in KMeansQuantizeLayer would not catch.
         max_k = max(self.n_embed_list)
         assert N >= max_k, (
             f"need >= {max_k} points to fit the codebook (largest layer K), got N={N}"

@@ -14,7 +14,7 @@ import unittest
 import torch
 
 from tzrec.modules.sid.kmeans import (
-    KMeansLayer,
+    KMeansQuantizeLayer,
     ReservoirSampler,
     recon_diagnostics,
 )
@@ -30,42 +30,52 @@ class KmeansHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(rel.item(), 0.0, places=6)
 
 
-class KMeansLayerTest(unittest.TestCase):
-    """Tests for the single KMeansLayer."""
+class KMeansQuantizeLayerTest(unittest.TestCase):
+    """Tests for the single KMeansQuantizeLayer."""
 
     def test_uninitialized_by_default(self) -> None:
-        layer = KMeansLayer(n_clusters=4, n_features=3)
+        layer = KMeansQuantizeLayer(n_clusters=4, n_features=3)
         self.assertFalse(layer.is_initialized)
         self.assertEqual(layer.centroids.abs().sum().item(), 0.0)
 
-    def test_load_centroids_and_predict(self) -> None:
-        layer = KMeansLayer(n_clusters=2, n_features=2)
+    def test_load_centroids_and_quantize(self) -> None:
+        layer = KMeansQuantizeLayer(n_clusters=2, n_features=2)
         centroids = torch.tensor([[0.0, 0.0], [10.0, 10.0]])
         layer.load_centroids_(centroids)
         self.assertTrue(layer.is_initialized)
 
         batch = torch.tensor([[0.1, 0.0], [9.0, 11.0]])
-        codes = layer.predict(batch)
-        torch.testing.assert_close(codes, torch.tensor([0, 1]))
+        out = layer.quantize(batch)
+        torch.testing.assert_close(out.ids, torch.tensor([0, 1]))
+        # embeddings are the gathered centroids; lookup matches.
+        torch.testing.assert_close(out.embeddings, centroids[out.ids])
+        torch.testing.assert_close(layer.lookup(out.ids), out.embeddings)
+
+    def test_quantize_uninitialized_returns_zeros(self) -> None:
+        layer = KMeansQuantizeLayer(n_clusters=4, n_features=3)
+        out = layer.quantize(torch.randn(5, 3))
+        self.assertEqual(out.ids.shape, (5,))
+        self.assertEqual(int(out.ids.abs().sum()), 0)
+        torch.testing.assert_close(out.embeddings, torch.zeros(5, 3))
 
     def test_load_centroids_shape_mismatch_raises(self) -> None:
-        layer = KMeansLayer(n_clusters=2, n_features=2)
+        layer = KMeansQuantizeLayer(n_clusters=2, n_features=2)
         with self.assertRaises(AssertionError):
             layer.load_centroids_(torch.zeros(3, 2))
 
     def test_mid_fit_checkpoint_rejected(self) -> None:
-        layer = KMeansLayer(n_clusters=2, n_features=2)
+        layer = KMeansQuantizeLayer(n_clusters=2, n_features=2)
         sd = layer.state_dict()
         # Simulate a mid-fit checkpoint: flag True but centroids still zero.
         sd["_is_initialized"] = torch.tensor(True)
-        fresh = KMeansLayer(n_clusters=2, n_features=2)
+        fresh = KMeansQuantizeLayer(n_clusters=2, n_features=2)
         with self.assertRaisesRegex(RuntimeError, "mid-FAISS-fit"):
             fresh.load_state_dict(sd)
 
     def test_post_fit_checkpoint_round_trips(self) -> None:
-        layer = KMeansLayer(n_clusters=2, n_features=2)
+        layer = KMeansQuantizeLayer(n_clusters=2, n_features=2)
         layer.load_centroids_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-        fresh = KMeansLayer(n_clusters=2, n_features=2)
+        fresh = KMeansQuantizeLayer(n_clusters=2, n_features=2)
         fresh.load_state_dict(layer.state_dict())
         self.assertTrue(fresh.is_initialized)
         torch.testing.assert_close(fresh.centroids, layer.centroids)
