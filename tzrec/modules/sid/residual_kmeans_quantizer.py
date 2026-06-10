@@ -187,7 +187,10 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
             f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
         )
-        # Own one contiguous float32 copy to update in place as the residual.
+        # The loop below mutates x in place (the residual ``x -= q``), and the
+        # input is a view into the caller's float32 reservoir buffer — so own a
+        # fresh copy (copy=True forces one even when the dtype already matches,
+        # avoiding the double copy a separate ``.clone()`` would add).
         x = inputs.detach().to(dtype=torch.float32, copy=True).contiguous()
         N = x.shape[0]
         # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
