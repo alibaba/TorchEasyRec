@@ -1042,9 +1042,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     emb_config.name = feat_to_group_to_emb_name[name][group_name]
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_config.name
-                    emb_name_to_feature_to_shared_name[emb_config.name][
-                        name
-                    ] = shared_name
+                    emb_name_to_feature_to_shared_name[emb_config.name][name] = (
+                        shared_name
+                    )
                     embedding_dim = emb_config.embedding_dim
                     const = feature.parameter_constraints(emb_config)
 
