@@ -31,20 +31,7 @@ from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
-
-
-def _coerce_proto_numbers(d: Dict) -> Dict:
-    """Coerce whole-valued floats back to int.
-
-    ``Struct.number_value`` is always float, but faiss.Kmeans kwargs
-    (``niter``, ``seed``, ...) need ``int``.
-    """
-    return {
-        k: int(v) if isinstance(v, float) and v.is_integer() else v
-        for k, v in d.items()
-    }
 
 
 class SidRqkmeans(BaseSidModel):
@@ -90,12 +77,11 @@ class SidRqkmeans(BaseSidModel):
 
         cfg = self._model_config  # SidRqkmeans proto message
 
-        # config_to_kwargs yields Struct numbers as floats; coerce back to int.
-        self._faiss_kwargs = (
-            _coerce_proto_numbers(config_util.config_to_kwargs(cfg.faiss_kmeans_kwargs))
-            if cfg.HasField("faiss_kmeans_kwargs")
-            else {}
-        )
+        # Typed faiss kwargs: only the explicitly-set fields are forwarded, so
+        # unset ones fall back to faiss's own defaults (no float->int coercion).
+        self._faiss_kwargs = {
+            f.name: v for f, v in cfg.faiss_kmeans_kwargs.ListFields()
+        }
 
         self._quantizer = ResidualKMeansQuantizer(
             embed_dim=self._input_dim,

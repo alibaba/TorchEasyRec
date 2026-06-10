@@ -63,11 +63,10 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         SID models read the item-embedding dense feature directly from the
         batch and do not consume feature_groups, so none is set.
         """
-        from google.protobuf.struct_pb2 import Struct
-
         n_embed_list = codebook if codebook is not None else [16] * n_layers
-        faiss_kwargs = Struct()
-        faiss_kwargs.update({"niter": niter, "verbose": False, "seed": 1234})
+        faiss_kwargs = sid_model_pb2.FaissKmeansConfig(
+            niter=niter, verbose=False, seed=1234
+        )
         cfg = sid_model_pb2.SidRqkmeans(
             input_dim=input_dim,
             codebook=n_embed_list,

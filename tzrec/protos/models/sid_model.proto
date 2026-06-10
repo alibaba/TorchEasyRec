@@ -1,7 +1,19 @@
 syntax = "proto2";
 package tzrec.protos;
 
-import "google/protobuf/struct.proto";
+// Strictly-typed subset of faiss.Kmeans(D, K, **kwargs) knobs. Unset fields
+// fall back to faiss's own defaults (so it is safe to leave partially set).
+// ``gpu`` is intentionally omitted — the fit is CPU-only (SidRqkmeans refuses
+// a visible CUDA device).
+message FaissKmeansConfig {
+    optional uint32 niter = 1;
+    optional uint32 nredo = 2;
+    optional uint32 seed = 3;
+    optional uint32 max_points_per_centroid = 4;
+    optional uint32 min_points_per_centroid = 5;
+    optional bool spherical = 6;
+    optional bool verbose = 7;
+}
 
 message SidRqkmeans {
     // Input embedding dimension (K-Means runs directly on raw embeddings,
@@ -15,10 +27,8 @@ message SidRqkmeans {
     repeated uint32 codebook = 3;
     // L2-normalize residuals before each layer.
     optional bool normalize_residuals = 4 [default = false];
-    // Extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs) as a
-    // loosely-typed dict, e.g. {niter: 20, gpu: true, verbose: true,
-    // spherical: false, seed: 1234}.
-    optional google.protobuf.Struct faiss_kmeans_kwargs = 5;
+    // Strictly-typed extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs).
+    optional FaissKmeansConfig faiss_kmeans_kwargs = 5;
     // Target number of embeddings to reservoir-sample for the FAISS fit
     // (global, across all ranks). Bounds host memory regardless of corpus
     // size. 0 (the default) auto-derives it as max(K) * max_points_per_centroid
