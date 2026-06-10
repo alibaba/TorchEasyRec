@@ -96,16 +96,7 @@ class BaseSidModel(BaseModel):
         if feature_name is None:
             feature_name = self._embedding_feature_name
         kt = batch.dense_features[BASE_DATA_GROUP]
-        embedding = kt[feature_name]
-        # Guard a misconfigured width: a (B, 1) tensor (raw_feature missing
-        # value_dim) would broadcast silently into a degenerate rank-1 codebook.
-        if embedding.dim() != 2 or embedding.shape[1] != self._input_dim:
-            raise ValueError(
-                f"feature '{feature_name}' has shape {tuple(embedding.shape)}, "
-                f"expected (B, {self._input_dim}); check that its value_dim "
-                "matches the SID input_dim."
-            )
-        return embedding
+        return kt[feature_name]
 
     def init_loss(self) -> None:
         """Initialize loss modules.

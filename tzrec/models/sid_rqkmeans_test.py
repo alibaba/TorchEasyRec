@@ -124,12 +124,6 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input_dim must be >= 1"):
             self._create_model(input_dim=0)
 
-    def test_predict_raises_on_wrong_feature_width(self) -> None:
-        """A feature whose width != input_dim fails fast (missing value_dim)."""
-        model = self._create_model(input_dim=32)
-        with self.assertRaisesRegex(ValueError, "value_dim"):
-            model.predict(_batch_from_rows(torch.randn(8, 1)))
-
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""
         B, input_dim = 8, 32
