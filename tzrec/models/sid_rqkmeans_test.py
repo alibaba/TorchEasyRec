@@ -105,6 +105,11 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             model._reservoir.capacity, model._quantizer.default_fit_sample_size()
         )
 
+    def test_init_raises_on_too_small_train_sample_size(self) -> None:
+        """train_sample_size below the largest codebook fails fast at init."""
+        with self.assertRaisesRegex(AssertionError, "largest codebook"):
+            self._create_model(codebook=[16, 16], train_sample_size=8)
+
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""
         B, input_dim = 8, 32
@@ -269,6 +274,17 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         for key in ("mse", "rel_loss", "unique_sid_ratio"):
             self.assertIn(key, metrics)
             self.assertTrue(torch.isfinite(torch.as_tensor(metrics[key])).all())
+
+    def test_update_metric_skipped_before_fit(self) -> None:
+        """Pre-fit eval (unfitted codebook) does not pollute metric state."""
+        B, input_dim = 8, 32
+        model = self._create_model(input_dim=input_dim)
+        model.init_metric()
+        model.eval()
+        # Codebook not fitted yet: predict emits zeros; update_metric must skip.
+        batch = _make_batch(B, input_dim)
+        model.update_metric(model.predict(batch), batch)
+        self.assertEqual(model._metric_modules["unique_sid_ratio"].count.item(), 0.0)
 
     def test_on_train_end_noop_on_empty_buffer(self) -> None:
         """on_train_end on an empty buffer is a warned no-op."""

@@ -50,11 +50,28 @@ def recon_diagnostics(
         mse:  scalar ``((out - x) ** 2).mean()``.
         rel:  scalar relative-L1 ``mean(|x - out| / (max(|x|, |out|) + eps))``.
     """
-    mse = ((out - x) ** 2).mean()
-    rel = (
+    return ((out - x) ** 2).mean(), relative_l1(x, out, epsilon)
+
+
+def relative_l1(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    epsilon: float = 1e-4,
+) -> torch.Tensor:
+    """Relative-L1 error ``mean(|x - out| / (max(|x|, |out|) + eps))``.
+
+    Symmetric relative error in [0, 1] (verbatim port of OpenOneRec's
+    ``calc_loss``). Used standalone by :meth:`SidRqkmeans.update_metric` (which
+    needs only ``rel``, not the MSE :meth:`recon_diagnostics` also computes).
+
+    Args:
+        x: ground-truth embedding, shape (B, D).
+        out: quantized reconstruction, shape (B, D).
+        epsilon: numerical stabilizer for the denominator.
+    """
+    return (
         torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
     ).mean()
-    return mse, rel
 
 
 class ReservoirSampler:

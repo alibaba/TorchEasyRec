@@ -127,6 +127,15 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         cluster_ids, quantized_sum, _ = self._residual_pass(input)
         return cluster_ids, quantized_sum
 
+    @property
+    def is_fitted(self) -> bool:
+        """Whether ``train_offline`` has populated every layer's codebook.
+
+        ``forward`` is callable before the fit (uninitialized layers emit
+        zeros), so reconstruction outputs are meaningful only once this is True.
+        """
+        return all(layer.is_initialized for layer in self.layers)
+
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:
         """Get centroid weights for a specific layer.
@@ -189,10 +198,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             f"need >= {max_k} points to fit the codebook (largest layer K), got N={N}"
         )
         out = torch.zeros_like(x)
-        # Original input, kept only for the log: the per-layer diagnostic is the
-        # cumulative recon error of x0 by the centroid sum (what update_metric
-        # reports). ``out + x`` would equal it only without normalization.
-        x0 = x.clone() if verbose else None
+        # The per-layer log reports the cumulative recon error of the original
+        # input x0 by the centroid sum. Without normalization the invariant
+        # ``out + x == x0`` holds, so x0 is reconstructed on the fly below and we
+        # skip the persistent (N, D) clone; with normalization x is rescaled each
+        # layer, breaking the invariant, so the clone is required.
+        x0 = x.clone() if (verbose and self.normalize_residuals) else None
 
         # CPU-only fit: SidRqkmeans refuses to initialize when CUDA is visible,
         # so the codebook is always built on CPU. Drop any stale ``gpu`` request
@@ -233,10 +244,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 del idx, q
 
             if verbose:
+                # x0 == out + x without normalization (see above).
+                ref = x0 if x0 is not None else out + x
                 logger.info(
                     "[ResidualKMeansQuantizer][offline_faiss][layer %d] %s",
                     layer_idx,
-                    self._calc_loss(x0, out),  # cumulative recon of original input
+                    self._calc_loss(ref, out),  # cumulative recon of original input
                 )
 
             self.layers[layer_idx].load_centroids_(centroids)

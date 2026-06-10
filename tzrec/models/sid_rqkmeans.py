@@ -27,7 +27,7 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid.kmeans import ReservoirSampler, recon_diagnostics
+from tzrec.modules.sid.kmeans import ReservoirSampler, relative_l1
 from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
@@ -116,6 +116,14 @@ class SidRqkmeans(BaseSidModel):
         # so no per-rank split.
         target = self._model_config.train_sample_size
         cap = target if target > 0 else self._quantizer.default_fit_sample_size()
+        # Fail fast: FAISS needs >= K points to fit each layer, so a cap below
+        # the largest codebook would only assert at on_train_end — after the
+        # whole training pass. (The default cap is always >= max(K).)
+        max_k = max(self._n_embed_list)
+        assert cap >= max_k, (
+            f"reservoir cap ({cap}) < largest codebook size ({max_k}); set "
+            f"train_sample_size >= {max_k} (or 0 for the default)."
+        )
         self._reservoir = ReservoirSampler(cap, self._input_dim)
 
         # KMeans has no learnable params; a dummy keeps the optimizer/DDP happy.
@@ -207,13 +215,20 @@ class SidRqkmeans(BaseSidModel):
             batch (Batch): input batch data.
             losses (dict, optional): a dict of loss.
         """
+        # In-loop eval can run before the end-of-train FAISS fit; the codebook
+        # is all-zeros then, so codes/reconstruction are meaningless. Skip until
+        # fitted so those bogus values don't pollute the eval metrics.
+        if not self._quantizer.is_fitted:
+            return
+
         if "quantized" in predictions:
             embedding = self._extract_feature(batch)
-            _, rel = recon_diagnostics(embedding, predictions["quantized"])
-            # mse aggregates (preds, target) itself; rel_loss has no
-            # torchmetrics equivalent, so it stays a MeanMetric.
+            # mse aggregates (preds, target) itself; rel_loss has no torchmetrics
+            # equivalent, so compute it directly (only rel is needed here).
             self._metric_modules["mse"].update(predictions["quantized"], embedding)
-            self._metric_modules["rel_loss"].update(rel)
+            self._metric_modules["rel_loss"].update(
+                relative_l1(embedding, predictions["quantized"])
+            )
 
         self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
 
