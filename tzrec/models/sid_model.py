@@ -40,9 +40,9 @@ class BaseSidModel(BaseModel):
       proxy).
 
     Subclasses build their quantizer in ``__init__`` (after calling
-    ``super().__init__``) and implement :meth:`predict`, :meth:`loss`, and
-    :meth:`_reconstruction` (which exposes the model's reconstruction of the
-    input embedding for the shared :meth:`update_metric`).
+    ``super().__init__``) and implement :meth:`predict` and :meth:`loss`.
+    :meth:`predict` exposes the reconstruction under ``predictions["x_hat"]``
+    (only when meaningful) so the shared :meth:`update_metric` can score it.
     (:meth:`update_train_metric` defaults to a no-op.)
 
     Args:
@@ -115,42 +115,28 @@ class BaseSidModel(BaseModel):
         self._metric_modules["rel_loss"] = RelativeL1()
         self._metric_modules["unique_sid_ratio"] = UniqueRatio()
 
-    def _reconstruction(
-        self, predictions: Dict[str, torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        """The model's reconstruction of the input embedding, or None.
-
-        Returns the (B, D) tensor that ``mse``/``rel_loss`` compare against the
-        input embedding — e.g. ``predictions["quantized"]`` (RQ-KMeans) or
-        ``predictions["x_hat"]`` (RQ-VAE). Returns None when it is unavailable or
-        not yet meaningful this step (e.g. before a K-Means fit), in which case
-        :meth:`update_metric` skips the eval metrics entirely.
-
-        Args:
-            predictions (dict): a dict of predicted result.
-        """
-        raise NotImplementedError
-
     def update_metric(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
         losses: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
-        """Update eval metrics from a reconstruction + the re-extracted input.
+        """Update eval metrics from the reconstruction + the re-extracted input.
 
-        The target embedding is re-extracted from ``batch`` (it is an input, not
-        a model output). All three metrics are gated on a non-None
-        :meth:`_reconstruction` so a not-yet-fitted model does not log garbage.
+        ``predictions["x_hat"]`` is the model's reconstruction of the input
+        embedding (the centroid sum for RQ-KMeans, the decoder output for
+        RQ-VAE). Subclasses expose it only when it is meaningful, so a
+        not-yet-fitted model omits it and this logs nothing. The target
+        embedding is re-extracted from ``batch`` (it is an input, not an output).
 
         Args:
             predictions (dict): a dict of predicted result.
             batch (Batch): input batch data.
             losses (dict, optional): a dict of loss.
         """
-        recon = self._reconstruction(predictions)
-        if recon is None:
+        if "x_hat" not in predictions:
             return
+        recon = predictions["x_hat"]
         embedding = self._extract_feature(batch)
         self._metric_modules["mse"].update(recon, embedding)
         self._metric_modules["rel_loss"].update(recon, embedding)

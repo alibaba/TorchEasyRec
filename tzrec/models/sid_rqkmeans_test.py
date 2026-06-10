@@ -223,7 +223,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertTrue((codes >= 0).all() and (codes < 16).all())
 
     def test_eval_and_inference_predict_contract(self) -> None:
-        """Eval exposes codes + quantized only; inference is codes-only."""
+        """Eval (post-fit) exposes codes + x_hat; inference is codes-only."""
         try:
             import faiss  # noqa: F401
         except ImportError:
@@ -236,12 +236,12 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             model.predict(_make_batch(B, input_dim))
         model.on_train_end()
 
-        # Eval mode: the centroid-sum reconstruction is exposed for
-        # update_metric; the input embedding is NOT threaded through
-        # predictions (it is re-extracted from the batch in update_metric).
+        # Eval mode (fitted): the reconstruction is exposed as ``x_hat`` for
+        # update_metric; the input embedding is re-extracted from the batch
+        # there, not threaded through predictions.
         model.eval()
         eval_preds = model.predict(_make_batch(B, input_dim))
-        self.assertEqual(set(eval_preds.keys()), {"codes", "quantized"})
+        self.assertEqual(set(eval_preds.keys()), {"codes", "x_hat"})
 
         # Inference (serving) mode: codes-only contract.
         model.set_is_inference(True)

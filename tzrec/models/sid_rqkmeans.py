@@ -140,8 +140,13 @@ class SidRqkmeans(BaseSidModel):
             "codes": codes,
         }
 
-        if self.is_eval:
-            predictions["quantized"] = quantized
+        # Expose the centroid-sum reconstruction (``x_hat``, the scoring target
+        # for update_metric) only in eval AND once the codebook is fit — before
+        # on_train_end it is all-zeros, so omitting it makes update_metric skip.
+        # (Meaningful only with normalize_residuals=False; with normalization the
+        # centroids live on the rescaled-residual scale, off the input's scale.)
+        if self.is_eval and self._quantizer.is_fitted:
+            predictions["x_hat"] = quantized
 
         return predictions
 
@@ -161,25 +166,6 @@ class SidRqkmeans(BaseSidModel):
             losses (dict): a dict of loss tensor.
         """
         return {"dummy_loss": self._dummy_param.sum() * 0.0}
-
-    def _reconstruction(
-        self, predictions: Dict[str, torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        """Centroid-sum reconstruction, or None until the codebook is fit.
-
-        ``quantized`` is present only in eval and is all-zeros before the
-        end-of-train FAISS fit, so gate on the fit — the shared
-        :meth:`BaseSidModel.update_metric` then skips the eval metrics until the
-        reconstruction is meaningful. (Meaningful only with
-        ``normalize_residuals=False``; with normalization the centroids live on
-        the rescaled-residual scale, so the two quantities don't share a scale.)
-
-        Args:
-            predictions (dict): a dict of predicted result.
-        """
-        if not self._quantizer.is_fitted:
-            return None
-        return predictions.get("quantized")
 
     @torch.no_grad()
     def on_train_end(self) -> None:
