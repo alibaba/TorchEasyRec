@@ -15,7 +15,6 @@ import torch
 
 from tzrec.modules.sid.kmeans import (
     KMeansLayer,
-    _squared_euclidean_distance,
     recon_diagnostics,
 )
 
@@ -28,14 +27,6 @@ class KmeansHelpersTest(unittest.TestCase):
         mse, rel = recon_diagnostics(x, x.clone())
         self.assertAlmostEqual(mse.item(), 0.0, places=6)
         self.assertAlmostEqual(rel.item(), 0.0, places=6)
-
-    def test_squared_euclidean_distance(self) -> None:
-        x = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
-        y = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
-        d = _squared_euclidean_distance(x, y)
-        self.assertEqual(d.shape, (2, 2))
-        # row0: dist to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
-        torch.testing.assert_close(d, torch.tensor([[0.0, 1.0], [1.0, 2.0]]))
 
 
 class KMeansLayerTest(unittest.TestCase):

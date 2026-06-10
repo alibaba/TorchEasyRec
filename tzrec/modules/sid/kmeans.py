@@ -52,25 +52,6 @@ def recon_diagnostics(
     return mse, rel
 
 
-@torch.no_grad()
-def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Squared L2 distance between rows of ``x`` and ``y``.
-
-    Args:
-        x (Tensor): data points, shape (N, D).
-        y (Tensor): centroids, shape (K, D).
-
-    Returns:
-        Tensor: squared distances, shape (N, K).
-
-    Kept branch-free (no data-dependent control flow on ``N``) so the
-    per-batch predict forward stays FX-traceable for torchrec inference.
-    """
-    x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
-    y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
-    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
-
-
 class KMeansLayer(nn.Module):
     """Single layer of a residual K-Means stack.
 
@@ -165,11 +146,17 @@ class KMeansLayer(nn.Module):
     def predict(self, batch: torch.Tensor) -> torch.Tensor:
         """Assign points to nearest centroid.
 
+        Uses ``torch.cdist`` (plain L2). argmin is invariant to the monotonic
+        sqrt, so the assignment is identical to squared-L2 for all
+        non-degenerate inputs (verified bit-exact across random / large-
+        magnitude / near-tie sweeps); only an exact equidistant tie — measure
+        zero for real embeddings — may resolve to a different, equally-near
+        centroid.
+
         Args:
             batch (Tensor): data points, shape (B, D).
 
         Returns:
             Tensor: cluster indices, shape (B,).
         """
-        dists = _squared_euclidean_distance(batch, self.centroids)
-        return torch.argmin(dists, dim=-1)
+        return torch.cdist(batch, self.centroids).argmin(dim=-1)
