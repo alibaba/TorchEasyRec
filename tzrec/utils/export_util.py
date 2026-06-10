@@ -51,6 +51,7 @@ from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
+from tzrec.datasets.data_parser import _tile_size
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -78,6 +79,29 @@ from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 
+def ensure_input_tile_for_distributed_embedding() -> None:
+    """Ensure distributed embedding export uses INPUT_TILE=3."""
+    if not env_util.use_distributed_embedding():
+        return
+
+    # Distributed embedding export only supports INPUT_TILE=3.
+    # Default to 3 when unset; warn and override if set to anything else.
+    current_input_tile = os.environ.get("INPUT_TILE")
+    if current_input_tile is None:
+        os.environ["INPUT_TILE"] = "3"
+    elif current_input_tile != "3":
+        logger.warning(
+            "USE_DISTRIBUTED_EMBEDDING=1 requires INPUT_TILE=3, "
+            f"got INPUT_TILE={current_input_tile}. Overriding to 3."
+        )
+        os.environ["INPUT_TILE"] = "3"
+
+
+def _is_input_tile_user_keyed_tensor(name: str) -> bool:
+    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
+    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
+
+
 def export_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -93,19 +117,8 @@ def export_model(
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
     use_rtp = env_util.use_rtp()
+    ensure_input_tile_for_distributed_embedding()
     use_dist_embedding = env_util.use_distributed_embedding()
-    if use_dist_embedding:
-        # Distributed embedding export only supports INPUT_TILE=3.
-        # Default to 3 when unset; warn and override if set to anything else.
-        current_input_tile = os.environ.get("INPUT_TILE")
-        if current_input_tile is None:
-            os.environ["INPUT_TILE"] = "3"
-        elif current_input_tile != "3":
-            logger.warning(
-                "use_distributed_embedding=1 requires INPUT_TILE=3, "
-                f"got INPUT_TILE={current_input_tile}. Overriding to 3."
-            )
-            os.environ["INPUT_TILE"] = "3"
     if use_rtp:
         impl = export_rtp_model
     elif use_dist_embedding:
@@ -333,6 +346,36 @@ def export_model_normal(
         if assets is not None:
             for asset in assets:
                 shutil.copy(asset, save_dir)
+
+
+def _prepare_single_rank_distributed_embedding_export() -> bool:
+    """Force distributed-embedding export to run as a single rank."""
+    rank = int(os.environ.get("RANK", 0))
+    if rank != 0:
+        logger.warning(
+            "Only first rank will be used for distributed embedding export now."
+        )
+        return False
+
+    forced_env = {
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_WORLD_SIZE": "1",
+    }
+    changed = [
+        f"{key}={value}"
+        for key, value in forced_env.items()
+        if os.environ.get(key) != value
+    ]
+    if changed:
+        logger.warning(
+            "distributed embedding export only supports single-rank export now, "
+            "we set %s.",
+            ", ".join(changed),
+        )
+    os.environ.update(forced_env)
+    return True
 
 
 def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
@@ -1251,11 +1294,13 @@ def export_distributed_embedding(
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
     **kwargs: Any,
-) -> List[nn.Module]:
+) -> None:
     """Export for online serving under distributed embedding mode."""
+    if not _prepare_single_rank_distributed_embedding_export():
+        return
+
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
-    # local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_rank_zero = rank == 0
     graph_dir = os.path.join(save_dir, "graph")
@@ -1273,7 +1318,7 @@ def export_distributed_embedding(
     )
 
     # make dataparser to get user feats before create model
-    data_config = pipeline_config.data_config
+    data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
     dataloader = create_dataloader(
@@ -1356,13 +1401,27 @@ def export_distributed_embedding(
                 continue
             node_kt = node.args[1]
             with graph.inserting_after(node_kt):
-                outputs[name] = graph.call_method("values", args=(node_kt,))
-                output_attrs[name + "__length_per_key"] = graph.call_method(
-                    "length_per_key", args=(node_kt,)
-                )
-                output_attrs[name + "__keys"] = graph.call_method(
-                    "keys", args=(node_kt,)
-                )
+                kt_values = node_kt.kwargs.get("values")
+                if (
+                    _is_input_tile_user_keyed_tensor(name)
+                    and getattr(kt_values, "op", None) == "call_method"
+                    and kt_values.target == "tile"
+                ):
+                    # Serving supplies raw user-side embedding values with batch=1.
+                    # Keep sparse output raw as well; the dense model owns tiling.
+                    outputs[name] = kt_values.args[0]
+                    output_attrs[name + "__length_per_key"] = node_kt.kwargs[
+                        "length_per_key"
+                    ]
+                    output_attrs[name + "__keys"] = node_kt.kwargs["keys"]
+                else:
+                    outputs[name] = graph.call_method("values", args=(node_kt,))
+                    output_attrs[name + "__length_per_key"] = graph.call_method(
+                        "length_per_key", args=(node_kt,)
+                    )
+                    output_attrs[name + "__keys"] = graph.call_method(
+                        "keys", args=(node_kt,)
+                    )
         elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
             name = node.args[0]
             node_jt = node.args[1]
@@ -1384,14 +1443,12 @@ def export_distributed_embedding(
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
 
-    sparse_model = DistributedModelParallel(
-        module=sparse_gm,
-        sharders=sharders,
-        device=device,
-        plan=plan,
-    )
+    # `unwrap_model` has already been wrapped by DistributedModelParallel and
+    # restored above. `sparse_gm` shares those sharded embedding modules; wrapping
+    # the extracted sparse graph a second time can leave TorchRec's per-table
+    # feature split state inconsistent for INPUT_TILE user towers.
+    sparse_model = sparse_gm
     sparse_model.eval()
-    checkpoint_util.restore_model(checkpoint_path, sparse_model)
     sparse_output, sparse_attrs = sparse_model(data, device=device)
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")
@@ -1466,12 +1523,23 @@ def export_distributed_embedding(
                 getitem_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
+                values_node = getitem_node
+                if _is_input_tile_user_keyed_tensor(name):
+                    batch_size_node = graph.call_function(
+                        operator.getitem, args=(input_node, "batch_size")
+                    )
+                    tile_size_node = graph.call_function(
+                        _tile_size, args=(batch_size_node,)
+                    )
+                    values_node = graph.call_method(
+                        "tile", args=(getitem_node, tile_size_node, 1)
+                    )
                 new_node = graph.call_function(
                     KeyedTensor,
                     kwargs={
                         "keys": sparse_attrs[name + "__keys"],
                         "length_per_key": sparse_attrs[name + "__length_per_key"],
-                        "values": getitem_node,
+                        "values": values_node,
                     },
                 )
                 dense_graph_config[name] = [
@@ -1587,14 +1655,22 @@ def _merge_sharded_embedding_json(
                     # Dynamic npz entry names are uniform across ranks
                     # (e.g. always "user_id_emb.keys"). Serving iterates all
                     # sparse_dynamic_embedding-*.npz files with the same entry
-                    # names, so keep the single key_name/value_name pair.
-                    for field in ("key_name", "value_name"):
+                    # names, so keep the single key/value/score entry names.
+                    for field in ("key_name", "value_name", "score_name"):
                         if merged_json[emb_name].get(field) != info.get(field):
                             raise ValueError(
                                 f"dynamic embedding {emb_name} has inconsistent "
                                 f"{field}: {merged_json[emb_name].get(field)} vs "
                                 f"{info.get(field)}"
                             )
+                    if merged_json[emb_name].get("score_dtype") != info.get(
+                        "score_dtype"
+                    ):
+                        raise ValueError(
+                            f"dynamic embedding {emb_name} has inconsistent "
+                            f"score_dtype: {merged_json[emb_name].get('score_dtype')} "
+                            f"vs {info.get('score_dtype')}"
+                        )
 
     return merged_json
 
@@ -1644,7 +1720,7 @@ def _get_sparse_embedding_tensor(
 
     Returns:
         out: regular sparse embedding tensors keyed by emb_name.
-        dynamic_out: dynamicemb keys/values keyed by composite names. Empty if
+        dynamic_out: dynamicemb keys/values/scores keyed by composite names. Empty if
             no dynamic embedding tables exist.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
         feat_meta: feature -> embedding_name / pooling mapping.
@@ -1691,7 +1767,6 @@ def _get_sparse_embedding_tensor(
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
     dynamic_out = {}
     # shard_offsets = {}
-    value_name_to_key = {}
     # per-table representative tensor used only for meta (shape/dtype/memory).
     # dynamicemb tables are stored in `dynamic_out` under composite keys, so we
     # track a separate mapping keyed by emb_name here.
@@ -1702,6 +1777,7 @@ def _get_sparse_embedding_tensor(
     # per-emb_name npz entry names for dynamic tables on this rank.
     dynamic_key_names = defaultdict(list)
     dynamic_value_names = defaultdict(list)
+    dynamic_score_names = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
@@ -1716,7 +1792,7 @@ def _get_sparse_embedding_tensor(
         elif isinstance(values, ShardedTensor):
             _len_local_shards = len(values.local_shards())
             assert _len_local_shards in [0, 1], "other cases are not considered."
-            num_shards = len(values.metadata().shards_metadata)
+
             if _len_local_shards == 1:
                 for _idx, shards_meta in enumerate(values.metadata().shards_metadata):
                     placement = shards_meta.placement
@@ -1728,13 +1804,12 @@ def _get_sparse_embedding_tensor(
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
                             out[emb_name] = local_tensor
                             emb_name_to_meta_tensor[emb_name] = local_tensor
-                            value_name_to_key[feat_name_impl] = None
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
-            out[emb_name] = values
-            emb_name_to_meta_tensor[emb_name] = values
-            value_name_to_key[feat_name_impl] = None
+            local_tensor = values.detach().cpu().numpy()
+            out[emb_name] = local_tensor
+            emb_name_to_meta_tensor[emb_name] = local_tensor
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
@@ -1764,39 +1839,88 @@ def _get_sparse_embedding_tensor(
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
-        for i in range(rank, len(key_files), world_size):
-            key_file = key_files[i]
+        key_files_by_emb = defaultdict(list)
+        for key_file in key_files:
             path_parts = key_file.split(os.path.sep)
             match = key_pattern.match(path_parts[-1])
-            if match:
-                emb_name = match.group("emb_name")
-                emb_dim = emb_name_to_emb_dim[emb_name]
-                idx = match.group("idx")
-                num_shards = match.group("num_shards")
+            if not match:
+                continue
+            emb_name = match.group("emb_name")
+            ckpt_rank = int(match.group("idx"))
+            ckpt_world_size = int(match.group("num_shards"))
+            key_files_by_emb[emb_name].append((ckpt_rank, ckpt_world_size, key_file))
+
+        for emb_name, emb_key_files in key_files_by_emb.items():
+            emb_dim = emb_name_to_emb_dim[emb_name]
+            key_name = f"{emb_name}.keys"
+            value_name = f"{emb_name}.values"
+            score_name = f"{emb_name}.scores"
+            keys_list = []
+            values_list = []
+            scores_list = []
+            ckpt_world_sizes = {x[1] for x in emb_key_files}
+            if len(ckpt_world_sizes) > 1:
+                raise ValueError(
+                    f"dynamic embedding {emb_name} has inconsistent checkpoint "
+                    f"world_size values: {sorted(ckpt_world_sizes)}"
+                )
+            for ckpt_rank, ckpt_world_size, key_file in sorted(emb_key_files):
+                if ckpt_rank % world_size != rank:
+                    continue
                 with open(key_file, "rb") as f:
                     keys = torch.tensor(
                         np.fromfile(f, dtype=np.int64), dtype=torch.int64
                     )
-                with open(
-                    os.path.join(
-                        os.path.dirname(key_file),
-                        f"{emb_name}_emb_values.rank_{idx}.world_size_{num_shards}",
-                    ),
-                    "rb",
-                ) as f:
+                value_file = os.path.join(
+                    os.path.dirname(key_file),
+                    f"{emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                )
+                with open(value_file, "rb") as f:
                     values = torch.tensor(
                         np.fromfile(f, dtype=np.float32), dtype=torch.float32
                     )
-                key_name = f"{emb_name}.keys"
-                value_name = f"{emb_name}.values"
-                values_2d = values.view([-1, emb_dim])
-                dynamic_out[key_name] = keys
-                dynamic_out[value_name] = values_2d
-                emb_name_to_meta_tensor[emb_name] = values_2d
-                value_name_to_key[value_name] = key_name
-                dynamic_emb_names.add(emb_name)
-                dynamic_key_names[emb_name].append(key_name)
-                dynamic_value_names[emb_name].append(value_name)
+                score_file = os.path.join(
+                    os.path.dirname(key_file),
+                    f"{emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                )
+                if not os.path.exists(score_file):
+                    raise FileNotFoundError(
+                        f"dynamic embedding {emb_name} score file not found: "
+                        f"{score_file}"
+                    )
+                with open(score_file, "rb") as f:
+                    scores = torch.tensor(
+                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
+                    )
+                if keys.numel() != scores.numel():
+                    raise ValueError(
+                        f"dynamic embedding {emb_name} key/score row mismatch: "
+                        f"keys={keys.numel()}, scores={scores.numel()}, "
+                        f"key_file={key_file}, score_file={score_file}"
+                    )
+                if values.numel() != keys.numel() * emb_dim:
+                    raise ValueError(
+                        f"dynamic embedding {emb_name} value row mismatch: "
+                        f"keys={keys.numel()}, value_elements={values.numel()}, "
+                        f"embedding_dim={emb_dim}"
+                    )
+                keys_list.append(keys)
+                values_list.append(values.view([-1, emb_dim]))
+                scores_list.append(scores)
+
+            if not keys_list:
+                continue
+            keys = torch.cat(keys_list)
+            values_2d = torch.cat(values_list, dim=0)
+            scores = torch.cat(scores_list)
+            dynamic_out[key_name] = keys
+            dynamic_out[value_name] = values_2d
+            dynamic_out[score_name] = scores
+            emb_name_to_meta_tensor[emb_name] = values_2d
+            dynamic_emb_names.add(emb_name)
+            dynamic_key_names[emb_name].append(key_name)
+            dynamic_value_names[emb_name].append(value_name)
+            dynamic_score_names[emb_name].append(score_name)
 
     # TODO(hongsheng.jhs): support mczch
 
@@ -1824,18 +1948,22 @@ def _get_sparse_embedding_tensor(
         }
         if is_dynamic:
             # Entry names inside sparse_dynamic_embedding-*.npz. The serving
-            # processor expects one key/value entry pair and applies it to all
-            # dynamic npz shards.
+            # processor expects one key/value/score entry triplet and applies it
+            # to all dynamic npz shards.
             t_meta["key_dtype"] = "int64"
+            t_meta["score_dtype"] = "int64"
             key_names = list(dict.fromkeys(dynamic_key_names[emb_name]))
             value_names = list(dict.fromkeys(dynamic_value_names[emb_name]))
-            if len(key_names) != 1 or len(value_names) != 1:
+            score_names = list(dict.fromkeys(dynamic_score_names[emb_name]))
+            if len(key_names) != 1 or len(value_names) != 1 or len(score_names) != 1:
                 raise ValueError(
-                    f"dynamic embedding {emb_name} expects one key/value npz "
-                    f"entry pair, got {key_names} / {value_names}"
+                    f"dynamic embedding {emb_name} expects one key/value/score "
+                    f"npz entry triplet, got {key_names} / {value_names} / "
+                    f"{score_names}"
                 )
             t_meta["key_name"] = key_names[0]
             t_meta["value_name"] = value_names[0]
+            t_meta["score_name"] = score_names[0]
         emb_meta[emb_name] = t_meta
 
     feat_meta = {}

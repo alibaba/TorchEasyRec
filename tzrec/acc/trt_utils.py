@@ -49,6 +49,9 @@ def trt_convert(
     torch_tensorrt.runtime.set_multi_device_safe_mode(True)
     enabled_precisions = {torch.float32}
 
+    # match TRT engine precision to the configured cuBLAS matmul tf32 mode
+    disable_tf32 = not torch.backends.cuda.matmul.allow_tf32
+
     # Workspace size for TensorRT
     workspace_size = 2 << 30
 
@@ -64,6 +67,7 @@ def trt_convert(
                 inputs,
                 # pyre-ignore [6]
                 enabled_precisions=enabled_precisions,
+                disable_tf32=disable_tf32,
                 workspace_size=workspace_size,
                 min_block_size=min_block_size,
                 hardware_compatible=True,
@@ -78,6 +82,7 @@ def trt_convert(
             inputs,
             # pyre-ignore [6]
             enabled_precisions=enabled_precisions,
+            disable_tf32=disable_tf32,
             workspace_size=workspace_size,
             min_block_size=min_block_size,
             hardware_compatible=True,
