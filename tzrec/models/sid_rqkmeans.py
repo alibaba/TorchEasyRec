@@ -26,7 +26,7 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid.kmeans import ReservoirSampler
+from tzrec.modules.sid.kmeans_quantize import ReservoirSampler
 from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
@@ -178,6 +178,9 @@ class SidRqkmeans(BaseSidModel):
         An empty reservoir only happens for a pathologically tiny corpus; the
         fit is then skipped.
         """
+        # train_offline consumes its input; we hand it the reservoir buffer
+        # directly (no copy) since nothing reads it after this — reset() drops
+        # the sampler's reference and ``local`` is the last user of the storage.
         local = self._reservoir.sample()
         self._reservoir.reset()
 

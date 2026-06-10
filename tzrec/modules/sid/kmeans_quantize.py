@@ -14,22 +14,18 @@
 This module is the single home for torch-native K-Means code used by
 SID models:
 
-* :class:`QuantizeLayer` — the per-layer quantizer interface
-  (``quantize`` / ``lookup`` / ``get_codebook_embeddings``) shared with the
-  RQ-VAE backend's vector-quantize layer.
-* :class:`KMeansQuantizeLayer` — the K-Means implementation: a centroid
-  container populated by the FAISS backend via ``load_centroids_``.
+* :class:`KMeansQuantizeLayer` — the K-Means :class:`QuantizeLayer`: a
+  centroid container populated by the FAISS backend via ``load_centroids_``.
 * :class:`ReservoirSampler` — bounded uniform stream sample (Vitter
   Algorithm R) that :class:`~tzrec.models.sid_rqkmeans.SidRqkmeans`
   fills during training to feed the one-shot FAISS fit.
 """
 
-from abc import abstractmethod
 from typing import Optional, Tuple
 
 import torch
-from torch import nn
 
+from tzrec.modules.sid.quantize_layer import QuantizeLayer
 from tzrec.modules.sid.types import QuantizeOutput
 from tzrec.utils.logging_util import logger
 
@@ -165,63 +161,22 @@ class ReservoirSampler:
         self._n_seen = 0
 
 
-class QuantizeLayer(nn.Module):
-    """One quantize layer: assign inputs to a codebook and look codes up.
-
-    Shared interface for the K-Means backend (:class:`KMeansQuantizeLayer`)
-    and the RQ-VAE backend's vector-quantize layer, so the residual quantizer
-    can drive either uniformly. Owns the codebook shape; subclasses build the
-    backend-specific codebook (a buffer, an ``nn.Embedding``, …) from it.
-
-    Args:
-        n_clusters (int): number of codebook entries.
-        n_features (int): feature dimension.
-    """
-
-    def __init__(self, n_clusters: int, n_features: int) -> None:
-        super().__init__()
-        self.n_clusters = n_clusters
-        self.n_features = n_features
-
-    @abstractmethod
-    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
-        """Assign ``x`` (B, D) to the codebook, returning codes + embeddings."""
-        raise NotImplementedError
-
-    def lookup(self, ids: torch.Tensor) -> torch.Tensor:
-        """Gather codebook embeddings for ``ids`` (indexes the codebook)."""
-        return self.get_codebook_embeddings()[ids]
-
-    @abstractmethod
-    def get_codebook_embeddings(self) -> torch.Tensor:
-        """Return the full codebook, shape (n_clusters, D).
-
-        The codebook lives in a backend-specific attribute (a ``centroids``
-        buffer for K-Means, an ``nn.Embedding`` for RQ-VAE), so this stays
-        abstract; :meth:`lookup` is then concrete in terms of it.
-        """
-        raise NotImplementedError
-
-
 class KMeansQuantizeLayer(QuantizeLayer):
-    """Single layer of a residual K-Means stack.
+    """K-Means :class:`QuantizeLayer`: a centroid codebook + nearest assignment.
 
     Centroids are populated externally by ``load_centroids_`` (the FAISS
     backend in :class:`ResidualKMeansQuantizer`); ``quantize`` is the only
-    forward path.
+    forward path. (The k-means *fit* lives in the quantizer; this layer just
+    holds the resulting centroids.)
 
     Args:
-        n_clusters (int): number of clusters (codebook size).
-        n_features (int): feature dimension.
+        n_embed (int): number of centroids (codebook size).
+        embed_dim (int): feature dimension.
     """
 
-    def __init__(
-        self,
-        n_clusters: int,
-        n_features: int,
-    ) -> None:
-        super().__init__(n_clusters, n_features)
-        self.register_buffer("centroids", torch.zeros(n_clusters, n_features))
+    def __init__(self, n_embed: int, embed_dim: int) -> None:
+        super().__init__(n_embed, embed_dim)
+        self.register_buffer("centroids", torch.zeros(n_embed, embed_dim))
         # Persistent so a post-fit checkpoint round-trips; a mid-fit poison
         # (True flag + zero centroids) is caught in _load_from_state_dict.
         self.register_buffer("_is_initialized", torch.tensor(False))
@@ -246,7 +201,7 @@ class KMeansQuantizeLayer(QuantizeLayer):
 
         Args:
             centroids (Tensor): externally trained centroids,
-                shape (n_clusters, n_features).
+                shape (n_embed, embed_dim).
         """
         assert centroids.shape == self.centroids.shape, (
             f"centroids shape mismatch: expected {tuple(self.centroids.shape)}, "
@@ -311,5 +266,5 @@ class KMeansQuantizeLayer(QuantizeLayer):
         return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
-        """Return the centroid table, shape (n_clusters, n_features)."""
+        """Return the centroid table, shape (n_embed, embed_dim)."""
         return self.centroids

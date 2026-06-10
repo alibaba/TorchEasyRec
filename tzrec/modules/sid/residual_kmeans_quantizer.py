@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.kmeans import KMeansQuantizeLayer, recon_diagnostics
+from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer, recon_diagnostics
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.utils.logging_util import logger
 
@@ -72,8 +72,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         self.layers = nn.ModuleList(
             [
                 KMeansQuantizeLayer(
-                    n_clusters=self.n_embed_list[i],
-                    n_features=embed_dim,
+                    n_embed=self.n_embed_list[i],
+                    embed_dim=embed_dim,
                 )
                 for i in range(n_layers)
             ]
@@ -168,8 +168,9 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         ``SEARCH_CHUNK``-sized chunks to cap peak memory.
 
         Args:
-            inputs (Tensor): embedding matrix (N, D) on CPU. Copied once to an
-                owned float32 tensor; not mutated.
+            inputs (Tensor): embedding matrix (N, D) on CPU. CONSUMED: the
+                residual pass may mutate it in place, so the caller must not
+                rely on its contents afterward (copy first if it needs them).
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
         # Assert the host-tensor contract locally (this is a standalone module)
@@ -178,11 +179,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
             f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
         )
-        # The loop below mutates x in place (the residual ``x -= q``), and the
-        # input is a view into the caller's float32 reservoir buffer — so own a
-        # fresh copy (copy=True forces one even when the dtype already matches,
-        # avoiding the double copy a separate ``.clone()`` would add).
-        x = inputs.detach().to(dtype=torch.float32, copy=True).contiguous()
+        # train_offline CONSUMES its input: the residual loop below mutates x
+        # in place (``x -= q``). We only normalize dtype/layout for faiss — a
+        # no-op view when the input is already float32 + contiguous, so the
+        # mutation lands in the caller's buffer (intended; the caller copies
+        # first if it still needs the data).
+        x = inputs.detach().to(dtype=torch.float32).contiguous()
         N = x.shape[0]
         # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
         # errors) when N < K and returns a degenerate codebook, which the
