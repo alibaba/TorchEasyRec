@@ -178,14 +178,18 @@ class QuantizeLayer(nn.Module):
         """Assign ``x`` (B, D) to the codebook, returning codes + embeddings."""
         raise NotImplementedError
 
-    @abstractmethod
     def lookup(self, ids: torch.Tensor) -> torch.Tensor:
-        """Gather codebook embeddings for ``ids``."""
-        raise NotImplementedError
+        """Gather codebook embeddings for ``ids`` (indexes the codebook)."""
+        return self.get_codebook_embeddings()[ids]
 
     @abstractmethod
     def get_codebook_embeddings(self) -> torch.Tensor:
-        """Return the full codebook, shape (n_clusters, D)."""
+        """Return the full codebook, shape (n_clusters, D).
+
+        The codebook lives in a backend-specific attribute (a ``centroids``
+        buffer for K-Means, an ``nn.Embedding`` for RQ-VAE), so this stays
+        abstract; :meth:`lookup` is then concrete in terms of it.
+        """
         raise NotImplementedError
 
 
@@ -298,10 +302,6 @@ class KMeansQuantizeLayer(QuantizeLayer):
             return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
         ids = torch.cdist(x, self.centroids).argmin(dim=-1)
         return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
-
-    def lookup(self, ids: torch.Tensor) -> torch.Tensor:
-        """Gather centroids for ``ids``, shape (..., D)."""
-        return self.centroids[ids]
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the centroid table, shape (n_clusters, n_features)."""
