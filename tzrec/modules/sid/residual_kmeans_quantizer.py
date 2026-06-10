@@ -198,16 +198,14 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             f"need >= {max_k} points to fit the codebook (largest layer K), got N={N}"
         )
         out = torch.zeros_like(x)
-        # The per-layer log reports the cumulative recon error of the original
-        # input x0 by the centroid sum. Without normalization the invariant
-        # ``out + x == x0`` holds, so x0 is reconstructed on the fly below and we
-        # skip the persistent (N, D) clone; with normalization x is rescaled each
-        # layer, breaking the invariant, so the clone is required.
+        # x0 (original input) feeds the per-layer recon log. Without
+        # normalization ``out + x == x0``, so it's rebuilt on the fly below and
+        # the persistent (N, D) clone is skipped; normalization rescales x and
+        # breaks that invariant, so clone then.
         x0 = x.clone() if (verbose and self.normalize_residuals) else None
 
-        # CPU-only fit: SidRqkmeans refuses to initialize when CUDA is visible,
-        # so the codebook is always built on CPU. Drop any stale ``gpu`` request
-        # from the config so a faiss-gpu build can't try to use an absent GPU.
+        # CPU-only fit (SidRqkmeans refuses CUDA). Drop any stale ``gpu`` kwarg
+        # so a faiss-gpu build can't target an absent GPU.
         kwargs = dict(self.faiss_kmeans_kwargs)
         kwargs.pop("gpu", None)
         if verbose:

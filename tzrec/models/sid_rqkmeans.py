@@ -72,19 +72,16 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # CPU-only: everything (embeddings, reservoir, FAISS fit) stays on the
-        # host, so there are no device copies on the train path. Refuse to run
-        # when CUDA is visible rather than silently shuttling tensors to/from a
-        # GPU; launch with CUDA_VISIBLE_DEVICES="" (or on a CPU-only host).
+        # CPU-only: embeddings, reservoir, and FAISS fit all stay on the host,
+        # so there are no device copies. Refuse to run when CUDA is visible.
         if torch.cuda.is_available():
             raise RuntimeError(
                 "SidRqkmeans is CPU-only, but a CUDA device is visible. "
                 'Run with CUDA_VISIBLE_DEVICES="" (or on a CPU-only host).'
             )
 
-        # Single-process only: the FAISS fit runs on one process over its local
-        # reservoir, with no cross-rank gather/broadcast. Fail fast here rather
-        # than after a full (wasted) training pass.
+        # Single-process only: the fit runs over one process's local reservoir,
+        # with no cross-rank gather. Fail fast before the (wasted) train pass.
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             raise RuntimeError(
                 "SidRqkmeans supports single-process training only "
@@ -109,16 +106,13 @@ class SidRqkmeans(BaseSidModel):
             faiss_kmeans_kwargs=self._faiss_kwargs,
         )
 
-        # Bounded host reservoir for the end-of-loop FAISS fit: cap at
-        # ``train_sample_size`` when set (>0), else the points the FAISS fit
-        # subsamples to (``default_fit_sample_size``) — rather than buffer the
-        # whole corpus. Single-process only (see the world_size guard above),
-        # so no per-rank split.
+        # Bounded host reservoir for the end-of-loop fit: cap at
+        # ``train_sample_size`` (when >0) else the fit's subsample size, rather
+        # than buffer the whole corpus.
         target = self._model_config.train_sample_size
         cap = target if target > 0 else self._quantizer.default_fit_sample_size()
-        # Fail fast: FAISS needs >= K points to fit each layer, so a cap below
-        # the largest codebook would only assert at on_train_end — after the
-        # whole training pass. (The default cap is always >= max(K).)
+        # Fail fast: a cap below the largest codebook would only fail deep in
+        # train_offline, after the whole training pass.
         max_k = max(self._n_embed_list)
         if cap < max_k:
             raise RuntimeError(
@@ -224,8 +218,7 @@ class SidRqkmeans(BaseSidModel):
 
         if "quantized" in predictions:
             embedding = self._extract_feature(batch)
-            # mse aggregates (preds, target) itself; rel_loss has no torchmetrics
-            # equivalent, so compute it directly (only rel is needed here).
+            # rel_loss has no torchmetrics equivalent, so compute it directly.
             self._metric_modules["mse"].update(predictions["quantized"], embedding)
             self._metric_modules["rel_loss"].update(
                 relative_l1(embedding, predictions["quantized"])

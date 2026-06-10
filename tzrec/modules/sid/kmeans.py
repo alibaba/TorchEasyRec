@@ -124,8 +124,8 @@ class ReservoirSampler:
         if self._buf is None:
             self._buf = torch.empty(cap, self._dim, dtype=torch.float32)
 
-        # Phase 1: fill empty slots first. x is already on the host (CPU-only
-        # model), so this is a dtype cast into the buffer, not a device copy.
+        # Phase 1: fill empty slots first. x is on the host, so ``.to`` is a
+        # dtype cast into the buffer, not a device copy.
         if self._n_filled < cap:
             take = min(x.shape[0], cap - self._n_filled)
             self._buf[self._n_filled : self._n_filled + take] = x[:take].to(
