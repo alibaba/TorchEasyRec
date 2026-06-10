@@ -177,6 +177,73 @@ class ExportUtilTest(unittest.TestCase):
                 os.environ["WORLD_SIZE"] = old_world_size
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_sparse_export_disambiguates_ec_ebc_embedding_name_collision(
+        self,
+    ) -> None:
+        """EC and EBC may use the same config name but hold different tensors."""
+
+        class SparseCollisionModel(torch.nn.Module):
+            def state_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                return {
+                    "model.embedding_group.emb_impls.__BASE__.ebc."
+                    "embedding_bags.shared_emb.weight": torch.tensor(
+                        [[1.0, 1.1], [1.2, 1.3]]
+                    ),
+                    "model.embedding_group.seq_emb_impls.__BASE__.ec_dict.2."
+                    "embeddings.shared_emb.weight": torch.tensor(
+                        [[2.0, 2.1], [2.2, 2.3]]
+                    ),
+                }
+
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_collision_")
+        try:
+            out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                SparseCollisionModel(),
+                tmp,
+                [
+                    SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["seq_feat"],
+                    )
+                ],
+                [
+                    SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["id_feat"],
+                        pooling="SUM",
+                    )
+                ],
+            )
+
+            self.assertEqual(dynamic_out, {})
+            self.assertNotIn("shared_emb", out)
+            np.testing.assert_array_equal(
+                out["shared_emb__ec"],
+                np.array([[2.0, 2.1], [2.2, 2.3]], dtype=np.float32),
+            )
+            np.testing.assert_array_equal(
+                out["shared_emb__ebc"],
+                np.array([[1.0, 1.1], [1.2, 1.3]], dtype=np.float32),
+            )
+            self.assertEqual(
+                emb_meta["shared_emb__ec"]["feat_name_impl"], ["seq_feat__ec"]
+            )
+            self.assertEqual(
+                emb_meta["shared_emb__ebc"]["feat_name_impl"], ["id_feat__ebc"]
+            )
+            self.assertEqual(
+                feat_meta["seq_feat__ec"],
+                {"embedding_name": "shared_emb__ec", "pooling": "NONE"},
+            )
+            self.assertEqual(
+                feat_meta["id_feat__ebc"],
+                {"embedding_name": "shared_emb__ebc", "pooling": "SUM"},
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_dense_embedding_restore_survives_fx_flatten(self) -> None:
         """AutoDis/MLP params must restore after the RTP FX flatten.
 

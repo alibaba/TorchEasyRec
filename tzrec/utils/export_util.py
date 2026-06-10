@@ -1705,6 +1705,93 @@ def _get_sparse_feature_to_embedding_info(
     return feature_to_embedding_bag_info, feature_to_embedding_info
 
 
+_SPARSE_EC_ROLE = "ec"
+_SPARSE_EBC_ROLE = "ebc"
+
+
+def _build_sparse_export_name_map(
+    embedding_infos: List[BaseEmbeddingConfig],
+    embedding_bag_info: List[BaseEmbeddingConfig],
+) -> Dict[Tuple[str, str], str]:
+    """Build physical export names for sparse embedding tables.
+
+    TorchRec keeps EmbeddingCollection and EmbeddingBagCollection as separate
+    physical modules. A config may reuse the same embedding_name in both places,
+    but those are still distinct checkpoint tensors. Keep the historical name
+    unless it appears in multiple sparse collection kinds; then suffix the
+    exported table name so serving can address the correct physical table.
+    """
+    roles_by_name = defaultdict(set)
+    for emb_info in embedding_infos:
+        roles_by_name[emb_info.name].add(_SPARSE_EC_ROLE)
+    for emb_info in embedding_bag_info:
+        roles_by_name[emb_info.name].add(_SPARSE_EBC_ROLE)
+
+    used_names = set(roles_by_name.keys())
+    export_name_by_role: Dict[Tuple[str, str], str] = {}
+    for emb_name, roles in roles_by_name.items():
+        if len(roles) == 1:
+            role = next(iter(roles))
+            export_name_by_role[(role, emb_name)] = emb_name
+            continue
+
+        for role in sorted(roles):
+            base_candidate = f"{emb_name}__{role}"
+            candidate = base_candidate
+            suffix = 1
+            while candidate in used_names:
+                candidate = f"{base_candidate}_{suffix}"
+                suffix += 1
+            used_names.add(candidate)
+            export_name_by_role[(role, emb_name)] = candidate
+    return export_name_by_role
+
+
+def _sparse_export_role_from_state_key(state_key: str) -> Optional[str]:
+    if ".embedding_bags." in state_key:
+        return _SPARSE_EBC_ROLE
+    if ".embeddings." in state_key:
+        return _SPARSE_EC_ROLE
+    return None
+
+
+def _sparse_export_role_from_dynamic_path(path: str) -> Optional[str]:
+    parent = os.path.dirname(path)
+    if (
+        ".ec_dict" in parent
+        or ".ec_list" in parent
+        or ".mc_ec" in parent
+        or ".ec." in parent
+    ):
+        return _SPARSE_EC_ROLE
+    if ".ebc" in parent or ".mc_ebc" in parent:
+        return _SPARSE_EBC_ROLE
+    return None
+
+
+def _resolve_sparse_export_name(
+    export_name_by_role: Dict[Tuple[str, str], str],
+    emb_name: str,
+    role: Optional[str],
+) -> str:
+    if role is not None and (role, emb_name) in export_name_by_role:
+        return export_name_by_role[(role, emb_name)]
+
+    candidates = [
+        export_name
+        for (_role, name), export_name in export_name_by_role.items()
+        if name == emb_name
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise KeyError(f"sparse embedding {emb_name} is not in export metadata")
+    raise ValueError(
+        f"sparse embedding {emb_name} appears in multiple sparse collection "
+        f"kinds; cannot resolve export name without role, got role={role}"
+    )
+
+
 def _get_sparse_embedding_tensor(
     model: nn.Module,
     checkpoint_path: str,
@@ -1731,13 +1818,20 @@ def _get_sparse_embedding_tensor(
     feat_name_impl_to_emb_name = dict()
     emb_name_to_feat_name_impl = dict()
 
+    export_name_by_role = _build_sparse_export_name_map(
+        embedding_infos, embedding_bag_info
+    )
+
     for emb_info in embedding_infos:
-        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
-        emb_name_to_feat_name_impl[emb_info.name] = []
+        export_emb_name = _resolve_sparse_export_name(
+            export_name_by_role, emb_info.name, _SPARSE_EC_ROLE
+        )
+        emb_name_to_emb_dim[export_emb_name] = emb_info.embedding_dim
+        emb_name_to_feat_name_impl[export_emb_name] = []
         for feat_name in emb_info.feature_names:
             feat_name_impl = feat_name + "__ec"
-            emb_name_to_feat_name_impl[emb_info.name].append(feat_name_impl)
-            feat_name_impl_to_emb_name[feat_name_impl] = emb_info.name
+            emb_name_to_feat_name_impl[export_emb_name].append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
             if hasattr(emb_info, "pooling"):
                 feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[
                     -1
@@ -1745,12 +1839,15 @@ def _get_sparse_embedding_tensor(
             else:
                 feat_name_to_pooling[feat_name_impl] = "NONE"
     for emb_info in embedding_bag_info:
-        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
-        emb_name_to_feat_name_impl[emb_info.name] = []
+        export_emb_name = _resolve_sparse_export_name(
+            export_name_by_role, emb_info.name, _SPARSE_EBC_ROLE
+        )
+        emb_name_to_emb_dim[export_emb_name] = emb_info.embedding_dim
+        emb_name_to_feat_name_impl[export_emb_name] = []
         for feat_name in emb_info.feature_names:
             feat_name_impl = feat_name + "__ebc"
-            emb_name_to_feat_name_impl[emb_info.name].append(feat_name_impl)
-            feat_name_impl_to_emb_name[feat_name_impl] = emb_info.name
+            emb_name_to_feat_name_impl[export_emb_name].append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
             if hasattr(emb_info, "pooling"):
                 feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[
                     -1
@@ -1782,11 +1879,16 @@ def _get_sparse_embedding_tensor(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
         emb_name = name.split(".")[-2]
+        export_emb_name = _resolve_sparse_export_name(
+            export_name_by_role,
+            emb_name,
+            _sparse_export_role_from_state_key(name),
+        )
         # emb_impl_type = name.split(".")[2]  # 'emb_impls' or 'seq_emb_impls'
 
         # feat_name_impl_list = emb_name_to_feat_name_impl.get(emb_name, [])
 
-        emb_dim = emb_name_to_emb_dim[emb_name]
+        emb_dim = emb_name_to_emb_dim[export_emb_name]
         if isinstance(values, DTensor):
             raise ValueError("DTensors are not considered yet.")
         elif isinstance(values, ShardedTensor):
@@ -1802,14 +1904,14 @@ def _get_sparse_embedding_tensor(
                         local_tensor = values.local_tensor().cpu().numpy()
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
-                            out[emb_name] = local_tensor
-                            emb_name_to_meta_tensor[emb_name] = local_tensor
+                            out[export_emb_name] = local_tensor
+                            emb_name_to_meta_tensor[export_emb_name] = local_tensor
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
             local_tensor = values.detach().cpu().numpy()
-            out[emb_name] = local_tensor
-            emb_name_to_meta_tensor[emb_name] = local_tensor
+            out[export_emb_name] = local_tensor
+            emb_name_to_meta_tensor[export_emb_name] = local_tensor
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
@@ -1846,9 +1948,16 @@ def _get_sparse_embedding_tensor(
             if not match:
                 continue
             emb_name = match.group("emb_name")
+            export_emb_name = _resolve_sparse_export_name(
+                export_name_by_role,
+                emb_name,
+                _sparse_export_role_from_dynamic_path(key_file),
+            )
             ckpt_rank = int(match.group("idx"))
             ckpt_world_size = int(match.group("num_shards"))
-            key_files_by_emb[emb_name].append((ckpt_rank, ckpt_world_size, key_file))
+            key_files_by_emb[export_emb_name].append(
+                (emb_name, ckpt_rank, ckpt_world_size, key_file)
+            )
 
         for emb_name, emb_key_files in key_files_by_emb.items():
             emb_dim = emb_name_to_emb_dim[emb_name]
@@ -1858,13 +1967,15 @@ def _get_sparse_embedding_tensor(
             keys_list = []
             values_list = []
             scores_list = []
-            ckpt_world_sizes = {x[1] for x in emb_key_files}
+            ckpt_world_sizes = {x[2] for x in emb_key_files}
             if len(ckpt_world_sizes) > 1:
                 raise ValueError(
                     f"dynamic embedding {emb_name} has inconsistent checkpoint "
                     f"world_size values: {sorted(ckpt_world_sizes)}"
                 )
-            for ckpt_rank, ckpt_world_size, key_file in sorted(emb_key_files):
+            for ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file in sorted(
+                emb_key_files
+            ):
                 if ckpt_rank % world_size != rank:
                     continue
                 with open(key_file, "rb") as f:
@@ -1873,7 +1984,7 @@ def _get_sparse_embedding_tensor(
                     )
                 value_file = os.path.join(
                     os.path.dirname(key_file),
-                    f"{emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                    f"{ckpt_emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
                 )
                 with open(value_file, "rb") as f:
                     values = torch.tensor(
@@ -1881,7 +1992,7 @@ def _get_sparse_embedding_tensor(
                     )
                 score_file = os.path.join(
                     os.path.dirname(key_file),
-                    f"{emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+                    f"{ckpt_emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
                 )
                 if not os.path.exists(score_file):
                     raise FileNotFoundError(
