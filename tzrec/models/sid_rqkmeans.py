@@ -75,7 +75,7 @@ class SidRqkmeans(BaseSidModel):
                 "Launch with --nproc-per-node=1."
             )
 
-        cfg = self._model_config  # SidRqkmeans proto message
+        cfg = self._model_config
 
         # Typed faiss kwargs: only the explicitly-set fields are forwarded, so
         # unset ones fall back to faiss's own defaults (no float->int coercion).
@@ -123,8 +123,7 @@ class SidRqkmeans(BaseSidModel):
         """
         embedding = self._extract_feature(batch)
 
-        # Training: just reservoir-sample for the end-of-loop FAISS fit and
-        # return dummy codes — the codebook does not exist yet.
+        # Training: reservoir-sample only; codes are dummy until the fit.
         if self.is_train:
             self._reservoir.add(embedding)
             B = embedding.shape[0]
@@ -140,11 +139,9 @@ class SidRqkmeans(BaseSidModel):
             "codes": codes,
         }
 
-        # Expose the centroid-sum reconstruction (``x_hat``, the scoring target
-        # for update_metric) only in eval AND once the codebook is fit — before
-        # on_train_end it is all-zeros, so omitting it makes update_metric skip.
-        # (Meaningful only with normalize_residuals=False; with normalization the
-        # centroids live on the rescaled-residual scale, off the input's scale.)
+        # Expose the centroid-sum reconstruction (``x_hat``) for update_metric
+        # only once fitted — pre-fit it is all-zeros, so omitting it skips the
+        # eval metrics. (Meaningful only with normalize_residuals=False.)
         if self.is_eval and self._quantizer.is_fitted:
             predictions["x_hat"] = quantized
 

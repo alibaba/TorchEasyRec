@@ -172,9 +172,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 owned float32 tensor; not mutated.
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # CPU-only: SidRqkmeans refuses to init when CUDA is visible, but this
-        # quantizer is a standalone module — assert the host-tensor contract it
-        # relies on so misuse fails here, not deep inside faiss.
+        # Assert the host-tensor contract locally (this is a standalone module)
+        # so misuse fails here, not deep inside faiss.
         assert not inputs.is_cuda, "train_offline is CPU-only; got a CUDA tensor"
         assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
             f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
