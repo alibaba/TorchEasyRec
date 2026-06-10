@@ -18,9 +18,12 @@ SID models:
   :class:`ResidualKMeansQuantizer`. Centroids are injected
   by the FAISS backend via ``load_centroids_``; the only forward path
   is ``predict``.
+* :class:`ReservoirSampler` — bounded uniform stream sample (Vitter
+  Algorithm R) that :class:`~tzrec.models.sid_rqkmeans.SidRqkmeans`
+  fills during training to feed the one-shot FAISS fit.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -50,6 +53,93 @@ def recon_diagnostics(
         torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
     ).mean()
     return mse, rel
+
+
+class ReservoirSampler:
+    """Bounded uniform sample of a stream (Vitter Algorithm R).
+
+    Keeps a uniform ``capacity``-row sample of all rows passed to ``add``, in
+    O(capacity) host (CPU) memory — used to subsample the training corpus for
+    the one-shot FAISS fit without buffering the whole corpus. The buffer is a
+    CPU float32 tensor, allocated lazily on the first ``add``.
+
+    Args:
+        capacity (int): max rows retained.
+        dim (int): row width (feature dimension).
+    """
+
+    def __init__(self, capacity: int, dim: int) -> None:
+        self._cap = capacity
+        self._dim = dim
+        # Allocated lazily on the first add. _n_filled = used slots;
+        # _n_seen = running count for the accept prob.
+        self._buf: Optional[torch.Tensor] = None
+        self._n_filled = 0
+        self._n_seen = 0
+
+    @property
+    def capacity(self) -> int:
+        """Max rows retained."""
+        return self._cap
+
+    @property
+    def n_seen(self) -> int:
+        """Total rows passed to ``add`` so far."""
+        return self._n_seen
+
+    @property
+    def n_filled(self) -> int:
+        """Rows currently held (<= capacity)."""
+        return self._n_filled
+
+    @torch.no_grad()
+    def add(self, x: torch.Tensor) -> None:
+        """Stream a batch of rows into the reservoir.
+
+        Args:
+            x (Tensor): rows to add, shape (B, dim).
+        """
+        x = x.detach()
+        cap = self._cap
+        if self._buf is None:
+            self._buf = torch.empty(cap, self._dim, dtype=torch.float32)
+
+        # Phase 1: fill empty slots first. x is already on the host (CPU-only
+        # model), so this is a dtype cast into the buffer, not a device copy.
+        if self._n_filled < cap:
+            take = min(x.shape[0], cap - self._n_filled)
+            self._buf[self._n_filled : self._n_filled + take] = x[:take].to(
+                torch.float32
+            )
+            self._n_filled += take
+            self._n_seen += take
+            x = x[take:]
+            if x.shape[0] == 0:
+                return
+
+        # Phase 2: row j enters with prob cap/(n_seen+j+1), displacing a random
+        # slot. float64 keeps n_seen+j+1 exact past 2**24.
+        r = x.shape[0]
+        pos = self._n_seen + torch.arange(r)
+        accept = torch.rand(r) < (cap / (pos + 1).to(torch.float64))
+        idx = accept.nonzero(as_tuple=True)[0]
+        if idx.numel() > 0:
+            slots = torch.randint(0, cap, (idx.numel(),))
+            # Slot collisions are last-write-wins; O(B/cap) bias, negligible here.
+            self._buf[slots] = x[idx].to(torch.float32)
+        self._n_seen += r
+
+    def sample(self) -> torch.Tensor:
+        """Return the filled portion of the reservoir, shape (n_filled, dim)."""
+        if self._buf is None or self._n_filled == 0:
+            return torch.empty(0, self._dim, dtype=torch.float32)
+        return self._buf[: self._n_filled]
+
+    def reset(self) -> None:
+        """Drop the buffer and counters to free host memory."""
+        self._buf = None
+        self._n_filled = 0
+        self._n_seen = 0
 
 
 class KMeansLayer(nn.Module):

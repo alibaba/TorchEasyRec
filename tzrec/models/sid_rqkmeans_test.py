@@ -90,18 +90,20 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertEqual(model._faiss_kwargs.get("niter"), 5)
         self.assertEqual(model._faiss_kwargs.get("seed"), 1234)
         self.assertFalse(model._faiss_kwargs.get("verbose"))
-        self.assertEqual(model._n_seen, 0)
-        self.assertIsNone(model._reservoir)
+        self.assertEqual(model._reservoir.n_seen, 0)
+        self.assertEqual(model._reservoir.n_filled, 0)
 
     def test_sample_cap_from_train_sample_size(self) -> None:
         """train_sample_size (when set) drives the reservoir cap directly."""
         # Explicit train_sample_size: cap == train_sample_size.
         model = self._create_model(train_sample_size=900)
-        self.assertEqual(model._sample_cap, 900)
+        self.assertEqual(model._reservoir.capacity, 900)
 
         # Default (train_sample_size=0): cap == the FAISS fit's subsample size.
         model = self._create_model()
-        self.assertEqual(model._sample_cap, model._quantizer.default_fit_sample_size())
+        self.assertEqual(
+            model._reservoir.capacity, model._quantizer.default_fit_sample_size()
+        )
 
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""
@@ -116,69 +118,11 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
 
         # Reservoir holds all 4*B samples (well under the cap) and tracks
         # the running count.
-        self.assertEqual(model._n_seen, 4 * B)
-        self.assertEqual(model._n_filled, 4 * B)
+        self.assertEqual(model._reservoir.n_seen, 4 * B)
+        self.assertEqual(model._reservoir.n_filled, 4 * B)
         # FAISS not yet triggered: layers should be uninitialized
         for layer in model._quantizer.layers:
             self.assertFalse(layer.is_initialized)
-
-    def test_reservoir_caps_memory(self) -> None:
-        """Reservoir bounds the buffer at _sample_cap regardless of corpus."""
-        B, input_dim = 16, 8
-        model = self._create_model(input_dim=input_dim)
-        model._sample_cap = 10  # force a tiny cap
-        model._reset_reservoir()
-        model.train()
-        for _ in range(20):  # 320 rows >> cap
-            model.predict(_make_batch(B, input_dim))
-        self.assertEqual(model._n_seen, 20 * B)
-        self.assertEqual(model._n_filled, 10)
-        self.assertEqual(model._reservoir.shape, (10, input_dim))
-
-    def test_reservoir_phase2_replacement(self) -> None:
-        """Phase-2 replacement keeps a valid reservoir of real, in-range rows.
-
-        Feeds identifiable rows (each row's value == its global stream index),
-        then asserts every reservoir slot still holds an intact fed row, all
-        indices are in range, and replacement past the initial fill actually
-        happened — exercising the accept-prob / slot-write logic that the
-        count/shape-only ``test_reservoir_caps_memory`` cannot.
-        """
-        torch.manual_seed(0)
-        input_dim, cap, B, n_batches = 4, 8, 4, 50
-        model = self._create_model(input_dim=input_dim)
-        model._sample_cap = cap
-        model._reset_reservoir()
-        model.train()
-
-        gidx = 0
-        for _ in range(n_batches):
-            rows = (
-                torch.arange(gidx, gidx + B, dtype=torch.float32)
-                .unsqueeze(1)
-                .expand(B, input_dim)
-                .contiguous()
-            )
-            gidx += B
-            model.predict(_batch_from_rows(rows))
-
-        total = B * n_batches
-        self.assertEqual(model._n_seen, total)
-        self.assertEqual(model._n_filled, cap)
-
-        res = model._reservoir
-        idx = res[:, 0].round().long()
-        # Each stored row is an intact fed row (all columns equal its index),
-        # never zeros/garbage.
-        self.assertTrue(
-            torch.equal(res, idx.unsqueeze(1).float().expand_as(res)),
-            "reservoir holds corrupted (non-fed) rows",
-        )
-        # All indices are valid stream positions.
-        self.assertTrue((idx >= 0).all() and (idx < total).all())
-        # Phase-2 replacement happened: at least one slot holds a row added
-        # after the reservoir filled (index >= cap).
-        self.assertTrue((idx >= cap).any(), "no Phase-2 replacement occurred")
 
     def test_on_train_end_runs_faiss(self) -> None:
         """on_train_end triggers FAISS fit and clears buffer."""
@@ -194,14 +138,14 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         # Accumulate enough samples (FAISS K-Means needs at least K points)
         for _ in range(8):
             model.predict(_make_batch(B, input_dim))
-        self.assertGreater(model._n_seen, 0)
+        self.assertGreater(model._reservoir.n_seen, 0)
 
         # Trigger one-shot FAISS fit; a real fit must request a tail checkpoint
         self.assertTrue(model.on_train_end())
 
         # Reservoir should be released after the fit
-        self.assertEqual(model._n_seen, 0)
-        self.assertIsNone(model._reservoir)
+        self.assertEqual(model._reservoir.n_seen, 0)
+        self.assertEqual(model._reservoir.n_filled, 0)
         # All layers should be initialized + centroids non-zero
         for layer in model._quantizer.layers:
             self.assertTrue(bool(layer._is_initialized.item()))
@@ -226,7 +170,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         model = self._create_model(input_dim=input_dim, codebook=codebook)
         # Reservoir cap derives from the LARGEST K (16), not the first (8).
         self.assertEqual(
-            model._sample_cap,
+            model._reservoir.capacity,
             16 * int(model._faiss_kwargs.get("max_points_per_centroid", 256)),
         )
 

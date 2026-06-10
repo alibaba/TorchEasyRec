@@ -27,7 +27,7 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
-from tzrec.modules.sid.kmeans import recon_diagnostics
+from tzrec.modules.sid.kmeans import ReservoirSampler, recon_diagnostics
 from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
@@ -109,81 +109,17 @@ class SidRqkmeans(BaseSidModel):
             faiss_kmeans_kwargs=self._faiss_kwargs,
         )
 
-        self._init_reservoir()
+        # Bounded host reservoir for the end-of-loop FAISS fit: cap at
+        # ``train_sample_size`` when set (>0), else the points the FAISS fit
+        # subsamples to (``default_fit_sample_size``) — rather than buffer the
+        # whole corpus. Single-process only (see the world_size guard above),
+        # so no per-rank split.
+        target = self._model_config.train_sample_size
+        cap = target if target > 0 else self._quantizer.default_fit_sample_size()
+        self._reservoir = ReservoirSampler(cap, self._input_dim)
 
         # KMeans has no learnable params; a dummy keeps the optimizer/DDP happy.
         self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=True)
-
-    def _init_reservoir(self) -> None:
-        """Set up the bounded host reservoir for the end-of-loop FAISS fit.
-
-        Caps at ``train_sample_size`` when set (>0), else the points the FAISS
-        fit subsamples to (``ResidualKMeansQuantizer.default_fit_sample_size``)
-        — rather than buffer the whole corpus. Single-process only (see the
-        world_size guard in ``__init__``), so no per-rank split.
-        """
-        target = self._model_config.train_sample_size
-        self._sample_cap = (
-            target if target > 0 else self._quantizer.default_fit_sample_size()
-        )
-
-        # Allocated lazily on the first batch. _n_filled = used slots;
-        # _n_seen = running count for the accept prob.
-        self._reservoir: Optional[torch.Tensor] = None
-        self._n_filled = 0
-        self._n_seen = 0
-
-    @torch.no_grad()
-    def _reservoir_add(self, x: torch.Tensor) -> None:
-        """Stream a batch into the reservoir (Vitter Algorithm R).
-
-        Keeps a uniform ``_sample_cap`` sample of all embeddings seen, in
-        O(cap) host memory.
-
-        Args:
-            x (Tensor): batch of embeddings, shape (B, D).
-        """
-        x = x.detach()
-        cap = self._sample_cap
-        if self._reservoir is None:
-            self._reservoir = torch.empty(cap, x.shape[1], dtype=torch.float32)
-
-        # Phase 1: fill empty slots first. x is already on the host (CPU-only
-        # model), so this is a dtype cast into the reservoir, not a device copy.
-        if self._n_filled < cap:
-            take = min(x.shape[0], cap - self._n_filled)
-            self._reservoir[self._n_filled : self._n_filled + take] = x[:take].to(
-                torch.float32
-            )
-            self._n_filled += take
-            self._n_seen += take
-            x = x[take:]
-            if x.shape[0] == 0:
-                return
-
-        # Phase 2: row j enters with prob cap/(n_seen+j+1), displacing a random
-        # slot. float64 keeps n_seen+j+1 exact past 2**24.
-        r = x.shape[0]
-        pos = self._n_seen + torch.arange(r)
-        accept = torch.rand(r) < (cap / (pos + 1).to(torch.float64))
-        idx = accept.nonzero(as_tuple=True)[0]
-        if idx.numel() > 0:
-            slots = torch.randint(0, cap, (idx.numel(),))
-            # Slot collisions are last-write-wins; O(B/cap) bias, negligible here.
-            self._reservoir[slots] = x[idx].to(torch.float32)
-        self._n_seen += r
-
-    def _reservoir_sample(self) -> torch.Tensor:
-        """Return the filled portion of the reservoir, shape (n_filled, D)."""
-        if self._reservoir is None or self._n_filled == 0:
-            return torch.empty(0, self._input_dim, dtype=torch.float32)
-        return self._reservoir[: self._n_filled]
-
-    def _reset_reservoir(self) -> None:
-        """Drop the reservoir after the FAISS fit to free host memory."""
-        self._reservoir = None
-        self._n_filled = 0
-        self._n_seen = 0
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model.
@@ -202,7 +138,7 @@ class SidRqkmeans(BaseSidModel):
         # Training: just reservoir-sample for the end-of-loop FAISS fit and
         # return dummy codes — the codebook does not exist yet.
         if self.is_train:
-            self._reservoir_add(embedding)
+            self._reservoir.add(embedding)
             B = embedding.shape[0]
             return {
                 "codes": torch.zeros(
@@ -298,8 +234,8 @@ class SidRqkmeans(BaseSidModel):
             (centroids changed → force a final checkpoint), ``False`` if the
             fit was skipped (empty reservoir).
         """
-        local = self._reservoir_sample()
-        self._reset_reservoir()
+        local = self._reservoir.sample()
+        self._reservoir.reset()
 
         if local.shape[0] == 0:
             logger.warning(
