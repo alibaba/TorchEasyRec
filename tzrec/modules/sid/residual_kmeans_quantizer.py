@@ -245,7 +245,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
 
             if verbose:
                 # x0 == out + x without normalization (see above).
-                ref = x0 if x0 is not None else out + x
+                ref = x0 if self.normalize_residuals else out + x
                 logger.info(
                     "[ResidualKMeansQuantizer][offline_faiss][layer %d] %s",
                     layer_idx,

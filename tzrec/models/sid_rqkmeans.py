@@ -120,10 +120,11 @@ class SidRqkmeans(BaseSidModel):
         # the largest codebook would only assert at on_train_end — after the
         # whole training pass. (The default cap is always >= max(K).)
         max_k = max(self._n_embed_list)
-        assert cap >= max_k, (
-            f"reservoir cap ({cap}) < largest codebook size ({max_k}); set "
-            f"train_sample_size >= {max_k} (or 0 for the default)."
-        )
+        if cap < max_k:
+            raise RuntimeError(
+                f"reservoir cap ({cap}) < largest codebook size ({max_k}); set "
+                f"train_sample_size >= {max_k} (or 0 for the default)."
+            )
         self._reservoir = ReservoirSampler(cap, self._input_dim)
 
         # KMeans has no learnable params; a dummy keeps the optimizer/DDP happy.

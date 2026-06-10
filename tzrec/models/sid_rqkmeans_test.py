@@ -107,7 +107,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
 
     def test_init_raises_on_too_small_train_sample_size(self) -> None:
         """train_sample_size below the largest codebook fails fast at init."""
-        with self.assertRaisesRegex(AssertionError, "largest codebook"):
+        with self.assertRaisesRegex(RuntimeError, "largest codebook"):
             self._create_model(codebook=[16, 16], train_sample_size=8)
 
     def test_predict_collects_buffer(self) -> None:
