@@ -173,25 +173,22 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 rely on its contents afterward (copy first if it needs them).
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # Check the host-tensor contract locally (this is a standalone module)
-        # so misuse fails here, not deep inside faiss. raise (not assert): these
-        # guard silent data corruption and must survive ``python -O``.
+        # Host-tensor contract, checked here (not deep in faiss). raise (not
+        # assert): these guard data corruption and must survive ``python -O``.
         if inputs.is_cuda:
             raise RuntimeError("train_offline is CPU-only; got a CUDA tensor")
         if inputs.dim() != 2 or inputs.shape[1] != self.embed_dim:
             raise RuntimeError(
                 f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
             )
-        # train_offline CONSUMES its input: the residual loop below mutates x
-        # in place (``x -= q``). We only normalize dtype/layout for faiss — a
-        # no-op view when the input is already float32 + contiguous, so the
-        # mutation lands in the caller's buffer (intended; the caller copies
-        # first if it still needs the data).
+        # The loop below mutates x in place (``x -= q``); the dtype/layout
+        # normalize is a no-op view when already float32 + contiguous, so the
+        # mutation lands in the caller's buffer (intended — see Args: CONSUMED).
         x = inputs.detach().to(dtype=torch.float32).contiguous()
         N = x.shape[0]
-        # Fail loudly on a too-small corpus: faiss.Kmeans only warns (not
-        # errors) when N < K and returns a degenerate codebook, which the
-        # all-zero poison guard in KMeansQuantizeLayer would not catch.
+        # Clear message before faiss's own opaque C++ throw for N < K. (The
+        # K <= N < K * min_points_per_centroid case, where faiss only warns and
+        # returns a degenerate codebook, is not guarded here.)
         max_k = max(self.n_embed_list)
         if N < max_k:
             raise RuntimeError(

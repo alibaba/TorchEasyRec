@@ -29,9 +29,8 @@ class RelativeL1(Metric):
     def __init__(self, epsilon: float = 1e-4, **kwargs) -> None:
         super().__init__(**kwargs)
         self.epsilon = epsilon
-        # float64 sum / long count: element-wise aggregation crosses 2**24 at
-        # only ~32K rows of a 512-dim embedding, past which float32 increments
-        # round (mirrors the float64 care in ``ReservoirSampler.add``).
+        # float64 sum / long count: float32 loses integer precision past 2**24
+        # (~32K rows of a 512-dim embedding) under element-wise aggregation.
         self.add_state(
             "sum_rel",
             default=torch.tensor(0.0, dtype=torch.float64),

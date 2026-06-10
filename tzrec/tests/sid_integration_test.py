@@ -10,6 +10,8 @@
 # limitations under the License.
 
 import glob
+import json
+import math
 import os
 import shutil
 import tempfile
@@ -31,12 +33,10 @@ class SidIntegrationTest(unittest.TestCase):
             os.makedirs("./tmp")
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
         os.chmod(self.test_dir, 0o755)
-        # SID models are CPU-only (refuse a visible CUDA device) and
-        # single-process (refuse world_size > 1), so hide CUDA and pin
-        # nproc=1 — the GPU CI harness otherwise defaults to GPU + nproc=2.
-        # Use "-1", not "" — an empty CUDA_VISIBLE_DEVICES is treated
-        # inconsistently across CUDA runtimes (the GPU CI runner does not hide
-        # the devices), which trips the CPU-only guard in the train_eval child.
+        # SID is CPU-only + single-process, so hide CUDA and pin nproc=1 (the
+        # GPU CI harness defaults to GPU + nproc=2). Use "-1", not "" — an empty
+        # CUDA_VISIBLE_DEVICES is treated inconsistently and the GPU CI runner
+        # doesn't hide the devices, tripping the CPU-only guard in the child.
         patcher = mock.patch.dict(
             os.environ, {"CUDA_VISIBLE_DEVICES": "-1", "TEST_NPROC_PER_NODE": "1"}
         )
@@ -98,10 +98,22 @@ class SidIntegrationTest(unittest.TestCase):
             glob.glob(os.path.join(self.test_dir, "train", "model.ckpt-*")),
             "no checkpoint persisted after on_train_end",
         )
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "train", "eval_result.txt")),
-            "no eval_result.txt produced",
-        )
+        # A fitted codebook yields finite metrics; a degenerate/unfitted one
+        # never exposes x_hat -> metrics stay NaN. So assert finiteness, plus
+        # rel_loss < 1.0 (all-zero baseline ~ 1.0) and nonzero SID variety.
+        result_path = os.path.join(self.test_dir, "train", "eval_result.txt")
+        self.assertTrue(os.path.exists(result_path), "no eval_result.txt produced")
+        with open(result_path) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        self.assertTrue(lines, "eval_result.txt is empty")
+        metrics = json.loads(lines[-1])
+        for key in ("mse", "rel_loss", "unique_sid_ratio"):
+            self.assertIn(key, metrics)
+            self.assertTrue(
+                math.isfinite(metrics[key]), f"{key} not finite: {metrics[key]}"
+            )
+        self.assertLess(metrics["rel_loss"], 1.0)
+        self.assertGreater(metrics["unique_sid_ratio"], 0.0)
 
 
 if __name__ == "__main__":

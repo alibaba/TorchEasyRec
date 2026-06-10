@@ -58,14 +58,12 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # CPU-only: training and inference both run on the host (embeddings,
-        # reservoir, FAISS fit, and post-fit assignment), so there are no device
-        # copies. v1 deliberately restricts the whole model to CPU; refuse to
-        # run when CUDA is visible.
+        # CPU-only: v1 restricts the whole model (train + inference) to the
+        # host. Refuse to run when CUDA is visible.
         if torch.cuda.is_available():
             raise RuntimeError(
                 "SidRqkmeans is CPU-only, but a CUDA device is visible. "
-                'Run with CUDA_VISIBLE_DEVICES="" (or on a CPU-only host).'
+                'Run with CUDA_VISIBLE_DEVICES="-1" (or on a CPU-only host).'
             )
 
         # Single-process only: the fit runs over one process's local reservoir,
@@ -177,19 +175,16 @@ class SidRqkmeans(BaseSidModel):
         then persists the fitted codebook (SID runs with periodic checkpointing
         disabled, so that save is never deduped away).
 
-        TODO: the "periodic checkpointing disabled" requirement is currently a
-        convention, not enforced. If a user sets save_checkpoints_steps/epochs
-        > 0 and the last in-loop save lands on the final step, the tail save is
-        deduped away and the fitted codebook is silently dropped. Harden the
-        save logic (enforce the contract / bypass the dedupe for this save) in a
-        future update.
+        TODO: "periodic checkpointing disabled" is a convention, not enforced.
+        With save_checkpoints_steps/epochs > 0, a final-step in-loop save can
+        dedupe the tail save away, silently dropping the fitted codebook. Harden
+        this (enforce the contract / bypass the dedupe) in a future update.
 
         An empty reservoir only happens for a pathologically tiny corpus; the
         fit is then skipped.
         """
-        # train_offline consumes its input; we hand it the reservoir buffer
-        # directly (no copy) since nothing reads it after this — reset() drops
-        # the sampler's reference and ``local`` is the last user of the storage.
+        # train_offline consumes its input; hand it the reservoir buffer
+        # directly (no copy) — nothing reads it after this.
         local = self._reservoir.sample()
         self._reservoir.reset()
 

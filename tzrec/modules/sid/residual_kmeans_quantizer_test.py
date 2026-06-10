@@ -31,6 +31,18 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertEqual(rkq.n_embed_list, [8, 4, 16])
         self.assertEqual([layer.centroids.shape[0] for layer in rkq.layers], [8, 4, 16])
 
+    def test_train_offline_raises_on_too_few_points(self) -> None:
+        """N < largest K fails fast (clear message before faiss's own throw)."""
+        rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=1, n_embed=8)
+        with self.assertRaisesRegex(RuntimeError, "largest layer K"):
+            rkq.train_offline(torch.randn(4, 4), verbose=False)
+
+    def test_train_offline_raises_on_wrong_dim(self) -> None:
+        """An input whose width != embed_dim fails fast."""
+        rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=1, n_embed=8)
+        with self.assertRaisesRegex(RuntimeError, "inputs must be"):
+            rkq.train_offline(torch.randn(16, 8), verbose=False)
+
     def test_forward_returns_zeros_before_fit(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
         self.assertFalse(all(layer.is_initialized for layer in rkq.layers))
