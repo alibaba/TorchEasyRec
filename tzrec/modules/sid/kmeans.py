@@ -28,6 +28,8 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from tzrec.utils.logging_util import logger
+
 
 def recon_diagnostics(
     x: torch.Tensor,
@@ -76,6 +78,7 @@ class ReservoirSampler:
         self._buf: Optional[torch.Tensor] = None
         self._n_filled = 0
         self._n_seen = 0
+        logger.info("[ReservoirSampler] capacity=%d, dim=%d", capacity, dim)
 
     @property
     def capacity(self) -> int:
