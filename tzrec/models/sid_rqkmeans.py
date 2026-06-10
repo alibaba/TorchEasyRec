@@ -58,8 +58,10 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # CPU-only: embeddings, reservoir, and FAISS fit all stay on the host,
-        # so there are no device copies. Refuse to run when CUDA is visible.
+        # CPU-only: training and inference both run on the host (embeddings,
+        # reservoir, FAISS fit, and post-fit assignment), so there are no device
+        # copies. v1 deliberately restricts the whole model to CPU; refuse to
+        # run when CUDA is visible.
         if torch.cuda.is_available():
             raise RuntimeError(
                 "SidRqkmeans is CPU-only, but a CUDA device is visible. "
@@ -174,6 +176,13 @@ class SidRqkmeans(BaseSidModel):
         with no cross-rank gather/broadcast. The tail ``final=True`` checkpoint
         then persists the fitted codebook (SID runs with periodic checkpointing
         disabled, so that save is never deduped away).
+
+        TODO: the "periodic checkpointing disabled" requirement is currently a
+        convention, not enforced. If a user sets save_checkpoints_steps/epochs
+        > 0 and the last in-loop save lands on the final step, the tail save is
+        deduped away and the fitted codebook is silently dropped. Harden the
+        save logic (enforce the contract / bypass the dedupe for this save) in a
+        future update.
 
         An empty reservoir only happens for a pathologically tiny corpus; the
         fit is then skipped.

@@ -16,18 +16,7 @@ import torch
 from tzrec.modules.sid.kmeans_quantize import (
     KMeansQuantizeLayer,
     ReservoirSampler,
-    recon_diagnostics,
 )
-
-
-class KmeansHelpersTest(unittest.TestCase):
-    """Tests for the K-Means helper functions."""
-
-    def test_recon_diagnostics_zero_on_identity(self) -> None:
-        x = torch.randn(8, 4)
-        mse, rel = recon_diagnostics(x, x.clone())
-        self.assertAlmostEqual(mse.item(), 0.0, places=6)
-        self.assertAlmostEqual(rel.item(), 0.0, places=6)
 
 
 class KMeansQuantizeLayerTest(unittest.TestCase):
@@ -60,7 +49,7 @@ class KMeansQuantizeLayerTest(unittest.TestCase):
 
     def test_load_centroids_shape_mismatch_raises(self) -> None:
         layer = KMeansQuantizeLayer(n_embed=2, embed_dim=2)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             layer.load_centroids_(torch.zeros(3, 2))
 
     def test_mid_fit_checkpoint_rejected(self) -> None:

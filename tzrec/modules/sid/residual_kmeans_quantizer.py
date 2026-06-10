@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer, recon_diagnostics
+from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.utils.logging_util import logger
 
@@ -173,12 +173,15 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 rely on its contents afterward (copy first if it needs them).
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # Assert the host-tensor contract locally (this is a standalone module)
-        # so misuse fails here, not deep inside faiss.
-        assert not inputs.is_cuda, "train_offline is CPU-only; got a CUDA tensor"
-        assert inputs.dim() == 2 and inputs.shape[1] == self.embed_dim, (
-            f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
-        )
+        # Check the host-tensor contract locally (this is a standalone module)
+        # so misuse fails here, not deep inside faiss. raise (not assert): these
+        # guard silent data corruption and must survive ``python -O``.
+        if inputs.is_cuda:
+            raise RuntimeError("train_offline is CPU-only; got a CUDA tensor")
+        if inputs.dim() != 2 or inputs.shape[1] != self.embed_dim:
+            raise RuntimeError(
+                f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
+            )
         # train_offline CONSUMES its input: the residual loop below mutates x
         # in place (``x -= q``). We only normalize dtype/layout for faiss — a
         # no-op view when the input is already float32 + contiguous, so the
@@ -190,9 +193,11 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # errors) when N < K and returns a degenerate codebook, which the
         # all-zero poison guard in KMeansQuantizeLayer would not catch.
         max_k = max(self.n_embed_list)
-        assert N >= max_k, (
-            f"need >= {max_k} points to fit the codebook (largest layer K), got N={N}"
-        )
+        if N < max_k:
+            raise RuntimeError(
+                f"need >= {max_k} points to fit the codebook (largest layer K), "
+                f"got N={N}"
+            )
         out = torch.zeros_like(x)
         # x0 (original input) feeds the per-layer recon log. Without
         # normalization ``out + x == x0``, so it's rebuilt on the fly below and
@@ -254,9 +259,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 )
 
     @staticmethod
-    def _calc_loss(
-        x: torch.Tensor, out: torch.Tensor, epsilon: float = 1e-4
-    ) -> Dict[str, float]:
-        """Reconstruction loss diagnostics (MSE + relative L1)."""
-        loss, rel_loss = recon_diagnostics(x, out, epsilon=epsilon)
-        return {"loss": float(loss.item()), "rel_loss": float(rel_loss.item())}
+    def _calc_loss(x: torch.Tensor, out: torch.Tensor) -> Dict[str, float]:
+        """Per-layer reconstruction MSE for the offline-fit log."""
+        return {"loss": float(((out - x) ** 2).mean().item())}

@@ -21,56 +21,13 @@ SID models:
   fills during training to feed the one-shot FAISS fit.
 """
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 from tzrec.modules.sid.quantize_layer import QuantizeLayer
 from tzrec.modules.sid.types import QuantizeOutput
 from tzrec.utils.logging_util import logger
-
-
-def recon_diagnostics(
-    x: torch.Tensor,
-    out: torch.Tensor,
-    epsilon: float = 1e-4,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """MSE + relative-L1 reconstruction diagnostics.
-
-    Shared by :meth:`SidRqkmeans.update_metric` and
-    :meth:`ResidualKMeansQuantizer.train_offline`'s per-layer log.
-
-    Args:
-        x: ground-truth embedding, shape (B, D).
-        out: quantized reconstruction, shape (B, D).
-        epsilon: numerical stabilizer for the relative-L1 denominator.
-
-    Returns:
-        mse:  scalar ``((out - x) ** 2).mean()``.
-        rel:  scalar relative-L1 ``mean(|x - out| / (max(|x|, |out|) + eps))``.
-    """
-    return ((out - x) ** 2).mean(), relative_l1(x, out, epsilon)
-
-
-def relative_l1(
-    x: torch.Tensor,
-    out: torch.Tensor,
-    epsilon: float = 1e-4,
-) -> torch.Tensor:
-    """Relative-L1 error ``mean(|x - out| / (max(|x|, |out|) + eps))``.
-
-    Symmetric relative error in [0, 1] (verbatim port of OpenOneRec's
-    ``calc_loss``). Used standalone by :meth:`SidRqkmeans.update_metric` (which
-    needs only ``rel``, not the MSE :meth:`recon_diagnostics` also computes).
-
-    Args:
-        x: ground-truth embedding, shape (B, D).
-        out: quantized reconstruction, shape (B, D).
-        epsilon: numerical stabilizer for the denominator.
-    """
-    return (
-        torch.abs(x - out) / (torch.maximum(torch.abs(x), torch.abs(out)) + epsilon)
-    ).mean()
 
 
 class ReservoirSampler:
@@ -203,10 +160,13 @@ class KMeansQuantizeLayer(QuantizeLayer):
             centroids (Tensor): externally trained centroids,
                 shape (n_embed, embed_dim).
         """
-        assert centroids.shape == self.centroids.shape, (
-            f"centroids shape mismatch: expected {tuple(self.centroids.shape)}, "
-            f"got {tuple(centroids.shape)}"
-        )
+        # raise (not assert): under ``python -O`` a dropped assert would let a
+        # (1, D) tensor broadcast-replicate into all K centroid rows silently.
+        if centroids.shape != self.centroids.shape:
+            raise RuntimeError(
+                f"centroids shape mismatch: expected {tuple(self.centroids.shape)}, "
+                f"got {tuple(centroids.shape)}"
+            )
         self.centroids.copy_(
             centroids.to(dtype=self.centroids.dtype, device=self.centroids.device)
         )

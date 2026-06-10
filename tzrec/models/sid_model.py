@@ -70,8 +70,17 @@ class BaseSidModel(BaseModel):
         self._input_dim = cfg.input_dim
         self._normalize_residuals = cfg.normalize_residuals
 
-        assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
+        if not cfg.codebook:
+            raise ValueError("codebook must be set, e.g. [256, 256, 256]")
         self._n_embed_list = list(cfg.codebook)
+        # Fail fast: a zero codebook entry / input_dim==0 only errors opaquely
+        # deep inside faiss, after the whole training pass.
+        if any(k < 1 for k in self._n_embed_list):
+            raise ValueError(
+                f"every codebook entry must be >= 1, got {self._n_embed_list}"
+            )
+        if self._input_dim < 1:
+            raise ValueError(f"input_dim must be >= 1, got {self._input_dim}")
         self._n_layers = len(self._n_embed_list)
 
     def _extract_feature(
@@ -87,7 +96,17 @@ class BaseSidModel(BaseModel):
         if feature_name is None:
             feature_name = self._embedding_feature_name
         kt = batch.dense_features[BASE_DATA_GROUP]
-        return kt[feature_name]
+        embedding = kt[feature_name]
+        # Guard a misconfigured feature width: a (B, 1) tensor (raw_feature
+        # missing value_dim, which defaults to 1) would otherwise broadcast
+        # silently downstream and fit a degenerate rank-1 codebook.
+        if embedding.dim() != 2 or embedding.shape[1] != self._input_dim:
+            raise ValueError(
+                f"feature '{feature_name}' has shape {tuple(embedding.shape)}, "
+                f"expected (B, {self._input_dim}); check that its value_dim "
+                "matches the SID input_dim."
+            )
+        return embedding
 
     def init_loss(self) -> None:
         """Initialize loss modules.

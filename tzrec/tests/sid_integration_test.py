@@ -34,8 +34,11 @@ class SidIntegrationTest(unittest.TestCase):
         # SID models are CPU-only (refuse a visible CUDA device) and
         # single-process (refuse world_size > 1), so hide CUDA and pin
         # nproc=1 — the GPU CI harness otherwise defaults to GPU + nproc=2.
+        # Use "-1", not "" — an empty CUDA_VISIBLE_DEVICES is treated
+        # inconsistently across CUDA runtimes (the GPU CI runner does not hide
+        # the devices), which trips the CPU-only guard in the train_eval child.
         patcher = mock.patch.dict(
-            os.environ, {"CUDA_VISIBLE_DEVICES": "", "TEST_NPROC_PER_NODE": "1"}
+            os.environ, {"CUDA_VISIBLE_DEVICES": "-1", "TEST_NPROC_PER_NODE": "1"}
         )
         patcher.start()
         self.addCleanup(patcher.stop)
