@@ -170,8 +170,18 @@ class QuantizeLayer(nn.Module):
 
     Shared interface for the K-Means backend (:class:`KMeansQuantizeLayer`)
     and the RQ-VAE backend's vector-quantize layer, so the residual quantizer
-    can drive either uniformly.
+    can drive either uniformly. Owns the codebook shape; subclasses build the
+    backend-specific codebook (a buffer, an ``nn.Embedding``, …) from it.
+
+    Args:
+        n_clusters (int): number of codebook entries.
+        n_features (int): feature dimension.
     """
+
+    def __init__(self, n_clusters: int, n_features: int) -> None:
+        super().__init__()
+        self.n_clusters = n_clusters
+        self.n_features = n_features
 
     @abstractmethod
     def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
@@ -210,10 +220,7 @@ class KMeansQuantizeLayer(QuantizeLayer):
         n_clusters: int,
         n_features: int,
     ) -> None:
-        super().__init__()
-        self.n_clusters = n_clusters
-        self.n_features = n_features
-
+        super().__init__(n_clusters, n_features)
         self.register_buffer("centroids", torch.zeros(n_clusters, n_features))
         # Persistent so a post-fit checkpoint round-trips; a mid-fit poison
         # (True flag + zero centroids) is caught in _load_from_state_dict.
