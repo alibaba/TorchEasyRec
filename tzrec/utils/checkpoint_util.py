@@ -417,8 +417,7 @@ class CheckpointManager:
             epoch: current epoch; enables the epoch trigger when not None.
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
-            final: request a save unconditionally (still subject to the per-step
-                dedupe), e.g. at train end.
+            final: force a save (still subject to the dedupe), e.g. at train end.
 
         Returns:
             True if a checkpoint was saved.
