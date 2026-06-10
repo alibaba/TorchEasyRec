@@ -171,6 +171,52 @@ def _remap_restore_worker(test_dir, rank, world_size, port, remap_file_path):
         shard_w_2_m2.gather(0)
 
 
+def _force_overwrite_worker(test_dir, rank, world_size, port):
+    """force=True re-save at an already-saved step must overwrite it.
+
+    Saves step 5 with centroids=0, then re-saves the SAME step with different
+    params (centroids=7): a non-force re-save dedupes (no overwrite), a force
+    re-save overwrites. Reloads and asserts the persisted step-5 checkpoint
+    holds the later params. (This is the on_train_end post-fit checkpoint path:
+    a periodic save at the final step, then a forced re-save of the fitted
+    codebook at the same step.)
+    """
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo")
+
+    class BufModel(nn.Module):
+        def __init__(self, fill):
+            super().__init__()
+            self.register_buffer("centroids", torch.full((4, 3), float(fill)))
+
+    manager = checkpoint_util.CheckpointManager(test_dir, keep_checkpoint_max=0)
+
+    # Initial save at step 5 (pre-fit: centroids = 0).
+    assert manager.maybe_save(5, BufModel(0.0), final=True), "initial save"
+
+    # Same step, different params: non-force dedupes; force overwrites.
+    model = BufModel(7.0)
+    assert not manager.maybe_save(5, model, final=True, force=False), (
+        "non-force same-step save must dedupe (not overwrite)"
+    )
+    assert manager.maybe_save(5, model, final=True, force=True), (
+        "force same-step save must fire"
+    )
+    manager.close()  # drain the async prune worker
+
+    # Reload: the persisted step-5 checkpoint must hold the LATER params (7),
+    # i.e. the force-save overwrote the earlier (0) one.
+    restored = BufModel(0.0)
+    checkpoint_util.restore_model(os.path.join(test_dir, "model.ckpt-5"), restored)
+    assert torch.allclose(restored.centroids, torch.full((4, 3), 7.0)), (
+        f"overwrite failed: centroids={restored.centroids.flatten().tolist()}"
+    )
+    dist.destroy_process_group()
+
+
 class CheckpointUtilTest(unittest.TestCase):
     def setUp(self):
         if not os.path.exists("./tmp"):
@@ -326,6 +372,19 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.best_checkpoint(self.test_dir, export_config),
         )
         self.assertEqual(manager.best_checkpoint()[1], 10)
+
+    def test_force_overwrite_same_step(self):
+        port = misc_util.get_free_port()
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(
+            target=_force_overwrite_worker, args=(self.test_dir, 0, 1, port)
+        )
+        p.start()
+        p.join(timeout=120)
+        if p.is_alive():
+            p.terminate()
+            raise RuntimeError("force-overwrite worker timed out.")
+        self.assertEqual(p.exitcode, 0, "force-overwrite worker failed")
 
     def test_dist_save_restore_model(self):
         port = misc_util.get_free_port()
