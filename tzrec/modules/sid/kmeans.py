@@ -146,12 +146,9 @@ class KMeansLayer(nn.Module):
     def predict(self, batch: torch.Tensor) -> torch.Tensor:
         """Assign points to nearest centroid.
 
-        Uses ``torch.cdist`` (plain L2). argmin is invariant to the monotonic
-        sqrt, so the assignment is identical to squared-L2 for all
-        non-degenerate inputs (verified bit-exact across random / large-
-        magnitude / near-tie sweeps); only an exact equidistant tie — measure
-        zero for real embeddings — may resolve to a different, equally-near
-        centroid.
+        Uses ``torch.cdist`` (L2); argmin is invariant to the monotonic sqrt,
+        so assignments match squared-L2 except at exact equidistant ties
+        (measure zero for real embeddings), where either centroid is valid.
 
         Args:
             batch (Tensor): data points, shape (B, D).

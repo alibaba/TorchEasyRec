@@ -257,9 +257,8 @@ class SidRqkmeans(BaseSidModel):
         """Update metric state.
 
         The reconstruction target (the input embedding) is re-extracted from
-        ``batch`` rather than threaded through ``predictions`` — it is an input,
-        not a model output (mirrors ``SidRqvae.update_metric``). ``quantized`` is
-        present only in eval (see ``predict``), so this runs eval-only.
+        ``batch`` — it is an input, not a model output. ``quantized`` is present
+        only in eval (see ``predict``), so this runs eval-only.
 
         Note: ``mse``/``rel_loss`` compare that embedding against the centroid-sum
         reconstruction. They are meaningful reconstruction metrics only with
