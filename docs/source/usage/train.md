@@ -63,7 +63,7 @@ LR策略可以支持按epoch更新或者按step更新
 - num_epochs: 训练的epoch数
 - save_checkpoints_steps: 保存模型的步数间隔，保存模型后会做一次评估
 - save_checkpoints_epochs: 保存模型的Epoch数间隔，保存模型后会做一次评估，与save_checkpoints_steps不能同时设置
-- save_checkpoints_timestamp_interval: 按数据时间（如Kafka消息的timestamp）保存模型的间隔秒数，每当已消费数据的事件时间跨过一个间隔边界时保存一次；边界按 Unix 时间(epoch/墙钟)对齐，而非训练 epoch。默认0表示关闭。仅对带timestamp的数据源（如KafkaDataset）生效
+- save_checkpoints_timestamp_interval: 按数据时间（如Kafka消息的timestamp）保存模型的间隔秒数，每当已消费数据的事件时间跨过一个间隔边界时保存一次。默认0表示关闭。仅对带timestamp的数据源（如KafkaDataset）生效
 - save_checkpoints_timestamps: 按数据时间保存模型的绝对时间点列表（单位为秒的 Unix 时间戳），已消费数据的事件时间每跨过一个时间点保存一次，默认为空表示关闭
 - save_checkpoints_timestamp_quorum: 分布式训练下各rank消费的分区不同，事件时间也不同；当至少该比例（取值(0,1\]，默认0.5）的rank已消费越过边界/时间点时才触发保存。1.0表示所有rank都越过才保存（最保守），越小越激进（最小可仅需一个rank）；默认值对单个异常/超前的timestamp具有鲁棒性
 - keep_checkpoint_max: 最多保留的最近checkpoint数量，超出后会异步删除最旧的checkpoint，默认0表示全部保留；当exporter_type为best时，会额外保留指标最优的checkpoint
