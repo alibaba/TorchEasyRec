@@ -91,14 +91,8 @@ class SidRqvae(BaseSidModel):
         hidden_dims = (
             list(cfg.hidden_dims) if cfg.hidden_dims else [self._input_dim // 2]
         )
-        # Empty -> default (1.0, 0.5); else must be exactly [w1, w2] (the
-        # quantizer unpacks two). Validate here for a field-named error.
+        # Empty -> default (1.0, 0.5); the quantizer validates the arity.
         latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
-        if len(latent_weight) != 2:
-            raise ValueError(
-                "latent_weight must have exactly 2 values [w1, w2], got "
-                f"{list(cfg.latent_weight)}"
-            )
 
         use_sinkhorn = True
         sinkhorn_iters = 5

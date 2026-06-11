@@ -147,6 +147,11 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         self.commitment_loss_type = commitment_loss
         self.rotation_trick = rotation_trick
 
+        if len(latent_weight) != 2:
+            raise ValueError(
+                f"latent_weight must have exactly 2 values [w1, w2], got "
+                f"{list(latent_weight)}"
+            )
         self.commitment_w1, self.commitment_w2 = latent_weight
 
         # ``initted`` is the kmeans_init guard: True means "codebook has
@@ -339,6 +344,11 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
 
+    def _train_gumbel(self) -> bool:
+        """Training pass in Gumbel mode (its soft assignment carries grad)."""
+        is_gumbel = self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
+        return self.training and is_gumbel
+
     def _quantize_layer(
         self,
         layer_idx: int,
@@ -361,7 +371,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         """
         layer = self.layers[layer_idx]
         out = layer.quantize(residual, temperature)
-        if self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX and self.training:
+        if self._train_gumbel():
             # Gumbel: soft embedding carries grad to encoder + codebook.
             return out.ids, out.embeddings
         # STE / eval: raw codebook vector; STE applied on the aggregate in forward.
@@ -397,8 +407,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if self.training:
             self.init_embed_(input)
 
-        is_gumbel = self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
-        train_gumbel = is_gumbel and self.training
+        train_gumbel = self._train_gumbel()
 
         # Step 2: residual walk. Gumbel walks the live input; STE detaches and
         # re-attaches grad in step 4. cumulative[i] = sum after layer i.
@@ -414,7 +423,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         # Step 4: aggregate STE (STE only; Gumbel already carries grad)
         quants_trunc = aggregated_quants
-        if self.training and not is_gumbel:
+        if self.training and not train_gumbel:
             if self.rotation_trick:
                 quants_trunc = self._apply_rotation_trick(input, quants_trunc)
             else:
