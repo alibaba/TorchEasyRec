@@ -588,22 +588,6 @@ def train_and_evaluate(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    # Build dataloader
-    train_dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.TRAIN
-    )
-    eval_dataloader = None
-    if pipeline_config.eval_input_path:
-        # pyre-ignore [16]
-        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = create_dataloader(
-            data_config,
-            features,
-            pipeline_config.eval_input_path,
-            mode=Mode.EVAL,
-            gl_cluster=gl_cluster,
-        )
-
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
         keep_checkpoint_max=train_config.keep_checkpoint_max,
@@ -637,12 +621,33 @@ def train_and_evaluate(
                     "--continue_train)"
                 )
 
-    # Restore dataloader checkpoint state
+    # Restore dataloader checkpoint state before building the dataloader:
+    # create_dataloader eagerly starts persistent workers, which keep a
+    # fork-time copy of the dataset, so state set afterwards is invisible
+    # to them.
     dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
-        if dataloader_state:
-            train_dataloader.dataset.load_state_dict(dataloader_state)
+
+    # Build dataloader
+    train_dataloader = create_dataloader(
+        data_config,
+        features,
+        pipeline_config.train_input_path,
+        mode=Mode.TRAIN,
+        checkpoint_state=dataloader_state,
+    )
+    eval_dataloader = None
+    if pipeline_config.eval_input_path:
+        # pyre-ignore [16]
+        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
+        eval_dataloader = create_dataloader(
+            data_config,
+            features,
+            pipeline_config.eval_input_path,
+            mode=Mode.EVAL,
+            gl_cluster=gl_cluster,
+        )
 
     sampler_type = _get_sampler_type(data_config)
 
