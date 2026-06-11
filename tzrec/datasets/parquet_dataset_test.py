@@ -246,9 +246,17 @@ class ParquetDatasetTest(unittest.TestCase):
         feature_cfgs = self._create_feature_cfgs()
         features = create_features(feature_cfgs)
 
+        def _drain(iterator):
+            keys = set()
+            num_rows = 0
+            for batch in iterator:
+                keys |= set(batch.checkpoint_info)
+                num_rows += len(batch.labels["label"])
+            return keys, num_rows
+
         with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            # 20000 rows at max_rows_per_file=5000 -> 4 files, so
-            # data_config.num_workers=2 survives the num_files clamp.
+            # 20000 rows at max_rows_per_file=5000 -> 4 files: rebalanced
+            # multi-worker intervals plus a tail remaining after 4 batches.
             self._create_test_parquet_data(test_dir, num_rows=20000)
             input_path = f"{test_dir}/*.parquet"
             data_config = data_pb2.DataConfig(
@@ -266,19 +274,32 @@ class ParquetDatasetTest(unittest.TestCase):
                 batch1 = next(iterator1)
                 update_dataloder_state(checkpoint_state, batch1.checkpoint_info)
             self.assertGreater(len(checkpoint_state), 0)
+            # baseline rows of a full pass: 4 consumed batches + the rest
+            _, num_remain_rows = _drain(iterator1)
+            num_total_rows = 4 * 128 + num_remain_rows
             del iterator1, dataloader1
 
+            num_consumed_rows = sum(
+                consumed - int(key.rsplit(":", 1)[1]) + 1
+                for key, consumed in checkpoint_state.items()
+            )
             dataloader2 = create_dataloader(
                 data_config, features, input_path, checkpoint_state=checkpoint_state
             )
-            iterator2 = iter(dataloader2)
-            for _ in range(4):
-                batch2 = next(iterator2)
-                for key, new_offset in batch2.checkpoint_info.items():
-                    if key in checkpoint_state:
-                        # without the pre-fork state, workers replay from row 0
-                        self.assertGreater(new_offset, checkpoint_state[key])
-            del iterator2, dataloader2
+            resumed_keys, num_resumed_rows = _drain(iter(dataloader2))
+            # resumed intervals start at consumed+1, never at a saved start;
+            # without the pre-fork state, workers would replay the saved keys
+            self.assertTrue(resumed_keys.isdisjoint(checkpoint_state))
+            for key, consumed in checkpoint_state.items():
+                path = key.rsplit(":", 1)[0]
+                self.assertIn(f"{path}:{consumed + 1}", resumed_keys)
+            self.assertEqual(num_resumed_rows, num_total_rows - num_consumed_rows)
+
+            # state is consumed by the completed pass: a second iter() on the
+            # same (persistent-worker) dataloader reads the full dataset again
+            _, num_second_pass_rows = _drain(iter(dataloader2))
+            self.assertEqual(num_second_pass_rows, num_total_rows)
+            del dataloader2
 
 
 class ParquetReaderTest(unittest.TestCase):
