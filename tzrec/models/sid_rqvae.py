@@ -92,8 +92,16 @@ class SidRqvae(BaseSidModel):
             list(cfg.hidden_dims) if cfg.hidden_dims else [self._input_dim // 2]
         )
         # latent_weight defaults to (1.0, 0.5) when the user leaves the
-        # repeated field empty.
+        # repeated field empty. It must be exactly [w1, w2] (encoder-side and
+        # codebook-side commitment weights); the quantizer unpacks it into two,
+        # so validate here with a field-named error instead of a cryptic
+        # unpack ValueError deep in ResidualVectorQuantizer.
         latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
+        if len(latent_weight) != 2:
+            raise ValueError(
+                "latent_weight must have exactly 2 values [w1, w2], got "
+                f"{list(cfg.latent_weight)}"
+            )
 
         use_sinkhorn = True
         sinkhorn_iters = 5

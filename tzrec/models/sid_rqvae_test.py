@@ -273,6 +273,20 @@ class SidRqvaeTest(unittest.TestCase):
         )
         self.assertTrue(has_grad)
 
+    def test_latent_weight_wrong_length_raises(self) -> None:
+        """latent_weight must be exactly [w1, w2]; a bad length fails fast."""
+        for bad in ([1.0], [1.0, 0.5, 0.25]):
+            cfg = sid_model_pb2.SidRqvae(
+                input_dim=32,
+                embed_dim=8,
+                codebook=[16, 16],
+                kmeans_init=False,
+                latent_weight=bad,
+            )
+            model_config = model_pb2.ModelConfig(sid_rqvae=cfg)
+            with self.assertRaisesRegex(ValueError, "latent_weight"):
+                SidRqvae(model_config=model_config, features=[], labels=[])
+
     def test_clip_mask_uses_flag_not_equality(self) -> None:
         """The is_clip_pair flag, not bit-exact equality, drives routing.
 

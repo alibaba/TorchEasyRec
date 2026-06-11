@@ -67,8 +67,11 @@ message SidRqvae {
     repeated float latent_weight = 11;
     // STE rotation trick.
     optional bool rotation_trick = 12 [default = false];
-    // KMeans codebook initialization on first training forward.
-    optional bool kmeans_init = 13 [default = true];
+    // KMeans codebook initialization on first training forward. Default false:
+    // the FAISS warm-start needs the first batch to have >= max(codebook) rows
+    // (faiss requires N >= K) and, under DDP, a rank-0 fit failure would hang
+    // the other ranks on the centroid broadcast — so it is opt-in.
+    optional bool kmeans_init = 13 [default = false];
 
     // === Optional sub-module configs ===
     // Sinkhorn uniform assignment. Default behavior when this block is

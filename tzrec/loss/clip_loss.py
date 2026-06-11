@@ -19,6 +19,15 @@ import torch.distributed.nn as dist_nn
 from torch.nn import functional as F
 from torch.nn.modules.loss import _Loss
 
+# Finite large-negative fill for masked-out (recon) logit columns. ``exp()`` of
+# it underflows to 0 (same masking effect as ``-inf``), but unlike ``-inf`` it
+# keeps cross-entropy and its gradient finite when a row has no valid column
+# (a batch/rank with zero clip rows). With ``-inf`` such a row yields NaN and,
+# crucially, a NaN gradient (``0 * NaN``) that survives the row mask and poisons
+# the encoder. Finite, so a no-clip batch contributes exactly 0 with 0 gradient.
+# Kept well within fp16 range (-65504) so it is safe under FP16/BF16 autocast.
+_MASKED_LOGIT_FILL = -1e4
+
 
 class MaskedCLIPLoss(_Loss):
     """Masked CLIP loss for mixed recon+clip batches.
@@ -102,10 +111,15 @@ class MaskedCLIPLoss(_Loss):
         """
         ce_i = F.cross_entropy(logits_i, safe_labels, reduction="none")
         ce_t = F.cross_entropy(logits_t, safe_labels, reduction="none")
-        # NaN can occur when all logits are -inf (all-recon edge case)
+        # Backstop only: the finite _MASKED_LOGIT_FILL already keeps the
+        # all-recon row finite, so this guards solely against a non-finite
+        # logit arriving from upstream (e.g. an overflowed logit_scale).
         ce_i = torch.nan_to_num(ce_i, nan=0.0)
         ce_t = torch.nan_to_num(ce_t, nan=0.0)
 
+        # Row mask: only clip rows contribute; clamp(min=1) keeps a no-clip
+        # batch at 0 (not 0/0). Combined with the finite fill, a batch with no
+        # clip rows yields exactly 0 loss and 0 gradient.
         n_valid = clip_mask.float().sum().clamp(min=1)
         return ((ce_i + ce_t) * clip_mask.float()).sum() / (2 * n_valid)
 
@@ -159,16 +173,18 @@ class MaskedCLIPLoss(_Loss):
         logits_img_cl = logit_scale_cl * image_embed @ image_embed_all_ori.t()
         logits_txt_cl = logit_scale_cl * text_embed @ text_embed_all_ori.t()
 
-        # --- Column mask: recon columns -> -inf (not as negatives) ---
+        # --- Column mask: recon columns -> large-negative (not as negatives) ---
+        # Finite fill (not -inf) so an all-recon row keeps a finite, non-NaN
+        # gradient; see _MASKED_LOGIT_FILL.
         clip_mask_all = self._gather_bool_mask(clip_mask)
         col_mask = (~clip_mask_all).unsqueeze(0)  # (1, B_global)
 
-        logits_img_self = logits_img_self.masked_fill(col_mask, float("-inf"))
-        logits_txt_self = logits_txt_self.masked_fill(col_mask, float("-inf"))
-        logits_img_ori = logits_img_ori.masked_fill(col_mask, float("-inf"))
-        logits_txt_ori = logits_txt_ori.masked_fill(col_mask, float("-inf"))
-        logits_img_cl = logits_img_cl.masked_fill(col_mask, float("-inf"))
-        logits_txt_cl = logits_txt_cl.masked_fill(col_mask, float("-inf"))
+        logits_img_self = logits_img_self.masked_fill(col_mask, _MASKED_LOGIT_FILL)
+        logits_txt_self = logits_txt_self.masked_fill(col_mask, _MASKED_LOGIT_FILL)
+        logits_img_ori = logits_img_ori.masked_fill(col_mask, _MASKED_LOGIT_FILL)
+        logits_txt_ori = logits_txt_ori.masked_fill(col_mask, _MASKED_LOGIT_FILL)
+        logits_img_cl = logits_img_cl.masked_fill(col_mask, _MASKED_LOGIT_FILL)
+        logits_txt_cl = logits_txt_cl.masked_fill(col_mask, _MASKED_LOGIT_FILL)
 
         # --- Safe labels: recon rows fallback to first clip column ---
         labels = self.labels

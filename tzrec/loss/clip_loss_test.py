@@ -59,6 +59,19 @@ class MaskedCLIPLossTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["clip_loss"]))
         self.assertAlmostEqual(out["clip_loss"].item(), 0.0, places=6)
 
+    def test_all_recon_mask_finite_gradient(self) -> None:
+        # Regression: with float("-inf") column fill an all-recon batch produced
+        # a NaN gradient (0 * NaN) that survived the row mask. The finite fill
+        # must keep the backward finite (and zero, since no clip row contributes).
+        loss_fn = MaskedCLIPLoss()
+        feats = self._features(6, 8)
+        mask = torch.zeros(6, dtype=torch.bool)
+        loss_fn(feats, mask)["clip_loss"].backward()
+        grad = feats["image_embed"].grad
+        self.assertIsNotNone(grad)
+        self.assertTrue(torch.isfinite(grad).all())
+        self.assertAlmostEqual(grad.abs().sum().item(), 0.0, places=6)
+
     def test_backward_flows_to_embeddings(self) -> None:
         loss_fn = MaskedCLIPLoss()
         feats = self._features(6, 8)
