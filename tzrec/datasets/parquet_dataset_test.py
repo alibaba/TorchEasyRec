@@ -23,6 +23,7 @@ from pyarrow import parquet
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
+from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
@@ -234,6 +235,50 @@ class ParquetDatasetTest(unittest.TestCase):
                 if key in checkpoint_state_acc:
                     # New offset should be less than or equal to acc checkpoint offset
                     self.assertLessEqual(new_offset, checkpoint_state_acc[key])
+
+    def test_create_dataloader_checkpoint_state_reaches_workers(self):
+        """State passed to create_dataloader must reach forked workers.
+
+        create_dataloader eagerly starts persistent workers, so state applied
+        to the returned dataloader's dataset afterwards never reaches them;
+        the checkpoint_state argument applies it before the fork.
+        """
+        feature_cfgs = self._create_feature_cfgs()
+        features = create_features(feature_cfgs)
+
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            # 20000 rows at max_rows_per_file=5000 -> 4 files, so
+            # data_config.num_workers=2 survives the num_files clamp.
+            self._create_test_parquet_data(test_dir, num_rows=20000)
+            input_path = f"{test_dir}/*.parquet"
+            data_config = data_pb2.DataConfig(
+                batch_size=128,
+                dataset_type=data_pb2.DatasetType.ParquetDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+                label_fields=["label"],
+                num_workers=2,
+            )
+
+            dataloader1 = create_dataloader(data_config, features, input_path)
+            iterator1 = iter(dataloader1)
+            checkpoint_state = {}
+            for _ in range(4):
+                batch1 = next(iterator1)
+                update_dataloder_state(checkpoint_state, batch1.checkpoint_info)
+            self.assertGreater(len(checkpoint_state), 0)
+            del iterator1, dataloader1
+
+            dataloader2 = create_dataloader(
+                data_config, features, input_path, checkpoint_state=checkpoint_state
+            )
+            iterator2 = iter(dataloader2)
+            for _ in range(4):
+                batch2 = next(iterator2)
+                for key, new_offset in batch2.checkpoint_info.items():
+                    if key in checkpoint_state:
+                        # without the pre-fork state, workers replay from row 0
+                        self.assertGreater(new_offset, checkpoint_state[key])
+            del iterator2, dataloader2
 
 
 class ParquetReaderTest(unittest.TestCase):
