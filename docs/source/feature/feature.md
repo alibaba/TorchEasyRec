@@ -778,7 +778,7 @@ feature_configs {
     - 在不指定sequence_fields的情况下:
       - 对于只有一个输入字段的特征算子（如: IdFeature，RawFeature，TokenizeFeature等），`input_side != feature`的输入字段默认是序列类型
         - 以上述配置中`item_id`子特征为例，`item:iid`对应的输入样本数据中列名应为`click_seq__iid`
-      - 对于输入字段大于一个的特征算子（如: LookupFeature，ComboFeature等），`input_side != item`的输入字段默认是序列类型
+      - 对于输入字段大于一个的特征算子（如: LookupFeature，ComboFeature等），`input_side == item`的输入字段默认是序列类型，其余输入字段默认不是序列类型
         - 以上述配置中`user_cate_cnt`子特征为例，`item:cate`对应的输入样本数据中列名应为`click_seq__cate`，`user:kv_cate_cnt`对应的输入样本数据中列名应为`kv_cate_cnt`
     - 在指定sequence_fields的情况下：只有指定的字段认为是序列类型
       - 以上述配置中`user_search_cate_cnt`子特征为例，`user:searched_cate`对应的输入样本数据中列名应为`click_seq__searched_cate`，`user:kv_search_cate_cnt`对应的输入样本数据中列名应为`kv_search_cate_cnt`
