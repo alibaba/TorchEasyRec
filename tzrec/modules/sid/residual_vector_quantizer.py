@@ -414,13 +414,19 @@ class ResidualVectorQuantizer(ResidualQuantizer):
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:
         """Get codebook embedding weights for a specific layer.
 
+        Detached: the layer's ``get_codebook_embeddings`` returns the live
+        ``nn.Embedding.weight`` (a grad-requiring leaf, needed by the training
+        ``lookup`` path), but this is a read-only accessor for export/inspection,
+        so it returns a non-grad view — matching the K-Means sibling, whose
+        codebook is a buffer.
+
         Args:
             layer_idx (int): index of the quantization layer.
 
         Returns:
             Tensor: codebook weights, shape (n_embed, embed_dim).
         """
-        return self.layers[layer_idx].get_codebook_embeddings()
+        return self.layers[layer_idx].get_codebook_embeddings().detach()
 
     def _lookup_code(self, layer_idx: int, code_idx: torch.Tensor) -> torch.Tensor:
         """Look up codebook vectors via the layer's embedding table."""
