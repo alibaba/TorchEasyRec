@@ -21,6 +21,7 @@ from unittest import mock
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 
 from tzrec.tests import utils
 from tzrec.utils import config_util
@@ -33,13 +34,9 @@ class SidIntegrationTest(unittest.TestCase):
             os.makedirs("./tmp")
         self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
         os.chmod(self.test_dir, 0o755)
-        # SID is CPU-only + single-process, so hide CUDA and pin nproc=1 (the
-        # GPU CI harness defaults to GPU + nproc=2). Use "-1", not "" — an empty
-        # CUDA_VISIBLE_DEVICES is treated inconsistently and the GPU CI runner
-        # doesn't hide the devices, tripping the CPU-only guard in the child.
-        patcher = mock.patch.dict(
-            os.environ, {"CUDA_VISIBLE_DEVICES": "-1", "TEST_NPROC_PER_NODE": "1"}
-        )
+        # SidRqkmeans is single-process; pin nproc=1 (the CI harness defaults
+        # to 2, which would trip the world_size>1 guard).
+        patcher = mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -73,6 +70,11 @@ class SidIntegrationTest(unittest.TestCase):
         config_util.save_message(config, config_path)
         return config_path
 
+    @unittest.skipIf(
+        torch.cuda.is_available(),
+        "SidRqkmeans is CPU-only; this end-to-end test runs on the CPU CI job. "
+        "Forcing CPU on a CUDA-built (GPU) image is unreliable.",
+    )
     def test_sid_rqkmeans_train_eval(self):
         """End-to-end train -> on_train_end FAISS fit -> checkpoint -> eval.
 
