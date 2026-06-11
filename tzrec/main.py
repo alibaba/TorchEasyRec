@@ -347,7 +347,12 @@ def _train_and_evaluate(
     )
     use_epoch = train_config.num_epochs and train_config.num_epochs > 0
     use_step = train_config.num_steps and train_config.num_steps > 0
-    epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
+    epochs_completed = dataloader_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+    epoch_iter = (
+        range(min(epochs_completed, train_config.num_epochs), train_config.num_epochs)
+        if use_epoch
+        else itertools.count(0, 0)
+    )
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
     save_checkpoints_steps, save_checkpoints_epochs = 0, 0
@@ -480,6 +485,11 @@ def _train_and_evaluate(
                     if not lr.by_epoch:
                         lr.step()
             except StopIteration:
+                # pass completed: later saves should record positions
+                # within the next pass, on top of the completed-pass count.
+                epochs_completed += 1
+                dataloader_state.clear()
+                dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = epochs_completed
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
@@ -588,22 +598,6 @@ def train_and_evaluate(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
-    # Build dataloader
-    train_dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.TRAIN
-    )
-    eval_dataloader = None
-    if pipeline_config.eval_input_path:
-        # pyre-ignore [16]
-        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = create_dataloader(
-            data_config,
-            features,
-            pipeline_config.eval_input_path,
-            mode=Mode.EVAL,
-            gl_cluster=gl_cluster,
-        )
-
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
         keep_checkpoint_max=train_config.keep_checkpoint_max,
@@ -623,12 +617,14 @@ def train_and_evaluate(
                 "fine_tune_checkpoint"
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
+    restore_from_model_dir = False
     if os.path.exists(pipeline_config.model_dir):
-        # Restore dataloader state if continuing training
+        # Find the latest checkpoint in model_dir when continuing training
         latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
         if latest_ckpt_path:
             if continue_train:
                 ckpt_path = latest_ckpt_path
+                restore_from_model_dir = True
             else:
                 raise RuntimeError(
                     f"model_dir[{pipeline_config.model_dir}] already exists "
@@ -637,12 +633,33 @@ def train_and_evaluate(
                     "--continue_train)"
                 )
 
-    # Restore dataloader checkpoint state
+    # Restore dataloader state before create_dataloader starts its workers
     dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
-        if dataloader_state:
-            train_dataloader.dataset.load_state_dict(dataloader_state)
+        if dataloader_state and not restore_from_model_dir:
+            # fine-tune checkpoints do not carry this job's epoch budget
+            dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
+
+    # Build dataloader
+    train_dataloader = create_dataloader(
+        data_config,
+        features,
+        pipeline_config.train_input_path,
+        mode=Mode.TRAIN,
+        checkpoint_state=dataloader_state,
+    )
+    eval_dataloader = None
+    if pipeline_config.eval_input_path:
+        # pyre-ignore [16]
+        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
+        eval_dataloader = create_dataloader(
+            data_config,
+            features,
+            pipeline_config.eval_input_path,
+            mode=Mode.EVAL,
+            gl_cluster=gl_cluster,
+        )
 
     sampler_type = _get_sampler_type(data_config)
 

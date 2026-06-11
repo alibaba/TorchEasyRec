@@ -306,6 +306,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         worker_id, num_workers = self.get_worker_info()
         for input_data in self._reader.to_batches(worker_id, num_workers):
             yield self._build_batch(input_data)
+        # Normal exhaustion = the resumed pass is complete; clear the state so
+        # subsequent epochs do full passes. close()/GeneratorExit skips this
+        # line, so dataloader resets mid-pass still re-seek from the state.
+        self._reader.load_state_dict(None)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
         """Process input data and build batch.
@@ -756,6 +760,7 @@ def create_dataloader(
     mode: Mode = Mode.TRAIN,
     gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
     debug_level: int = 0,
+    checkpoint_state: Optional[Dict[str, Any]] = None,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -768,6 +773,11 @@ def create_dataloader(
         gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
+        checkpoint_state (dict, optional): dataloader checkpoint state for
+            resume. Must be set here rather than on the returned dataloader:
+            the eager ``iter(dataloader)`` below forks persistent workers,
+            which keep a fork-time copy of the dataset, so state applied
+            afterwards never reaches them.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -783,6 +793,8 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
     )
+    if checkpoint_state:
+        dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
     if data_config.num_workers < 1:
