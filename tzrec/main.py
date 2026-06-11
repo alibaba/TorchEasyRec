@@ -347,7 +347,20 @@ def _train_and_evaluate(
     )
     use_epoch = train_config.num_epochs and train_config.num_epochs > 0
     use_step = train_config.num_steps and train_config.num_steps > 0
-    epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
+    epochs_completed = dataloader_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+    if use_epoch and epochs_completed >= train_config.num_epochs:
+        if is_local_rank_zero:
+            logger.warning(
+                f"all {train_config.num_epochs} epochs already completed "
+                "in the restored checkpoint, no epochs left to train."
+            )
+    elif epochs_completed > 0 and is_local_rank_zero:
+        logger.info(f"resume training after {epochs_completed} completed epochs.")
+    epoch_iter = (
+        range(min(epochs_completed, train_config.num_epochs), train_config.num_epochs)
+        if use_epoch
+        else itertools.count(0, 0)
+    )
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
     save_checkpoints_steps, save_checkpoints_epochs = 0, 0
@@ -481,8 +494,10 @@ def _train_and_evaluate(
                         lr.step()
             except StopIteration:
                 # pass completed: later saves should record positions
-                # within the next pass.
+                # within the next pass, on top of the completed-pass count.
+                epochs_completed += 1
                 dataloader_state.clear()
+                dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = epochs_completed
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
@@ -610,12 +625,14 @@ def train_and_evaluate(
                 "fine_tune_checkpoint"
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
+    resume_own_model_dir = False
     if os.path.exists(pipeline_config.model_dir):
         # Find the latest checkpoint in model_dir when continuing training
         latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
         if latest_ckpt_path:
             if continue_train:
                 ckpt_path = latest_ckpt_path
+                resume_own_model_dir = True
             else:
                 raise RuntimeError(
                     f"model_dir[{pipeline_config.model_dir}] already exists "
@@ -631,6 +648,10 @@ def train_and_evaluate(
     dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
+        if dataloader_state and not resume_own_model_dir:
+            # fine-tune checkpoints carry data positions, not this job's
+            # epoch budget.
+            dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
 
     # Build dataloader
     train_dataloader = create_dataloader(

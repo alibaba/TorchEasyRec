@@ -28,7 +28,7 @@ from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, Parque
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import misc_util
-from tzrec.utils.checkpoint_util import update_dataloder_state
+from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
 
 
 class ParquetDatasetTest(unittest.TestCase):
@@ -300,6 +300,19 @@ class ParquetDatasetTest(unittest.TestCase):
             _, num_second_pass_rows = _drain(iter(dataloader2))
             self.assertEqual(num_second_pass_rows, num_total_rows)
             del dataloader2
+
+            # epoch-boundary checkpoints carry only reserved meta keys
+            # (__epochs_completed__ etc.); readers must skip them and read
+            # the full dataset
+            dataloader3 = create_dataloader(
+                data_config,
+                features,
+                input_path,
+                checkpoint_state={EPOCHS_COMPLETED: 1},
+            )
+            _, num_meta_only_rows = _drain(iter(dataloader3))
+            self.assertEqual(num_meta_only_rows, num_total_rows)
+            del dataloader3
 
 
 class ParquetReaderTest(unittest.TestCase):

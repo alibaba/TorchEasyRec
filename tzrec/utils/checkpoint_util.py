@@ -917,6 +917,9 @@ DATALOADER_CKPT_FILENAME = "dataloader_state.json"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
+# reserved dataloader_state key: number of completed data passes; resume
+# continues the epoch budget from here. no ":" so per-source consumers skip it.
+EPOCHS_COMPLETED = "__epochs_completed__"
 
 
 def save_dataloader_state(
