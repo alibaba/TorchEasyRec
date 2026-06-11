@@ -608,7 +608,7 @@ def train_and_evaluate(
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
     if os.path.exists(pipeline_config.model_dir):
-        # Restore dataloader state if continuing training
+        # Find the latest checkpoint in model_dir when continuing training
         latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
         if latest_ckpt_path:
             if continue_train:

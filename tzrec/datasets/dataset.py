@@ -306,6 +306,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         worker_id, num_workers = self.get_worker_info()
         for input_data in self._reader.to_batches(worker_id, num_workers):
             yield self._build_batch(input_data)
+        # Normal exhaustion = the resumed pass is complete; clear the state so
+        # subsequent epochs do full passes. close()/GeneratorExit skips this
+        # line, so dataloader resets mid-pass still re-seek from the state.
+        self._reader.load_state_dict(None)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
         """Process input data and build batch.
@@ -790,7 +794,7 @@ def create_dataloader(
         debug_level=debug_level,
     )
     if checkpoint_state:
-        dataset.load_state_dict(checkpoint_state)
+        dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
     if data_config.num_workers < 1:
