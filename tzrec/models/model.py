@@ -150,6 +150,15 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric_results[metric_name] = metric.compute()
         return metric_results
 
+    def on_train_end(self) -> None:
+        """Hook fired once after the train_eval loop exits.
+
+        Default no-op; override for one-shot end-of-loop work (e.g.
+        :class:`SidRqkmeans` fits its FAISS codebook here). The tail
+        ``final=True`` checkpoint persists whatever it produced.
+        """
+        return
+
     def sparse_parameters(
         self,
     ) -> Tuple[Iterable[nn.Parameter], Iterable[nn.Parameter]]:

@@ -515,6 +515,12 @@ def _train_and_evaluate(
             if lr.by_epoch:
                 lr.step()
 
+    # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
+    # codebook here). SID models run with periodic checkpointing disabled
+    # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
+    # the only checkpoint and persists whatever on_train_end produced.
+    _model.on_train_end()
+
     _log_train(
         i_step,
         losses,
