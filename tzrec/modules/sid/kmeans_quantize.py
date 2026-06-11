@@ -19,15 +19,76 @@ SID models:
 * :class:`ReservoirSampler` — bounded uniform stream sample (Vitter
   Algorithm R) that :class:`~tzrec.models.sid_rqkmeans.SidRqkmeans`
   fills during training to feed the one-shot FAISS fit.
+* :func:`faiss_residual_kmeans` — FAISS residual K-Means used by
+  :class:`~tzrec.modules.sid.residual_vector_quantizer.ResidualVectorQuantizer`
+  to warm-start the RQ-VAE codebook on the first training batch (same FAISS
+  backend as the offline RQ-KMeans fit). Fits on CPU and returns centroids on
+  the input device, so it is safe to call from a GPU-resident RQ-VAE.
 """
 
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 
 from tzrec.modules.sid.quantize_layer import QuantizeLayer
 from tzrec.modules.sid.types import QuantizeOutput
 from tzrec.utils.logging_util import logger
+
+
+@torch.no_grad()
+def faiss_residual_kmeans(
+    samples: torch.Tensor,
+    n_clusters_list: List[int],
+    faiss_kmeans_kwargs: Optional[Dict] = None,
+) -> List[torch.Tensor]:
+    """Residual K-Means warm-start via FAISS, one pass per layer.
+
+    Clusters ``samples`` with FAISS K-Means, subtracts each point's assigned
+    centroid, and repeats on the residual for every layer. Used by
+    :meth:`ResidualVectorQuantizer.init_embed_` to seed the RQ-VAE codebook
+    from the first training batch — the same FAISS backend the offline
+    RQ-KMeans model uses, instead of a separate torch-native Lloyd's loop.
+
+    Device handling (CPU + GPU): the FAISS fit is always CPU (``samples`` is
+    copied to host as fp32 numpy), and the returned centroids are moved back to
+    ``samples.device``. So an RQ-VAE training on GPU gets GPU centroids while
+    the fit itself stays on CPU — no faiss-gpu build required.
+
+    Args:
+        samples (Tensor): data points, shape (N, D).
+        n_clusters_list (List[int]): per-layer cluster counts.
+        faiss_kmeans_kwargs (Dict|None): extra kwargs for ``faiss.Kmeans``
+            (e.g. ``{'niter': 10, 'seed': 123}``).
+
+    Returns:
+        List[Tensor]: per-layer centroids ``[(K0, D), ...]`` on samples.device.
+
+    Raises:
+        ImportError: if ``faiss`` is not installed.
+    """
+    try:
+        import faiss
+    except ImportError as e:
+        raise ImportError(
+            "faiss is required for RQ-VAE kmeans_init. Install via "
+            "`pip install faiss-cpu` or `pip install faiss-gpu`."
+        ) from e
+
+    kwargs = dict(faiss_kmeans_kwargs or {})
+    device = samples.device
+    _, D = samples.shape
+    # Own a contiguous fp32 numpy copy we mutate in place to form residuals.
+    x = samples.detach().cpu().float().numpy().copy()
+
+    res_centers: List[torch.Tensor] = []
+    for n_clusters in n_clusters_list:
+        kmeans = faiss.Kmeans(D, n_clusters, **kwargs)
+        kmeans.train(x)
+        centroids = kmeans.centroids.copy()  # (K, D)
+        res_centers.append(torch.from_numpy(centroids).to(device))
+        _, idx = kmeans.index.search(x, 1)
+        x -= centroids[idx.ravel()]  # residual, in place
+    return res_centers
 
 
 class ReservoirSampler:

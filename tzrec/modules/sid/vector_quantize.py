@@ -18,11 +18,31 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.kmeans import _squared_euclidean_distance
+from tzrec.modules.sid.quantize_layer import QuantizeLayer
 from tzrec.modules.sid.types import (
     QuantizeForwardMode,
     QuantizeOutput,
 )
+
+
+@torch.no_grad()
+def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Squared L2 distance between rows of ``x`` and ``y``.
+
+    Args:
+        x (Tensor): data points, shape (N, D).
+        y (Tensor): centroids, shape (K, D).
+
+    Returns:
+        Tensor: squared distances, shape (N, K).
+
+    Device-agnostic (pure torch); the (N, K) product is small (N is the batch
+    size). Kept branch-free (no data-dependent chunking on ``N``) so the
+    forward stays FX-traceable for torchrec's inference pipeline.
+    """
+    x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
+    y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
+    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
 
 
 def _gumbel_softmax_sample(
@@ -104,11 +124,14 @@ def _sinkhorn(
     return Q.t()  # (B, K)
 
 
-class VectorQuantize(nn.Module):
-    """Single codebook vector quantization layer.
+class VectorQuantize(QuantizeLayer):
+    """Single codebook vector quantization layer (RQ-VAE backend).
 
-    Maps continuous input vectors to the nearest codebook entry and returns
-    the quantized embeddings + codebook indices. The commitment loss is
+    The VQ :class:`~tzrec.modules.sid.quantize_layer.QuantizeLayer`: a
+    gradient-trained ``nn.Embedding`` codebook, the sibling of the K-Means
+    backend's :class:`~tzrec.modules.sid.kmeans_quantize.KMeansQuantizeLayer`.
+    Maps continuous input vectors to a codebook entry and returns the quantized
+    embeddings + codebook indices via :meth:`quantize`. The commitment loss is
     computed at the residual-aggregator level by
     :meth:`ResidualVectorQuantizer._single_commitment_loss` over the cumulative
     quants (matching al_sid's ``RQBottleneck.compute_commitment_loss``);
@@ -141,7 +164,7 @@ class VectorQuantize(nn.Module):
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
     ) -> None:
-        super().__init__()
+        super().__init__(n_embed=n_embed, embed_dim=embed_dim)
         # Sinkhorn + Gumbel-Softmax pick the code by two different rules:
         # `ids` come from the Sinkhorn balanced-assignment argmax, while the
         # Gumbel branch builds `emb` from argmax(-distances + noise) (nearest
@@ -155,8 +178,7 @@ class VectorQuantize(nn.Module):
             "`emb` (nearest code), so the returned id and embedding diverge. "
             "Use STE with Sinkhorn, or Gumbel-Softmax without Sinkhorn."
         )
-        self.embed_dim = embed_dim
-        self.n_embed = n_embed
+        # ``n_embed`` / ``embed_dim`` are owned by the QuantizeLayer base.
         self.forward_mode = forward_mode
         self.distance_type = distance_type
         self.use_sinkhorn = use_sinkhorn
@@ -231,12 +253,8 @@ class VectorQuantize(nn.Module):
 
         return ids, distances
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        temperature: float = 1.0,
-    ) -> QuantizeOutput:
-        """Forward the vector quantization layer.
+    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+        """Assign ``x`` to the codebook (the :class:`QuantizeLayer` interface).
 
         Training flow:
             1. compute distances (L2 or cosine)
@@ -245,7 +263,9 @@ class VectorQuantize(nn.Module):
             3. compute differentiable embedding (STE or Gumbel-Softmax)
 
         Commitment loss is computed by the caller
-        (:meth:`ResidualVectorQuantizer._single_commitment_loss`).
+        (:meth:`ResidualVectorQuantizer._single_commitment_loss`). Device follows
+        ``x`` (and the codebook, which moves with the module), so this runs on
+        CPU or GPU unchanged.
 
         Args:
             x (Tensor): input vectors, shape (B, D).
@@ -275,3 +295,11 @@ class VectorQuantize(nn.Module):
             emb = self.embedding(ids)
 
         return QuantizeOutput(embeddings=emb, ids=ids)
+
+    def forward(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+        """Delegate to :meth:`quantize` so standalone ``vq(x)`` still works."""
+        return self.quantize(x, temperature)
+
+    def get_codebook_embeddings(self) -> torch.Tensor:
+        """Return the codebook table, shape (n_embed, embed_dim)."""
+        return self.embedding.weight

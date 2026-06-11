@@ -15,7 +15,22 @@ import torch
 from parameterized import parameterized
 
 from tzrec.modules.sid.types import QuantizeForwardMode
-from tzrec.modules.sid.vector_quantize import VectorQuantize
+from tzrec.modules.sid.vector_quantize import (
+    VectorQuantize,
+    _squared_euclidean_distance,
+)
+
+
+class SquaredEuclideanDistanceTest(unittest.TestCase):
+    """Tests for the squared-L2 distance helper used by VectorQuantize."""
+
+    def test_squared_euclidean_distance(self) -> None:
+        x = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
+        y = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
+        d = _squared_euclidean_distance(x, y)
+        self.assertEqual(d.shape, (2, 2))
+        # row0: dist to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
+        torch.testing.assert_close(d, torch.tensor([[0.0, 1.0], [1.0, 2.0]]))
 
 
 class VectorQuantizeTest(unittest.TestCase):

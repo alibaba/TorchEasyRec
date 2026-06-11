@@ -16,7 +16,29 @@ import torch
 from tzrec.modules.sid.kmeans_quantize import (
     KMeansQuantizeLayer,
     ReservoirSampler,
+    faiss_residual_kmeans,
 )
+
+
+class FaissResidualKmeansTest(unittest.TestCase):
+    """Tests for the FAISS residual K-Means warm-start helper."""
+
+    def test_faiss_residual_kmeans_per_layer_centers(self) -> None:
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        torch.manual_seed(0)
+        samples = torch.randn(512, 6)
+        centers = faiss_residual_kmeans(
+            samples, [8, 4], {"niter": 5, "verbose": False, "seed": 1}
+        )
+        self.assertEqual(len(centers), 2)
+        self.assertEqual(centers[0].shape, (8, 6))
+        self.assertEqual(centers[1].shape, (4, 6))
+        self.assertTrue(torch.isfinite(centers[0]).all())
+        # Centroids come back on the input device (CPU fit, device-preserving).
+        self.assertEqual(centers[0].device, samples.device)
 
 
 class KMeansQuantizeLayerTest(unittest.TestCase):

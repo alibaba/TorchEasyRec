@@ -18,7 +18,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.kmeans import faiss_residual_kmeans
+from tzrec.modules.sid.kmeans_quantize import faiss_residual_kmeans
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.modules.sid.types import (
     QuantizeForwardMode,
@@ -297,8 +297,12 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             raw_emb (Tensor): raw codebook vectors (with grad), shape (B, D).
         """
         layer = self.layers[layer_idx]
-        out = layer(residual, temperature=temperature)
-        return out.ids, layer.embedding(out.ids)
+        out = layer.quantize(residual, temperature)
+        # ``lookup`` (QuantizeLayer base) returns the raw codebook vector
+        # embedding.weight[ids] — gradient still flows into the codebook; STE is
+        # applied once on the aggregate in :meth:`forward`. The soft STE/Gumbel
+        # ``out.embeddings`` is intentionally not used in the residual walk.
+        return out.ids, layer.lookup(out.ids)
 
     def forward(
         self,
@@ -363,8 +367,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         Returns:
             Tensor: codebook weights, shape (n_embed, embed_dim).
         """
-        return self.layers[layer_idx].embedding.weight.data
+        return self.layers[layer_idx].get_codebook_embeddings()
 
     def _lookup_code(self, layer_idx: int, code_idx: torch.Tensor) -> torch.Tensor:
         """Look up codebook vectors via the layer's embedding table."""
-        return self.layers[layer_idx].embedding(code_idx)
+        return self.layers[layer_idx].lookup(code_idx)
