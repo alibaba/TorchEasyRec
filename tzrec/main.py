@@ -617,14 +617,14 @@ def train_and_evaluate(
                 "fine_tune_checkpoint"
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
-    resume_own_model_dir = False
+    restore_from_model_dir = False
     if os.path.exists(pipeline_config.model_dir):
         # Find the latest checkpoint in model_dir when continuing training
         latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
         if latest_ckpt_path:
             if continue_train:
                 ckpt_path = latest_ckpt_path
-                resume_own_model_dir = True
+                restore_from_model_dir = True
             else:
                 raise RuntimeError(
                     f"model_dir[{pipeline_config.model_dir}] already exists "
@@ -637,7 +637,7 @@ def train_and_evaluate(
     dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
-        if dataloader_state and not resume_own_model_dir:
+        if dataloader_state and not restore_from_model_dir:
             # fine-tune checkpoints do not carry this job's epoch budget
             dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
 
