@@ -348,14 +348,6 @@ def _train_and_evaluate(
     use_epoch = train_config.num_epochs and train_config.num_epochs > 0
     use_step = train_config.num_steps and train_config.num_steps > 0
     epochs_completed = dataloader_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
-    if use_epoch and epochs_completed >= train_config.num_epochs:
-        if is_local_rank_zero:
-            logger.warning(
-                f"all {train_config.num_epochs} epochs already completed "
-                "in the restored checkpoint, no epochs left to train."
-            )
-    elif epochs_completed > 0 and is_local_rank_zero:
-        logger.info(f"resume training after {epochs_completed} completed epochs.")
     epoch_iter = (
         range(min(epochs_completed, train_config.num_epochs), train_config.num_epochs)
         if use_epoch
@@ -641,16 +633,12 @@ def train_and_evaluate(
                     "--continue_train)"
                 )
 
-    # Restore dataloader checkpoint state before building the dataloader:
-    # create_dataloader eagerly starts persistent workers, which keep a
-    # fork-time copy of the dataset, so state set afterwards is invisible
-    # to them.
+    # Restore dataloader state before create_dataloader starts its workers
     dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
         if dataloader_state and not resume_own_model_dir:
-            # fine-tune checkpoints carry data positions, not this job's
-            # epoch budget.
+            # fine-tune checkpoints do not carry this job's epoch budget
             dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
 
     # Build dataloader
