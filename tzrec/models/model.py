@@ -153,11 +153,11 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
     def on_train_end(self) -> None:
         """Hook fired once after the train_eval loop exits.
 
-        Default: no-op. Override in models that need one-shot end-of-loop
-        work — e.g. :class:`SidRqkmeans` uses this hook to fit the FAISS
-        codebook from the embedding sample it collected during training.
+        Default no-op; override for one-shot end-of-loop work (e.g.
+        :class:`SidRqkmeans` fits its FAISS codebook here). The tail
+        ``final=True`` checkpoint persists whatever it produced.
         """
-        pass
+        return
 
     def sparse_parameters(
         self,

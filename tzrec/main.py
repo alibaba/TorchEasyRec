@@ -329,7 +329,7 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
-    dataloader_state: Optional[Dict[str, int]] = None,
+    dataloader_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -355,6 +355,16 @@ def _train_and_evaluate(
         save_checkpoints_epochs = train_config.save_checkpoints_epochs
     else:
         save_checkpoints_steps = train_config.save_checkpoints_steps
+
+    # The CheckpointManager owns the save cadence + dedupe + watermark; the loop
+    # only gathers per-worker event-times and runs eval after a save.
+    ckpt_manager.set_save_policy(
+        save_checkpoints_steps,
+        save_checkpoints_epochs,
+        train_config.save_checkpoints_timestamp_interval,
+        list(train_config.save_checkpoints_timestamps),
+        train_config.save_checkpoints_timestamp_quorum,
+    )
 
     plogger = None
     summary_writer = None
@@ -395,10 +405,27 @@ def _train_and_evaluate(
         )
         prof.start()
 
-    last_ckpt_step = -1
     i_step = 0
     i_epoch = 0
     losses = {}
+
+    def run_eval(step: int, epoch: int) -> None:
+        """Run eval after a checkpoint save, if an eval dataloader is configured."""
+        if eval_dataloader is not None:
+            _evaluate(
+                model,
+                eval_dataloader,
+                eval_config,
+                eval_result_filename=eval_result_filename,
+                global_step=step,
+                eval_summary_writer=eval_summary_writer,
+                global_epoch=epoch,
+                check_all_workers_data_status=check_all_workers_data_status,
+            )
+            model.train()
+
+    # this rank's last consumed event-time, reused by the epoch / final saves
+    data_timestamp = -1.0
     for i_epoch in epoch_iter:
         pipeline = create_train_pipeline(
             model,
@@ -457,41 +484,29 @@ def _train_and_evaluate(
                 i_step -= 1
                 break
 
-            if save_checkpoints_steps > 0 and i_step > 0:
-                if i_step % save_checkpoints_steps == 0:
-                    last_ckpt_step = i_step
-                    ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-                    if eval_dataloader is not None:
-                        _evaluate(
-                            model,
-                            eval_dataloader,
-                            eval_config,
-                            eval_result_filename=eval_result_filename,
-                            global_step=i_step,
-                            eval_summary_writer=eval_summary_writer,
-                            global_epoch=i_epoch,
-                            check_all_workers_data_status=check_all_workers_data_status,
-                        )
-                        model.train()
+            # Single entry point for step / epoch / event-time saves + dedupe;
+            # maybe_save reconciles this rank's event-time across ranks in lockstep.
+            data_timestamp = batch.data_timestamp
+            if ckpt_manager.maybe_save(
+                i_step,
+                model,
+                optimizer,
+                dataloader_state,
+                data_timestamp=data_timestamp,
+            ):
+                run_eval(i_step, i_epoch)
             if train_config.is_profiling:
                 prof.step()
 
-        if save_checkpoints_epochs > 0 and i_step > 0:
-            if (i_epoch + 1) % save_checkpoints_epochs == 0:
-                last_ckpt_step = i_step
-                ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-                if eval_dataloader is not None:
-                    _evaluate(
-                        model,
-                        eval_dataloader,
-                        eval_config,
-                        eval_result_filename=eval_result_filename,
-                        global_step=i_step,
-                        eval_summary_writer=eval_summary_writer,
-                        global_epoch=i_epoch,
-                        check_all_workers_data_status=check_all_workers_data_status,
-                    )
-                    model.train()
+        if ckpt_manager.maybe_save(
+            i_step,
+            model,
+            optimizer,
+            dataloader_state,
+            epoch=i_epoch,
+            data_timestamp=data_timestamp,
+        ):
+            run_eval(i_step, i_epoch)
 
         if use_step and i_step >= train_config.num_steps - 1:
             break
@@ -500,14 +515,11 @@ def _train_and_evaluate(
             if lr.by_epoch:
                 lr.step()
 
-    # One-shot end-of-loop hook (default no-op). Some models do real work
-    # here — e.g. SidRqkmeans fits its FAISS codebook from the embeddings
-    # collected during training. Since that mutates model state, force the
-    # tail-save below to fire so the post-hook state is persisted even when
-    # the last in-loop checkpoint coincided with the final step.
+    # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
+    # codebook here). SID models run with periodic checkpointing disabled
+    # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
+    # the only checkpoint and persists whatever on_train_end produced.
     _model.on_train_end()
-    if last_ckpt_step == i_step:
-        last_ckpt_step = -1
 
     _log_train(
         i_step,
@@ -522,20 +534,15 @@ def _train_and_evaluate(
         summary_writer.close()
     if train_config.is_profiling:
         prof.stop()
-    if last_ckpt_step != i_step:
-        ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-        if eval_dataloader is not None:
-            _evaluate(
-                model,
-                eval_dataloader,
-                eval_config,
-                eval_result_filename=eval_result_filename,
-                global_step=i_step,
-                eval_summary_writer=eval_summary_writer,
-                global_epoch=i_epoch,
-                check_all_workers_data_status=check_all_workers_data_status,
-            )
-            model.train()
+    if ckpt_manager.maybe_save(
+        i_step,
+        model,
+        optimizer,
+        dataloader_state,
+        data_timestamp=data_timestamp,
+        final=True,
+    ):
+        run_eval(i_step, i_epoch)
     ckpt_manager.close()
 
 
@@ -637,7 +644,7 @@ def train_and_evaluate(
                 )
 
     # Restore dataloader checkpoint state
-    dataloader_state: Optional[Dict[str, int]] = None
+    dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
         if dataloader_state:

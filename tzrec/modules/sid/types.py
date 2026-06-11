@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Data types for SID generation: enums and output tuples."""
+"""Data types for SID generation: enums and output tuples shared across quantizers."""
 
 from enum import Enum
 from typing import NamedTuple
@@ -18,7 +18,7 @@ import torch
 
 
 class QuantizeForwardMode(Enum):
-    """Forward mode for vector quantization.
+    """Forward mode for vector quantization (RQ-VAE backend).
 
     Attributes:
         GUMBEL_SOFTMAX: use Gumbel-Softmax reparameterization.
@@ -30,7 +30,7 @@ class QuantizeForwardMode(Enum):
 
 
 class QuantizeOutput(NamedTuple):
-    """Output of a single vector quantization layer.
+    """One quantize layer's output.
 
     Attributes:
         embeddings (Tensor): quantized embeddings, shape (B, D).
@@ -42,7 +42,7 @@ class QuantizeOutput(NamedTuple):
 
 
 class ResidualQuantizerOutput(NamedTuple):
-    """Output of the residual quantization module.
+    """Output of the residual quantization module (RQ-VAE backend).
 
     Attributes:
         cluster_ids (Tensor): codebook indices per layer, shape (B, n_layers).
