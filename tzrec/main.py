@@ -515,6 +515,8 @@ def _train_and_evaluate(
             if lr.by_epoch:
                 lr.step()
 
+    _model.on_train_end()
+
     _log_train(
         i_step,
         losses,
