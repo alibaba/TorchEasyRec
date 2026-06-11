@@ -56,7 +56,7 @@ class VectorQuantizeTest(unittest.TestCase):
         )
         vq.train()
         x = torch.randn(5, 8, requires_grad=True)
-        out = vq(x)
+        out = vq.quantize(x)
         self.assertEqual(out.embeddings.shape, (5, 8))
         self.assertEqual(out.ids.shape, (5,))
         self.assertTrue((out.ids >= 0).all() and (out.ids < 16).all())
@@ -77,7 +77,7 @@ class VectorQuantizeTest(unittest.TestCase):
         vq = VectorQuantize(embed_dim=8, n_embed=16, use_sinkhorn=False)
         vq.train()
         x = torch.randn(5, 8, requires_grad=True)
-        out = vq(x)
+        out = vq.quantize(x)
         out.embeddings.sum().backward()
         # STE routes gradient back through x.
         self.assertIsNotNone(x.grad)
@@ -88,7 +88,7 @@ class VectorQuantizeTest(unittest.TestCase):
         vq = VectorQuantize(embed_dim=4, n_embed=8)
         vq.eval()
         x = torch.randn(3, 4)
-        out = vq(x)
+        out = vq.quantize(x)
         # In eval, emb == embedding(ids) exactly.
         torch.testing.assert_close(out.embeddings, vq.embedding(out.ids))
 

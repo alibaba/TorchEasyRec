@@ -296,10 +296,6 @@ class VectorQuantize(QuantizeLayer):
 
         return QuantizeOutput(embeddings=emb, ids=ids)
 
-    def forward(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
-        """Delegate to :meth:`quantize` so standalone ``vq(x)`` still works."""
-        return self.quantize(x, temperature)
-
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""
         return self.embedding.weight

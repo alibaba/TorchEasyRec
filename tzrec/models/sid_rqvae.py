@@ -338,6 +338,10 @@ class SidRqvae(BaseSidModel):
 
         Overrides the BaseSidModel no-op: RQ-VAE has a train-time
         reconstruction (the decoder output), so it can report a train-path mse.
+        The eval metrics (mse / rel_loss / unique_sid_ratio over
+        ``predictions["x_hat"]`` and ``["codes"]``) are handled by
+        ``BaseSidModel.update_metric`` — SidRqvae emits ``x_hat``, so it needs
+        no ``update_metric`` override.
 
         Args:
             predictions (dict): a dict of predicted result.
@@ -346,7 +350,3 @@ class SidRqvae(BaseSidModel):
         if "x_hat" in predictions:
             embedding = self._extract_feature(batch)
             self._train_metric_modules["mse"].update(predictions["x_hat"], embedding)
-
-    # Eval metrics (mse / rel_loss / unique_sid_ratio over predictions["x_hat"]
-    # and ["codes"]) are handled by BaseSidModel.update_metric — SidRqvae emits
-    # x_hat (the decoder reconstruction) so no override is needed here.

@@ -298,10 +298,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         """
         layer = self.layers[layer_idx]
         out = layer.quantize(residual, temperature)
-        # ``lookup`` (QuantizeLayer base) returns the raw codebook vector
-        # embedding.weight[ids] — gradient still flows into the codebook; STE is
-        # applied once on the aggregate in :meth:`forward`. The soft STE/Gumbel
-        # ``out.embeddings`` is intentionally not used in the residual walk.
+        # Re-look up the raw codebook vector (not the soft STE/Gumbel
+        # ``out.embeddings``); see the docstring for why.
         return out.ids, layer.lookup(out.ids)
 
     def forward(
