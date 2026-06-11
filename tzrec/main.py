@@ -480,6 +480,9 @@ def _train_and_evaluate(
                     if not lr.by_epoch:
                         lr.step()
             except StopIteration:
+                # pass completed: later saves should record positions
+                # within the next pass.
+                dataloader_state.clear()
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
