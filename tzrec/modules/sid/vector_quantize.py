@@ -35,11 +35,8 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     Returns:
         Tensor: squared distances, shape (N, K).
 
-    Device-agnostic (pure torch); the (N, K) product is small (N is the batch
-    size). Kept branch-free (no data-dependent chunking on ``N``) so the
-    forward stays FX-traceable for torchrec's inference pipeline. NOT wrapped in
-    ``no_grad``: the Gumbel-Softmax path needs differentiable distances (the
-    STE/Sinkhorn callers run it under their own ``no_grad``). ``clamp`` is
+    Branch-free (FX-traceable). Not ``no_grad`` (Gumbel needs grad here; the
+    STE/Sinkhorn callers wrap it in their own ``no_grad``); ``clamp`` is
     out-of-place to stay autograd-safe.
     """
     x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
@@ -191,12 +188,10 @@ class VectorQuantize(QuantizeLayer):
         nn.init.kaiming_uniform_(self.embedding.weight)
 
     def _compute_distances(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute distances between input vectors and codebook entries.
+        """Compute L2/cosine distances between inputs and codebook entries.
 
-        Supports L2 and cosine distance metrics. NOT wrapped in ``no_grad``:
-        the Gumbel-Softmax path calls this directly and needs the gradient to
-        flow to the encoder; the STE/Sinkhorn path calls it inside
-        :meth:`_find_nearest_embedding`, which is itself ``no_grad``.
+        Not ``no_grad``: Gumbel calls this directly for the encoder gradient;
+        the STE/Sinkhorn path wraps it via ``no_grad`` :meth:`_find_nearest_embedding`.
 
         Args:
             x (Tensor): input vectors, shape (B, D).
@@ -278,13 +273,9 @@ class VectorQuantize(QuantizeLayer):
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids).
         """
-        # Gumbel-Softmax: distances must be differentiable so the gradient
-        # reaches the encoder through the soft assignment, so they are computed
-        # WITH grad here (the STE/eval branch below assigns under no_grad). The
-        # straight-through hard sample drives BOTH the embedding and ``ids``, so
-        # the saved code matches the codebook vector actually reconstructed
-        # (unlike argmin, which the gumbel noise can disagree with). Sinkhorn is
-        # disabled for this mode (see ResidualVectorQuantizer.__init__).
+        # Gumbel: grad-enabled distances (so the encoder gets gradient); the
+        # hard sample drives both emb and ids, so the saved code matches the
+        # vector used. Sinkhorn is off here (ResidualVectorQuantizer.__init__).
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             logits = -self._compute_distances(x)  # (B, n_embed), differentiable
             weights = _gumbel_softmax_sample(logits, temperature=temperature, hard=True)

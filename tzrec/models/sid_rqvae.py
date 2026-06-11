@@ -91,11 +91,8 @@ class SidRqvae(BaseSidModel):
         hidden_dims = (
             list(cfg.hidden_dims) if cfg.hidden_dims else [self._input_dim // 2]
         )
-        # latent_weight defaults to (1.0, 0.5) when the user leaves the
-        # repeated field empty. It must be exactly [w1, w2] (encoder-side and
-        # codebook-side commitment weights); the quantizer unpacks it into two,
-        # so validate here with a field-named error instead of a cryptic
-        # unpack ValueError deep in ResidualVectorQuantizer.
+        # Empty -> default (1.0, 0.5); else must be exactly [w1, w2] (the
+        # quantizer unpacks two). Validate here for a field-named error.
         latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
         if len(latent_weight) != 2:
             raise ValueError(
@@ -344,12 +341,9 @@ class SidRqvae(BaseSidModel):
     ) -> None:
         """Update train metric state.
 
-        Overrides the BaseSidModel no-op: RQ-VAE has a train-time
-        reconstruction (the decoder output), so it can report a train-path mse.
-        The eval metrics (mse / rel_loss / unique_sid_ratio over
-        ``predictions["x_hat"]`` and ``["codes"]``) are handled by
-        ``BaseSidModel.update_metric`` — SidRqvae emits ``x_hat``, so it needs
-        no ``update_metric`` override.
+        Overrides the BaseSidModel no-op: RQ-VAE has a train-time reconstruction
+        (the decoder output), so it reports a train-path mse. Eval metrics are
+        handled by ``BaseSidModel.update_metric`` (SidRqvae emits ``x_hat``).
 
         Args:
             predictions (dict): a dict of predicted result.
