@@ -13,7 +13,67 @@ import unittest
 
 import torch
 
-from tzrec.modules.sid.residual_vector_quantizer import faiss_residual_kmeans
+from tzrec.modules.sid.residual_vector_quantizer import (
+    ResidualVectorQuantizer,
+    faiss_residual_kmeans,
+)
+
+
+class GumbelResidualVQTest(unittest.TestCase):
+    """Gumbel-Softmax forward_mode: grad reaches encoder + codebook (not STE)."""
+
+    def test_default_gumbel_config_disables_sinkhorn(self) -> None:
+        # use_sinkhorn defaults True; gumbel must auto-disable it (not crash).
+        rvq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=3,
+            n_embed=16,
+            forward_mode="gumbel_softmax",
+            use_sinkhorn=True,
+            kmeans_init=False,
+        )
+        self.assertTrue(all(not layer.use_sinkhorn for layer in rvq.layers))
+
+    def test_gumbel_grad_flows_via_soft_assignment(self) -> None:
+        # The fix: the gradient from the reconstruction path (no commitment
+        # loss) must reach BOTH the encoder input and the codebook through the
+        # soft gumbel embedding. Under the old code it reached neither (the soft
+        # embedding was discarded), so gumbel silently trained like STE.
+        torch.manual_seed(0)
+        rvq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=3,
+            n_embed=16,
+            forward_mode="gumbel_softmax",
+            use_sinkhorn=False,
+            kmeans_init=False,
+        )
+        rvq.train()
+        z = torch.randn(32, 8, requires_grad=True)
+        rvq(z).quantized_embeddings.sum().backward()
+        self.assertIsNotNone(z.grad)
+        self.assertGreater(z.grad.abs().sum().item(), 0.0)
+        cb_grad = rvq.layers[0].embedding.weight.grad
+        self.assertIsNotNone(cb_grad)
+        self.assertGreater(cb_grad.abs().sum().item(), 0.0)
+
+    def test_ste_codebook_grad_is_detached_on_recon_path(self) -> None:
+        # Contrast: STE detaches the aggregate, so the recon path gives the
+        # codebook no gradient (it trains via the commitment loss instead).
+        torch.manual_seed(0)
+        rvq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=2,
+            n_embed=16,
+            forward_mode="ste",
+            use_sinkhorn=False,
+            kmeans_init=False,
+        )
+        rvq.train()
+        z = torch.randn(16, 8, requires_grad=True)
+        rvq(z).quantized_embeddings.sum().backward()
+        cb_grad = rvq.layers[0].embedding.weight.grad
+        self.assertTrue(cb_grad is None or cb_grad.abs().sum().item() == 0.0)
 
 
 class FaissResidualKmeansTest(unittest.TestCase):

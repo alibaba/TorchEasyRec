@@ -161,6 +161,24 @@ class ResidualVectorQuantizer(ResidualQuantizer):
                 f"choose from {list(self._FORWARD_MODE_MAP.keys())}"
             )
         mode_enum = self._FORWARD_MODE_MAP[forward_mode]
+        self._forward_mode = mode_enum
+        is_gumbel = mode_enum == QuantizeForwardMode.GUMBEL_SOFTMAX
+        # Gumbel drives its own assignment, so Sinkhorn is incompatible (and the
+        # two would desync code vs embedding). Auto-disable rather than crash on
+        # the proto default (use_sinkhorn omitted -> True).
+        if is_gumbel and use_sinkhorn:
+            logger.warning(
+                "forward_mode=gumbel_softmax is incompatible with Sinkhorn; "
+                "disabling use_sinkhorn for this quantizer."
+            )
+            use_sinkhorn = False
+        # The aggregate STE (and its rotation-trick variant) is the STE encoder
+        # gradient path; Gumbel carries its own, so the rotation trick is unused.
+        if is_gumbel and rotation_trick:
+            logger.warning(
+                "rotation_trick has no effect with forward_mode=gumbel_softmax "
+                "(the aggregate STE is skipped); ignoring it."
+            )
 
         if isinstance(distance_type, str):
             distance_types = [distance_type] * n_layers
@@ -353,8 +371,12 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         """
         layer = self.layers[layer_idx]
         out = layer.quantize(residual, temperature)
-        # Re-look up the raw codebook vector (not the soft STE/Gumbel
-        # ``out.embeddings``); see the docstring for why.
+        if self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX and self.training:
+            # Gumbel: the soft differentiable embedding carries gradient to both
+            # the encoder and the codebook, so use it directly (no aggregate STE).
+            return out.ids, out.embeddings
+        # STE / eval: re-look up the raw codebook vector (not the soft
+        # ``out.embeddings``); STE is applied once on the aggregate in forward.
         return out.ids, layer.lookup(out.ids)
 
     def forward(
@@ -364,13 +386,20 @@ class ResidualVectorQuantizer(ResidualQuantizer):
     ) -> ResidualQuantizerOutput:
         """Forward the multi-layer residual quantization.
 
-        Training flow:
-            1. If kmeans_init and not initialized -> init_embed_(input)
-            2. Shared residual walk (:meth:`_residual_pass`) over the detached
-               input: per-layer assign + grad-carrying accumulation.
-            3. Mean of per-layer commitment losses over the cumulative quants
-               (cos/l2 with latent_weight).
-            4. STE gradient pass-through (or rotation trick).
+        Two encoder-gradient regimes by ``forward_mode``:
+
+        - STE: the residual walk runs on the DETACHED input (the assignment is
+          non-differentiable), and the encoder gradient is re-attached once via
+          the aggregate STE in step 4. The codebook trains via the commitment
+          loss (the accumulated raw lookups keep grad).
+        - Gumbel-Softmax: the soft assignment is itself differentiable, so the
+          walk runs on the LIVE input and the gradient reaches the encoder and
+          codebook through the accumulated soft embeddings; the aggregate STE is
+          skipped.
+
+        Steps: (1) kmeans_init on the first training forward; (2) residual walk;
+        (3) mean per-layer commitment loss over the cumulative quants;
+        (4) aggregate STE (STE mode only).
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
@@ -384,11 +413,15 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if self.training:
             self.init_embed_(input)
 
-        # Step 2: shared residual walk on the detached input (encoder grad
-        # flows only via the STE in step 4; the accumulated quants keep grad
-        # so the codebook still trains). cumulative[i] = sum after layer i.
+        is_gumbel = self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
+        train_gumbel = is_gumbel and self.training
+
+        # Step 2: residual walk. Gumbel keeps the live input (its soft
+        # assignment carries encoder grad); STE detaches and re-attaches grad in
+        # step 4. cumulative[i] = sum after layer i.
+        walk_input = input if train_gumbel else input.detach()
         cluster_ids, aggregated_quants, cumulative = self._residual_pass(
-            input.detach(), temperature
+            walk_input, temperature
         )
 
         # Step 3: aggregate per-layer commitment loss
@@ -396,9 +429,9 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             torch.stack([self._single_commitment_loss(input, c) for c in cumulative])
         )
 
-        # Step 4: STE or rotation trick (quants_trunc = final accumulated)
+        # Step 4: aggregate STE (STE mode only; Gumbel already carries grad).
         quants_trunc = aggregated_quants
-        if self.training:
+        if self.training and not is_gumbel:
             if self.rotation_trick:
                 quants_trunc = self._apply_rotation_trick(input, quants_trunc)
             else:

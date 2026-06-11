@@ -25,7 +25,6 @@ from tzrec.modules.sid.types import (
 )
 
 
-@torch.no_grad()
 def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Squared L2 distance between rows of ``x`` and ``y``.
 
@@ -38,11 +37,14 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
 
     Device-agnostic (pure torch); the (N, K) product is small (N is the batch
     size). Kept branch-free (no data-dependent chunking on ``N``) so the
-    forward stays FX-traceable for torchrec's inference pipeline.
+    forward stays FX-traceable for torchrec's inference pipeline. NOT wrapped in
+    ``no_grad``: the Gumbel-Softmax path needs differentiable distances (the
+    STE/Sinkhorn callers run it under their own ``no_grad``). ``clamp`` is
+    out-of-place to stay autograd-safe.
     """
     x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
     y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
-    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp_(min=0.0)
+    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
 
 
 def _gumbel_softmax_sample(
@@ -188,11 +190,13 @@ class VectorQuantize(QuantizeLayer):
         self.embedding = nn.Embedding(n_embed, embed_dim)
         nn.init.kaiming_uniform_(self.embedding.weight)
 
-    @torch.no_grad()
     def _compute_distances(self, x: torch.Tensor) -> torch.Tensor:
         """Compute distances between input vectors and codebook entries.
 
-        Supports L2 and cosine distance metrics.
+        Supports L2 and cosine distance metrics. NOT wrapped in ``no_grad``:
+        the Gumbel-Softmax path calls this directly and needs the gradient to
+        flow to the encoder; the STE/Sinkhorn path calls it inside
+        :meth:`_find_nearest_embedding`, which is itself ``no_grad``.
 
         Args:
             x (Tensor): input vectors, shape (B, D).
@@ -274,18 +278,23 @@ class VectorQuantize(QuantizeLayer):
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids).
         """
-        # Step 1-2: find nearest codebook entry
-        ids, distances = self._find_nearest_embedding(x)
-
-        # Step 3: differentiable embedding. Gumbel takes a separate path
-        # that combines all codebook entries; STE goes through a single
-        # embedding lookup.
+        # Gumbel-Softmax: distances must be differentiable so the gradient
+        # reaches the encoder through the soft assignment, so they are computed
+        # WITH grad here (the STE/eval branch below assigns under no_grad). The
+        # straight-through hard sample drives BOTH the embedding and ``ids``, so
+        # the saved code matches the codebook vector actually reconstructed
+        # (unlike argmin, which the gumbel noise can disagree with). Sinkhorn is
+        # disabled for this mode (see ResidualVectorQuantizer.__init__).
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-            weights = _gumbel_softmax_sample(
-                -distances, temperature=temperature, hard=True
-            )
+            logits = -self._compute_distances(x)  # (B, n_embed), differentiable
+            weights = _gumbel_softmax_sample(logits, temperature=temperature, hard=True)
             emb = weights @ self.embedding.weight
-        elif self.training and self.forward_mode == QuantizeForwardMode.STE:
+            ids = weights.argmax(dim=-1)
+            return QuantizeOutput(embeddings=emb, ids=ids)
+
+        # STE / eval: nearest-neighbour assignment under no_grad.
+        ids, _ = self._find_nearest_embedding(x)
+        if self.training and self.forward_mode == QuantizeForwardMode.STE:
             quantized = self.embedding(ids)
             # Straight-Through Estimator: gradient passes through
             emb = x + (quantized - x).detach()

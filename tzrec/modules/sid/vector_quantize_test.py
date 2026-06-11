@@ -92,6 +92,38 @@ class VectorQuantizeTest(unittest.TestCase):
         # In eval, emb == embedding(ids) exactly.
         torch.testing.assert_close(out.embeddings, vq.embedding(out.ids))
 
+    def test_gumbel_train_ids_match_embedding(self) -> None:
+        # In gumbel training the saved code must index the codebook vector
+        # actually used (the hard sample), so emb forward == embedding(ids).
+        # (Under the old code ids came from argmin and could disagree with the
+        # gumbel-sampled embedding.)
+        torch.manual_seed(0)
+        vq = VectorQuantize(
+            embed_dim=8,
+            n_embed=16,
+            forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
+            use_sinkhorn=False,
+        )
+        vq.train()
+        out = vq.quantize(torch.randn(5, 8))
+        torch.testing.assert_close(out.embeddings, vq.embedding(out.ids))
+
+    def test_gumbel_train_distances_are_differentiable(self) -> None:
+        # Gumbel needs the assignment differentiable: grad must reach the input.
+        torch.manual_seed(0)
+        vq = VectorQuantize(
+            embed_dim=8,
+            n_embed=16,
+            forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
+            use_sinkhorn=False,
+        )
+        vq.train()
+        x = torch.randn(5, 8, requires_grad=True)
+        vq.quantize(x).embeddings.sum().backward()
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+        self.assertGreater(x.grad.abs().sum().item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
