@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import shutil
+import tempfile
 import threading
 import weakref
 from dataclasses import replace
@@ -43,6 +44,23 @@ from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
+# Substring substitutions used to fall back from INPUT_TILE=3 user-side state
+# keys to their non-user training-checkpoint counterparts. Mirrors
+# `tzrec/acc/utils.py:write_mapping_file_for_input_tile`. Applied at load time
+# so callers like `export_distributed_embedding` and `export_rtp_model` do not
+# need to pre-generate a mapping file.
+_INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
+    (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
+    (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
+    (
+        ".mc_ebc_user._managed_collision_collection.",
+        ".mc_ebc._managed_collision_collection.",
+    ),
+    (".ec_list_user.", ".ec_list."),
+    (".mc_ec_list_user.", ".mc_ec_list."),
+    (".ec_dict_user.", ".ec_dict."),
+    (".mc_ec_dict_user.", ".mc_ec_dict."),
+)
 # queue token meaning "run a prune pass"; ``None`` means "stop the worker".
 _PRUNE_REQUEST = object()
 
@@ -123,6 +141,26 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                         f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
                         "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
                     )
+
+            # INPUT_TILE=3 export adds user-side twin modules (`ebc_user`,
+            # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) whose
+            # state_dict keys do not exist in the training checkpoint
+            # (training never sets INPUT_TILE). Fall back to the non-user
+            # counterpart that does exist. Equivalent to the explicit
+            # `emb_ckpt_mapping.txt` generated in `export_model_normal`,
+            # but works without the call site pre-computing a mapping.
+            if meta_fqn not in self.metadata.state_dict_metadata:
+                for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
+                    if new_pat not in meta_fqn:
+                        continue
+                    candidate = meta_fqn.replace(new_pat, old_pat)
+                    if candidate in self.metadata.state_dict_metadata:
+                        logger.info(
+                            f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]"
+                        )
+                        meta_fqn = candidate
+                        fqn_remap_set.add(fqn)
+                        break
 
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
@@ -777,6 +815,50 @@ def _redistribute_mch_state(model: nn.Module) -> None:
             m._buffers[name].copy_(new_meta)
 
 
+# Module-name segments that get a `_user` twin when INPUT_TILE=3 export
+# duplicates the embedding group into item/user halves. See
+# tzrec/modules/embedding.py:EmbeddingGroupImpl /
+# SequenceEmbeddingGroupImpl for the construction.
+_INPUT_TILE_USER_SEGMENTS = frozenset({"ebc", "mc_ebc", "ec_dict", "mc_ec_dict"})
+
+
+def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) -> str:
+    """Create a local symlink view for INPUT_TILE=3 dynamicemb loading.
+
+    The training checkpoint has non-user module paths, while INPUT_TILE=3
+    export adds user-side twins. Build aliases in a temporary local directory
+    instead of mutating the checkpoint directory.
+    """
+    entries = []
+    for entry in os.listdir(dynamicemb_path):
+        full_path = os.path.join(dynamicemb_path, entry)
+        if not os.path.isdir(full_path):
+            continue
+        entries.append((entry, full_path))
+        link_path = os.path.join(view_path, entry)
+        if not os.path.lexists(link_path):
+            os.symlink(full_path, link_path, target_is_directory=True)
+
+    for entry, full_path in entries:
+        segs = entry.split(".")
+        if any(seg.endswith("_user") for seg in segs):
+            continue
+        for i, seg in enumerate(segs):
+            if seg not in _INPUT_TILE_USER_SEGMENTS:
+                continue
+            user_segs = list(segs)
+            user_segs[i] = f"{seg}_user"
+            user_entry = ".".join(user_segs)
+            user_path = os.path.join(view_path, user_entry)
+            if os.path.lexists(user_path):
+                continue
+            os.symlink(full_path, user_path, target_is_directory=True)
+            logger.info(
+                f"created INPUT_TILE=3 dynamicemb alias {user_entry} -> {entry}"
+            )
+    return view_path
+
+
 def restore_model(
     checkpoint_dir: str,
     model: nn.Module,
@@ -855,16 +937,36 @@ def restore_model(
 
         dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
         if os.path.exists(dynamicemb_path):
+            # Training never sets INPUT_TILE, but exporting with
+            # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
+            # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) that
+            # share dynamic-embedding tables with their non-user counterparts.
+            # Build a local symlink view instead of mutating the checkpoint
+            # directory, which may be read-only or remote-mounted.
+            input_tile = os.environ.get("INPUT_TILE", "")
+            dynamicemb_load_path = dynamicemb_path
+            dynamicemb_view = None
+            if input_tile.startswith("3"):
+                dynamicemb_view = tempfile.TemporaryDirectory(
+                    prefix=f"tzrec_dynamicemb_rank{os.environ.get('RANK', '0')}_"
+                )
+                dynamicemb_load_path = _make_dynamicemb_input_tile_user_view(
+                    dynamicemb_path, dynamicemb_view.name
+                )
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding..."
             )
-            DynamicEmbLoad(
-                dynamicemb_path,
-                model,
-                table_names=meta.get("dynamicemb_load_table_names", None),
-                optim=meta.get("dynamicemb_load_optim", optimizer is not None),
-                counter=True,
-            )
+            try:
+                DynamicEmbLoad(
+                    dynamicemb_load_path,
+                    model,
+                    table_names=meta.get("dynamicemb_load_table_names", None),
+                    optim=meta.get("dynamicemb_load_optim", optimizer is not None),
+                    counter=True,
+                )
+            finally:
+                if dynamicemb_view is not None:
+                    dynamicemb_view.cleanup()
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
             )

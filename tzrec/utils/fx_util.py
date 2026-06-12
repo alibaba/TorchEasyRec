@@ -12,7 +12,7 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from torchrec import KeyedTensor
+from torchrec import JaggedTensor, KeyedTensor
 from torchrec.fx import symbolic_trace as _symbolic_trace
 
 
@@ -83,11 +83,13 @@ def fx_numel(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
-def fx_mark_keyed_tensor(name: str, x: KeyedTensor) -> None:
+def fx_mark_keyed_tensor(name: str, x: KeyedTensor, is_dense: bool = False) -> None:
     """Mark a KeyedTensor in fx.graph.
 
     Used in EmbeddingGroup for split sparse part model when export.
     KeyedTensor.values() will be sparse part output and dense part input.
+    If ``is_dense`` is true, split exporters keep the node in the dense graph
+    instead of treating it as sparse-model output.
     """
     return
 
@@ -123,4 +125,10 @@ def fx_mark_seq_tensor(
 @torch.fx.wrap
 def fx_mark_seq_len(seq_name: str, x: torch.Tensor) -> None:
     """Mark a sequence length Tensor in fx.graph."""
+    return
+
+
+@torch.fx.wrap
+def fx_mark_seq_ec_jt(seq_name: str, x: JaggedTensor) -> None:
+    """Mark a sequence embedding collection output."""
     return

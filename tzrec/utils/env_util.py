@@ -32,6 +32,11 @@ def use_rtp() -> bool:
     return flag
 
 
+def use_distributed_embedding() -> bool:
+    """Export model for distributed embedding mode of EAS processor."""
+    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
+
+
 def enable_tma() -> bool:
     """Enable TMA (Tensor Memory Accelerator) for triton ops."""
     flag = os.environ.get("ENABLE_TMA", "0") == "1"
