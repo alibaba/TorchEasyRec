@@ -283,14 +283,13 @@ class VectorQuantize(QuantizeLayer):
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
-        # STE / eval: nearest-neighbour assignment under no_grad.
+        # STE / eval: nearest-neighbour assignment under no_grad. (Gumbel
+        # early-returned above; STE is the only remaining training mode.)
         ids, _ = self._find_nearest_embedding(x)
-        if self.training and self.forward_mode == QuantizeForwardMode.STE:
+        if self.training:
+            # Straight-Through Estimator: gradient passes through.
             quantized = self.embedding(ids)
-            # Straight-Through Estimator: gradient passes through
             emb = x + (quantized - x).detach()
-        elif self.training:
-            raise ValueError(f"Unsupported forward mode: {self.forward_mode}")
         else:
             emb = self.embedding(ids)
 

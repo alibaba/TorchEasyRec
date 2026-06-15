@@ -19,11 +19,6 @@ import torch.distributed.nn as dist_nn
 from torch.nn import functional as F
 from torch.nn.modules.loss import _Loss
 
-# Fill for masked-out (recon) logit columns. exp() underflows to 0 like -inf,
-# but stays finite so an all-recon row gives finite CE/grad (not 0*NaN). Within
-# fp16 range, so safe under autocast.
-_MASKED_LOGIT_FILL = -1e4
-
 
 class MaskedCLIPLoss(_Loss):
     """Masked CLIP loss for mixed recon+clip batches.
@@ -165,16 +160,20 @@ class MaskedCLIPLoss(_Loss):
         logits_img_cl = logit_scale_cl * image_embed @ image_embed_all_ori.t()
         logits_txt_cl = logit_scale_cl * text_embed @ text_embed_all_ori.t()
 
-        # Mask recon columns out of the negatives (finite fill, see above).
+        # Mask recon columns out of the negatives. Fill with the dtype's most
+        # negative finite value: provably below any real logit (so it masks like
+        # -inf regardless of logit_scale), but finite so an all-recon row gives
+        # a finite CE/grad instead of 0*NaN.
         clip_mask_all = self._gather_bool_mask(clip_mask)
         col_mask = (~clip_mask_all).unsqueeze(0)  # (1, B_global)
+        neg_fill = torch.finfo(logits_img_self.dtype).min
 
-        logits_img_self = logits_img_self.masked_fill(col_mask, _MASKED_LOGIT_FILL)
-        logits_txt_self = logits_txt_self.masked_fill(col_mask, _MASKED_LOGIT_FILL)
-        logits_img_ori = logits_img_ori.masked_fill(col_mask, _MASKED_LOGIT_FILL)
-        logits_txt_ori = logits_txt_ori.masked_fill(col_mask, _MASKED_LOGIT_FILL)
-        logits_img_cl = logits_img_cl.masked_fill(col_mask, _MASKED_LOGIT_FILL)
-        logits_txt_cl = logits_txt_cl.masked_fill(col_mask, _MASKED_LOGIT_FILL)
+        logits_img_self = logits_img_self.masked_fill(col_mask, neg_fill)
+        logits_txt_self = logits_txt_self.masked_fill(col_mask, neg_fill)
+        logits_img_ori = logits_img_ori.masked_fill(col_mask, neg_fill)
+        logits_txt_ori = logits_txt_ori.masked_fill(col_mask, neg_fill)
+        logits_img_cl = logits_img_cl.masked_fill(col_mask, neg_fill)
+        logits_txt_cl = logits_txt_cl.masked_fill(col_mask, neg_fill)
 
         # --- Safe labels: recon rows fallback to first clip column ---
         labels = self.labels
