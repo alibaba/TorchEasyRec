@@ -46,13 +46,13 @@ def _sinkhorn(
     cost: torch.Tensor,
     n_iters: int = 5,
     epsilon: float = 10.0,
-    is_distributed: bool = True,
 ) -> torch.Tensor:
     """Sinkhorn-Knopp algorithm for optimal-transport based uniform assignment.
 
     Transforms a distance matrix into a soft assignment matrix via exponential
     kernel and alternating row-column normalization, approximating a doubly
-    stochastic matrix to ensure uniform codebook utilization.
+    stochastic matrix to ensure uniform codebook utilization. Row sums are
+    all-reduced across ranks when a process group is initialized.
 
     Args:
         cost (Tensor): distance matrix, shape (B, K) where K is codebook size.
@@ -61,8 +61,6 @@ def _sinkhorn(
         n_iters (int): number of Sinkhorn iterations. Default: 5.
         epsilon (float): sharpness parameter for exp(-cost * epsilon).
             Larger values produce sharper assignments. Default: 10.0.
-        is_distributed (bool): whether running in distributed mode.
-            If True, row sums are all_reduced across GPUs. Default: True.
 
     Returns:
         Tensor: assignment matrix, shape (B, K).
@@ -72,7 +70,7 @@ def _sinkhorn(
     Q = torch.exp(-cost * epsilon).t()
 
     # Global batch size for distributed training
-    if is_distributed and dist.is_initialized():
+    if dist.is_initialized():
         B = Q.size(1) * dist.get_world_size()
     else:
         B = Q.size(1)
@@ -80,7 +78,7 @@ def _sinkhorn(
 
     # Step 2: global normalization — make matrix sum to 1
     sum_Q = torch.sum(Q)
-    if is_distributed and dist.is_initialized():
+    if dist.is_initialized():
         dist.all_reduce(sum_Q)
     Q /= sum_Q + 1e-8
 
@@ -88,7 +86,7 @@ def _sinkhorn(
     for _ in range(n_iters):
         # Row normalization: each prototype's total weight = 1/K
         sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
-        if is_distributed and dist.is_initialized():
+        if dist.is_initialized():
             dist.all_reduce(sum_of_rows)
         Q /= sum_of_rows + 1e-8
         Q /= K
@@ -211,7 +209,6 @@ class VectorQuantize(QuantizeLayer):
                 distances,
                 n_iters=self.sinkhorn_iters,
                 epsilon=self.sinkhorn_epsilon,
-                is_distributed=dist.is_initialized(),
             )
             ids = Q.argmax(dim=-1)
         else:
