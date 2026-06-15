@@ -321,11 +321,8 @@ class SidRqvae(BaseSidModel):
         """Initialize metric modules (shared eval metrics + train-path mse)."""
         super().init_metric()
 
-        # Loss values are already logged by the framework via loss(); only
-        # quantization quality needs the train-path metric. unique_sid_ratio
-        # is intentionally eval-only: torch.unique(codes, dim=0).shape[0]
-        # forces a GPU->host sync every step, and codebook coverage is a
-        # diagnostic, not a training signal.
+        # Only the train-path reconstruction needs a metric here; unique_sid_ratio
+        # is eval-only (its torch.unique forces a per-step GPU->host sync).
         self._train_metric_modules["mse"] = torchmetrics.MeanSquaredError()
 
     def update_train_metric(

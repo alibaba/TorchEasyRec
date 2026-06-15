@@ -36,14 +36,11 @@ def faiss_residual_kmeans(
 ) -> List[torch.Tensor]:
     """Residual K-Means warm-start via FAISS, one pass per layer.
 
-    Clusters ``samples`` with FAISS K-Means, subtracts each point's assigned
-    centroid, and repeats on the residual for every layer. Used by
-    :meth:`ResidualVectorQuantizer.init_embed_` to seed the RQ-VAE codebook
-    from the first training batch — the same FAISS backend the offline
-    RQ-KMeans model uses, instead of a separate torch-native Lloyd's loop.
-
-    CPU+GPU: the fit is always CPU (host fp32 numpy copy); centroids are
-    returned on ``samples.device`` — no faiss-gpu build needed.
+    Clusters ``samples``, subtracts each point's assigned centroid, and repeats
+    on the residual per layer. Seeds the RQ-VAE codebook (via
+    :meth:`ResidualVectorQuantizer.init_embed_`) from the first training batch.
+    The fit is always CPU (host fp32 numpy copy); centroids return on
+    ``samples.device`` — no faiss-gpu build needed.
 
     Args:
         samples (Tensor): data points, shape (N, D).
@@ -217,13 +214,10 @@ class ResidualVectorQuantizer(ResidualQuantizer):
     def init_embed_(self, data: torch.Tensor) -> None:
         """Initialize codebook weights via FAISS residual K-Means.
 
-        Only executed once when kmeans_init=True and not yet initialized.
-        Uses the first batch of training data as the initialization pool.
-
-        Under DDP the codebook is fit on rank 0 only and broadcast, so every
-        rank starts from the SAME codebook. (Averaging per-rank centroids —
-        the previous behavior — mixes permutation-misaligned clusters across
-        ranks and yields a near-random warm start.)
+        Runs once (kmeans_init=True, not yet initialized), seeding from the first
+        training batch. Under DDP the fit happens on rank 0 and is broadcast, so
+        every rank starts from the same codebook (averaging per-rank centroids
+        would mix permutation-misaligned clusters into a near-random start).
 
         Args:
             data (Tensor): input data, shape (B, D).
@@ -364,8 +358,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         layer = self.layers[layer_idx]
         out = layer.quantize(residual, temperature)
         if self._train_gumbel():
-            # Gumbel: soft embedding carries grad to encoder + codebook.
-            return out.ids, out.embeddings
+            return out.ids, out.embeddings  # soft embedding carries grad
         # STE / eval: raw codebook vector; STE applied on the aggregate in forward.
         return out.ids, layer.lookup(out.ids)
 
@@ -376,16 +369,10 @@ class ResidualVectorQuantizer(ResidualQuantizer):
     ) -> ResidualQuantizerOutput:
         """Forward the multi-layer residual quantization.
 
-        Encoder gradient by ``forward_mode``:
-
-        - STE: walk the DETACHED input, re-attach encoder grad via the aggregate
-          STE (step 4); the codebook trains via the commitment loss.
-        - Gumbel: the soft assignment is differentiable, so walk the LIVE input
-          (grad reaches encoder + codebook through the soft embeddings) and skip
-          the aggregate STE.
-
-        Steps: (1) kmeans_init (first training forward); (2) residual walk;
-        (3) mean per-layer commitment loss; (4) aggregate STE (STE only).
+        Encoder gradient by ``forward_mode``: STE walks the DETACHED input and
+        re-attaches grad via the aggregate STE below (codebook trains via the
+        commitment loss); Gumbel's soft assignment is differentiable, so it walks
+        the LIVE input and skips the aggregate STE.
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
@@ -395,25 +382,22 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
                 quantization_loss).
         """
-        # Step 1: KMeans init (first training forward only)
         if self.training:
-            self.init_embed_(input)
+            self.init_embed_(input)  # first training forward only
 
         train_gumbel = self._train_gumbel()
 
-        # Step 2: residual walk. Gumbel walks the live input; STE detaches and
-        # re-attaches grad in step 4. cumulative[i] = sum after layer i.
+        # cumulative[i] = sum after layer i.
         walk_input = input if train_gumbel else input.detach()
         cluster_ids, aggregated_quants, cumulative = self._residual_pass(
             walk_input, temperature
         )
 
-        # Step 3: mean per-layer commitment loss
         commitment_loss = torch.mean(
             torch.stack([self._single_commitment_loss(input, c) for c in cumulative])
         )
 
-        # Step 4: aggregate STE (STE only; Gumbel already carries grad)
+        # Aggregate STE (STE only; Gumbel already carries grad).
         quants_trunc = aggregated_quants
         if self.training and not train_gumbel:
             if self.rotation_trick:

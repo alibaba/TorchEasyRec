@@ -35,9 +35,8 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     Returns:
         Tensor: squared distances, shape (N, K).
 
-    Branch-free (FX-traceable). Not ``no_grad`` (Gumbel needs grad here; the
-    STE/Sinkhorn callers wrap it in their own ``no_grad``); ``clamp`` is
-    out-of-place to stay autograd-safe.
+    Grad-enabled and branch-free (Gumbel needs grad; STE/Sinkhorn callers add
+    their own ``no_grad``).
     """
     x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
     y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
@@ -126,18 +125,11 @@ def _sinkhorn(
 class VectorQuantize(QuantizeLayer):
     """Single codebook vector quantization layer (RQ-VAE backend).
 
-    The VQ :class:`~tzrec.modules.sid.quantize_layer.QuantizeLayer`: a
-    gradient-trained ``nn.Embedding`` codebook, the sibling of the K-Means
-    backend's :class:`~tzrec.modules.sid.kmeans_quantize.KMeansQuantizeLayer`.
-    Maps continuous input vectors to a codebook entry and returns the quantized
-    embeddings + codebook indices via :meth:`quantize`. The commitment loss is
-    computed at the residual-aggregator level by
-    :meth:`ResidualVectorQuantizer._single_commitment_loss` over the cumulative
-    quants (matching al_sid's ``RQBottleneck.compute_commitment_loss``);
-    this layer is intentionally loss-free.
-
-    During training, Sinkhorn optimal-transport assignment is optionally
-    used to encourage uniform codebook utilization.
+    A gradient-trained ``nn.Embedding`` codebook (the VQ ``QuantizeLayer``),
+    sibling of the K-Means backend's ``KMeansQuantizeLayer``. Maps inputs to a
+    codebook entry via :meth:`quantize`. Loss-free: the commitment loss lives in
+    :meth:`ResidualVectorQuantizer._single_commitment_loss`. Sinkhorn
+    optimal-transport assignment optionally balances codebook usage in training.
 
     Args:
         embed_dim (int): dimension of each codebook embedding.
@@ -164,12 +156,9 @@ class VectorQuantize(QuantizeLayer):
         sinkhorn_epsilon: float = 10.0,
     ) -> None:
         super().__init__(n_embed=n_embed, embed_dim=embed_dim)
-        # Sinkhorn + Gumbel-Softmax pick the code by two different rules:
-        # `ids` come from the Sinkhorn balanced-assignment argmax, while the
-        # Gumbel branch builds `emb` from argmax(-distances + noise) (nearest
-        # code). The two indices generally disagree, so the saved SID would not
-        # match the codebook vector actually reconstructed/trained. STE avoids
-        # this by looking up embedding(ids) directly. Force a consistent combo.
+        # Sinkhorn drives `ids` (balanced assignment), Gumbel drives `emb`
+        # (nearest code); combining them makes the saved id and embedding
+        # diverge, so reject the combo (see the assert message).
         _is_gumbel = forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
         assert not (use_sinkhorn and _is_gumbel), (
             "use_sinkhorn=True is incompatible with forward_mode=GUMBEL_SOFTMAX: "
@@ -255,16 +244,9 @@ class VectorQuantize(QuantizeLayer):
     def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
         """Assign ``x`` to the codebook (the :class:`QuantizeLayer` interface).
 
-        Training flow:
-            1. compute distances (L2 or cosine)
-            2. if use_sinkhorn: z-score normalize + Sinkhorn -> argmax
-               else: argmin
-            3. compute differentiable embedding (STE or Gumbel-Softmax)
-
         Commitment loss is computed by the caller
-        (:meth:`ResidualVectorQuantizer._single_commitment_loss`). Device follows
-        ``x`` (and the codebook, which moves with the module), so this runs on
-        CPU or GPU unchanged.
+        (:meth:`ResidualVectorQuantizer._single_commitment_loss`); device follows
+        ``x``, so this runs on CPU or GPU unchanged.
 
         Args:
             x (Tensor): input vectors, shape (B, D).
@@ -273,9 +255,8 @@ class VectorQuantize(QuantizeLayer):
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids).
         """
-        # Gumbel: grad-enabled distances (so the encoder gets gradient); the
-        # hard sample drives both emb and ids, so the saved code matches the
-        # vector used. Sinkhorn is off here (ResidualVectorQuantizer.__init__).
+        # Gumbel: grad-enabled distances feed the encoder; the hard sample drives
+        # both emb and ids, so the saved code matches the vector used.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             logits = -self._compute_distances(x)  # (B, n_embed), differentiable
             weights = _gumbel_softmax_sample(logits, temperature=temperature, hard=True)
@@ -283,12 +264,10 @@ class VectorQuantize(QuantizeLayer):
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
-        # STE / eval: nearest-neighbour assignment under no_grad. (Gumbel
-        # early-returned above; STE is the only remaining training mode.)
+        # STE / eval: nearest-neighbour assignment under no_grad.
         ids, _ = self._find_nearest_embedding(x)
         if self.training:
-            # Straight-Through Estimator: gradient passes through.
-            quantized = self.embedding(ids)
+            quantized = self.embedding(ids)  # straight-through: grad passes to x
             emb = x + (quantized - x).detach()
         else:
             emb = self.embedding(ids)

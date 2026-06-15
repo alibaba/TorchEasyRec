@@ -40,18 +40,11 @@ def faiss_kmeans_fit(
 ) -> Any:
     """Train one ``faiss.Kmeans(dim, n_clusters)`` on ``x`` and return it.
 
-    The shared one-layer FAISS fit behind both SID residual-K-Means loops — the
-    RQ-VAE warm-start
-    (:func:`~tzrec.modules.sid.residual_vector_quantizer.faiss_residual_kmeans`)
-    and the offline RQ-K-Means
-    (:meth:`~tzrec.modules.sid.residual_kmeans_quantizer.ResidualKMeansQuantizer.train_offline`).
-    The caller reads ``km.centroids`` and runs assignment via
-    ``km.index.search``, keeping its own residual / chunking / device logic.
-
-    Strips a stale ``gpu`` kwarg (a faiss-gpu build must not target an absent
-    GPU) and guards ``N >= n_clusters`` with a clear message before faiss's
-    opaque C++ throw. ``x`` may be a numpy array or a torch tensor
-    (``faiss.contrib.torch_utils``).
+    The shared one-layer FAISS fit behind both SID residual-K-Means loops (the
+    RQ-VAE warm-start and the offline RQ-K-Means); the caller reads
+    ``km.centroids`` and assigns via ``km.index.search``. Strips a stale ``gpu``
+    kwarg and guards ``N >= n_clusters`` before faiss's opaque C++ throw. ``x``
+    may be a numpy array or a torch tensor.
 
     Args:
         x: data points, shape (N, dim) — numpy array or torch tensor.

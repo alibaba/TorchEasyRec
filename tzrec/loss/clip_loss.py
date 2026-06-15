@@ -23,11 +23,9 @@ from torch.nn.modules.loss import _Loss
 class MaskedCLIPLoss(_Loss):
     """Masked CLIP loss for mixed recon+clip batches.
 
-    In a mixed batch, recon rows (clip_mask=False) should not
-    contribute to CLIP loss, and recon columns should not serve as
-    negatives.  This module applies row and column masks to achieve
-    selective contrastive learning without data-dependent branching,
-    ensuring ``torch.compile`` compatibility.
+    In a mixed batch, recon rows (clip_mask=False) must not contribute to the
+    CLIP loss, and recon columns must not serve as negatives. Row/column masks
+    achieve this without data-dependent branching (``torch.compile``-friendly).
 
     Input dict keys:
         'image_embed':      (B, D)  quantized output of first feature
@@ -56,11 +54,9 @@ class MaskedCLIPLoss(_Loss):
     def _all_gather_with_grad(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
         """All-gather tensors across workers with gradient support.
 
-        In single-process mode, returns the input tensors unchanged. In
-        multi-process mode, uses ``torch.distributed.nn.functional
-        .all_gather`` — the built-in differentiable collective (its backward
-        sum-reduces the per-rank grads and returns this rank's slice), so no
-        custom ``autograd.Function`` is needed.
+        Single-process: returns the inputs unchanged. Multi-process: uses the
+        built-in differentiable ``torch.distributed.nn.functional.all_gather``,
+        so no custom ``autograd.Function`` is needed.
 
         Args:
             tensors (List[Tensor]): list of tensors to gather.
@@ -160,10 +156,9 @@ class MaskedCLIPLoss(_Loss):
         logits_img_cl = logit_scale_cl * image_embed @ image_embed_all_ori.t()
         logits_txt_cl = logit_scale_cl * text_embed @ text_embed_all_ori.t()
 
-        # Mask recon columns out of the negatives. Fill with the dtype's most
-        # negative finite value: provably below any real logit (so it masks like
-        # -inf regardless of logit_scale), but finite so an all-recon row gives
-        # a finite CE/grad instead of 0*NaN.
+        # Mask recon columns out of the negatives with the dtype's most negative
+        # finite value: below any real logit (masks like -inf), but finite so an
+        # all-recon row gives a finite CE/grad instead of 0*NaN.
         clip_mask_all = self._gather_bool_mask(clip_mask)
         col_mask = (~clip_mask_all).unsqueeze(0)  # (1, B_global)
         neg_fill = torch.finfo(logits_img_self.dtype).min
