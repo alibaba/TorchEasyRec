@@ -63,7 +63,7 @@ message SidRqvae {
     // Commitment loss type: "l2", "l1" or "cos".
     optional string commitment_loss = 10 [default = "l2"];
     // Commitment loss weights [w1, w2]. Defaults to [1.0, 0.5] when unset
-    // (applied by RQVAE / ResidualVectorQuantizer).
+    // (applied by SidRqvae / ResidualVectorQuantizer).
     repeated float latent_weight = 11;
     // STE rotation trick.
     optional bool rotation_trick = 12 [default = false];

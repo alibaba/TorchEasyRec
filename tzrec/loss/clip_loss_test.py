@@ -80,6 +80,45 @@ class MaskedCLIPLossTest(unittest.TestCase):
         self.assertIsNotNone(feats["image_embed"].grad)
         self.assertTrue(torch.isfinite(feats["image_embed"].grad).all())
 
+    def test_recon_columns_excluded_from_negatives(self) -> None:
+        """A recon row's embedding must not affect a clip row's loss.
+
+        Recon rows are dropped as queries (row mask) AND their columns are
+        masked out of the negatives (col_mask). Perturbing the recon rows of
+        EVERY column operand — ``text_embed`` (the self group) and both
+        ``*_ori`` operands (the ori/cl groups) — must leave the clip rows' loss
+        unchanged; a dropped or inverted ``col_mask`` on any group would fail.
+        Distinct ``image_embed_ori`` / ``text_embed_ori`` so the ori/cl masking
+        is actually exercised (not hidden by a shared tensor).
+        """
+        torch.manual_seed(0)
+        B, D = 4, 8
+        img = torch.randn(B, D)
+        scale = torch.tensor(10.0)
+        mask = torch.tensor([True, True, False, False])  # rows 2,3 are recon
+
+        def feats(txt: torch.Tensor, txt_ori: torch.Tensor, img_ori: torch.Tensor):
+            return {
+                "image_embed": img,
+                "text_embed": txt,
+                "image_embed_ori": img_ori,
+                "text_embed_ori": txt_ori,
+                "logit_scale_self": scale,
+                "logit_scale_cl": scale,
+                "logit_scale": scale,
+            }
+
+        txt, txt_ori, img_ori = (torch.randn(B, D) for _ in range(3))
+        loss_fn = MaskedCLIPLoss()
+        loss_fn.eval()
+        base = loss_fn(feats(txt, txt_ori, img_ori), mask)["clip_loss"]
+        # Perturb ONLY the recon rows of every column operand that feeds negatives.
+        txt2, txt_ori2, img_ori2 = txt.clone(), txt_ori.clone(), img_ori.clone()
+        for t in (txt2, txt_ori2, img_ori2):
+            t[2:] = torch.randn(2, D)
+        after = loss_fn(feats(txt2, txt_ori2, img_ori2), mask)["clip_loss"]
+        torch.testing.assert_close(base, after)
+
     def test_mask_holds_under_large_scale(self) -> None:
         # The column fill is finfo.min (below any real logit) rather than a
         # hardcoded -1e4, so masking holds even when logit_scale is large and

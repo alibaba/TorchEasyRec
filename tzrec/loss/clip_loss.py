@@ -37,11 +37,7 @@ class MaskedCLIPLoss(_Loss):
         'logit_scale':      scalar  original feature contrast temperature
 
     Output dict keys:
-        'clip_loss':  scalar  mean of three losses (self/ori/cl)
-        'clip_acc':   scalar  contrast accuracy (%); 0 during training
-        'loss_self':  scalar  quantized vs quantized
-        'loss_ori':   scalar  quantized vs original
-        'loss_cl':    scalar  quantized vs counterpart original
+        'clip_loss':  scalar  mean of three contrastive losses (self/ori/cl)
     """
 
     def __init__(self) -> None:
@@ -188,25 +184,4 @@ class MaskedCLIPLoss(_Loss):
 
         clip_loss = (loss_self + loss_ori + loss_cl) / 3
 
-        # Retrieval accuracy is diagnostic-only; skip the four argmax+eq+sum
-        # reductions during training (recover via the eval pass).
-        if self.training:
-            acc = torch.zeros((), device=clip_loss.device)
-        else:
-            with torch.no_grad():
-                n_valid = clip_mask.float().sum().clamp(min=1)
-                correct = (
-                    (logits_img_self.argmax(-1).eq(safe_labels) & clip_mask).sum()
-                    + (logits_txt_self.argmax(-1).eq(safe_labels) & clip_mask).sum()
-                    + (logits_img_ori.argmax(-1).eq(safe_labels) & clip_mask).sum()
-                    + (logits_txt_ori.argmax(-1).eq(safe_labels) & clip_mask).sum()
-                )
-                acc = 100 * correct / (n_valid * 4)
-
-        return {
-            "clip_loss": clip_loss,
-            "clip_acc": acc,
-            "loss_self": loss_self,
-            "loss_ori": loss_ori,
-            "loss_cl": loss_cl,
-        }
+        return {"clip_loss": clip_loss}

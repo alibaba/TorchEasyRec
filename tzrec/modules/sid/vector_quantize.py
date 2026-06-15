@@ -216,7 +216,9 @@ class VectorQuantize(QuantizeLayer):
 
         return ids
 
-    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+    def quantize(
+        self, x: torch.Tensor, temperature: float = 1.0, apply_ste: bool = True
+    ) -> QuantizeOutput:
         """Assign ``x`` to the codebook (the :class:`QuantizeLayer` interface).
 
         Commitment loss is computed by the caller
@@ -226,6 +228,11 @@ class VectorQuantize(QuantizeLayer):
         Args:
             x (Tensor): input vectors, shape (B, D).
             temperature (float): temperature for Gumbel-Softmax.
+            apply_ste (bool): in STE training, wrap the embedding with the
+                straight-through estimator (``x + (q - x).detach()``). Set False
+                when the caller re-applies STE on the aggregate
+                (:class:`ResidualVectorQuantizer`): the raw codebook vector is
+                returned and the otherwise-discarded wrap + re-gather is avoided.
 
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids).
@@ -239,15 +246,14 @@ class VectorQuantize(QuantizeLayer):
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
-        # STE / eval: nearest-neighbour assignment under no_grad.
+        # STE / eval: nearest-neighbour assignment under no_grad, one codebook
+        # gather. STE wrap only when the caller wants it (standalone use); the
+        # RVQ caller passes apply_ste=False and re-applies STE on the aggregate.
         ids = self._find_nearest_embedding(x)
-        if self.training:
-            quantized = self.embedding(ids)  # straight-through: grad passes to x
-            emb = x + (quantized - x).detach()
-        else:
-            emb = self.embedding(ids)
-
-        return QuantizeOutput(embeddings=emb, ids=ids)
+        quantized = self.embedding(ids)
+        if self.training and apply_ste:
+            quantized = x + (quantized - x).detach()  # grad passes to x
+        return QuantizeOutput(embeddings=quantized, ids=ids)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""

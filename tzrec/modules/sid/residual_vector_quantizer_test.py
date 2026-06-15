@@ -107,5 +107,57 @@ class FaissResidualKmeansTest(unittest.TestCase):
             faiss_residual_kmeans(torch.randn(4, 6), [8])
 
 
+class ResidualVQBranchTest(unittest.TestCase):
+    """Coverage for the rotation-trick STE branch and the kmeans-init guard."""
+
+    def test_rotation_trick_rotates_gradient(self) -> None:
+        # The rotation trick keeps the STE forward value but ROTATES the input
+        # gradient. Plain STE also yields a finite non-zero grad, so a regression
+        # that reverted the Householder branch to ordinary STE would pass a smoke
+        # test. Pin the distinguishing property: same forward output, different
+        # input gradient.
+        def run(rotation_trick: bool):
+            torch.manual_seed(0)  # identical codebook init
+            rvq = ResidualVectorQuantizer(
+                embed_dim=8,
+                n_layers=2,
+                n_embed=16,
+                forward_mode="ste",
+                rotation_trick=rotation_trick,
+                use_sinkhorn=False,
+                kmeans_init=False,
+            )
+            rvq.train()
+            torch.manual_seed(1)  # identical input
+            z = torch.randn(16, 8, requires_grad=True)
+            out = rvq(z).quantized_embeddings
+            out.sum().backward()
+            return out.detach(), z.grad
+
+        out_rot, grad_rot = run(True)
+        out_ste, grad_ste = run(False)
+        self.assertTrue(torch.isfinite(grad_rot).all())
+        self.assertGreater(grad_rot.abs().sum().item(), 0.0)
+        # Forward value is identical (the trick only changes the backward).
+        torch.testing.assert_close(out_rot, out_ste)
+        # ...but it genuinely rotates the gradient, unlike plain STE.
+        self.assertFalse(torch.allclose(grad_rot, grad_ste))
+
+    def test_kmeans_init_too_small_batch_raises(self) -> None:
+        # kmeans_init needs N >= max(codebook). A too-small first batch must
+        # raise a clear error (broadcast so all ranks abort together under DDP),
+        # not hang the non-rank-0 ranks on the centroid broadcast.
+        rvq = ResidualVectorQuantizer(
+            embed_dim=4,
+            n_layers=2,
+            n_embed=8,
+            kmeans_init=True,
+            use_sinkhorn=False,
+        )
+        rvq.train()
+        with self.assertRaisesRegex(RuntimeError, "fewer rows than the largest"):
+            rvq(torch.randn(4, 4))  # 4 < max(codebook)=8
+
+
 if __name__ == "__main__":
     unittest.main()

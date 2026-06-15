@@ -35,6 +35,10 @@ from tzrec.modules.sid.residual_vector_quantizer import (
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.logging_util import logger
 
+# Cap the CLIP temperatures before ``exp`` (reference CLIP clamps to ln(100)):
+# an unbounded ``logit_scale`` overflows to +Inf -> NaN grad -> corrupt param.
+_LOGIT_SCALE_MAX = float(np.log(100))
+
 
 class SidRqvae(BaseSidModel):
     """SID generation model using RQ-VAE (Encoder + VQ + Decoder).
@@ -229,9 +233,11 @@ class SidRqvae(BaseSidModel):
             "text_embed": x_hat2,
             "image_embed_ori": fea1,
             "text_embed_ori": fea2,
-            "logit_scale_self": self._logit_scale_self.exp(),
-            "logit_scale_cl": self._logit_scale_cl.exp(),
-            "logit_scale": self._logit_scale.exp(),
+            "logit_scale_self": self._logit_scale_self.clamp(
+                max=_LOGIT_SCALE_MAX
+            ).exp(),
+            "logit_scale_cl": self._logit_scale_cl.clamp(max=_LOGIT_SCALE_MAX).exp(),
+            "logit_scale": self._logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp(),
         }
         clip_result = self._masked_clip_loss_fn(features, clip_mask)
 

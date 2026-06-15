@@ -367,14 +367,15 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Returns:
             ids (Tensor): per-layer cluster ids, shape (B,).
-            raw_emb (Tensor): raw codebook vectors (with grad), shape (B, D).
+            emb (Tensor): the raw codebook vector (STE/eval) or the soft
+                embedding (Gumbel), with grad, shape (B, D).
         """
-        layer = self.layers[layer_idx]
-        out = layer.quantize(residual, temperature)
-        if self._train_gumbel():
-            return out.ids, out.embeddings  # soft embedding carries grad
-        # STE / eval: raw codebook vector; STE applied on the aggregate in forward.
-        return out.ids, layer.lookup(out.ids)
+        # apply_ste=False: Gumbel ignores it (returns the soft embedding that
+        # carries grad); STE/eval get the raw codebook vector in one gather (STE
+        # is applied on the aggregate in :meth:`forward`), avoiding the discarded
+        # per-layer straight-through wrap + a second codebook gather.
+        out = self.layers[layer_idx].quantize(residual, temperature, apply_ste=False)
+        return out.ids, out.embeddings
 
     def forward(
         self,

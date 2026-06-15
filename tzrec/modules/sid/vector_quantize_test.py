@@ -62,6 +62,29 @@ class VectorQuantizeTest(unittest.TestCase):
         self.assertTrue((out.ids >= 0).all() and (out.ids < 16).all())
         self.assertTrue(torch.isfinite(out.embeddings).all())
 
+    def test_sinkhorn_balances_assignment(self) -> None:
+        """Sinkhorn spreads clustered points across codes; argmin collapses them.
+
+        Functional check (not just shape/finiteness): feed points clustered at
+        one anchor — argmin sends all to that code, while Sinkhorn's uniform
+        assignment must use more than one code.
+        """
+        torch.manual_seed(0)
+        vq = VectorQuantize(
+            embed_dim=2, n_embed=4, use_sinkhorn=True, sinkhorn_iters=10
+        )
+        vq.train()
+        with torch.no_grad():
+            vq.embedding.weight.copy_(
+                torch.tensor([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]])
+            )
+        x = torch.randn(16, 2) * 0.1  # all clustered at anchor 0
+        sinkhorn_ids = vq.quantize(x).ids
+        vq.use_sinkhorn = False
+        argmin_ids = vq.quantize(x).ids
+        self.assertEqual(argmin_ids.unique().numel(), 1)
+        self.assertGreater(sinkhorn_ids.unique().numel(), 1)
+
     def test_sinkhorn_gumbel_combo_rejected(self) -> None:
         """Sinkhorn + Gumbel would desync `ids` and `emb`; constructor rejects it."""
         with self.assertRaisesRegex(AssertionError, "GUMBEL_SOFTMAX"):

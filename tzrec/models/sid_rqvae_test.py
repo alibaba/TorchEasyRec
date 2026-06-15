@@ -401,6 +401,101 @@ class SidRqvaeTest(unittest.TestCase):
                 use_sinkhorn=False,
             )
 
+    def test_loss_type_l1_and_cosine(self) -> None:
+        """loss_type 'l1' and 'cosine' recon branches run end-to-end.
+
+        Only 'mse' was previously exercised; a typo'd branch would have been
+        silent.
+        """
+        B, input_dim = 4, 32
+        for loss_type in ("l1", "cosine"):
+            cfg = sid_model_pb2.SidRqvae(
+                input_dim=input_dim,
+                embed_dim=8,
+                codebook=[16, 16],
+                forward_mode="ste",
+                loss_type=loss_type,
+                kmeans_init=False,
+                embedding_feature_name="item_emb",
+            )
+            model = SidRqvae(
+                model_config=model_pb2.ModelConfig(sid_rqvae=cfg),
+                features=[],
+                labels=[],
+            )
+            init_parameters(model, device=torch.device("cpu"))
+            model.train()
+            model.init_loss()
+            preds = model.predict(_make_batch(B, input_dim))
+            recon = preds["reconstruction_loss"]
+            self.assertTrue(torch.isfinite(recon), f"{loss_type} recon not finite")
+            recon.backward()  # grad must flow through the decoder
+
+    def test_commitment_loss_cos_branch(self) -> None:
+        """Verify the commitment_loss='cos' branch runs end-to-end."""
+        from tzrec.modules.sid.residual_vector_quantizer import (
+            ResidualVectorQuantizer,
+        )
+
+        torch.manual_seed(0)
+        rq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=2,
+            n_embed=4,
+            forward_mode="ste",
+            commitment_loss="cos",
+            kmeans_init=False,
+            use_sinkhorn=False,
+        )
+        for layer in rq.layers:
+            torch.nn.init.normal_(layer.embedding.weight, std=0.1)
+        x = torch.randn(4, 8, requires_grad=True)
+        out = rq(x)
+        self.assertTrue(torch.isfinite(out.quantization_loss))
+        out.quantization_loss.backward()
+        self.assertIsNotNone(x.grad)
+
+    def test_logit_scale_clamped_prevents_overflow(self) -> None:
+        """A raw logit_scale far above ln(100) must not overflow.
+
+        The clamp caps ``exp()`` so the CLIP loss and the parameter gradient
+        stay finite; without it, ``exp(large)`` -> +Inf -> a NaN gradient that
+        permanently corrupts the parameter.
+        """
+        B, input_dim = 8, 32
+        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model.train()
+        model.init_loss()
+        with torch.no_grad():
+            model._logit_scale_self.fill_(100.0)
+            model._logit_scale_cl.fill_(100.0)
+            model._logit_scale.fill_(100.0)
+
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    tensors=[
+                        torch.randn(B, input_dim),
+                        torch.randn(B, input_dim),
+                        torch.ones(B, 1),
+                    ],
+                )
+            },
+            sparse_features={},
+            labels={},
+        )
+        losses = model.loss(model.predict(batch), batch)
+        self.assertTrue(torch.isfinite(losses["clip_loss"]))
+        sum(losses.values()).backward()
+        for p in (
+            model._logit_scale_self,
+            model._logit_scale_cl,
+            model._logit_scale,
+        ):
+            self.assertIsNotNone(p.grad)
+            self.assertTrue(torch.isfinite(p.grad).all())
+
 
 if __name__ == "__main__":
     unittest.main()
