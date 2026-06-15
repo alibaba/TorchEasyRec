@@ -212,9 +212,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
     def test_non_uniform_codebook_supported(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=3, n_embed=[8, 4, 16])
         self.assertEqual(rkq.n_embed_list, [8, 4, 16])
-        self.assertEqual(
-            [layer.centroids.shape[0] for layer in rkq.layers], [8, 4, 16]
-        )
+        self.assertEqual([layer.centroids.shape[0] for layer in rkq.layers], [8, 4, 16])
 
     def test_forward_returns_zeros_before_fit(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
