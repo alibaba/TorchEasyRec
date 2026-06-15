@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
+from tzrec.modules.sid.kmeans_quantize import faiss_kmeans_fit
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.modules.sid.types import (
     QuantizeForwardMode,
@@ -55,16 +56,8 @@ def faiss_residual_kmeans(
 
     Raises:
         ImportError: if ``faiss`` is not installed.
+        RuntimeError: if a layer has fewer points than its cluster count.
     """
-    try:
-        import faiss
-    except ImportError as e:
-        raise ImportError(
-            "faiss is required for RQ-VAE kmeans_init. Install via "
-            "`pip install faiss-cpu` or `pip install faiss-gpu`."
-        ) from e
-
-    kwargs = dict(faiss_kmeans_kwargs or {})
     device = samples.device
     _, D = samples.shape
     # Own a contiguous fp32 numpy copy we mutate in place to form residuals.
@@ -72,11 +65,10 @@ def faiss_residual_kmeans(
 
     res_centers: List[torch.Tensor] = []
     for n_clusters in n_clusters_list:
-        kmeans = faiss.Kmeans(D, n_clusters, **kwargs)
-        kmeans.train(x)
-        centroids = kmeans.centroids.copy()  # (K, D)
+        km = faiss_kmeans_fit(x, D, n_clusters, faiss_kmeans_kwargs)
+        centroids = km.centroids.copy()  # (K, D)
         res_centers.append(torch.from_numpy(centroids).to(device))
-        _, idx = kmeans.index.search(x, 1)
+        _, idx = km.index.search(x, 1)
         x -= centroids[idx.ravel()]  # residual, in place
     return res_centers
 

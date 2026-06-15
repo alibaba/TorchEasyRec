@@ -19,15 +19,71 @@ SID models:
 * :class:`ReservoirSampler` — bounded uniform stream sample (Vitter
   Algorithm R) that :class:`~tzrec.models.sid_rqkmeans.SidRqkmeans`
   fills during training to feed the one-shot FAISS fit.
+* :func:`faiss_kmeans_fit` — the shared one-layer FAISS fit behind both SID
+  residual-K-Means loops (RQ-VAE warm-start and offline RQ-K-Means).
 """
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 
 from tzrec.modules.sid.quantize_layer import QuantizeLayer
 from tzrec.modules.sid.types import QuantizeOutput
 from tzrec.utils.logging_util import logger
+
+
+def faiss_kmeans_fit(
+    x: Any,
+    dim: int,
+    n_clusters: int,
+    faiss_kmeans_kwargs: Optional[Dict] = None,
+) -> Any:
+    """Train one ``faiss.Kmeans(dim, n_clusters)`` on ``x`` and return it.
+
+    The shared one-layer FAISS fit behind both SID residual-K-Means loops — the
+    RQ-VAE warm-start
+    (:func:`~tzrec.modules.sid.residual_vector_quantizer.faiss_residual_kmeans`)
+    and the offline RQ-K-Means
+    (:meth:`~tzrec.modules.sid.residual_kmeans_quantizer.ResidualKMeansQuantizer.train_offline`).
+    The caller reads ``km.centroids`` and runs assignment via
+    ``km.index.search``, keeping its own residual / chunking / device logic.
+
+    Strips a stale ``gpu`` kwarg (a faiss-gpu build must not target an absent
+    GPU) and guards ``N >= n_clusters`` with a clear message before faiss's
+    opaque C++ throw. ``x`` may be a numpy array or a torch tensor
+    (``faiss.contrib.torch_utils``).
+
+    Args:
+        x: data points, shape (N, dim) — numpy array or torch tensor.
+        dim (int): feature dimension.
+        n_clusters (int): number of centroids (codebook size).
+        faiss_kmeans_kwargs (Dict|None): extra kwargs for ``faiss.Kmeans``.
+
+    Returns:
+        The trained ``faiss.Kmeans`` (read ``.centroids`` / ``.index``).
+
+    Raises:
+        ImportError: if ``faiss`` is not installed.
+        RuntimeError: if ``x`` has fewer than ``n_clusters`` rows.
+    """
+    try:
+        import faiss
+    except ImportError as e:
+        raise ImportError(
+            "faiss is required for SID residual K-Means. Install via "
+            "`pip install faiss-cpu` or `pip install faiss-gpu`."
+        ) from e
+
+    kwargs = dict(faiss_kmeans_kwargs or {})
+    kwargs.pop("gpu", None)
+    n = int(x.shape[0])
+    if n < n_clusters:
+        raise RuntimeError(
+            f"need >= {n_clusters} points to fit the codebook, got N={n}"
+        )
+    km = faiss.Kmeans(dim, n_clusters, **kwargs)
+    km.train(x)
+    return km
 
 
 class ReservoirSampler:

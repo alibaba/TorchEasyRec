@@ -96,6 +96,16 @@ class FaissResidualKmeansTest(unittest.TestCase):
         # Centroids come back on the input device (CPU fit, device-preserving).
         self.assertEqual(centers[0].device, samples.device)
 
+    def test_raises_on_too_few_points(self) -> None:
+        # Gained from the shared faiss_kmeans_fit primitive: a clear N>=K error
+        # before faiss's opaque C++ throw.
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        with self.assertRaisesRegex(RuntimeError, "need >= 8 points"):
+            faiss_residual_kmeans(torch.randn(4, 6), [8])
+
 
 if __name__ == "__main__":
     unittest.main()

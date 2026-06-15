@@ -80,6 +80,28 @@ class MaskedCLIPLossTest(unittest.TestCase):
         self.assertIsNotNone(feats["image_embed"].grad)
         self.assertTrue(torch.isfinite(feats["image_embed"].grad).all())
 
+    def test_mask_holds_under_large_scale(self) -> None:
+        # The column fill is finfo.min (below any real logit) rather than a
+        # hardcoded -1e4, so masking holds even when logit_scale is large and
+        # the *_ori operands are un-normalized (real logits can dwarf 1e4).
+        # Loss/grad must stay finite and acc valid; eval exercises the argmax.
+        loss_fn = MaskedCLIPLoss()
+        loss_fn.eval()
+        feats = self._features(6, 8)
+        big = torch.tensor(3000.0)
+        feats["logit_scale"] = big
+        feats["logit_scale_self"] = big
+        feats["logit_scale_cl"] = big
+        feats["image_embed_ori"] = feats["image_embed_ori"] * 50
+        feats["text_embed_ori"] = feats["text_embed_ori"] * 50
+        mask = torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool)
+        out = loss_fn(feats, mask)
+        self.assertTrue(torch.isfinite(out["clip_loss"]))
+        loss_fn.train()
+        feats["image_embed"].grad = None
+        loss_fn(feats, mask)["clip_loss"].backward()
+        self.assertTrue(torch.isfinite(feats["image_embed"].grad).all())
+
 
 if __name__ == "__main__":
     unittest.main()
