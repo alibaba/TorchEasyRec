@@ -226,6 +226,20 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             return
 
         is_ddp = dist.is_initialized() and dist.get_world_size() > 1
+        # The fit runs on rank 0 only, then broadcasts. faiss needs N >= max(K),
+        # so a too-small rank-0 first batch would raise on rank 0 while the other
+        # ranks block forever on the centroid broadcast. Broadcast rank 0's verdict
+        # first so every rank aborts together with a clear error instead.
+        max_k = max(self.n_embed_list)
+        enough = torch.tensor([1 if data.shape[0] >= max_k else 0], device=data.device)
+        if is_ddp:
+            dist.broadcast(enough, src=0)
+        if enough.item() == 0:
+            raise RuntimeError(
+                f"kmeans_init: rank-0 first training batch has fewer rows than the "
+                f"largest codebook ({max_k}); raise batch_size or disable kmeans_init."
+            )
+
         if (not is_ddp) or dist.get_rank() == 0:
             centers = faiss_residual_kmeans(
                 data,

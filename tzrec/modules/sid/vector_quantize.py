@@ -11,8 +11,6 @@
 
 """Single codebook vector quantization with Sinkhorn uniform assignment."""
 
-from typing import Tuple
-
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -41,24 +39,6 @@ def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
     x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
     y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
     return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
-
-
-def _gumbel_softmax_sample(
-    logits: torch.Tensor,
-    temperature: float = 1.0,
-    hard: bool = True,
-) -> torch.Tensor:
-    """Sample from the Gumbel-Softmax distribution.
-
-    Args:
-        logits (Tensor): un-normalized log probabilities, shape (B, N).
-        temperature (float): temperature for Gumbel-Softmax.
-        hard (bool): if True, return one-hot with straight-through gradient.
-
-    Returns:
-        Tensor: soft or hard sample, shape (B, N).
-    """
-    return F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)
 
 
 @torch.no_grad()
@@ -180,7 +160,8 @@ class VectorQuantize(QuantizeLayer):
         """Compute L2/cosine distances between inputs and codebook entries.
 
         Not ``no_grad``: Gumbel calls this directly for the encoder gradient;
-        the STE/Sinkhorn path wraps it via ``no_grad`` :meth:`_find_nearest_embedding`.
+        the STE/Sinkhorn path calls it inside ``no_grad`` in
+        :meth:`_find_nearest_embedding`.
 
         Args:
             x (Tensor): input vectors, shape (B, D).
@@ -204,10 +185,8 @@ class VectorQuantize(QuantizeLayer):
         return distances
 
     @torch.no_grad()
-    def _find_nearest_embedding(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Find nearest codebook entry for each input vector.
+    def _find_nearest_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """Find the nearest codebook id for each input vector.
 
         During training with use_sinkhorn=True, applies z-score
         normalization + non-negative shift before Sinkhorn assignment.
@@ -217,8 +196,7 @@ class VectorQuantize(QuantizeLayer):
             x (Tensor): input vectors, shape (B, D).
 
         Returns:
-            ids (Tensor): codebook indices, shape (B,).
-            distances (Tensor): distance matrix, shape (B, n_embed).
+            Tensor: codebook indices, shape (B,).
         """
         distances = self._compute_distances(x)  # (B, n_embed)
 
@@ -239,7 +217,7 @@ class VectorQuantize(QuantizeLayer):
         else:
             ids = distances.argmin(dim=-1)
 
-        return ids, distances
+        return ids
 
     def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
         """Assign ``x`` to the codebook (the :class:`QuantizeLayer` interface).
@@ -259,13 +237,13 @@ class VectorQuantize(QuantizeLayer):
         # both emb and ids, so the saved code matches the vector used.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             logits = -self._compute_distances(x)  # (B, n_embed), differentiable
-            weights = _gumbel_softmax_sample(logits, temperature=temperature, hard=True)
+            weights = F.gumbel_softmax(logits, tau=temperature, hard=True, dim=-1)
             emb = weights @ self.embedding.weight
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
         # STE / eval: nearest-neighbour assignment under no_grad.
-        ids, _ = self._find_nearest_embedding(x)
+        ids = self._find_nearest_embedding(x)
         if self.training:
             quantized = self.embedding(ids)  # straight-through: grad passes to x
             emb = x + (quantized - x).detach()

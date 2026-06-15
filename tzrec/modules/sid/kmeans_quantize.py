@@ -42,9 +42,10 @@ def faiss_kmeans_fit(
 
     The shared one-layer FAISS fit behind both SID residual-K-Means loops (the
     RQ-VAE warm-start and the offline RQ-K-Means); the caller reads
-    ``km.centroids`` and assigns via ``km.index.search``. Strips a stale ``gpu``
-    kwarg and guards ``N >= n_clusters`` before faiss's opaque C++ throw. ``x``
-    may be a numpy array or a torch tensor.
+    ``km.centroids`` and assigns via ``km.index.search``. Strips a ``gpu`` kwarg
+    (faiss honors it and would move the fit to GPU, breaking the CPU-only
+    contract) and guards ``N >= n_clusters`` before faiss's opaque C++ throw.
+    ``x`` may be a numpy array or a torch tensor.
 
     Args:
         x: data points, shape (N, dim) — numpy array or torch tensor.
@@ -67,6 +68,8 @@ def faiss_kmeans_fit(
             "`pip install faiss-cpu` or `pip install faiss-gpu`."
         ) from e
 
+    # Copy + drop any `gpu` key: faiss.Kmeans honors it and would move the fit
+    # to GPU, breaking the CPU-only contract (the caller's dict stays untouched).
     kwargs = dict(faiss_kmeans_kwargs or {})
     kwargs.pop("gpu", None)
     n = int(x.shape[0])
@@ -271,7 +274,9 @@ class KMeansQuantizeLayer(QuantizeLayer):
         if not self.is_initialized:
             ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
             return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
-        ids = torch.cdist(x, self.centroids).argmin(dim=-1)
+        # Match x to the centroid dtype (as load_centroids_ does): cdist rejects
+        # mismatched dtypes, so a non-fp32 input would otherwise raise.
+        ids = torch.cdist(x.to(self.centroids.dtype), self.centroids).argmin(dim=-1)
         return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
 
     def get_codebook_embeddings(self) -> torch.Tensor:

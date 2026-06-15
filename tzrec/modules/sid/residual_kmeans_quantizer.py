@@ -201,9 +201,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # breaks that invariant, so clone then.
         x0 = x.clone() if (verbose and self.normalize_residuals) else None
 
-        # CPU-only fit (SidRqkmeans refuses CUDA). The ``gpu`` kwarg is stripped
-        # inside faiss_kmeans_fit.
-        kwargs = dict(self.faiss_kmeans_kwargs)
+        # CPU-only fit (SidRqkmeans refuses CUDA).
         if verbose:
             logger.info(
                 "[ResidualKMeansQuantizer] fitting %d-layer codebook on CPU "
@@ -223,7 +221,10 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             # Fresh Kmeans per layer so each can use its own K (non-uniform
             # codebooks).
             km = faiss_kmeans_fit(
-                x, self.embed_dim, self.n_embed_list[layer_idx], kwargs
+                x,
+                self.embed_dim,
+                self.n_embed_list[layer_idx],
+                self.faiss_kmeans_kwargs,
             )
             centroids = torch.as_tensor(km.centroids, dtype=torch.float32)
 

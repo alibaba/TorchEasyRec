@@ -88,9 +88,15 @@ class SidRqvae(BaseSidModel):
         )
 
         embed_dim = cfg.embed_dim
+        # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
+        # dim only errors opaquely deep in nn.Linear/Embedding otherwise.
+        if embed_dim < 1:
+            raise ValueError(f"embed_dim must be >= 1, got {embed_dim}")
         hidden_dims = (
             list(cfg.hidden_dims) if cfg.hidden_dims else [self._input_dim // 2]
         )
+        if any(h < 1 for h in hidden_dims):
+            raise ValueError(f"every hidden_dims entry must be >= 1, got {hidden_dims}")
         # Empty -> default (1.0, 0.5); the quantizer validates the arity.
         latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
 
