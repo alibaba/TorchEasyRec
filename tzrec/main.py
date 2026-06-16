@@ -78,6 +78,11 @@ from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.delta_embedding_dump import (
+    DeltaEmbeddingDumper,
+    validate_delta_embedding_dump_config,
+    validate_delta_embedding_dump_no_zch_features,
+)
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -330,6 +335,7 @@ def _train_and_evaluate(
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
+    delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -452,6 +458,8 @@ def _train_and_evaluate(
                 ckpt_manager.restore(
                     ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
                 )
+            if delta_embedding_dumper is not None:
+                delta_embedding_dumper.clear()
 
         for i_step in step_iter:
             if i_step <= skip_steps:
@@ -479,6 +487,9 @@ def _train_and_evaluate(
                 for lr in lr_scheduler:
                     if not lr.by_epoch:
                         lr.step()
+
+                if delta_embedding_dumper is not None:
+                    delta_embedding_dumper.maybe_dump(i_step)
             except StopIteration:
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
@@ -589,6 +600,18 @@ def train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     acc_utils.allow_tf32(train_config)
+    zch_feature_names = set()
+    zch_table_names = set()
+    if train_config.HasField("delta_embedding_dump_config"):
+        validate_delta_embedding_dump_config(
+            train_config.delta_embedding_dump_config, device
+        )
+        if train_config.delta_embedding_dump_config.enable:
+            zch_feature_names, zch_table_names = (
+                validate_delta_embedding_dump_no_zch_features(
+                    pipeline_config.feature_configs
+                )
+            )
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -695,6 +718,18 @@ def train_and_evaluate(
         sharders=sharders,
         plan=plan,
     )
+    delta_embedding_dumper = None
+    if (
+        train_config.HasField("delta_embedding_dump_config")
+        and train_config.delta_embedding_dump_config.enable
+    ):
+        delta_embedding_dumper = DeltaEmbeddingDumper(
+            model,
+            train_config.delta_embedding_dump_config,
+            pipeline_config.model_dir,
+            zch_feature_names=zch_feature_names,
+            zch_table_names=zch_table_names,
+        )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
         train_config.dense_optimizer
@@ -789,6 +824,7 @@ def train_and_evaluate(
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
         dataloader_state=dataloader_state,
+        delta_embedding_dumper=delta_embedding_dumper,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
