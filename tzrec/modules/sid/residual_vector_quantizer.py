@@ -91,8 +91,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             Default: 'ste'.
         normalize_residuals (bool): L2-normalize residuals before each
             quantization layer. Default: False.
-        distance_type (str|List[str]): distance metric per layer,
-            'l2' or 'cosine'. Supports per-layer list. Default: 'l2'.
+        distance_type (str): distance metric, 'l2' or 'cosine'. Default: 'l2'.
         commitment_loss (str): commitment loss type, 'l2', 'l1' or 'cos'.
             Default: 'l2'.
         latent_weight (List[float]): commitment loss weights [w1, w2].
@@ -120,7 +119,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         n_embed: Union[int, List[int]] = 256,
         forward_mode: str = "ste",
         normalize_residuals: bool = False,
-        distance_type: Union[str, List[str]] = "l2",
+        distance_type: str = "l2",
         commitment_loss: str = "l2",
         latent_weight: Sequence[float] = (1.0, 0.5),
         rotation_trick: bool = False,
@@ -164,14 +163,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if is_gumbel and rotation_trick:
             logger.warning("gumbel_softmax: rotation_trick has no effect; ignoring.")
 
-        if isinstance(distance_type, str):
-            distance_types = [distance_type] * n_layers
-        else:
-            assert len(distance_type) == n_layers, (
-                "length of distance_type and n_layers must be same, "
-                f"but got {len(distance_type)} vs {n_layers}"
-            )
-            distance_types = list(distance_type)
+        distance_types = [distance_type] * n_layers
 
         self.layers = nn.ModuleList(
             [

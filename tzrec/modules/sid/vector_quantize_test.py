@@ -95,6 +95,13 @@ class VectorQuantizeTest(unittest.TestCase):
                 use_sinkhorn=True,
             )
 
+    def test_sinkhorn_epsilon_must_be_positive(self) -> None:
+        """Reject a non-positive sinkhorn_epsilon (it overflows exp(-cost*eps))."""
+        with self.assertRaisesRegex(ValueError, "sinkhorn_epsilon"):
+            VectorQuantize(
+                embed_dim=8, n_embed=16, use_sinkhorn=True, sinkhorn_epsilon=0.0
+            )
+
     def test_train_forward_backward_reaches_input(self) -> None:
         torch.manual_seed(0)
         vq = VectorQuantize(embed_dim=8, n_embed=16, use_sinkhorn=False)

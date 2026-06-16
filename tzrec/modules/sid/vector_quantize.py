@@ -144,6 +144,10 @@ class VectorQuantize(QuantizeLayer):
             "`emb` (nearest code), so the returned id and embedding diverge. "
             "Use STE with Sinkhorn, or Gumbel-Softmax without Sinkhorn."
         )
+        # epsilon sharpens exp(-cost * epsilon); <= 0 flips the kernel and the
+        # (large, shifted) cost overflows to +Inf -> NaN assignments.
+        if use_sinkhorn and sinkhorn_epsilon <= 0:
+            raise ValueError(f"sinkhorn_epsilon must be > 0, got {sinkhorn_epsilon}")
         # ``n_embed`` / ``embed_dim`` are owned by the QuantizeLayer base.
         self.forward_mode = forward_mode
         self.distance_type = distance_type

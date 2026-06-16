@@ -27,14 +27,14 @@ class MaskedCLIPLoss(_Loss):
     CLIP loss, and recon columns must not serve as negatives. Row/column masks
     achieve this without data-dependent branching (``torch.compile``-friendly).
 
-    Input dict keys:
-        'image_embed':      (B, D)  quantized output of first feature
-        'text_embed':       (B, D)  quantized output of second feature
-        'image_embed_ori':  (B, D)  original embedding of first feature
-        'text_embed_ori':   (B, D)  original embedding of second feature
-        'logit_scale_self': scalar  self-contrast temperature
-        'logit_scale_cl':   scalar  cross-modal contrast temperature
-        'logit_scale':      scalar  original feature contrast temperature
+    Input dict keys (all embeddings shape (B, input_dim)):
+        'image_embed':      reconstructed (decoder) output of feature 1
+        'text_embed':       reconstructed (decoder) output of feature 2
+        'image_embed_ori':  original embedding of feature 1
+        'text_embed_ori':   original embedding of feature 2
+        'logit_scale_self': scalar  temperature: recon-1 vs recon-2
+        'logit_scale_cl':   scalar  temperature: recon vs same-feature original
+        'logit_scale':      scalar  temperature: recon vs counterpart original
 
     Output dict keys:
         'clip_loss':  scalar  mean of three contrastive losses (self/ori/cl)
