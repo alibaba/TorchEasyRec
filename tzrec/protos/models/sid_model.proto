@@ -1,0 +1,42 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Strictly-typed subset of faiss.Kmeans(D, K, **kwargs) knobs. Unset fields
+// fall back to faiss's own defaults (so it is safe to leave partially set).
+// ``gpu`` is intentionally omitted — the fit is CPU-only (SidRqkmeans refuses
+// a visible CUDA device).
+message FaissKmeansConfig {
+    optional uint32 niter = 1;
+    optional uint32 nredo = 2;
+    optional uint32 seed = 3;
+    optional uint32 max_points_per_centroid = 4;
+    optional uint32 min_points_per_centroid = 5;
+    optional bool spherical = 6;
+    optional bool verbose = 7;
+}
+
+message SidRqkmeans {
+    // Input embedding dimension (K-Means runs directly on raw embeddings,
+    // no encoder).
+    optional uint32 input_dim = 1 [default = 512];
+    // Per-layer cluster counts, e.g. [256, 256, 256].
+    // List length is the number of residual quantization layers. Entries
+    // may differ per layer (non-uniform codebooks such as [256, 512, 1024]
+    // are supported — the FAISS backend fits a separate ``faiss.Kmeans``
+    // per layer).
+    repeated uint32 codebook = 3;
+    // L2-normalize residuals before each layer.
+    optional bool normalize_residuals = 4 [default = false];
+    // Strictly-typed extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs).
+    optional FaissKmeansConfig faiss_kmeans_kwargs = 5;
+    // Target number of embeddings to reservoir-sample for the FAISS fit.
+    // Bounds host memory regardless of corpus
+    // size. 0 (the default) auto-derives it as max(K) * max_points_per_centroid
+    // (the largest per-layer codebook, for non-uniform codebooks) — exactly
+    // what FAISS subsamples to internally (default 256), so no training points
+    // are wasted.
+    optional uint32 train_sample_size = 6 [default = 0];
+
+    // Name of the item embedding feature inside the input Batch.
+    optional string embedding_feature_name = 40 [default = "item_emb"];
+}

@@ -6,6 +6,7 @@ import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
 import "tzrec/protos/models/general_rank_model.proto";
 import "tzrec/protos/models/generative_model.proto";
+import "tzrec/protos/models/sid_model.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
@@ -78,13 +79,14 @@ message ModelConfig {
 
         RocketLaunching rocket_launching = 500;
 
-        // Generative (causal-LM) models — one family message per LLM family.
-        Qwen2RecLM qwen2_rec_lm = 601;
-    }
+        // SID generation models
+        // (600 is reserved for SidRqvae, arriving in the follow-up PR)
+        SidRqkmeans sid_rqkmeans = 601;
 
-    // Field 600 was the removed v1 offline-tokenized `Qwen2` wrapper —
-    // do not reuse the number.
-    reserved 600;
+        // Generative (causal-LM) models — one family message per LLM family.
+        // 700-block keeps clear of the SID family's 600-block.
+        Qwen2RecLM qwen2_rec_lm = 700;
+    }
 
     optional uint32 num_class = 2 [default = 1];
 
