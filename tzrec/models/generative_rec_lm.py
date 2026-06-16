@@ -83,89 +83,14 @@ class GenerativeRecLM(BaseModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        cfg = self._model_config  # the family message (e.g. Qwen2RecLM)
+        cfg = self._model_config  # family message (e.g. Qwen2RecLM)
         common = cfg.common  # GenerativeRecLMConfig — shared by all families
 
-        # shared proto -> python knobs
-        self._input_name: str = common.user_sequence_feature_name
-        self._label_name: str = common.label_feature_name
-        self._ignore_index: int = int(common.ignore_index)
-        # max history length (SID codes) for activation pre-allocation, taken
-        # from the user-sequence feature's truncation length (the data reader
-        # caps every row at it, so it's the guaranteed upper bound). 0 = off.
-        self._max_seq_length: int = self._input_sequence_length()
-        codebook = list(common.codebook)
-        if len(codebook) == 0:
-            raise ValueError(
-                "GenerativeRecLM: codebook must be non-empty "
-                "(see design §3 — required field)"
-            )
-        # len(codebook) = SID codes per item (answer width); sum = vocab atoms.
-        self._num_levels = len(codebook)
-        sid_atoms = sum(int(c) for c in codebook)
-        pad_mult = int(common.vocab_pad_to_multiple_of) or 128
+        sid_atoms = self._read_common_config(common)
 
-        # backbone + tokenizer (the backbone is family-owned; see _backbone_id)
-        hf_model_id = self._backbone_id()
-        if not hf_model_id:
-            raise ValueError(
-                f"{type(self).__name__}: empty backbone id (see _backbone_id)."
-            )
-        # Build the EMPTY extended architecture only — NO weight download. The
-        # config/tokenizer reads are lightweight (they define the module shapes
-        # and vocab the DCP checkpoint expects); the GB-scale pretrained weights
-        # load exactly once, at cold start, via `init_from_pretrained` (the
-        # PIPELINE is the caller). Every restore/eval/export then fills weights
-        # from DCP and skips the download. See design §1 (import).
-        # NOTE: named `hf_cfg` (not `cfg`) — `cfg` above is the proto family
-        # message consumed by `_build_prompt_tokens` below; do not shadow it.
-        hf_cfg = AutoConfig.from_pretrained(hf_model_id)
-        # from_config respects torch_dtype; keep the stored dtype (bf16) so the
-        # DCP checkpoint's tensors match on load_state_dict. The default upcasts
-        # to fp32 (2x memory on GPU).
-        self.lm = AutoModelForCausalLM.from_config(
-            hf_cfg, torch_dtype=hf_cfg.torch_dtype or torch.bfloat16
-        )
-        if next(self.lm.parameters()).dtype != torch.bfloat16:
-            # Some configs/builders ignore torch_dtype; force bf16 so the empty
-            # arch matches the checkpoint's dtype for DCP load_state_dict.
-            self.lm = self.lm.to(torch.bfloat16)
-        tokenizer = AutoTokenizer.from_pretrained(hf_model_id, use_fast=True)
-
-        # vocab extension: base = tokenizer's next free id BEFORE adding C0..
-        # (use len(tokenizer), NOT config.vocab_size which counts reserved slots).
-        base = len(tokenizer)
-        new_atoms = [f"C{i}" for i in range(sid_atoms)]
-        added = tokenizer.add_tokens(new_atoms)
-        if added != sid_atoms:
-            # The tokenizer already had some Cxxx tokens — we expect a fresh
-            # base, so this would silently break our offset arithmetic.
-            raise RuntimeError(
-                f"GenerativeRecLM: tokenizer was expected to grow by "
-                f"{sid_atoms} new atoms, only added {added}. "
-                f"Aborting to avoid silent SID-token mismatch."
-            )
-        # SID atoms appended directly after the existing vocab (algr's layout);
-        # offset arithmetic is `token = base + (sid - 1)`. Stash the resize
-        # target + pad so `init_from_pretrained` re-extends to the SAME shape.
-        self._target_vocab = base + sid_atoms
-        self._vocab_pad_mult = pad_mult
-        self.lm.resize_token_embeddings(
-            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
-        )
-
-        # keep the extended tokenizer (base vocab + C0..C{sum-1}) so export can
-        # save it alongside the backbone without rebuilding the SID atoms.
+        self.lm = self._build_backbone()
+        tokenizer, base = self._build_extended_tokenizer(sid_atoms)
         self._hf_tokenizer = tokenizer
-
-        # assert C0 landed at the recorded base (the offset arithmetic relies on it)
-        c0_id = tokenizer.convert_tokens_to_ids("C0")
-        if c0_id != base:
-            raise RuntimeError(
-                f"GenerativeRecLM: SID atom layout mismatch — expected "
-                f"C0 at token id {base}, got {c0_id}. "
-                f"Splice arithmetic would produce wrong token ids."
-            )
         self._base_vocab = base
 
         # pad token for the left-padded splice (fall back to eos)
@@ -177,8 +102,83 @@ class GenerativeRecLM(BaseModel):
         self._build_prompt_tokens(tokenizer, cfg)
 
         # one-shot debug dump of the first spliced batch
-        self._smoke_log_once = (os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1")
+        self._smoke_log_once = os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1"
         self._first_predict = True
+
+    def _read_common_config(self, common: Any) -> int:
+        """Parse shared proto knobs into attributes; return the SID atom count."""
+        self._input_name: str = common.user_sequence_feature_name
+        self._label_name: str = common.label_feature_name
+        self._ignore_index: int = int(common.ignore_index)
+        # max history (SID codes) for activation pre-sizing = the user-sequence
+        # feature's truncation length (the reader caps every row at it). 0 = off.
+        self._max_seq_length: int = self._input_sequence_length()
+        codebook = list(common.codebook)
+        if len(codebook) == 0:
+            raise ValueError(
+                "GenerativeRecLM: codebook must be non-empty "
+                "(see design §3 — required field)"
+            )
+        # len(codebook) = SID codes per item (answer width); sum = vocab atoms.
+        self._num_levels = len(codebook)
+        self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of) or 128
+        return sum(int(c) for c in codebook)
+
+    def _build_backbone(self) -> Any:
+        """Build the EMPTY extended architecture in bf16 — no weight download.
+
+        Config reads only define the module shapes the DCP checkpoint expects;
+        the GB-scale pretrained weights load once at cold start via
+        ``init_from_pretrained``, then DCP fills them on every restore/eval.
+        """
+        hf_model_id = self._backbone_id()
+        if not hf_model_id:
+            raise ValueError(
+                f"{type(self).__name__}: empty backbone id (see _backbone_id)."
+            )
+        hf_cfg = AutoConfig.from_pretrained(hf_model_id)
+        # keep the stored dtype (bf16) so the DCP checkpoint's tensors match on
+        # load_state_dict; the default upcasts to fp32 (2x memory on GPU).
+        lm = AutoModelForCausalLM.from_config(
+            hf_cfg, torch_dtype=hf_cfg.torch_dtype or torch.bfloat16
+        )
+        if next(lm.parameters()).dtype != torch.bfloat16:
+            # Some configs/builders ignore torch_dtype; force bf16 to match DCP.
+            lm = lm.to(torch.bfloat16)
+        return lm
+
+    def _build_extended_tokenizer(self, sid_atoms: int) -> tuple[Any, int]:
+        """Add the SID atoms ``C0..C{sid_atoms-1}`` and resize ``self.lm``.
+
+        Returns ``(tokenizer, base)`` where ``base`` is the tokenizer's next free
+        id BEFORE adding the atoms — use ``len(tokenizer)``, NOT
+        ``config.vocab_size`` (which counts reserved slots). The atoms append
+        directly after the existing vocab (algr's layout), so the splice offset
+        is ``token = base + (sid - 1)``.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(self._backbone_id(), use_fast=True)
+        base = len(tokenizer)
+        added = tokenizer.add_tokens([f"C{i}" for i in range(sid_atoms)])
+        if added != sid_atoms:
+            # pre-existing Cxxx tokens would silently break the offset arithmetic.
+            raise RuntimeError(
+                f"GenerativeRecLM: tokenizer was expected to grow by "
+                f"{sid_atoms} new atoms, only added {added}. "
+                f"Aborting to avoid silent SID-token mismatch."
+            )
+        # stash the resize target so init_from_pretrained re-extends identically.
+        self._target_vocab = base + sid_atoms
+        self.lm.resize_token_embeddings(
+            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
+        )
+        c0_id = tokenizer.convert_tokens_to_ids("C0")
+        if c0_id != base:
+            raise RuntimeError(
+                f"GenerativeRecLM: SID atom layout mismatch — expected "
+                f"C0 at token id {base}, got {c0_id}. "
+                f"Splice arithmetic would produce wrong token ids."
+            )
+        return tokenizer, base
 
     def _backbone_id(self) -> str:
         """Family hook: the HF model id to load for ``self.lm``.
