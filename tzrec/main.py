@@ -24,8 +24,6 @@ from torch import distributed as dist
 from torch import nn, optim
 from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
-from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint import load as dcp_load
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.optim.apply_optimizer_in_backward import (
@@ -73,6 +71,7 @@ from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
+from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -467,14 +466,15 @@ def _train_and_evaluate(
             if save_checkpoints_steps > 0 and i_step > 0:
                 if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
-                    ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-                    # also save an HF-loadable copy (GenerativeRecLM family only)
-                    # so intermediate checkpoints are directly inspectable
-                    # without the DCP->HF export round-trip.
-                    if is_rank_zero and hasattr(_model, "export_hf"):
-                        _model.export_hf(
-                            os.path.join(model_dir, f"hf_ckpt-{i_step}")
-                        )
+                    ckpt_manager.save(
+                        i_step,
+                        model,
+                        optimizer,
+                        dataloader_state,
+                    )
+                    # Training writes DCP (+ co-located HF config/tokenizer when
+                    # export_format == HF); HF weights are produced on demand by
+                    # `tzrec.export` (dcp_to_hf) from the self-contained ckpt dir.
                     if eval_dataloader is not None:
                         _evaluate(
                             model,
@@ -493,7 +493,12 @@ def _train_and_evaluate(
         if save_checkpoints_epochs > 0 and i_step > 0:
             if (i_epoch + 1) % save_checkpoints_epochs == 0:
                 last_ckpt_step = i_step
-                ckpt_manager.save(i_step, model, optimizer, dataloader_state)
+                ckpt_manager.save(
+                    i_step,
+                    model,
+                    optimizer,
+                    dataloader_state,
+                )
                 if eval_dataloader is not None:
                     _evaluate(
                         model,
@@ -528,7 +533,12 @@ def _train_and_evaluate(
     if train_config.is_profiling:
         prof.stop()
     if last_ckpt_step != i_step:
-        ckpt_manager.save(i_step, model, optimizer, dataloader_state)
+        ckpt_manager.save(
+            i_step,
+            model,
+            optimizer,
+            dataloader_state,
+        )
         if eval_dataloader is not None:
             _evaluate(
                 model,
@@ -659,6 +669,16 @@ def train_and_evaluate(
         sampler_type=sampler_type,
         batch_size=data_config.batch_size,
     )
+    # Cold-start gate (training-only). `_create_model` builds the EMPTY extended
+    # architecture (GenerativeRecLM: from_config, no weight download). On a fresh
+    # run (no checkpoint to resume/fine-tune — same `ckpt_path is None` signal the
+    # DCP-restore branch at L420-433 keys off) we load the pretrained HF weights
+    # ONCE here, before TrainWrapper/DMP wrapping and before any DCP restore. On
+    # resume/fine-tune (`ckpt_path` set) we skip it: DCP `load_state_dict` fills
+    # the weights. eval/export never reach this path — they always DCP-restore an
+    # empty model. (See design §1.)
+    if ckpt_path is None:
+        model.init_from_pretrained()  # no-op unless the model has a pretrained source
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
@@ -932,6 +952,33 @@ def export(
     if asset_files:
         assets = asset_files.split(",")
 
+    ckpt_manager = checkpoint_util.CheckpointManager(
+        pipeline_config.model_dir, export_config=pipeline_config.export_config
+    )
+    if not checkpoint_path:
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == "best"
+        ):
+            checkpoint_path, _ = ckpt_manager.best_checkpoint()
+        else:
+            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+
+    # Explicit export-format branch (driven by export_config.export_format).
+    # HF: a standalone DCP->HF conversion — NO model build, NO DCP restore, NO
+    # from_pretrained. `dcp_to_hf` reads everything from the self-contained
+    # checkpoint dir (DCP weights + co-located config/tokenizer) and writes a
+    # `from_pretrained`-loadable dir. Done before _create_model so we never
+    # instantiate the model for HF export (design §2).
+    if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
+        if checkpoint_path is None:
+            raise ValueError("HF export: no checkpoint found to convert.")
+        if is_rank_zero:
+            from tzrec.utils.export_util import dcp_to_hf
+
+            dcp_to_hf(checkpoint_path, export_dir)
+        return
+
     data_config = pipeline_config.data_config
 
     # Build feature
@@ -950,36 +997,6 @@ def export(
     # is snapshot from the scalar view.
     model.set_is_inference(True)
     model = InferWrapper(model)
-
-    if not checkpoint_path:
-        ckpt_manager = checkpoint_util.CheckpointManager(
-            pipeline_config.model_dir, export_config=pipeline_config.export_config
-        )
-        if (
-            pipeline_config.HasField("export_config")
-            and pipeline_config.export_config.exporter_type == "best"
-        ):
-            checkpoint_path, _ = ckpt_manager.best_checkpoint()
-        else:
-            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
-
-    # GenerativeRecLM family: export to a HF (from_pretrained-loadable) dir
-    # instead of TorchScript. Overlay the DCP checkpoint (training FQNs are
-    # ``model.lm.<hf_fqn>``) and reuse the model's ``export_hf`` save path — the
-    # same code path as the in-training checkpoint hook, so there is no separate
-    # export tool and no duplicated save.
-    grl_model = model.model
-    if hasattr(grl_model, "export_hf"):
-        ckpt_model_dir = os.path.join(checkpoint_path, "model")
-        lm_sd = grl_model.lm.state_dict()
-        prefixed = {f"model.lm.{k}": v for k, v in lm_sd.items()}
-        dcp_load(prefixed, storage_reader=FileSystemReader(ckpt_model_dir))
-        grl_model.lm.load_state_dict(
-            {k[len("model.lm.") :]: v for k, v in prefixed.items()}
-        )
-        if is_rank_zero:
-            grl_model.export_hf(export_dir)
-        return
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():

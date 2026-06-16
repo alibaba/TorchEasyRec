@@ -306,9 +306,23 @@ class CheckpointManager:
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, int]] = None,
     ) -> str:
-        """Save a checkpoint at the given step, then request an async prune."""
+        """Save a checkpoint at the given step, then request an async prune.
+
+        When ``export_format == HF``, co-locates the HF config + tokenizer (no
+        weights) in this checkpoint dir so each ``model.ckpt-N/`` is
+        self-contained and convertible to HF (design §2); ``write_hf_assets``
+        no-ops for non-HF models, so gating on the export format is enough.
+        """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer)
+        if (
+            self._export_config is not None
+            and self._export_config.export_format == export_pb2.ExportFormat.HF
+        ):
+            # Local import avoids a circular import (export_util imports us).
+            from tzrec.utils.export_util import write_hf_assets
+
+            write_hf_assets(model, ckpt_dir)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
         self.prune()
@@ -723,7 +737,9 @@ def restore_model(
 
 
 def save_model(
-    checkpoint_dir: str, model: nn.Module, optimizer: Optional[optim.Optimizer] = None
+    checkpoint_dir: str,
+    model: nn.Module,
+    optimizer: Optional[optim.Optimizer] = None,
 ) -> None:
     """Save model state.
 

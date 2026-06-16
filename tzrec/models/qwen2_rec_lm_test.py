@@ -196,45 +196,58 @@ class Qwen2RecLMTest(unittest.TestCase):
         m._max_seq_length = 0  # pre-allocation disabled
         self.assertEqual(m._compute_max_total_length(), 0)
 
-    def test_warmup_fires_once_in_training(self) -> None:
+    def test_first_step_pads_to_max_then_actual_length(self) -> None:
         m = _stub()
         m._is_inference = False  # not inference + nn.Module.training=True -> is_train
         m._smoke_log_once = False
         m._input_name, m._label_name = "user_sequence", "label"
         m._max_total_len = 50
         m._pool_warmed = False
-        calls = []
-        m._warmup_alloc = lambda: calls.append(1)
+        seen_lens = []
+
+        def fwd(i, lbl, a):
+            seen_lens.append(i.shape[1])
+            return {"loss": torch.tensor(0.0)}
+
         m._sid_token_rows = lambda jt, expected_width=None, max_codes=None: [
             torch.tensor([100, 101, 102])
         ]
-        m._forward_loss = lambda i, lbl, a: {"loss": torch.tensor(0.0)}
+        m._forward_loss = fwd
         batch = types.SimpleNamespace(
             sequence_dense_features={"user_sequence": None, "label": None}
         )
-        m._predict_train(batch)
-        m._predict_train(batch)
-        self.assertEqual(len(calls), 1)  # one-shot, latched by _pool_warmed
+        m._predict_train(batch)  # first step: pre-size to worst case
+        m._predict_train(batch)  # subsequent step: natural length
+        # one-shot: first step left-pads to _max_total_len, latched by
+        # _pool_warmed; later steps use the actual (shorter) length.
+        self.assertEqual(seen_lens[0], 50)
+        self.assertLess(seen_lens[1], 50)
         self.assertTrue(m._pool_warmed)
 
-    def test_warmup_skipped_when_disabled(self) -> None:
+    def test_no_forced_padding_when_disabled(self) -> None:
         m = _stub()
         m._is_inference = False
         m._smoke_log_once = False
         m._input_name, m._label_name = "user_sequence", "label"
         m._max_total_len = 0  # max_seq_length unset -> pre-allocation off
         m._pool_warmed = False
-        calls = []
-        m._warmup_alloc = lambda: calls.append(1)
+        seen_lens = []
+
+        def fwd(i, lbl, a):
+            seen_lens.append(i.shape[1])
+            return {"loss": torch.tensor(0.0)}
+
         m._sid_token_rows = lambda jt, expected_width=None, max_codes=None: [
             torch.tensor([100, 101, 102])
         ]
-        m._forward_loss = lambda i, lbl, a: {"loss": torch.tensor(0.0)}
+        m._forward_loss = fwd
         batch = types.SimpleNamespace(
             sequence_dense_features={"user_sequence": None, "label": None}
         )
         m._predict_train(batch)
-        self.assertEqual(calls, [])  # never warms up when disabled
+        # disabled: natural length, never forced to max; flag stays unlatched.
+        self.assertLess(seen_lens[0], 50)
+        self.assertFalse(m._pool_warmed)
 
 
 if __name__ == "__main__":

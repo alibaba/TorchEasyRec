@@ -109,31 +109,6 @@ class Qwen2RecLM(GenerativeRecLM):
         )
         return int(frame + self._max_seq_length + self._num_levels)
 
-    def _warmup_alloc(self) -> None:
-        """One-shot: build the CUDA activation pool at the worst case (B, T_max).
-
-        Runs a dummy forward+backward at the configured maximum length so the
-        caching allocator reserves its largest segments up front; every real
-        (shorter) batch is then served from that pool, so it never grows
-        mid-run — which is what stranded segments unevenly across ranks. Fires
-        from the first training step (earliest point the backbone is on-GPU);
-        the throwaway gradients are zeroed before the real step runs.
-        """
-        batch_size = self._batch_size or 1
-        device = self.device
-        tok = self._base_vocab  # C0 — a valid extended-vocab id
-        u_rows = [
-            torch.full((self._max_seq_length,), tok, dtype=torch.long, device=device)
-            for _ in range(batch_size)
-        ]
-        l_rows = [
-            torch.full((self._num_levels,), tok, dtype=torch.long, device=device)
-            for _ in range(batch_size)
-        ]
-        input_ids, labels, attention_mask = self._splice_input_ids(u_rows, l_rows)
-        self._forward_loss(input_ids, labels, attention_mask)["loss"].backward()
-        self.lm.zero_grad(set_to_none=True)
-
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Tokenise the family chat template once; cache as buffers.
 
@@ -179,6 +154,7 @@ class Qwen2RecLM(GenerativeRecLM):
         self,
         user_seq_rows: List[torch.Tensor],
         label_rows: List[torch.Tensor],
+        pad_to: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build ``(input_ids, labels, attention_mask)``, each ``(B, T_max)``.
 
@@ -196,6 +172,10 @@ class Qwen2RecLM(GenerativeRecLM):
 
         ``user_seq_rows`` / ``label_rows`` already hold extended-vocab token ids
         on the model device (see ``_sid_token_rows``).
+
+        ``pad_to`` left-extends every row to at least that length (first-step
+        activation-pool pre-sizing). The supervised tail stays end-aligned, so
+        labels and the suffix-slice are unchanged — only more masked left-pad.
         """
         assert len(user_seq_rows) == len(label_rows)
         A = self._num_levels
@@ -210,7 +190,7 @@ class Qwen2RecLM(GenerativeRecLM):
             ])
             for i in range(len(user_seq_rows))
         ]
-        input_ids, attention_mask = self._left_pad(rows_ids)
+        input_ids, attention_mask = self._left_pad(rows_ids, pad_to=pad_to)
 
         # labels: the supervised tail is fixed-width, so left-padding aligns it
         # to the same columns for every row -> one vectorized write.
@@ -252,12 +232,6 @@ class Qwen2RecLM(GenerativeRecLM):
 
     def _predict_train(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Branch 1: teacher-forced forward -> suffix-slice -> CE loss."""
-        # one-shot: pre-size the activation pool at the worst-case length on the
-        # first on-GPU training step (see _warmup_alloc); no-op once warmed or
-        # when the input feature has no truncation length (pre-allocation off).
-        if not self._pool_warmed and self._max_total_len > 0 and self.is_train:
-            self._warmup_alloc()
-            self._pool_warmed = True
         # SID indices -> token ids once, at the data boundary (see
         # _sid_token_rows); the splice then just assembles the prompt.
         u_rows = self._sid_token_rows(
@@ -269,7 +243,23 @@ class Qwen2RecLM(GenerativeRecLM):
             expected_width=self._num_levels,  # answer = one item = num_levels codes
         )
 
-        input_ids, labels, attention_mask = self._splice_input_ids(u_rows, l_rows)
+        # One-shot pool pre-sizing: on the FIRST training step, pad the splice to
+        # the worst-case length so the caching allocator reserves its largest
+        # (B, T_max) activation segments up front — every shorter batch is then
+        # served from that pool, keeping per-rank reservations uniform (no
+        # mid-run growth, the source of the cross-rank imbalance). This rides the
+        # REAL step: the extra positions are attention-masked and labelled -100,
+        # so loss and gradient are identical to the unpadded batch. Replaces the
+        # old _warmup_alloc, whose separate unscaled forward+backward corrupted
+        # the first optimizer step (the 1.14-flat HR regression).
+        pad_to = 0
+        if not self._pool_warmed and self._max_total_len > 0 and self.is_train:
+            pad_to = self._max_total_len
+            self._pool_warmed = True
+
+        input_ids, labels, attention_mask = self._splice_input_ids(
+            u_rows, l_rows, pad_to=pad_to
+        )
 
         if self._smoke_log_once and self._first_predict:
             print(
@@ -290,11 +280,7 @@ class Qwen2RecLM(GenerativeRecLM):
         labels: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Teacher-forced forward over spliced ids -> suffix-slice -> CE loss.
-
-        Shared by ``_predict_train`` and the ``_warmup_alloc`` dummy step so the
-        pre-allocation reproduces the exact training allocation pattern.
-        """
+        """Teacher-forced forward over spliced ids -> suffix-slice -> CE loss."""
         outputs = self.lm.model(input_ids=input_ids, attention_mask=attention_mask)
         hidden = outputs.last_hidden_state  # (B, T, D)
 
@@ -373,13 +359,17 @@ class Qwen2RecLM(GenerativeRecLM):
         return self._left_pad(rows)
 
     def _left_pad(
-        self, rows: List[torch.Tensor]
+        self, rows: List[torch.Tensor], pad_to: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Left-pad token rows into ``(input_ids, attention_mask)``, ``(B, T_max)``.
 
         Real content is right-aligned, pad at the front. ``attention_mask`` is
         built from ``ones_like(row)`` (not ``!= pad``) so a real trailing eos is
         never masked when ``pad_token_id == eos``.
+
+        ``pad_to`` left-extends the batch to at least that many columns (the
+        first-step activation-pool pre-sizing). Extending on the LEFT keeps the
+        end-aligned supervised tail in place, so labels/suffix-slice are intact.
         """
         input_ids = pad_sequence(
             rows, batch_first=True,
@@ -389,4 +379,13 @@ class Qwen2RecLM(GenerativeRecLM):
             [torch.ones_like(r) for r in rows], batch_first=True,
             padding_value=0, padding_side="left",
         )
+        if pad_to > input_ids.shape[1]:
+            B, extra = input_ids.shape[0], pad_to - input_ids.shape[1]
+            input_ids = torch.cat(
+                [input_ids.new_full((B, extra), self._pad_token_id), input_ids],
+                dim=1,
+            )
+            attention_mask = torch.cat(
+                [attention_mask.new_zeros((B, extra)), attention_mask], dim=1
+            )
         return input_ids, attention_mask

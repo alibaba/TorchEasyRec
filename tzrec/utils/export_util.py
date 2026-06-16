@@ -77,6 +77,188 @@ from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 
+# HF config/tokenizer asset files co-located in each checkpoint dir (no
+# weights) and copied into the converted HF export dir. Missing files are
+# skipped — different tokenizers emit different subsets (e.g. BPE merges vs.
+# sentencepiece vocab).
+_HF_ASSET_FILES = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "added_tokens.json",
+    "special_tokens_map.json",
+)
+
+_HF_EXPORT_META_FILENAME = "hf_export_meta.json"
+
+# Max wrapper layers to unwrap to reach the HF-backed model: DMP(.module) ->
+# TrainWrapper(.model) -> model is 3 hops; 4 is a small cycle guard.
+_MAX_WRAPPER_DEPTH = 4
+
+
+def _unwrap_hf_model(wrapped_model: nn.Module) -> Optional[nn.Module]:
+    """Walk DMP/TrainWrapper layers down to the model exposing ``hf_backbone``.
+
+    Handles DMP (``.module`` -> TrainWrapper), TrainWrapper (``.model`` ->
+    GenerativeRecLM), and the GenerativeRecLM itself. Returns ``None`` if no
+    backbone is found in the wrapper chain (i.e. not an HF-backed model, so
+    callers no-op).
+    """
+    m = wrapped_model
+    for _ in range(_MAX_WRAPPER_DEPTH):
+        if hasattr(m, "hf_backbone"):
+            return m
+        if hasattr(m, "module"):  # DMP / DDP-style wrapper
+            m = m.module
+        elif hasattr(m, "model"):  # Train/Predict/Script wrapper
+            m = m.model
+        else:
+            break
+    return None
+
+
+def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
+    """Co-locate the HF config + tokenizer (NO weights) in a checkpoint dir.
+
+    Writes the architecture (``config.json`` + ``generation_config.json``) and
+    the extended tokenizer alongside the DCP ``model/`` dir so each
+    ``model.ckpt-N/`` is self-describing and convertible to HF independent of
+    the current code (design §2). Also records the backbone's true FQN prefix
+    off the LIVE module graph into ``hf_export_meta.json`` so ``dcp_to_hf`` can
+    strip it without hard-coding a wrapper/attribute convention. Rank 0 only —
+    the dense backbone is data-parallel-replicated, so rank 0 holds it.
+
+    ``wrapped_model`` may be the DMP (``.module.model``), the TrainWrapper
+    (``.model``), or the GenerativeRecLM itself; the inner model is found by
+    walking the wrappers down to the one exposing ``hf_backbone``. The recorded
+    prefix is read off ``wrapped_model.named_modules()`` so it matches the FQNs
+    that ``save_model`` writes from ``wrapped_model.state_dict()``.
+    """
+    if int(os.environ.get("RANK", 0)) != 0:
+        return
+    inner = _unwrap_hf_model(wrapped_model)
+    if inner is None:  # not an HF-backed model -> nothing to co-locate
+        return
+    os.makedirs(save_dir, exist_ok=True)
+
+    backbone = inner.hf_backbone()
+    backbone.config.save_pretrained(save_dir)
+    gen_cfg = getattr(backbone, "generation_config", None)
+    if gen_cfg is not None:
+        gen_cfg.save_pretrained(save_dir)
+    inner.hf_tokenizer().save_pretrained(save_dir)
+
+    # Record the backbone's FQN prefix as it appears in the SAVED state_dict
+    # (data, not a magic string): robust to wrapper/parallelism and to families
+    # that don't name the backbone `self.lm`. `named_modules()` FQNs carry the
+    # DMP/DDP wrapper prefix (e.g. `_dmp_wrapped_module.module.`) that
+    # `state_dict()` strips, so map it through the same helper `save_model`'s
+    # DCP keys went through, or the recorded prefix would not match them.
+    raw_prefix = next(
+        (n for n, m in wrapped_model.named_modules() if m is backbone), ""
+    )
+    prefix = checkpoint_util._strip_dmp_prefix(raw_prefix)
+    meta = {"backbone_state_dict_prefix": prefix + ("." if prefix else "")}
+    with open(os.path.join(save_dir, _HF_EXPORT_META_FILENAME), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
+    """Convert a self-contained checkpoint dir to a ``from_pretrained`` HF dir.
+
+    Standalone — builds no live model and runs no ``from_pretrained`` weight
+    download (design §2). Reads EVERYTHING from the one checkpoint dir:
+    materialize the DCP state dict, map the wrapper-prefixed keys onto the bare
+    HF keys, strict-validate against the architecture built from the co-located
+    ``config.json``, then write safetensors + copy the config/tokenizer. The
+    numbered steps below walk through it.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from torch.distributed.checkpoint.state_dict_loader import (
+        _load_state_dict_from_keys,
+    )
+
+    model_ckpt_path = os.path.join(ckpt_dir, "model")
+    if not os.path.exists(model_ckpt_path):
+        raise RuntimeError(f"dcp_to_hf: model DCP dir [{model_ckpt_path}] not exists.")
+
+    # 1. materialize the full (replicated) DCP state dict into a plain dict.
+    # No keys => load everything; non-distributed => full tensors locally.
+    raw_state: Dict[str, torch.Tensor] = _load_state_dict_from_keys(
+        checkpoint_id=model_ckpt_path
+    )
+
+    # 2. recorded backbone prefix (data, not a magic string); None => derive.
+    meta_path = os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME)
+    prefix: Optional[str] = None
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            prefix = json.load(f).get("backbone_state_dict_prefix")
+
+    # 3. empty backbone from the checkpoint's OWN config -> the target key set.
+    cfg = AutoConfig.from_pretrained(ckpt_dir)
+    empty = AutoModelForCausalLM.from_config(cfg)
+    target_keys: Set[str] = set(empty.state_dict().keys())
+
+    def _strip_recorded_prefix() -> Optional[Dict[str, torch.Tensor]]:
+        """Strip the recorded prefix; None unless it yields an EXACT match."""
+        if not prefix:
+            return None
+        out = {k[len(prefix) :]: v for k, v in raw_state.items() if k.startswith(prefix)}
+        return out if set(out) == target_keys else None
+
+    def _derive_by_suffix() -> Optional[Dict[str, torch.Tensor]]:
+        """Each target key is a unique suffix of exactly one DCP key; None if not."""
+        out: Dict[str, torch.Tensor] = {}
+        for tk in target_keys:
+            matches = [k for k in raw_state if k == tk or k.endswith("." + tk)]
+            if len(matches) != 1:
+                return None
+            out[tk] = raw_state[matches[0]]
+        return out
+
+    # The recorded prefix is a hint, not gospel: if it does not map exactly onto
+    # the architecture (stale metadata, a wrapper/parallelism change since the
+    # checkpoint was written), self-heal by suffix-matching the actual DCP keys
+    # to the architecture's keys -- which is independent of any prefix convention.
+    mapped = _strip_recorded_prefix()
+    if mapped is None:
+        if prefix:
+            logger.warning(
+                f"dcp_to_hf: recorded prefix [{prefix}] did not map exactly onto "
+                "the architecture; deriving the backbone prefix by suffix-matching."
+            )
+        mapped = _derive_by_suffix()
+
+    # STRICT validation: exact 1:1 with the architecture, fail loudly. Reached
+    # only when neither path matched -- a genuine architecture/checkpoint
+    # mismatch, never a silent partial load.
+    if mapped is None or set(mapped.keys()) != target_keys:
+        got = set(mapped.keys()) if mapped is not None else set()
+        missing = sorted(target_keys - got)
+        extra = sorted(got - target_keys)
+        raise RuntimeError(
+            "dcp_to_hf: cannot map the DCP state dict onto the backbone "
+            f"architecture (recorded prefix={prefix!r}). missing={missing[:10]} "
+            f"extra={extra[:10]}. Refusing to write a partially-loaded HF model."
+        )
+
+    # 4. write weights as safetensors. Clone so save_file gets contiguous,
+    # storage-owning tensors.
+    os.makedirs(out_dir, exist_ok=True)
+    mapped = {k: v.contiguous().clone() for k, v in mapped.items()}
+    save_file(mapped, os.path.join(out_dir, "model.safetensors"))
+
+    # 5. copy the co-located HF config + tokenizer assets.
+    for fname in _HF_ASSET_FILES:
+        src = os.path.join(ckpt_dir, fname)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(out_dir, fname))
+
+
 def export_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,

@@ -1,6 +1,14 @@
 syntax = "proto2";
 package tzrec.protos;
 
+// serialization format produced by `tzrec.export`.
+// TORCHSCRIPT: native scripted_model.pt (+ TRT/AOTI), the default.
+// HF: a HuggingFace `from_pretrained`-loadable dir (GenerativeRecLM family).
+enum ExportFormat {
+    TORCHSCRIPT = 0;
+    HF = 1;
+}
+
 message ExportConfig {
     // type of exporter [latest | best] when train_and_evaluation
     // latest: regularly exports the serving graph and checkpoints
@@ -21,4 +29,7 @@ message ExportConfig {
     optional bool cudnn_allow_tf32 = 5 [default = true];
     // whether to use torch.backends.cuda.matmul.allow_tf32
     optional bool cuda_matmul_allow_tf32 = 6 [default = false];
+    // serialization format produced by `tzrec.export`; selects the export
+    // branch in main.export (TORCHSCRIPT native graph vs HF backbone dir).
+    optional ExportFormat export_format = 7 [default = TORCHSCRIPT];
 }

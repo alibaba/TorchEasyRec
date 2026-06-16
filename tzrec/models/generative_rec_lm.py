@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torchmetrics
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -82,10 +82,6 @@ class GenerativeRecLM(BaseModel):
         sample_weights: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
-        # per-rank batch size, threaded from data_config.batch_size by
-        # _create_model (absorbed by BaseModule's **kwargs); used to pre-size
-        # the activation pool. 0 = unknown (e.g. export/predict construction).
-        self._batch_size: int = int(kwargs.get("batch_size") or 0)
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         cfg = self._model_config  # the family message (e.g. Qwen2RecLM)
         common = cfg.common  # GenerativeRecLMConfig — shared by all families
@@ -115,11 +111,25 @@ class GenerativeRecLM(BaseModel):
             raise ValueError(
                 f"{type(self).__name__}: empty backbone id (see _backbone_id)."
             )
-        # torch_dtype="auto" keeps the stored dtype (bf16); the default upcasts
+        # Build the EMPTY extended architecture only — NO weight download. The
+        # config/tokenizer reads are lightweight (they define the module shapes
+        # and vocab the DCP checkpoint expects); the GB-scale pretrained weights
+        # load exactly once, at cold start, via `init_from_pretrained` (the
+        # PIPELINE is the caller). Every restore/eval/export then fills weights
+        # from DCP and skips the download. See design §1 (import).
+        # NOTE: named `hf_cfg` (not `cfg`) — `cfg` above is the proto family
+        # message consumed by `_build_prompt_tokens` below; do not shadow it.
+        hf_cfg = AutoConfig.from_pretrained(hf_model_id)
+        # from_config respects torch_dtype; keep the stored dtype (bf16) so the
+        # DCP checkpoint's tensors match on load_state_dict. The default upcasts
         # to fp32 (2x memory on GPU).
-        self.lm = AutoModelForCausalLM.from_pretrained(
-            hf_model_id, torch_dtype="auto"
+        self.lm = AutoModelForCausalLM.from_config(
+            hf_cfg, torch_dtype=hf_cfg.torch_dtype or torch.bfloat16
         )
+        if next(self.lm.parameters()).dtype != torch.bfloat16:
+            # Some configs/builders ignore torch_dtype; force bf16 so the empty
+            # arch matches the checkpoint's dtype for DCP load_state_dict.
+            self.lm = self.lm.to(torch.bfloat16)
         tokenizer = AutoTokenizer.from_pretrained(hf_model_id, use_fast=True)
 
         # vocab extension: base = tokenizer's next free id BEFORE adding C0..
@@ -136,10 +146,17 @@ class GenerativeRecLM(BaseModel):
                 f"Aborting to avoid silent SID-token mismatch."
             )
         # SID atoms appended directly after the existing vocab (algr's layout);
-        # offset arithmetic is `token = base + (sid - 1)`.
+        # offset arithmetic is `token = base + (sid - 1)`. Stash the resize
+        # target + pad so `init_from_pretrained` re-extends to the SAME shape.
+        self._target_vocab = base + sid_atoms
+        self._vocab_pad_mult = pad_mult
         self.lm.resize_token_embeddings(
-            base + sid_atoms, pad_to_multiple_of=pad_mult
+            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
         )
+
+        # keep the extended tokenizer (base vocab + C0..C{sum-1}) so export can
+        # save it alongside the backbone without rebuilding the SID atoms.
+        self._hf_tokenizer = tokenizer
 
         # assert C0 landed at the recorded base (the offset arithmetic relies on it)
         c0_id = tokenizer.convert_tokens_to_ids("C0")
@@ -171,37 +188,47 @@ class GenerativeRecLM(BaseModel):
         """
         return self._model_config.hf_model_id
 
+    def init_from_pretrained(self) -> None:
+        """Load the pretrained HF backbone weights into ``self.lm``.
+
+        The SINGLE place ``AutoModelForCausalLM.from_pretrained`` runs. The
+        PIPELINE (``tzrec/main.py``) calls this exactly once, only at COLD START
+        (no checkpoint to resume). On resume/eval/export the empty arch built in
+        ``__init__`` is weight-filled by native DCP ``load_state_dict`` instead,
+        so the GB-scale download is skipped. Re-extends the vocab to the SAME
+        target/pad as ``__init__`` so the module shapes stay identical.
+        """
+        # torch_dtype="auto" keeps the stored dtype (bf16); the default upcasts
+        # to fp32 (2x memory on GPU).
+        lm = AutoModelForCausalLM.from_pretrained(
+            self._backbone_id(), torch_dtype="auto"
+        )
+        lm.resize_token_embeddings(
+            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
+        )
+        self.lm = lm
+
     def _input_sequence_length(self) -> int:
         """Truncation length (SID codes) of the user-sequence feature.
 
         The data reader caps every row's history at the feature's
         ``sequence_length``, so it is the guaranteed upper bound used to
-        pre-size the activation pool (see ``Qwen2RecLM._warmup_alloc``). Returns
-        0 if the feature has no length cap, which disables pre-allocation.
+        pre-size the activation pool (see ``Qwen2RecLM._predict_train``'s
+        first-step padding). Returns 0 if the feature has no length cap, which
+        disables pre-allocation.
         """
         for feature in self._features:
             if feature.config.feature_name == self._input_name:
                 return int(getattr(feature, "sequence_length", 0) or 0)
         return 0
 
-    def export_hf(self, export_dir: str) -> None:
-        """Save the HF backbone + extended tokenizer as a HF-loadable dir.
+    def hf_backbone(self):
+        """The HF backbone module (``export_util.write_hf_assets``/``dcp_to_hf``)."""
+        return self.lm
 
-        Single source of truth for HF (``from_pretrained``-loadable) export,
-        reused by BOTH ``main.export`` (the standard TER export path, after it
-        overlays the DCP checkpoint) and the in-training checkpoint hook in
-        ``main._train_and_evaluate`` — so offline and online exports are
-        identical and there is no separate export tool. Call on rank 0 only;
-        the dense backbone is replicated, so rank 0 holds the full weights. The
-        extended tokenizer is rebuilt (base + C0..C{sum-1}) so SID atoms decode
-        with the same ids the model trained on.
-        """
-        os.makedirs(export_dir, exist_ok=True)
-        self.lm.save_pretrained(export_dir)
-        tokenizer = AutoTokenizer.from_pretrained(self._backbone_id(), use_fast=True)
-        sid_atoms = sum(int(c) for c in self._model_config.common.codebook)
-        tokenizer.add_tokens([f"C{i}" for i in range(sid_atoms)])
-        tokenizer.save_pretrained(export_dir)
+    def hf_tokenizer(self):
+        """The extended tokenizer (base vocab + C0..C{sum-1}) to serialize."""
+        return self._hf_tokenizer
 
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Family hook: cache the tokenised prompt template as buffers.
@@ -216,12 +243,26 @@ class GenerativeRecLM(BaseModel):
         )
 
     def init_input(self) -> None:
-        """No-op override.
+        """Build the native sparse EmbeddingGroup only if declared.
 
-        The HF backbone owns its own ``embed_tokens``; we don't use TER's
-        ``EmbeddingGroup`` at all. Token IDs flow through directly.
+        The HF backbone owns its own ``embed_tokens`` and SID token ids flow
+        through it directly, so the dense-only GenerativeRecLM case has no
+        sparse feature groups and keeps ``embedding_group = None`` (the dense
+        forward never touches it). When a future model declares sparse
+        ``feature_groups``, this builds the native ``EmbeddingGroup`` (same as
+        ``RankModel.init_input``) so those params flow through the native
+        planner/DMP/DCP path alongside the replicated backbone.
         """
-        self.embedding_group = None
+        if self._feature_groups:
+            # NOTE: enables the native sparse path for future dense+sparse models.
+            from tzrec.modules.embedding import EmbeddingGroup
+
+            self.embedding_group = EmbeddingGroup(
+                self._features,
+                self._feature_groups,
+            )
+        else:
+            self.embedding_group = None
 
     @property
     def device(self) -> torch.device:

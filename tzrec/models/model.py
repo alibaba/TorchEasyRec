@@ -94,6 +94,16 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         """
         raise NotImplementedError
 
+    def init_from_pretrained(self) -> None:
+        """Load pretrained weights at cold start (no checkpoint to restore).
+
+        Lifecycle hook the training pipeline calls only on a fresh run
+        (``ckpt_path is None``), before distributed wrapping. The default is a
+        no-op; models backed by an external pretrained source (e.g. an HF
+        backbone) override it. Resume/eval/export never reach it -- they restore
+        weights from the checkpoint.
+        """
+
     def init_loss(self) -> None:
         """Initialize loss modules."""
         raise NotImplementedError
