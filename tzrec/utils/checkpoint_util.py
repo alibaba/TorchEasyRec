@@ -335,7 +335,17 @@ class CheckpointManager:
             # Local import avoids a circular import (export_util imports us).
             from tzrec.utils.export_util import write_hf_assets
 
-            write_hf_assets(model, ckpt_dir)
+            # HF assets are convenience metadata; the DCP weights (save_model
+            # above) are already durable. Isolate a failure so it can't abort the
+            # save before the next collective (save_dataloader_state's all_gather)
+            # and one-sidedly hang the other ranks.
+            try:
+                write_hf_assets(model, ckpt_dir)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"write_hf_assets failed for {ckpt_dir}: {e} — checkpoint "
+                    f"weights are saved; skipping HF assets."
+                )
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
         self.prune()

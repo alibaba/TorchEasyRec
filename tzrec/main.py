@@ -131,7 +131,6 @@ def _create_model(
     labels: List[str],
     sample_weights: Optional[List[str]] = None,
     sampler_type: Optional[str] = None,
-    batch_size: Optional[int] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -141,8 +140,6 @@ def _create_model(
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
         sampler_type (str): negative sampler type
-        batch_size (int): per-rank batch size (data_config.batch_size); most
-            models ignore it, generative LMs use it to pre-size their pool.
 
     Return:
         model: a EasyRec Model.
@@ -157,7 +154,6 @@ def _create_model(
         labels,
         sample_weights=sample_weights,
         sampler_type=sampler_type,
-        batch_size=batch_size,
     )
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
@@ -665,7 +661,6 @@ def train_and_evaluate(
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
-        batch_size=data_config.batch_size,
     )
     # Cold-start gate (training-only). `_create_model` builds the EMPTY extended
     # architecture (GenerativeRecLM: from_config, no weight download). On a fresh
@@ -855,7 +850,6 @@ def evaluate(
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
-        batch_size=data_config.batch_size,
     )
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision

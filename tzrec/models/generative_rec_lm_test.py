@@ -55,6 +55,26 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertIs(BaseModel.create_class("Qwen2RecLM"), Qwen2RecLM)
         self.assertTrue(issubclass(Qwen2RecLM, GenerativeRecLM))
 
+    def test_resolve_pad_token_id(self) -> None:
+        tok = types.SimpleNamespace
+        # pad present -> pad
+        self.assertEqual(
+            GenerativeRecLM._resolve_pad_token_id(tok(pad_token_id=5, eos_token_id=9)),
+            5,
+        )
+        # pad absent -> eos fallback
+        self.assertEqual(
+            GenerativeRecLM._resolve_pad_token_id(
+                tok(pad_token_id=None, eos_token_id=9)
+            ),
+            9,
+        )
+        # neither -> a clear error, not an opaque int(None) TypeError
+        with self.assertRaisesRegex(ValueError, "neither pad_token_id nor"):
+            GenerativeRecLM._resolve_pad_token_id(
+                tok(pad_token_id=None, eos_token_id=None)
+            )
+
     def test_backbone_owned_by_family_proto(self) -> None:
         # the backbone lives on the family message (its architecture), NOT in
         # the shared common config; it defaults to the canonical Qwen2.5-0.5B.

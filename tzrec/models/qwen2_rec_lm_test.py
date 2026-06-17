@@ -15,14 +15,20 @@ import unittest
 import torch
 from torch import nn
 
+from tzrec.models.generative_rec_lm_test import _FakeJT
 from tzrec.models.qwen2_rec_lm import Qwen2RecLM
 
 
-def _stub(num_levels=3, base_vocab=100, pad_id=9, device="cpu"):
+def _stub(num_levels=3, base_vocab=100, pad_id=9, device="cpu", per_level=4):
     """A Qwen2RecLM with the splice-relevant state wired up, no HF backbone.
 
     Template buffers use tiny placeholder ids so the spliced layout is easy to
     read; real buffers come from ``_build_prompt_tokens`` at init time.
+
+    ``per_level`` sets the (uniform) codebook size used to derive the per-level
+    SID validity bands the inference gate checks — real bands come from
+    ``_read_common_config``. With ``per_level=4`` / ``num_levels=3`` the bands
+    are lo=[1,5,9], hi=[4,8,12] (level j -> sid in [j*4+1, (j+1)*4]).
     """
     m = object.__new__(Qwen2RecLM)
     nn.Module.__init__(m)
@@ -37,7 +43,23 @@ def _stub(num_levels=3, base_vocab=100, pad_id=9, device="cpu"):
         "tpl_asst_prefix": [14], "tpl_asst_suffix": [15], "tpl_eos": [9],
     }.items():
         m.register_buffer(name, torch.tensor(vals, dtype=torch.long), persistent=False)
+    lo, hi = Qwen2RecLM._sid_level_bands([per_level] * num_levels)
+    m.register_buffer("_sid_lvl_lo", lo, persistent=False)
+    m.register_buffer("_sid_lvl_hi", hi, persistent=False)
     return m
+
+
+def _gen_batch():
+    """A one-row inference batch (history SIDs [1, 2, 3]) for ``_generate`` tests."""
+    return types.SimpleNamespace(
+        sequence_dense_features={"user_sequence": _FakeJT([1, 2, 3], [3])}
+    )
+
+
+def _first_non_neg_index(labels):
+    """The per-step suffix bound _forward_loss's cached _suffix_keep replaces."""
+    tmp = (labels >= 0).cumsum(dim=-1)
+    return int((tmp == 1).float().argmax(dim=-1).min().item())
 
 
 class Qwen2RecLMTest(unittest.TestCase):
@@ -82,9 +104,21 @@ class Qwen2RecLMTest(unittest.TestCase):
         self.assertEqual(int(mask[0, -1]), 1)
         self.assertEqual(mask[0].tolist(), [1] * ids.shape[1])
 
-    def test_min_first_non_neg_index(self) -> None:
-        labels = torch.tensor([[-100, -100, 5, 6], [-100, 7, 8, 9]])
-        self.assertEqual(Qwen2RecLM._min_first_non_neg_index(labels), 1)
+    def test_suffix_keep_matches_dynamic_slice(self) -> None:
+        # _forward_loss caches self._suffix_keep instead of recomputing the suffix
+        # bound per step (two GPU->CPU syncs); prove the constant equals the old
+        # dynamic computation and that the slice drops nothing supervised.
+        m = _stub()  # num_levels=3, asst_suffix=[15] (numel 1) -> suffix_keep=6
+        suffix_keep = m._num_levels + m.tpl_asst_suffix.numel() + 2
+        _, labels, _ = m._splice_input_ids(
+            [torch.tensor([100, 101, 102])], [torch.tensor([200, 201, 202])]
+        )
+        # the constant matches the per-step bound it replaces
+        self.assertEqual(
+            suffix_keep, labels.shape[1] - _first_non_neg_index(labels) + 1
+        )
+        # everything before the kept suffix is unsupervised (-100): nothing dropped
+        self.assertTrue(bool((labels[:, :-suffix_keep] < 0).all()))
 
     def test_splice_prompt_ids(self) -> None:
         m = _stub()
@@ -110,22 +144,62 @@ class Qwen2RecLMTest(unittest.TestCase):
         def fake_generate(input_ids, attention_mask, max_new_tokens,
                           num_beams, num_return_sequences, do_sample, pad_token_id):
             prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
-            new = torch.tensor([[200, 201, 202], [203, 204, 205]])  # 2 beams x 3 codes
+            # 2 beams x 3 codes, every atom INSIDE its level's band
+            # (bands lo=[1,5,9] hi=[4,8,12]; token = sid + 99):
+            #   pos0 token in [100,103], pos1 in [104,107], pos2 in [108,111].
+            new = torch.tensor([[100, 104, 108], [103, 107, 111]])
             return torch.cat([prompt, new], dim=1)
 
         m.lm.generate = fake_generate
-
-        class _JT:
-            def values(self):
-                return torch.tensor([1, 2, 3], dtype=torch.float)
-
-            def lengths(self):
-                return torch.tensor([3])
-
-        batch = types.SimpleNamespace(sequence_dense_features={"user_sequence": _JT()})
-        sids = m._generate(batch)["generated_sids"]
+        sids = m._generate(_gen_batch())["generated_sids"]
         self.assertEqual(tuple(sids.shape), (1, 2, 3))  # (B, num_return, num_levels)
-        self.assertEqual(sids[0].tolist(), [[101, 102, 103], [104, 105, 106]])
+        self.assertEqual(sids[0].tolist(), [[1, 5, 9], [4, 8, 12]])
+
+    def test_generate_rejects_malformed_candidates(self) -> None:
+        # Layer-A gate: every malformed candidate -> the -1 sentinel, in place.
+        # bands lo=[1,5,9] hi=[4,8,12]; token = sid + 99.
+        m = _stub(base_vocab=100)
+        m._input_name = "user_sequence"
+        m._num_beams = m._num_return = 4
+
+        def fake_generate(input_ids, attention_mask, max_new_tokens,
+                          num_beams, num_return_sequences, do_sample, pad_token_id):
+            prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
+            new = torch.tensor([
+                [100, 104, 108],  # all in-band -> valid -> [1, 5, 9]
+                [100, 104, 9],    # pos2 = eos/pad token (sid -90) -> invalid
+                [108, 104, 100],  # wrong-level scramble (pos0 = lvl-2 code) -> invalid
+                [100, 104, 112],  # pos2 sid 13 > band hi 12 -> invalid
+            ])
+            return torch.cat([prompt, new], dim=1)
+
+        m.lm.generate = fake_generate
+        sids = m._generate(_gen_batch())["generated_sids"]
+        self.assertEqual(tuple(sids.shape), (1, 4, 3))
+        # valid candidate kept at its rank; every malformed one -> all -1 (in place)
+        self.assertEqual(
+            sids[0].tolist(),
+            [[1, 5, 9], [-1, -1, -1], [-1, -1, -1], [-1, -1, -1]],
+        )
+
+    def test_generate_narrow_tail_no_crash(self) -> None:
+        # every beam emits EOS before num_levels -> generate() returns a tail
+        # narrower than num_levels; the canvas keeps the reshape rectangular.
+        m = _stub(base_vocab=100)
+        m._input_name = "user_sequence"
+        m._num_beams = m._num_return = 2
+
+        def fake_generate(input_ids, attention_mask, max_new_tokens,
+                          num_beams, num_return_sequences, do_sample, pad_token_id):
+            prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
+            new = torch.tensor([[100, 104], [103, 107]])  # width 2 < num_levels 3
+            return torch.cat([prompt, new], dim=1)
+
+        m.lm.generate = fake_generate
+        sids = m._generate(_gen_batch())["generated_sids"]
+        self.assertEqual(tuple(sids.shape), (1, 2, 3))  # rectangular, no crash
+        # the missing 3rd atom stays -1 -> out of band -> whole candidate -1
+        self.assertEqual(sids[0].tolist(), [[-1, -1, -1], [-1, -1, -1]])
 
     def test_build_prompt_tokens_registers_buffers(self) -> None:
         m = object.__new__(Qwen2RecLM)

@@ -22,3 +22,4 @@ tensorboard
 torch==2.11.0
 torchmetrics==1.0.3
 torchrec==1.6.0
+transformers==4.51.2  # generative-rec LM backbone (HF); pin <5.0 — 5.x flips from_pretrained dtype default to "auto"(bf16)

@@ -6,29 +6,22 @@
 
 """Generic generative-recommendation language-model base for TorchEasyRec.
 
-Implements the FINAL design (see FINAL_DESIGN_GENERATIVE_REC_LM.md):
-
-  * Per-family subclasses (design §2 / G4): ``GenerativeRecLM`` is the
-    abstract base; each LLM family is a concrete subclass implementing the
-    ``_build_prompt_tokens`` and ``predict`` hooks (e.g. ``Qwen2RecLM`` in
-    ``tzrec/models/qwen2_rec_lm.py``). The pipeline config selects the family
-    by its own oneof entry (``qwen2_rec_lm``), whose message-type name resolves
-    directly to the same-named class via the BaseModel registry — no dispatch.
-    Shared config lives in ``GenerativeRecLMConfig`` (the family message's
-    ``common`` field); family-specific knobs sit on the family message.
-  * Streaming sample format: each row carries two raw-int64 sequence features,
-    ``user_sequence`` (list[int]) and ``label`` (list[int]), both holding raw
-    SID indices in ``[1, sum(codebook)]``.
-  * The chat template is tokenised ONCE at ``__init__`` and cached as
-    ``nn.Module`` non-persistent buffers, so per-batch encoding is purely
-    integer arithmetic + tensor concatenation (no HF tokenizer in the hot
-    path).
-  * SID → token id by integer offset: ``token = sid + base_vocab - 1`` (the
-    SID atoms ``C0..C{sum-1}`` are added right after the original vocabulary,
-    no [SEP] in between; matches algr's ``add_tokens`` layout).
-  * Left padding with ``eos_token_id`` (L7 fix from §11 of the design doc) —
-    real content sits at the END of every row so the suffix slice captures
-    only ``[response + end_markers]`` and matches algr's pad-side exactly.
+* Per-family subclasses: ``GenerativeRecLM`` is the abstract base; each LLM
+family is a concrete subclass implementing the ``_build_prompt_tokens`` and
+``predict`` hooks (e.g. ``Qwen2RecLM``). The pipeline config selects the
+family by its own oneof entry, whose message-type name resolves directly to
+the same-named class via the BaseModel registry. Shared config lives in
+``GenerativeRecLMConfig`` (the family message's ``common`` field).
+* Streaming sample format: each row carries two raw-int64 sequence features,
+``user_sequence`` and ``label``, both holding raw SID indices in
+``[1, sum(codebook)]``.
+* The chat template is tokenised ONCE at ``__init__`` and cached as
+non-persistent buffers, so per-batch encoding is integer arithmetic only
+(no HF tokenizer in the hot path).
+* SID -> token id by integer offset: ``token = sid + base_vocab - 1`` (the SID
+atoms ``C0..C{sum-1}`` are added right after the original vocabulary).
+* Left padding with ``eos_token_id``: real content sits at the END of every
+row so the suffix slice captures only ``[response + end_markers]``.
 """
 
 from __future__ import annotations
@@ -49,30 +42,32 @@ from tzrec.protos.model_pb2 import ModelConfig
 class GenerativeRecLM(BaseModel):
     """Abstract base for HF-backed generative-recommendation LMs.
 
-    The base owns the architecture-agnostic plumbing: model construction,
-    SID vocab extension, the shared sample data-prep (``_sid_token_rows`` /
-    ``_tokenize_sids`` — the streaming SID sample contract is the same for all
-    families, design §1), loss, and metrics. The two architecture-specific
-    pieces are abstract hooks that each family subclass implements (§15/§16):
+    The base owns the architecture-agnostic plumbing: model construction, SID
+    vocab extension, the shared sample data-prep (``_sid_token_rows`` /
+    ``_tokenize_sids``), loss, and metrics. Each family subclass implements two
+    architecture-specific hooks:
 
         _build_prompt_tokens(tokenizer, cfg)  — cache the prompt template
         predict(batch)                        — build inputs + HF forward
 
-    Family proto contract: every family message embeds
-    ``GenerativeRecLMConfig common = 1`` (shared config the base reads) and
-    supplies a backbone, by default via an ``hf_model_id`` field (overridable
-    through ``_backbone_id``).
+    Family proto contract: every family message embeds ``GenerativeRecLMConfig
+    common = 1`` and supplies a backbone (by default an ``hf_model_id`` field,
+    overridable via ``_backbone_id``).
 
-    ``Qwen2RecLM`` (``tzrec/models/qwen2_rec_lm.py``) provides the decoder-only
-    chat implementation (ChatML splice + ``.model``/``.lm_head`` forward),
-    reusable by Llama/Mistral/Gemma/Phi-style families; GPT-NeoX/RWKV/Mamba/T5
-    each need their own. Each family registers directly (its oneof message-type
-    name == the class name); there is no ``class_name`` dispatch.
+    ``Qwen2RecLM`` provides the decoder-only chat implementation, reusable by
+    Llama/Mistral/Gemma/Phi-style families; GPT-NeoX/RWKV/Mamba/T5 each need
+    their own. Each family registers directly (oneof message-type name == class
+    name).
     """
 
     # predictions key the inference branch emits generated SIDs under, stable
     # across families (PredictWrapper ``output_cols`` should reference it).
     GENERATED_SIDS_KEY = "generated_sids"
+
+    # Single source of truth for the backbone PARAM dtype: fp32 MASTER weights.
+    # The optimizer needs fp32 to avoid bf16-ULP underflow at small lr; bf16
+    # *compute* comes from mixed_precision:"BF16" autocast, not the param dtype.
+    _PARAM_DTYPE = torch.float32
 
     def __init__(
         self,
@@ -93,17 +88,36 @@ class GenerativeRecLM(BaseModel):
         self._hf_tokenizer = tokenizer
         self._base_vocab = base
 
-        # pad token for the left-padded splice (fall back to eos)
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = tokenizer.eos_token_id
-        self._pad_token_id = int(pad_id)
+        self._pad_token_id = self._resolve_pad_token_id(tokenizer)
 
         self._build_prompt_tokens(tokenizer, cfg)
+
+        # Dense-only: the HF backbone owns its embeddings and SID token ids flow
+        # through it directly (the SEQUENCE feature is consumed as raw token ids in
+        # _sid_token_rows, NOT via an EmbeddingGroup), so there is no native sparse
+        # path. Set explicitly (vs RankModel.init_input) to keep the contract clear.
+        self.embedding_group = None
 
         # one-shot debug dump of the first spliced batch
         self._smoke_log_once = os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1"
         self._first_predict = True
+
+    @staticmethod
+    def _resolve_pad_token_id(tokenizer: Any) -> int:
+        """Pad id for the left-padded splice, falling back to eos.
+
+        Qwen2.5 has both, but the base is reused by Llama/Mistral/Gemma/Phi — fail
+        loudly if a tokenizer has neither rather than an opaque ``int(None)``.
+        """
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+        if pad_id is None:
+            raise ValueError(
+                "GenerativeRecLM: tokenizer has neither pad_token_id nor "
+                "eos_token_id; cannot choose a pad id for the left-padded splice."
+            )
+        return int(pad_id)
 
     def _read_common_config(self, common: Any) -> int:
         """Parse shared proto knobs into attributes; return the SID atom count."""
@@ -115,12 +129,15 @@ class GenerativeRecLM(BaseModel):
         self._max_seq_length: int = self._input_sequence_length()
         codebook = list(common.codebook)
         if len(codebook) == 0:
-            raise ValueError(
-                "GenerativeRecLM: codebook must be non-empty "
-                "(see design §3 — required field)"
-            )
+            raise ValueError("GenerativeRecLM: codebook must be non-empty.")
         # len(codebook) = SID codes per item (answer width); sum = vocab atoms.
         self._num_levels = len(codebook)
+        # Per-level SID validity bands, cached as (num_levels,) buffers so the
+        # inference gate (_validate_sid_candidates) can reject malformed beams with
+        # a vectorized band check and no host sync. Non-persistent: derived config.
+        lo, hi = self._sid_level_bands(codebook)
+        self.register_buffer("_sid_lvl_lo", lo, persistent=False)
+        self.register_buffer("_sid_lvl_hi", hi, persistent=False)
         self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of) or 128
         return sum(int(c) for c in codebook)
 
@@ -137,14 +154,13 @@ class GenerativeRecLM(BaseModel):
                 f"{type(self).__name__}: empty backbone id (see _backbone_id)."
             )
         hf_cfg = AutoConfig.from_pretrained(hf_model_id)
-        # Build in fp32 so the optimizer keeps fp32 MASTER weights. With bf16
-        # params, Adam's small updates (e.g. at lr=1e-5) fall below the bf16 ULP
-        # and round to zero -> weights freeze -> training collapses (the lr1e-5
-        # bug). Use mixed_precision:"BF16" (autocast) for bf16 *compute* speed on
-        # the fp32 master; the DCP checkpoint is then fp32 (consistent on restore).
-        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=torch.float32)
-        if next(lm.parameters()).dtype != torch.float32:
-            lm = lm.to(torch.float32)
+        # Build in fp32 so the optimizer keeps fp32 MASTER weights: with bf16
+        # params, Adam's small updates (e.g. lr=1e-5) fall below the bf16 ULP and
+        # round to zero, freezing the weights. Use mixed_precision:"BF16" for bf16
+        # compute speed; the DCP checkpoint stays fp32 (consistent on restore).
+        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._PARAM_DTYPE)
+        if next(lm.parameters()).dtype != self._PARAM_DTYPE:
+            lm = lm.to(self._PARAM_DTYPE)
         return lm
 
     def _build_extended_tokenizer(self, sid_atoms: int) -> tuple[Any, int]:
@@ -153,8 +169,8 @@ class GenerativeRecLM(BaseModel):
         Returns ``(tokenizer, base)`` where ``base`` is the tokenizer's next free
         id BEFORE adding the atoms — use ``len(tokenizer)``, NOT
         ``config.vocab_size`` (which counts reserved slots). The atoms append
-        directly after the existing vocab (algr's layout), so the splice offset
-        is ``token = base + (sid - 1)``.
+        directly after the existing vocab, so the splice offset is
+        ``token = base + (sid - 1)``.
         """
         tokenizer = AutoTokenizer.from_pretrained(self._backbone_id(), use_fast=True)
         base = len(tokenizer)
@@ -198,12 +214,11 @@ class GenerativeRecLM(BaseModel):
         so the GB-scale download is skipped. Re-extends the vocab to the SAME
         target/pad as ``__init__`` so the module shapes stay identical.
         """
-        # Load fp32 (master weights), NOT torch_dtype="auto" (which keeps the
-        # backbone's stored bf16): bf16 params underflow Adam's lr=1e-5 updates ->
-        # collapse; fp32 master fixes it. Must match _build_backbone's fp32 so the
-        # cold-start and restore arches agree. mixed_precision:"BF16" -> bf16 compute.
+        # Load fp32 master weights, NOT torch_dtype="auto" (which keeps the stored
+        # bf16): bf16 params underflow Adam's lr=1e-5 updates. Must match
+        # _build_backbone's fp32 so the cold-start and restore arches agree.
         lm = AutoModelForCausalLM.from_pretrained(
-            self._backbone_id(), torch_dtype=torch.float32
+            self._backbone_id(), torch_dtype=self._PARAM_DTYPE
         )
         lm.resize_token_embeddings(
             self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
@@ -244,28 +259,6 @@ class GenerativeRecLM(BaseModel):
             f"(GenerativeRecLM is abstract)."
         )
 
-    def init_input(self) -> None:
-        """Build the native sparse EmbeddingGroup only if declared.
-
-        The HF backbone owns its own ``embed_tokens`` and SID token ids flow
-        through it directly, so the dense-only GenerativeRecLM case has no
-        sparse feature groups and keeps ``embedding_group = None`` (the dense
-        forward never touches it). When a future model declares sparse
-        ``feature_groups``, this builds the native ``EmbeddingGroup`` (same as
-        ``RankModel.init_input``) so those params flow through the native
-        planner/DMP/DCP path alongside the replicated backbone.
-        """
-        if self._feature_groups:
-            # NOTE: enables the native sparse path for future dense+sparse models.
-            from tzrec.modules.embedding import EmbeddingGroup
-
-            self.embedding_group = EmbeddingGroup(
-                self._features,
-                self._feature_groups,
-            )
-        else:
-            self.embedding_group = None
-
     @property
     def device(self) -> torch.device:
         """Device the HF backbone runs on — the single source for model I/O."""
@@ -280,6 +273,48 @@ class GenerativeRecLM(BaseModel):
         """
         return sids + (self._base_vocab - 1)
 
+    @staticmethod
+    def _sid_level_bands(codebook: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-level closed SID bands ``(lo, hi)`` as ``(num_levels,)`` long tensors.
+
+        Level ``j`` occupies a DISJOINT band ``[offset_j + 1, offset_j +
+        codebook[j]]`` where ``offset_j = sum(codebook[:j])``. Single source of
+        truth: both ``_read_common_config`` and the tests build bands from this.
+        """
+        lo, hi, acc = [], [], 0
+        for c in codebook:
+            lo.append(acc + 1)
+            hi.append(acc + int(c))
+            acc += int(c)
+        return (
+            torch.tensor(lo, dtype=torch.long),
+            torch.tensor(hi, dtype=torch.long),
+        )
+
+    def _validate_sid_candidates(
+        self, new_tokens: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
+        """Map a generated token tail back to SIDs and reject malformed candidates.
+
+        Inference-side counterpart of ``_tokenize_sids``. ``new_tokens`` is the
+        per-beam generated tail ``(B*num_return, w)`` (``w`` may be < ``num_levels``
+        when beams stop early). Returns ``(batch_size, num_return, num_levels)`` raw
+        SIDs with every MALFORMED candidate set to the ``-1`` sentinel — early EOS,
+        a non-SID token, or a wrong-level atom (outside THAT level's band). ``-1``
+        can never match a real item, and the fixed-width canvas keeps the reshape
+        rectangular even when every beam stopped early.
+        """
+        sids = new_tokens - (self._base_vocab - 1)
+        canvas = sids.new_full((sids.shape[0], self._num_levels), -1)
+        w = min(sids.shape[1], self._num_levels)
+        canvas[:, :w] = sids[:, :w]
+        in_band = (canvas >= self._sid_lvl_lo) & (canvas <= self._sid_lvl_hi)
+        canvas[~in_band.all(dim=1)] = -1
+        # view groups beams under the right user (generate() returns rows
+        # batch-major: [b0_beam0, b0_beam1, ..., b1_beam0, ...]); the in-place mask
+        # above preserves that order (no filter/scatter that would scramble it).
+        return canvas.view(batch_size, -1, self._num_levels)
+
     def _sid_token_rows(
         self,
         jt,
@@ -288,23 +323,17 @@ class GenerativeRecLM(BaseModel):
     ) -> List[torch.Tensor]:
         """Read a SID jagged feature -> per-row token-id tensors.
 
-        TER delivers the feature as a JaggedTensor (flat ``values`` +
-        ``lengths``); ``values`` may arrive as float / shape ``(N, 1)``. The
-        whole batch is tokenized once (``_tokenize_sids``) on the backbone
-        device, then split into rows.
+        TER delivers the feature as a JaggedTensor (flat ``values`` + ``lengths``);
+        ``values`` may arrive as float / shape ``(N, 1)``. The whole batch is
+        tokenized once on the backbone device, then split into rows.
 
-        ``expected_width``, when set, enforces the sample contract here at the
-        data boundary: every row must have exactly that many codes (e.g. the
-        answer = ``num_levels``); a deviation is an anomalous sample.
+        ``expected_width``, when set, enforces the sample contract: every row must
+        have exactly that many codes (the answer = ``num_levels``).
 
-        ``max_codes``, when set, caps each row to its most-recent whole items —
-        the last ``floor(max_codes / num_levels) * num_levels`` codes, dropping
-        the oldest *head* (sequences are oldest->newest, so recent behaviour is
-        preserved). FG_NONE does not truncate, so this is what actually enforces
-        the feature's ``sequence_length`` — guaranteeing the pre-allocated pool
-        covers every batch. Done on host views before the H2D copy, and skipped
-        entirely unless some row overflows, so it's free in the common case and
-        shrinks downstream work (and forward ``T``) when it fires.
+        ``max_codes``, when set, caps each row to its most-recent whole items (the
+        last ``floor(max_codes / num_levels) * num_levels`` codes, dropping the
+        oldest head) so the pre-allocated pool covers every batch. Done on host
+        views before the H2D copy, skipped unless a row overflows.
         """
         values = jt.values()
         lengths = jt.lengths()
