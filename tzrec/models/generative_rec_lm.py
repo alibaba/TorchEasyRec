@@ -30,6 +30,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 import torchmetrics
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -301,19 +302,21 @@ class GenerativeRecLM(BaseModel):
         when beams stop early). Returns ``(batch_size, num_return, num_levels)`` raw
         SIDs with every MALFORMED candidate set to the ``-1`` sentinel — early EOS,
         a non-SID token, or a wrong-level atom (outside THAT level's band). ``-1``
-        can never match a real item, and the fixed-width canvas keeps the reshape
+        can never match a real item, and the fixed-width padding keeps the reshape
         rectangular even when every beam stopped early.
         """
         sids = new_tokens - (self._base_vocab - 1)
-        canvas = sids.new_full((sids.shape[0], self._num_levels), -1)
-        w = min(sids.shape[1], self._num_levels)
-        canvas[:, :w] = sids[:, :w]
-        in_band = (canvas >= self._sid_lvl_lo) & (canvas <= self._sid_lvl_hi)
-        canvas[~in_band.all(dim=1)] = -1
+        # pad each candidate to exactly num_levels with the -1 sentinel (an
+        # early-EOS beam returns fewer tokens) so the reshape stays rectangular.
+        sids = F.pad(sids, (0, self._num_levels - sids.shape[1]), value=-1)
+        # valid only if every position-j atom is in level j's band; any violation
+        # invalidates the WHOLE candidate -> -1.
+        invalid = ((sids < self._sid_lvl_lo) | (sids > self._sid_lvl_hi)).any(dim=1)
+        sids = sids.masked_fill(invalid.unsqueeze(1), -1)
         # view groups beams under the right user (generate() returns rows
-        # batch-major: [b0_beam0, b0_beam1, ..., b1_beam0, ...]); the in-place mask
-        # above preserves that order (no filter/scatter that would scramble it).
-        return canvas.view(batch_size, -1, self._num_levels)
+        # batch-major: [b0_beam0, b0_beam1, ..., b1_beam0, ...]); the row-wise mask
+        # preserves that order (no filter/scatter that would scramble it).
+        return sids.view(batch_size, -1, self._num_levels)
 
     def _sid_token_rows(
         self,
