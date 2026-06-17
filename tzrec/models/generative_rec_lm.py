@@ -123,7 +123,8 @@ class GenerativeRecLM(BaseModel):
         self._label_name: str = common.label_feature_name
         self._ignore_index: int = int(common.ignore_index)
         # max history (SID codes) for activation pre-sizing = the user-sequence
-        # feature's truncation length (the reader caps every row at it). 0 = off.
+        # feature's sequence_length. FG_NONE doesn't truncate, so _sid_token_rows
+        # enforces this cap (item-aligned) model-side. 0 = off.
         self._max_seq_length: int = self._input_sequence_length()
         codebook = list(common.codebook)
         if len(codebook) == 0:
@@ -218,13 +219,12 @@ class GenerativeRecLM(BaseModel):
         self.lm = lm
 
     def _input_sequence_length(self) -> int:
-        """Truncation length (SID codes) of the user-sequence feature.
+        """The user-sequence feature's ``sequence_length`` (SID codes), or 0.
 
-        The data reader caps every row's history at the feature's
-        ``sequence_length``, so it is the guaranteed upper bound used to
-        pre-size the activation pool (see ``Qwen2RecLM._predict_train``'s
-        first-step padding). Returns 0 if the feature has no length cap, which
-        disables pre-allocation.
+        FG_NONE does NOT truncate, so this is the cap ``_sid_token_rows`` enforces
+        model-side (item-aligned), and the upper bound the activation pool is
+        pre-sized to (see ``Qwen2RecLM._predict_train``). 0 if the feature has no
+        length cap, which disables pre-allocation.
         """
         for feature in self._features:
             if feature.config.feature_name == self._input_name:
