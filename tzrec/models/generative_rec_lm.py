@@ -264,6 +264,10 @@ class GenerativeRecLM(BaseModel):
         """
         return sids + (self._base_vocab - 1)
 
+    def _detokenize_sids(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Inverse of ``_tokenize_sids``: token id -> raw 1-indexed SID."""
+        return tokens - (self._base_vocab - 1)
+
     @staticmethod
     def _sid_level_bands(codebook: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-level closed SID bands ``(lo, hi)`` as ``(num_levels,)`` long tensors.
@@ -292,7 +296,7 @@ class GenerativeRecLM(BaseModel):
         num_levels)`` SIDs with every malformed candidate (early EOS / non-SID /
         wrong-level atom) set to ``-1`` — which can never match a real item.
         """
-        sids = new_tokens - (self._base_vocab - 1)
+        sids = self._detokenize_sids(new_tokens)
         # pad each candidate to exactly num_levels with the -1 sentinel (an
         # early-EOS beam returns fewer tokens) so the reshape stays rectangular.
         sids = F.pad(sids, (0, self._num_levels - sids.shape[1]), value=-1)
