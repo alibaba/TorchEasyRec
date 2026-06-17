@@ -125,7 +125,7 @@ class GenerativeRecLM(BaseModel):
         return sum(int(c) for c in codebook)
 
     def _build_backbone(self) -> Any:
-        """Build the EMPTY extended architecture in bf16 — no weight download.
+        """Build the EMPTY extended architecture in fp32 (master) — no download.
 
         Config reads only define the module shapes the DCP checkpoint expects;
         the GB-scale pretrained weights load once at cold start via
@@ -137,14 +137,14 @@ class GenerativeRecLM(BaseModel):
                 f"{type(self).__name__}: empty backbone id (see _backbone_id)."
             )
         hf_cfg = AutoConfig.from_pretrained(hf_model_id)
-        # keep the stored dtype (bf16) so the DCP checkpoint's tensors match on
-        # load_state_dict; the default upcasts to fp32 (2x memory on GPU).
-        lm = AutoModelForCausalLM.from_config(
-            hf_cfg, torch_dtype=hf_cfg.torch_dtype or torch.bfloat16
-        )
-        if next(lm.parameters()).dtype != torch.bfloat16:
-            # Some configs/builders ignore torch_dtype; force bf16 to match DCP.
-            lm = lm.to(torch.bfloat16)
+        # Build in fp32 so the optimizer keeps fp32 MASTER weights. With bf16
+        # params, Adam's small updates (e.g. at lr=1e-5) fall below the bf16 ULP
+        # and round to zero -> weights freeze -> training collapses (the lr1e-5
+        # bug). Use mixed_precision:"BF16" (autocast) for bf16 *compute* speed on
+        # the fp32 master; the DCP checkpoint is then fp32 (consistent on restore).
+        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=torch.float32)
+        if next(lm.parameters()).dtype != torch.float32:
+            lm = lm.to(torch.float32)
         return lm
 
     def _build_extended_tokenizer(self, sid_atoms: int) -> tuple[Any, int]:
@@ -198,10 +198,12 @@ class GenerativeRecLM(BaseModel):
         so the GB-scale download is skipped. Re-extends the vocab to the SAME
         target/pad as ``__init__`` so the module shapes stay identical.
         """
-        # torch_dtype="auto" keeps the stored dtype (bf16); the default upcasts
-        # to fp32 (2x memory on GPU).
+        # Load fp32 (master weights), NOT torch_dtype="auto" (which keeps the
+        # backbone's stored bf16): bf16 params underflow Adam's lr=1e-5 updates ->
+        # collapse; fp32 master fixes it. Must match _build_backbone's fp32 so the
+        # cold-start and restore arches agree. mixed_precision:"BF16" -> bf16 compute.
         lm = AutoModelForCausalLM.from_pretrained(
-            self._backbone_id(), torch_dtype="auto"
+            self._backbone_id(), torch_dtype=torch.float32
         )
         lm.resize_token_embeddings(
             self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
