@@ -10,6 +10,8 @@
 # limitations under the License.
 
 import os
+import re
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pyarrow as pa
@@ -28,8 +30,34 @@ from tzrec.utils.logging_util import logger
 _CONSUMER = "delta_embedding_dump"
 
 
+@dataclass(frozen=True)
+class _TableShardInfo:
+    row_offset: int = 0
+    column_offset: int = 0
+    local_rows: int = 0
+    local_cols: int = 0
+    global_rows: int = 0
+    global_cols: int = 0
+    has_shard_metadata: bool = False
+
+
+@dataclass(frozen=True)
+class _TableWeight:
+    tensor: torch.Tensor
+    shard_info: _TableShardInfo
+
+
 def _is_enabled(config: DeltaEmbeddingDumpConfig) -> bool:
     return config is not None and config.enable
+
+
+def _distributed_rank_world_size() -> Tuple[int, int]:
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+    return rank, world_size
 
 
 def validate_delta_embedding_dump_config(
@@ -38,13 +66,10 @@ def validate_delta_embedding_dump_config(
     """Validate runtime constraints for delta embedding dump."""
     if not _is_enabled(config):
         return
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size()
-    if world_size != 1 or device.type != "cuda":
+    if device.type != "cuda":
         raise ValueError(
-            "delta_embedding_dump_config only supports single GPU training "
-            f"for now, but got WORLD_SIZE={world_size}, device={device}."
+            "delta_embedding_dump_config only supports CUDA training, "
+            f"but got device={device}."
         )
     if config.dump_interval_steps <= 0:
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
@@ -99,14 +124,152 @@ def _feature_name(feature_names: Iterable[str]) -> str:
     return ",".join(names)
 
 
-def _local_tensor(value: Any) -> torch.Tensor:
+def _int_attr(value: Any, name: str) -> int:
+    attr = getattr(value, name, 0)
+    return int(attr) if attr is not None else 0
+
+
+def _metadata_shard_info(metadata: Any) -> _TableShardInfo:
+    if metadata is None or not hasattr(metadata, "shard_offsets"):
+        return _TableShardInfo()
+    offsets = getattr(metadata, "shard_offsets", [])
+    sizes = getattr(metadata, "shard_sizes", [])
+    return _TableShardInfo(
+        row_offset=int(offsets[0]) if len(offsets) > 0 else 0,
+        column_offset=int(offsets[1]) if len(offsets) > 1 else 0,
+        local_rows=int(sizes[0]) if len(sizes) > 0 else 0,
+        local_cols=int(sizes[1]) if len(sizes) > 1 else 0,
+        has_shard_metadata=True,
+    )
+
+
+def _placement_rank(placement: Any) -> Optional[int]:
+    if placement is None:
+        return None
+    rank_fn = getattr(placement, "rank", None)
+    if callable(rank_fn):
+        rank = rank_fn()
+        if rank is not None:
+            return int(rank)
+    match = re.search(r"rank:(\d+)", str(placement))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _table_shard_info_from_parameter_sharding(
+    parameter_sharding: Any, rank: int
+) -> _TableShardInfo:
+    sharding_spec = getattr(parameter_sharding, "sharding_spec", None)
+    shards = getattr(sharding_spec, "shards", None)
+    if not shards:
+        return _TableShardInfo()
+
+    ranks = getattr(parameter_sharding, "ranks", None)
+    for idx, shard in enumerate(shards):
+        placement_rank = _placement_rank(getattr(shard, "placement", None))
+        if placement_rank == rank:
+            return _metadata_shard_info(shard)
+        if ranks is not None and idx < len(ranks) and ranks[idx] == rank:
+            return _metadata_shard_info(shard)
+
+    if ranks is None and 0 <= rank < len(shards):
+        return _metadata_shard_info(shards[rank])
+    return _TableShardInfo()
+
+
+def _merge_shard_info(
+    primary: _TableShardInfo, fallback: _TableShardInfo
+) -> _TableShardInfo:
+    primary_has_offsets = primary.has_shard_metadata
+    return _TableShardInfo(
+        row_offset=primary.row_offset if primary_has_offsets else fallback.row_offset,
+        column_offset=(
+            primary.column_offset if primary_has_offsets else fallback.column_offset
+        ),
+        local_rows=primary.local_rows or fallback.local_rows,
+        local_cols=primary.local_cols or fallback.local_cols,
+        global_rows=primary.global_rows or fallback.global_rows,
+        global_cols=primary.global_cols or fallback.global_cols,
+        has_shard_metadata=primary.has_shard_metadata or fallback.has_shard_metadata,
+    )
+
+
+def _table_shard_info_from_config(table_config: Any) -> _TableShardInfo:
+    metadata_info = _metadata_shard_info(getattr(table_config, "local_metadata", None))
+    config_info = _TableShardInfo(
+        local_rows=_int_attr(table_config, "local_rows"),
+        local_cols=_int_attr(table_config, "local_cols"),
+        global_rows=_int_attr(table_config, "num_embeddings"),
+        global_cols=_int_attr(table_config, "embedding_dim"),
+    )
+    return _merge_shard_info(config_info, metadata_info)
+
+
+def _table_shard_info_from_tensor(
+    tensor: torch.Tensor, shard_info: Optional[_TableShardInfo] = None
+) -> _TableShardInfo:
+    tensor_info = _TableShardInfo(
+        local_rows=tensor.size(0) if tensor.dim() > 0 else 0,
+        local_cols=tensor.size(1) if tensor.dim() > 1 else 0,
+        global_rows=tensor.size(0) if tensor.dim() > 0 else 0,
+        global_cols=tensor.size(1) if tensor.dim() > 1 else 0,
+    )
+    if shard_info is None:
+        return tensor_info
+    return _merge_shard_info(shard_info, tensor_info)
+
+
+def _validate_table_shard_info(table_name: str, shard_info: _TableShardInfo) -> None:
+    if shard_info.column_offset != 0 or (
+        shard_info.local_cols > 0
+        and shard_info.global_cols > 0
+        and shard_info.local_cols != shard_info.global_cols
+    ):
+        raise ValueError(
+            "delta_embedding_dump_config does not support column-wise "
+            "embedding sharding. Please use table-wise, row-wise, or "
+            f"data-parallel sharding for table {table_name}. "
+            f"local_cols={shard_info.local_cols}, "
+            f"global_cols={shard_info.global_cols}, "
+            f"column_offset={shard_info.column_offset}."
+        )
+
+
+def _shard_info_quality(shard_info: _TableShardInfo) -> Tuple[bool, bool, bool, bool]:
+    return (
+        shard_info.has_shard_metadata,
+        shard_info.row_offset != 0,
+        shard_info.global_rows > 0 and shard_info.global_cols > 0,
+        shard_info.local_rows > 0 and shard_info.local_cols > 0,
+    )
+
+
+def _merge_table_shard_info(
+    existing: Optional[_TableShardInfo], new_info: _TableShardInfo
+) -> _TableShardInfo:
+    if existing is None:
+        return new_info
+    if _shard_info_quality(new_info) >= _shard_info_quality(existing):
+        return _merge_shard_info(new_info, existing)
+    return _merge_shard_info(existing, new_info)
+
+
+def _local_table_weight(
+    value: Any, shard_info: Optional[_TableShardInfo] = None
+) -> _TableWeight:
     if isinstance(value, ShardedTensor):
         shards = value.local_shards()
         if len(shards) != 1:
             raise ValueError(
                 "delta embedding dump only supports one local shard per table."
             )
-        return shards[0].tensor
+        info = _merge_shard_info(
+            shard_info or _TableShardInfo(),
+            _metadata_shard_info(getattr(shards[0], "metadata", None)),
+        )
+        info = _table_shard_info_from_tensor(shards[0].tensor, info)
+        return _TableWeight(tensor=shards[0].tensor, shard_info=info)
     if hasattr(value, "to_local"):
         local_value = value.to_local()
         if hasattr(local_value, "local_shards"):
@@ -115,11 +278,18 @@ def _local_tensor(value: Any) -> torch.Tensor:
                 raise ValueError(
                     "delta embedding dump only supports one local shard per table."
                 )
-            return shards[0].tensor
+            info = _merge_shard_info(
+                shard_info or _TableShardInfo(),
+                _metadata_shard_info(getattr(shards[0], "metadata", None)),
+            )
+            info = _table_shard_info_from_tensor(shards[0].tensor, info)
+            return _TableWeight(tensor=shards[0].tensor, shard_info=info)
         if isinstance(local_value, torch.Tensor):
-            return local_value
+            info = _table_shard_info_from_tensor(local_value, shard_info)
+            return _TableWeight(tensor=local_value, shard_info=info)
     if isinstance(value, torch.Tensor):
-        return value
+        info = _table_shard_info_from_tensor(value, shard_info)
+        return _TableWeight(tensor=value, shard_info=info)
     raise TypeError(f"Unsupported embedding table value type: {type(value)}")
 
 
@@ -139,13 +309,14 @@ class DeltaEmbeddingDumper:
         self._interval = config.dump_interval_steps
         self._zch_feature_names = zch_feature_names or set()
         self._zch_table_names = zch_table_names or set()
-        self._batches_seen = 0
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
         self._file_prefix = config.file_prefix or "delta_embedding"
+        self._rank, self._world_size = _distributed_rank_world_size()
         os.makedirs(self._output_dir, exist_ok=True)
 
+        self._validate_supported_table_sharding()
         self._tracker = ModelDeltaTrackerTrec(
             model,
             consumers=[_CONSUMER],
@@ -172,9 +343,12 @@ class DeltaEmbeddingDumper:
             )
 
         logger.info(
-            "Delta embedding dump enabled: interval=%s output_dir=%s tables=%s",
+            "Delta embedding dump enabled: interval=%s output_dir=%s "
+            "rank=%s/%s tables=%s",
             self._interval,
             self._output_dir,
+            self._rank,
+            self._world_size,
             sorted(self._table_to_fqn.keys()),
         )
 
@@ -183,9 +357,8 @@ class DeltaEmbeddingDumper:
         self._tracker.clear(_CONSUMER)
 
     def maybe_dump(self, global_step: int) -> None:
-        """Dump on the configured batch interval and advance the tracker window."""
-        self._batches_seen += 1
-        if self._batches_seen % self._interval == 0:
+        """Dump on the configured global-step interval and advance tracker state."""
+        if global_step > 0 and global_step % self._interval == 0:
             self.dump(global_step)
         self._tracker.step()
 
@@ -203,18 +376,31 @@ class DeltaEmbeddingDumper:
         if not rows:
             logger.info("No delta embedding rows to dump at step %s.", global_step)
             return None
-        output_path = os.path.join(
-            self._output_dir, f"{self._file_prefix}_step_{global_step}.parquet"
-        )
+        output_path = self._output_path(global_step)
         self._write_rows(rows, output_path)
         logger.info("Dumped %s delta embedding rows to %s.", len(rows), output_path)
         return output_path
+
+    def _output_path(self, global_step: int) -> str:
+        if self._world_size == 1:
+            return os.path.join(
+                self._output_dir, f"{self._file_prefix}_step_{global_step}.parquet"
+            )
+        step_dir = os.path.join(self._output_dir, f"step_{global_step}")
+        os.makedirs(step_dir, exist_ok=True)
+        return os.path.join(
+            step_dir,
+            (
+                f"{self._file_prefix}_step_{global_step}_rank_{self._rank}"
+                f"_of_{self._world_size}.parquet"
+            ),
+        )
 
     def _append_model_delta_rows(
         self,
         rows: List[Dict[str, Any]],
         global_step: int,
-        table_weights: Dict[str, torch.Tensor],
+        table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
     ) -> None:
         for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
@@ -228,20 +414,19 @@ class DeltaEmbeddingDumper:
                 logger.warning("Skip delta rows for unknown table fqn: %s", fqn)
                 continue
             ids = ids.unique(sorted=True)
-            embeddings, found_mask = self._lookup_embeddings(
+            embeddings, key_ids = self._lookup_embeddings(
                 table_name,
                 ids,
                 table_weights=table_weights,
                 dynamic_modules=dynamic_modules,
             )
-            ids = ids[found_mask]
             feature_name = _feature_name(self._fqn_to_feature_names.get(fqn, []))
             self._extend_rows(
                 rows,
                 global_step=global_step,
                 feature_name=feature_name,
                 table_fqn=fqn,
-                key_ids=ids,
+                key_ids=key_ids,
                 embeddings=embeddings,
                 source="model_delta_tracker",
             )
@@ -250,7 +435,7 @@ class DeltaEmbeddingDumper:
         self,
         table_name: str,
         ids: torch.Tensor,
-        table_weights: Dict[str, torch.Tensor],
+        table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dynamic_module = dynamic_modules.get(table_name)
@@ -258,14 +443,17 @@ class DeltaEmbeddingDumper:
             return self._lookup_dynamic_embeddings(dynamic_module, table_name, ids)
         if table_name not in table_weights:
             raise KeyError(f"Embedding table {table_name} not found in sharded model.")
-        weight = table_weights[table_name]
+        table_weight = table_weights[table_name]
+        _validate_table_shard_info(table_name, table_weight.shard_info)
+        self._validate_row_shard_metadata(table_name, table_weight.shard_info)
+        weight = table_weight.tensor
         ids = ids.to(weight.device, dtype=torch.long)
         if ids.numel() == 0:
             return (
                 torch.empty(
                     0, weight.size(1), device=weight.device, dtype=weight.dtype
                 ),
-                torch.empty(0, device=weight.device, dtype=torch.bool),
+                torch.empty(0, device=weight.device, dtype=torch.int64),
             )
         valid_mask = (ids >= 0) & (ids < weight.size(0))
         if not bool(valid_mask.all().item()):
@@ -275,7 +463,9 @@ class DeltaEmbeddingDumper:
                 table_name,
                 weight.size(0),
             )
-        return weight[ids[valid_mask]].detach(), valid_mask
+        local_ids = ids[valid_mask]
+        key_ids = local_ids + table_weight.shard_info.row_offset
+        return weight[local_ids].detach(), key_ids
 
     def _lookup_dynamic_embeddings(
         self, dynamic_module: nn.Module, table_name: str, ids: torch.Tensor
@@ -302,10 +492,76 @@ class DeltaEmbeddingDumper:
                 int((~founds).sum().item()),
                 table_name,
             )
-        return values[founds, :emb_dim].detach(), founds
+        return values[founds, :emb_dim].detach(), ids[founds]
 
-    def _collect_table_weights(self) -> Dict[str, torch.Tensor]:
-        table_weights: Dict[str, torch.Tensor] = {}
+    def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:
+        table_shard_infos: Dict[str, _TableShardInfo] = {}
+        for module in self._model.modules():
+            table_name_to_config = getattr(module, "_table_name_to_config", None)
+            if table_name_to_config is not None:
+                for table_name, table_config in table_name_to_config.items():
+                    table_shard_infos[table_name] = _merge_table_shard_info(
+                        table_shard_infos.get(table_name),
+                        _table_shard_info_from_config(table_config),
+                    )
+            for table_config in self._grouped_embedding_table_configs(module):
+                table_name = getattr(table_config, "name", "")
+                if not table_name:
+                    continue
+                table_shard_infos[table_name] = _merge_table_shard_info(
+                    table_shard_infos.get(table_name),
+                    _table_shard_info_from_config(table_config),
+                )
+            module_sharding_plan = getattr(module, "module_sharding_plan", None)
+            if module_sharding_plan is None:
+                continue
+            for table_name, parameter_sharding in module_sharding_plan.items():
+                table_shard_infos[table_name] = _merge_table_shard_info(
+                    table_shard_infos.get(table_name),
+                    _table_shard_info_from_parameter_sharding(
+                        parameter_sharding, self._rank
+                    ),
+                )
+        return table_shard_infos
+
+    def _grouped_embedding_table_configs(self, module: nn.Module) -> Iterable[Any]:
+        grouped_configs = []
+        module_config = getattr(module, "config", None)
+        if module_config is not None:
+            grouped_configs.append(module_config)
+        private_config = getattr(module, "_config", None)
+        if private_config is not None and private_config is not module_config:
+            grouped_configs.append(private_config)
+
+        for grouped_config in grouped_configs:
+            embedding_tables = getattr(grouped_config, "embedding_tables", None)
+            if embedding_tables is None:
+                continue
+            yield from embedding_tables
+
+    def _validate_supported_table_sharding(self) -> None:
+        for table_name, shard_info in self._collect_table_shard_infos().items():
+            _validate_table_shard_info(table_name, shard_info)
+
+    def _validate_row_shard_metadata(
+        self, table_name: str, shard_info: _TableShardInfo
+    ) -> None:
+        if (
+            self._world_size > 1
+            and shard_info.local_rows > 0
+            and shard_info.global_rows > 0
+            and shard_info.local_rows < shard_info.global_rows
+            and not shard_info.has_shard_metadata
+        ):
+            raise ValueError(
+                "delta_embedding_dump_config cannot convert local row ids to "
+                f"global key ids for row-wise sharded table {table_name}, because "
+                "TorchRec shard metadata is missing."
+            )
+
+    def _collect_table_weights(self) -> Dict[str, _TableWeight]:
+        table_weights: Dict[str, _TableWeight] = {}
+        table_shard_infos = self._collect_table_shard_infos()
         for module in self._model.modules():
             lookups = getattr(module, "_lookups", None)
             if lookups is None:
@@ -318,7 +574,10 @@ class DeltaEmbeddingDumper:
                 if named_parameters_by_table is None:
                     continue
                 for table_name, table_value in named_parameters_by_table():
-                    table_weights[table_name] = _local_tensor(table_value)
+                    table_weights[table_name] = _local_table_weight(
+                        table_value,
+                        table_shard_infos.get(table_name),
+                    )
         return table_weights
 
     def _collect_dynamic_modules(self) -> Dict[str, nn.Module]:
@@ -352,6 +611,8 @@ class DeltaEmbeddingDumper:
             rows.append(
                 {
                     "global_step": global_step,
+                    "rank": self._rank,
+                    "world_size": self._world_size,
                     "feature_name": feature_name,
                     "table_fqn": table_fqn,
                     "key_id": key_id,
@@ -364,6 +625,8 @@ class DeltaEmbeddingDumper:
         table = pa.Table.from_arrays(
             [
                 pa.array([r["global_step"] for r in rows], type=pa.int64()),
+                pa.array([r["rank"] for r in rows], type=pa.int32()),
+                pa.array([r["world_size"] for r in rows], type=pa.int32()),
                 pa.array([r["feature_name"] for r in rows], type=pa.string()),
                 pa.array([r["table_fqn"] for r in rows], type=pa.string()),
                 pa.array([r["key_id"] for r in rows], type=pa.int64()),
@@ -372,6 +635,8 @@ class DeltaEmbeddingDumper:
             ],
             names=[
                 "global_step",
+                "rank",
+                "world_size",
                 "feature_name",
                 "table_fqn",
                 "key_id",

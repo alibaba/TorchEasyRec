@@ -93,8 +93,9 @@ message TrainConfig {
     // fraction of workers (0,1] that must pass a boundary/target before a
     // timestamp checkpoint fires; default 0.5 (1.0 = all). outlier-robust.
     optional float save_checkpoints_timestamp_quorum = 23 [default = 0.5];
-    // dump changed sparse embedding rows during training; only WORLD_SIZE=1 CUDA
-    // training is supported.
+    // dump changed sparse embedding rows during CUDA training. Multi-GPU
+    // training writes one parquet shard per rank; column-wise embedding
+    // sharding is not supported.
     optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // TBD: qcomm config
 }
