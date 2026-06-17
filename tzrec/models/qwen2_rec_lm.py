@@ -80,10 +80,8 @@ class Qwen2RecLM(GenerativeRecLM):
         # worst-case spliced length for the first-step activation-pool pre-sizing.
         self._max_total_len = self._compute_max_total_length()
         self._pool_warmed = False
-        # CE suffix width. The supervised tail is fixed — [answer(num_levels) |
-        # asst_suffix | eos] — so _forward_loss slices a CONSTANT number of trailing
-        # positions (the tail + 1 for the shift-by-one CE alignment) instead of
-        # recomputing it per step, which cost two GPU->CPU syncs every step.
+        # CE suffix width: the supervised tail [answer | asst_suffix | eos] is
+        # fixed, so _forward_loss slices a constant suffix (no per-step sync).
         self._suffix_keep = self._num_levels + self.tpl_asst_suffix.numel() + 2
 
     def _compute_max_total_length(self) -> int:
@@ -178,10 +176,8 @@ class Qwen2RecLM(GenerativeRecLM):
         ]
         input_ids, attention_mask = self._left_pad(rows_ids, pad_to=pad_to)
 
-        # labels: the supervised tail is fixed-width, so left-padding aligns it
-        # to the same columns for every row -> one vectorized write.
-        # tail layout (from the end): [answer(A) | asst_suffix(s) | eos(1)].
-        # ``tail <= T`` always holds: every row already contains those tokens.
+        # supervised tail is fixed-width -> same columns every row -> one write.
+        # tail from the end: [answer(A) | asst_suffix(s) | eos(1)].
         B, T = input_ids.shape
         s = self.tpl_asst_suffix.numel()
         tail = A + s + 1
@@ -216,12 +212,9 @@ class Qwen2RecLM(GenerativeRecLM):
             expected_width=self._num_levels,  # answer = one item = num_levels codes
         )
 
-        # One-shot pool pre-sizing: on the FIRST training step, pad the splice to
-        # the worst-case length so the caching allocator reserves its largest
-        # (B, T_max) activation segments up front, keeping per-rank reservations
-        # uniform (no mid-run growth). The extra positions are attention-masked
-        # and labelled -100, so loss and gradient are identical to the unpadded
-        # batch.
+        # One-shot pool pre-sizing: pad the FIRST train step to the worst-case
+        # length so the allocator reserves its largest segments up front (no
+        # mid-run growth). Extra positions are masked + -100 -> loss/grad unchanged.
         pad_to = 0
         if not self._pool_warmed and self._max_total_len > 0 and self.is_train:
             pad_to = self._max_total_len
@@ -254,12 +247,9 @@ class Qwen2RecLM(GenerativeRecLM):
         outputs = self.lm.model(input_ids=input_ids, attention_mask=attention_mask)
         hidden = outputs.last_hidden_state  # (B, T, D)
 
-        # Suffix slice in BOTH train and eval. The supervised tail is fixed-width
-        # (see _splice_input_ids), so slice a CONSTANT number of trailing positions
-        # — a per-step recompute would cost two GPU->CPU syncs. Outside the suffix
-        # every label is -100 (CE value-identical), and this bounds the logits to
-        # (B, suffix, V) instead of (B, T, vocab) + the fp32 upcast (eval at bsz=80
-        # would otherwise OOM).
+        # Slice the fixed-width supervised suffix (constant -> no per-step sync).
+        # Outside it every label is -100 (CE unchanged); it also bounds the logits
+        # to (B, suffix, V) — the full (B, T, vocab) + fp32 upcast would OOM.
         sl = slice(-self._suffix_keep, None)
         labels_sl = labels[:, sl]
         logits = self.lm.lm_head(hidden[:, sl, :])

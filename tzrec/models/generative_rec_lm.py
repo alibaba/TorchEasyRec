@@ -93,10 +93,8 @@ class GenerativeRecLM(BaseModel):
 
         self._build_prompt_tokens(tokenizer, cfg)
 
-        # Dense-only: the HF backbone owns its embeddings and SID token ids flow
-        # through it directly (the SEQUENCE feature is consumed as raw token ids in
-        # _sid_token_rows, NOT via an EmbeddingGroup), so there is no native sparse
-        # path. Set explicitly (vs RankModel.init_input) to keep the contract clear.
+        # Dense-only: the HF backbone owns its embeddings and SID ids flow through
+        # it directly (no EmbeddingGroup). Set explicit (vs RankModel.init_input).
         self.embedding_group = None
 
         # one-shot debug dump of the first spliced batch
@@ -107,8 +105,7 @@ class GenerativeRecLM(BaseModel):
     def _resolve_pad_token_id(tokenizer: Any) -> int:
         """Pad id for the left-padded splice, falling back to eos.
 
-        Qwen2.5 has both, but the base is reused by Llama/Mistral/Gemma/Phi — fail
-        loudly if a tokenizer has neither rather than an opaque ``int(None)``.
+        Fail loudly if a tokenizer has neither (vs an opaque ``int(None)``).
         """
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
@@ -133,9 +130,8 @@ class GenerativeRecLM(BaseModel):
             raise ValueError("GenerativeRecLM: codebook must be non-empty.")
         # len(codebook) = SID codes per item (answer width); sum = vocab atoms.
         self._num_levels = len(codebook)
-        # Per-level SID validity bands, cached as (num_levels,) buffers so the
-        # inference gate (_validate_sid_candidates) can reject malformed beams with
-        # a vectorized band check and no host sync. Non-persistent: derived config.
+        # Per-level SID validity bands (buffers) for the inference gate
+        # (_validate_sid_candidates). Non-persistent: derived config.
         lo, hi = self._sid_level_bands(codebook)
         self.register_buffer("_sid_lvl_lo", lo, persistent=False)
         self.register_buffer("_sid_lvl_hi", hi, persistent=False)
@@ -155,10 +151,8 @@ class GenerativeRecLM(BaseModel):
                 f"{type(self).__name__}: empty backbone id (see _backbone_id)."
             )
         hf_cfg = AutoConfig.from_pretrained(hf_model_id)
-        # Build in fp32 so the optimizer keeps fp32 MASTER weights: with bf16
-        # params, Adam's small updates (e.g. lr=1e-5) fall below the bf16 ULP and
-        # round to zero, freezing the weights. Use mixed_precision:"BF16" for bf16
-        # compute speed; the DCP checkpoint stays fp32 (consistent on restore).
+        # fp32 MASTER weights: bf16 params underflow Adam's small (lr=1e-5) updates
+        # and freeze. bf16 compute comes from mixed_precision:"BF16"; ckpt stays fp32.
         lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._PARAM_DTYPE)
         if next(lm.parameters()).dtype != self._PARAM_DTYPE:
             lm = lm.to(self._PARAM_DTYPE)
@@ -208,16 +202,13 @@ class GenerativeRecLM(BaseModel):
     def init_from_pretrained(self) -> None:
         """Load the pretrained HF backbone weights into ``self.lm``.
 
-        The SINGLE place ``AutoModelForCausalLM.from_pretrained`` runs. The
-        PIPELINE (``tzrec/main.py``) calls this exactly once, only at COLD START
-        (no checkpoint to resume). On resume/eval/export the empty arch built in
-        ``__init__`` is weight-filled by native DCP ``load_state_dict`` instead,
-        so the GB-scale download is skipped. Re-extends the vocab to the SAME
-        target/pad as ``__init__`` so the module shapes stay identical.
+        The single ``from_pretrained`` call, run once at COLD START (no checkpoint
+        to resume); on resume/eval/export the empty ``__init__`` arch is filled by
+        DCP instead, skipping the download. Re-extends the vocab to ``__init__``'s
+        target so the shapes match.
         """
-        # Load fp32 master weights, NOT torch_dtype="auto" (which keeps the stored
-        # bf16): bf16 params underflow Adam's lr=1e-5 updates. Must match
-        # _build_backbone's fp32 so the cold-start and restore arches agree.
+        # fp32 master (not "auto", which keeps the stored bf16); must match
+        # _build_backbone so cold-start and restore arches agree.
         lm = AutoModelForCausalLM.from_pretrained(
             self._backbone_id(), torch_dtype=self._PARAM_DTYPE
         )
@@ -251,9 +242,8 @@ class GenerativeRecLM(BaseModel):
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Family hook: cache the tokenised prompt template as buffers.
 
-        Called from ``__init__`` after vocab extension; the buffers it
-        registers are consumed by the family's ``predict``. Architecture-
-        specific — see design §15.1/§15.2. Subclasses MUST implement this.
+        Called from ``__init__`` after vocab extension; consumed by the family's
+        ``predict``. Subclasses MUST implement this.
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement _build_prompt_tokens "
@@ -297,13 +287,10 @@ class GenerativeRecLM(BaseModel):
     ) -> torch.Tensor:
         """Map a generated token tail back to SIDs and reject malformed candidates.
 
-        Inference-side counterpart of ``_tokenize_sids``. ``new_tokens`` is the
-        per-beam generated tail ``(B*num_return, w)`` (``w`` may be < ``num_levels``
-        when beams stop early). Returns ``(batch_size, num_return, num_levels)`` raw
-        SIDs with every MALFORMED candidate set to the ``-1`` sentinel — early EOS,
-        a non-SID token, or a wrong-level atom (outside THAT level's band). ``-1``
-        can never match a real item, and the fixed-width padding keeps the reshape
-        rectangular even when every beam stopped early.
+        ``new_tokens`` is the per-beam tail ``(B*num_return, w)`` (``w`` may be <
+        ``num_levels`` when beams stop early). Returns ``(batch_size, num_return,
+        num_levels)`` SIDs with every malformed candidate (early EOS / non-SID /
+        wrong-level atom) set to ``-1`` — which can never match a real item.
         """
         sids = new_tokens - (self._base_vocab - 1)
         # pad each candidate to exactly num_levels with the -1 sentinel (an
@@ -313,9 +300,8 @@ class GenerativeRecLM(BaseModel):
         # invalidates the WHOLE candidate -> -1.
         invalid = ((sids < self._sid_lvl_lo) | (sids > self._sid_lvl_hi)).any(dim=1)
         sids = sids.masked_fill(invalid.unsqueeze(1), -1)
-        # view groups beams under the right user (generate() returns rows
-        # batch-major: [b0_beam0, b0_beam1, ..., b1_beam0, ...]); the row-wise mask
-        # preserves that order (no filter/scatter that would scramble it).
+        # generate() returns rows batch-major ([b0_beam0, b0_beam1, ...]) so this
+        # groups beams per user; the row-wise mask above preserved that order.
         return sids.view(batch_size, -1, self._num_levels)
 
     def _sid_token_rows(
