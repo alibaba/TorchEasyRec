@@ -11,8 +11,9 @@
 
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -314,6 +315,7 @@ class DeltaEmbeddingDumper:
         )
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
+        self._tracking_pause_depth = 0
         os.makedirs(self._output_dir, exist_ok=True)
 
         self._validate_supported_table_sharding()
@@ -324,6 +326,7 @@ class DeltaEmbeddingDumper:
             mode=TrackingMode.ID_ONLY,
             fqns_to_skip=self._zch_table_names,
         )
+        self._install_tracking_pause_guard()
         self._table_to_fqn: Dict[str, str] = {}
         self._table_to_fqn.update(self._tracker.table_to_fqn)
         self._fqn_to_table: Dict[str, str] = {
@@ -355,6 +358,15 @@ class DeltaEmbeddingDumper:
     def clear(self) -> None:
         """Clear tracked sparse ids, usually after restore-time dummy steps."""
         self._tracker.clear(_CONSUMER)
+
+    @contextmanager
+    def pause_tracking(self) -> Iterator[None]:
+        """Temporarily skip delta tracking for non-training forward passes."""
+        self._tracking_pause_depth += 1
+        try:
+            yield
+        finally:
+            self._tracking_pause_depth -= 1
 
     def maybe_dump(self, global_step: int) -> None:
         """Dump on the configured global-step interval and advance tracker state."""
@@ -395,6 +407,28 @@ class DeltaEmbeddingDumper:
                 f"_of_{self._world_size}.parquet"
             ),
         )
+
+    def _install_tracking_pause_guard(self) -> None:
+        guarded_modules = getattr(self, "_guarded_tracking_modules", set())
+        for module in self._tracker.get_tracked_modules().values():
+            if id(module) in guarded_modules:
+                continue
+            record_fn = getattr(module, "post_lookup_tracker_fn", None)
+            if record_fn is None:
+                continue
+            module.post_lookup_tracker_fn = self._wrap_post_lookup_tracker_fn(record_fn)
+            guarded_modules.add(id(module))
+        self._guarded_tracking_modules = guarded_modules
+
+    def _wrap_post_lookup_tracker_fn(
+        self, record_fn: Callable[..., Any]
+    ) -> Callable[..., Any]:
+        def guarded_record_lookup(*args: Any, **kwargs: Any) -> Any:
+            if self._tracking_pause_depth > 0:
+                return None
+            return record_fn(*args, **kwargs)
+
+        return guarded_record_lookup
 
     def _append_model_delta_rows(
         self,

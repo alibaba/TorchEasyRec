@@ -169,6 +169,32 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
             self.assertNotIn("step=50", output_path)
 
+    def test_pause_tracking_suppresses_post_lookup_recording(self):
+        record_fn = mock.MagicMock()
+        sharded_module = SimpleNamespace(post_lookup_tracker_fn=record_fn)
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._tracking_pause_depth = 0
+        dumper._tracker = SimpleNamespace(
+            get_tracked_modules=lambda: {"user_emb": sharded_module}
+        )
+        dumper._install_tracking_pause_guard()
+
+        sharded_module.post_lookup_tracker_fn("train")
+        record_fn.assert_called_once_with("train")
+
+        with dumper.pause_tracking():
+            sharded_module.post_lookup_tracker_fn("eval")
+        record_fn.assert_called_once_with("train")
+
+        sharded_module.post_lookup_tracker_fn("train2", source="train")
+        self.assertEqual(
+            record_fn.call_args_list,
+            [
+                mock.call("train"),
+                mock.call("train2", source="train"),
+            ],
+        )
+
     def test_collect_table_shard_infos_prefers_grouped_embedding_metadata(self):
         original_config_module = torch.nn.Module()
         original_config_module._table_name_to_config = {

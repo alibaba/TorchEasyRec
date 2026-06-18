@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 from collections import OrderedDict
+from contextlib import nullcontext
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
@@ -418,16 +419,22 @@ def _train_and_evaluate(
     def run_eval(step: int, epoch: int) -> None:
         """Run eval after a checkpoint save, if an eval dataloader is configured."""
         if eval_dataloader is not None:
-            _evaluate(
-                model,
-                eval_dataloader,
-                eval_config,
-                eval_result_filename=eval_result_filename,
-                global_step=step,
-                eval_summary_writer=eval_summary_writer,
-                global_epoch=epoch,
-                check_all_workers_data_status=check_all_workers_data_status,
+            tracking_context = (
+                delta_embedding_dumper.pause_tracking()
+                if delta_embedding_dumper is not None
+                else nullcontext()
             )
+            with tracking_context:
+                _evaluate(
+                    model,
+                    eval_dataloader,
+                    eval_config,
+                    eval_result_filename=eval_result_filename,
+                    global_step=step,
+                    eval_summary_writer=eval_summary_writer,
+                    global_epoch=epoch,
+                    check_all_workers_data_status=check_all_workers_data_status,
+                )
             model.train()
 
     # this rank's last consumed event-time, reused by the epoch / final saves
