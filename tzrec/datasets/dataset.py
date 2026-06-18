@@ -30,6 +30,7 @@ from tzrec.datasets.utils import (
     CAND_POS_LENGTHS,
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    DATA_TIMESTAMP,
     HARD_NEG_INDICES,
     Batch,
     RecordBatchTensor,
@@ -289,7 +290,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         return rank * num_workers + worker_id, num_workers * world_size
 
-    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
         """Set checkpoint state for resume.
 
         Args:
@@ -333,6 +334,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 )
             )
 
+        # Pop the event-time column (so it's not parsed as a feature) and surface
+        # its max; the -1.0 sentinel sorts below real times, so max is correct.
+        data_timestamp = -1.0
+        ts_col = input_data.pop(DATA_TIMESTAMP, None)
+        if ts_col is not None and len(ts_col) > 0:
+            max_ts = pc.max(ts_col).as_py()
+            if max_ts is not None:
+                data_timestamp = max_ts
+
         use_sample_mask = self._mode == Mode.TRAIN and (
             self._data_config.negative_sample_mask_prob > 0
             or self._data_config.sample_mask_prob > 0
@@ -372,6 +382,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
+        batch.data_timestamp = data_timestamp
         return batch
 
     def _apply_negative_sampler(
@@ -527,14 +538,14 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
         self._use_sample_cost = False
-        self._checkpoint_state: Optional[Dict[str, int]] = None
+        self._checkpoint_state: Optional[Dict[str, Any]] = None
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
             assert (
                 self._sample_cost_field is not None and len(self._sample_cost_field) > 0
             ), "Should set data_config.sample_cost_field when use batch_cost_size"
             self._use_sample_cost = True
 
-    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
         """Set checkpoint state for resume.
 
         Args:
