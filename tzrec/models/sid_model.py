@@ -18,6 +18,7 @@ import torchmetrics
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
 from tzrec.protos.model_pb2 import ModelConfig
@@ -40,9 +41,9 @@ class BaseSidModel(BaseModel):
 
     Subclasses build their quantizer in ``__init__`` (after calling
     ``super().__init__``) and implement :meth:`predict` and :meth:`loss`.
-    They extend :meth:`init_metric` (via ``super()``) and implement
-    :meth:`update_metric` to populate the registered metrics
-    (:meth:`update_train_metric` defaults to a no-op).
+    :meth:`predict` exposes the reconstruction under ``predictions["x_hat"]``
+    (only when meaningful) so the shared :meth:`update_metric` can score it.
+    (:meth:`update_train_metric` defaults to a no-op.)
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -69,8 +70,17 @@ class BaseSidModel(BaseModel):
         self._input_dim = cfg.input_dim
         self._normalize_residuals = cfg.normalize_residuals
 
-        assert cfg.codebook, "codebook must be set, e.g. [256, 256, 256]"
+        if not cfg.codebook:
+            raise ValueError("codebook must be set, e.g. [256, 256, 256]")
         self._n_embed_list = list(cfg.codebook)
+        # Fail fast: a zero codebook entry / input_dim==0 only errors opaquely
+        # deep inside faiss, after the whole training pass.
+        if any(k < 1 for k in self._n_embed_list):
+            raise ValueError(
+                f"every codebook entry must be >= 1, got {self._n_embed_list}"
+            )
+        if self._input_dim < 1:
+            raise ValueError(f"input_dim must be >= 1, got {self._input_dim}")
         self._n_layers = len(self._n_embed_list)
 
     def _extract_feature(
@@ -99,13 +109,47 @@ class BaseSidModel(BaseModel):
     def init_metric(self) -> None:
         """Initialize the eval metrics shared by all SID models.
 
-        ``mse``: reconstruction error (input vs. quantized / decoded).
-        ``unique_sid_ratio``: mean per-batch unique-SID ratio (distinct rows /
-        batch size; a batch-size-sensitive diversity proxy, not global
-        coverage). Subclasses call ``super().init_metric()`` then add extras.
+        - ``mse``: reconstruction error (input vs. quantized / decoded).
+        - ``rel_loss``: symmetric relative-L1 reconstruction error
+          (:class:`~tzrec.metrics.relative_l1.RelativeL1`); meaningful only with
+          ``normalize_residuals=False`` (else the reconstruction and the input
+          live on different scales).
+        - ``unique_sid_ratio``: mean per-batch unique-SID ratio (distinct rows /
+          batch size; a batch-size-sensitive diversity proxy, not global
+          coverage).
+
+        Subclasses that add extras call ``super().init_metric()`` first.
         """
         self._metric_modules["mse"] = torchmetrics.MeanSquaredError()
+        self._metric_modules["rel_loss"] = RelativeL1()
         self._metric_modules["unique_sid_ratio"] = UniqueRatio()
+
+    def update_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        losses: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """Update eval metrics from the reconstruction + the re-extracted input.
+
+        ``predictions["x_hat"]`` is the model's reconstruction of the input
+        embedding (the centroid sum for RQ-KMeans, the decoder output for
+        RQ-VAE). Subclasses expose it only when it is meaningful, so a
+        not-yet-fitted model omits it and this logs nothing. The target
+        embedding is re-extracted from ``batch`` (it is an input, not an output).
+
+        Args:
+            predictions (dict): a dict of predicted result.
+            batch (Batch): input batch data.
+            losses (dict, optional): a dict of loss.
+        """
+        if "x_hat" not in predictions:
+            return
+        recon = predictions["x_hat"]
+        embedding = self._extract_feature(batch)
+        self._metric_modules["mse"].update(recon, embedding)
+        self._metric_modules["rel_loss"].update(recon, embedding)
+        self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
 
     def update_train_metric(
         self,
