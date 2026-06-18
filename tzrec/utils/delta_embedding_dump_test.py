@@ -78,11 +78,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 )
             )
         ]
-        zch_feature_names, zch_table_names = (
-            validate_delta_embedding_dump_no_zch_features(feature_configs)
-        )
-        self.assertEqual(zch_feature_names, set())
-        self.assertEqual(zch_table_names, set())
+        validate_delta_embedding_dump_no_zch_features(feature_configs)
 
     def test_row_wise_shard_info_uses_row_offset(self):
         table_config = SimpleNamespace(

@@ -87,9 +87,8 @@ def _feature_config_name(config: Any) -> str:
     return getattr(config, "feature_name", "")
 
 
-def _zch_feature_info(feature_configs: Iterable[Any]) -> Tuple[Set[str], Set[str]]:
+def _zch_feature_names(feature_configs: Iterable[Any]) -> Set[str]:
     zch_feature_names: Set[str] = set()
-    zch_table_names: Set[str] = set()
     for feature_config in feature_configs:
         feature_type = feature_config.WhichOneof("feature")
         if feature_type is None:
@@ -98,24 +97,20 @@ def _zch_feature_info(feature_configs: Iterable[Any]) -> Tuple[Set[str], Set[str
         if _has_proto_field(config, "zch"):
             feature_name = _feature_config_name(config) or feature_type
             zch_feature_names.add(feature_name)
-            zch_table_names.add(
-                getattr(config, "embedding_name", "") or f"{feature_name}_emb"
-            )
-    return zch_feature_names, zch_table_names
+    return zch_feature_names
 
 
 def validate_delta_embedding_dump_no_zch_features(
     feature_configs: Iterable[Any],
-) -> Tuple[Set[str], Set[str]]:
+) -> None:
     """Validate that delta embedding dump is not used with MC/ZCH features."""
-    zch_feature_names, zch_table_names = _zch_feature_info(feature_configs)
+    zch_feature_names = _zch_feature_names(feature_configs)
     if zch_feature_names:
         raise ValueError(
             "delta_embedding_dump_config does not support MC/ZCH features. "
             "Please convert these zch features to dynamicemb before enabling "
             f"delta embedding dump: {sorted(zch_feature_names)}"
         )
-    return zch_feature_names, zch_table_names
 
 
 def _feature_name(feature_names: Iterable[str]) -> str:
@@ -302,14 +297,10 @@ class DeltaEmbeddingDumper:
         model: nn.Module,
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
-        zch_feature_names: Optional[Set[str]] = None,
-        zch_table_names: Optional[Set[str]] = None,
     ) -> None:
         self._model = model
         self._config = config
         self._interval = config.dump_interval_steps
-        self._zch_feature_names = zch_feature_names or set()
-        self._zch_table_names = zch_table_names or set()
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
@@ -324,7 +315,6 @@ class DeltaEmbeddingDumper:
             consumers=[_CONSUMER],
             delete_on_read=True,
             mode=TrackingMode.ID_ONLY,
-            fqns_to_skip=self._zch_table_names,
         )
         self._install_tracking_pause_guard()
         self._table_to_fqn: Dict[str, str] = {}
@@ -334,16 +324,6 @@ class DeltaEmbeddingDumper:
         }
         self._fqn_to_feature_names: Dict[str, List[str]] = {}
         self._fqn_to_feature_names.update(self._tracker.fqn_to_feature_names())
-        self._skip_fqns = {
-            fqn
-            for fqn, feature_names in self._fqn_to_feature_names.items()
-            if any(name in self._zch_feature_names for name in feature_names)
-        }
-        if self._skip_fqns:
-            logger.warning(
-                "Delta embedding dump will skip MC/ZCH embedding tables: %s",
-                sorted(self._skip_fqns),
-            )
 
         logger.info(
             "Delta embedding dump enabled: interval=%s output_dir=%s "
@@ -438,8 +418,6 @@ class DeltaEmbeddingDumper:
         dynamic_modules: Dict[str, nn.Module],
     ) -> None:
         for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
-            if fqn in self._skip_fqns:
-                continue
             ids = unique_rows.ids
             if ids.numel() == 0:
                 continue

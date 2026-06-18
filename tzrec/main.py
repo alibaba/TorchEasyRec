@@ -607,17 +607,13 @@ def train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     acc_utils.allow_tf32(train_config)
-    zch_feature_names = set()
-    zch_table_names = set()
     if train_config.HasField("delta_embedding_dump_config"):
         validate_delta_embedding_dump_config(
             train_config.delta_embedding_dump_config, device
         )
         if train_config.delta_embedding_dump_config.enable:
-            zch_feature_names, zch_table_names = (
-                validate_delta_embedding_dump_no_zch_features(
-                    pipeline_config.feature_configs
-                )
+            validate_delta_embedding_dump_no_zch_features(
+                pipeline_config.feature_configs
             )
 
     data_config = pipeline_config.data_config
@@ -734,8 +730,6 @@ def train_and_evaluate(
             model,
             train_config.delta_embedding_dump_config,
             pipeline_config.model_dir,
-            zch_feature_names=zch_feature_names,
-            zch_table_names=zch_table_names,
         )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
