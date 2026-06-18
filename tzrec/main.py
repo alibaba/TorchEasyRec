@@ -540,7 +540,9 @@ def _train_and_evaluate(
     _model.on_train_end()
     if delta_embedding_dumper is not None and i_step >= 0:
         # Flush the trailing partial interval before the final checkpoint.
-        delta_embedding_dumper.dump(i_step)
+        # final_dump skips dump-boundary steps already written by maybe_dump,
+        # so it never overwrites their shards with an empty file.
+        delta_embedding_dumper.final_dump(i_step)
 
     _log_train(
         i_step,

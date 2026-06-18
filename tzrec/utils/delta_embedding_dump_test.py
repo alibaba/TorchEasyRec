@@ -329,6 +329,34 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table["embedding"].type, pa.list_(pa.float32()))
         self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0], [3.0, 4.0]])
 
+    def test_write_empty_table_chunks_preserves_parquet_schema(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = os.path.join(tmp_dir, "delta.parquet")
+            dumper._write_table_chunks([], output_path)
+            table = pq.read_table(output_path)
+
+        self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        self.assertEqual(table.num_rows, 0)
+
+    def test_final_dump_skips_boundary_step_to_avoid_overwrite(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval = 50
+        with mock.patch.object(dumper, "dump") as dump_mock:
+            # Boundary steps were already written by maybe_dump; skip them so a
+            # trailing empty shard never overwrites the real one.
+            self.assertIsNone(dumper.final_dump(50))
+            self.assertIsNone(dumper.final_dump(100))
+            dump_mock.assert_not_called()
+
+            # Trailing partial interval (and step 0) must still be flushed.
+            dumper.final_dump(0)
+            dumper.final_dump(73)
+            self.assertEqual(
+                [call.args[0] for call in dump_mock.call_args_list],
+                [0, 73],
+            )
+
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval = 50
@@ -384,6 +412,48 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 ),
             )
             self.assertNotIn("step=50", output_path)
+
+    def test_multi_gpu_dump_writes_empty_shard_when_rank_has_no_delta(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._output_dir = tmp_dir
+            dumper._file_prefix = "delta_embedding"
+            dumper._rank = 1
+            dumper._world_size = 2
+            with (
+                mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+                mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
+                mock.patch.object(dumper, "_append_model_delta_rows", return_value=0),
+            ):
+                output_path = dumper.dump(50)
+            table = pq.read_table(output_path)
+
+        self.assertEqual(
+            output_path,
+            os.path.join(
+                tmp_dir,
+                "step_50",
+                "delta_embedding_step_50_rank_1_of_2.parquet",
+            ),
+        )
+        self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        self.assertEqual(table.num_rows, 0)
+
+    def test_single_gpu_dump_skips_file_when_rank_has_no_delta(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._output_dir = tmp_dir
+            dumper._file_prefix = "delta_embedding"
+            dumper._rank = 0
+            dumper._world_size = 1
+            with (
+                mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+                mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
+                mock.patch.object(dumper, "_append_model_delta_rows", return_value=0),
+            ):
+                output_path = dumper.dump(50)
+
+        self.assertIsNone(output_path)
 
     def test_pause_tracking_suppresses_post_lookup_recording(self):
         lookup_fn = mock.MagicMock()

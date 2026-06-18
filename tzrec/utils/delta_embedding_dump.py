@@ -367,6 +367,17 @@ class DeltaEmbeddingDumper:
             self.dump(global_step)
         self._tracker.step()
 
+    def final_dump(self, global_step: int) -> Optional[str]:
+        """Flush the trailing partial interval at the end of training.
+
+        Boundary steps were already written by ``maybe_dump`` and have no
+        remaining delta; re-dumping them would overwrite their shards with an
+        empty file under multi-GPU, so skip them here.
+        """
+        if global_step > 0 and global_step % self._interval == 0:
+            return None
+        return self.dump(global_step)
+
     def dump(self, global_step: int) -> Optional[str]:
         """Dump currently tracked sparse ids and embeddings to a parquet file."""
         table_weights = self._collect_table_weights()
@@ -379,8 +390,17 @@ class DeltaEmbeddingDumper:
             dynamic_modules=dynamic_modules,
         )
         if num_rows == 0:
-            logger.info("No delta embedding rows to dump at step %s.", global_step)
-            return None
+            if self._world_size == 1:
+                logger.info("No delta embedding rows to dump at step %s.", global_step)
+                return None
+            output_path = self._output_path(global_step)
+            self._write_table_chunks(table_chunks, output_path)
+            logger.info(
+                "Dumped empty delta embedding shard to %s at step %s.",
+                output_path,
+                global_step,
+            )
+            return output_path
         output_path = self._output_path(global_step)
         self._write_table_chunks(table_chunks, output_path)
         logger.info("Dumped %s delta embedding rows to %s.", num_rows, output_path)
@@ -689,5 +709,6 @@ class DeltaEmbeddingDumper:
         self, table_chunks: List[pa.Table], output_path: str
     ) -> None:
         with pq.ParquetWriter(output_path, _DELTA_DUMP_SCHEMA) as writer:
-            for table_chunk in table_chunks:
+            chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
+            for table_chunk in chunks:
                 writer.write_table(table_chunk)
