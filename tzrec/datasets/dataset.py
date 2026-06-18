@@ -306,9 +306,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         worker_id, num_workers = self.get_worker_info()
         for input_data in self._reader.to_batches(worker_id, num_workers):
             yield self._build_batch(input_data)
-        # Normal exhaustion = the resumed pass is complete; clear the state so
-        # subsequent epochs do full passes. close()/GeneratorExit skips this
-        # line, so dataloader resets mid-pass still re-seek from the state.
+        # pass complete: clear the resume state so later epochs do full passes
         self._reader.load_state_dict(None)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
@@ -773,11 +771,8 @@ def create_dataloader(
         gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
-        checkpoint_state (dict, optional): dataloader checkpoint state for
-            resume. Must be set here rather than on the returned dataloader:
-            the eager ``iter(dataloader)`` below forks persistent workers,
-            which keep a fork-time copy of the dataset, so state applied
-            afterwards never reaches them.
+        checkpoint_state (dict, optional): resume state, applied before the
+            eager ``iter()`` forks workers so it reaches them.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -849,10 +844,7 @@ def create_dataloader(
     first_iterator = iter(dataloader)
 
     def get_iterator() -> Iterator[Batch]:
-        # First call returns the eagerly created iterator so its prefetched
-        # batches (including a short resumed tail) are consumed instead of
-        # being reset and discarded by a new iter(); later calls return a
-        # fresh iterator.
+        # return the eager iterator first (keeps its prefetch), then fresh ones
         nonlocal first_iterator
         if first_iterator is not None:
             it, first_iterator = first_iterator, None

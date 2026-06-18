@@ -237,12 +237,7 @@ class ParquetDatasetTest(unittest.TestCase):
                     self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
     def test_create_dataloader_checkpoint_state_reaches_workers(self):
-        """State passed to create_dataloader must reach forked workers.
-
-        create_dataloader eagerly starts persistent workers, so state applied
-        to the returned dataloader's dataset afterwards never reaches them;
-        the checkpoint_state argument applies it before the fork.
-        """
+        """checkpoint_state passed to create_dataloader must reach forked workers."""
         feature_cfgs = self._create_feature_cfgs()
         features = create_features(feature_cfgs)
 

@@ -178,7 +178,7 @@ def _evaluate(
     )
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
-    iterator = iter(eval_dataloader)
+    iterator = eval_dataloader.get_iterator()  # pyre-ignore[16]
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
@@ -454,10 +454,8 @@ def _train_and_evaluate(
 
         # Restore model and optimizer checkpoint
         if i_step == 0 and ckpt_path is not None:
-            # because optimizer's state is lazy init, we should do a dummy
-            # step before restore. a fully-consumed resumed pass has no data
-            # to peek, so the optimizer state stays lazy and is restored on
-            # the next pass.
+            # optimizer state is lazy, so peek one batch to init it before
+            # restore; an empty resumed pass has none, so restore model only.
             try:
                 peek_batch = None if ignore_restore_optimizer else next(train_iterator)
             except StopIteration:
@@ -1180,7 +1178,7 @@ def predict(
         mode=Mode.PREDICT,
         debug_level=debug_level,
     )
-    infer_iterator = iter(infer_dataloader)
+    infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
 
     if writer_type is None:
         writer_type = DatasetType.Name(data_config.dataset_type).replace(
@@ -1469,7 +1467,7 @@ def predict_checkpoint(
         model.device,
         execute_all_batches=True,
     )
-    iterator = iter(predict_dataloader)
+    iterator = predict_dataloader.get_iterator()  # pyre-ignore[16]
     step_iter = range(predict_steps) if predict_steps else itertools.count(0)
 
     desc_suffix = ""
