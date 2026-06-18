@@ -696,7 +696,7 @@ class OdpsWriterTest(unittest.TestCase):
 class _FailingStorageClient:
     """Stub storage-api client whose calls raise a connection-reset error."""
 
-    _table = "test_project.test_table"
+    table = SimpleNamespace(full_table_name="test_project.test_table")
     _quota_name = "test_quota"
     _rest_endpoint = "http://service.odps.test"
 

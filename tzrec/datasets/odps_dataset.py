@@ -208,10 +208,11 @@ def _parse_table_path(
 
 def _storage_debug_info(client: StorageApiArrowClient, **req_fields: Any) -> str:
     """Format MaxCompute storage-api context for error logging."""
+    # client.table is a pyodps Table whose str() dumps the full schema; log its name.
     parts = {
-        "table": getattr(client, "_table", None),
-        "quota": getattr(client, "_quota_name", None),
-        "endpoint": getattr(client, "_rest_endpoint", None),
+        "table": client.table.full_table_name,
+        "quota": client._quota_name,
+        "endpoint": client._rest_endpoint,
         **req_fields,
     }
     return ", ".join(f"{k}={v}" for k, v in parts.items())
