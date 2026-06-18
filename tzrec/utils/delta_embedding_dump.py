@@ -314,6 +314,7 @@ class DeltaEmbeddingDumper:
             model,
             consumers=[_CONSUMER],
             delete_on_read=True,
+            auto_compact=True,
             mode=TrackingMode.ID_ONLY,
         )
         self._install_tracking_pause_guard()
@@ -393,22 +394,27 @@ class DeltaEmbeddingDumper:
         for module in self._tracker.get_tracked_modules().values():
             if id(module) in guarded_modules:
                 continue
-            record_fn = getattr(module, "post_lookup_tracker_fn", None)
-            if record_fn is None:
+            has_tracker_fn = False
+            post_lookup_fn = getattr(module, "post_lookup_tracker_fn", None)
+            if post_lookup_fn is not None:
+                module.post_lookup_tracker_fn = self._wrap_tracker_fn(post_lookup_fn)
+                has_tracker_fn = True
+            post_odist_fn = getattr(module, "post_odist_tracker_fn", None)
+            if post_odist_fn is not None:
+                module.post_odist_tracker_fn = self._wrap_tracker_fn(post_odist_fn)
+                has_tracker_fn = True
+            if not has_tracker_fn:
                 continue
-            module.post_lookup_tracker_fn = self._wrap_post_lookup_tracker_fn(record_fn)
             guarded_modules.add(id(module))
         self._guarded_tracking_modules = guarded_modules
 
-    def _wrap_post_lookup_tracker_fn(
-        self, record_fn: Callable[..., Any]
-    ) -> Callable[..., Any]:
-        def guarded_record_lookup(*args: Any, **kwargs: Any) -> Any:
+    def _wrap_tracker_fn(self, tracker_fn: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_tracker_fn(*args: Any, **kwargs: Any) -> Any:
             if self._tracking_pause_depth > 0:
                 return None
-            return record_fn(*args, **kwargs)
+            return tracker_fn(*args, **kwargs)
 
-        return guarded_record_lookup
+        return guarded_tracker_fn
 
     def _append_model_delta_rows(
         self,

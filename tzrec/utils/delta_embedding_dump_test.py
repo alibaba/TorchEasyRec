@@ -147,6 +147,26 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
         self.assertEqual(dumper._tracker.step.call_count, 4)
 
+    def test_tracker_uses_auto_compact(self):
+        tracker = mock.MagicMock()
+        tracker.table_to_fqn = {}
+        tracker.fqn_to_feature_names.return_value = {}
+        tracker.get_tracked_modules.return_value = {}
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTrackerTrec",
+                return_value=tracker,
+            ) as tracker_cls,
+        ):
+            DeltaEmbeddingDumper(
+                torch.nn.Module(),
+                DeltaEmbeddingDumpConfig(enable=True, dump_interval_steps=10),
+                tmp_dir,
+            )
+
+        self.assertTrue(tracker_cls.call_args.kwargs["auto_compact"])
+
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
@@ -166,8 +186,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             self.assertNotIn("step=50", output_path)
 
     def test_pause_tracking_suppresses_post_lookup_recording(self):
-        record_fn = mock.MagicMock()
-        sharded_module = SimpleNamespace(post_lookup_tracker_fn=record_fn)
+        lookup_fn = mock.MagicMock()
+        odist_fn = mock.MagicMock()
+        sharded_module = SimpleNamespace(
+            post_lookup_tracker_fn=lookup_fn,
+            post_odist_tracker_fn=odist_fn,
+        )
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._tracking_pause_depth = 0
         dumper._tracker = SimpleNamespace(
@@ -176,20 +200,26 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._install_tracking_pause_guard()
 
         sharded_module.post_lookup_tracker_fn("train")
-        record_fn.assert_called_once_with("train")
+        sharded_module.post_odist_tracker_fn()
+        lookup_fn.assert_called_once_with("train")
+        odist_fn.assert_called_once_with()
 
         with dumper.pause_tracking():
             sharded_module.post_lookup_tracker_fn("eval")
-        record_fn.assert_called_once_with("train")
+            sharded_module.post_odist_tracker_fn()
+        lookup_fn.assert_called_once_with("train")
+        odist_fn.assert_called_once_with()
 
         sharded_module.post_lookup_tracker_fn("train2", source="train")
+        sharded_module.post_odist_tracker_fn()
         self.assertEqual(
-            record_fn.call_args_list,
+            lookup_fn.call_args_list,
             [
                 mock.call("train"),
                 mock.call("train2", source="train"),
             ],
         )
+        self.assertEqual(odist_fn.call_args_list, [mock.call(), mock.call()])
 
     def test_collect_table_shard_infos_prefers_grouped_embedding_metadata(self):
         original_config_module = torch.nn.Module()
