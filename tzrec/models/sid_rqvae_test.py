@@ -319,36 +319,6 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertEqual(predictions["reconstruction_loss"].item(), 0.0)
         self.assertGreater(predictions["clip_loss"].item(), 0.0)
 
-    def test_commitment_loss_l1_branch(self) -> None:
-        """Verify the new commitment_loss='l1' branch runs end-to-end.
-
-        Previously ``"l1"`` silently fell through to the L2 branch.
-        """
-        from tzrec.modules.sid.residual_vector_quantizer import (
-            ResidualVectorQuantizer,
-        )
-
-        torch.manual_seed(0)
-        rq = ResidualVectorQuantizer(
-            embed_dim=8,
-            n_layers=2,
-            n_embed=4,
-            forward_mode="ste",
-            commitment_loss="l1",
-            kmeans_init=False,
-            use_sinkhorn=False,
-        )
-        # Stub the codebook to known centroids so the result is reproducible.
-        for layer in rq.layers:
-            torch.nn.init.normal_(layer.embedding.weight, std=0.1)
-
-        x = torch.randn(4, 8, requires_grad=True)
-        out = rq(x)
-        # Loss must be a finite scalar with gradient flowing back into x.
-        self.assertTrue(torch.isfinite(out.quantization_loss))
-        out.quantization_loss.backward()
-        self.assertIsNotNone(x.grad)
-
     def test_sinkhorn_config_enabled_false(self) -> None:
         """``sinkhorn_config { enabled: false }`` must turn Sinkhorn off.
 
@@ -386,21 +356,6 @@ class SidRqvaeTest(unittest.TestCase):
         for layer in model._quantizer.layers:
             self.assertTrue(layer.use_sinkhorn)
 
-    def test_commitment_loss_invalid_raises(self) -> None:
-        """ResidualVectorQuantizer rejects unknown commitment_loss spellings."""
-        from tzrec.modules.sid.residual_vector_quantizer import (
-            ResidualVectorQuantizer,
-        )
-
-        with self.assertRaisesRegex(AssertionError, "commitment_loss"):
-            ResidualVectorQuantizer(
-                embed_dim=8,
-                n_layers=2,
-                n_embed=4,
-                commitment_loss="bogus",
-                use_sinkhorn=False,
-            )
-
     def test_loss_type_l1_and_cosine(self) -> None:
         """loss_type 'l1' and 'cosine' recon branches run end-to-end.
 
@@ -430,30 +385,6 @@ class SidRqvaeTest(unittest.TestCase):
             recon = preds["reconstruction_loss"]
             self.assertTrue(torch.isfinite(recon), f"{loss_type} recon not finite")
             recon.backward()  # grad must flow through the decoder
-
-    def test_commitment_loss_cos_branch(self) -> None:
-        """Verify the commitment_loss='cos' branch runs end-to-end."""
-        from tzrec.modules.sid.residual_vector_quantizer import (
-            ResidualVectorQuantizer,
-        )
-
-        torch.manual_seed(0)
-        rq = ResidualVectorQuantizer(
-            embed_dim=8,
-            n_layers=2,
-            n_embed=4,
-            forward_mode="ste",
-            commitment_loss="cos",
-            kmeans_init=False,
-            use_sinkhorn=False,
-        )
-        for layer in rq.layers:
-            torch.nn.init.normal_(layer.embedding.weight, std=0.1)
-        x = torch.randn(4, 8, requires_grad=True)
-        out = rq(x)
-        self.assertTrue(torch.isfinite(out.quantization_loss))
-        out.quantization_loss.backward()
-        self.assertIsNotNone(x.grad)
 
     def test_logit_scale_clamped_prevents_overflow(self) -> None:
         """A raw logit_scale far above ln(100) must not overflow.

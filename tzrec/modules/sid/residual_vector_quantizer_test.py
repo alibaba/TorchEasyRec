@@ -13,10 +13,12 @@ import unittest
 
 import torch
 
+from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
     faiss_residual_kmeans,
 )
+from tzrec.modules.sid.types import ResidualQuantizerOutput
 
 
 class GumbelResidualVQTest(unittest.TestCase):
@@ -157,6 +159,116 @@ class ResidualVQBranchTest(unittest.TestCase):
         rvq.train()
         with self.assertRaisesRegex(RuntimeError, "fewer rows than the largest"):
             rvq(torch.randn(4, 4))  # 4 < max(codebook)=8
+
+
+class ResidualVectorQuantizerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        self.rvq = ResidualVectorQuantizer(
+            embed_dim=8, n_layers=3, n_embed=16, kmeans_init=False
+        )
+
+    def test_is_subclass(self) -> None:
+        self.assertIsInstance(self.rvq, ResidualQuantizer)
+
+    def test_forward_output(self) -> None:
+        self.rvq.train()
+        out = self.rvq(torch.randn(5, 8))
+        self.assertIsInstance(out, ResidualQuantizerOutput)
+        self.assertEqual(out.cluster_ids.shape, (5, 3))
+        self.assertEqual(out.quantized_embeddings.shape, (5, 8))
+        self.assertTrue(torch.isfinite(out.quantization_loss).all())
+
+    def test_decode_codes_shared_base(self) -> None:
+        codes = torch.randint(0, 16, (5, 3))
+        recon = self.rvq.decode_codes(codes)
+        self.assertEqual(recon.shape, (5, 8))
+
+    def test_get_codes_no_grad(self) -> None:
+        codes = self.rvq.get_codes(torch.randn(4, 8))
+        self.assertEqual(codes.shape, (4, 3))
+
+    def test_forward_get_codes_consistent_eval(self) -> None:
+        """get_codes (shared base walk) matches forward's ids in eval."""
+        self.rvq.eval()
+        x = torch.randn(6, 8)
+        fwd_ids = self.rvq(x).cluster_ids
+        gc_ids = self.rvq.get_codes(x)
+        self.assertFalse(gc_ids.requires_grad)
+        torch.testing.assert_close(gc_ids, fwd_ids)
+
+    def test_faiss_kmeans_init_seeds_codebook(self) -> None:
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        torch.manual_seed(0)
+        rvq = ResidualVectorQuantizer(
+            embed_dim=8, n_layers=2, n_embed=16, kmeans_init=True
+        )
+        self.assertFalse(bool(rvq.initted.item()))
+        rvq.train()
+        # First training forward triggers the FAISS warm-start.
+        rvq(torch.randn(512, 8))
+        self.assertTrue(bool(rvq.initted.item()))
+        for layer in rvq.layers:
+            self.assertTrue(torch.isfinite(layer.embedding.weight).all())
+            self.assertGreater(layer.embedding.weight.abs().sum().item(), 0.0)
+
+
+class CommitmentLossTest(unittest.TestCase):
+    """ResidualVectorQuantizer commitment-loss branches (l1 / cos / invalid)."""
+
+    def test_commitment_loss_l1_branch(self) -> None:
+        """The commitment_loss='l1' branch runs end-to-end (no fall-through to l2)."""
+        torch.manual_seed(0)
+        rq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=2,
+            n_embed=4,
+            forward_mode="ste",
+            commitment_loss="l1",
+            kmeans_init=False,
+            use_sinkhorn=False,
+        )
+        for layer in rq.layers:
+            torch.nn.init.normal_(layer.embedding.weight, std=0.1)
+        x = torch.randn(4, 8, requires_grad=True)
+        out = rq(x)
+        self.assertTrue(torch.isfinite(out.quantization_loss))
+        out.quantization_loss.backward()
+        self.assertIsNotNone(x.grad)
+
+    def test_commitment_loss_cos_branch(self) -> None:
+        """The commitment_loss='cos' branch runs end-to-end."""
+        torch.manual_seed(0)
+        rq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=2,
+            n_embed=4,
+            forward_mode="ste",
+            commitment_loss="cos",
+            kmeans_init=False,
+            use_sinkhorn=False,
+        )
+        for layer in rq.layers:
+            torch.nn.init.normal_(layer.embedding.weight, std=0.1)
+        x = torch.randn(4, 8, requires_grad=True)
+        out = rq(x)
+        self.assertTrue(torch.isfinite(out.quantization_loss))
+        out.quantization_loss.backward()
+        self.assertIsNotNone(x.grad)
+
+    def test_commitment_loss_invalid_raises(self) -> None:
+        """ResidualVectorQuantizer rejects unknown commitment_loss spellings."""
+        with self.assertRaisesRegex(AssertionError, "commitment_loss"):
+            ResidualVectorQuantizer(
+                embed_dim=8,
+                n_layers=2,
+                n_embed=4,
+                commitment_loss="bogus",
+                use_sinkhorn=False,
+            )
 
 
 if __name__ == "__main__":
