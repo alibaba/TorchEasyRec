@@ -18,6 +18,24 @@ from unittest import mock
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from torch import nn
+from torchrec import KeyedJaggedTensor
+from torchrec.distributed import DistributedModelParallel, ShardingEnv
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.planner import (
+    EmbeddingShardingPlanner,
+    ParameterConstraints,
+    Topology,
+)
+from torchrec.distributed.test_utils.multi_process import (
+    MultiProcessContext,
+    MultiProcessTestBase,
+)
+from torchrec.distributed.types import ShardingType
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
@@ -31,6 +49,156 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_config,
     validate_delta_embedding_dump_no_zch_features,
 )
+from tzrec.utils.dynamicemb_util import has_dynamicemb
+
+_SHARDED_TABLE_NAME = "table_1"
+_SHARDED_FEATURE_NAME = "feature_1"
+_SHARDED_NUM_EMBEDDINGS = 16
+_SHARDED_EMBEDDING_DIM = 4
+_SHARDED_INPUT_IDS = [0, 2, 8, 9, 15]
+
+
+class _DeltaDumpEBCModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_SHARDED_TABLE_NAME,
+                    num_embeddings=_SHARDED_NUM_EMBEDDINGS,
+                    embedding_dim=_SHARDED_EMBEDDING_DIM,
+                    feature_names=[_SHARDED_FEATURE_NAME],
+                    pooling=PoolingType.SUM,
+                )
+            ],
+            device=torch.device("meta"),
+        )
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        return self.ebc(features).values()
+
+
+class _FakeDynamicTables:
+    def __init__(self) -> None:
+        self.ids = None
+        self.table_ids = None
+        self.copy_mode = None
+
+    def find(self, ids, table_ids, copy_mode):
+        self.ids = ids.detach().clone()
+        self.table_ids = table_ids.detach().clone()
+        self.copy_mode = copy_mode
+        founds = torch.tensor([True, False, True], device=ids.device)
+        values = torch.tensor(
+            [
+                [1.0, 2.0, 20.0],
+                [3.0, 4.0, 40.0],
+                [5.0, 6.0, 60.0],
+            ],
+            device=ids.device,
+        )
+        return None, None, None, None, None, founds, None, values
+
+
+def _build_sharded_delta_dump_model(rank: int, world_size: int, ctx):
+    torch.manual_seed(2026)
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    model = _DeltaDumpEBCModel()
+    constraints = {
+        _SHARDED_TABLE_NAME: ParameterConstraints(
+            sharding_types=[ShardingType.ROW_WISE.value],
+            compute_kernels=[EmbeddingComputeKernel.FUSED.value],
+            feature_names=[_SHARDED_FEATURE_NAME],
+            pooling_factors=[1.0],
+        )
+    }
+    planner = EmbeddingShardingPlanner(
+        topology=Topology(world_size, "cuda"),
+        constraints=constraints,
+    )
+    sharders = [
+        EmbeddingBagCollectionSharder(
+            fused_params={"optimizer": OptimType.EXACT_ROWWISE_ADAGRAD}
+        )
+    ]
+    plan = planner.collective_plan(model, sharders, ctx.pg)
+    return DistributedModelParallel(
+        module=model,
+        device=device,
+        env=ShardingEnv.from_process_group(ctx.pg),
+        plan=plan,
+        sharders=sharders,
+    )
+
+
+def _sharded_features(rank: int) -> KeyedJaggedTensor:
+    device = torch.device(f"cuda:{rank}")
+    return KeyedJaggedTensor.from_offsets_sync(
+        keys=[_SHARDED_FEATURE_NAME],
+        values=torch.tensor(_SHARDED_INPUT_IDS, device=device, dtype=torch.int64),
+        offsets=torch.tensor([0, len(_SHARDED_INPUT_IDS)], device=device),
+    )
+
+
+def _assert_sharded_dump_file(rank: int, output_path: str, dumper) -> None:
+    testcase = unittest.TestCase()
+    testcase.assertTrue(os.path.exists(output_path))
+    table = pq.read_table(output_path)
+    testcase.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+    testcase.assertEqual(table["rank"].to_pylist(), [rank] * table.num_rows)
+    testcase.assertEqual(table["world_size"].to_pylist(), [2] * table.num_rows)
+    testcase.assertEqual(
+        set(table["feature_name"].to_pylist()), {_SHARDED_FEATURE_NAME}
+    )
+    testcase.assertEqual(set(table["source"].to_pylist()), {"model_delta_tracker"})
+
+    table_weight = dumper._collect_table_weights()[_SHARDED_TABLE_NAME]
+    expected_key_ids = [
+        key_id
+        for key_id in _SHARDED_INPUT_IDS
+        if table_weight.shard_info.row_offset
+        <= key_id
+        < table_weight.shard_info.row_offset + table_weight.shard_info.local_rows
+    ]
+    actual_key_ids = table["key_id"].to_pylist()
+    testcase.assertEqual(sorted(actual_key_ids), expected_key_ids)
+    testcase.assertTrue(
+        all(key_id >= table_weight.shard_info.row_offset for key_id in actual_key_ids)
+    )
+
+    actual_ids = torch.tensor(actual_key_ids, dtype=torch.int64)
+    sort_order = torch.argsort(actual_ids)
+    local_ids = actual_ids[sort_order] - table_weight.shard_info.row_offset
+    actual_embeddings = torch.tensor(
+        table["embedding"].to_pylist(), dtype=torch.float32
+    )
+    expected_embeddings = table_weight.tensor[local_ids.to(table_weight.tensor.device)]
+    torch.testing.assert_close(
+        actual_embeddings[sort_order],
+        expected_embeddings.detach().cpu().to(torch.float32),
+    )
+
+
+def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: str):
+    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+        model = _build_sharded_delta_dump_model(rank, world_size, ctx)
+        dumper = DeltaEmbeddingDumper(
+            model,
+            DeltaEmbeddingDumpConfig(
+                enable=True,
+                dump_interval_steps=1,
+                output_dir=output_dir,
+                file_prefix="delta",
+            ),
+            output_dir,
+        )
+        output = model(_sharded_features(rank))
+        output.sum().backward()
+        output_path = dumper.dump(50)
+        unittest.TestCase().assertIsNotNone(output_path)
+        _assert_sharded_dump_file(rank, output_path, dumper)
+        torch.distributed.barrier()
 
 
 class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
@@ -373,6 +541,69 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 },
                 dynamic_modules={},
             )
+
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    def test_lookup_dynamic_embeddings_filters_missing_ids(self):
+        from dynamicemb.types import CopyMode
+
+        torch.cuda.set_device(0)
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        fake_tables = _FakeDynamicTables()
+        dynamic_module = SimpleNamespace(
+            table_names=["dyn_table"],
+            tables=fake_tables,
+            flush=mock.MagicMock(),
+            _dynamicemb_options=[SimpleNamespace(dim=2)],
+        )
+
+        embeddings, key_ids = dumper._lookup_dynamic_embeddings(
+            dynamic_module, "dyn_table", torch.tensor([101, 102, 103])
+        )
+
+        dynamic_module.flush.assert_called_once_with()
+        self.assertIs(fake_tables.copy_mode, CopyMode.EMBEDDING)
+        torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
+        torch.testing.assert_close(fake_tables.table_ids.cpu(), torch.tensor([0, 0, 0]))
+        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 103]))
+        torch.testing.assert_close(
+            embeddings.cpu(), torch.tensor([[1.0, 2.0], [5.0, 6.0]])
+        )
+
+
+class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
+    def __init__(self, methodName="runTest") -> None:
+        super().__init__(methodName)
+        self.world_size = 2
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    def test_row_wise_sharded_dump_writes_global_key_ids(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "NCCL_DEBUG": "WARN",
+                    "FORCED_NCCL_DEBUG": "WARN",
+                    "NCCL_DEBUG_SUBSYS": "",
+                },
+            ),
+        ):
+            self._run_multi_process_test(
+                callable=_run_sharded_delta_embedding_dump,
+                world_size=self.world_size,
+                output_dir=tmp_dir,
+            )
+            for rank in range(self.world_size):
+                self.assertTrue(
+                    os.path.exists(
+                        os.path.join(
+                            tmp_dir,
+                            "step_50",
+                            f"delta_step_50_rank_{rank}_of_{self.world_size}.parquet",
+                        )
+                    )
+                )
 
 
 if __name__ == "__main__":
