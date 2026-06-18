@@ -846,5 +846,18 @@ def create_dataloader(
     # For PyTorch versions 2.6 and above, we initialize the data iterator before
     # beginning the training process to avoid potential CUDA-related issues following
     # model saving.
-    iter(dataloader)
+    first_iterator = iter(dataloader)
+
+    def get_iterator() -> Iterator[Batch]:
+        # First call returns the eagerly created iterator so its prefetched
+        # batches (including a short resumed tail) are consumed instead of
+        # being reset and discarded by a new iter(); later calls return a
+        # fresh iterator.
+        nonlocal first_iterator
+        if first_iterator is not None:
+            it, first_iterator = first_iterator, None
+            return it
+        return iter(dataloader)
+
+    dataloader.get_iterator = get_iterator  # pyre-ignore[16]
     return dataloader

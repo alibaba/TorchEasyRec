@@ -348,8 +348,18 @@ def _train_and_evaluate(
     use_epoch = train_config.num_epochs and train_config.num_epochs > 0
     use_step = train_config.num_steps and train_config.num_steps > 0
     epochs_completed = dataloader_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+    if use_epoch and epochs_completed >= train_config.num_epochs:
+        # nothing left to train: returning here avoids re-saving a checkpoint
+        # of freshly-initialized weights (the model restore lives inside the
+        # epoch loop, which would not run).
+        if is_local_rank_zero:
+            logger.warning(
+                f"{epochs_completed} epochs already completed in the restored "
+                "checkpoint, no epochs left to train."
+            )
+        return
     epoch_iter = (
-        range(min(epochs_completed, train_config.num_epochs), train_config.num_epochs)
+        range(epochs_completed, train_config.num_epochs)
         if use_epoch
         else itertools.count(0, 0)
     )
@@ -440,23 +450,27 @@ def _train_and_evaluate(
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
 
-        train_iterator = iter(train_dataloader)
+        train_iterator = train_dataloader.get_iterator()  # pyre-ignore[16]
 
         # Restore model and optimizer checkpoint
         if i_step == 0 and ckpt_path is not None:
-            if ignore_restore_optimizer:
-                ckpt_manager.restore(
-                    ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
-                )
-            else:
-                # because optimizer's state is lazy init, we should do a dummy
-                # step before restore.
-                peek_batch = next(train_iterator)
+            # because optimizer's state is lazy init, we should do a dummy
+            # step before restore. a fully-consumed resumed pass has no data
+            # to peek, so the optimizer state stays lazy and is restored on
+            # the next pass.
+            try:
+                peek_batch = None if ignore_restore_optimizer else next(train_iterator)
+            except StopIteration:
+                peek_batch = None
+            if peek_batch is not None:
                 pipeline.progress(iter([peek_batch]))
                 train_iterator = itertools.chain([peek_batch], train_iterator)
-                ckpt_manager.restore(
-                    ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
-                )
+            ckpt_manager.restore(
+                ckpt_path,
+                model,
+                None if peek_batch is None else optimizer,
+                train_config.fine_tune_ckpt_param_map,
+            )
 
         for i_step in step_iter:
             if i_step <= skip_steps:
