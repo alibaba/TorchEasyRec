@@ -271,17 +271,18 @@ class SidRqvae(BaseSidModel):
         """Standard RQ-VAE: encode -> quantize -> decode -> loss."""
         result = self._forward_rqvae(embedding)
 
-        predictions: Dict[str, torch.Tensor] = {
+        # Inference emits codes only (mirrors _predict_mixed); train/eval also
+        # carry the recon/loss tensors.
+        if self._is_inference:
+            return {"codes": result["codes"]}
+
+        return {
             "codes": result["codes"],
+            "quantized": result["quantized"],
+            "x_hat": result["x_hat"],
+            "reconstruction_loss": result["reconstruction_loss"],
+            "quantization_loss": result["quantization_loss"],
         }
-
-        if self.is_train or self.is_eval:
-            predictions["quantized"] = result["quantized"]
-            predictions["x_hat"] = result["x_hat"]
-            predictions["reconstruction_loss"] = result["reconstruction_loss"]
-            predictions["quantization_loss"] = result["quantization_loss"]
-
-        return predictions
 
     def _predict_mixed(
         self, embedding: torch.Tensor, batch: Batch
