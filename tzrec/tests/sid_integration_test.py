@@ -44,7 +44,12 @@ class SidIntegrationTest(unittest.TestCase):
         if self.success and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _prepare_config(self, num_rows: int, dim: int) -> str:
+    def _prepare_config(
+        self,
+        num_rows: int,
+        dim: int,
+        base_config: str = "tzrec/tests/configs/sid_rqkmeans_mock.config",
+    ) -> str:
         """Write an embedding parquet + a SID config pointed at it.
 
         Single dense ``embedding`` column, no labels — SID reads the item
@@ -61,9 +66,7 @@ class SidIntegrationTest(unittest.TestCase):
 
         # train_input_path set -> load_config_for_test uses it as-is (the
         # FG_DAG auto-mock path is match-model-specific; SID is single-table).
-        config = config_util.load_pipeline_config(
-            "tzrec/tests/configs/sid_rqkmeans_mock.config"
-        )
+        config = config_util.load_pipeline_config(base_config)
         config.train_input_path = data_glob
         config.eval_input_path = data_glob
         config_path = os.path.join(self.test_dir, "sid.config")
@@ -115,6 +118,44 @@ class SidIntegrationTest(unittest.TestCase):
                 math.isfinite(metrics[key]), f"{key} not finite: {metrics[key]}"
             )
         self.assertLess(metrics["rel_loss"], 1.0)
+        self.assertGreater(metrics["unique_sid_ratio"], 0.0)
+
+    @unittest.skipIf(
+        torch.cuda.is_available(),
+        "the SID integration tests run on the CPU CI job; forcing CPU on a "
+        "CUDA-built (GPU) image is unreliable.",
+    )
+    def test_sid_rqvae_train_eval(self):
+        """End-to-end SidRqvae train -> checkpoint -> eval (gradient-trained).
+
+        Exercises the full RQ-VAE pipeline (encode -> quantize -> decode,
+        commitment + reconstruction loss, gradient training, checkpoint, eval
+        metrics). On random data the model need not beat the all-zero baseline,
+        so only finiteness + nonzero SID variety are asserted (not rel_loss<1).
+        """
+        config_path = self._prepare_config(
+            num_rows=2048,
+            dim=16,
+            base_config="tzrec/tests/configs/sid_rqvae_mock.config",
+        )
+        self.success = utils.test_train_eval(config_path, self.test_dir)
+        self.assertTrue(self.success)
+        # save_checkpoints_epochs=1 persists a checkpoint during training.
+        self.assertTrue(
+            glob.glob(os.path.join(self.test_dir, "train", "model.ckpt-*")),
+            "no checkpoint persisted",
+        )
+        result_path = os.path.join(self.test_dir, "train", "eval_result.txt")
+        self.assertTrue(os.path.exists(result_path), "no eval_result.txt produced")
+        with open(result_path) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        self.assertTrue(lines, "eval_result.txt is empty")
+        metrics = json.loads(lines[-1])
+        for key in ("mse", "rel_loss", "unique_sid_ratio"):
+            self.assertIn(key, metrics)
+            self.assertTrue(
+                math.isfinite(metrics[key]), f"{key} not finite: {metrics[key]}"
+            )
         self.assertGreater(metrics["unique_sid_ratio"], 0.0)
 
 

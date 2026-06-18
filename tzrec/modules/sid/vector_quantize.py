@@ -100,7 +100,7 @@ def _sinkhorn(
     return Q.t()  # (B, K)
 
 
-class VectorQuantize(QuantizeLayer):
+class VectorQuantizeLayer(QuantizeLayer):
     """Single codebook vector quantization layer (RQ-VAE backend).
 
     A gradient-trained ``nn.Embedding`` codebook (the VQ ``QuantizeLayer``),

@@ -12,6 +12,7 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -319,72 +320,55 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertEqual(predictions["reconstruction_loss"].item(), 0.0)
         self.assertGreater(predictions["clip_loss"].item(), 0.0)
 
-    def test_sinkhorn_config_enabled_false(self) -> None:
-        """``sinkhorn_config { enabled: false }`` must turn Sinkhorn off.
-
-        Previously ``use_sinkhorn`` was hard-coded ``True`` and the proto
-        block was honored only for iters/epsilon.
-        """
-        n_embed_list = [16] * 2
-        sid_rqvae_cfg = sid_model_pb2.SidRqvae(
+    @parameterized.expand(
+        [
+            ("omitted", None, True),  # no sinkhorn_config -> on by default
+            ("enabled_true", True, True),
+            ("enabled_false", False, False),  # was hard-coded True before
+        ]
+    )
+    def test_sinkhorn_config(self, _name, enabled, expect_use_sinkhorn) -> None:
+        """``sinkhorn_config.enabled`` (or its omission) drives layer.use_sinkhorn."""
+        cfg = sid_model_pb2.SidRqvae(
             input_dim=32,
             embed_dim=8,
-            codebook=n_embed_list,
+            codebook=[16, 16],
             forward_mode="ste",
             loss_type="mse",
             kmeans_init=False,
             embedding_feature_name="item_emb",
         )
-        sid_rqvae_cfg.sinkhorn_config.CopyFrom(
-            sid_model_pb2.SinkhornConfig(enabled=False)
+        if enabled is not None:
+            cfg.sinkhorn_config.CopyFrom(sid_model_pb2.SinkhornConfig(enabled=enabled))
+        model = SidRqvae(
+            model_config=model_pb2.ModelConfig(sid_rqvae=cfg), features=[], labels=[]
         )
-        model_config = model_pb2.ModelConfig(
-            sid_rqvae=sid_rqvae_cfg,
-        )
-        model = SidRqvae(model_config=model_config, features=[], labels=[])
         init_parameters(model, device=torch.device("cpu"))
-
         for layer in model._quantizer.layers:
-            self.assertFalse(layer.use_sinkhorn)
+            self.assertEqual(layer.use_sinkhorn, expect_use_sinkhorn)
 
-    def test_sinkhorn_config_default_enabled(self) -> None:
-        """Omitting ``sinkhorn_config`` preserves on-by-default behavior.
-
-        Back-compat for legacy configs that never set the sub-config.
-        """
-        model = self._create_model()  # no sinkhorn_config set
-        for layer in model._quantizer.layers:
-            self.assertTrue(layer.use_sinkhorn)
-
-    def test_loss_type_l1_and_cosine(self) -> None:
-        """loss_type 'l1' and 'cosine' recon branches run end-to-end.
-
-        Only 'mse' was previously exercised; a typo'd branch would have been
-        silent.
-        """
+    @parameterized.expand([("mse",), ("l1",), ("cosine",)])
+    def test_loss_type_recon_branch(self, loss_type) -> None:
+        """Each loss_type recon branch runs end-to-end (grad flows)."""
         B, input_dim = 4, 32
-        for loss_type in ("l1", "cosine"):
-            cfg = sid_model_pb2.SidRqvae(
-                input_dim=input_dim,
-                embed_dim=8,
-                codebook=[16, 16],
-                forward_mode="ste",
-                loss_type=loss_type,
-                kmeans_init=False,
-                embedding_feature_name="item_emb",
-            )
-            model = SidRqvae(
-                model_config=model_pb2.ModelConfig(sid_rqvae=cfg),
-                features=[],
-                labels=[],
-            )
-            init_parameters(model, device=torch.device("cpu"))
-            model.train()
-            model.init_loss()
-            preds = model.predict(_make_batch(B, input_dim))
-            recon = preds["reconstruction_loss"]
-            self.assertTrue(torch.isfinite(recon), f"{loss_type} recon not finite")
-            recon.backward()  # grad must flow through the decoder
+        cfg = sid_model_pb2.SidRqvae(
+            input_dim=input_dim,
+            embed_dim=8,
+            codebook=[16, 16],
+            forward_mode="ste",
+            loss_type=loss_type,
+            kmeans_init=False,
+            embedding_feature_name="item_emb",
+        )
+        model = SidRqvae(
+            model_config=model_pb2.ModelConfig(sid_rqvae=cfg), features=[], labels=[]
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        model.train()
+        model.init_loss()
+        recon = model.predict(_make_batch(B, input_dim))["reconstruction_loss"]
+        self.assertTrue(torch.isfinite(recon), f"{loss_type} recon not finite")
+        recon.backward()  # grad must flow through the decoder
 
     def test_logit_scale_clamped_prevents_overflow(self) -> None:
         """A raw logit_scale far above ln(100) must not overflow.

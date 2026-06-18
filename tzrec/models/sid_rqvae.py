@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchmetrics
 from torch import nn
 
 from tzrec.datasets.utils import Batch
@@ -33,6 +32,7 @@ from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.logging_util import logger
 
 # Cap the CLIP temperatures before ``exp`` (reference CLIP clamps to ln(100)):
@@ -104,13 +104,10 @@ class SidRqvae(BaseSidModel):
         # Empty -> default (1.0, 0.5); the quantizer validates the arity.
         latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
 
-        use_sinkhorn = True
-        sinkhorn_iters = 5
-        sinkhorn_epsilon = 10.0
-        if cfg.HasField("sinkhorn_config"):
-            use_sinkhorn = cfg.sinkhorn_config.enabled
-            sinkhorn_iters = cfg.sinkhorn_config.iters
-            sinkhorn_epsilon = cfg.sinkhorn_config.epsilon
+        # Sinkhorn params from the proto: config_to_kwargs flows the proto
+        # defaults (enabled=True, iters=5, epsilon=10.0) so the model never
+        # restates them; keys map to the quantizer's use_sinkhorn/iters/epsilon.
+        sinkhorn_cfg = config_to_kwargs(cfg.sinkhorn_config)
 
         self._encoder = self._build_mlp([self._input_dim, *hidden_dims, embed_dim])
         # Decoder is the symmetric reverse of the encoder.
@@ -129,17 +126,10 @@ class SidRqvae(BaseSidModel):
             latent_weight=latent_weight,
             rotation_trick=cfg.rotation_trick,
             kmeans_init=cfg.kmeans_init,
-            use_sinkhorn=use_sinkhorn,
-            sinkhorn_iters=sinkhorn_iters,
-            sinkhorn_epsilon=sinkhorn_epsilon,
+            use_sinkhorn=sinkhorn_cfg["enabled"],
+            sinkhorn_iters=sinkhorn_cfg["iters"],
+            sinkhorn_epsilon=sinkhorn_cfg["epsilon"],
         )
-
-        # CLIP contrastive head (optional).
-        if self._use_clip:
-            self._logit_scale_self = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self._logit_scale_cl = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self._logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self._masked_clip_loss_fn = MaskedCLIPLoss()
 
         logger.info(
             "SidRqvae init: input_dim=%d, embed_dim=%d, hidden_dims=%s, "
@@ -311,6 +301,19 @@ class SidRqvae(BaseSidModel):
         }
         return predictions
 
+    def init_loss(self) -> None:
+        """Initialize loss modules: the optional CLIP contrastive head.
+
+        The three ``logit_scale`` temperatures and the ``MaskedCLIPLoss`` module
+        are created here (not in ``__init__``) so loss state lives in one place.
+        """
+        super().init_loss()
+        if self._use_clip:
+            self._logit_scale_self = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale_cl = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._masked_clip_loss_fn = MaskedCLIPLoss()
+
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
@@ -329,30 +332,3 @@ class SidRqvae(BaseSidModel):
         if self._use_clip:
             losses["clip_loss"] = predictions["clip_loss"]
         return losses
-
-    def init_metric(self) -> None:
-        """Initialize metric modules (shared eval metrics + train-path mse)."""
-        super().init_metric()
-
-        # Only the train-path reconstruction needs a metric here; unique_sid_ratio
-        # is eval-only (its torch.unique forces a per-step GPU->host sync).
-        self._train_metric_modules["mse"] = torchmetrics.MeanSquaredError()
-
-    def update_train_metric(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        batch: Batch,
-    ) -> None:
-        """Update train metric state.
-
-        Overrides the BaseSidModel no-op: RQ-VAE has a train-time reconstruction
-        (the decoder output), so it reports a train-path mse. Eval metrics are
-        handled by ``BaseSidModel.update_metric`` (SidRqvae emits ``x_hat``).
-
-        Args:
-            predictions (dict): a dict of predicted result.
-            batch (Batch): input batch data.
-        """
-        if "x_hat" in predictions:
-            embedding = self._extract_feature(batch)
-            self._train_metric_modules["mse"].update(predictions["x_hat"], embedding)

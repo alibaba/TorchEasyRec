@@ -24,7 +24,7 @@ from tzrec.modules.sid.types import (
     QuantizeForwardMode,
     ResidualQuantizerOutput,
 )
-from tzrec.modules.sid.vector_quantize import VectorQuantize
+from tzrec.modules.sid.vector_quantize import VectorQuantizeLayer
 from tzrec.utils.logging_util import logger
 
 
@@ -167,7 +167,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         self.layers = nn.ModuleList(
             [
-                VectorQuantize(
+                VectorQuantizeLayer(
                     embed_dim=embed_dim,
                     n_embed=self.n_embed_list[i],
                     forward_mode=mode_enum,
@@ -233,6 +233,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             )
 
         if (not is_ddp) or dist.get_rank() == 0:
+            # TODO(follow-up): accumulate samples across multiple batches for the
+            # warm-start fit instead of seeding from only the first training batch.
             centers = faiss_residual_kmeans(
                 data,
                 self.n_embed_list,
@@ -336,18 +338,13 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
 
-    def _train_gumbel(self) -> bool:
-        """Training pass in Gumbel mode (its soft assignment carries grad)."""
-        is_gumbel = self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
-        return self.training and is_gumbel
-
     def _quantize_layer(
         self,
         layer_idx: int,
         residual: torch.Tensor,
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantize one layer's residual via its ``VectorQuantize`` layer.
+        """Quantize one layer's residual via its ``VectorQuantizeLayer`` layer.
 
         STE: raw codebook vector (STE applied on the aggregate in :meth:`forward`).
         Gumbel: the soft embedding (carries grad directly).
@@ -392,7 +389,9 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if self.training:
             self.init_embed_(input)  # first training forward only
 
-        train_gumbel = self._train_gumbel()
+        train_gumbel = (
+            self.training and self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
+        )
 
         # cumulative[i] = sum after layer i.
         walk_input = input if train_gumbel else input.detach()

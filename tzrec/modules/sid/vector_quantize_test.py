@@ -16,13 +16,13 @@ from parameterized import parameterized
 
 from tzrec.modules.sid.types import QuantizeForwardMode
 from tzrec.modules.sid.vector_quantize import (
-    VectorQuantize,
+    VectorQuantizeLayer,
     _squared_euclidean_distance,
 )
 
 
 class SquaredEuclideanDistanceTest(unittest.TestCase):
-    """Tests for the squared-L2 distance helper used by VectorQuantize."""
+    """Tests for the squared-L2 distance helper used by VectorQuantizeLayer."""
 
     def test_squared_euclidean_distance(self) -> None:
         x = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
@@ -34,7 +34,7 @@ class SquaredEuclideanDistanceTest(unittest.TestCase):
 
 
 class VectorQuantizeTest(unittest.TestCase):
-    """Tests for a single VectorQuantize layer."""
+    """Tests for a single VectorQuantizeLayer layer."""
 
     @parameterized.expand(
         [
@@ -47,7 +47,7 @@ class VectorQuantizeTest(unittest.TestCase):
     )
     def test_train_forward(self, _name, mode, distance_type, use_sinkhorn) -> None:
         torch.manual_seed(0)
-        vq = VectorQuantize(
+        vq = VectorQuantizeLayer(
             embed_dim=8,
             n_embed=16,
             forward_mode=mode,
@@ -70,7 +70,7 @@ class VectorQuantizeTest(unittest.TestCase):
         assignment must use more than one code.
         """
         torch.manual_seed(0)
-        vq = VectorQuantize(
+        vq = VectorQuantizeLayer(
             embed_dim=2, n_embed=4, use_sinkhorn=True, sinkhorn_iters=10
         )
         vq.train()
@@ -88,7 +88,7 @@ class VectorQuantizeTest(unittest.TestCase):
     def test_sinkhorn_gumbel_combo_rejected(self) -> None:
         """Sinkhorn + Gumbel would desync `ids` and `emb`; constructor rejects it."""
         with self.assertRaisesRegex(AssertionError, "GUMBEL_SOFTMAX"):
-            VectorQuantize(
+            VectorQuantizeLayer(
                 embed_dim=8,
                 n_embed=16,
                 forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
@@ -98,13 +98,13 @@ class VectorQuantizeTest(unittest.TestCase):
     def test_sinkhorn_epsilon_must_be_positive(self) -> None:
         """Reject a non-positive sinkhorn_epsilon (it overflows exp(-cost*eps))."""
         with self.assertRaisesRegex(ValueError, "sinkhorn_epsilon"):
-            VectorQuantize(
+            VectorQuantizeLayer(
                 embed_dim=8, n_embed=16, use_sinkhorn=True, sinkhorn_epsilon=0.0
             )
 
     def test_train_forward_backward_reaches_input(self) -> None:
         torch.manual_seed(0)
-        vq = VectorQuantize(embed_dim=8, n_embed=16, use_sinkhorn=False)
+        vq = VectorQuantizeLayer(embed_dim=8, n_embed=16, use_sinkhorn=False)
         vq.train()
         x = torch.randn(5, 8, requires_grad=True)
         out = vq.quantize(x)
@@ -115,7 +115,7 @@ class VectorQuantizeTest(unittest.TestCase):
 
     def test_eval_forward_is_plain_lookup(self) -> None:
         torch.manual_seed(0)
-        vq = VectorQuantize(embed_dim=4, n_embed=8)
+        vq = VectorQuantizeLayer(embed_dim=4, n_embed=8)
         vq.eval()
         x = torch.randn(3, 4)
         out = vq.quantize(x)
@@ -128,7 +128,7 @@ class VectorQuantizeTest(unittest.TestCase):
         # (Under the old code ids came from argmin and could disagree with the
         # gumbel-sampled embedding.)
         torch.manual_seed(0)
-        vq = VectorQuantize(
+        vq = VectorQuantizeLayer(
             embed_dim=8,
             n_embed=16,
             forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
@@ -141,7 +141,7 @@ class VectorQuantizeTest(unittest.TestCase):
     def test_gumbel_train_distances_are_differentiable(self) -> None:
         # Gumbel needs the assignment differentiable: grad must reach the input.
         torch.manual_seed(0)
-        vq = VectorQuantize(
+        vq = VectorQuantizeLayer(
             embed_dim=8,
             n_embed=16,
             forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
