@@ -30,13 +30,13 @@ message GradClipping {
 }
 
 message DeltaEmbeddingDumpConfig {
+    // MC/ZCH features are not supported; use dynamicemb for delta dump.
     // enable dumping changed sparse embedding rows during training
     optional bool enable = 1 [default = false];
     // dump touched ids and their latest embedding every N training steps. Larger
     // intervals retain a longer id window in memory; auto compaction reduces
     // per-batch tensor buildup but unique ids still scale with the interval.
     optional uint32 dump_interval_steps = 2 [default = 1000];
-    // MC/ZCH features are not supported; use dynamicemb for delta dump.
     // output directory. default is ${model_dir}/delta_embedding_dump
     optional string output_dir = 3;
     // parquet file prefix
