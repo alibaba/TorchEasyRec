@@ -29,6 +29,18 @@ from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.utils.logging_util import logger
 
 _CONSUMER = "delta_embedding_dump"
+_DELTA_DUMP_SCHEMA = pa.schema(
+    [
+        ("global_step", pa.int64()),
+        ("rank", pa.int32()),
+        ("world_size", pa.int32()),
+        ("feature_name", pa.string()),
+        ("table_fqn", pa.string()),
+        ("key_id", pa.int64()),
+        ("embedding", pa.list_(pa.float32())),
+        ("source", pa.string()),
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -359,19 +371,19 @@ class DeltaEmbeddingDumper:
         """Dump currently tracked sparse ids and embeddings to a parquet file."""
         table_weights = self._collect_table_weights()
         dynamic_modules = self._collect_dynamic_modules()
-        rows: List[Dict[str, Any]] = []
-        self._append_model_delta_rows(
-            rows,
+        table_chunks: List[pa.Table] = []
+        num_rows = self._append_model_delta_rows(
+            table_chunks,
             global_step=global_step,
             table_weights=table_weights,
             dynamic_modules=dynamic_modules,
         )
-        if not rows:
+        if num_rows == 0:
             logger.info("No delta embedding rows to dump at step %s.", global_step)
             return None
         output_path = self._output_path(global_step)
-        self._write_rows(rows, output_path)
-        logger.info("Dumped %s delta embedding rows to %s.", len(rows), output_path)
+        self._write_table_chunks(table_chunks, output_path)
+        logger.info("Dumped %s delta embedding rows to %s.", num_rows, output_path)
         return output_path
 
     def _output_path(self, global_step: int) -> str:
@@ -418,11 +430,12 @@ class DeltaEmbeddingDumper:
 
     def _append_model_delta_rows(
         self,
-        rows: List[Dict[str, Any]],
+        table_chunks: List[pa.Table],
         global_step: int,
         table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
-    ) -> None:
+    ) -> int:
+        num_rows = 0
         for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
             ids = unique_rows.ids
             if ids.numel() == 0:
@@ -439,8 +452,8 @@ class DeltaEmbeddingDumper:
                 dynamic_modules=dynamic_modules,
             )
             feature_name = _feature_name(self._fqn_to_feature_names.get(fqn, []))
-            self._extend_rows(
-                rows,
+            num_rows += self._append_table_chunk(
+                table_chunks,
                 global_step=global_step,
                 feature_name=feature_name,
                 table_fqn=fqn,
@@ -448,6 +461,7 @@ class DeltaEmbeddingDumper:
                 embeddings=embeddings,
                 source="model_delta_tracker",
             )
+        return num_rows
 
     def _lookup_embeddings(
         self,
@@ -613,53 +627,67 @@ class DeltaEmbeddingDumper:
                 modules[table_name] = dynamic_module
         return modules
 
-    def _extend_rows(
+    def _append_table_chunk(
         self,
-        rows: List[Dict[str, Any]],
+        table_chunks: List[pa.Table],
         global_step: int,
         feature_name: str,
         table_fqn: str,
         key_ids: torch.Tensor,
         embeddings: torch.Tensor,
         source: str,
-    ) -> None:
-        key_ids_cpu = key_ids.detach().cpu().to(torch.int64).tolist()
-        embeddings_cpu = embeddings.detach().cpu().to(torch.float32).tolist()
-        for key_id, embedding in zip(key_ids_cpu, embeddings_cpu):
-            rows.append(
-                {
-                    "global_step": global_step,
-                    "rank": self._rank,
-                    "world_size": self._world_size,
-                    "feature_name": feature_name,
-                    "table_fqn": table_fqn,
-                    "key_id": key_id,
-                    "embedding": embedding,
-                    "source": source,
-                }
+    ) -> int:
+        key_ids_cpu = key_ids.detach().cpu().to(torch.int64).contiguous()
+        embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
+        if embeddings_cpu.dim() != 2:
+            raise ValueError(
+                "delta embedding dump expects a 2-D embedding tensor, "
+                f"but got shape={tuple(embeddings_cpu.shape)}."
+            )
+        num_rows = int(key_ids_cpu.numel())
+        if num_rows == 0:
+            return 0
+        if embeddings_cpu.size(0) != num_rows:
+            raise ValueError(
+                "delta embedding dump key ids and embeddings row count mismatch: "
+                f"key_ids={num_rows}, embeddings={embeddings_cpu.size(0)}."
             )
 
-    def _write_rows(self, rows: List[Dict[str, Any]], output_path: str) -> None:
-        table = pa.Table.from_arrays(
-            [
-                pa.array([r["global_step"] for r in rows], type=pa.int64()),
-                pa.array([r["rank"] for r in rows], type=pa.int32()),
-                pa.array([r["world_size"] for r in rows], type=pa.int32()),
-                pa.array([r["feature_name"] for r in rows], type=pa.string()),
-                pa.array([r["table_fqn"] for r in rows], type=pa.string()),
-                pa.array([r["key_id"] for r in rows], type=pa.int64()),
-                pa.array([r["embedding"] for r in rows], type=pa.list_(pa.float32())),
-                pa.array([r["source"] for r in rows], type=pa.string()),
-            ],
-            names=[
-                "global_step",
-                "rank",
-                "world_size",
-                "feature_name",
-                "table_fqn",
-                "key_id",
-                "embedding",
-                "source",
-            ],
+        table_chunks.append(
+            pa.Table.from_arrays(
+                [
+                    pa.repeat(pa.scalar(global_step, pa.int64()), num_rows),
+                    pa.repeat(pa.scalar(self._rank, pa.int32()), num_rows),
+                    pa.repeat(pa.scalar(self._world_size, pa.int32()), num_rows),
+                    pa.repeat(pa.scalar(feature_name, pa.string()), num_rows),
+                    pa.repeat(pa.scalar(table_fqn, pa.string()), num_rows),
+                    pa.array(key_ids_cpu.numpy(), type=pa.int64()),
+                    self._embedding_array(embeddings_cpu),
+                    pa.repeat(pa.scalar(source, pa.string()), num_rows),
+                ],
+                schema=_DELTA_DUMP_SCHEMA,
+            )
         )
-        pq.write_table(table, output_path)
+        return num_rows
+
+    def _embedding_array(self, embeddings: torch.Tensor) -> pa.ListArray:
+        num_rows = embeddings.size(0)
+        emb_dim = embeddings.size(1)
+        if emb_dim == 0:
+            offsets = torch.zeros(num_rows + 1, dtype=torch.int32).numpy()
+        else:
+            offsets = torch.arange(
+                0,
+                (num_rows + 1) * emb_dim,
+                emb_dim,
+                dtype=torch.int32,
+            ).numpy()
+        values = pa.array(embeddings.reshape(-1).numpy(), type=pa.float32())
+        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
+
+    def _write_table_chunks(
+        self, table_chunks: List[pa.Table], output_path: str
+    ) -> None:
+        with pq.ParquetWriter(output_path, _DELTA_DUMP_SCHEMA) as writer:
+            for table_chunk in table_chunks:
+                writer.write_table(table_chunk)

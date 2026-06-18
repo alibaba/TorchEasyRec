@@ -15,11 +15,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 
 from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.utils.delta_embedding_dump import (
+    _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
     _table_shard_info_from_config,
     _TableShardInfo,
@@ -115,9 +118,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 1
         dumper._world_size = 4
-        rows = []
-        dumper._extend_rows(
-            rows,
+        table_chunks = []
+        num_rows = dumper._append_table_chunk(
+            table_chunks,
             global_step=10,
             feature_name="user_id",
             table_fqn="model.ebc.user_emb",
@@ -125,9 +128,38 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             embeddings=torch.tensor([[1.0, 2.0]]),
             source="model_delta_tracker",
         )
-        self.assertEqual(rows[0]["rank"], 1)
-        self.assertEqual(rows[0]["world_size"], 4)
-        self.assertEqual(rows[0]["key_id"], 42)
+        self.assertEqual(num_rows, 1)
+        self.assertEqual(len(table_chunks), 1)
+        table = table_chunks[0]
+        self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        self.assertEqual(table["rank"].to_pylist(), [1])
+        self.assertEqual(table["world_size"].to_pylist(), [4])
+        self.assertEqual(table["key_id"].to_pylist(), [42])
+        self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0]])
+
+    def test_write_table_chunks_preserves_parquet_schema(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        table_chunks = []
+        dumper._append_table_chunk(
+            table_chunks,
+            global_step=5,
+            feature_name="user_id",
+            table_fqn="model.ebc.user_emb",
+            key_ids=torch.tensor([7, 8]),
+            embeddings=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            source="model_delta_tracker",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = os.path.join(tmp_dir, "delta.parquet")
+            dumper._write_table_chunks(table_chunks, output_path)
+            table = pq.read_table(output_path)
+
+        self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        self.assertEqual(table["key_id"].to_pylist(), [7, 8])
+        self.assertEqual(table["embedding"].type, pa.list_(pa.float32()))
+        self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0], [3.0, 4.0]])
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
