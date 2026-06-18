@@ -44,12 +44,18 @@ class QuantizeOutput(NamedTuple):
 class ResidualQuantizerOutput(NamedTuple):
     """Output of the residual quantization module (RQ-VAE backend).
 
+    The commitment loss is no longer computed inside the quantizer; the per-layer
+    cumulative quantized vectors are exposed as ``latents`` so the model-side
+    commitment loss (:class:`~tzrec.loss.commitment_loss.CommitmentLoss`) can
+    consume them.
+
     Attributes:
         cluster_ids (Tensor): codebook indices per layer, shape (B, n_layers).
         quantized_embeddings (Tensor): sum of quantized embeddings, shape (B, D).
-        quantization_loss (Tensor): total commitment loss scalar.
+        latents (Tensor): per-layer cumulative quantized vectors, shape
+            (B, n_layers, D) (``latents[:, i]`` is the sum after layer ``i``).
     """
 
     cluster_ids: torch.Tensor
     quantized_embeddings: torch.Tensor
-    quantization_loss: torch.Tensor
+    latents: torch.Tensor

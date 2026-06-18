@@ -17,7 +17,7 @@ from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.models.sid_rqvae import SidRqvae
-from tzrec.protos import model_pb2
+from tzrec.protos import loss_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 
@@ -43,38 +43,77 @@ def _make_batch(
     )
 
 
+def _recon_loss_cfg(kind: str = "recon_l2_loss") -> loss_pb2.LossConfig:
+    """A LossConfig whose sid_loss oneof is the given recon variant."""
+    lc = loss_pb2.LossConfig()
+    getattr(lc, kind).SetInParent()
+    return lc
+
+
+def _commitment_cfg(
+    latent_weight=(1.0, 0.5), commitment_type="l2"
+) -> loss_pb2.LossConfig:
+    lc = loss_pb2.LossConfig()
+    lc.commitment_loss.latent_weight.extend(latent_weight)
+    lc.commitment_loss.commitment_type = commitment_type
+    return lc
+
+
+def _clip_cfg() -> loss_pb2.LossConfig:
+    lc = loss_pb2.LossConfig()
+    lc.sid_clip_loss.clip_feature_name = "image_emb"
+    lc.sid_clip_loss.is_clip_pair_feature_name = "is_clip_pair"
+    return lc
+
+
 class SidRqvaeTest(unittest.TestCase):
     """Tests for SidRqvae model."""
 
-    def _create_model(self, use_clip=False, input_dim=32, embed_dim=8, n_layers=2):
-        """Helper to create a SidRqvae model with minimal config."""
+    def _create_model(
+        self,
+        use_clip=False,
+        input_dim=32,
+        embed_dim=8,
+        n_layers=2,
+        recon="recon_l2_loss",
+    ):
+        """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
         sid_rqvae_cfg = sid_model_pb2.SidRqvae(
             input_dim=input_dim,
             embed_dim=embed_dim,
             codebook=n_embed_list,
             forward_mode="ste",
-            loss_type="mse",
             kmeans_init=False,
             embedding_feature_name="item_emb",
         )
+        losses = [_recon_loss_cfg(recon), _commitment_cfg()]
         if use_clip:
-            sid_rqvae_cfg.clip_config.CopyFrom(
-                sid_model_pb2.ClipConfig(
-                    clip_feature_name="image_emb",
-                    is_clip_pair_feature_name="is_clip_pair",
-                )
-            )
+            losses.append(_clip_cfg())
 
         # SID models read the item-embedding dense feature directly from the
         # batch; they do not consume feature_groups, so none is set (which
         # keeps the config consistent with the empty ``features`` list).
-        model_config = model_pb2.ModelConfig(
-            sid_rqvae=sid_rqvae_cfg,
-        )
+        model_config = model_pb2.ModelConfig(sid_rqvae=sid_rqvae_cfg, losses=losses)
         model = SidRqvae(model_config=model_config, features=[], labels=[])
         init_parameters(model, device=torch.device("cpu"))
         return model
+
+    def _clip_batch(self, B, input_dim, is_clip_pair):
+        return Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    tensors=[
+                        torch.randn(B, input_dim),
+                        torch.randn(B, input_dim),
+                        is_clip_pair,
+                    ],
+                )
+            },
+            sparse_features={},
+            labels={},
+        )
 
     def test_rqvae_train_mode(self) -> None:
         """Test SidRqvae in train mode: predict -> loss -> metric."""
@@ -87,44 +126,39 @@ class SidRqvaeTest(unittest.TestCase):
         batch = _make_batch(B, input_dim)
         predictions = model.predict(batch)
 
-        # Train mode should return all fields
+        # predict() returns only the raw tensors the losses consume.
         self.assertIn("codes", predictions)
-        self.assertIn("quantized", predictions)
         self.assertIn("x_hat", predictions)
-        self.assertIn("reconstruction_loss", predictions)
-        self.assertIn("quantization_loss", predictions)
+        self.assertIn("encoder_out", predictions)
+        self.assertIn("latents", predictions)
         self.assertEqual(predictions["codes"].shape[0], B)
 
-        # Loss should return reconstruction_loss + quantization_loss
+        # loss() computes the configured recon + commitment terms.
         losses = model.loss(predictions, batch)
-        self.assertIn("reconstruction_loss", losses)
-        self.assertIn("quantization_loss", losses)
+        self.assertIn("recon_l2_loss", losses)
+        self.assertIn("commitment_loss", losses)
 
-        # Total loss should be a scalar and have grad
         total_loss = sum(losses.values())
         self.assertTrue(total_loss.requires_grad)
 
-        # Metric update should not raise
         model.update_metric(predictions, batch, losses)
         metrics = model.compute_metric()
         self.assertIn("mse", metrics)
         self.assertIn("unique_sid_ratio", metrics)
 
     def test_rqvae_eval_mode(self) -> None:
-        """Test SidRqvae in eval mode: predict returns all fields."""
+        """Test SidRqvae in eval mode: predict returns the recon fields."""
         B, input_dim = 4, 32
         model = self._create_model(input_dim=input_dim)
         model.eval()
 
-        batch = _make_batch(B, input_dim)
-        predictions = model.predict(batch)
+        predictions = model.predict(_make_batch(B, input_dim))
 
-        # Eval mode (not inference) should return all fields
+        # Eval mode (not inference) exposes x_hat for the metric + losses.
         self.assertIn("codes", predictions)
-        self.assertIn("quantized", predictions)
         self.assertIn("x_hat", predictions)
-        self.assertIn("reconstruction_loss", predictions)
-        self.assertIn("quantization_loss", predictions)
+        self.assertIn("encoder_out", predictions)
+        self.assertIn("latents", predictions)
 
     def test_rqvae_inference_mode(self) -> None:
         """Test SidRqvae in inference mode: only codes returned."""
@@ -133,13 +167,10 @@ class SidRqvaeTest(unittest.TestCase):
         model.eval()
         model.set_is_inference(True)
 
-        batch = _make_batch(B, input_dim)
-        predictions = model.predict(batch)
-
-        # Inference mode should only return codes
+        predictions = model.predict(_make_batch(B, input_dim))
         self.assertIn("codes", predictions)
         self.assertNotIn("x_hat", predictions)
-        self.assertNotIn("reconstruction_loss", predictions)
+        self.assertNotIn("latents", predictions)
 
     def test_rqvae_clip_mode(self) -> None:
         """Test SidRqvae with CLIP mixed mode (mixed recon + clip batch)."""
@@ -148,45 +179,23 @@ class SidRqvaeTest(unittest.TestCase):
         model.train()
         model.init_loss()
 
-        # Build mixed batch: first half recon, second half clip.
-        # With the explicit is_clip_pair column the actual tensor values
-        # no longer matter — the flag column drives routing.
-        item_emb = torch.randn(B, input_dim)
-        image_emb = torch.randn(B, input_dim)
         is_clip_pair = torch.zeros(B, 1)
-        is_clip_pair[B // 2 :] = 1.0  # clip rows
-
-        batch = Batch(
-            dense_features={
-                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb", "is_clip_pair"],
-                    tensors=[item_emb, image_emb, is_clip_pair],
-                )
-            },
-            sparse_features={},
-            labels={},
-        )
+        is_clip_pair[B // 2 :] = 1.0  # second half clip
+        batch = self._clip_batch(B, input_dim, is_clip_pair)
 
         predictions = model.predict(batch)
-
-        # Mixed mode returns reconstruction_loss, clip_loss, quantization_loss
         self.assertIn("codes", predictions)
-        self.assertIn("reconstruction_loss", predictions)
-        self.assertIn("clip_loss", predictions)
-        self.assertIn("quantization_loss", predictions)
         self.assertIn("x_hat", predictions)
+        self.assertIn("clip_image", predictions)
         self.assertEqual(predictions["codes"].shape[0], B)
 
-        # Loss should return all three
         losses = model.loss(predictions, batch)
-        self.assertIn("reconstruction_loss", losses)
-        self.assertIn("clip_loss", losses)
-        self.assertIn("quantization_loss", losses)
+        self.assertIn("recon_l2_loss", losses)
+        self.assertIn("commitment_loss", losses)
+        self.assertIn("sid_clip_loss", losses)
 
         total_loss = sum(losses.values())
         self.assertTrue(total_loss.requires_grad)
-
-        # Backward should work
         total_loss.backward()
         has_grad = any(
             p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
@@ -194,66 +203,28 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertTrue(has_grad)
 
     def test_rqvae_clip_all_recon(self) -> None:
-        """Test mixed mode with all-recon batch (edge case)."""
+        """Mixed mode with all-recon batch: clip term 0, recon term > 0."""
         B, input_dim = 4, 32
         model = self._create_model(input_dim=input_dim, use_clip=True)
         model.train()
         model.init_loss()
 
-        # All recon: is_clip_pair = 0 everywhere
-        item_emb = torch.randn(B, input_dim)
-        image_emb = torch.randn(B, input_dim)
-        is_clip_pair = torch.zeros(B, 1)
-
-        batch = Batch(
-            dense_features={
-                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb", "is_clip_pair"],
-                    tensors=[item_emb, image_emb, is_clip_pair],
-                )
-            },
-            sparse_features={},
-            labels={},
-        )
-
-        predictions = model.predict(batch)
-        model.loss(predictions, batch)
-
-        # clip_loss should be 0 (no clip rows)
-        self.assertEqual(predictions["clip_loss"].item(), 0.0)
-        # reconstruction_loss should be > 0
-        self.assertGreater(predictions["reconstruction_loss"].item(), 0.0)
+        batch = self._clip_batch(B, input_dim, torch.zeros(B, 1))
+        losses = model.loss(model.predict(batch), batch)
+        self.assertEqual(losses["sid_clip_loss"].item(), 0.0)
+        self.assertGreater(losses["recon_l2_loss"].item(), 0.0)
 
     def test_rqvae_clip_all_clip(self) -> None:
-        """Test mixed mode with all-clip batch (edge case)."""
+        """Mixed mode with all-clip batch: recon term 0, clip term > 0."""
         B, input_dim = 4, 32
         model = self._create_model(input_dim=input_dim, use_clip=True)
         model.train()
         model.init_loss()
 
-        # All clip: is_clip_pair = 1 everywhere
-        item_emb = torch.randn(B, input_dim)
-        image_emb = torch.randn(B, input_dim)
-        is_clip_pair = torch.ones(B, 1)
-
-        batch = Batch(
-            dense_features={
-                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb", "is_clip_pair"],
-                    tensors=[item_emb, image_emb, is_clip_pair],
-                )
-            },
-            sparse_features={},
-            labels={},
-        )
-
-        predictions = model.predict(batch)
-        model.loss(predictions, batch)
-
-        # reconstruction_loss should be 0 (no recon rows)
-        self.assertEqual(predictions["reconstruction_loss"].item(), 0.0)
-        # clip_loss should be > 0
-        self.assertGreater(predictions["clip_loss"].item(), 0.0)
+        batch = self._clip_batch(B, input_dim, torch.ones(B, 1))
+        losses = model.loss(model.predict(batch), batch)
+        self.assertEqual(losses["recon_l2_loss"].item(), 0.0)
+        self.assertGreater(losses["sid_clip_loss"].item(), 0.0)
 
     def test_rqvae_backward(self) -> None:
         """Test that backward pass works without errors."""
@@ -263,37 +234,33 @@ class SidRqvaeTest(unittest.TestCase):
         model.init_loss()
 
         batch = _make_batch(B, input_dim)
-        predictions = model.predict(batch)
-        losses = model.loss(predictions, batch)
-        total_loss = sum(losses.values())
-        total_loss.backward()
+        losses = model.loss(model.predict(batch), batch)
+        sum(losses.values()).backward()
 
-        # Encoder params should have gradients
         has_grad = any(
             p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
         )
         self.assertTrue(has_grad)
 
-    def test_latent_weight_wrong_length_raises(self) -> None:
-        """latent_weight must be exactly [w1, w2]; a bad length fails fast."""
+    def test_commitment_latent_weight_wrong_length_raises(self) -> None:
+        """A commitment_loss with a bad latent_weight length fails in init_loss."""
         for bad in ([1.0], [1.0, 0.5, 0.25]):
             cfg = sid_model_pb2.SidRqvae(
-                input_dim=32,
-                embed_dim=8,
-                codebook=[16, 16],
-                kmeans_init=False,
-                latent_weight=bad,
+                input_dim=32, embed_dim=8, codebook=[16, 16], kmeans_init=False
             )
-            model_config = model_pb2.ModelConfig(sid_rqvae=cfg)
+            model_config = model_pb2.ModelConfig(
+                sid_rqvae=cfg, losses=[_commitment_cfg(latent_weight=bad)]
+            )
+            model = SidRqvae(model_config=model_config, features=[], labels=[])
             with self.assertRaisesRegex(ValueError, "latent_weight"):
-                SidRqvae(model_config=model_config, features=[], labels=[])
+                model.init_loss()
 
     def test_clip_mask_uses_flag_not_equality(self) -> None:
         """The is_clip_pair flag, not bit-exact equality, drives routing.
 
         Build a batch where ``image_emb == item_emb`` numerically but
-        ``is_clip_pair=1``: row must route to the CLIP branch (under the
-        old bit-exact logic it would have been silently relabeled recon).
+        ``is_clip_pair=1``: rows must route to the CLIP branch (under the old
+        bit-exact logic they would have been silently relabeled recon).
         """
         B, input_dim = 4, 32
         model = self._create_model(input_dim=input_dim, use_clip=True)
@@ -301,24 +268,19 @@ class SidRqvaeTest(unittest.TestCase):
         model.init_loss()
 
         item_emb = torch.randn(B, input_dim)
-        image_emb = item_emb.clone()  # bit-identical
-        is_clip_pair = torch.ones(B, 1)  # but flagged as clip
-
         batch = Batch(
             dense_features={
                 BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
                     keys=["item_emb", "image_emb", "is_clip_pair"],
-                    tensors=[item_emb, image_emb, is_clip_pair],
+                    tensors=[item_emb, item_emb.clone(), torch.ones(B, 1)],
                 )
             },
             sparse_features={},
             labels={},
         )
-
-        predictions = model.predict(batch)
-        # All rows flagged as clip -> reconstruction_loss should be 0, clip_loss > 0
-        self.assertEqual(predictions["reconstruction_loss"].item(), 0.0)
-        self.assertGreater(predictions["clip_loss"].item(), 0.0)
+        losses = model.loss(model.predict(batch), batch)
+        self.assertEqual(losses["recon_l2_loss"].item(), 0.0)
+        self.assertGreater(losses["sid_clip_loss"].item(), 0.0)
 
     @parameterized.expand(
         [
@@ -334,7 +296,6 @@ class SidRqvaeTest(unittest.TestCase):
             embed_dim=8,
             codebook=[16, 16],
             forward_mode="ste",
-            loss_type="mse",
             kmeans_init=False,
             embedding_feature_name="item_emb",
         )
@@ -347,28 +308,25 @@ class SidRqvaeTest(unittest.TestCase):
         for layer in model._quantizer.layers:
             self.assertEqual(layer.use_sinkhorn, expect_use_sinkhorn)
 
-    @parameterized.expand([("mse",), ("l1",), ("cosine",)])
-    def test_loss_type_recon_branch(self, loss_type) -> None:
-        """Each loss_type recon branch runs end-to-end (grad flows)."""
+    @parameterized.expand(
+        [
+            ("recon_l2_loss",),
+            ("recon_l1_loss",),
+            ("recon_cosine_loss",),
+        ]
+    )
+    def test_recon_loss_variant_branch(self, recon) -> None:
+        """Each recon variant runs end-to-end (grad flows through the decoder)."""
         B, input_dim = 4, 32
-        cfg = sid_model_pb2.SidRqvae(
-            input_dim=input_dim,
-            embed_dim=8,
-            codebook=[16, 16],
-            forward_mode="ste",
-            loss_type=loss_type,
-            kmeans_init=False,
-            embedding_feature_name="item_emb",
-        )
-        model = SidRqvae(
-            model_config=model_pb2.ModelConfig(sid_rqvae=cfg), features=[], labels=[]
-        )
-        init_parameters(model, device=torch.device("cpu"))
+        model = self._create_model(input_dim=input_dim, recon=recon)
         model.train()
         model.init_loss()
-        recon = model.predict(_make_batch(B, input_dim))["reconstruction_loss"]
-        self.assertTrue(torch.isfinite(recon), f"{loss_type} recon not finite")
-        recon.backward()  # grad must flow through the decoder
+        losses = model.loss(
+            model.predict(_make_batch(B, input_dim)), _make_batch(B, input_dim)
+        )
+        recon_loss = losses[recon]
+        self.assertTrue(torch.isfinite(recon_loss), f"{recon} not finite")
+        recon_loss.backward()  # grad must flow through the decoder
 
     def test_logit_scale_clamped_prevents_overflow(self) -> None:
         """A raw logit_scale far above ln(100) must not overflow.
@@ -386,22 +344,9 @@ class SidRqvaeTest(unittest.TestCase):
             model._logit_scale_cl.fill_(100.0)
             model._logit_scale.fill_(100.0)
 
-        batch = Batch(
-            dense_features={
-                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb", "is_clip_pair"],
-                    tensors=[
-                        torch.randn(B, input_dim),
-                        torch.randn(B, input_dim),
-                        torch.ones(B, 1),
-                    ],
-                )
-            },
-            sparse_features={},
-            labels={},
-        )
+        batch = self._clip_batch(B, input_dim, torch.ones(B, 1))
         losses = model.loss(model.predict(batch), batch)
-        self.assertTrue(torch.isfinite(losses["clip_loss"]))
+        self.assertTrue(torch.isfinite(losses["sid_clip_loss"]))
         sum(losses.values()).backward()
         for p in (
             model._logit_scale_self,

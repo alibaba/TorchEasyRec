@@ -13,15 +13,32 @@
 
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 import torchmetrics
+from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.clip_loss import MaskedCLIPLoss
+from tzrec.loss.commitment_loss import CommitmentLoss
 from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
+from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
+
+# Cap the CLIP temperatures before ``exp`` (reference CLIP clamps to ln(100)):
+# an unbounded ``logit_scale`` overflows to +Inf -> NaN grad -> corrupt param.
+_LOGIT_SCALE_MAX = float(np.log(100))
+
+# sid_loss reconstruction variants -> the reduction used by ``_recon_loss``.
+_RECON_TYPES = {
+    "recon_l2_loss": "mse",
+    "recon_l1_loss": "l1",
+    "recon_cosine_loss": "cosine",
+}
 
 
 class BaseSidModel(BaseModel):
@@ -99,12 +116,126 @@ class BaseSidModel(BaseModel):
         return kt[feature_name]
 
     def init_loss(self) -> None:
-        """Initialize loss modules.
+        """Initialize SID loss modules from ``ModelConfig.losses``.
 
-        SID models compute their losses internally and pass them through
-        ``predictions``; there is no external loss module to register.
+        Each ``LossConfig`` sets one ``sid_loss`` oneof variant (a reconstruction
+        loss, the commitment loss, or the CLIP loss). Mirrors ``RankModel``: the
+        config drives which loss modules are registered, and :meth:`loss`
+        computes them from ``predictions``.
         """
-        pass
+        for loss_cfg in self._base_model_config.losses:
+            self._init_sid_loss_impl(loss_cfg)
+
+    def _init_sid_loss_impl(self, loss_cfg: LossConfig) -> None:
+        """Register the module (if any) for one ``sid_loss`` config."""
+        loss_type = loss_cfg.WhichOneof("sid_loss")
+        if loss_type in _RECON_TYPES:
+            return  # reconstruction losses are functional (no module)
+        elif loss_type == "commitment_loss":
+            cfg = loss_cfg.commitment_loss
+            latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
+            self._loss_modules["commitment_loss"] = CommitmentLoss(
+                latent_weight=latent_weight,
+                commitment_type=cfg.commitment_type,
+            )
+        elif loss_type == "sid_clip_loss":
+            # The three learnable CLIP temperatures + the masked-CLIP module.
+            self._logit_scale_self = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale_cl = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._loss_modules["sid_clip_loss"] = MaskedCLIPLoss()
+        else:
+            raise ValueError(
+                f"LossConfig for a SID model must set a sid_loss variant, "
+                f"got {loss_type!r}"
+            )
+
+    def loss(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Compute the configured SID losses from ``predictions``.
+
+        Args:
+            predictions (dict): a dict of predicted result (the raw tensors the
+                losses consume — ``x_hat``/``recon_target`` for reconstruction,
+                ``encoder_out``/``latents`` for commitment, and the CLIP embeds).
+            batch (Batch): input batch data.
+
+        Return:
+            losses (dict): a dict of loss tensor keyed by the sid_loss variant.
+        """
+        losses: Dict[str, torch.Tensor] = {}
+        for loss_cfg in self._base_model_config.losses:
+            losses.update(self._sid_loss_impl(predictions, loss_cfg))
+        return losses
+
+    def _sid_loss_impl(
+        self, predictions: Dict[str, torch.Tensor], loss_cfg: LossConfig
+    ) -> Dict[str, torch.Tensor]:
+        """Compute one ``sid_loss`` term from ``predictions``."""
+        loss_type = loss_cfg.WhichOneof("sid_loss")
+        if loss_type in _RECON_TYPES:
+            loss = self._recon_loss(
+                predictions["x_hat"],
+                predictions["recon_target"],
+                _RECON_TYPES[loss_type],
+                predictions.get("recon_mask"),
+            )
+            return {loss_type: loss}
+        elif loss_type == "commitment_loss":
+            loss = self._loss_modules["commitment_loss"](
+                predictions["encoder_out"], predictions["latents"]
+            )
+            return {"commitment_loss": loss}
+        elif loss_type == "sid_clip_loss":
+            feats = {
+                "image_embed": predictions["clip_image"],
+                "text_embed": predictions["clip_text"],
+                "image_embed_ori": predictions["clip_image_ori"],
+                "text_embed_ori": predictions["clip_text_ori"],
+                "logit_scale_self": self._logit_scale_self.clamp(
+                    max=_LOGIT_SCALE_MAX
+                ).exp(),
+                "logit_scale_cl": self._logit_scale_cl.clamp(
+                    max=_LOGIT_SCALE_MAX
+                ).exp(),
+                "logit_scale": self._logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp(),
+            }
+            out = self._loss_modules["sid_clip_loss"](feats, predictions["clip_mask"])
+            return {"sid_clip_loss": out["clip_loss"]}
+        else:
+            raise ValueError(f"unsupported sid_loss variant: {loss_type!r}")
+
+    def _recon_loss(
+        self,
+        x_hat: torch.Tensor,
+        x: torch.Tensor,
+        recon_type: str,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Reconstruction loss for ``recon_type`` ('mse'|'l1'|'cosine').
+
+        Returns the mean over all rows, or — when ``mask`` (a per-row bool) is
+        given — the mean over only the masked-in rows (the mixed recon+CLIP path
+        applies recon loss to recon rows only). No data-dependent branching, so
+        it stays ``torch.compile``-friendly.
+
+        Args:
+            x_hat (Tensor): reconstructed output, shape (B, D).
+            x (Tensor): original input, shape (B, D).
+            recon_type (str): 'mse', 'l1' or 'cosine'.
+            mask (Tensor, optional): per-row bool; rows to include.
+        """
+        if recon_type == "mse":
+            per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
+        elif recon_type == "l1":
+            per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
+        else:  # 'cosine'
+            per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
+        if mask is None:
+            return per_sample.mean()
+        mask = mask.float()
+        return (per_sample * mask).sum() / mask.sum().clamp(min=1)
 
     def init_metric(self) -> None:
         """Initialize the eval metrics shared by all SID models.

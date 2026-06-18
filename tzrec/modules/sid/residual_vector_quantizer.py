@@ -11,7 +11,7 @@
 
 """ResidualVectorQuantizer: multi-layer residual VQ with gradient training."""
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -92,12 +92,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         normalize_residuals (bool): L2-normalize residuals before each
             quantization layer. Default: False.
         distance_type (str): distance metric, 'l2' or 'cosine'. Default: 'l2'.
-        commitment_loss (str): commitment loss type, 'l2', 'l1' or 'cos'.
-            Default: 'l2'.
-        latent_weight (List[float]): commitment loss weights [w1, w2].
-            w1: x toward quant (encoder side).
-            w2: quant toward x (codebook side).
-            Default: [1.0, 0.5].
         rotation_trick (bool): use rotation trick for improved STE
             gradient estimation (arXiv:2410.06424). Default: False.
         kmeans_init (bool): use residual K-Means codebook initialization
@@ -121,8 +115,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         forward_mode: str = "ste",
         normalize_residuals: bool = False,
         distance_type: str = "l2",
-        commitment_loss: str = "l2",
-        latent_weight: Sequence[float] = (1.0, 0.5),
         rotation_trick: bool = False,
         kmeans_init: bool = False,
         use_sinkhorn: bool = True,
@@ -131,18 +123,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         gumbel_temperature: float = 1.0,
     ) -> None:
         super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
-        assert commitment_loss in ("l2", "l1", "cos"), (
-            f"commitment_loss must be 'l2', 'l1' or 'cos', got {commitment_loss!r}"
-        )
-        self.commitment_loss_type = commitment_loss
         self.rotation_trick = rotation_trick
-
-        if len(latent_weight) != 2:
-            raise ValueError(
-                f"latent_weight must have exactly 2 values [w1, w2], got "
-                f"{list(latent_weight)}"
-            )
-        self.commitment_w1, self.commitment_w2 = latent_weight
 
         # ``initted`` is the kmeans_init guard: True means "codebook has
         # been seeded", so init_embed_() becomes a no-op on later forwards.
@@ -186,17 +167,14 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         logger.info(
             "ResidualVectorQuantizer init: embed_dim=%d, n_layers=%d, "
             "n_embed=%s, forward_mode=%s, normalize_residuals=%s, "
-            "distance_type=%s, commitment_loss=%s, latent_weight=%s, "
-            "rotation_trick=%s, kmeans_init=%s, use_sinkhorn=%s, "
-            "sinkhorn_iters=%d, sinkhorn_epsilon=%s",
+            "distance_type=%s, rotation_trick=%s, kmeans_init=%s, "
+            "use_sinkhorn=%s, sinkhorn_iters=%d, sinkhorn_epsilon=%s",
             embed_dim,
             n_layers,
             n_embed,
             forward_mode,
             normalize_residuals,
             distance_type,
-            commitment_loss,
-            list(latent_weight),
             rotation_trick,
             kmeans_init,
             use_sinkhorn,
@@ -256,44 +234,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             layer.embedding.weight.data.copy_(centers[i])
 
         self.initted.fill_(True)
-
-    def _single_commitment_loss(
-        self,
-        x: torch.Tensor,
-        quant: torch.Tensor,
-    ) -> torch.Tensor:
-        """Commitment loss for a single cumulative quantization tensor.
-
-          - cos: (1 - cosine_similarity) * weight
-          - l2:  (x - quant)^2.mean() * weight
-          - l1:  |x - quant|.mean() * weight
-
-        Both directions are always summed:
-            loss1 = encoder-toward-quant (gradient flows into encoder)
-            loss2 = quant-toward-encoder (gradient flows into codebook)
-
-        Args:
-            x (Tensor): original input, shape (B, D).
-            quant (Tensor): cumulative quantized output at one layer,
-                shape (B, D).
-
-        Returns:
-            Tensor: scalar commitment loss for this layer.
-        """
-        if self.commitment_loss_type == "cos":
-            loss1 = (
-                1 - F.cosine_similarity(x, quant.detach(), dim=-1)
-            ).mean() * self.commitment_w1
-            loss2 = (
-                1 - F.cosine_similarity(x.detach(), quant, dim=-1)
-            ).mean() * self.commitment_w2
-        elif self.commitment_loss_type == "l1":
-            loss1 = (x - quant.detach()).abs().mean() * self.commitment_w1
-            loss2 = (x.detach() - quant).abs().mean() * self.commitment_w2
-        else:  # 'l2'
-            loss1 = (x - quant.detach()).pow(2.0).mean() * self.commitment_w1
-            loss2 = (x.detach() - quant).pow(2.0).mean() * self.commitment_w2
-        return loss1 + loss2
 
     @staticmethod
     def _apply_rotation_trick(
@@ -383,7 +323,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Returns:
             ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
-                quantization_loss).
+                latents).
         """
         if self.training:
             self.init_embed_(input)  # first training forward only
@@ -396,9 +336,10 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         walk_input = input if train_gumbel else input.detach()
         cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
 
-        commitment_loss = torch.mean(
-            torch.stack([self._single_commitment_loss(input, c) for c in cumulative])
-        )
+        # Expose the per-layer cumulative quantized vectors (grad-carrying on the
+        # codebook side) so the model-side CommitmentLoss can consume them; the
+        # commitment loss is no longer computed inside the quantizer.
+        latents = torch.stack(cumulative, dim=1)  # (B, n_layers, D)
 
         # Aggregate STE (STE only; Gumbel already carries grad).
         quants_trunc = aggregated_quants
@@ -411,7 +352,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         return ResidualQuantizerOutput(
             cluster_ids=cluster_ids,
             quantized_embeddings=quants_trunc,
-            quantization_loss=commitment_loss,
+            latents=latents,
         )
 
     @torch.no_grad()

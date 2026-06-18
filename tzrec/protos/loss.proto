@@ -9,6 +9,44 @@ message LossConfig {
         JRCLoss jrc_loss = 4;
         BinaryFocalLoss binary_focal_loss = 5;
     }
+    // Losses for semantic-ID (SID) generation models (SidRqvae). A SID model
+    // lists one LossConfig per term it trains on (a reconstruction loss, the
+    // commitment loss, and optionally the CLIP contrastive loss).
+    oneof sid_loss {
+        ReconL2Loss recon_l2_loss = 6;
+        ReconL1Loss recon_l1_loss = 7;
+        ReconCosineLoss recon_cosine_loss = 8;
+        CommitmentLoss commitment_loss = 9;
+        SidClipLoss sid_clip_loss = 10;
+    }
+}
+
+// RQ-VAE reconstruction losses (input vs. decoder output).
+message ReconL2Loss {
+}
+
+message ReconL1Loss {
+}
+
+message ReconCosineLoss {
+}
+
+// RQ-VAE commitment loss between the encoder output and the per-layer
+// cumulative quantized vectors.
+message CommitmentLoss {
+    // Commitment loss weights [w1, w2] (encoder-toward-quant, quant-toward-
+    // encoder). Defaults to [1.0, 0.5] when unset.
+    repeated float latent_weight = 1;
+    // Distance used for the commitment term: "l2", "l1" or "cos".
+    optional string commitment_type = 2 [default = "l2"];
+}
+
+// CLIP contrastive loss for the dual (image/text) reconstruction path.
+message SidClipLoss {
+    // Name of the second (paired) embedding feature inside the input Batch.
+    required string clip_feature_name = 1;
+    // Name of the per-row float feature flagging CLIP-pair rows (>0.5 = pair).
+    required string is_clip_pair_feature_name = 2;
 }
 
 message BinaryCrossEntropy {
