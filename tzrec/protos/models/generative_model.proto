@@ -40,6 +40,12 @@ message GenerativeRecLMConfig {
     // Inference (beam search) — used only by predict()'s inference branch.
     optional uint32 num_beams = 7 [default = 50];
     optional uint32 num_return_sequences = 8 [default = 50];
+    // When set, decode with the ALGR-style escalating beam instead of HF's
+    // fixed-width beam search: the beam width doubles at every SID level
+    // (num_beams -> 2*num_beams -> ... ), returning num_beams * 2**num_levels
+    // candidates (num_return_sequences is ignored). Faithful parity with ALGR's
+    // dynamic_beams schedule; exploits the fixed-length, EOS-free SID answer.
+    optional bool dynamic_beam = 9 [default = false];
 }
 
 // Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.). Registered directly via its

@@ -36,11 +36,16 @@ def _stub(num_levels=3, base_vocab=100, pad_id=9, device="cpu", per_level=4):
     m._num_levels = num_levels
     m._base_vocab = base_vocab
     m._pad_token_id = pad_id
+    m._dynamic_beam = False  # default = HF fixed-width beam path
     m._max_seq_length = 0  # no recency clip by default in unit stubs
     m.lm = types.SimpleNamespace(device=torch.device(device))
     for name, vals in {
-        "tpl_system": [10, 11], "tpl_user_prefix": [12], "tpl_user_suffix": [13],
-        "tpl_asst_prefix": [14], "tpl_asst_suffix": [15], "tpl_eos": [9],
+        "tpl_system": [10, 11],
+        "tpl_user_prefix": [12],
+        "tpl_user_suffix": [13],
+        "tpl_asst_prefix": [14],
+        "tpl_asst_suffix": [15],
+        "tpl_eos": [9],
     }.items():
         m.register_buffer(name, torch.tensor(vals, dtype=torch.long), persistent=False)
     lo, hi = Qwen2RecLM._sid_level_bands([per_level] * num_levels)
@@ -141,8 +146,15 @@ class Qwen2RecLMTest(unittest.TestCase):
         m._input_name = "user_sequence"
         m._num_beams = m._num_return = 2
 
-        def fake_generate(input_ids, attention_mask, max_new_tokens,
-                          num_beams, num_return_sequences, do_sample, pad_token_id):
+        def fake_generate(
+            input_ids,
+            attention_mask,
+            max_new_tokens,
+            num_beams,
+            num_return_sequences,
+            do_sample,
+            pad_token_id,
+        ):
             prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
             # 2 beams x 3 codes, every atom INSIDE its level's band
             # (bands lo=[1,5,9] hi=[4,8,12]; token = sid + 99):
@@ -162,15 +174,28 @@ class Qwen2RecLMTest(unittest.TestCase):
         m._input_name = "user_sequence"
         m._num_beams = m._num_return = 4
 
-        def fake_generate(input_ids, attention_mask, max_new_tokens,
-                          num_beams, num_return_sequences, do_sample, pad_token_id):
+        def fake_generate(
+            input_ids,
+            attention_mask,
+            max_new_tokens,
+            num_beams,
+            num_return_sequences,
+            do_sample,
+            pad_token_id,
+        ):
             prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
-            new = torch.tensor([
-                [100, 104, 108],  # all in-band -> valid -> [1, 5, 9]
-                [100, 104, 9],    # pos2 = eos/pad token (sid -90) -> invalid
-                [108, 104, 100],  # wrong-level scramble (pos0 = lvl-2 code) -> invalid
-                [100, 104, 112],  # pos2 sid 13 > band hi 12 -> invalid
-            ])
+            new = torch.tensor(
+                [
+                    [100, 104, 108],  # all in-band -> valid -> [1, 5, 9]
+                    [100, 104, 9],  # pos2 = eos/pad token (sid -90) -> invalid
+                    [
+                        108,
+                        104,
+                        100,
+                    ],  # wrong-level scramble (pos0 = lvl-2 code) -> invalid
+                    [100, 104, 112],  # pos2 sid 13 > band hi 12 -> invalid
+                ]
+            )
             return torch.cat([prompt, new], dim=1)
 
         m.lm.generate = fake_generate
@@ -189,8 +214,15 @@ class Qwen2RecLMTest(unittest.TestCase):
         m._input_name = "user_sequence"
         m._num_beams = m._num_return = 2
 
-        def fake_generate(input_ids, attention_mask, max_new_tokens,
-                          num_beams, num_return_sequences, do_sample, pad_token_id):
+        def fake_generate(
+            input_ids,
+            attention_mask,
+            max_new_tokens,
+            num_beams,
+            num_return_sequences,
+            do_sample,
+            pad_token_id,
+        ):
             prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
             new = torch.tensor([[100, 104], [103, 107]])  # width 2 < num_levels 3
             return torch.cat([prompt, new], dim=1)
@@ -213,8 +245,12 @@ class Qwen2RecLMTest(unittest.TestCase):
         )
         m._build_prompt_tokens(tok, cfg)
         for name in [
-            "tpl_system", "tpl_user_prefix", "tpl_user_suffix",
-            "tpl_asst_prefix", "tpl_asst_suffix", "tpl_eos",
+            "tpl_system",
+            "tpl_user_prefix",
+            "tpl_user_suffix",
+            "tpl_asst_prefix",
+            "tpl_asst_suffix",
+            "tpl_eos",
         ]:
             buf = getattr(m, name)
             self.assertIsInstance(buf, torch.Tensor)
@@ -322,6 +358,101 @@ class Qwen2RecLMTest(unittest.TestCase):
         # disabled: natural length, never forced to max; flag stays unlatched.
         self.assertLess(seen_lens[0], 50)
         self.assertFalse(m._pool_warmed)
+
+
+def _real_lm_stub(num_levels=3, base_vocab=20, per_level=4, num_beams=2):
+    """A Qwen2RecLM carrying a real (tiny, random) Qwen2 backbone.
+
+    Needed by the dynamic-beam tests, which exercise the actual KV-cached
+    forward / cache-reorder path (the other tests mock ``lm.generate``). The SID
+    atoms occupy the last ``num_levels * per_level`` token ids, matching the
+    base-vocab + appended-codebook layout.
+    """
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    m = object.__new__(Qwen2RecLM)
+    nn.Module.__init__(m)
+    m._num_levels = num_levels
+    m._base_vocab = base_vocab
+    m._num_beams = num_beams
+    cfg = Qwen2Config(
+        vocab_size=base_vocab + per_level * num_levels,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    torch.manual_seed(0)
+    m.lm = Qwen2ForCausalLM(cfg).eval()
+    lo, hi = Qwen2RecLM._sid_level_bands([per_level] * num_levels)
+    m.register_buffer("_sid_lvl_lo", lo, persistent=False)
+    m.register_buffer("_sid_lvl_hi", hi, persistent=False)
+    return m
+
+
+class Qwen2DynamicBeamTest(unittest.TestCase):
+    def test_width_schedule_and_final_count(self) -> None:
+        # widths double per level, returning num_beams * 2**num_levels candidates.
+        m = _real_lm_stub(num_levels=3, base_vocab=20, per_level=8, num_beams=2)
+        ids = torch.tensor([[1, 2, 3, 4]])
+        new = m._dynamic_beam_search(ids, torch.ones_like(ids))
+        # base 2: widths [4, 8, 16] (none capped: per_level 8 is roomy) -> 16 final
+        self.assertEqual(tuple(new.shape), (2 * 2**3, 3))
+
+    def test_every_candidate_is_in_band(self) -> None:
+        # band masking guarantees well-formed SIDs: validate -> no -1 sentinels.
+        m = _real_lm_stub(num_levels=3, base_vocab=20, per_level=4, num_beams=2)
+        ids = torch.tensor([[5, 6, 7]])
+        new = m._dynamic_beam_search(ids, torch.ones_like(ids))
+        sids = m._validate_sid_candidates(new, batch_size=1)
+        self.assertEqual(tuple(sids.shape), (1, new.shape[0], 3))
+        self.assertFalse(bool((sids < 0).any()))  # every candidate well-formed
+
+    def test_left_padding_two_rows(self) -> None:
+        # ragged batch (row 1 left-padded): both rows yield valid, full beam sets.
+        m = _real_lm_stub(num_levels=2, base_vocab=20, per_level=4, num_beams=2)
+        ids = torch.tensor([[5, 6, 7, 8], [0, 0, 9, 10]])
+        am = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        new = m._dynamic_beam_search(ids, am)
+        self.assertEqual(tuple(new.shape), (2 * 2 * 2**2, 2))  # B=2, 2*2^2=8 each
+        sids = m._validate_sid_candidates(new, batch_size=2)
+        self.assertEqual(tuple(sids.shape), (2, 8, 2))
+        self.assertFalse(bool((sids < 0).any()))
+
+    def test_exhaustive_matches_bruteforce_topk(self) -> None:
+        # When the schedule covers the whole tree (no pruning) the escalating
+        # beam is EXACT: its candidate set must equal all SID combos and be
+        # ordered by true (full-recompute) cumulative log-prob. This validates
+        # cache-stepping, band masking, scoring, and ordering end-to-end.
+        per, base = 3, 20
+        m = _real_lm_stub(num_levels=2, base_vocab=base, per_level=per, num_beams=3)
+        # widths [min(6,3)=3, min(12,9)=9] -> exhaustive over all 3*3=9 SIDs
+        ids = torch.tensor([[5, 6, 7, 8]])
+        am = torch.ones_like(ids)
+        got = [tuple(r) for r in m._dynamic_beam_search(ids, am).tolist()]
+        self.assertEqual(len(got), per * per)
+        lm = m.lm
+        lo0, lo1 = base, base + per  # level token bands [20,22] and [23,25]
+        ref = {}
+        with torch.no_grad():
+            logp0 = torch.log_softmax(
+                lm(ids, attention_mask=am).logits[0, -1].float(), -1
+            )
+            for t0 in range(lo0, lo0 + per):
+                s2 = torch.cat([ids, torch.tensor([[t0]])], 1)
+                logp1 = torch.log_softmax(
+                    lm(s2, attention_mask=torch.ones_like(s2)).logits[0, -1].float(), -1
+                )
+                for t1 in range(lo1, lo1 + per):
+                    ref[(t0, t1)] = (logp0[t0] + logp1[t1]).item()
+        # 1. exhaustive: the returned set is exactly every SID combination
+        self.assertEqual(set(got), set(ref))
+        # 2. ordered best-first by the true score (tolerant of float-noise ties)
+        s = [ref[c] for c in got]
+        self.assertTrue(all(s[i] >= s[i + 1] - 1e-4 for i in range(len(s) - 1)))
+        self.assertEqual(got[0], max(ref, key=ref.get))  # top-1 is the global best
 
 
 if __name__ == "__main__":

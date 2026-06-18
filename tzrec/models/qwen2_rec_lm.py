@@ -33,6 +33,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.models.escalating_beam import escalating_beam_search
 from tzrec.models.generative_rec_lm import GenerativeRecLM
 from tzrec.protos.model_pb2 import ModelConfig
 
@@ -44,6 +45,7 @@ def _encode_no_special(tokenizer, text: str) -> List[int]:
     so we must NOT let the tokenizer's BOS/EOS handling double-emit them.
     """
     return tokenizer.encode(text, add_special_tokens=False)
+
 
 # Verbatim Qwen2 ChatML fragments.
 QWEN2_TEMPLATE = {
@@ -77,6 +79,8 @@ class Qwen2RecLM(GenerativeRecLM):
         # generation params, consumed only by this family's _generate.
         self._num_beams = int(common.num_beams)
         self._num_return = int(common.num_return_sequences)
+        # opt-in ALGR-style escalating beam (width doubles per SID level).
+        self._dynamic_beam = bool(common.dynamic_beam)
         # worst-case spliced length for the first-step activation-pool pre-sizing.
         self._max_total_len = self._compute_max_total_length()
         self._pool_warmed = False
@@ -167,11 +171,18 @@ class Qwen2RecLM(GenerativeRecLM):
         # input_ids: assembled per row (user history length varies), then
         # left-padded into a (B, T) batch (real content right-aligned).
         rows_ids = [
-            torch.cat([
-                self.tpl_system, self.tpl_user_prefix, user_seq_rows[i],
-                self.tpl_user_suffix, self.tpl_asst_prefix, label_rows[i],
-                self.tpl_asst_suffix, self.tpl_eos,
-            ])
+            torch.cat(
+                [
+                    self.tpl_system,
+                    self.tpl_user_prefix,
+                    user_seq_rows[i],
+                    self.tpl_user_suffix,
+                    self.tpl_asst_prefix,
+                    label_rows[i],
+                    self.tpl_asst_suffix,
+                    self.tpl_eos,
+                ]
+            )
             for i in range(len(user_seq_rows))
         ]
         input_ids, attention_mask = self._left_pad(rows_ids, pad_to=pad_to)
@@ -275,18 +286,39 @@ class Qwen2RecLM(GenerativeRecLM):
             max_codes=self._max_seq_length,  # cap to most-recent items (drop oldest)
         )
         input_ids, attention_mask = self._splice_prompt_ids(u_rows)
-        out = self.lm.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=self._num_levels,
-            num_beams=self._num_beams,
-            num_return_sequences=self._num_return,
-            do_sample=False,
-            pad_token_id=self._pad_token_id,
-        )
-        new_tokens = out[:, input_ids.shape[1]:]  # the generated tail
+        if self._dynamic_beam:
+            new_tokens = self._dynamic_beam_search(input_ids, attention_mask)
+        else:
+            out = self.lm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self._num_levels,
+                num_beams=self._num_beams,
+                num_return_sequences=self._num_return,
+                do_sample=False,
+                pad_token_id=self._pad_token_id,
+            )
+            new_tokens = out[:, input_ids.shape[1] :]  # the generated tail
         sids = self._validate_sid_candidates(new_tokens, input_ids.shape[0])
         return {self.GENERATED_SIDS_KEY: sids}
+
+    def _dynamic_beam_search(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """ALGR-style escalating-beam decode (delegates to the shared kernel).
+
+        Returns the generated tail ``(B * num_beams * 2**num_levels, num_levels)``
+        score-ordered best-first per row, ready for ``_validate_sid_candidates``.
+        See ``escalating_beam_search`` for the schedule.
+        """
+        return escalating_beam_search(
+            self.lm,
+            input_ids,
+            attention_mask,
+            num_beams=self._num_beams,
+            lo_tok=self._tokenize_sids(self._sid_lvl_lo),
+            hi_tok=self._tokenize_sids(self._sid_lvl_hi),
+        )
 
     def _splice_prompt_ids(
         self, user_seq_rows: List[torch.Tensor]
@@ -298,10 +330,15 @@ class Qwen2RecLM(GenerativeRecLM):
         continues from the assistant turn.
         """
         rows = [
-            torch.cat([
-                self.tpl_system, self.tpl_user_prefix, r,
-                self.tpl_user_suffix, self.tpl_asst_prefix,
-            ])
+            torch.cat(
+                [
+                    self.tpl_system,
+                    self.tpl_user_prefix,
+                    r,
+                    self.tpl_user_suffix,
+                    self.tpl_asst_prefix,
+                ]
+            )
             for r in user_seq_rows
         ]
         return self._left_pad(rows)
@@ -320,12 +357,16 @@ class Qwen2RecLM(GenerativeRecLM):
         end-aligned supervised tail in place, so labels/suffix-slice are intact.
         """
         input_ids = pad_sequence(
-            rows, batch_first=True,
-            padding_value=self._pad_token_id, padding_side="left",
+            rows,
+            batch_first=True,
+            padding_value=self._pad_token_id,
+            padding_side="left",
         )
         attention_mask = pad_sequence(
-            [torch.ones_like(r) for r in rows], batch_first=True,
-            padding_value=0, padding_side="left",
+            [torch.ones_like(r) for r in rows],
+            batch_first=True,
+            padding_value=0,
+            padding_side="left",
         )
         if pad_to > input_ids.shape[1]:
             B, extra = input_ids.shape[0], pad_to - input_ids.shape[1]
