@@ -9,7 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import os
+import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -39,6 +41,8 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
+from tzrec.tests import utils as test_utils
+from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
@@ -50,6 +54,7 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_no_zch_features,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.test_util import gpu_unavailable
 
 _SHARDED_TABLE_NAME = "table_1"
 _SHARDED_FEATURE_NAME = "feature_1"
@@ -674,6 +679,102 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
                         )
                     )
                 )
+
+
+class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
+    """End-to-end multi-process delta dump over a sharded dynamicemb model.
+
+    Runs the real tzrec train pipeline (torchrun, row-wise sharded dynamicemb
+    tables) with delta dump enabled, so the dynamic lookup path
+    (``flush()`` + ``tables.find()``) is exercised under genuine multi-rank
+    sharding rather than a single-process fake table.
+    """
+
+    def setUp(self):
+        self.success = False
+        if not os.path.exists("./tmp"):
+            os.makedirs("./tmp")
+        self.test_dir = tempfile.mkdtemp(prefix="tzrec_delta_dyn_", dir="./tmp")
+        os.chmod(self.test_dir, 0o755)
+
+    def tearDown(self):
+        if self.success and os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    @unittest.skipIf(
+        gpu_unavailable[0] or not has_dynamicemb,
+        "dynamicemb or GPU not available.",
+    )
+    def test_dynamicemb_multi_gpu_delta_dump_writes_uniform_shards(self):
+        world_size = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
+        pipeline_config = config_util.load_pipeline_config(
+            "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config"
+        )
+        # Admit every id immediately so the find() lookup returns embeddings
+        # for the touched ids (default frequency admission would hide them).
+        for feature_config in pipeline_config.feature_configs:
+            feature_type = feature_config.WhichOneof("feature")
+            if feature_type is None:
+                continue
+            feature = getattr(feature_config, feature_type)
+            if "dynamicemb" not in feature.DESCRIPTOR.fields_by_name:
+                continue
+            if feature.HasField("dynamicemb"):
+                admission = feature.dynamicemb.WhichOneof("admission_strategy")
+                if admission is not None:
+                    feature.dynamicemb.ClearField(admission)
+
+        dump_dir = os.path.abspath(os.path.join(self.test_dir, "delta_dump"))
+        dump_cfg = pipeline_config.train_config.delta_embedding_dump_config
+        dump_cfg.enable = True
+        dump_cfg.dump_interval_steps = 1
+        dump_cfg.output_dir = dump_dir
+        dump_cfg.file_prefix = "delta_embedding"
+        new_config_path = os.path.join(self.test_dir, "new_pipeline.config")
+        config_util.save_message(pipeline_config, new_config_path)
+
+        self.success = test_utils.test_train_eval(
+            new_config_path,
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        self.assertTrue(self.success)
+
+        step_dirs = sorted(glob.glob(os.path.join(dump_dir, "step_*")))
+        self.assertTrue(step_dirs, f"no delta dump produced under {dump_dir}")
+
+        dumped_real_rows = False
+        for step_dir in step_dirs:
+            shards = sorted(glob.glob(os.path.join(step_dir, "*.parquet")))
+            # Every rank writes a shard even with no delta, so each step dir
+            # holds exactly world_size shards (no ragged shard set).
+            self.assertEqual(
+                len(shards),
+                world_size,
+                f"{step_dir} has {len(shards)} shards, expected {world_size}",
+            )
+            for shard in shards:
+                table = pq.read_table(shard)
+                self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+                if table.num_rows == 0:
+                    continue
+                dumped_real_rows = True
+                self.assertEqual(set(table["world_size"].to_pylist()), {world_size})
+                self.assertEqual(
+                    set(table["source"].to_pylist()), {"model_delta_tracker"}
+                )
+                # dynamic lookup must return a real embedding vector per id.
+                self.assertTrue(
+                    all(len(emb) > 0 for emb in table["embedding"].to_pylist())
+                )
+
+        # If no rank ever dumped a real row, the flush()/find() lookup path was
+        # not actually exercised and the test would be vacuous.
+        self.assertTrue(
+            dumped_real_rows,
+            "no dynamic delta rows dumped; flush()/find() path not exercised",
+        )
 
 
 if __name__ == "__main__":
