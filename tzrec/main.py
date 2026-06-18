@@ -538,6 +538,9 @@ def _train_and_evaluate(
     # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
     # the only checkpoint and persists whatever on_train_end produced.
     _model.on_train_end()
+    if delta_embedding_dumper is not None and i_step >= 0:
+        # Flush the trailing partial interval before the final checkpoint.
+        delta_embedding_dumper.dump(i_step)
 
     _log_train(
         i_step,
