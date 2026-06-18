@@ -121,6 +121,8 @@ class VectorQuantizeLayer(QuantizeLayer):
         sinkhorn_iters (int): number of Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness parameter for
             exp(-cost * epsilon). Default: 10.0.
+        gumbel_temperature (float): Gumbel-Softmax temperature (tau), used only
+            in GUMBEL_SOFTMAX training. Default: 1.0.
     """
 
     def __init__(
@@ -132,6 +134,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         use_sinkhorn: bool = True,
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
+        gumbel_temperature: float = 1.0,
     ) -> None:
         super().__init__(n_embed=n_embed, embed_dim=embed_dim)
         # Sinkhorn drives `ids` (balanced assignment), Gumbel drives `emb`
@@ -154,6 +157,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         self.use_sinkhorn = use_sinkhorn
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_epsilon = sinkhorn_epsilon
+        self.gumbel_temperature = gumbel_temperature
 
         self.embedding = nn.Embedding(n_embed, embed_dim)
         nn.init.kaiming_uniform_(self.embedding.weight)
@@ -220,23 +224,15 @@ class VectorQuantizeLayer(QuantizeLayer):
 
         return ids
 
-    def quantize(
-        self, x: torch.Tensor, temperature: float = 1.0, apply_ste: bool = True
-    ) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
         """Assign ``x`` to the codebook (the :class:`QuantizeLayer` interface).
 
-        Commitment loss is computed by the caller
-        (:meth:`ResidualVectorQuantizer._single_commitment_loss`); device follows
-        ``x``, so this runs on CPU or GPU unchanged.
+        Commitment loss is computed by the caller; device follows ``x``, so this
+        runs on CPU or GPU unchanged. The Gumbel temperature is the
+        ``gumbel_temperature`` init parameter.
 
         Args:
             x (Tensor): input vectors, shape (B, D).
-            temperature (float): temperature for Gumbel-Softmax.
-            apply_ste (bool): in STE training, wrap the embedding with the
-                straight-through estimator (``x + (q - x).detach()``). Set False
-                when the caller re-applies STE on the aggregate
-                (:class:`ResidualVectorQuantizer`): the raw codebook vector is
-                returned and the otherwise-discarded wrap + re-gather is avoided.
 
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids).
@@ -245,17 +241,21 @@ class VectorQuantizeLayer(QuantizeLayer):
         # both emb and ids, so the saved code matches the vector used.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             logits = -self._compute_distances(x)  # (B, n_embed), differentiable
-            weights = F.gumbel_softmax(logits, tau=temperature, hard=True, dim=-1)
+            weights = F.gumbel_softmax(
+                logits, tau=self.gumbel_temperature, hard=True, dim=-1
+            )
             emb = weights @ self.embedding.weight
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
         # STE / eval: nearest-neighbour assignment under no_grad, one codebook
-        # gather. STE wrap only when the caller wants it (standalone use); the
-        # RVQ caller passes apply_ste=False and re-applies STE on the aggregate.
+        # gather. In STE training, wrap with the straight-through estimator so
+        # grad reaches the encoder. (Under the RVQ residual walk the input is
+        # detached, so this per-layer wrap is a numeric no-op and the aggregate
+        # STE in ResidualVectorQuantizer.forward carries the gradient.)
         ids = self._find_nearest_embedding(x)
         quantized = self.embedding(ids)
-        if self.training and apply_ste:
+        if self.training and self.forward_mode == QuantizeForwardMode.STE:
             quantized = x + (quantized - x).detach()  # grad passes to x
         return QuantizeOutput(embeddings=quantized, ids=ids)
 

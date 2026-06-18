@@ -82,7 +82,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         self,
         layer_idx: int,
         residual: torch.Tensor,
-        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Nearest-centroid assignment for one layer (delegates to the layer).
 
@@ -92,13 +91,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         Args:
             layer_idx (int): quantization layer index.
             residual (Tensor): current residual, shape (B, D).
-            temperature (float): unused (no soft assignment).
 
         Returns:
             codes (Tensor): cluster indices, shape (B,).
             quantized (Tensor): selected centroids, shape (B, D).
         """
-        out = self.layers[layer_idx].quantize(residual, temperature)
+        out = self.layers[layer_idx].quantize(residual)
         return out.ids, out.embeddings
 
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -254,7 +254,7 @@ class KMeansQuantizeLayer(QuantizeLayer):
             )
 
     @torch.no_grad()
-    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
         """Assign points to the nearest centroid and gather them.
 
         Uses ``torch.cdist`` (L2); argmin is invariant to the monotonic sqrt,
@@ -262,11 +262,9 @@ class KMeansQuantizeLayer(QuantizeLayer):
         (measure zero for real embeddings), where either centroid is valid.
         Before the FAISS fit (uninitialized) this returns all-zero codes +
         embeddings so the residual walk stays a no-op and the model is callable.
-        ``temperature`` is unused (no soft assignment).
 
         Args:
             x (Tensor): data points, shape (B, D).
-            temperature (float): unused.
 
         Returns:
             QuantizeOutput: ``ids`` (B,) and ``embeddings`` (B, D).

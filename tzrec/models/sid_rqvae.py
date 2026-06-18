@@ -180,12 +180,10 @@ class SidRqvae(BaseSidModel):
         mask = mask.float()
         return (per_sample * mask).sum() / mask.sum().clamp(min=1)
 
-    def _forward_rqvae(
-        self, x: torch.Tensor, temperature: float = 1.0
-    ) -> Dict[str, torch.Tensor]:
+    def _forward_rqvae(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Standard RQ-VAE forward: encode -> quantize -> decode -> loss."""
         z_e = self._encode(x)
-        quant = self._quantizer(z_e, temperature=temperature)
+        quant = self._quantizer(z_e)
         x_hat = self._decode(quant.quantized_embeddings)
 
         recon_loss = self._recon_loss(x_hat, x)
@@ -204,15 +202,14 @@ class SidRqvae(BaseSidModel):
         fea1: torch.Tensor,
         fea2: torch.Tensor,
         clip_mask: torch.Tensor,
-        temperature: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         """Mixed recon + CLIP forward (all rows dual-pathed; mask splits loss)."""
         z_e1 = self._encode(fea1)
-        quant1 = self._quantizer(z_e1, temperature=temperature)
+        quant1 = self._quantizer(z_e1)
         x_hat1 = self._decode(quant1.quantized_embeddings)
 
         z_e2 = self._encode(fea2)
-        quant2 = self._quantizer(z_e2, temperature=temperature)
+        quant2 = self._quantizer(z_e2)
         x_hat2 = self._decode(quant2.quantized_embeddings)
 
         recon_mask = ~clip_mask

@@ -105,6 +105,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         use_sinkhorn (bool): Sinkhorn uniform assignment. Default: True.
         sinkhorn_iters (int): Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness. Default: 10.0.
+        gumbel_temperature (float): Gumbel-Softmax temperature. Default: 1.0.
     """
 
     _FORWARD_MODE_MAP = {
@@ -127,6 +128,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         use_sinkhorn: bool = True,
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
+        gumbel_temperature: float = 1.0,
     ) -> None:
         super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
         assert commitment_loss in ("l2", "l1", "cos"), (
@@ -175,6 +177,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
                     use_sinkhorn=use_sinkhorn,
                     sinkhorn_iters=sinkhorn_iters,
                     sinkhorn_epsilon=sinkhorn_epsilon,
+                    gumbel_temperature=gumbel_temperature,
                 )
                 for i in range(n_layers)
             ]
@@ -342,7 +345,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         self,
         layer_idx: int,
         residual: torch.Tensor,
-        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize one layer's residual via its ``VectorQuantizeLayer`` layer.
 
@@ -352,24 +354,22 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         Args:
             layer_idx (int): quantization layer index.
             residual (Tensor): current residual, shape (B, D).
-            temperature (float): Gumbel-Softmax temperature.
 
         Returns:
             ids (Tensor): per-layer cluster ids, shape (B,).
             emb (Tensor): the raw codebook vector (STE/eval) or the soft
                 embedding (Gumbel), with grad, shape (B, D).
         """
-        # apply_ste=False: Gumbel ignores it (returns the soft embedding that
-        # carries grad); STE/eval get the raw codebook vector in one gather (STE
-        # is applied on the aggregate in :meth:`forward`), avoiding the discarded
-        # per-layer straight-through wrap + a second codebook gather.
-        out = self.layers[layer_idx].quantize(residual, temperature, apply_ste=False)
+        # On the STE residual walk the residual is detached, so the layer's
+        # straight-through wrap is a numeric no-op; the real STE gradient comes
+        # from the aggregate STE in :meth:`forward`. Gumbel returns the soft
+        # embedding that carries grad directly.
+        out = self.layers[layer_idx].quantize(residual)
         return out.ids, out.embeddings
 
     def forward(
         self,
         input: torch.Tensor,
-        temperature: float = 1.0,
     ) -> ResidualQuantizerOutput:
         """Forward the multi-layer residual quantization.
 
@@ -380,7 +380,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
-            temperature (float): temperature for Gumbel-Softmax.
 
         Returns:
             ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
@@ -395,9 +394,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         # cumulative[i] = sum after layer i.
         walk_input = input if train_gumbel else input.detach()
-        cluster_ids, aggregated_quants, cumulative = self._residual_pass(
-            walk_input, temperature
-        )
+        cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
 
         commitment_loss = torch.mean(
             torch.stack([self._single_commitment_loss(input, c) for c in cumulative])

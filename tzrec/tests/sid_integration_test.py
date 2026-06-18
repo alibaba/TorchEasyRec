@@ -139,6 +139,12 @@ class SidIntegrationTest(unittest.TestCase):
             base_config="tzrec/tests/configs/sid_rqvae_mock.config",
         )
         self.success = utils.test_train_eval(config_path, self.test_dir)
+        # train_eval writes train_eval_result_v2.txt; a standalone eval pass
+        # (like the rqkmeans test) writes eval_result.txt from the checkpoint.
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
         self.assertTrue(self.success)
         # save_checkpoints_epochs=1 persists a checkpoint during training.
         self.assertTrue(
