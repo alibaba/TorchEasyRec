@@ -697,7 +697,10 @@ class DataloaderCheckpointTest(unittest.TestCase):
         self.assertTrue(
             mgr.maybe_save(2, model=None, dataloader_state=state, data_timestamp=3600.0)
         )
-        self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+        # the watermark is stamped into the saved state, not the caller's dict
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, state)
+        saved_state = mgr.save.call_args.args[3]
+        self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
 
     def test_reconcile_event_time_single_process(self):
         # not distributed: this rank's value passes through (quorum of one); -1.0

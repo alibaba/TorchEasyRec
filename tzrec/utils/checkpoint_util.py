@@ -425,6 +425,11 @@ class CheckpointManager:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
+        # copy so the watermark isn't leaked back into the train loop's state
+        if dataloader_state is not None:
+            dataloader_state = dict(dataloader_state)
+            if data_ts is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -448,28 +453,22 @@ class CheckpointManager:
         if not want:
             return False
         if step == self._last_ckpt_step:
-            # the pass-end step was already saved with fully-consumed offsets;
-            # a following epoch / final save carries the cleared + bumped state
-            # for the same step. refresh the existing checkpoint's dataloader
-            # state so the bookkeeping is not lost to the per-step dedupe. all
-            # ranks reach this branch in lockstep, so the collective inside
-            # save_dataloader_state is safe.
+            # a boundary save dedup'd against an already-saved step: refresh
+            # that checkpoint's state so the cleared + bumped bookkeeping is
+            # not lost to the dedupe (lockstep across ranks, so the collective
+            # in save_dataloader_state is safe).
             if (
                 (final or epoch is not None)
                 and dataloader_state is not None
                 and self._last_ckpt_dir is not None
             ):
-                if data_ts is not None:
-                    dataloader_state[DATA_TS_WATERMARK] = data_ts
                 save_dataloader_state(self._last_ckpt_dir, dataloader_state)
             return False
 
         self._last_ckpt_step = step
         if data_ts is not None:
-            # advance + persist the watermark on every save so resume is exact
+            # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-            if dataloader_state is not None:
-                dataloader_state[DATA_TS_WATERMARK] = data_ts
         self.save(step, model, optimizer, dataloader_state)
         return True
 
