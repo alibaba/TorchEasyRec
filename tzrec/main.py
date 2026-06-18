@@ -453,21 +453,19 @@ def _train_and_evaluate(
 
         # Restore model and optimizer checkpoint
         if i_step == 0 and ckpt_path is not None:
-            # optimizer state is lazy, so peek one batch to init it before
-            # restore; an empty resumed pass has none, so restore model only.
-            try:
-                peek_batch = None if ignore_restore_optimizer else next(train_iterator)
-            except StopIteration:
-                peek_batch = None
-            if peek_batch is not None:
+            if ignore_restore_optimizer:
+                ckpt_manager.restore(
+                    ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
+                )
+            else:
+                # optimizer state is lazy, so peek one batch to init it
+                # before restore.
+                peek_batch = next(train_iterator)
                 pipeline.progress(iter([peek_batch]))
                 train_iterator = itertools.chain([peek_batch], train_iterator)
-            ckpt_manager.restore(
-                ckpt_path,
-                model,
-                None if peek_batch is None else optimizer,
-                train_config.fine_tune_ckpt_param_map,
-            )
+                ckpt_manager.restore(
+                    ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
+                )
 
         for i_step in step_iter:
             if i_step <= skip_steps:
