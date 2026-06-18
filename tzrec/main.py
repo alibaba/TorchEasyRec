@@ -349,9 +349,8 @@ def _train_and_evaluate(
     use_step = train_config.num_steps and train_config.num_steps > 0
     epochs_completed = dataloader_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
     if use_epoch and epochs_completed >= train_config.num_epochs:
-        # nothing left to train: returning here avoids re-saving a checkpoint
-        # of freshly-initialized weights (the model restore lives inside the
-        # epoch loop, which would not run).
+        # nothing left to train; return before the model restore (inside the
+        # epoch loop) is skipped and a fresh-weight checkpoint is re-saved.
         if is_local_rank_zero:
             logger.warning(
                 f"{epochs_completed} epochs already completed in the restored "

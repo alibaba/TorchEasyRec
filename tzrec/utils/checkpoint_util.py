@@ -999,11 +999,6 @@ def restore_dataloader_state(
     with open(ckpt_path, "r") as f:
         state = json.load(f)
 
-    if EPOCHS_COMPLETED in state:
-        # coerce so a hand-edited/legacy value fails loudly here rather than
-        # deep inside range() when building the epoch iterator.
-        state[EPOCHS_COMPLETED] = int(state[EPOCHS_COMPLETED])
-
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
         logger.info(f"Restored dataloader state from {ckpt_path}")
