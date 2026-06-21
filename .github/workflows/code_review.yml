@@ -116,6 +116,7 @@ jobs:
           claude -p \
             --output-format stream-json \
             --verbose \
+            --settings '{"disableRemoteControl": true}' \
             --mcp-config "$MCP_CONFIG" \
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent" \
             -- "/review-pr REPO: ${{ github.repository }} PR_NUMBER: ${PR_NUMBER}"
