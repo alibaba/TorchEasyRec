@@ -336,6 +336,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_write_empty_table_chunks_preserves_parquet_schema(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_path = os.path.join(tmp_dir, "delta.parquet")
             dumper._write_table_chunks([], output_path)
@@ -343,6 +344,24 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table.num_rows, 0)
+
+    def test_write_table_chunks_leaves_no_partial_shard_on_error(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        writer = mock.MagicMock()
+        writer.__enter__.return_value = writer
+        writer.write_table.side_effect = RuntimeError("boom mid-write")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = os.path.join(tmp_dir, "delta.parquet")
+            # The temp file is created by ParquetWriter before the write fails;
+            # the error handler must remove it so the dir is left clean.
+            open(f"{output_path}.rank0.tmp", "w").close()
+            with mock.patch.object(pq, "ParquetWriter", return_value=writer):
+                with self.assertRaises(RuntimeError):
+                    dumper._write_table_chunks([mock.MagicMock()], output_path)
+            # Neither the canonical shard nor the temp file should survive, so
+            # a downstream glob(*.parquet) never observes a truncated write.
+            self.assertEqual(os.listdir(tmp_dir), [])
 
     def test_final_dump_skips_boundary_step_to_avoid_overwrite(self):
         dumper = object.__new__(DeltaEmbeddingDumper)

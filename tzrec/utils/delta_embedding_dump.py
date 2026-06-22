@@ -749,7 +749,18 @@ class DeltaEmbeddingDumper:
     def _write_table_chunks(
         self, table_chunks: List[pa.Table], output_path: str
     ) -> None:
-        with pq.ParquetWriter(output_path, _DELTA_DUMP_SCHEMA) as writer:
-            chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
-            for table_chunk in chunks:
-                writer.write_table(table_chunk)
+        # Write to a sibling temp file and atomically os.replace() it into place
+        # only after the writer closes cleanly. A kill or exception mid-write
+        # then leaves at most an orphan .tmp (which the step_*/*.parquet glob
+        # ignores), never a truncated shard at the canonical path.
+        tmp_path = f"{output_path}.rank{self._rank}.tmp"
+        try:
+            with pq.ParquetWriter(tmp_path, _DELTA_DUMP_SCHEMA) as writer:
+                chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
+                for table_chunk in chunks:
+                    writer.write_table(table_chunk)
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
