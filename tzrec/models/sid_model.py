@@ -26,19 +26,18 @@ from tzrec.loss.commitment_loss import CommitmentLoss
 from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
+from tzrec.modules.utils import div_no_nan
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
 
 # Cap the CLIP temperatures before ``exp`` (reference CLIP clamps to ln(100)):
 # an unbounded ``logit_scale`` overflows to +Inf -> NaN grad -> corrupt param.
 _LOGIT_SCALE_MAX = float(np.log(100))
+# CLIP temperature init (reference CLIP: log(1 / 0.07)).
+_LOGIT_SCALE_INIT = float(np.log(1 / 0.07))
 
-# sid_loss reconstruction variants -> the reduction used by ``_recon_loss``.
-_RECON_TYPES = {
-    "recon_l2_loss": "mse",
-    "recon_l1_loss": "l1",
-    "recon_cosine_loss": "cosine",
-}
+# sid_loss reconstruction variants (``_recon_loss`` branches on these directly).
+_RECON_LOSSES = frozenset(("recon_l2_loss", "recon_l1_loss", "recon_cosine_loss"))
 
 
 class BaseSidModel(BaseModel):
@@ -129,7 +128,7 @@ class BaseSidModel(BaseModel):
     def _init_sid_loss_impl(self, loss_cfg: LossConfig) -> None:
         """Register the module (if any) for one ``sid_loss`` config."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
-        if loss_type in _RECON_TYPES:
+        if loss_type in _RECON_LOSSES:
             return  # reconstruction losses are functional (no module)
         elif loss_type == "commitment_loss":
             cfg = loss_cfg.commitment_loss
@@ -140,9 +139,9 @@ class BaseSidModel(BaseModel):
             )
         elif loss_type == "sid_clip_loss":
             # The three learnable CLIP temperatures + the masked-CLIP module.
-            self._logit_scale_self = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self._logit_scale_cl = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self._logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self._logit_scale_self = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+            self._logit_scale_cl = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+            self._logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
             self._loss_modules["sid_clip_loss"] = MaskedCLIPLoss()
         else:
             raise ValueError(
@@ -174,11 +173,11 @@ class BaseSidModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute one ``sid_loss`` term from ``predictions``."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
-        if loss_type in _RECON_TYPES:
+        if loss_type in _RECON_LOSSES:
             loss = self._recon_loss(
                 predictions["x_hat"],
                 predictions["recon_target"],
-                _RECON_TYPES[loss_type],
+                loss_type,
                 predictions.get("recon_mask"),
             )
             return {loss_type: loss}
@@ -188,18 +187,19 @@ class BaseSidModel(BaseModel):
             )
             return {"commitment_loss": loss}
         elif loss_type == "sid_clip_loss":
+
+            def scaled(p: torch.Tensor) -> torch.Tensor:
+                # clamp before exp so a large temperature can't overflow to +Inf.
+                return p.clamp(max=_LOGIT_SCALE_MAX).exp()
+
             feats = {
                 "image_embed": predictions["clip_image"],
                 "text_embed": predictions["clip_text"],
                 "image_embed_ori": predictions["clip_image_ori"],
                 "text_embed_ori": predictions["clip_text_ori"],
-                "logit_scale_self": self._logit_scale_self.clamp(
-                    max=_LOGIT_SCALE_MAX
-                ).exp(),
-                "logit_scale_cl": self._logit_scale_cl.clamp(
-                    max=_LOGIT_SCALE_MAX
-                ).exp(),
-                "logit_scale": self._logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp(),
+                "logit_scale_self": scaled(self._logit_scale_self),
+                "logit_scale_cl": scaled(self._logit_scale_cl),
+                "logit_scale": scaled(self._logit_scale),
             }
             out = self._loss_modules["sid_clip_loss"](feats, predictions["clip_mask"])
             return {"sid_clip_loss": out["clip_loss"]}
@@ -210,10 +210,10 @@ class BaseSidModel(BaseModel):
         self,
         x_hat: torch.Tensor,
         x: torch.Tensor,
-        recon_type: str,
+        recon_loss: str,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Reconstruction loss for ``recon_type`` ('mse'|'l1'|'cosine').
+        """Reconstruction loss for a ``sid_loss`` recon variant.
 
         Returns the mean over all rows, or — when ``mask`` (a per-row bool) is
         given — the mean over only the masked-in rows (the mixed recon+CLIP path
@@ -223,19 +223,20 @@ class BaseSidModel(BaseModel):
         Args:
             x_hat (Tensor): reconstructed output, shape (B, D).
             x (Tensor): original input, shape (B, D).
-            recon_type (str): 'mse', 'l1' or 'cosine'.
+            recon_loss (str): the recon variant, one of ``_RECON_LOSSES``
+                (``recon_l2_loss`` | ``recon_l1_loss`` | ``recon_cosine_loss``).
             mask (Tensor, optional): per-row bool; rows to include.
         """
-        if recon_type == "mse":
+        if recon_loss == "recon_l2_loss":
             per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
-        elif recon_type == "l1":
+        elif recon_loss == "recon_l1_loss":
             per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
-        else:  # 'cosine'
+        else:  # "recon_cosine_loss"
             per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
         if mask is None:
             return per_sample.mean()
         mask = mask.float()
-        return (per_sample * mask).sum() / mask.sum().clamp(min=1)
+        return div_no_nan((per_sample * mask).sum(), mask.sum())
 
     def init_metric(self) -> None:
         """Initialize the eval metrics shared by all SID models.

@@ -78,15 +78,19 @@ class SidRqvae(BaseSidModel):
 
         # CLIP is enabled by a `sid_clip_loss` entry in ModelConfig.losses, which
         # also carries the paired-feature names (data wiring).
-        self._clip_feature_name: Optional[str] = None
-        self._is_clip_pair_feature_name: Optional[str] = None
-        for loss_cfg in self._base_model_config.losses:
-            if loss_cfg.WhichOneof("sid_loss") == "sid_clip_loss":
-                self._clip_feature_name = loss_cfg.sid_clip_loss.clip_feature_name
-                self._is_clip_pair_feature_name = (
-                    loss_cfg.sid_clip_loss.is_clip_pair_feature_name
-                )
-        self._use_clip = self._clip_feature_name is not None
+        clip_cfg = next(
+            (
+                lc.sid_clip_loss
+                for lc in self._base_model_config.losses
+                if lc.WhichOneof("sid_loss") == "sid_clip_loss"
+            ),
+            None,
+        )
+        self._use_clip = clip_cfg is not None
+        self._clip_feature_name = clip_cfg.clip_feature_name if clip_cfg else None
+        self._is_clip_pair_feature_name = (
+            clip_cfg.is_clip_pair_feature_name if clip_cfg else None
+        )
 
         embed_dim = cfg.embed_dim
         # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
@@ -156,6 +160,10 @@ class SidRqvae(BaseSidModel):
             predictions (dict): a dict of predicted result.
         """
         embedding = self._extract_feature(batch)
+        if self._is_inference:
+            # Codes-only path: get_codes does just the residual walk (no decode,
+            # no commitment latents), so neither dual-path branch is needed.
+            return {"codes": self._quantizer.get_codes(self._encode(embedding))}
         if self._use_clip:
             return self._predict_mixed(embedding, batch)
         return self._predict_rqvae(embedding)
@@ -164,8 +172,6 @@ class SidRqvae(BaseSidModel):
         """Standard RQ-VAE: encode -> quantize -> decode."""
         z_e = self._encode(embedding)
         quant = self._quantizer(z_e)
-        if self._is_inference:
-            return {"codes": quant.cluster_ids}
         return {
             "codes": quant.cluster_ids,
             "x_hat": self._decode(quant.quantized_embeddings),
@@ -183,10 +189,6 @@ class SidRqvae(BaseSidModel):
         averages over them; ``recon_mask`` (= non-CLIP rows) restricts the recon
         loss to reconstruction-only rows.
         """
-        if self._is_inference:
-            z_e = self._encode(embedding)
-            return {"codes": self._quantizer(z_e).cluster_ids}
-
         fea2 = self._extract_feature(batch, self._clip_feature_name)
         is_clip_pair_raw = self._extract_feature(batch, self._is_clip_pair_feature_name)
         clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
