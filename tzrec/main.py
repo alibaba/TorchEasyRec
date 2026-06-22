@@ -615,14 +615,12 @@ def train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     acc_utils.allow_tf32(train_config)
-    if train_config.HasField("delta_embedding_dump_config"):
+    enable_delta_embedding_dump = train_config.HasField("delta_embedding_dump_config")
+    if enable_delta_embedding_dump:
         validate_delta_embedding_dump_config(
             train_config.delta_embedding_dump_config, device
         )
-        if train_config.delta_embedding_dump_config.enable:
-            validate_delta_embedding_dump_no_zch_features(
-                pipeline_config.feature_configs
-            )
+        validate_delta_embedding_dump_no_zch_features(pipeline_config.feature_configs)
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -730,10 +728,7 @@ def train_and_evaluate(
         plan=plan,
     )
     delta_embedding_dumper = None
-    if (
-        train_config.HasField("delta_embedding_dump_config")
-        and train_config.delta_embedding_dump_config.enable
-    ):
+    if enable_delta_embedding_dump:
         delta_embedding_dumper = DeltaEmbeddingDumper(
             model,
             train_config.delta_embedding_dump_config,

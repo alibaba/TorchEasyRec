@@ -60,10 +60,6 @@ class _TableWeight:
     shard_info: _TableShardInfo
 
 
-def _is_enabled(config: DeltaEmbeddingDumpConfig) -> bool:
-    return config is not None and config.enable
-
-
 def _distributed_rank_world_size() -> Tuple[int, int]:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -74,10 +70,10 @@ def _distributed_rank_world_size() -> Tuple[int, int]:
 
 
 def validate_delta_embedding_dump_config(
-    config: DeltaEmbeddingDumpConfig, device: torch.device
+    config: Optional[DeltaEmbeddingDumpConfig], device: torch.device
 ) -> None:
     """Validate runtime constraints for delta embedding dump."""
-    if not _is_enabled(config):
+    if config is None:
         return
     if device.type != "cuda":
         raise ValueError(

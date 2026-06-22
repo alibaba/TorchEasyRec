@@ -191,7 +191,6 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
         dumper = DeltaEmbeddingDumper(
             model,
             DeltaEmbeddingDumpConfig(
-                enable=True,
                 dump_interval_steps=1,
                 output_dir=output_dir,
                 file_prefix="delta",
@@ -207,24 +206,23 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
 
 
 class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
-    def test_disabled_config_skips_runtime_validation(self):
-        config = DeltaEmbeddingDumpConfig(enable=False, dump_interval_steps=0)
+    def test_missing_config_skips_runtime_validation(self):
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
-            validate_delta_embedding_dump_config(config, torch.device("cpu"))
+            validate_delta_embedding_dump_config(None, torch.device("cpu"))
 
-    def test_enabled_config_allows_multi_gpu_cuda_device(self):
-        config = DeltaEmbeddingDumpConfig(enable=True, dump_interval_steps=10)
+    def test_present_config_allows_multi_gpu_cuda_device(self):
+        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
             validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
-    def test_enabled_config_requires_cuda_device(self):
-        config = DeltaEmbeddingDumpConfig(enable=True, dump_interval_steps=10)
+    def test_present_config_requires_cuda_device(self):
+        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}):
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 validate_delta_embedding_dump_config(config, torch.device("cpu"))
 
-    def test_enabled_config_requires_positive_interval(self):
-        config = DeltaEmbeddingDumpConfig(enable=True, dump_interval_steps=0)
+    def test_present_config_requires_positive_interval(self):
+        config = DeltaEmbeddingDumpConfig(dump_interval_steps=0)
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}):
             with self.assertRaisesRegex(ValueError, "dump_interval_steps"):
                 validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
@@ -441,7 +439,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ):
             DeltaEmbeddingDumper(
                 torch.nn.Module(),
-                DeltaEmbeddingDumpConfig(enable=True, dump_interval_steps=10),
+                DeltaEmbeddingDumpConfig(dump_interval_steps=10),
                 tmp_dir,
             )
 
@@ -799,7 +797,6 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
 
         dump_dir = os.path.abspath(os.path.join(self.test_dir, "delta_dump"))
         dump_cfg = pipeline_config.train_config.delta_embedding_dump_config
-        dump_cfg.enable = True
         dump_cfg.dump_interval_steps = 1
         dump_cfg.output_dir = dump_dir
         dump_cfg.file_prefix = "delta_embedding"
