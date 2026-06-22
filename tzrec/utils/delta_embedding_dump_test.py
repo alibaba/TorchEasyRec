@@ -347,6 +347,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_final_dump_skips_boundary_step_to_avoid_overwrite(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval = 50
+        dumper._world_size = 1
         with mock.patch.object(dumper, "dump") as dump_mock:
             # Boundary steps were already written by maybe_dump; skip them so a
             # trailing empty shard never overwrites the real one.
@@ -361,6 +362,33 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 [call.args[0] for call in dump_mock.call_args_list],
                 [0, 73],
             )
+
+    def test_final_dump_syncs_step_across_ranks_before_flush(self):
+        # A lagging rank reaches final_dump at a boundary step (50) while the
+        # furthest rank stopped at 73. Without syncing, the lagging rank would
+        # skip and write no shard, leaving step_73/ ragged. The MAX all_reduce
+        # lifts every rank to 73 so all take the same dump-into-step_73 path.
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval = 50
+        dumper._world_size = 2
+
+        def fake_all_reduce(tensor, op=None):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            tensor.fill_(73)
+
+        with (
+            mock.patch.object(dumper, "dump") as dump_mock,
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch(
+                "torch.tensor",
+                side_effect=lambda *a, **k: torch.zeros(1, dtype=torch.long),
+            ),
+            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+        ):
+            dumper.final_dump(50)
+        dump_mock.assert_called_once_with(73)
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)

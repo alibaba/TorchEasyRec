@@ -541,7 +541,10 @@ def _train_and_evaluate(
     if delta_embedding_dumper is not None and i_step >= 0:
         # Flush the trailing partial interval before the final checkpoint.
         # final_dump skips dump-boundary steps already written by maybe_dump,
-        # so it never overwrites their shards with an empty file.
+        # so it never overwrites their shards with an empty file. Ranks can
+        # reach here at different i_step (independent dataloader exhaustion with
+        # check_all_workers_data_status=False), so final_dump all-reduces the
+        # step across ranks to keep one complete shard set per step dir.
         delta_embedding_dumper.final_dump(i_step)
 
     _log_train(

@@ -374,9 +374,33 @@ class DeltaEmbeddingDumper:
         remaining delta; re-dumping them would overwrite their shards with an
         empty file under multi-GPU, so skip them here.
         """
+        global_step = self._sync_final_step(global_step)
         if global_step > 0 and global_step % self._interval == 0:
             return None
         return self.dump(global_step)
+
+    def _sync_final_step(self, global_step: int) -> int:
+        """Align the final step across ranks before the trailing flush.
+
+        ``maybe_dump`` runs in lockstep so every rank shares ``global_step``,
+        but ``final_dump`` is reached with each rank's own last step. With
+        ``check_all_workers_data_status=False`` ranks can exhaust the dataloader
+        at different steps, so without syncing each would write a lone shard to
+        its own ``step_<N>/`` dir -- exactly the ragged shard set the per-rank
+        empty-shard logic prevents. Reduce with MAX so the furthest-progressed
+        rank's trailing delta is never swallowed by the boundary-step skip, and
+        so every rank takes the same skip/dump decision into the same dir.
+        """
+        if self._world_size <= 1:
+            return global_step
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return global_step
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        step_tensor = torch.tensor(global_step, dtype=torch.long, device=device)
+        torch.distributed.all_reduce(step_tensor, op=torch.distributed.ReduceOp.MAX)
+        return int(step_tensor.item())
 
     def dump(self, global_step: int) -> Optional[str]:
         """Dump currently tracked sparse ids and embeddings to a parquet file."""
