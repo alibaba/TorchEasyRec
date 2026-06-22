@@ -13,22 +13,16 @@ message LossConfig {
     // lists one LossConfig per term it trains on (a reconstruction loss, the
     // commitment loss, and optionally the CLIP contrastive loss).
     oneof sid_loss {
-        ReconL2Loss recon_l2_loss = 6;
-        ReconL1Loss recon_l1_loss = 7;
-        ReconCosineLoss recon_cosine_loss = 8;
-        CommitmentLoss commitment_loss = 9;
-        SidClipLoss sid_clip_loss = 10;
+        ReconLoss recon_loss = 6;
+        CommitmentLoss commitment_loss = 7;
+        SidClipLoss sid_clip_loss = 8;
     }
 }
 
-// RQ-VAE reconstruction losses (input vs. decoder output).
-message ReconL2Loss {
-}
-
-message ReconL1Loss {
-}
-
-message ReconCosineLoss {
+// RQ-VAE reconstruction loss (input vs. decoder output).
+message ReconLoss {
+    // Distance for the reconstruction term: "l2" (mse), "l1" or "cos".
+    optional string recon_type = 1 [default = "l2"];
 }
 
 // RQ-VAE commitment loss between the encoder output and the per-layer

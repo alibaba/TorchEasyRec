@@ -11,7 +11,7 @@
 
 """BaseSidModel: shared base for semantic-ID generation models."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -36,8 +36,25 @@ _LOGIT_SCALE_MAX = float(np.log(100))
 # CLIP temperature init (reference CLIP: log(1 / 0.07)).
 _LOGIT_SCALE_INIT = float(np.log(1 / 0.07))
 
-# sid_loss reconstruction variants (``_sid_loss_impl`` branches on these).
-_RECON_LOSSES = frozenset(("recon_l2_loss", "recon_l1_loss", "recon_cosine_loss"))
+
+def recon_loss(
+    recon_type: str,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Per-row reconstruction-distance fn for the configured ``recon_type``.
+
+    Args:
+        recon_type (str): the distance, ``"l2"`` (mse), ``"l1"`` or ``"cos"``.
+
+    Returns:
+        Callable: ``f(x_hat, x) -> (B,)`` per-row reconstruction distance.
+    """
+    if recon_type == "l2":
+        return lambda x_hat, x: F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
+    if recon_type == "l1":
+        return lambda x_hat, x: F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
+    if recon_type == "cos":
+        return lambda x_hat, x: 1 - F.cosine_similarity(x_hat, x, dim=-1)
+    raise ValueError(f"recon_type must be 'l2', 'l1' or 'cos', got {recon_type!r}")
 
 
 def _masked_mean(
@@ -138,17 +155,21 @@ class BaseSidModel(BaseModel):
 
         Each ``LossConfig`` sets one ``sid_loss`` oneof variant (a reconstruction
         loss, the commitment loss, or the CLIP loss). Mirrors ``RankModel``: the
-        config drives which loss modules are registered, and :meth:`loss`
-        computes them from ``predictions``.
+        config drives what is bound here, and :meth:`loss` computes them from
+        ``predictions``. The reconstruction loss binds a per-row distance fn into
+        ``_recon_fn``; commitment/CLIP register modules into ``_loss_modules``.
         """
+        self._recon_fn: Optional[
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        ] = None
         for loss_cfg in self._base_model_config.losses:
             self._init_sid_loss_impl(loss_cfg)
 
     def _init_sid_loss_impl(self, loss_cfg: LossConfig) -> None:
-        """Register the module (if any) for one ``sid_loss`` config."""
+        """Bind the loss (a recon fn or a module) for one ``sid_loss`` config."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
-        if loss_type in _RECON_LOSSES:
-            return  # reconstruction losses are functional (no module)
+        if loss_type == "recon_loss":
+            self._recon_fn = recon_loss(loss_cfg.recon_loss.recon_type)
         elif loss_type == "commitment_loss":
             cfg = loss_cfg.commitment_loss
             latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
@@ -192,15 +213,13 @@ class BaseSidModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute one ``sid_loss`` term from ``predictions``."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
-        if loss_type in _RECON_LOSSES:
-            x_hat, x = predictions["x_hat"], predictions["recon_target"]
-            if loss_type == "recon_l2_loss":
-                per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
-            elif loss_type == "recon_l1_loss":
-                per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
-            else:  # "recon_cosine_loss"
-                per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
-            return {loss_type: _masked_mean(per_sample, predictions.get("recon_mask"))}
+        if loss_type == "recon_loss":
+            per_sample = self._recon_fn(
+                predictions["x_hat"], predictions["recon_target"]
+            )
+            return {
+                "recon_loss": _masked_mean(per_sample, predictions.get("recon_mask"))
+            }
         elif loss_type == "commitment_loss":
             loss = self._loss_modules["commitment_loss"](
                 predictions["encoder_out"], predictions["latents"]

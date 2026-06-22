@@ -43,10 +43,10 @@ def _make_batch(
     )
 
 
-def _recon_loss_cfg(kind: str = "recon_l2_loss") -> loss_pb2.LossConfig:
-    """A LossConfig whose sid_loss oneof is the given recon variant."""
+def _recon_loss_cfg(recon_type: str = "l2") -> loss_pb2.LossConfig:
+    """A LossConfig with a recon_loss term of the given recon_type."""
     lc = loss_pb2.LossConfig()
-    getattr(lc, kind).SetInParent()
+    lc.recon_loss.recon_type = recon_type
     return lc
 
 
@@ -76,7 +76,7 @@ class SidRqvaeTest(unittest.TestCase):
         input_dim=32,
         embed_dim=8,
         n_layers=2,
-        recon="recon_l2_loss",
+        recon="l2",
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
@@ -139,7 +139,7 @@ class SidRqvaeTest(unittest.TestCase):
 
         # loss() computes the configured recon + commitment terms.
         losses = model.loss(predictions, batch)
-        self.assertIn("recon_l2_loss", losses)
+        self.assertIn("recon_loss", losses)
         self.assertIn("commitment_loss", losses)
 
         total_loss = sum(losses.values())
@@ -194,7 +194,7 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertEqual(predictions["codes"].shape[0], B)
 
         losses = model.loss(predictions, batch)
-        self.assertIn("recon_l2_loss", losses)
+        self.assertIn("recon_loss", losses)
         self.assertIn("commitment_loss", losses)
         self.assertIn("sid_clip_loss", losses)
 
@@ -216,7 +216,7 @@ class SidRqvaeTest(unittest.TestCase):
         batch = self._clip_batch(B, input_dim, torch.zeros(B, 1))
         losses = model.loss(model.predict(batch), batch)
         self.assertEqual(losses["sid_clip_loss"].item(), 0.0)
-        self.assertGreater(losses["recon_l2_loss"].item(), 0.0)
+        self.assertGreater(losses["recon_loss"].item(), 0.0)
 
     def test_rqvae_clip_all_clip(self) -> None:
         """Mixed mode with all-clip batch: recon term 0, clip term > 0."""
@@ -227,7 +227,7 @@ class SidRqvaeTest(unittest.TestCase):
 
         batch = self._clip_batch(B, input_dim, torch.ones(B, 1))
         losses = model.loss(model.predict(batch), batch)
-        self.assertEqual(losses["recon_l2_loss"].item(), 0.0)
+        self.assertEqual(losses["recon_loss"].item(), 0.0)
         self.assertGreater(losses["sid_clip_loss"].item(), 0.0)
 
     def test_rqvae_backward(self) -> None:
@@ -283,7 +283,7 @@ class SidRqvaeTest(unittest.TestCase):
             labels={},
         )
         losses = model.loss(model.predict(batch), batch)
-        self.assertEqual(losses["recon_l2_loss"].item(), 0.0)
+        self.assertEqual(losses["recon_loss"].item(), 0.0)
         self.assertGreater(losses["sid_clip_loss"].item(), 0.0)
 
     @parameterized.expand(
@@ -312,25 +312,19 @@ class SidRqvaeTest(unittest.TestCase):
         for layer in model._quantizer.layers:
             self.assertEqual(layer.use_sinkhorn, expect_use_sinkhorn)
 
-    @parameterized.expand(
-        [
-            ("recon_l2_loss",),
-            ("recon_l1_loss",),
-            ("recon_cosine_loss",),
-        ]
-    )
-    def test_recon_loss_variant_branch(self, recon) -> None:
-        """Each recon variant runs end-to-end (grad flows through the decoder)."""
+    @parameterized.expand([("l2",), ("l1",), ("cos",)])
+    def test_recon_type_branch(self, recon_type) -> None:
+        """Each recon_type runs end-to-end (grad flows through the decoder)."""
         B, input_dim = 4, 32
-        model = self._create_model(input_dim=input_dim, recon=recon)
+        model = self._create_model(input_dim=input_dim, recon=recon_type)
         model.train()
         model.init_loss()
         losses = model.loss(
             model.predict(_make_batch(B, input_dim)), _make_batch(B, input_dim)
         )
-        recon_loss = losses[recon]
-        self.assertTrue(torch.isfinite(recon_loss), f"{recon} not finite")
-        recon_loss.backward()  # grad must flow through the decoder
+        recon = losses["recon_loss"]
+        self.assertTrue(torch.isfinite(recon), f"{recon_type} not finite")
+        recon.backward()  # grad must flow through the decoder
 
     def test_logit_scale_clamped_prevents_overflow(self) -> None:
         """A raw logit_scale far above ln(100) must not overflow.
