@@ -77,8 +77,6 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
 
-        # Structure (clip_config) lives on the model proto; the objective
-        # (sid_clip_loss) lives in losses. The two must be set together.
         self._use_clip = cfg.HasField("clip_config")
         self._clip_feature_group = (
             cfg.clip_config.clip_feature_group if self._use_clip else None
@@ -96,9 +94,6 @@ class SidRqvae(BaseSidModel):
                 "losses (the objective) must be set together; got "
                 f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
             )
-        # Validate the CLIP groups up front (parity with the base feature_group
-        # has_group guard): a typo/missing group otherwise only KeyErrors on the
-        # first forward, after the whole TorchRec setup.
         if self._use_clip:
             for grp in (self._clip_feature_group, self._clip_pair_feature_group):
                 if not self.embedding_group.has_group(grp):
@@ -106,8 +101,6 @@ class SidRqvae(BaseSidModel):
                         f"clip group {grp!r} is not in model_config.feature_groups "
                         f"{self.embedding_group.group_names()}"
                     )
-            # The paired group shares the main encoder, so it must match
-            # input_dim; fail fast instead of an opaque matmul error.
             clip_dim = self.embedding_group.group_total_dim(self._clip_feature_group)
             if clip_dim != self._input_dim:
                 raise ValueError(
@@ -116,8 +109,6 @@ class SidRqvae(BaseSidModel):
                     f"the main feature_group (dim {self._input_dim}); the two "
                     "must match"
                 )
-            # The pair flag is read as a single raw column (>0.5); a transformed
-            # or multi-dim group would silently mis-route rows.
             pair_dim = self.embedding_group.group_total_dim(
                 self._clip_pair_feature_group
             )

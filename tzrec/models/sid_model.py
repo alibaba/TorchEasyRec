@@ -298,8 +298,6 @@ class BaseSidModel(BaseModel):
             return
         recon = predictions["x_hat"]
         embedding = predictions["recon_target"]
-        # Restrict reconstruction scoring to the rows the recon loss optimizes
-        # (the mixed CLIP path masks out pair rows); no mask = score all rows.
         recon_mask = predictions.get("recon_mask")
         if recon_mask is not None:
             recon = recon[recon_mask]
