@@ -76,10 +76,8 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
 
-        # The CLIP-style dual-encoder structure (which paired feature group to
-        # encode, the dual path) is declared on the MODEL proto (`clip_config`);
-        # the contrastive OBJECTIVE is enabled by a `sid_clip_loss` entry in
-        # ModelConfig.losses. The two must be set together.
+        # Structure (clip_config) lives on the model proto; the objective
+        # (sid_clip_loss) lives in losses. The two must be set together.
         self._use_clip = cfg.HasField("clip_config")
         self._clip_feature_group = (
             cfg.clip_config.clip_feature_group if self._use_clip else None
@@ -97,6 +95,17 @@ class SidRqvae(BaseSidModel):
                 "losses (the objective) must be set together; got "
                 f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
             )
+        # The paired group shares the main encoder, so it must match input_dim;
+        # fail fast here instead of an opaque matmul error on the first forward.
+        if self._use_clip:
+            clip_dim = self.embedding_group.group_total_dim(self._clip_feature_group)
+            if clip_dim != self._input_dim:
+                raise ValueError(
+                    f"clip_feature_group {self._clip_feature_group!r} has total "
+                    f"dim {clip_dim}, but it is encoded by the same encoder as "
+                    f"the main feature_group (dim {self._input_dim}); the two "
+                    "must match"
+                )
 
         embed_dim = cfg.embed_dim
         # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero

@@ -23,13 +23,15 @@ from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 
 
-def _features_and_groups(input_dim: int, use_clip: bool = False):
+def _features_and_groups(input_dim: int, use_clip: bool = False, clip_dim: int = None):
     """Real raw features + feature groups for a SID model.
 
     Mirrors how every other model test wires inputs: ``create_features`` builds
     the ``BaseFeature`` objects and ``feature_groups`` (consumed by the model's
     :class:`EmbeddingGroup`) name the main ``deep`` group — plus, for CLIP, the
-    paired image group and the per-row pair-flag group.
+    paired image group and the per-row pair-flag group. ``clip_dim`` (default:
+    match ``input_dim``) sizes the paired group, so a test can deliberately
+    mismatch it.
     """
 
     def _raw(name: str, dim: int) -> feature_pb2.FeatureConfig:
@@ -47,7 +49,10 @@ def _features_and_groups(input_dim: int, use_clip: bool = False):
     feature_cfgs = [_raw("item_emb", input_dim)]
     groups = [_deep("deep", "item_emb")]
     if use_clip:
-        feature_cfgs += [_raw("image_emb", input_dim), _raw("is_clip_pair", 1)]
+        feature_cfgs += [
+            _raw("image_emb", clip_dim if clip_dim is not None else input_dim),
+            _raw("is_clip_pair", 1),
+        ]
         groups += [_deep("clip_image", "image_emb"), _deep("clip_pair", "is_clip_pair")]
     return create_features(feature_cfgs), groups
 
@@ -109,14 +114,11 @@ class SidRqvaeTest(unittest.TestCase):
         )
         losses = [_recon_loss_cfg(recon), _commitment_cfg()]
         if use_clip:
-            # structure on the model proto (paired + pair-flag groups);
-            # objective marker in losses.
             sid_rqvae_cfg.clip_config.clip_feature_group = "clip_image"
             sid_rqvae_cfg.clip_config.clip_pair_feature_group = "clip_pair"
             losses.append(_clip_cfg())
 
-        # SID models consume the framework's EmbeddingGroup: input_dim is derived
-        # from the ``deep`` group, so real features + feature_groups are required.
+        # Real features + feature_groups: input_dim is derived from the group.
         features, feature_groups = _features_and_groups(input_dim, use_clip)
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups, sid_rqvae=sid_rqvae_cfg, losses=losses
@@ -283,6 +285,23 @@ class SidRqvaeTest(unittest.TestCase):
             model = SidRqvae(model_config=model_config, features=features, labels=[])
             with self.assertRaisesRegex(ValueError, "latent_weight"):
                 model.init_loss()
+
+    def test_clip_feature_group_dim_mismatch_raises(self) -> None:
+        """A CLIP paired group whose dim != the main group fails fast at init.
+
+        The paired feature is encoded by the same encoder as the main input, so
+        a dim mismatch would otherwise crash with an opaque matmul shape error
+        on the first contrastive forward — not at construction.
+        """
+        features, feature_groups = _features_and_groups(32, use_clip=True, clip_dim=16)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.clip_config.clip_feature_group = "clip_image"
+        cfg.clip_config.clip_pair_feature_group = "clip_pair"
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_clip_cfg()]
+        )
+        with self.assertRaisesRegex(ValueError, "must match"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
 
     def test_clip_mask_uses_flag_not_equality(self) -> None:
         """The is_clip_pair flag, not bit-exact equality, drives routing.

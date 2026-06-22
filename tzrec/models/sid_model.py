@@ -119,27 +119,22 @@ class BaseSidModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         cfg = self._model_config
-        # Config fields shared by every SID model (present on each SID proto
-        # message): the main input feature group, the residual-normalization
-        # toggle, and the per-layer codebook.
+        # Config fields shared by every SID proto message.
         self._feature_group = cfg.feature_group
         self._normalize_residuals = cfg.normalize_residuals
 
         if not cfg.codebook:
             raise ValueError("codebook must be set, e.g. [256, 256, 256]")
         self._n_embed_list = list(cfg.codebook)
-        # Fail fast: a zero codebook entry only errors opaquely deep inside
-        # faiss, after the whole training pass.
+        # Fail fast: a zero entry only errors opaquely deep in faiss later.
         if any(k < 1 for k in self._n_embed_list):
             raise ValueError(
                 f"every codebook entry must be >= 1, got {self._n_embed_list}"
             )
         self._n_layers = len(self._n_embed_list)
 
-        # Build the framework's EmbeddingGroup (same path every model uses) and
-        # derive the encoder input dim from the main group's total dimension —
-        # the group may hold one content embedding or several content + side-info
-        # features, all concatenated into ``_input_dim``.
+        # Derive the encoder input dim from the main group's total dim (it may
+        # concatenate several content + side-info features).
         self.init_input()
         self._input_dim = self.embedding_group.group_total_dim(self._feature_group)
         if self._input_dim < 1:
