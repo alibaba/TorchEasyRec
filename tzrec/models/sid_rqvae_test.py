@@ -60,9 +60,10 @@ def _commitment_cfg(
 
 
 def _clip_cfg() -> loss_pb2.LossConfig:
+    # The contrastive objective marker (empty); the paired-feature wiring lives
+    # on the model proto (SidRqvae.clip_config), set in _create_model.
     lc = loss_pb2.LossConfig()
-    lc.sid_clip_loss.clip_feature_name = "image_emb"
-    lc.sid_clip_loss.is_clip_pair_feature_name = "is_clip_pair"
+    lc.sid_clip_loss.SetInParent()
     return lc
 
 
@@ -89,6 +90,9 @@ class SidRqvaeTest(unittest.TestCase):
         )
         losses = [_recon_loss_cfg(recon), _commitment_cfg()]
         if use_clip:
+            # structure on the model proto; objective marker in losses.
+            sid_rqvae_cfg.clip_config.clip_feature_name = "image_emb"
+            sid_rqvae_cfg.clip_config.is_clip_pair_feature_name = "is_clip_pair"
             losses.append(_clip_cfg())
 
         # SID models read the item-embedding dense feature directly from the
@@ -186,7 +190,7 @@ class SidRqvaeTest(unittest.TestCase):
         predictions = model.predict(batch)
         self.assertIn("codes", predictions)
         self.assertIn("x_hat", predictions)
-        self.assertIn("clip_image", predictions)
+        self.assertIn("embed_a", predictions)
         self.assertEqual(predictions["codes"].shape[0], B)
 
         losses = model.loss(predictions, batch)

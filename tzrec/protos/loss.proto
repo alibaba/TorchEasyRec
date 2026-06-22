@@ -41,12 +41,10 @@ message CommitmentLoss {
     optional string commitment_type = 2 [default = "l2"];
 }
 
-// CLIP contrastive loss for the dual (image/text) reconstruction path.
+// Enables the contrastive (masked InfoNCE) objective for a CLIP-style SID model.
+// The paired-feature wiring lives on the model (SidRqvae.clip_config); this just
+// turns the objective on (any loss hyperparameters would go here).
 message SidClipLoss {
-    // Name of the second (paired) embedding feature inside the input Batch.
-    required string clip_feature_name = 1;
-    // Name of the per-row float feature flagging CLIP-pair rows (>0.5 = pair).
-    required string is_clip_pair_feature_name = 2;
 }
 
 message BinaryCrossEntropy {

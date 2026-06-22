@@ -26,6 +26,16 @@ message SinkhornConfig {
     optional bool enabled = 3 [default = true];
 }
 
+// CLIP-style dual-encoder wiring for SidRqvae: which paired feature to encode
+// and which column flags the contrastive-pair rows. This is model structure /
+// input contract (declared on the model), not loss config.
+message ClipConfig {
+    // Name of the second (paired) embedding feature inside the input Batch.
+    required string clip_feature_name = 1;
+    // Name of the per-row float feature flagging pair rows (>0.5 = pair).
+    required string is_clip_pair_feature_name = 2;
+}
+
 message SidRqvae {
     // === Network structure ===
     // Input embedding dimension.
@@ -67,10 +77,15 @@ message SidRqvae {
     // omitted: enabled with iters=5, epsilon=10.0. Include the sub-config
     // to override params; set ``enabled: false`` inside it to disable.
     optional SinkhornConfig sinkhorn_config = 15;
+    // CLIP-style dual-encoder structure: when set, the model encodes a second
+    // (paired) feature and runs the contrastive path. This declares the model's
+    // input contract + topology; the contrastive OBJECTIVE is enabled separately
+    // by a `sid_clip_loss` entry in ModelConfig.losses (both must be set together).
+    optional ClipConfig clip_config = 16;
 
-    // Reconstruction, commitment and (optional) CLIP losses are configured via
-    // ModelConfig.losses (the LossConfig ``sid_loss`` oneof), not on this
-    // message — see tzrec/protos/loss.proto.
+    // Reconstruction, commitment and (optional) contrastive losses are configured
+    // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the CLIP
+    // feature wiring above lives on this message.
 
     // Name of the item embedding feature inside the input Batch.
     optional string embedding_feature_name = 40 [default = "item_emb"];

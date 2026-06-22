@@ -21,8 +21,8 @@ from torch import nn
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.loss.clip_loss import MaskedCLIPLoss
 from tzrec.loss.commitment_loss import CommitmentLoss
+from tzrec.loss.infonce_loss import MaskedInfoNCELoss
 from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
@@ -138,11 +138,11 @@ class BaseSidModel(BaseModel):
                 commitment_type=cfg.commitment_type,
             )
         elif loss_type == "sid_clip_loss":
-            # The three learnable CLIP temperatures + the masked-CLIP module.
+            # The three learnable contrastive temperatures + the InfoNCE module.
             self._logit_scale_self = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
             self._logit_scale_cl = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
             self._logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
-            self._loss_modules["sid_clip_loss"] = MaskedCLIPLoss()
+            self._loss_modules["sid_clip_loss"] = MaskedInfoNCELoss()
         else:
             raise ValueError(
                 f"LossConfig for a SID model must set a sid_loss variant, "
@@ -193,16 +193,16 @@ class BaseSidModel(BaseModel):
                 return p.clamp(max=_LOGIT_SCALE_MAX).exp()
 
             feats = {
-                "image_embed": predictions["clip_image"],
-                "text_embed": predictions["clip_text"],
-                "image_embed_ori": predictions["clip_image_ori"],
-                "text_embed_ori": predictions["clip_text_ori"],
+                "embed_a": predictions["embed_a"],
+                "embed_b": predictions["embed_b"],
+                "embed_a_ori": predictions["embed_a_ori"],
+                "embed_b_ori": predictions["embed_b_ori"],
                 "logit_scale_self": scaled(self._logit_scale_self),
                 "logit_scale_cl": scaled(self._logit_scale_cl),
                 "logit_scale": scaled(self._logit_scale),
             }
-            out = self._loss_modules["sid_clip_loss"](feats, predictions["clip_mask"])
-            return {"sid_clip_loss": out["clip_loss"]}
+            out = self._loss_modules["sid_clip_loss"](feats, predictions["pair_mask"])
+            return {"sid_clip_loss": out["loss"]}
         else:
             raise ValueError(f"unsupported sid_loss variant: {loss_type!r}")
 

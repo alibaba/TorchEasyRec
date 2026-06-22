@@ -17,82 +17,82 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tzrec.loss.clip_loss import MaskedCLIPLoss
+from tzrec.loss.infonce_loss import MaskedInfoNCELoss
 from tzrec.utils import misc_util
 
 
 class AllGatherWithGradTest(unittest.TestCase):
     def test_single_process_identity(self) -> None:
         a, b = torch.randn(3, 4), torch.randn(3, 4)
-        out = MaskedCLIPLoss._all_gather_with_grad([a, b])
+        out = MaskedInfoNCELoss._all_gather_with_grad([a, b])
         self.assertIs(out[0], a)
         self.assertIs(out[1], b)
 
 
-class MaskedCLIPLossTest(unittest.TestCase):
+class MaskedInfoNCELossTest(unittest.TestCase):
     """Single-process tests for the masked CLIP loss."""
 
     def _features(self, B: int, D: int) -> dict:
         torch.manual_seed(0)
         scale = torch.tensor(np.log(1 / 0.07)).exp()
         return {
-            "image_embed": torch.randn(B, D, requires_grad=True),
-            "text_embed": torch.randn(B, D, requires_grad=True),
-            "image_embed_ori": torch.randn(B, D),
-            "text_embed_ori": torch.randn(B, D),
+            "embed_a": torch.randn(B, D, requires_grad=True),
+            "embed_b": torch.randn(B, D, requires_grad=True),
+            "embed_a_ori": torch.randn(B, D),
+            "embed_b_ori": torch.randn(B, D),
             "logit_scale_self": scale,
             "logit_scale_cl": scale,
             "logit_scale": scale,
         }
 
     def test_forward_all_clip_finite(self) -> None:
-        loss_fn = MaskedCLIPLoss()
+        loss_fn = MaskedInfoNCELoss()
         feats = self._features(6, 8)
         mask = torch.ones(6, dtype=torch.bool)
         out = loss_fn(feats, mask)
-        self.assertIn("clip_loss", out)
-        self.assertTrue(torch.isfinite(out["clip_loss"]))
-        self.assertGreater(out["clip_loss"].item(), 0.0)
+        self.assertIn("loss", out)
+        self.assertTrue(torch.isfinite(out["loss"]))
+        self.assertGreater(out["loss"].item(), 0.0)
 
     def test_all_recon_mask_zero_loss(self) -> None:
-        loss_fn = MaskedCLIPLoss()
+        loss_fn = MaskedInfoNCELoss()
         feats = self._features(6, 8)
         mask = torch.zeros(6, dtype=torch.bool)  # no clip rows
         out = loss_fn(feats, mask)
         # No clip rows -> masked average is exactly zero (and finite).
-        self.assertTrue(torch.isfinite(out["clip_loss"]))
-        self.assertAlmostEqual(out["clip_loss"].item(), 0.0, places=6)
+        self.assertTrue(torch.isfinite(out["loss"]))
+        self.assertAlmostEqual(out["loss"].item(), 0.0, places=6)
 
     def test_all_recon_mask_finite_gradient(self) -> None:
         # Regression: with float("-inf") column fill an all-recon batch produced
         # a NaN gradient (0 * NaN) that survived the row mask. The finite fill
         # must keep the backward finite (and zero, since no clip row contributes).
-        loss_fn = MaskedCLIPLoss()
+        loss_fn = MaskedInfoNCELoss()
         feats = self._features(6, 8)
         mask = torch.zeros(6, dtype=torch.bool)
-        loss_fn(feats, mask)["clip_loss"].backward()
-        grad = feats["image_embed"].grad
+        loss_fn(feats, mask)["loss"].backward()
+        grad = feats["embed_a"].grad
         self.assertIsNotNone(grad)
         self.assertTrue(torch.isfinite(grad).all())
         self.assertAlmostEqual(grad.abs().sum().item(), 0.0, places=6)
 
     def test_backward_flows_to_embeddings(self) -> None:
-        loss_fn = MaskedCLIPLoss()
+        loss_fn = MaskedInfoNCELoss()
         feats = self._features(6, 8)
         mask = torch.ones(6, dtype=torch.bool)
-        loss_fn(feats, mask)["clip_loss"].backward()
-        self.assertIsNotNone(feats["image_embed"].grad)
-        self.assertTrue(torch.isfinite(feats["image_embed"].grad).all())
+        loss_fn(feats, mask)["loss"].backward()
+        self.assertIsNotNone(feats["embed_a"].grad)
+        self.assertTrue(torch.isfinite(feats["embed_a"].grad).all())
 
     def test_recon_columns_excluded_from_negatives(self) -> None:
         """A recon row's embedding must not affect a clip row's loss.
 
         Recon rows are dropped as queries (row mask) AND their columns are
         masked out of the negatives (col_mask). Perturbing the recon rows of
-        EVERY column operand — ``text_embed`` (the self group) and both
+        EVERY column operand — ``embed_b`` (the self group) and both
         ``*_ori`` operands (the ori/cl groups) — must leave the clip rows' loss
         unchanged; a dropped or inverted ``col_mask`` on any group would fail.
-        Distinct ``image_embed_ori`` / ``text_embed_ori`` so the ori/cl masking
+        Distinct ``embed_a_ori`` / ``embed_b_ori`` so the ori/cl masking
         is actually exercised (not hidden by a shared tensor).
         """
         torch.manual_seed(0)
@@ -103,24 +103,24 @@ class MaskedCLIPLossTest(unittest.TestCase):
 
         def feats(txt: torch.Tensor, txt_ori: torch.Tensor, img_ori: torch.Tensor):
             return {
-                "image_embed": img,
-                "text_embed": txt,
-                "image_embed_ori": img_ori,
-                "text_embed_ori": txt_ori,
+                "embed_a": img,
+                "embed_b": txt,
+                "embed_a_ori": img_ori,
+                "embed_b_ori": txt_ori,
                 "logit_scale_self": scale,
                 "logit_scale_cl": scale,
                 "logit_scale": scale,
             }
 
         txt, txt_ori, img_ori = (torch.randn(B, D) for _ in range(3))
-        loss_fn = MaskedCLIPLoss()
+        loss_fn = MaskedInfoNCELoss()
         loss_fn.eval()
-        base = loss_fn(feats(txt, txt_ori, img_ori), mask)["clip_loss"]
+        base = loss_fn(feats(txt, txt_ori, img_ori), mask)["loss"]
         # Perturb ONLY the recon rows of every column operand that feeds negatives.
         txt2, txt_ori2, img_ori2 = txt.clone(), txt_ori.clone(), img_ori.clone()
         for t in (txt2, txt_ori2, img_ori2):
             t[2:] = torch.randn(2, D)
-        after = loss_fn(feats(txt2, txt_ori2, img_ori2), mask)["clip_loss"]
+        after = loss_fn(feats(txt2, txt_ori2, img_ori2), mask)["loss"]
         torch.testing.assert_close(base, after)
 
     def test_mask_holds_under_large_scale(self) -> None:
@@ -128,27 +128,27 @@ class MaskedCLIPLossTest(unittest.TestCase):
         # hardcoded -1e4, so masking holds even when logit_scale is large and
         # the *_ori operands are un-normalized (real logits can dwarf 1e4).
         # Loss/grad must stay finite and acc valid; eval exercises the argmax.
-        loss_fn = MaskedCLIPLoss()
+        loss_fn = MaskedInfoNCELoss()
         loss_fn.eval()
         feats = self._features(6, 8)
         big = torch.tensor(3000.0)
         feats["logit_scale"] = big
         feats["logit_scale_self"] = big
         feats["logit_scale_cl"] = big
-        feats["image_embed_ori"] = feats["image_embed_ori"] * 50
-        feats["text_embed_ori"] = feats["text_embed_ori"] * 50
+        feats["embed_a_ori"] = feats["embed_a_ori"] * 50
+        feats["embed_b_ori"] = feats["embed_b_ori"] * 50
         mask = torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool)
         out = loss_fn(feats, mask)
-        self.assertTrue(torch.isfinite(out["clip_loss"]))
+        self.assertTrue(torch.isfinite(out["loss"]))
         loss_fn.train()
-        feats["image_embed"].grad = None
-        loss_fn(feats, mask)["clip_loss"].backward()
-        self.assertTrue(torch.isfinite(feats["image_embed"].grad).all())
+        feats["embed_a"].grad = None
+        loss_fn(feats, mask)["loss"].backward()
+        self.assertTrue(torch.isfinite(feats["embed_a"].grad).all())
 
 
 # --- Multi-process tests for the CLIP distributed all-gather path. ---
 # Validates ``_all_gather_with_grad`` (built on the differentiable
-# ``torch.distributed.nn.functional.all_gather``) and ``MaskedCLIPLoss`` across
+# ``torch.distributed.nn.functional.all_gather``) and ``MaskedInfoNCELoss`` across
 # ranks. Uses NCCL on GPU when >=2 devices are available (the production path the
 # reviewer cared about), else falls back to gloo/CPU, so it runs on a multi-GPU
 # box and in CPU CI alike.
@@ -174,7 +174,7 @@ def _all_gather_worker(rank: int, world_size: int, port: int) -> None:
     device = _init(rank, world_size, port)
     # Each rank holds a distinct, rank-identifying tensor.
     x = torch.full((2, 3), float(rank + 1), device=device, requires_grad=True)
-    gathered = MaskedCLIPLoss._all_gather_with_grad([x])[0]
+    gathered = MaskedInfoNCELoss._all_gather_with_grad([x])[0]
 
     # Forward: gathered is (world_size*2, 3); rank r contributes rows
     # [2r : 2r+2] all equal to (r+1).
@@ -202,24 +202,24 @@ def _masked_clip_worker(rank: int, world_size: int, port: int) -> None:
     B, D = 4, 8
     scale = torch.tensor(np.log(1 / 0.07)).exp().to(device)
     feats = {
-        "image_embed": torch.randn(B, D, device=device, requires_grad=True),
-        "text_embed": torch.randn(B, D, device=device, requires_grad=True),
-        "image_embed_ori": torch.randn(B, D, device=device),
-        "text_embed_ori": torch.randn(B, D, device=device),
+        "embed_a": torch.randn(B, D, device=device, requires_grad=True),
+        "embed_b": torch.randn(B, D, device=device, requires_grad=True),
+        "embed_a_ori": torch.randn(B, D, device=device),
+        "embed_b_ori": torch.randn(B, D, device=device),
         "logit_scale_self": scale,
         "logit_scale_cl": scale,
         "logit_scale": scale,
     }
     mask = torch.ones(B, dtype=torch.bool, device=device)
 
-    loss_fn = MaskedCLIPLoss().to(device)
+    loss_fn = MaskedInfoNCELoss().to(device)
     out = loss_fn(feats, mask)
-    clip_loss = out["clip_loss"]
+    clip_loss = out["loss"]
     assert torch.isfinite(clip_loss).all(), f"rank{rank}: non-finite clip_loss"
     assert clip_loss.item() > 0.0, f"rank{rank}: clip_loss not positive"
 
     clip_loss.backward()
-    g = feats["image_embed"].grad
+    g = feats["embed_a"].grad
     assert g is not None and torch.isfinite(g).all(), f"rank{rank}: bad grad"
     dist.destroy_process_group()
 
@@ -238,7 +238,7 @@ def _run(target) -> None:
             raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
 
 
-class ClipLossDistTest(unittest.TestCase):
+class InfoNCEDistTest(unittest.TestCase):
     """2-rank tests for the CLIP distributed collectives."""
 
     def test_all_gather_with_grad(self) -> None:

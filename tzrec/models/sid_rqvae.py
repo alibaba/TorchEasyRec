@@ -76,21 +76,27 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
 
-        # CLIP is enabled by a `sid_clip_loss` entry in ModelConfig.losses, which
-        # also carries the paired-feature names (data wiring).
-        clip_cfg = next(
-            (
-                lc.sid_clip_loss
-                for lc in self._base_model_config.losses
-                if lc.WhichOneof("sid_loss") == "sid_clip_loss"
-            ),
-            None,
+        # The CLIP-style dual-encoder structure (which paired feature to encode,
+        # the dual path) is declared on the MODEL proto (`clip_config`); the
+        # contrastive OBJECTIVE is enabled by a `sid_clip_loss` entry in
+        # ModelConfig.losses. The two must be set together.
+        self._use_clip = cfg.HasField("clip_config")
+        self._clip_feature_name = (
+            cfg.clip_config.clip_feature_name if self._use_clip else None
         )
-        self._use_clip = clip_cfg is not None
-        self._clip_feature_name = clip_cfg.clip_feature_name if clip_cfg else None
         self._is_clip_pair_feature_name = (
-            clip_cfg.is_clip_pair_feature_name if clip_cfg else None
+            cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
         )
+        has_clip_obj = any(
+            lc.WhichOneof("sid_loss") == "sid_clip_loss"
+            for lc in self._base_model_config.losses
+        )
+        if self._use_clip != has_clip_obj:
+            raise ValueError(
+                "clip_config (model structure) and a sid_clip_loss entry in "
+                "losses (the objective) must be set together; got "
+                f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
+            )
 
         embed_dim = cfg.embed_dim
         # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
@@ -208,9 +214,10 @@ class SidRqvae(BaseSidModel):
             "recon_mask": ~clip_mask,
             "encoder_out": torch.cat([z_e1, z_e2], dim=0),
             "latents": torch.cat([quant1.latents, quant2.latents], dim=0),
-            "clip_image": x_hat1,
-            "clip_text": x_hat2,
-            "clip_image_ori": embedding,
-            "clip_text_ori": fea2,
-            "clip_mask": clip_mask,
+            # generic contrastive operands (view a = main, view b = paired):
+            "embed_a": x_hat1,
+            "embed_b": x_hat2,
+            "embed_a_ori": embedding,
+            "embed_b_ori": fea2,
+            "pair_mask": clip_mask,
         }
