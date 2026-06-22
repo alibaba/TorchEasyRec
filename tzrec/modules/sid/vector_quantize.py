@@ -23,24 +23,6 @@ from tzrec.modules.sid.types import (
 )
 
 
-def _squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Squared L2 distance between rows of ``x`` and ``y``.
-
-    Args:
-        x (Tensor): data points, shape (N, D).
-        y (Tensor): centroids, shape (K, D).
-
-    Returns:
-        Tensor: squared distances, shape (N, K).
-
-    Grad-enabled and branch-free (Gumbel needs grad; STE/Sinkhorn callers add
-    their own ``no_grad``).
-    """
-    x_sq = x.pow(2).sum(dim=1, keepdim=True)  # (N, 1)
-    y_sq = y.pow(2).sum(dim=1, keepdim=True).t()  # (1, K)
-    return (x_sq + y_sq - 2.0 * x @ y.t()).clamp(min=0.0)
-
-
 @torch.no_grad()
 def _sinkhorn(
     cost: torch.Tensor,
@@ -178,7 +160,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         codebook = self.embedding.weight  # (n_embed, D)
 
         if self.distance_type == "l2":
-            distances = _squared_euclidean_distance(x, codebook)
+            distances = torch.cdist(x, codebook, p=2).pow(2)
         elif self.distance_type == "cosine":
             x_norm = F.normalize(x, p=2, dim=1)
             codebook_norm = F.normalize(codebook, p=2, dim=1)

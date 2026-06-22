@@ -17,19 +17,20 @@ from parameterized import parameterized
 from tzrec.modules.sid.types import QuantizeForwardMode
 from tzrec.modules.sid.vector_quantize import (
     VectorQuantizeLayer,
-    _squared_euclidean_distance,
 )
 
 
 class SquaredEuclideanDistanceTest(unittest.TestCase):
-    """Tests for the squared-L2 distance helper used by VectorQuantizeLayer."""
+    """Tests the l2 path of ``VectorQuantizeLayer._compute_distances`` (cdist²)."""
 
-    def test_squared_euclidean_distance(self) -> None:
+    def test_l2_compute_distances(self) -> None:
+        layer = VectorQuantizeLayer(embed_dim=2, n_embed=2, distance_type="l2")
+        # Pin the codebook to (0,0) and (0,1) so distances are exact.
+        layer.embedding.weight.data.copy_(torch.tensor([[0.0, 0.0], [0.0, 1.0]]))
         x = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
-        y = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
-        d = _squared_euclidean_distance(x, y)
+        d = layer._compute_distances(x)
         self.assertEqual(d.shape, (2, 2))
-        # row0: dist to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
+        # row0: dist² to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
         torch.testing.assert_close(d, torch.tensor([[0.0, 1.0], [1.0, 2.0]]))
 
 

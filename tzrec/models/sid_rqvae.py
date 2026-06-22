@@ -27,6 +27,7 @@ from torch import nn
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.sid_model import BaseSidModel
+from tzrec.modules.mlp import MLP
 from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
@@ -54,16 +55,6 @@ class SidRqvae(BaseSidModel):
         labels (list): list of label names.
         sample_weights (list): sample weight names.
     """
-
-    @staticmethod
-    def _build_mlp(dims: List[int]) -> nn.Sequential:
-        """Build MLP: dims[0] -> ... -> dims[-1], ReLU between hidden layers."""
-        layers: List[nn.Module] = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:  # no activation after the last layer
-                layers.append(nn.ReLU())
-        return nn.Sequential(*layers)
 
     def __init__(
         self,
@@ -134,10 +125,17 @@ class SidRqvae(BaseSidModel):
         # restates them; keys map to the quantizer's use_sinkhorn/iters/epsilon.
         sinkhorn_cfg = config_to_kwargs(cfg.sinkhorn_config)
 
-        self._encoder = self._build_mlp([self._input_dim, *hidden_dims, embed_dim])
-        # Decoder is the symmetric reverse of the encoder.
-        self._decoder = self._build_mlp(
-            [embed_dim, *reversed(hidden_dims), self._input_dim]
+        # Framework MLP (Linear+ReLU per hidden) + a bare trailing Linear: the
+        # latent / reconstruction must be unbounded and MLP always activates its
+        # last layer, so the projection carries no activation.
+        self._encoder = nn.Sequential(
+            MLP(self._input_dim, hidden_units=hidden_dims),
+            nn.Linear(hidden_dims[-1], embed_dim),
+        )
+        # Decoder mirrors the encoder over the reversed hidden stack.
+        self._decoder = nn.Sequential(
+            MLP(embed_dim, hidden_units=list(reversed(hidden_dims))),
+            nn.Linear(hidden_dims[0], self._input_dim),
         )
 
         self._quantizer = ResidualVectorQuantizer(
