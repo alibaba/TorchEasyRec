@@ -36,8 +36,27 @@ _LOGIT_SCALE_MAX = float(np.log(100))
 # CLIP temperature init (reference CLIP: log(1 / 0.07)).
 _LOGIT_SCALE_INIT = float(np.log(1 / 0.07))
 
-# sid_loss reconstruction variants (``_recon_loss`` branches on these directly).
+# sid_loss reconstruction variants (``_sid_loss_impl`` branches on these).
 _RECON_LOSSES = frozenset(("recon_l2_loss", "recon_l1_loss", "recon_cosine_loss"))
+
+
+def _masked_mean(
+    per_sample: torch.Tensor, mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Mean of a per-row loss over the masked-in rows (all rows if ``mask`` None).
+
+    The mixed recon+CLIP path applies the reconstruction loss to recon rows only;
+    the masked mean divides by the valid-row count (``div_no_nan`` keeps an empty
+    mask at 0). No data-dependent branching → ``torch.compile``-friendly.
+
+    Args:
+        per_sample (Tensor): per-row loss, shape (B,).
+        mask (Tensor, optional): per-row bool; rows to include.
+    """
+    if mask is None:
+        return per_sample.mean()
+    mask = mask.float()
+    return div_no_nan((per_sample * mask).sum(), mask.sum())
 
 
 class BaseSidModel(BaseModel):
@@ -174,13 +193,14 @@ class BaseSidModel(BaseModel):
         """Compute one ``sid_loss`` term from ``predictions``."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
         if loss_type in _RECON_LOSSES:
-            loss = self._recon_loss(
-                predictions["x_hat"],
-                predictions["recon_target"],
-                loss_type,
-                predictions.get("recon_mask"),
-            )
-            return {loss_type: loss}
+            x_hat, x = predictions["x_hat"], predictions["recon_target"]
+            if loss_type == "recon_l2_loss":
+                per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
+            elif loss_type == "recon_l1_loss":
+                per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
+            else:  # "recon_cosine_loss"
+                per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
+            return {loss_type: _masked_mean(per_sample, predictions.get("recon_mask"))}
         elif loss_type == "commitment_loss":
             loss = self._loss_modules["commitment_loss"](
                 predictions["encoder_out"], predictions["latents"]
@@ -205,38 +225,6 @@ class BaseSidModel(BaseModel):
             return {"sid_clip_loss": out["loss"]}
         else:
             raise ValueError(f"unsupported sid_loss variant: {loss_type!r}")
-
-    def _recon_loss(
-        self,
-        x_hat: torch.Tensor,
-        x: torch.Tensor,
-        recon_loss: str,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Reconstruction loss for a ``sid_loss`` recon variant.
-
-        Returns the mean over all rows, or — when ``mask`` (a per-row bool) is
-        given — the mean over only the masked-in rows (the mixed recon+CLIP path
-        applies recon loss to recon rows only). No data-dependent branching, so
-        it stays ``torch.compile``-friendly.
-
-        Args:
-            x_hat (Tensor): reconstructed output, shape (B, D).
-            x (Tensor): original input, shape (B, D).
-            recon_loss (str): the recon variant, one of ``_RECON_LOSSES``
-                (``recon_l2_loss`` | ``recon_l1_loss`` | ``recon_cosine_loss``).
-            mask (Tensor, optional): per-row bool; rows to include.
-        """
-        if recon_loss == "recon_l2_loss":
-            per_sample = F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
-        elif recon_loss == "recon_l1_loss":
-            per_sample = F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
-        else:  # "recon_cosine_loss"
-            per_sample = 1 - F.cosine_similarity(x_hat, x, dim=-1)
-        if mask is None:
-            return per_sample.mean()
-        mask = mask.float()
-        return div_no_nan((per_sample * mask).sum(), mask.sum())
 
     def init_metric(self) -> None:
         """Initialize the eval metrics shared by all SID models.
