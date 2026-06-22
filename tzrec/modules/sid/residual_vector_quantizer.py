@@ -146,15 +146,13 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         if is_gumbel and rotation_trick:
             logger.warning("gumbel_softmax: rotation_trick has no effect; ignoring.")
 
-        distance_types = [distance_type] * n_layers
-
         self.layers = nn.ModuleList(
             [
                 VectorQuantizeLayer(
                     embed_dim=embed_dim,
                     n_embed=self.n_embed_list[i],
                     forward_mode=mode_enum,
-                    distance_type=distance_types[i],
+                    distance_type=distance_type,
                     use_sinkhorn=use_sinkhorn,
                     sinkhorn_iters=sinkhorn_iters,
                     sinkhorn_epsilon=sinkhorn_epsilon,

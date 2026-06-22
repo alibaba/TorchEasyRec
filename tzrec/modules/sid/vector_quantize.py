@@ -87,9 +87,10 @@ class VectorQuantizeLayer(QuantizeLayer):
 
     A gradient-trained ``nn.Embedding`` codebook (the VQ ``QuantizeLayer``),
     sibling of the K-Means backend's ``KMeansQuantizeLayer``. Maps inputs to a
-    codebook entry via :meth:`quantize`. Loss-free: the commitment loss lives in
-    :meth:`ResidualVectorQuantizer._single_commitment_loss`. Sinkhorn
-    optimal-transport assignment optionally balances codebook usage in training.
+    codebook entry via :meth:`quantize`. Loss-free: the commitment loss is
+    computed model-side by :class:`tzrec.loss.commitment_loss.CommitmentLoss`
+    over the quantizer's per-layer ``latents``. Sinkhorn optimal-transport
+    assignment optionally balances codebook usage in training.
 
     Args:
         embed_dim (int): dimension of each codebook embedding.

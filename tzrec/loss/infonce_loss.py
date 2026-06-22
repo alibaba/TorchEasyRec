@@ -85,7 +85,8 @@ class MaskedInfoNCELoss(_Loss):
         logits_a: torch.Tensor,
         logits_b: torch.Tensor,
         safe_labels: torch.Tensor,
-        pair_mask: torch.Tensor,
+        pair_mask_f: torch.Tensor,
+        n_valid: torch.Tensor,
     ) -> torch.Tensor:
         """Masked cross-entropy on column-masked logits, row-masked average.
 
@@ -93,7 +94,8 @@ class MaskedInfoNCELoss(_Loss):
             logits_a: (B, B_global) column-masked logits (view-a branch).
             logits_b: (B, B_global) column-masked logits (view-b branch).
             safe_labels: (B,) labels with non-pair rows fallback to a safe col.
-            pair_mask: (B,) bool, True = pair row.
+            pair_mask_f: (B,) float pair mask (1.0 = pair row).
+            n_valid: scalar pair-row count, clamped to >= 1.
         """
         ce_a = F.cross_entropy(logits_a, safe_labels, reduction="none")
         ce_b = F.cross_entropy(logits_b, safe_labels, reduction="none")
@@ -101,9 +103,7 @@ class MaskedInfoNCELoss(_Loss):
         ce_a = torch.nan_to_num(ce_a, nan=0.0)
         ce_b = torch.nan_to_num(ce_b, nan=0.0)
 
-        # Only pair rows contribute; clamp(min=1) keeps a no-pair batch at 0.
-        n_valid = pair_mask.float().sum().clamp(min=1)
-        return ((ce_a + ce_b) * pair_mask.float()).sum() / (2 * n_valid)
+        return ((ce_a + ce_b) * pair_mask_f).sum() / (2 * n_valid)
 
     def forward(
         self,
@@ -172,15 +172,17 @@ class MaskedInfoNCELoss(_Loss):
         fallback = pair_mask.long().argmax()  # first pair sample index
         safe_labels = torch.where(pair_mask, labels, fallback.expand_as(labels))
 
-        # --- Masked CE for three loss groups ---
+        # --- Masked CE for three loss groups (shared row mask + valid count) ---
+        pair_mask_f = pair_mask.float()
+        n_valid = pair_mask_f.sum().clamp(min=1)
         loss_self = self._masked_cross_entropy(
-            logits_a_self, logits_b_self, safe_labels, pair_mask
+            logits_a_self, logits_b_self, safe_labels, pair_mask_f, n_valid
         )
         loss_ori = self._masked_cross_entropy(
-            logits_a_ori, logits_b_ori, safe_labels, pair_mask
+            logits_a_ori, logits_b_ori, safe_labels, pair_mask_f, n_valid
         )
         loss_cl = self._masked_cross_entropy(
-            logits_a_cl, logits_b_cl, safe_labels, pair_mask
+            logits_a_cl, logits_b_cl, safe_labels, pair_mask_f, n_valid
         )
 
         loss = (loss_self + loss_ori + loss_cl) / 3

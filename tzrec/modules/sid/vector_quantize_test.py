@@ -20,8 +20,8 @@ from tzrec.modules.sid.vector_quantize import (
 )
 
 
-class SquaredEuclideanDistanceTest(unittest.TestCase):
-    """Tests the l2 path of ``VectorQuantizeLayer._compute_distances`` (cdist²)."""
+class VectorQuantizeTest(unittest.TestCase):
+    """Tests for a single VectorQuantizeLayer layer."""
 
     def test_l2_compute_distances(self) -> None:
         layer = VectorQuantizeLayer(embed_dim=2, n_embed=2, distance_type="l2")
@@ -32,10 +32,6 @@ class SquaredEuclideanDistanceTest(unittest.TestCase):
         self.assertEqual(d.shape, (2, 2))
         # row0: dist² to (0,0)=0, to (0,1)=1; row1: to (0,0)=1, to (0,1)=2
         torch.testing.assert_close(d, torch.tensor([[0.0, 1.0], [1.0, 2.0]]))
-
-
-class VectorQuantizeTest(unittest.TestCase):
-    """Tests for a single VectorQuantizeLayer layer."""
 
     @parameterized.expand(
         [
