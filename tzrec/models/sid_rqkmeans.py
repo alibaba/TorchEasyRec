@@ -139,11 +139,13 @@ class SidRqkmeans(BaseSidModel):
             "codes": codes,
         }
 
-        # Expose the centroid-sum reconstruction (``x_hat``) for update_metric
-        # only once fitted — pre-fit it is all-zeros, so omitting it skips the
-        # eval metrics. (Meaningful only with normalize_residuals=False.)
+        # Expose the centroid-sum reconstruction (``x_hat``) + its target for
+        # update_metric only once fitted — pre-fit x_hat is all-zeros, so
+        # omitting it skips the eval metrics. (Meaningful only with
+        # normalize_residuals=False.)
         if self.is_eval and self._quantizer.is_fitted:
             predictions["x_hat"] = quantized
+            predictions["recon_target"] = embedding
 
         return predictions
 

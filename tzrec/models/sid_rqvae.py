@@ -19,7 +19,7 @@ losses consume. The encoder/decoder and residual vector quantizer live directly
 on the model — there is no intermediate ``RQVAE`` module wrapper.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -30,6 +30,7 @@ from tzrec.models.sid_model import BaseSidModel
 from tzrec.modules.sid.residual_vector_quantizer import (
     ResidualVectorQuantizer,
 )
+from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.logging_util import logger
@@ -95,9 +96,18 @@ class SidRqvae(BaseSidModel):
                 "losses (the objective) must be set together; got "
                 f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
             )
-        # The paired group shares the main encoder, so it must match input_dim;
-        # fail fast here instead of an opaque matmul error on the first forward.
+        # Validate the CLIP groups up front (parity with the base feature_group
+        # has_group guard): a typo/missing group otherwise only KeyErrors on the
+        # first forward, after the whole TorchRec setup.
         if self._use_clip:
+            for grp in (self._clip_feature_group, self._clip_pair_feature_group):
+                if not self.embedding_group.has_group(grp):
+                    raise ValueError(
+                        f"clip group {grp!r} is not in model_config.feature_groups "
+                        f"{self.embedding_group.group_names()}"
+                    )
+            # The paired group shares the main encoder, so it must match
+            # input_dim; fail fast instead of an opaque matmul error.
             clip_dim = self.embedding_group.group_total_dim(self._clip_feature_group)
             if clip_dim != self._input_dim:
                 raise ValueError(
@@ -105,6 +115,16 @@ class SidRqvae(BaseSidModel):
                     f"dim {clip_dim}, but it is encoded by the same encoder as "
                     f"the main feature_group (dim {self._input_dim}); the two "
                     "must match"
+                )
+            # The pair flag is read as a single raw column (>0.5); a transformed
+            # or multi-dim group would silently mis-route rows.
+            pair_dim = self.embedding_group.group_total_dim(
+                self._clip_pair_feature_group
+            )
+            if pair_dim != 1:
+                raise ValueError(
+                    f"clip_pair_feature_group {self._clip_pair_feature_group!r} "
+                    f"must be a single dim-1 raw flag, got total dim {pair_dim}"
                 )
 
         embed_dim = cfg.embed_dim
@@ -184,13 +204,25 @@ class SidRqvae(BaseSidModel):
             return self._predict_mixed(grouped)
         return self._predict_rqvae(embedding)
 
-    def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Standard RQ-VAE: encode -> quantize -> decode."""
-        z_e = self._encode(embedding)
+    def _rqvae_pass(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, ResidualQuantizerOutput, torch.Tensor]:
+        """One RQ-VAE pass over ``x``: encode -> quantize -> decode.
+
+        Returns the encoder output ``z_e`` (commitment operand), the quantizer
+        output ``quant`` (cluster_ids / latents / quantized_embeddings) and the
+        decoded reconstruction ``x_hat``.
+        """
+        z_e = self._encode(x)
         quant = self._quantizer(z_e)
+        return z_e, quant, self._decode(quant.quantized_embeddings)
+
+    def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Standard RQ-VAE: a single reconstruction pass."""
+        z_e, quant, x_hat = self._rqvae_pass(embedding)
         return {
             "codes": quant.cluster_ids,
-            "x_hat": self._decode(quant.quantized_embeddings),
+            "x_hat": x_hat,
             "recon_target": embedding,
             "encoder_out": z_e,
             "latents": quant.latents,
@@ -213,13 +245,8 @@ class SidRqvae(BaseSidModel):
         is_clip_pair_raw = grouped[self._clip_pair_feature_group]
         clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
 
-        z_e1 = self._encode(embedding)
-        quant1 = self._quantizer(z_e1)
-        x_hat1 = self._decode(quant1.quantized_embeddings)
-
-        z_e2 = self._encode(fea2)
-        quant2 = self._quantizer(z_e2)
-        x_hat2 = self._decode(quant2.quantized_embeddings)
+        z_e1, quant1, x_hat1 = self._rqvae_pass(embedding)
+        z_e2, quant2, x_hat2 = self._rqvae_pass(fea2)
 
         return {
             "codes": quant1.cluster_ids,

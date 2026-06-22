@@ -133,9 +133,16 @@ class BaseSidModel(BaseModel):
             )
         self._n_layers = len(self._n_embed_list)
 
-        # Derive the encoder input dim from the main group's total dim (it may
-        # concatenate several content + side-info features).
+        # Built in the base __init__ (not the subclass like Rank/Match models)
+        # so _input_dim is ready before the subclass builds its encoder; derived
+        # from the main group's total dim (which may concatenate several
+        # content + side-info features).
         self.init_input()
+        if not self.embedding_group.has_group(self._feature_group):
+            raise ValueError(
+                f"feature_group {self._feature_group!r} is not in "
+                f"model_config.feature_groups {self.embedding_group.group_names()}"
+            )
         self._input_dim = self.embedding_group.group_total_dim(self._feature_group)
         if self._input_dim < 1:
             raise ValueError(
@@ -270,13 +277,17 @@ class BaseSidModel(BaseModel):
         batch: Batch,
         losses: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
-        """Update eval metrics from the reconstruction + the re-extracted input.
+        """Update eval metrics from the reconstruction vs. the input embedding.
 
         ``predictions["x_hat"]`` is the model's reconstruction of the input
         embedding (the centroid sum for RQ-KMeans, the decoder output for
-        RQ-VAE). Subclasses expose it only when it is meaningful, so a
-        not-yet-fitted model omits it and this logs nothing. The target
-        embedding is re-extracted from ``batch`` (it is an input, not an output).
+        RQ-VAE); ``predictions["recon_target"]`` is the input it reconstructs.
+        Subclasses expose both only when meaningful, so a not-yet-fitted model
+        omits them and this logs nothing. (Reading the target from
+        ``predictions`` avoids a second ``build_input`` pass over ``batch``.)
+        For the mixed CLIP path the reconstruction is scored only on the
+        non-pair rows (``recon_mask``), matching the masked training recon loss
+        so the eval mse/rel_loss stay comparable to the optimized objective.
 
         Args:
             predictions (dict): a dict of predicted result.
@@ -286,7 +297,13 @@ class BaseSidModel(BaseModel):
         if "x_hat" not in predictions:
             return
         recon = predictions["x_hat"]
-        embedding = self.build_input(batch)[self._feature_group]
+        embedding = predictions["recon_target"]
+        # Restrict reconstruction scoring to the rows the recon loss optimizes
+        # (the mixed CLIP path masks out pair rows); no mask = score all rows.
+        recon_mask = predictions.get("recon_mask")
+        if recon_mask is not None:
+            recon = recon[recon_mask]
+            embedding = embedding[recon_mask]
         self._metric_modules["mse"].update(recon, embedding)
         self._metric_modules["rel_loss"].update(recon, embedding)
         self._metric_modules["unique_sid_ratio"].update(predictions["codes"])
@@ -298,7 +315,8 @@ class BaseSidModel(BaseModel):
     ) -> None:
         """Update train-path metric state.
 
-        Default is a no-op: K-Means has no train-time codes, so only models
-        with a meaningful train signal (RQ-VAE) override this.
+        Default no-op: the current SID models report metrics at eval (after the
+        codebook is fit / the decoder is trained), not during training. A
+        subclass with a meaningful train-time signal may override this.
         """
         return

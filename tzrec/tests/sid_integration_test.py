@@ -52,8 +52,9 @@ class SidIntegrationTest(unittest.TestCase):
     ) -> str:
         """Write an embedding parquet + a SID config pointed at it.
 
-        Single dense ``embedding`` column, no labels — SID reads the item
-        embedding straight from the batch. Returns the saved config path.
+        Single dense ``embedding`` column, no labels — the config's FG maps it
+        to the ``item_emb`` feature, which its ``deep`` feature_group feeds to
+        the model's EmbeddingGroup. Returns the saved config path.
         """
         data_dir = os.path.join(self.test_dir, "sid_data")
         os.makedirs(data_dir, exist_ok=True)

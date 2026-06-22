@@ -23,15 +23,17 @@ from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 
 
-def _features_and_groups(input_dim: int, use_clip: bool = False, clip_dim: int = None):
+def _features_and_groups(
+    input_dim: int, use_clip: bool = False, clip_dim: int = None, pair_dim: int = 1
+):
     """Real raw features + feature groups for a SID model.
 
     Mirrors how every other model test wires inputs: ``create_features`` builds
     the ``BaseFeature`` objects and ``feature_groups`` (consumed by the model's
     :class:`EmbeddingGroup`) name the main ``deep`` group — plus, for CLIP, the
     paired image group and the per-row pair-flag group. ``clip_dim`` (default:
-    match ``input_dim``) sizes the paired group, so a test can deliberately
-    mismatch it.
+    match ``input_dim``) sizes the paired group and ``pair_dim`` (default 1)
+    sizes the pair-flag group, so a test can deliberately mismatch either.
     """
 
     def _raw(name: str, dim: int) -> feature_pb2.FeatureConfig:
@@ -51,7 +53,7 @@ def _features_and_groups(input_dim: int, use_clip: bool = False, clip_dim: int =
     if use_clip:
         feature_cfgs += [
             _raw("image_emb", clip_dim if clip_dim is not None else input_dim),
-            _raw("is_clip_pair", 1),
+            _raw("is_clip_pair", pair_dim),
         ]
         groups += [_deep("clip_image", "image_emb"), _deep("clip_pair", "is_clip_pair")]
     return create_features(feature_cfgs), groups
@@ -302,6 +304,52 @@ class SidRqvaeTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "must match"):
             SidRqvae(model_config=model_config, features=features, labels=[])
+
+    def test_clip_pair_group_must_be_dim_1(self) -> None:
+        """A pair-flag group with dim != 1 fails fast (would mis-route rows)."""
+        features, feature_groups = _features_and_groups(32, use_clip=True, pair_dim=3)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.clip_config.clip_feature_group = "clip_image"
+        cfg.clip_config.clip_pair_feature_group = "clip_pair"
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_clip_cfg()]
+        )
+        with self.assertRaisesRegex(ValueError, "dim-1 raw flag"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
+
+    def test_clip_group_missing_raises(self) -> None:
+        """A typo'd clip group name fails fast at init, not a forward KeyError."""
+        features, feature_groups = _features_and_groups(32, use_clip=True)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.clip_config.clip_feature_group = "clip_image"
+        cfg.clip_config.clip_pair_feature_group = "clip_pairTYPO"
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_clip_cfg()]
+        )
+        with self.assertRaisesRegex(ValueError, "not in model_config.feature_groups"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
+
+    def test_eval_metric_masks_clip_pair_rows(self) -> None:
+        """CLIP eval mse/rel_loss score only the non-pair (recon) rows.
+
+        Training masks the recon loss to non-pair rows; update_metric must apply
+        the same ``recon_mask`` so the eval metric stays comparable (pair rows,
+        which the decoder is not trained to reconstruct, must not dilute it).
+        """
+        B, input_dim = 8, 32
+        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model.eval()
+        model.init_metric()
+
+        # All-pair batch: recon_mask selects zero rows, so mse observes none.
+        all_pair = self._clip_batch(B, input_dim, torch.ones(B, 1))
+        model.update_metric(model.predict(all_pair), all_pair)
+        self.assertEqual(model._metric_modules["mse"].total.item(), 0.0)
+
+        # A recon (non-pair) batch then contributes rows.
+        all_recon = self._clip_batch(B, input_dim, torch.zeros(B, 1))
+        model.update_metric(model.predict(all_recon), all_recon)
+        self.assertGreater(model._metric_modules["mse"].total.item(), 0.0)
 
     def test_clip_mask_uses_flag_not_equality(self) -> None:
         """The is_clip_pair flag, not bit-exact equality, drives routing.

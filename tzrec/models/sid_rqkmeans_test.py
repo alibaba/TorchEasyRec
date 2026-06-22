@@ -141,6 +141,15 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "codebook entry must be >= 1"):
             self._create_model(codebook=[16, 0])
 
+    def test_init_raises_on_zero_dim_feature_group(self) -> None:
+        """A feature group with total dim 0 fails fast (derived input_dim < 1).
+
+        input_dim is no longer a config knob — it is derived from the group, so
+        the guard now fires via a 0-dim group rather than an explicit input_dim=0.
+        """
+        with self.assertRaisesRegex(ValueError, "must be >= 1"):
+            self._create_model(input_dim=0)
+
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""
         B, input_dim = 8, 32
@@ -255,7 +264,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertTrue((codes >= 0).all() and (codes < 16).all())
 
     def test_eval_and_inference_predict_contract(self) -> None:
-        """Eval (post-fit) exposes codes + x_hat; inference is codes-only."""
+        """Eval (post-fit) exposes codes + x_hat + recon_target; infer codes-only."""
         try:
             import faiss  # noqa: F401
         except ImportError:
@@ -268,12 +277,12 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             model.predict(_make_batch(B, input_dim))
         model.on_train_end()
 
-        # Eval mode (fitted): the reconstruction is exposed as ``x_hat`` for
-        # update_metric; the input embedding is re-extracted from the batch
-        # there, not threaded through predictions.
+        # Eval mode (fitted): the reconstruction (``x_hat``) and its target
+        # (``recon_target``) are both exposed for update_metric, so it scores
+        # without a second build_input pass over the batch.
         model.eval()
         eval_preds = model.predict(_make_batch(B, input_dim))
-        self.assertEqual(set(eval_preds.keys()), {"codes", "x_hat"})
+        self.assertEqual(set(eval_preds.keys()), {"codes", "x_hat", "recon_target"})
 
         # Inference (serving) mode: codes-only contract.
         model.set_is_inference(True)
