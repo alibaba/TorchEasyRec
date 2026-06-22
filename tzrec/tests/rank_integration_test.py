@@ -528,11 +528,16 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
+        # Random-label mock trains to logit~=0, where TRT's per-process reduction
+        # nondeterminism is kappa-amplified into a flaky ~1e-3 prob diff. A confident
+        # model (label encoded into raw_1 + a few epochs) removes the amplification.
         self.success = utils.test_train_eval(
             pipeline_config_path,
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
+            learnable_label="raw_1",
+            num_epochs=3,
         )
         if self.success:
             self.success = utils.test_eval(
