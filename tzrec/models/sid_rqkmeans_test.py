@@ -17,10 +17,35 @@ import torch.distributed as dist
 from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.features.feature import create_features
 from tzrec.models.sid_rqkmeans import SidRqkmeans
-from tzrec.protos import model_pb2
+from tzrec.protos import feature_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
+
+
+def _features_and_groups(input_dim: int):
+    """Real ``item_emb`` raw feature + the ``deep`` group it feeds.
+
+    SID models consume the framework's EmbeddingGroup (built from these), and
+    derive the K-Means dimension from the ``deep`` group's total dim — so real
+    features + feature_groups are required, as in every other model test.
+    """
+    feature_cfgs = [
+        feature_pb2.FeatureConfig(
+            raw_feature=feature_pb2.RawFeature(
+                feature_name="item_emb", value_dim=input_dim
+            )
+        )
+    ]
+    groups = [
+        model_pb2.FeatureGroupConfig(
+            group_name="deep",
+            feature_names=["item_emb"],
+            group_type=model_pb2.FeatureGroupType.DEEP,
+        )
+    ]
+    return create_features(feature_cfgs), groups
 
 
 def _batch_from_rows(rows: torch.Tensor) -> Batch:
@@ -58,26 +83,23 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         normalize_residuals=False,
         train_sample_size=0,
     ):
-        """Build a SidRqkmeans on CPU with params initialized.
-
-        SID models read the item-embedding dense feature directly from the
-        batch and do not consume feature_groups, so none is set.
-        """
+        """Build a SidRqkmeans on CPU with params initialized."""
         n_embed_list = codebook if codebook is not None else [16] * n_layers
         faiss_kwargs = sid_model_pb2.FaissKmeansConfig(
             niter=niter, verbose=False, seed=1234
         )
         cfg = sid_model_pb2.SidRqkmeans(
-            input_dim=input_dim,
             codebook=n_embed_list,
             normalize_residuals=normalize_residuals,
             faiss_kmeans_kwargs=faiss_kwargs,
-            embedding_feature_name="item_emb",
             train_sample_size=train_sample_size,
         )
+        features, feature_groups = _features_and_groups(input_dim)
         model = SidRqkmeans(
-            model_config=model_pb2.ModelConfig(sid_rqkmeans=cfg),
-            features=[],
+            model_config=model_pb2.ModelConfig(
+                feature_groups=feature_groups, sid_rqkmeans=cfg
+            ),
+            features=features,
             labels=[],
         )
         init_parameters(model, device=torch.device("cpu"))
@@ -118,11 +140,6 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         """A zero codebook entry fails fast at construction."""
         with self.assertRaisesRegex(ValueError, "codebook entry must be >= 1"):
             self._create_model(codebook=[16, 0])
-
-    def test_init_raises_on_zero_input_dim(self) -> None:
-        """input_dim < 1 fails fast at construction."""
-        with self.assertRaisesRegex(ValueError, "input_dim must be >= 1"):
-            self._create_model(input_dim=0)
 
     def test_predict_collects_buffer(self) -> None:
         """In train mode, predict reservoir-samples; never fits."""

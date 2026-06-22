@@ -26,20 +26,22 @@ message SinkhornConfig {
     optional bool enabled = 3 [default = true];
 }
 
-// CLIP-style dual-encoder wiring for SidRqvae: which paired feature to encode
-// and which column flags the contrastive-pair rows. This is model structure /
-// input contract (declared on the model), not loss config.
+// CLIP-style dual-encoder wiring for SidRqvae: which paired feature group to
+// encode and which group flags the contrastive-pair rows. This is model
+// structure / input contract (declared on the model), not loss config.
 message ClipConfig {
-    // Name of the second (paired) embedding feature inside the input Batch.
-    required string clip_feature_name = 1;
-    // Name of the per-row float feature flagging pair rows (>0.5 = pair).
-    required string is_clip_pair_feature_name = 2;
+    // Name of the second (paired) embedding FEATURE GROUP (built by the same
+    // EmbeddingGroup as the main input; same total dim as `feature_group`).
+    required string clip_feature_group = 1;
+    // Name of the per-row pair-flag FEATURE GROUP (a single raw feature,
+    // dim 1; >0.5 = contrastive pair).
+    required string clip_pair_feature_group = 2;
 }
 
 message SidRqvae {
     // === Network structure ===
-    // Input embedding dimension.
-    optional uint32 input_dim = 1 [default = 512];
+    // (input_dim is not configured here — it is derived from the total
+    //  dimension of the `feature_group` built by the model's EmbeddingGroup.)
     // Quantization latent dimension (encoder output / codebook dim).
     optional uint32 embed_dim = 2 [default = 64];
     // Encoder hidden layer sizes, e.g. [256, 128].
@@ -78,23 +80,26 @@ message SidRqvae {
     // to override params; set ``enabled: false`` inside it to disable.
     optional SinkhornConfig sinkhorn_config = 15;
     // CLIP-style dual-encoder structure: when set, the model encodes a second
-    // (paired) feature and runs the contrastive path. This declares the model's
-    // input contract + topology; the contrastive OBJECTIVE is enabled separately
-    // by a `sid_clip_loss` entry in ModelConfig.losses (both must be set together).
+    // (paired) feature group and runs the contrastive path. This declares the
+    // model's input contract + topology; the contrastive OBJECTIVE is enabled
+    // separately by a `sid_clip_loss` entry in ModelConfig.losses (both must be
+    // set together).
     optional ClipConfig clip_config = 16;
 
     // Reconstruction, commitment and (optional) contrastive losses are configured
     // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the CLIP
     // feature wiring above lives on this message.
 
-    // Name of the item embedding feature inside the input Batch.
-    optional string embedding_feature_name = 40 [default = "item_emb"];
+    // Name of the main input FEATURE GROUP (built by the model's EmbeddingGroup
+    // from ModelConfig.feature_groups). May hold one or many content/side-info
+    // features; their concatenated dim is the encoder input_dim.
+    optional string feature_group = 40 [default = "deep"];
 }
 
 message SidRqkmeans {
-    // Input embedding dimension (K-Means runs directly on raw embeddings,
-    // no encoder).
-    optional uint32 input_dim = 1 [default = 512];
+    // (input_dim is not configured here — K-Means runs directly on the raw
+    //  embeddings of the `feature_group` built by the model's EmbeddingGroup,
+    //  whose total dim is the K-Means dimension.)
     // Per-layer cluster counts, e.g. [256, 256, 256].
     // List length is the number of residual quantization layers. Entries
     // may differ per layer (non-uniform codebooks such as [256, 512, 1024]
@@ -113,6 +118,8 @@ message SidRqkmeans {
     // are wasted.
     optional uint32 train_sample_size = 6 [default = 0];
 
-    // Name of the item embedding feature inside the input Batch.
-    optional string embedding_feature_name = 40 [default = "item_emb"];
+    // Name of the main input FEATURE GROUP (built by the model's EmbeddingGroup
+    // from ModelConfig.feature_groups). May hold one or many content/side-info
+    // features; their concatenated dim is the K-Means dimension.
+    optional string feature_group = 40 [default = "deep"];
 }

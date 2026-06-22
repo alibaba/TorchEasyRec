@@ -19,13 +19,14 @@ import torch.nn.functional as F
 import torchmetrics
 from torch import nn
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.commitment_loss import CommitmentLoss
 from tzrec.loss.infonce_loss import MaskedInfoNCELoss
 from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
+from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
@@ -82,11 +83,14 @@ class BaseSidModel(BaseModel):
     Factors the structure common to :class:`SidRqvae` (RQ-VAE) and
     :class:`SidRqkmeans` (residual K-Means):
 
-    - the shared config fields every SID proto carries —
-      ``embedding_feature_name`` (``_embedding_feature_name``), ``input_dim``
-      (``_input_dim``), ``normalize_residuals`` (``_normalize_residuals``),
+    - the shared config fields every SID proto carries — ``feature_group``
+      (``_feature_group``), ``normalize_residuals`` (``_normalize_residuals``),
       and the per-layer ``codebook`` (``_n_embed_list`` / ``_n_layers``),
-    - reading the item-embedding feature out of ``Batch.dense_features``,
+    - building the main input through the framework's :class:`EmbeddingGroup`
+      (:meth:`init_input` / :meth:`build_input`), so a SID model consumes the
+      same grouped/concatenated feature tensor as every other model and
+      ``_input_dim`` is *derived* from the group's total dimension (supporting
+      multiple content embeddings + side-info in one group),
     - the eval metrics every SID model reports — reconstruction ``mse`` and
       ``unique_sid_ratio`` (mean per-batch unique-SID ratio, a diversity
       proxy).
@@ -116,39 +120,41 @@ class BaseSidModel(BaseModel):
 
         cfg = self._model_config
         # Config fields shared by every SID model (present on each SID proto
-        # message): the item-embedding feature, the input dimension, the
-        # residual-normalization toggle, and the per-layer codebook.
-        self._embedding_feature_name = cfg.embedding_feature_name
-        self._input_dim = cfg.input_dim
+        # message): the main input feature group, the residual-normalization
+        # toggle, and the per-layer codebook.
+        self._feature_group = cfg.feature_group
         self._normalize_residuals = cfg.normalize_residuals
 
         if not cfg.codebook:
             raise ValueError("codebook must be set, e.g. [256, 256, 256]")
         self._n_embed_list = list(cfg.codebook)
-        # Fail fast: a zero codebook entry / input_dim==0 only errors opaquely
-        # deep inside faiss, after the whole training pass.
+        # Fail fast: a zero codebook entry only errors opaquely deep inside
+        # faiss, after the whole training pass.
         if any(k < 1 for k in self._n_embed_list):
             raise ValueError(
                 f"every codebook entry must be >= 1, got {self._n_embed_list}"
             )
-        if self._input_dim < 1:
-            raise ValueError(f"input_dim must be >= 1, got {self._input_dim}")
         self._n_layers = len(self._n_embed_list)
 
-    def _extract_feature(
-        self, batch: Batch, feature_name: Optional[str] = None
-    ) -> torch.Tensor:
-        """Extract a named dense feature from ``Batch.dense_features``.
+        # Build the framework's EmbeddingGroup (same path every model uses) and
+        # derive the encoder input dim from the main group's total dimension —
+        # the group may hold one content embedding or several content + side-info
+        # features, all concatenated into ``_input_dim``.
+        self.init_input()
+        self._input_dim = self.embedding_group.group_total_dim(self._feature_group)
+        if self._input_dim < 1:
+            raise ValueError(
+                f"feature group {self._feature_group!r} has total dim "
+                f"{self._input_dim}; it must be >= 1"
+            )
 
-        Args:
-            batch (Batch): input batch data.
-            feature_name (str, optional): feature name to extract.
-                Defaults to ``self._embedding_feature_name``.
-        """
-        if feature_name is None:
-            feature_name = self._embedding_feature_name
-        kt = batch.dense_features[BASE_DATA_GROUP]
-        return kt[feature_name]
+    def init_input(self) -> None:
+        """Build the :class:`EmbeddingGroup` from features + feature groups."""
+        self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
+
+    def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Build grouped input features: ``{group_name: (B, group_total_dim)}``."""
+        return self.embedding_group(batch)
 
     def init_loss(self) -> None:
         """Initialize SID loss modules from ``ModelConfig.losses``.
@@ -285,7 +291,7 @@ class BaseSidModel(BaseModel):
         if "x_hat" not in predictions:
             return
         recon = predictions["x_hat"]
-        embedding = self._extract_feature(batch)
+        embedding = self.build_input(batch)[self._feature_group]
         self._metric_modules["mse"].update(recon, embedding)
         self._metric_modules["rel_loss"].update(recon, embedding)
         self._metric_modules["unique_sid_ratio"].update(predictions["codes"])

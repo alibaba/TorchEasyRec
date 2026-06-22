@@ -121,7 +121,7 @@ class SidRqkmeans(BaseSidModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        embedding = self._extract_feature(batch)
+        embedding = self.build_input(batch)[self._feature_group]
 
         # Training: reservoir-sample only; codes are dummy until the fit.
         if self.is_train:

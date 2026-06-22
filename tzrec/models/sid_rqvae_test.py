@@ -16,26 +16,47 @@ from parameterized import parameterized
 from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.features.feature import create_features
 from tzrec.models.sid_rqvae import SidRqvae
-from tzrec.protos import loss_pb2, model_pb2
+from tzrec.protos import feature_pb2, loss_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 
 
-def _make_batch(
-    batch_size: int,
-    input_dim: int,
-    feature_name: str = "item_emb",
-    extra_features: dict = None,
-) -> Batch:
-    """Create a minimal Batch with dense embedding features."""
-    keys = [feature_name]
-    tensors = [torch.randn(batch_size, input_dim)]
-    if extra_features:
-        for k, v in extra_features.items():
-            keys.append(k)
-            tensors.append(v)
-    dense_feature = KeyedTensor.from_tensor_list(keys=keys, tensors=tensors)
+def _features_and_groups(input_dim: int, use_clip: bool = False):
+    """Real raw features + feature groups for a SID model.
+
+    Mirrors how every other model test wires inputs: ``create_features`` builds
+    the ``BaseFeature`` objects and ``feature_groups`` (consumed by the model's
+    :class:`EmbeddingGroup`) name the main ``deep`` group — plus, for CLIP, the
+    paired image group and the per-row pair-flag group.
+    """
+
+    def _raw(name: str, dim: int) -> feature_pb2.FeatureConfig:
+        return feature_pb2.FeatureConfig(
+            raw_feature=feature_pb2.RawFeature(feature_name=name, value_dim=dim)
+        )
+
+    def _deep(group_name: str, feature_name: str) -> model_pb2.FeatureGroupConfig:
+        return model_pb2.FeatureGroupConfig(
+            group_name=group_name,
+            feature_names=[feature_name],
+            group_type=model_pb2.FeatureGroupType.DEEP,
+        )
+
+    feature_cfgs = [_raw("item_emb", input_dim)]
+    groups = [_deep("deep", "item_emb")]
+    if use_clip:
+        feature_cfgs += [_raw("image_emb", input_dim), _raw("is_clip_pair", 1)]
+        groups += [_deep("clip_image", "image_emb"), _deep("clip_pair", "is_clip_pair")]
+    return create_features(feature_cfgs), groups
+
+
+def _make_batch(batch_size: int, input_dim: int) -> Batch:
+    """Create a minimal Batch with the ``item_emb`` dense feature."""
+    dense_feature = KeyedTensor.from_tensor_list(
+        keys=["item_emb"], tensors=[torch.randn(batch_size, input_dim)]
+    )
     return Batch(
         dense_features={BASE_DATA_GROUP: dense_feature},
         sparse_features={},
@@ -81,25 +102,26 @@ class SidRqvaeTest(unittest.TestCase):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
         sid_rqvae_cfg = sid_model_pb2.SidRqvae(
-            input_dim=input_dim,
             embed_dim=embed_dim,
             codebook=n_embed_list,
             forward_mode="ste",
             kmeans_init=False,
-            embedding_feature_name="item_emb",
         )
         losses = [_recon_loss_cfg(recon), _commitment_cfg()]
         if use_clip:
-            # structure on the model proto; objective marker in losses.
-            sid_rqvae_cfg.clip_config.clip_feature_name = "image_emb"
-            sid_rqvae_cfg.clip_config.is_clip_pair_feature_name = "is_clip_pair"
+            # structure on the model proto (paired + pair-flag groups);
+            # objective marker in losses.
+            sid_rqvae_cfg.clip_config.clip_feature_group = "clip_image"
+            sid_rqvae_cfg.clip_config.clip_pair_feature_group = "clip_pair"
             losses.append(_clip_cfg())
 
-        # SID models read the item-embedding dense feature directly from the
-        # batch; they do not consume feature_groups, so none is set (which
-        # keeps the config consistent with the empty ``features`` list).
-        model_config = model_pb2.ModelConfig(sid_rqvae=sid_rqvae_cfg, losses=losses)
-        model = SidRqvae(model_config=model_config, features=[], labels=[])
+        # SID models consume the framework's EmbeddingGroup: input_dim is derived
+        # from the ``deep`` group, so real features + feature_groups are required.
+        features, feature_groups = _features_and_groups(input_dim, use_clip)
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=sid_rqvae_cfg, losses=losses
+        )
+        model = SidRqvae(model_config=model_config, features=features, labels=[])
         init_parameters(model, device=torch.device("cpu"))
         return model
 
@@ -248,14 +270,17 @@ class SidRqvaeTest(unittest.TestCase):
 
     def test_commitment_latent_weight_wrong_length_raises(self) -> None:
         """A commitment_loss with a bad latent_weight length fails in init_loss."""
+        features, feature_groups = _features_and_groups(32)
         for bad in ([1.0], [1.0, 0.5, 0.25]):
             cfg = sid_model_pb2.SidRqvae(
-                input_dim=32, embed_dim=8, codebook=[16, 16], kmeans_init=False
+                embed_dim=8, codebook=[16, 16], kmeans_init=False
             )
             model_config = model_pb2.ModelConfig(
-                sid_rqvae=cfg, losses=[_commitment_cfg(latent_weight=bad)]
+                feature_groups=feature_groups,
+                sid_rqvae=cfg,
+                losses=[_commitment_cfg(latent_weight=bad)],
             )
-            model = SidRqvae(model_config=model_config, features=[], labels=[])
+            model = SidRqvae(model_config=model_config, features=features, labels=[])
             with self.assertRaisesRegex(ValueError, "latent_weight"):
                 model.init_loss()
 
@@ -296,17 +321,20 @@ class SidRqvaeTest(unittest.TestCase):
     def test_sinkhorn_config(self, _name, enabled, expect_use_sinkhorn) -> None:
         """``sinkhorn_config.enabled`` (or its omission) drives layer.use_sinkhorn."""
         cfg = sid_model_pb2.SidRqvae(
-            input_dim=32,
             embed_dim=8,
             codebook=[16, 16],
             forward_mode="ste",
             kmeans_init=False,
-            embedding_feature_name="item_emb",
         )
         if enabled is not None:
             cfg.sinkhorn_config.CopyFrom(sid_model_pb2.SinkhornConfig(enabled=enabled))
+        features, feature_groups = _features_and_groups(32)
         model = SidRqvae(
-            model_config=model_pb2.ModelConfig(sid_rqvae=cfg), features=[], labels=[]
+            model_config=model_pb2.ModelConfig(
+                feature_groups=feature_groups, sid_rqvae=cfg
+            ),
+            features=features,
+            labels=[],
         )
         init_parameters(model, device=torch.device("cpu"))
         for layer in model._quantizer.layers:

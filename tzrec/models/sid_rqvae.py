@@ -76,16 +76,16 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
 
-        # The CLIP-style dual-encoder structure (which paired feature to encode,
-        # the dual path) is declared on the MODEL proto (`clip_config`); the
-        # contrastive OBJECTIVE is enabled by a `sid_clip_loss` entry in
+        # The CLIP-style dual-encoder structure (which paired feature group to
+        # encode, the dual path) is declared on the MODEL proto (`clip_config`);
+        # the contrastive OBJECTIVE is enabled by a `sid_clip_loss` entry in
         # ModelConfig.losses. The two must be set together.
         self._use_clip = cfg.HasField("clip_config")
-        self._clip_feature_name = (
-            cfg.clip_config.clip_feature_name if self._use_clip else None
+        self._clip_feature_group = (
+            cfg.clip_config.clip_feature_group if self._use_clip else None
         )
-        self._is_clip_pair_feature_name = (
-            cfg.clip_config.is_clip_pair_feature_name if self._use_clip else None
+        self._clip_pair_feature_group = (
+            cfg.clip_config.clip_pair_feature_group if self._use_clip else None
         )
         has_clip_obj = any(
             lc.WhichOneof("sid_loss") == "sid_clip_loss"
@@ -165,13 +165,14 @@ class SidRqvae(BaseSidModel):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        embedding = self._extract_feature(batch)
+        grouped = self.build_input(batch)
+        embedding = grouped[self._feature_group]
         if self._is_inference:
             # Codes-only path: get_codes does just the residual walk (no decode,
             # no commitment latents), so neither dual-path branch is needed.
             return {"codes": self._quantizer.get_codes(self._encode(embedding))}
         if self._use_clip:
-            return self._predict_mixed(embedding, batch)
+            return self._predict_mixed(grouped)
         return self._predict_rqvae(embedding)
 
     def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -187,16 +188,20 @@ class SidRqvae(BaseSidModel):
         }
 
     def _predict_mixed(
-        self, embedding: torch.Tensor, batch: Batch
+        self, grouped: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Mixed recon + CLIP: dual path over the embedding + its paired feature.
+        """Mixed recon + CLIP: dual path over the main + paired feature groups.
 
         ``encoder_out`` / ``latents`` stack both paths so the commitment loss
         averages over them; ``recon_mask`` (= non-CLIP rows) restricts the recon
         loss to reconstruction-only rows.
+
+        Args:
+            grouped (dict): the EmbeddingGroup output (group name -> tensor).
         """
-        fea2 = self._extract_feature(batch, self._clip_feature_name)
-        is_clip_pair_raw = self._extract_feature(batch, self._is_clip_pair_feature_name)
+        embedding = grouped[self._feature_group]
+        fea2 = grouped[self._clip_feature_group]
+        is_clip_pair_raw = grouped[self._clip_pair_feature_group]
         clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
 
         z_e1 = self._encode(embedding)
