@@ -673,6 +673,32 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             embeddings.cpu(), torch.tensor([[1.0, 2.0], [5.0, 6.0]])
         )
 
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    def test_lookup_dynamic_embeddings_flushes_module_once_per_dump(self):
+        torch.cuda.set_device(0)
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        # One module hosting two tables, reachable under both table_name keys.
+        dynamic_module = SimpleNamespace(
+            table_names=["dyn_a", "dyn_b"],
+            tables=_FakeDynamicTables(),
+            flush=mock.MagicMock(),
+            _dynamicemb_options=[SimpleNamespace(dim=2), SimpleNamespace(dim=2)],
+        )
+
+        flushed_module_ids = set()
+        for table_name in ("dyn_a", "dyn_b"):
+            dumper._lookup_dynamic_embeddings(
+                dynamic_module,
+                table_name,
+                torch.tensor([101, 102, 103]),
+                flushed_module_ids,
+            )
+
+        # Both tables share the module; flush() flushes all tables, so it runs
+        # once per dump rather than once per table.
+        dynamic_module.flush.assert_called_once_with()
+
 
 class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
     def __init__(self, methodName="runTest") -> None:

@@ -480,6 +480,10 @@ class DeltaEmbeddingDumper:
         dynamic_modules: Dict[str, nn.Module],
     ) -> int:
         num_rows = 0
+        # A dynamic module hosting multiple tables is shared across their
+        # table_name keys; flush() flushes the whole module, so track which
+        # modules were already flushed this dump and skip the redundant repeats.
+        flushed_module_ids: Set[int] = set()
         for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
             ids = unique_rows.ids
             if ids.numel() == 0:
@@ -494,6 +498,7 @@ class DeltaEmbeddingDumper:
                 ids,
                 table_weights=table_weights,
                 dynamic_modules=dynamic_modules,
+                flushed_module_ids=flushed_module_ids,
             )
             feature_name = _feature_name(self._fqn_to_feature_names.get(fqn, []))
             num_rows += self._append_table_chunk(
@@ -513,10 +518,13 @@ class DeltaEmbeddingDumper:
         ids: torch.Tensor,
         table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
+        flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dynamic_module = dynamic_modules.get(table_name)
         if dynamic_module is not None:
-            return self._lookup_dynamic_embeddings(dynamic_module, table_name, ids)
+            return self._lookup_dynamic_embeddings(
+                dynamic_module, table_name, ids, flushed_module_ids
+            )
         if table_name not in table_weights:
             raise KeyError(f"Embedding table {table_name} not found in sharded model.")
         table_weight = table_weights[table_name]
@@ -544,7 +552,11 @@ class DeltaEmbeddingDumper:
         return weight[local_ids].detach(), key_ids
 
     def _lookup_dynamic_embeddings(
-        self, dynamic_module: nn.Module, table_name: str, ids: torch.Tensor
+        self,
+        dynamic_module: nn.Module,
+        table_name: str,
+        ids: torch.Tensor,
+        flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         try:
             from dynamicemb.types import CopyMode
@@ -552,7 +564,12 @@ class DeltaEmbeddingDumper:
             raise RuntimeError(
                 "dynamicemb is required to dump dynamic embedding values."
             ) from exc
-        dynamic_module.flush()
+        # flush() flushes the whole module; only the first table of a
+        # multi-table module needs it within a dump.
+        if flushed_module_ids is None or id(dynamic_module) not in flushed_module_ids:
+            dynamic_module.flush()
+            if flushed_module_ids is not None:
+                flushed_module_ids.add(id(dynamic_module))
         table_id = dynamic_module.table_names.index(table_name)
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         ids = ids.to(device=device, dtype=torch.int64)
