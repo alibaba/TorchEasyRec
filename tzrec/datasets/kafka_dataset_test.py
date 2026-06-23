@@ -14,6 +14,7 @@ import io
 import os
 import time
 import unittest
+from unittest import mock
 
 import pyarrow as pa
 from alibabacloud_alikafka20190916 import models as alikafka_models
@@ -21,11 +22,15 @@ from alibabacloud_alikafka20190916.client import Client as AliKafkaClient
 from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
-from confluent_kafka import Producer
+from confluent_kafka import KafkaException, Producer, TopicPartition
 from parameterized import parameterized
 from torch.utils.data import DataLoader
 
-from tzrec.datasets.kafka_dataset import KafkaDataset, _parse_kafka_uri
+from tzrec.datasets.kafka_dataset import (
+    KafkaDataset,
+    _offsets_for_times_batched,
+    _parse_kafka_uri,
+)
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils.checkpoint_util import update_dataloder_state
@@ -67,6 +72,122 @@ class ParseKafkaUriTest(unittest.TestCase):
         uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=abc"
         with self.assertRaises(ValueError):
             _parse_kafka_uri(uri)
+
+
+def _resolved(partition, offset, topic="t"):
+    """Build a TopicPartition as returned by offsets_for_times."""
+    tp = TopicPartition(topic, partition)
+    tp.offset = offset
+    return tp
+
+
+class OffsetsForTimesBatchedTest(unittest.TestCase):
+    """Unit tests for _offsets_for_times_batched (broker-free, mocked)."""
+
+    START_TS = 1711929600000
+
+    def test_empty_partitions_returns_empty(self):
+        consumer = mock.MagicMock()
+        result = _offsets_for_times_batched(
+            consumer, [], self.START_TS, 30, 30.0, 3, sleep_fn=mock.MagicMock()
+        )
+        self.assertEqual(result, {})
+        consumer.offsets_for_times.assert_not_called()
+
+    def test_single_chunk_all_resolved(self):
+        seen_offsets = []
+
+        def _fake(chunk, timeout):
+            # offsets_for_times receives the target timestamp in tp.offset.
+            seen_offsets.extend(tp.offset for tp in chunk)
+            return [_resolved(tp.partition, tp.partition + 100) for tp in chunk]
+
+        consumer = mock.MagicMock()
+        consumer.offsets_for_times.side_effect = _fake
+        parts = [TopicPartition("t", p) for p in range(5)]
+        result = _offsets_for_times_batched(
+            consumer, parts, self.START_TS, 30, 30.0, 3, sleep_fn=mock.MagicMock()
+        )
+        self.assertEqual(consumer.offsets_for_times.call_count, 1)
+        self.assertEqual(result, {("t", p): p + 100 for p in range(5)})
+        # target timestamp was set on every partition before the call.
+        self.assertEqual(seen_offsets, [self.START_TS] * 5)
+
+    def test_chunking_boundary(self):
+        consumer = mock.MagicMock()
+        consumer.offsets_for_times.side_effect = lambda chunk, timeout: [
+            _resolved(tp.partition, tp.partition + 100) for tp in chunk
+        ]
+        parts = [TopicPartition("t", p) for p in range(65)]
+        result = _offsets_for_times_batched(
+            consumer, parts, self.START_TS, 30, 30.0, 3, sleep_fn=mock.MagicMock()
+        )
+        chunk_sizes = [
+            len(call.args[0]) for call in consumer.offsets_for_times.call_args_list
+        ]
+        self.assertEqual(chunk_sizes, [30, 30, 5])
+        self.assertEqual(len(result), 65)
+
+    def test_partial_resolution_filters_negative(self):
+        # broker returns -1 when the timestamp is past the last message.
+        consumer = mock.MagicMock()
+        consumer.offsets_for_times.return_value = [
+            _resolved(0, 100),
+            _resolved(1, -1),
+            _resolved(2, 102),
+        ]
+        parts = [TopicPartition("t", p) for p in range(3)]
+        result = _offsets_for_times_batched(
+            consumer, parts, self.START_TS, 30, 30.0, 3, sleep_fn=mock.MagicMock()
+        )
+        self.assertEqual(result, {("t", 0): 100, ("t", 2): 102})
+        self.assertNotIn(("t", 1), result)
+
+    def test_retry_then_success(self):
+        sleep_fn = mock.MagicMock()
+        consumer = mock.MagicMock()
+        consumer.offsets_for_times.side_effect = [
+            KafkaException("transient timeout"),
+            [_resolved(0, 100)],
+        ]
+        parts = [TopicPartition("t", 0)]
+        result = _offsets_for_times_batched(
+            consumer, parts, self.START_TS, 30, 30.0, 3, sleep_fn=sleep_fn
+        )
+        self.assertEqual(result, {("t", 0): 100})
+        self.assertEqual(consumer.offsets_for_times.call_count, 2)
+        self.assertEqual(sleep_fn.call_count, 1)
+
+    def test_retry_exhausted_raises(self):
+        sleep_fn = mock.MagicMock()
+        consumer = mock.MagicMock()
+        consumer.offsets_for_times.side_effect = KafkaException("persistent timeout")
+        parts = [TopicPartition("t", 0)]
+        with self.assertRaises(KafkaException):
+            _offsets_for_times_batched(
+                consumer, parts, self.START_TS, 30, 30.0, 3, sleep_fn=sleep_fn
+            )
+        # 1 initial attempt + 3 retries = 4 calls; sleep before each retry = 3.
+        self.assertEqual(consumer.offsets_for_times.call_count, 4)
+        self.assertEqual(sleep_fn.call_count, 3)
+
+    def test_retry_isolated_per_chunk(self):
+        sleep_fn = mock.MagicMock()
+        # chunk 0 fails once then succeeds; chunk 1 succeeds first try.
+        outcomes = [
+            KafkaException("blip"),
+            [_resolved(0, 100)],
+            [_resolved(1, 101)],
+        ]
+        consumer = mock.MagicMock()
+        consumer.offsets_for_times.side_effect = outcomes
+        parts = [TopicPartition("t", 0), TopicPartition("t", 1)]
+        result = _offsets_for_times_batched(
+            consumer, parts, self.START_TS, 1, 30.0, 3, sleep_fn=sleep_fn
+        )
+        self.assertEqual(result, {("t", 0): 100, ("t", 1): 101})
+        self.assertEqual(consumer.offsets_for_times.call_count, 3)
+        self.assertEqual(sleep_fn.call_count, 1)
 
 
 class KafkaDatasetTest(unittest.TestCase):
