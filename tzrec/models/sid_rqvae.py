@@ -68,46 +68,7 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
 
-        self._use_clip = cfg.HasField("clip_config")
-        self._clip_feature_group = (
-            cfg.clip_config.clip_feature_group if self._use_clip else None
-        )
-        self._clip_pair_feature_group = (
-            cfg.clip_config.clip_pair_feature_group if self._use_clip else None
-        )
-        has_clip_obj = any(
-            lc.WhichOneof("sid_loss") == "sid_clip_loss"
-            for lc in self._base_model_config.losses
-        )
-        if self._use_clip != has_clip_obj:
-            raise ValueError(
-                "clip_config (model structure) and a sid_clip_loss entry in "
-                "losses (the objective) must be set together; got "
-                f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
-            )
-        if self._use_clip:
-            for grp in (self._clip_feature_group, self._clip_pair_feature_group):
-                if not self.embedding_group.has_group(grp):
-                    raise ValueError(
-                        f"clip group {grp!r} is not in model_config.feature_groups "
-                        f"{self.embedding_group.group_names()}"
-                    )
-            clip_dim = self.embedding_group.group_total_dim(self._clip_feature_group)
-            if clip_dim != self._input_dim:
-                raise ValueError(
-                    f"clip_feature_group {self._clip_feature_group!r} has total "
-                    f"dim {clip_dim}, but it is encoded by the same encoder as "
-                    f"the main feature_group (dim {self._input_dim}); the two "
-                    "must match"
-                )
-            pair_dim = self.embedding_group.group_total_dim(
-                self._clip_pair_feature_group
-            )
-            if pair_dim != 1:
-                raise ValueError(
-                    f"clip_pair_feature_group {self._clip_pair_feature_group!r} "
-                    f"must be a single dim-1 raw flag, got total dim {pair_dim}"
-                )
+        self._init_clip()
 
         embed_dim = cfg.embed_dim
         # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
@@ -162,6 +123,55 @@ class SidRqvae(BaseSidModel):
             self._n_embed_list,
             self._use_clip,
         )
+
+    def _init_clip(self) -> None:
+        """Read and validate the CLIP dual-encoder wiring (``clip_config``).
+
+        Sets ``_use_clip`` and the paired / pair-flag group names, and enforces:
+        ``clip_config`` (structure) and a ``sid_clip_loss`` entry (objective) are
+        set together; the paired group exists and matches ``input_dim`` (it shares
+        the encoder); the pair-flag group is a single dim-1 raw flag. Must run
+        after ``super().__init__()`` — it needs ``embedding_group`` / ``_input_dim``.
+        """
+        cfg = self._model_config
+        self._use_clip = cfg.HasField("clip_config")
+        self._clip_feature_group = (
+            cfg.clip_config.clip_feature_group if self._use_clip else None
+        )
+        self._clip_pair_feature_group = (
+            cfg.clip_config.clip_pair_feature_group if self._use_clip else None
+        )
+        has_clip_obj = any(
+            lc.WhichOneof("sid_loss") == "sid_clip_loss"
+            for lc in self._base_model_config.losses
+        )
+        if self._use_clip != has_clip_obj:
+            raise ValueError(
+                "clip_config (model structure) and a sid_clip_loss entry in "
+                "losses (the objective) must be set together; got "
+                f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
+            )
+        if not self._use_clip:
+            return
+        for grp in (self._clip_feature_group, self._clip_pair_feature_group):
+            if not self.embedding_group.has_group(grp):
+                raise ValueError(
+                    f"clip group {grp!r} is not in model_config.feature_groups "
+                    f"{self.embedding_group.group_names()}"
+                )
+        clip_dim = self.embedding_group.group_total_dim(self._clip_feature_group)
+        if clip_dim != self._input_dim:
+            raise ValueError(
+                f"clip_feature_group {self._clip_feature_group!r} has total "
+                f"dim {clip_dim}, but it is encoded by the same encoder as the "
+                f"main feature_group (dim {self._input_dim}); the two must match"
+            )
+        pair_dim = self.embedding_group.group_total_dim(self._clip_pair_feature_group)
+        if pair_dim != 1:
+            raise ValueError(
+                f"clip_pair_feature_group {self._clip_pair_feature_group!r} must "
+                f"be a single dim-1 raw flag, got total dim {pair_dim}"
+            )
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode. (B, input_dim) -> (B, embed_dim)."""
