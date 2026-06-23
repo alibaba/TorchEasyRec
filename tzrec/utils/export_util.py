@@ -207,7 +207,7 @@ def export_model_normal(
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
 
-        batch = next(iter(dataloader))
+        batch = next(dataloader.get_iterator())  # pyre-ignore[16]
 
         # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
         # for nbit quantization uses int32 pointer arithmetic which
@@ -752,7 +752,7 @@ def export_rtp_model(
     data_config.batch_size = acc_utils.get_max_export_batch_size()
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
-    batch = next(iter(dataloader))
+    batch = next(dataloader.get_iterator())  # pyre-ignore[16]
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
     # Build Sharded Model

@@ -310,6 +310,7 @@ class CheckpointManager:
         self._ts_group: Optional[dist.ProcessGroup] = None
         # cadence state owned here so dedupe is centralized across all save sites
         self._last_ckpt_step = -1
+        self._last_ckpt_dir: Optional[str] = None
         self._last_data_ts: Optional[float] = None
 
     def save(
@@ -324,6 +325,7 @@ class CheckpointManager:
         save_model(ckpt_dir, model, optimizer)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
+        self._last_ckpt_dir = ckpt_dir
         self.prune()
         return ckpt_dir
 
@@ -423,6 +425,11 @@ class CheckpointManager:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
+        # copy so the watermark isn't leaked back into the train loop's state
+        if dataloader_state is not None:
+            dataloader_state = dict(dataloader_state)
+            if data_ts is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -443,15 +450,25 @@ class CheckpointManager:
             ):
                 want = True
 
-        if not want or step == self._last_ckpt_step:
+        if not want:
+            return False
+        if step == self._last_ckpt_step:
+            # a boundary save dedup'd against an already-saved step: refresh
+            # that checkpoint's state so the cleared + bumped bookkeeping is
+            # not lost to the dedupe (lockstep across ranks, so the collective
+            # in save_dataloader_state is safe).
+            if (
+                (final or epoch is not None)
+                and dataloader_state is not None
+                and self._last_ckpt_dir is not None
+            ):
+                save_dataloader_state(self._last_ckpt_dir, dataloader_state)
             return False
 
         self._last_ckpt_step = step
         if data_ts is not None:
-            # advance + persist the watermark on every save so resume is exact
+            # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-            if dataloader_state is not None:
-                dataloader_state[DATA_TS_WATERMARK] = data_ts
         self.save(step, model, optimizer, dataloader_state)
         return True
 
@@ -917,6 +934,9 @@ DATALOADER_CKPT_FILENAME = "dataloader_state.json"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
+# reserved dataloader_state key: number of completed data passes; resume
+# continues the epoch budget from here. no ":" so per-source consumers skip it.
+EPOCHS_COMPLETED = "__epochs_completed__"
 
 
 def save_dataloader_state(

@@ -91,7 +91,7 @@ if __name__ == "__main__":
         dataloader = create_dataloader(
             pipeline_config.data_config, features, pipeline_config.train_input_path
         )
-        iterator = iter(dataloader)
+        iterator = dataloader.get_iterator()  # pyre-ignore[16]
         _ = next(iterator)
 
     tmp_dir = tempfile.mkdtemp(prefix="tzrec_")
