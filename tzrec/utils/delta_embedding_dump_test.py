@@ -641,6 +641,56 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(embeddings, weight[[0, 2]])
         torch.testing.assert_close(key_ids, torch.tensor([32, 34]))
 
+    def test_lookup_filters_out_of_range_ids(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._world_size = 2
+        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        embeddings, key_ids = dumper._lookup_embeddings(
+            "user_emb",
+            torch.tensor([0, 2, 99, -1]),
+            table_weights={
+                "user_emb": _TableWeight(
+                    tensor=weight,
+                    shard_info=_TableShardInfo(
+                        row_offset=32,
+                        local_rows=4,
+                        local_cols=2,
+                        global_rows=64,
+                        global_cols=2,
+                        has_shard_metadata=True,
+                    ),
+                )
+            },
+            dynamic_modules={},
+        )
+        torch.testing.assert_close(embeddings, weight[[0, 2]])
+        torch.testing.assert_close(key_ids, torch.tensor([32, 34]))
+
+    def test_lookup_handles_empty_ids(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._world_size = 2
+        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        embeddings, key_ids = dumper._lookup_embeddings(
+            "user_emb",
+            torch.tensor([], dtype=torch.long),
+            table_weights={
+                "user_emb": _TableWeight(
+                    tensor=weight,
+                    shard_info=_TableShardInfo(
+                        row_offset=32,
+                        local_rows=4,
+                        local_cols=2,
+                        global_rows=64,
+                        global_cols=2,
+                        has_shard_metadata=True,
+                    ),
+                )
+            },
+            dynamic_modules={},
+        )
+        self.assertEqual(embeddings.shape, (0, 2))
+        self.assertEqual(key_ids.shape, (0,))
+
     def test_row_wise_lookup_requires_shard_metadata(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
