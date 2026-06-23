@@ -373,7 +373,12 @@ class DeltaEmbeddingDumper:
         """
         global_step = self._sync_final_step(global_step)
         if global_step > 0 and global_step % self._interval == 0:
-            return None
+            if self._world_size > 1:
+                # Lagging ranks may hold un-flushed tail delta; dump into
+                # the preceding non-boundary step dir to keep full shard sets.
+                global_step -= 1
+            else:
+                return None
         return self.dump(global_step)
 
     def _sync_final_step(self, global_step: int) -> int:
