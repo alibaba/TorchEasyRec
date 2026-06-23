@@ -99,16 +99,17 @@ class VectorQuantizeTest(unittest.TestCase):
                 embed_dim=8, n_embed=16, use_sinkhorn=True, sinkhorn_epsilon=0.0
             )
 
-    def test_train_forward_backward_reaches_input(self) -> None:
+    def test_train_forward_backward_reaches_codebook(self) -> None:
         torch.manual_seed(0)
         vq = VectorQuantizeLayer(embed_dim=8, n_embed=16, use_sinkhorn=False)
         vq.train()
         x = torch.randn(5, 8, requires_grad=True)
         out = vq.quantize(x)
         out.embeddings.sum().backward()
-        # STE routes gradient back through x.
-        self.assertIsNotNone(x.grad)
-        self.assertTrue(torch.isfinite(x.grad).all())
+        # The layer returns the raw codebook vector, so gradient reaches the
+        # codebook (the encoder STE is applied on the aggregate by the RVQ).
+        self.assertIsNotNone(vq.embedding.weight.grad)
+        self.assertTrue(torch.isfinite(vq.embedding.weight.grad).all())
 
     def test_eval_forward_is_plain_lookup(self) -> None:
         torch.manual_seed(0)

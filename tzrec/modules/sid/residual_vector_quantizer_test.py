@@ -81,6 +81,26 @@ class GumbelResidualVQTest(unittest.TestCase):
         cb_grad = rvq.layers[0].embedding.weight.grad
         self.assertTrue(cb_grad is None or cb_grad.abs().sum().item() == 0.0)
 
+    def test_ste_codebook_grad_flows_via_commitment_latents(self) -> None:
+        # The codebook trains via the commitment loss, which consumes ``latents``,
+        # so backward through latents MUST reach the codebook. Regression: a
+        # per-layer STE wrap once detached the codebook from latents, freezing it
+        # at init (commitment loss then grew unbounded while recon stayed fine).
+        torch.manual_seed(0)
+        rvq = ResidualVectorQuantizer(
+            embed_dim=8,
+            n_layers=2,
+            n_embed=16,
+            forward_mode="ste",
+            use_sinkhorn=False,
+            kmeans_init=False,
+        )
+        rvq.train()
+        rvq(torch.randn(16, 8)).latents.sum().backward()
+        cb_grad = rvq.layers[0].embedding.weight.grad
+        self.assertIsNotNone(cb_grad)
+        self.assertGreater(cb_grad.abs().sum().item(), 0.0)
+
 
 class FaissResidualKmeansTest(unittest.TestCase):
     """Tests for the FAISS residual K-Means warm-start helper."""

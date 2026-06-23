@@ -232,15 +232,14 @@ class VectorQuantizeLayer(QuantizeLayer):
             return QuantizeOutput(embeddings=emb, ids=ids)
 
         # STE / eval: nearest-neighbour assignment under no_grad, one codebook
-        # gather. In STE training, wrap with the straight-through estimator so
-        # grad reaches the encoder. (Under the RVQ residual walk the input is
-        # detached, so this per-layer wrap is a numeric no-op and the aggregate
-        # STE in ResidualVectorQuantizer.forward carries the gradient.)
+        # gather. Return the RAW codebook vector (grad-carrying to the codebook)
+        # so the residual quantizer's cumulative ``latents`` trains the codebook
+        # via the commitment loss. The encoder straight-through gradient is
+        # applied once on the aggregate in ``ResidualVectorQuantizer.forward``; a
+        # per-layer STE wrap here would detach the codebook from ``latents`` and
+        # leave it frozen at init.
         ids = self._find_nearest_embedding(x)
-        quantized = self.embedding(ids)
-        if self.training and self.forward_mode == QuantizeForwardMode.STE:
-            quantized = x + (quantized - x).detach()  # grad passes to x
-        return QuantizeOutput(embeddings=quantized, ids=ids)
+        return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""
