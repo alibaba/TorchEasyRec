@@ -72,7 +72,12 @@ def _distributed_rank_world_size() -> Tuple[int, int]:
 def validate_delta_embedding_dump_config(
     config: Optional[DeltaEmbeddingDumpConfig], device: torch.device
 ) -> None:
-    """Validate runtime constraints for delta embedding dump."""
+    """Validate runtime constraints for delta embedding dump.
+
+    Args:
+        config: Delta embedding dump configuration, or None to skip validation.
+        device: Training device to validate (must be CUDA).
+    """
     if config is None:
         return
     if device.type != "cuda":
@@ -111,7 +116,11 @@ def _zch_feature_names(feature_configs: Iterable[Any]) -> Set[str]:
 def validate_delta_embedding_dump_no_zch_features(
     feature_configs: Iterable[Any],
 ) -> None:
-    """Validate that delta embedding dump is not used with MC/ZCH features."""
+    """Validate that delta embedding dump is not used with MC/ZCH features.
+
+    Args:
+        feature_configs: Iterable of feature configuration protos to check.
+    """
     zch_feature_names = _zch_feature_names(feature_configs)
     if zch_feature_names:
         raise ValueError(
@@ -298,7 +307,13 @@ def _local_table_weight(
 
 
 class DeltaEmbeddingDumper:
-    """Dump touched embedding ids and latest embedding rows during training."""
+    """Dump touched embedding ids and latest embedding rows during training.
+
+    Args:
+        model: The model containing embedding tables to track.
+        config: Configuration for delta embedding dump behavior.
+        model_dir: Base directory for model outputs; used as default output location.
+    """
 
     def __init__(
         self,
@@ -359,7 +374,11 @@ class DeltaEmbeddingDumper:
             self._tracking_pause_depth -= 1
 
     def maybe_dump(self, global_step: int) -> None:
-        """Dump on the configured global-step interval and advance tracker state."""
+        """Dump on the configured global-step interval and advance tracker state.
+
+        Args:
+            global_step: Current training step.
+        """
         if global_step > 0 and global_step % self._interval == 0:
             self.dump(global_step)
         self._tracker.step()
@@ -370,6 +389,12 @@ class DeltaEmbeddingDumper:
         Boundary steps were already written by ``maybe_dump`` and have no
         remaining delta; re-dumping them would overwrite their shards with an
         empty file under multi-GPU, so skip them here.
+
+        Args:
+            global_step: Current training step.
+
+        Returns:
+            Path to the dumped parquet file, or None if skipped.
         """
         global_step = self._sync_final_step(global_step)
         if global_step > 0 and global_step % self._interval == 0:
@@ -405,7 +430,14 @@ class DeltaEmbeddingDumper:
         return int(step_tensor.item())
 
     def dump(self, global_step: int) -> Optional[str]:
-        """Dump currently tracked sparse ids and embeddings to a parquet file."""
+        """Dump currently tracked sparse ids and embeddings to a parquet file.
+
+        Args:
+            global_step: Current training step.
+
+        Returns:
+            Path to the dumped parquet file, or None if no data to dump.
+        """
         table_weights = self._collect_table_weights()
         dynamic_modules = self._collect_dynamic_modules()
         table_chunks: List[pa.Table] = []
