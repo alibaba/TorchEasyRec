@@ -86,7 +86,10 @@ from tzrec.utils.dist_util import (
     create_train_pipeline,
     init_process_group,
 )
-from tzrec.utils.export_util import export_model
+from tzrec.utils.export_util import (
+    ensure_input_tile_for_distributed_embedding,
+    export_model,
+)
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -950,6 +953,8 @@ def export(
             reads from this path instead of ``train_input_path``.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+
+    ensure_input_tile_for_distributed_embedding()
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     ori_pipeline_config = copy.copy(pipeline_config)
