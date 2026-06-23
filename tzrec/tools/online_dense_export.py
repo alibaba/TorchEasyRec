@@ -17,7 +17,6 @@ import datetime
 import json
 import os
 import shutil
-import time
 from typing import Any, Dict, Optional
 
 from tzrec.main import _create_features, _create_model
@@ -28,22 +27,15 @@ from tzrec.utils.export_util import (
     export_distributed_embedding,
 )
 from tzrec.utils.logging_util import logger
+from tzrec.utils.online_dense_export_util import make_version
 
 DENSE_HOT_EXPORT_DIR = "dense_hot_export"
-DENSE_HOT_UPDATE_DIR = "dense_hot_update"
 VERSIONS_DIR = "versions"
 CURRENT_JSON = "current.json"
 
 
 def _utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-
-def make_version(timestamp_ms: Optional[int] = None) -> str:
-    """Build a timestamp-based dense export version name."""
-    if timestamp_ms is None:
-        timestamp_ms = int(time.time() * 1000)
-    return str(timestamp_ms)
 
 
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
@@ -75,7 +67,6 @@ def export_online_dense_model(
 
     version = version or make_version()
     export_root = os.path.join(model_dir, DENSE_HOT_EXPORT_DIR)
-    update_root = os.path.join(model_dir, DENSE_HOT_UPDATE_DIR)
     versions_root = os.path.join(export_root, VERSIONS_DIR)
     version_dir = os.path.join(versions_root, version)
     tmp_dir = f"{version_dir}.tmp.{os.getpid()}"
@@ -125,30 +116,16 @@ def export_online_dense_model(
             shutil.rmtree(tmp_dir)
         raise
 
-    payload: Dict[str, Any] = {
+    current_payload: Dict[str, Any] = {
         "version": version,
         "checkpoint_path": os.path.abspath(checkpoint_path),
-        "export_path": os.path.abspath(version_dir),
-        "scripted_model_path": os.path.abspath(
-            os.path.join(version_dir, "scripted_model.pt")
-        ),
-        "dense_meta_path": os.path.abspath(
-            os.path.join(version_dir, "dense_meta.json")
-        ),
-        "ready_path": os.path.abspath(os.path.join(version_dir, "READY")),
         "created_at": _utc_now(),
     }
-    if checkpoint_step is not None:
-        payload["checkpoint_step"] = checkpoint_step
-    if data_timestamp is not None:
-        payload["data_timestamp"] = data_timestamp
 
-    # Keep the service-facing pointer under dense_hot_update, and mirror it under
-    # dense_hot_export for local inspection beside the immutable versions.
-    _publish_current(os.path.join(update_root, CURRENT_JSON), payload)
-    _publish_current(os.path.join(export_root, CURRENT_JSON), payload)
+    # Keep the service-facing pointer beside the immutable dense export versions.
+    _publish_current(os.path.join(export_root, CURRENT_JSON), current_payload)
     logger.info("published online dense export version %s to %s", version, version_dir)
-    return payload
+    return current_payload
 
 
 def main() -> None:

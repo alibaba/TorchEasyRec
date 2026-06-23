@@ -77,13 +77,13 @@ class OnlineDenseExportTest(unittest.TestCase):
                     pipeline_config_path=pipeline_config_path,
                     checkpoint_path=checkpoint_path,
                     model_dir=tmp_dir,
-                    version="1234567890",
+                    version="20260623174703",
                     checkpoint_step=10,
                     data_timestamp=42.0,
                 )
 
             version_dir = os.path.join(
-                tmp_dir, "dense_hot_export", "versions", "1234567890"
+                tmp_dir, "dense_hot_export", "versions", "20260623174703"
             )
             self.assertTrue(os.path.exists(os.path.join(version_dir, "READY")))
             self.assertTrue(
@@ -93,18 +93,23 @@ class OnlineDenseExportTest(unittest.TestCase):
                 os.path.exists(os.path.join(version_dir, "dense_meta.json"))
             )
 
-            for current_path in (
-                os.path.join(tmp_dir, "dense_hot_update", "current.json"),
-                os.path.join(tmp_dir, "dense_hot_export", "current.json"),
-            ):
-                with open(current_path) as f:
-                    current = json.load(f)
-                self.assertEqual(current["version"], "1234567890")
-                self.assertEqual(current["checkpoint_step"], 10)
-                self.assertEqual(current["data_timestamp"], 42.0)
-                self.assertEqual(current["export_path"], os.path.abspath(version_dir))
+            current_path = os.path.join(tmp_dir, "dense_hot_export", "current.json")
+            with open(current_path) as f:
+                current = json.load(f)
+            self.assertEqual(
+                set(current.keys()), {"checkpoint_path", "created_at", "version"}
+            )
+            self.assertEqual(current["version"], "20260623174703")
+            self.assertEqual(
+                current["checkpoint_path"], os.path.abspath(checkpoint_path)
+            )
+            self.assertTrue(current["created_at"])
+            self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_update")))
 
-            self.assertEqual(payload["version"], "1234567890")
+            self.assertEqual(
+                set(payload.keys()), {"checkpoint_path", "created_at", "version"}
+            )
+            self.assertEqual(payload["version"], "20260623174703")
 
 
 if __name__ == "__main__":
