@@ -317,7 +317,8 @@ class DeltaEmbeddingDumper:
         self._tracking_pause_depth = 0
         os.makedirs(self._output_dir, exist_ok=True)
 
-        self._validate_supported_table_sharding()
+        self._table_shard_infos = self._collect_table_shard_infos()
+        self._validate_supported_table_sharding(self._table_shard_infos)
         self._tracker = ModelDeltaTrackerTrec(
             model,
             consumers=[_CONSUMER],
@@ -628,8 +629,10 @@ class DeltaEmbeddingDumper:
                 continue
             yield from embedding_tables
 
-    def _validate_supported_table_sharding(self) -> None:
-        for table_name, shard_info in self._collect_table_shard_infos().items():
+    def _validate_supported_table_sharding(
+        self, table_shard_infos: Dict[str, _TableShardInfo]
+    ) -> None:
+        for table_name, shard_info in table_shard_infos.items():
             _validate_table_shard_info(table_name, shard_info)
 
     def _validate_row_shard_metadata(
@@ -650,7 +653,7 @@ class DeltaEmbeddingDumper:
 
     def _collect_table_weights(self) -> Dict[str, _TableWeight]:
         table_weights: Dict[str, _TableWeight] = {}
-        table_shard_infos = self._collect_table_shard_infos()
+        table_shard_infos = self._table_shard_infos
         for module in self._model.modules():
             lookups = getattr(module, "_lookups", None)
             if lookups is None:
