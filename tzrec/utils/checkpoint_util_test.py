@@ -274,6 +274,25 @@ class CheckpointUtilTest(unittest.TestCase):
             manager.close()
         self.assertEqual(self._remaining_ckpt_steps(), [0, 10, 20, 30])
 
+    def test_checkpoint_manager_prune_keeps_protected_checkpoint(self):
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        protected_ckpt = os.path.join(self.test_dir, "model.ckpt-10")
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, keep_checkpoint_max=2
+        )
+        manager.protect_checkpoint(protected_ckpt)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [10, 20, 30])
+
+        manager.unprotect_checkpoint(protected_ckpt)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [20, 30])
+
     def test_checkpoint_manager_prune_idempotent(self):
         for step in [0, 10, 20, 30]:
             os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))

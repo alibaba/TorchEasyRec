@@ -1293,6 +1293,7 @@ def export_distributed_embedding(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
+    dense_only: bool = False,
     **kwargs: Any,
 ) -> None:
     """Export for online serving under distributed embedding mode."""
@@ -1450,49 +1451,52 @@ def export_distributed_embedding(
     sparse_model = sparse_gm
     sparse_model.eval()
     sparse_output, sparse_attrs = sparse_model(data, device=device)
-    # Save Sparse Parameters
-    logger.info("saving sparse parameters...")
+    if not dense_only:
+        # Save Sparse Parameters
+        logger.info("saving sparse parameters...")
 
-    local_tensor, dynamic_local_tensor, emb_meta, feat_meta = (
-        _get_sparse_embedding_tensor(
-            sparse_model,
-            checkpoint_path,
-            feature_to_embedding_info.values(),
-            feature_to_embedding_bag_info.values(),
+        local_tensor, dynamic_local_tensor, emb_meta, feat_meta = (
+            _get_sparse_embedding_tensor(
+                sparse_model,
+                checkpoint_path,
+                feature_to_embedding_info.values(),
+                feature_to_embedding_bag_info.values(),
+            )
         )
-    )
-    local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
-    save_dir_sparse = f"{save_dir}/sparse"
-    if not os.path.exists(save_dir_sparse):
-        os.makedirs(save_dir_sparse)
-    local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
-    logger.info(f"save sparse tensors to {local_tensor_path}")
-    # np.savez(local_tensor_path, **local_tensor)
-    import tempfile
+        local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
+        save_dir_sparse = f"{save_dir}/sparse"
+        if not os.path.exists(save_dir_sparse):
+            os.makedirs(save_dir_sparse)
+        local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
+        logger.info(f"save sparse tensors to {local_tensor_path}")
+        # np.savez(local_tensor_path, **local_tensor)
+        import tempfile
 
-    # OSS mounted file system may have problem in file seek, so first
-    # save to a temp file then move to target path
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-        np.savez(f, **local_tensor)
-        temp_path = f.name
-    shutil.move(temp_path, local_tensor_path)
-
-    if dynamic_local_tensor:
-        dynamic_tensor_name = f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
-        dynamic_tensor_path = os.path.join(
-            save_dir_sparse, f"{dynamic_tensor_name}.npz"
-        )
-        logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
+        # OSS mounted file system may have problem in file seek, so first
+        # save to a temp file then move to target path
         with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-            np.savez(f, **dynamic_local_tensor)
+            np.savez(f, **local_tensor)
             temp_path = f.name
-        shutil.move(temp_path, dynamic_tensor_path)
+        shutil.move(temp_path, local_tensor_path)
 
-    with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
-        json.dump(emb_meta, f, indent=4)
-    if is_rank_zero:
-        with open(os.path.join(save_dir_sparse, "sparse_features.json"), "w") as f:
-            json.dump(feat_meta, f, indent=4)
+        if dynamic_local_tensor:
+            dynamic_tensor_name = (
+                f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
+            )
+            dynamic_tensor_path = os.path.join(
+                save_dir_sparse, f"{dynamic_tensor_name}.npz"
+            )
+            logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
+                np.savez(f, **dynamic_local_tensor)
+                temp_path = f.name
+            shutil.move(temp_path, dynamic_tensor_path)
+
+        with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
+            json.dump(emb_meta, f, indent=4)
+        if is_rank_zero:
+            with open(os.path.join(save_dir_sparse, "sparse_features.json"), "w") as f:
+                json.dump(feat_meta, f, indent=4)
 
     # Extract Dense Model
     logger.info("exporting dense model...")
@@ -1595,35 +1599,36 @@ def export_distributed_embedding(
         dense_model_scripted = torch.jit.script(dense_model_traced)
         dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        logger.info("saving pipeline.config...")
-        feature_configs = create_feature_configs(features, asset_dir=save_dir)
-        pipeline_config = copy.copy(pipeline_config)
-        pipeline_config.ClearField("feature_configs")
-        pipeline_config.feature_configs.extend(feature_configs)
-        config_util.save_message(
-            pipeline_config, os.path.join(save_dir, "pipeline.config")
-        )
+        if not dense_only:
+            logger.info("saving pipeline.config...")
+            feature_configs = create_feature_configs(features, asset_dir=save_dir)
+            pipeline_config = copy.copy(pipeline_config)
+            pipeline_config.ClearField("feature_configs")
+            pipeline_config.feature_configs.extend(feature_configs)
+            config_util.save_message(
+                pipeline_config, os.path.join(save_dir, "pipeline.config")
+            )
 
-        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(acc_utils.export_acc_config(), f, indent=4)
+            with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
+                json.dump(acc_utils.export_acc_config(), f, indent=4)
 
-        has_fg_asset = False
-        if assets is not None:
-            for asset in assets:
-                if asset.endswith("fg.json"):
-                    has_fg_asset = True
-                shutil.copy(asset, save_dir)
+            has_fg_asset = False
+            if assets is not None:
+                for asset in assets:
+                    if asset.endswith("fg.json"):
+                        has_fg_asset = True
+                    shutil.copy(asset, save_dir)
 
-        # Save FG
-        if not has_fg_asset:
-            logger.info("saving fg json...")
-            fg_json = create_fg_json(features, asset_dir=save_dir)
-            fg_json["features"].extend(additional_fg)
-            with open(os.path.join(save_dir, "fg.json"), "w") as f:
-                json.dump(fg_json, f, indent=4)
+            # Save FG
+            if not has_fg_asset:
+                logger.info("saving fg json...")
+                fg_json = create_fg_json(features, asset_dir=save_dir)
+                fg_json["features"].extend(additional_fg)
+                with open(os.path.join(save_dir, "fg.json"), "w") as f:
+                    json.dump(fg_json, f, indent=4)
 
     dist.barrier()
-    if is_rank_zero:
+    if is_rank_zero and not dense_only:
         # merge sharded sparse meta files
         emb_json_file_names = glob.glob(
             os.path.join(save_dir_sparse, "sparse_embeddings*.json")

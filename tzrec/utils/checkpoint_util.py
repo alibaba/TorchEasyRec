@@ -20,7 +20,7 @@ import tempfile
 import threading
 import weakref
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -334,6 +334,7 @@ class CheckpointManager:
         self._eval_result_filename = eval_result_filename
         self._prune_queue: "queue.Queue[object]" = queue.Queue()
         self._prune_pending = False
+        self._protected_checkpoints: Set[str] = set()
         self._lock = threading.Lock()
         self._prune_worker: Optional[threading.Thread] = None
         self._finalizer: Optional[weakref.finalize] = None
@@ -364,6 +365,18 @@ class CheckpointManager:
             save_dataloader_state(ckpt_dir, dataloader_state)
         self.prune()
         return ckpt_dir
+
+    def protect_checkpoint(self, ckpt_path: str) -> None:
+        """Prevent an in-progress consumer from being pruned."""
+        with self._lock:
+            self._protected_checkpoints.add(self._canonical_checkpoint_path(ckpt_path))
+
+    def unprotect_checkpoint(self, ckpt_path: str) -> None:
+        """Allow a previously protected checkpoint to be pruned again."""
+        with self._lock:
+            self._protected_checkpoints.discard(
+                self._canonical_checkpoint_path(ckpt_path)
+            )
 
     def set_save_policy(
         self,
@@ -607,7 +620,10 @@ class CheckpointManager:
         if len(ckpt_metas) <= self._keep_checkpoint_max:
             return
         ckpt_metas.sort(key=_get_checkpoint_step)
-        protected = set(ckpt_metas[-self._keep_checkpoint_max :])
+        protected = {
+            self._canonical_checkpoint_path(path)
+            for path in ckpt_metas[-self._keep_checkpoint_max :]
+        }
         if (
             self._export_config is not None
             and self._export_config.exporter_type == "best"
@@ -616,14 +632,20 @@ class CheckpointManager:
                 self._model_dir, self._export_config, self._eval_result_filename
             )
             if best_ckpt_path is not None:
-                protected.add(best_ckpt_path.rstrip(os.path.sep))
+                protected.add(self._canonical_checkpoint_path(best_ckpt_path))
+        with self._lock:
+            protected.update(self._protected_checkpoints)
         for ckpt_path in ckpt_metas:
-            if ckpt_path not in protected:
+            if self._canonical_checkpoint_path(ckpt_path) not in protected:
                 logger.info(f"Removing old checkpoint {ckpt_path}...")
                 try:
                     shutil.rmtree(ckpt_path)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to remove checkpoint {ckpt_path}: {e}")
+
+    @staticmethod
+    def _canonical_checkpoint_path(ckpt_path: str) -> str:
+        return os.path.abspath(ckpt_path.rstrip(os.path.sep))
 
 
 _DISTCP_RANK_RE = re.compile(r"__(\d+)_\d+\.distcp$")

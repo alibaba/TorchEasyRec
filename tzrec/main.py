@@ -13,6 +13,10 @@ import copy
 import itertools
 import json
 import os
+import socket
+import subprocess
+import sys
+import time
 from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
@@ -78,7 +82,7 @@ from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.train_pb2 import TrainConfig
-from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils import checkpoint_util, config_util, env_util
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
@@ -94,6 +98,160 @@ from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
+
+
+def _online_dense_export_enabled() -> bool:
+    return os.environ.get("ONLINE_DENSE_EXPORT", "0") == "1"
+
+
+def _get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+class OnlineDenseExportManager:
+    """Background launcher for online-learning dense model export."""
+
+    def __init__(
+        self,
+        model_dir: str,
+        pipeline_config_path: str,
+        ckpt_manager: checkpoint_util.CheckpointManager,
+    ) -> None:
+        self._enabled = _online_dense_export_enabled()
+        self._rank = int(os.environ.get("RANK", 0))
+        self._model_dir = os.path.abspath(model_dir)
+        self._pipeline_config_path = os.path.abspath(pipeline_config_path)
+        self._ckpt_manager = ckpt_manager
+        self._queue: "Queue[Optional[Dict[str, Any]]]" = Queue()
+        self._worker: Optional[Thread] = None
+        self._last_version_ms = 0
+
+        if not self._enabled:
+            return
+        if not env_util.use_distributed_embedding():
+            raise RuntimeError(
+                "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
+            )
+        if self._rank == 0:
+            self._worker = Thread(
+                target=self._worker_loop,
+                name="online-dense-export",
+                daemon=True,
+            )
+            self._worker.start()
+            logger.info(
+                "ONLINE_DENSE_EXPORT enabled; dense versions will be exported under %s",
+                os.path.join(model_dir, "dense_hot_export"),
+            )
+
+    def submit(
+        self,
+        step: int,
+        checkpoint_path: str,
+        data_timestamp: float,
+    ) -> None:
+        """Queue a dense export task for one saved checkpoint."""
+        if not self._enabled or self._rank != 0:
+            return
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        version_ms = int(time.time() * 1000)
+        if version_ms <= self._last_version_ms:
+            version_ms = self._last_version_ms + 1
+        self._last_version_ms = version_ms
+        self._ckpt_manager.protect_checkpoint(checkpoint_path)
+        self._queue.put(
+            {
+                "step": step,
+                "checkpoint_path": checkpoint_path,
+                "data_timestamp": data_timestamp,
+                "version": str(version_ms),
+            }
+        )
+
+    def close(self) -> None:
+        """Wait for queued dense export tasks to finish."""
+        if self._worker is None:
+            return
+        self._queue.put(None)
+        self._worker.join()
+
+    def _worker_loop(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                if task is None:
+                    return
+                self._run_task(task)
+            finally:
+                self._queue.task_done()
+
+    def _run_task(self, task: Dict[str, Any]) -> None:
+        checkpoint_path = task["checkpoint_path"]
+        try:
+            if not os.path.exists(checkpoint_path):
+                logger.error(
+                    "skip online dense export version %s: checkpoint missing: %s",
+                    task["version"],
+                    checkpoint_path,
+                )
+                return
+
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env = os.environ.copy()
+            env.update(
+                {
+                    "USE_DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "3",
+                    "RANK": "0",
+                    "LOCAL_RANK": "0",
+                    "WORLD_SIZE": "1",
+                    "LOCAL_WORLD_SIZE": "1",
+                    "MASTER_ADDR": "127.0.0.1",
+                    "MASTER_PORT": str(_get_free_port()),
+                }
+            )
+            env["PYTHONPATH"] = (
+                repo_root
+                if not env.get("PYTHONPATH")
+                else repo_root + os.pathsep + env["PYTHONPATH"]
+            )
+            cmd = [
+                sys.executable,
+                "-m",
+                "tzrec.tools.online_dense_export",
+                "--pipeline_config_path",
+                self._pipeline_config_path,
+                "--checkpoint_path",
+                checkpoint_path,
+                "--model_dir",
+                self._model_dir,
+                "--version",
+                task["version"],
+                "--checkpoint_step",
+                str(task["step"]),
+                "--data_timestamp",
+                str(task["data_timestamp"]),
+            ]
+            logger.info(
+                "start online dense export version %s from %s",
+                task["version"],
+                checkpoint_path,
+            )
+            try:
+                subprocess.run(cmd, check=True, env=env, cwd=repo_root)
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    "online dense export version %s failed with return code %s",
+                    task["version"],
+                    e.returncode,
+                )
+                return
+            logger.info("online dense export version %s finished", task["version"])
+        finally:
+            self._ckpt_manager.unprotect_checkpoint(checkpoint_path)
+            self._ckpt_manager.prune()
 
 
 def _create_features(
@@ -336,6 +494,7 @@ def _train_and_evaluate(
     ignore_restore_optimizer: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
     delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
+    pipeline_config_path: Optional[str] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -436,6 +595,16 @@ def _train_and_evaluate(
                 )
             model.train()
 
+    online_dense_exporter = OnlineDenseExportManager(
+        model_dir,
+        pipeline_config_path or os.path.join(model_dir, "pipeline.config"),
+        ckpt_manager,
+    )
+
+    def after_checkpoint_saved(step: int, data_ts: float) -> None:
+        checkpoint_path = os.path.join(model_dir, f"model.ckpt-{step}")
+        online_dense_exporter.submit(step, checkpoint_path, data_ts)
+
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
     for i_epoch in epoch_iter:
@@ -511,6 +680,7 @@ def _train_and_evaluate(
                 dataloader_state,
                 data_timestamp=data_timestamp,
             ):
+                after_checkpoint_saved(i_step, data_timestamp)
                 run_eval(i_step, i_epoch)
             if train_config.is_profiling:
                 prof.step()
@@ -523,6 +693,7 @@ def _train_and_evaluate(
             epoch=i_epoch,
             data_timestamp=data_timestamp,
         ):
+            after_checkpoint_saved(i_step, data_timestamp)
             run_eval(i_step, i_epoch)
 
         if use_step and i_step >= train_config.num_steps - 1:
@@ -567,7 +738,9 @@ def _train_and_evaluate(
         data_timestamp=data_timestamp,
         final=True,
     ):
+        after_checkpoint_saved(i_step, data_timestamp)
         run_eval(i_step, i_epoch)
+    online_dense_exporter.close()
     ckpt_manager.close()
 
 
@@ -825,6 +998,7 @@ def train_and_evaluate(
         ignore_restore_optimizer=ignore_restore_optimizer,
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,
+        pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
