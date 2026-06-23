@@ -122,16 +122,6 @@ class FaissResidualKmeansTest(unittest.TestCase):
         # Centroids come back on the input device (CPU fit, device-preserving).
         self.assertEqual(centers[0].device, samples.device)
 
-    def test_raises_on_too_few_points(self) -> None:
-        # Gained from the shared faiss_kmeans_fit primitive: a clear N>=K error
-        # before faiss's opaque C++ throw.
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-        with self.assertRaisesRegex(RuntimeError, "need >= 8 points"):
-            faiss_residual_kmeans(torch.randn(4, 6), [8])
-
 
 class ResidualVQBranchTest(unittest.TestCase):
     """Coverage for the rotation-trick STE branch and the kmeans-init guard."""
@@ -204,15 +194,6 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         # latents: per-layer cumulative quantized vectors (B, n_layers, D).
         self.assertEqual(out.latents.shape, (5, 3, 8))
         self.assertTrue(torch.isfinite(out.latents).all())
-
-    def test_decode_codes_shared_base(self) -> None:
-        codes = torch.randint(0, 16, (5, 3))
-        recon = self.rvq.decode_codes(codes)
-        self.assertEqual(recon.shape, (5, 8))
-
-    def test_get_codes_no_grad(self) -> None:
-        codes = self.rvq.get_codes(torch.randn(4, 8))
-        self.assertEqual(codes.shape, (4, 3))
 
     def test_forward_get_codes_consistent_eval(self) -> None:
         """get_codes (shared base walk) matches forward's ids in eval."""

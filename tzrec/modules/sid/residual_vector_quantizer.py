@@ -298,10 +298,11 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             emb (Tensor): the raw codebook vector (STE/eval) or the soft
                 embedding (Gumbel), with grad, shape (B, D).
         """
-        # On the STE residual walk the residual is detached, so the layer's
-        # straight-through wrap is a numeric no-op; the real STE gradient comes
-        # from the aggregate STE in :meth:`forward`. Gumbel returns the soft
-        # embedding that carries grad directly.
+        # On the STE residual walk the residual is detached and the layer
+        # returns the raw codebook vector (grad-carrying on the codebook, no
+        # per-layer STE wrap); the encoder STE gradient is applied once on the
+        # aggregate in :meth:`forward`. Gumbel returns the soft embedding that
+        # carries grad directly.
         out = self.layers[layer_idx].quantize(residual)
         return out.ids, out.embeddings
 
