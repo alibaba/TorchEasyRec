@@ -313,6 +313,9 @@ class DeltaEmbeddingDumper:
         model: The model containing embedding tables to track.
         config: Configuration for delta embedding dump behavior.
         model_dir: Base directory for model outputs; used as default output location.
+        device: Training device; validated to be CUDA.
+        feature_configs: Feature configuration protos; validated to be free of
+            MC/ZCH features.
     """
 
     def __init__(
@@ -320,7 +323,11 @@ class DeltaEmbeddingDumper:
         model: nn.Module,
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
+        device: torch.device,
+        feature_configs: Iterable[Any],
     ) -> None:
+        validate_delta_embedding_dump_config(config, device)
+        validate_delta_embedding_dump_no_zch_features(feature_configs)
         self._model = model
         self._config = config
         self._interval = config.dump_interval_steps

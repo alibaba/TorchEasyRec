@@ -196,6 +196,8 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
                 file_prefix="delta",
             ),
             output_dir,
+            torch.device(f"cuda:{rank}"),
+            [],
         )
         output = model(_sharded_features(rank))
         output.sum().backward()
@@ -253,6 +255,40 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
         ]
         validate_delta_embedding_dump_no_zch_features(feature_configs)
+
+    def test_init_validates_cuda_device(self):
+        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaisesRegex(ValueError, "CUDA"):
+                DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    config,
+                    tmp_dir,
+                    torch.device("cpu"),
+                    [],
+                )
+
+    def test_init_validates_no_zch_features(self):
+        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
+        feature_configs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="user_id",
+                    expression="user:user_id",
+                    embedding_dim=8,
+                    zch=feature_pb2.ZeroCollisionHash(zch_size=1024),
+                )
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaisesRegex(ValueError, "user_id"):
+                DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    config,
+                    tmp_dir,
+                    torch.device("cuda"),
+                    feature_configs,
+                )
 
     def test_row_wise_shard_info_uses_row_offset(self):
         table_config = SimpleNamespace(
@@ -441,6 +477,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 torch.nn.Module(),
                 DeltaEmbeddingDumpConfig(dump_interval_steps=10),
                 tmp_dir,
+                torch.device("cuda"),
+                [],
             )
 
         self.assertTrue(tracker_cls.call_args.kwargs["auto_compact"])
