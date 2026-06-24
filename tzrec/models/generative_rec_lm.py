@@ -62,11 +62,6 @@ class GenerativeRecLM(BaseModel):
     name).
     """
 
-    # Default predictions key the inference branch emits generated SIDs under,
-    # stable across families (PredictWrapper ``output_cols`` should reference it).
-    # Overridable via ``common.generated_sids_key`` -> ``self._generated_sids_key``.
-    GENERATED_SIDS_KEY = "generated_sids"
-
     # Backbone PARAM dtype options (the fp32 MASTER weights). fp32 avoids
     # bf16-ULP underflow of Adam's small (lr=1e-5) updates; bf16 *compute* comes
     # from mixed_precision:"BF16" autocast, NOT the param dtype. Selected by
